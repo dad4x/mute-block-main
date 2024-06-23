@@ -1,0 +1,6 @@
+.DS_Store
+mix-manifest.json
+*.zip
+node_modules
+chrome
+firefox

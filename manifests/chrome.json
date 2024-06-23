@@ -1,0 +1,31 @@
+{
+    "name": "Mute Block",
+    "description": "Silence unwanted noise on Quora profiles instantly with this Chrome extension.",
+    "version": "1.2.0",
+    "manifest_version": 3,
+    "author": "https://mohsinali.dev",
+    "background": {
+        "service_worker": "js/sw.js"
+    },
+    "icons": {
+        "32": "icons/32.png",
+        "64": "icons/64.png",
+        "116": "icons/116.png"
+    },
+    "content_scripts": [
+        {
+            "matches": ["https://*.quora.com/*"],
+            "css": ["css/content.css"],
+            "js": ["js/content.js"],
+            "run_at": "document_start"
+        }
+    ],
+    "host_permissions": ["https://*.quora.com/"],
+    "permissions": ["webRequest"],
+    "web_accessible_resources": [
+        {
+            "matches": ["https://*.quora.com/*"],
+            "resources": ["img/*"]
+        }
+    ]
+}

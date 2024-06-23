@@ -1,0 +1,79 @@
+/* mute block button */
+.mb-ext_mute-block-btn {
+    background-color: #b92b27;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 3px 8px;
+    font-size: 12px;
+    margin-left: 5px;
+}
+.mb-ext_mute-block-btn:hover {
+    background-color: rgb(168, 39, 35);
+}
+
+/* find original poster button */
+.mb-ext_find-op-btn {
+    background-color: #b92b27;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 3px 12px;
+}
+
+.mb-ext_find-op-btn:hover {
+    background-color: rgb(168, 39, 35);
+}
+
+/* find original poster log page button */
+.mb-ext_find-op-log-btn {
+    background-color: #b92b27;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 15px;
+    margin-top: 10px;
+}
+
+.mb-ext_find-op-log-btn:hover {
+    background-color: rgb(168, 39, 35);
+}
+
+/* close tab button */
+.mb-ext_close-tab-btn {
+    background-color: #25a1b0;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 3px 8px;
+    font-size: 12px;
+    margin-left: 15px;
+}
+.mb-ext_close-tab-btn:hover {
+    background-color: #1d7f8a;
+}
+
+/* open profiles button */
+.mb-ext_open-profiles-btn {
+    background-color: #b92b27;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 10px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.mb-ext_open-profiles-btn:hover {
+    background-color: rgb(168, 39, 35);
+}
