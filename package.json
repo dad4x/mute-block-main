@@ -1,0 +1,23 @@
+{
+  "name": "mute-block",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "npx mix",
+    "prod": "npx mix --production",
+    "build:chrome": "web-ext build --config=chrome-config.cjs",
+    "build:firefox": "web-ext build --config=firefox-config.cjs",
+    "chrome": "web-ext run --config=chrome-config.cjs",
+    "firefox": "web-ext run --config=firefox-config.cjs",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "laravel-mix": "^6.0.49",
+    "web-ext-plugin": "^2.9.0",
+    "webextension-polyfill": "^0.12.0"
+  }
+}
