@@ -20,6 +20,7 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 1. Visit the [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/mute-block/).
 2. Click `Add to Firefox`.
 3. Follow the prompts to install the extension.
+4. Give it permissions.  See [https://qr.ae/ps9aTh]
 
 ## Development
 
