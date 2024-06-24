@@ -4,7 +4,7 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 
 ## Download Links
 
-- [Chrome](https://chromewebstore.google.com/detail/mute-block-fop-new/nlmmkoljofpgbmlcojebolmniineboah)
+- [Chrome](https://chromewebstore.google.com/detail/mute-block-fop-new/nlmmkoljofpgbmlcojebolmniineboah) (also Brave)
 - [Firefox](https://addons.mozilla.org/en-US/firefox/addon/mute-block/)
 
 ## Installation
