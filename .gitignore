@@ -1,5 +1,7 @@
 .DS_Store
 mix-manifest.json
+*.stale.*
+*.rebuild.*
 *.zip
 node_modules
 chrome

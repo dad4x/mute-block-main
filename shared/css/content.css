@@ -21,12 +21,26 @@
     border: none;
     border-radius: 999px;
     cursor: pointer;
-    font-size: 14px;
-    padding: 3px 12px;
+    font-size: 12px;
+    line-height: 1.2;
+    padding: 4px 8px;
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+    margin-right: 0;
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 .mb-ext_find-op-btn:hover {
     background-color: rgb(168, 39, 35);
+}
+
+.mb-ext_question-center-slot {
+    display: flex;
+    justify-content: center;
+    flex: 1 1 0;
+    min-width: 0;
 }
 
 /* find original poster log page button */
@@ -56,6 +70,8 @@
     padding: 3px 8px;
     font-size: 12px;
     margin-left: 15px;
+    display: inline-flex;
+    align-items: center;
 }
 .mb-ext_close-tab-btn:hover {
     background-color: #1d7f8a;

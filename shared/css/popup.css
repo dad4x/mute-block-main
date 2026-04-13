@@ -1,0 +1,108 @@
+body {
+    margin: 0;
+    font: 14px/1.4 system-ui, sans-serif;
+    background: #f7f7f8;
+    color: #1f2937;
+}
+
+.popup {
+    width: 360px;
+}
+
+.header {
+    background: #b92b27;
+    color: #fff;
+    padding: 10px 14px;
+    text-align: center;
+}
+
+.header-title {
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.header-version {
+    font-size: 12px;
+    margin-left: 6px;
+}
+
+.form {
+    padding: 10px;
+}
+
+.section {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    padding: 12px;
+}
+
+.row {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+}
+
+.label {
+    font-weight: 600;
+}
+
+.hint {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 2px;
+}
+
+.input {
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 6px 8px;
+    width: 84px;
+}
+
+.checkbox {
+    height: 18px;
+    width: 18px;
+}
+
+.actions {
+    display: flex;
+    gap: 10px;
+}
+
+.button {
+    border: 0;
+    border-radius: 6px;
+    color: #fff;
+    cursor: pointer;
+    flex: 1;
+    font-weight: 600;
+    padding: 8px 10px;
+}
+
+.button-primary {
+    background: #b92b27;
+}
+
+.button-primary:hover {
+    background: #a82723;
+}
+
+.button-secondary {
+    background: #6b7280;
+}
+
+.button-secondary:hover {
+    background: #4b5563;
+}
+
+.status {
+    background: #ecfdf3;
+    border-left: 4px solid #22c55e;
+    border-radius: 6px;
+    color: #166534;
+    margin-top: 10px;
+    padding: 8px 10px;
+}
