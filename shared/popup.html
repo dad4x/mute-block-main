@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mute Block</title>
+    <link rel="stylesheet" href="css/popup.css">
+</head>
+<body>
+    <main class="popup">
+        <header class="header">
+            <span class="header-title" id="appName">Mute Block</span>
+            <span class="header-version" id="appVersion">v0.0.0</span>
+        </header>
+
+        <form class="form" id="settingsForm">
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">FOP Button Delay (ms)</div>
+                        <div class="hint">Delay before showing the Find Original Poster button.</div>
+                    </div>
+                    <input class="input" id="fopDelay" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Auto Switch To Answers</div>
+                        <div class="hint">Flip All Related to Answers before adding the FOP button.</div>
+                    </div>
+                    <input class="checkbox" id="flipToAnswers" type="checkbox">
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">FOP Flip Delay (ms)</div>
+                        <div class="hint">Delay after switching to Answers before showing the FOP button.</div>
+                    </div>
+                    <input class="input" id="fopFlipDelay" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Profiles Per Batch</div>
+                        <div class="hint">How many profiles to open at one time.</div>
+                    </div>
+                    <input class="input" id="profilesPerBatch" type="number" min="1" required>
+                </div>
+            </section>
+
+            <div class="actions">
+                <button class="button button-primary" type="submit">Save</button>
+                <button class="button button-secondary" type="reset">Reset</button>
+            </div>
+
+            <div class="status" id="status" hidden></div>
+        </form>
+    </main>
+
+    <script src="js/popup.js"></script>
+</body>
+</html>

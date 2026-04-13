@@ -1,4 +1,18 @@
 const browser = require('webextension-polyfill')
+const defaults = require('./defaults')
+
+function sendTabMessage(tabId, message) {
+    return browser.tabs.sendMessage(tabId, message).catch(error => {
+        if(/Receiving end does not exist/i.test(error?.message || '')) return
+        console.warn('tabs.sendMessage failed', {tabId, message, error})
+    })
+}
+
+browser.runtime.onInstalled.addListener(details => {
+    if(details.reason === 'install') {
+        browser.storage.local.set(defaults)
+    }
+})
 
 browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if(request.action === 'create-tab') {
@@ -11,28 +25,28 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 browser.webRequest.onCompleted.addListener(details => {
     if(details.url.match(/TribePeopleModalQuery/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'space-people-modal-loaded'})
+        sendTabMessage(details.tabId, {status: 'space-people-modal-loaded'})
     }
     else if(details.url.match(/TribeContributorOrHigherListQuery/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'space-contributors-loaded'})
+        sendTabMessage(details.tabId, {status: 'space-contributors-loaded'})
     }
     else if(details.url.match(/UserProfileFollowersModalQuery/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'profile-followers-modal-loaded'})
+        sendTabMessage(details.tabId, {status: 'profile-followers-modal-loaded'})
     }
     else if(details.url.match(/UserProfileFollowers_ProfileTopics_Query/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'profile-followers-loaded'})
+        sendTabMessage(details.tabId, {status: 'profile-followers-loaded'})
     }
     else if(details.url.match(/UserProfileFollowingPeople_ProfileTopics_Query/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'profile-following-loaded'})
+        sendTabMessage(details.tabId, {status: 'profile-following-loaded'})
     }
     else if(details.url.match(/userBlockModalInnerUtils_userSetBlock_Mutation/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'profile-block-updated'})
+        sendTabMessage(details.tabId, {status: 'profile-block-updated'})
     }
     else if(details.url.match(/ContentLogMainQuery/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'question-log-loaded'})
+        sendTabMessage(details.tabId, {status: 'question-log-loaded'})
     }
     else if(details.url.match(/QuestionCollapsedAnswerLoaderQuery/i)) {
-        browser.tabs.sendMessage(details.tabId, {status: 'question-page-loaded'})
+        sendTabMessage(details.tabId, {status: 'question-page-loaded'})
     }
 },
 {
