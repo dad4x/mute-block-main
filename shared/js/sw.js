@@ -1,11 +1,193 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const pendingTabActions = new Map()
+const queuedTabActions = []
+const activeQueuedTabs = new Set()
+const ownedTabIdsByParent = new Map()
+const owningParentByChild = new Map()
+const OWNED_TAB_STATE_KEY = 'mbOwnedTabIdsByParent'
+let persistOwnedTabIdsTimeout = null
+let queuedTabConcurrency = 1
+
+function serializeOwnedTabIdsByParent() {
+    const serialized = {}
+
+    for(const [parentTabId, childTabIds] of ownedTabIdsByParent.entries()) {
+        if(!childTabIds.size) continue
+        serialized[parentTabId] = Array.from(childTabIds)
+    }
+
+    return serialized
+}
+
+function rebuildOwningParentByChild() {
+    owningParentByChild.clear()
+
+    for(const [parentTabId, childTabIds] of ownedTabIdsByParent.entries()) {
+        for(const childTabId of childTabIds) {
+            owningParentByChild.set(childTabId, Number(parentTabId))
+        }
+    }
+}
+
+async function persistOwnedTabIdsByParent() {
+    try {
+        await browser.storage.local.set({[OWNED_TAB_STATE_KEY]: serializeOwnedTabIdsByParent()})
+    }
+    catch {}
+}
+
+function schedulePersistOwnedTabIdsByParent(delayMs = 250) {
+    clearTimeout(persistOwnedTabIdsTimeout)
+    persistOwnedTabIdsTimeout = setTimeout(() => {
+        persistOwnedTabIdsTimeout = null
+        void persistOwnedTabIdsByParent()
+    }, delayMs)
+}
+
+async function loadOwnedTabIdsByParent() {
+    try {
+        const stored = await browser.storage.local.get({[OWNED_TAB_STATE_KEY]: {}})
+        const serialized = stored?.[OWNED_TAB_STATE_KEY] || {}
+
+        ownedTabIdsByParent.clear()
+
+        for(const [parentTabId, childTabIds] of Object.entries(serialized)) {
+            const numericParentTabId = Number.parseInt(parentTabId, 10)
+            if(!numericParentTabId || !Array.isArray(childTabIds) || !childTabIds.length) continue
+
+            ownedTabIdsByParent.set(numericParentTabId, new Set(childTabIds.map(tabId => Number.parseInt(tabId, 10)).filter(Boolean)))
+        }
+
+        rebuildOwningParentByChild()
+    }
+    catch {}
+}
+
+const ownedTabIdsReady = loadOwnedTabIdsByParent()
 
 function sendTabMessage(tabId, message) {
     return browser.tabs.sendMessage(tabId, message).catch(error => {
         if(/Receiving end does not exist/i.test(error?.message || '')) return
-        console.warn('tabs.sendMessage failed', {tabId, message, error})
     })
+}
+
+function registerOwnedTab(parentTabId, childTabId) {
+    if(!parentTabId || !childTabId) return
+
+    let ownedTabIds = ownedTabIdsByParent.get(parentTabId)
+    if(!ownedTabIds) {
+        ownedTabIds = new Set()
+        ownedTabIdsByParent.set(parentTabId, ownedTabIds)
+    }
+
+    ownedTabIds.add(childTabId)
+    owningParentByChild.set(childTabId, parentTabId)
+    schedulePersistOwnedTabIdsByParent()
+}
+
+function unregisterOwnedTab(childTabId) {
+    if(!childTabId) return
+
+    const parentTabId = owningParentByChild.get(childTabId)
+    if(!parentTabId) return
+
+    owningParentByChild.delete(childTabId)
+
+    const ownedTabIds = ownedTabIdsByParent.get(parentTabId)
+    if(!ownedTabIds) return
+
+    ownedTabIds.delete(childTabId)
+    if(!ownedTabIds.size) {
+        ownedTabIdsByParent.delete(parentTabId)
+    }
+
+    schedulePersistOwnedTabIdsByParent()
+}
+
+function clearOwnedTabsForParent(parentTabId) {
+    if(!parentTabId) return
+
+    const ownedTabIds = ownedTabIdsByParent.get(parentTabId)
+    if(!ownedTabIds) return
+
+    for(const childTabId of ownedTabIds) {
+        owningParentByChild.delete(childTabId)
+    }
+
+    ownedTabIdsByParent.delete(parentTabId)
+    schedulePersistOwnedTabIdsByParent()
+}
+
+async function getLiveOwnedTabIds(parentTabId) {
+    await ownedTabIdsReady
+
+    const ownedTabIds = Array.from(ownedTabIdsByParent.get(parentTabId) || [])
+    if(!ownedTabIds.length) return []
+
+    const liveTabIds = []
+
+    for(const tabId of ownedTabIds) {
+        try {
+            await browser.tabs.get(tabId)
+            liveTabIds.push(tabId)
+        }
+        catch {
+            unregisterOwnedTab(tabId)
+        }
+    }
+
+    return liveTabIds
+}
+
+async function sweepOwnedBlockedProfileTabs(parentTabId) {
+    const ownedTabIds = await getLiveOwnedTabIds(parentTabId)
+    if(!ownedTabIds.length) return {owned: 0, signaled: 0}
+
+    let signaled = 0
+
+    for(const tabId of ownedTabIds) {
+        try {
+            const response = await sendTabMessage(tabId, {action: 'close-if-blocked'})
+            if(response?.willClose) signaled += 1
+        }
+        catch {}
+    }
+
+    return {owned: ownedTabIds.length, signaled}
+}
+
+function getOwnedNukeStatus(parentTabId) {
+    const owned = ownedTabIdsByParent.get(parentTabId)?.size || 0
+    const active = Array.from(activeQueuedTabs).filter(tabId => owningParentByChild.get(tabId) === parentTabId).length
+    const queued = queuedTabActions.filter(action => action.ownerTabId === parentTabId && action.tabAction === 'nuke').length
+    return {active, owned, queued}
+}
+
+function releaseQueuedTab(tabId) {
+    pendingTabActions.delete(tabId)
+
+    if(activeQueuedTabs.delete(tabId)) {
+        void fillQueuedTabs()
+    }
+}
+
+async function fillQueuedTabs() {
+    await ownedTabIdsReady
+
+    while(activeQueuedTabs.size < queuedTabConcurrency && queuedTabActions.length) {
+        const next = queuedTabActions.shift()
+
+        try {
+            void sweepOwnedBlockedProfileTabs(next.ownerTabId)
+            const tab = await browser.tabs.create({url: next.url, active: false})
+            activeQueuedTabs.add(tab.id)
+            pendingTabActions.set(tab.id, next.tabAction)
+            registerOwnedTab(next.ownerTabId, tab.id)
+            void sweepOwnedBlockedProfileTabs(next.ownerTabId)
+        }
+        catch {}
+    }
 }
 
 browser.runtime.onInstalled.addListener(details => {
@@ -14,12 +196,73 @@ browser.runtime.onInstalled.addListener(details => {
     }
 })
 
+browser.tabs.onRemoved.addListener(tabId => {
+    void ownedTabIdsReady.then(() => {
+        releaseQueuedTab(tabId)
+        unregisterOwnedTab(tabId)
+        clearOwnedTabsForParent(tabId)
+    })
+})
+
 browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if(request.action === 'create-tab') {
-        browser.tabs.create({url: request.url, active: false})
+        return browser.tabs.create({url: request.url, active: false}).then(tab => {
+            if(request.tabAction) pendingTabActions.set(tab.id, request.tabAction)
+            return {tabId: tab.id}
+        })
+    }
+    else if(request.action === 'enqueue-tabs') {
+        const urls = Array.isArray(request.urls) ? request.urls.filter(Boolean) : []
+        if(!urls.length) return Promise.resolve({queued: 0})
+        const ownerTabId = sender.tab?.id || null
+
+        return ownedTabIdsReady.then(() => {
+            queuedTabConcurrency = Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1)
+
+            for(const url of urls) {
+                queuedTabActions.push({url, tabAction: request.tabAction || null, ownerTabId})
+            }
+
+            void sweepOwnedBlockedProfileTabs(ownerTabId)
+            return fillQueuedTabs().then(() => ({queued: urls.length}))
+        })
+    }
+    else if(request.action === 'claim-tab-action') {
+        const tabId = sender.tab?.id
+        if(!tabId) return Promise.resolve(null)
+
+        const action = pendingTabActions.get(tabId) || null
+        pendingTabActions.delete(tabId)
+        return Promise.resolve(action)
+    }
+    else if(request.action === 'release-tab-slot') {
+        const tabId = sender.tab?.id
+        if(!tabId) return Promise.resolve({released: false})
+
+        releaseQueuedTab(tabId)
+        return Promise.resolve({released: true})
     }
     else if(request.action === 'close-tab') {
-        browser.tabs.remove(sender.tab.id)
+        const tabId = sender.tab?.id
+        releaseQueuedTab(tabId)
+
+        if(tabId) {
+            setTimeout(() => {
+                void browser.tabs.remove(tabId).catch(() => {})
+            }, 0)
+            return Promise.resolve({closed: true})
+        }
+
+        return Promise.resolve({closed: false})
+    }
+    else if(request.action === 'get-owned-nuke-status') {
+        return ownedTabIdsReady.then(async () => {
+            await getLiveOwnedTabIds(sender.tab?.id || null)
+            return getOwnedNukeStatus(sender.tab?.id || null)
+        })
+    }
+    else if(request.action === 'sweep-owned-blocked-profile-tabs') {
+        return sweepOwnedBlockedProfileTabs(sender.tab?.id || null)
     }
 })
 

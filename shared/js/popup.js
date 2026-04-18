@@ -9,6 +9,7 @@ async function init() {
 
     document.getElementById('appName').textContent = manifest.name
     document.getElementById('appVersion').textContent = `v${manifest.version}`
+    document.getElementById('closePopup').addEventListener('click', () => window.close())
 
     const form = document.getElementById('settingsForm')
     const status = document.getElementById('status')
