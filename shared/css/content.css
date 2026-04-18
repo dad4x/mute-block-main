@@ -14,6 +14,21 @@
     background-color: rgb(168, 39, 35);
 }
 
+.mb-ext_mute-block-close-btn {
+    background-color: #6b7280;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 3px 8px;
+    margin-left: 5px;
+}
+
+.mb-ext_mute-block-close-btn:hover {
+    background-color: #4b5563;
+}
+
 /* find original poster button */
 .mb-ext_find-op-btn {
     background-color: #b92b27;
@@ -92,4 +107,67 @@
 }
 .mb-ext_open-profiles-btn:hover {
     background-color: rgb(168, 39, 35);
+}
+
+.mb-ext_view-contributors-btn {
+    display: inline-flex;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+
+.mb-ext_nuke-profiles-btn {
+    background-color: #111;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 10px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 8px;
+}
+
+.mb-ext_nuke-profiles-btn:hover {
+    background-color: #000;
+}
+
+.mb-ext_nuke-profiles-btn--flash {
+    background-color: #fff;
+    color: #fff;
+    box-shadow: inset 0 0 0 1px #fff;
+}
+
+.mb-ext_nuke-profiles-btn--working,
+.mb-ext_nuke-profiles-btn--done {
+    background-color: #fff;
+    color: #000;
+    box-shadow: inset 0 0 0 1px #000;
+}
+
+.mb-ext_post-nuke-btn {
+    display: inline-flex;
+    margin-left: auto;
+    vertical-align: middle;
+    flex: 0 0 auto;
+}
+
+.mb-ext_post-header-host {
+    padding-right: 104px;
+}
+
+.mb-ext_post-card {
+    position: relative;
+}
+
+.mb-ext_post-nuke-slot {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    right: 16px;
+    display: flex !important;
+    justify-content: flex-end;
+    align-items: center;
+    z-index: 1;
 }

@@ -10,10 +10,19 @@ body {
 }
 
 .header {
+    align-items: center;
     background: #b92b27;
     color: #fff;
+    display: flex;
+    justify-content: space-between;
     padding: 10px 14px;
-    text-align: center;
+    text-align: left;
+}
+
+.header-main {
+    align-items: baseline;
+    display: flex;
+    gap: 6px;
 }
 
 .header-title {
@@ -23,7 +32,24 @@ body {
 
 .header-version {
     font-size: 12px;
-    margin-left: 6px;
+}
+
+.header-close {
+    background: transparent;
+    border: 0;
+    border-radius: 999px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: 700;
+    height: 28px;
+    line-height: 1;
+    min-width: 28px;
+    padding: 0;
+}
+
+.header-close:hover {
+    background: rgba(255, 255, 255, 0.16);
 }
 
 .form {
