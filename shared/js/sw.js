@@ -5,6 +5,8 @@ const queuedTabActions = []
 const activeQueuedTabs = new Set()
 const ownedTabIdsByParent = new Map()
 const owningParentByChild = new Map()
+const canceledQueuedUrlsByOwner = new Map()
+const pausedQueuedOwners = new Set()
 const OWNED_TAB_STATE_KEY = 'mbOwnedTabIdsByParent'
 let persistOwnedTabIdsTimeout = null
 let queuedTabConcurrency = 1
@@ -105,20 +107,6 @@ function unregisterOwnedTab(childTabId) {
     schedulePersistOwnedTabIdsByParent()
 }
 
-function clearOwnedTabsForParent(parentTabId) {
-    if(!parentTabId) return
-
-    const ownedTabIds = ownedTabIdsByParent.get(parentTabId)
-    if(!ownedTabIds) return
-
-    for(const childTabId of ownedTabIds) {
-        owningParentByChild.delete(childTabId)
-    }
-
-    ownedTabIdsByParent.delete(parentTabId)
-    schedulePersistOwnedTabIdsByParent()
-}
-
 async function getLiveOwnedTabIds(parentTabId) {
     await ownedTabIdsReady
 
@@ -161,7 +149,42 @@ function getOwnedNukeStatus(parentTabId) {
     const owned = ownedTabIdsByParent.get(parentTabId)?.size || 0
     const active = Array.from(activeQueuedTabs).filter(tabId => owningParentByChild.get(tabId) === parentTabId).length
     const queued = queuedTabActions.filter(action => action.ownerTabId === parentTabId && action.tabAction === 'nuke').length
-    return {active, owned, queued}
+    const paused = pausedQueuedOwners.has(parentTabId)
+    return {active, owned, queued, paused}
+}
+
+function rememberCanceledOwnerUrls(ownerTabId, urls) {
+    if(!ownerTabId || !Array.isArray(urls) || !urls.length) return
+
+    const existing = canceledQueuedUrlsByOwner.get(ownerTabId) || []
+    canceledQueuedUrlsByOwner.set(ownerTabId, existing.concat(urls.filter(Boolean)))
+}
+
+function cancelQueuedOwnerActions(ownerTabId, tabAction = null) {
+    if(!ownerTabId) return []
+
+    const canceledUrls = []
+
+    for(let index = queuedTabActions.length - 1; index >= 0; index -= 1) {
+        const action = queuedTabActions[index]
+        if(action.ownerTabId !== ownerTabId) continue
+        if(tabAction && action.tabAction !== tabAction) continue
+
+        if(action.url) {
+            canceledUrls.push(action.url)
+        }
+        queuedTabActions.splice(index, 1)
+    }
+
+    return canceledUrls
+}
+
+function consumeCanceledOwnerUrls(ownerTabId) {
+    if(!ownerTabId) return []
+
+    const urls = canceledQueuedUrlsByOwner.get(ownerTabId) || []
+    canceledQueuedUrlsByOwner.delete(ownerTabId)
+    return urls
 }
 
 function releaseQueuedTab(tabId) {
@@ -177,6 +200,10 @@ async function fillQueuedTabs() {
 
     while(activeQueuedTabs.size < queuedTabConcurrency && queuedTabActions.length) {
         const next = queuedTabActions.shift()
+        if(pausedQueuedOwners.has(next.ownerTabId)) {
+            rememberCanceledOwnerUrls(next.ownerTabId, next.url ? [next.url] : [])
+            continue
+        }
 
         try {
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
@@ -198,10 +225,18 @@ browser.runtime.onInstalled.addListener(details => {
 
 browser.tabs.onRemoved.addListener(tabId => {
     void ownedTabIdsReady.then(() => {
+        pausedQueuedOwners.delete(tabId)
         releaseQueuedTab(tabId)
         unregisterOwnedTab(tabId)
-        clearOwnedTabsForParent(tabId)
     })
+})
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if(changeInfo.status !== 'loading') return
+
+    pausedQueuedOwners.add(tabId)
+    const canceledUrls = cancelQueuedOwnerActions(tabId, 'nuke')
+    rememberCanceledOwnerUrls(tabId, canceledUrls)
 })
 
 browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -217,6 +252,7 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const ownerTabId = sender.tab?.id || null
 
         return ownedTabIdsReady.then(() => {
+            pausedQueuedOwners.delete(ownerTabId)
             queuedTabConcurrency = Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1)
 
             for(const url of urls) {
@@ -241,6 +277,22 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         releaseQueuedTab(tabId)
         return Promise.resolve({released: true})
+    }
+    else if(request.action === 'cancel-queued-owner-nukes') {
+        const ownerTabId = sender.tab?.id || null
+        const canceledUrls = consumeCanceledOwnerUrls(ownerTabId)
+            .concat(cancelQueuedOwnerActions(ownerTabId, 'nuke'))
+        return Promise.resolve({
+            canceledUrls
+        })
+    }
+    else if(request.action === 'pause-owner-nukes') {
+        const ownerTabId = sender.tab?.id || null
+        pausedQueuedOwners.add(ownerTabId)
+        const canceledUrls = cancelQueuedOwnerActions(ownerTabId, 'nuke')
+        return Promise.resolve({
+            canceledUrls
+        })
     }
     else if(request.action === 'close-tab') {
         const tabId = sender.tab?.id
