@@ -290,7 +290,7 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalM
             return false
         }
 
-        setNukeButtonWorking(button, formatNukeProgressLabel('Fallout settling...', status))
+        setNukeButtonWorking(button, 'Fallout settling...')
         if(Date.now() >= nextSweepAt) {
             nextSweepAt = Date.now() + 4000
             void sweepBlockedProfileTabs()
@@ -303,7 +303,7 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalM
         setNukeButtonIdle(button)
         return false
     }
-    setNukeButtonWorking(button, formatNukeProgressLabel('Fallout settling...', status))
+    setNukeButtonWorking(button, 'Fallout settling...')
     return false
 }
 
@@ -674,7 +674,7 @@ function setNukeButtonDone(button, label = 'Nuked') {
 function setMuteBlockHelp(element, helpText) {
     if(!element) return
 
-    const text = `${helpText} (Mute Block)`
+    const text = `Mute-Block Extension: ${helpText}`
     element.title = text
     element.setAttribute('aria-label', text)
 }
@@ -2441,7 +2441,7 @@ function getNormalizedProfileIdentityKey(href) {
 }
 
 function getNormalizedProfileHrefList(urls) {
-    const normalizedUrls = []
+    const normalizedEntries = []
     const seen = new Set()
 
     for(const url of urls || []) {
@@ -2450,10 +2450,25 @@ function getNormalizedProfileHrefList(urls) {
         if(!normalized || !identityKey || seen.has(identityKey)) continue
 
         seen.add(identityKey)
-        normalizedUrls.push(normalized)
+        normalizedEntries.push({
+            href: normalized,
+            identityKey
+        })
     }
 
-    return normalizedUrls
+    return normalizedEntries
+        .filter((entry, _, entries) => !isLikelyTruncatedProfileIdentityKey(entry.identityKey, entries))
+        .map(entry => entry.href)
+}
+
+function isLikelyTruncatedProfileIdentityKey(identityKey, entries) {
+    const value = `${identityKey || ''}`
+    if(!/^[a-z]{1,3}$/i.test(value)) return false
+
+    return entries.some(entry => {
+        const other = `${entry?.identityKey || ''}`
+        return other !== value && other.startsWith(value) && other.length >= value.length + 3
+    })
 }
 
 function normalizeQuoraPostHref(href) {
@@ -2480,8 +2495,11 @@ function getProfileUrlsFromText(text) {
     const matches = `${text || ''}`.matchAll(/https?:\/\/www\.quora\.com\/profile\/[^\s<>"'`)\]]+/gi)
 
     for(const match of matches) {
-        const rawHref = `${match?.[0] || ''}`.replace(/[),.;:!?]+$/g, '')
-        const href = normalizeQuoraProfileHref(rawHref)
+        const rawHref = `${match?.[0] || ''}`
+        if(isTruncatedQuoraProfileTextUrl(rawHref)) continue
+
+        const cleanedHref = rawHref.replace(/[),.;:!?]+$/g, '')
+        const href = normalizeQuoraProfileHref(cleanedHref)
         if(!href || seen.has(href)) continue
 
         seen.add(href)
@@ -2491,12 +2509,18 @@ function getProfileUrlsFromText(text) {
     return urls
 }
 
+function isTruncatedQuoraProfileTextUrl(href) {
+    return /\/profile\/[^/\s<>"'`)\]]*(?:\.{3,}|…)/i.test(`${href || ''}`)
+}
+
 function normalizeRememberedProfileDisplayName(label) {
     const normalizedLabel = `${label || ''}`.replace(/\s+/g, ' ').trim()
     if(!normalizedLabel) return ''
 
     const embeddedProfileMatch = normalizedLabel.match(/https?:\/\/www\.quora\.com\/profile\/[^\s<>"'`)\]]+/i)
     if(embeddedProfileMatch?.[0]) {
+        if(isTruncatedQuoraProfileTextUrl(embeddedProfileMatch[0])) return ''
+
         const href = normalizeQuoraProfileHref(embeddedProfileMatch[0].replace(/[),.;:!?]+$/g, ''))
         const slugData = getQuoraProfileSlugData(href)
         if(slugData?.normalizedSlug) {
@@ -4065,7 +4089,7 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
 }
 
 function formatSpaceFeedStatusLabel(snapshot) {
-    return '(MB)'
+    return 'MB Info'
 }
 
 function formatSpaceFeedStatusDetails(snapshot) {
@@ -4111,13 +4135,13 @@ function syncSpaceFeedStatusButton(entries = null) {
         button.className = 'mb-ext_space-feed-status-btn'
         button.addEventListener('click', () => {
             scheduleSpaceAssetNukeControls(0)
-            showCopyableText('Mute Block status', formatSpaceFeedStatusDetails(getSpaceFeedDetectionSnapshot()))
+            showCopyableText('Mute-Block Extension Info:', formatSpaceFeedStatusDetails(getSpaceFeedDetectionSnapshot()))
         })
         host.appendChild(button)
     }
 
     button.textContent = formatSpaceFeedStatusLabel(snapshot)
-    setMuteBlockHelp(button, formatSpaceFeedStatusDetails(snapshot).replace(/\n/g, ' | '))
+    setMuteBlockHelp(button, `Mute-Block Extension Info: ${formatSpaceFeedStatusDetails(snapshot).replace(/\n/g, ' | ')}`)
     return true
 }
 
