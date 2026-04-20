@@ -20,16 +20,6 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">FOP Button Delay (ms)</div>
-                        <div class="hint">Delay before showing the Find Original Poster button.</div>
-                    </div>
-                    <input class="input" id="fopDelay" type="number" min="0" required>
-                </div>
-            </section>
-
-            <section class="section">
-                <div class="row">
-                    <div>
                         <div class="label">Auto Switch To Answers</div>
                         <div class="hint">Flip All Related to Answers before adding the FOP button.</div>
                     </div>
@@ -40,8 +30,18 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">FOP Flip Delay (ms)</div>
-                        <div class="hint">Delay after switching to Answers before showing the FOP button.</div>
+                        <div class="label">FOP Button Delay (ms)</div>
+                        <div class="hint">Delay before showing the Original Poster button.</div>
+                    </div>
+                    <input class="input" id="fopDelay" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Answers Only Flip Delay (ms)</div>
+                        <div class="hint">Delay after switching to Answers before showing the OP button.</div>
                     </div>
                     <input class="input" id="fopFlipDelay" type="number" min="0" required>
                 </div>
@@ -51,9 +51,29 @@
                 <div class="row">
                     <div>
                         <div class="label">Profiles Per Batch</div>
-                        <div class="hint">How many profiles to open at one time.</div>
+                        <div class="hint">How many profiles to open or nuke at one time.</div>
                     </div>
                     <input class="input" id="profilesPerBatch" type="number" min="1" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Remembered Nuke Retention (days)</div>
+                        <div class="hint">Auto-prune remembered space-post results older than this. Use `0` to disable age pruning.</div>
+                    </div>
+                    <input class="input" id="nukedPostRetentionDays" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Remembered Nuke Entry Cap</div>
+                        <div class="hint">Keep at most this many remembered posts, trimming the oldest first. Use `0` to disable the cap.</div>
+                    </div>
+                    <input class="input" id="maxRememberedNukedPosts" type="number" min="0" required>
                 </div>
             </section>
 
@@ -64,6 +84,41 @@
 
             <div class="status" id="status" hidden></div>
         </form>
+
+        <section class="section section-spaces">
+            <div class="section-head">
+                <div>
+                    <div class="label">Categorized Spaces</div>
+                    <div class="hint">Saved space classifications can be resorted and changed here.</div>
+                </div>
+                <label class="sort-control" for="spaceSortBy">
+                    <span class="sort-label">Sort</span>
+                    <select class="select" id="spaceSortBy">
+                        <option value="name">Name</option>
+                        <option value="category">Category</option>
+                    </select>
+                </label>
+            </div>
+
+            <div class="space-list" id="spaceList"></div>
+        </section>
+
+        <section class="section section-memory">
+            <div class="section-head">
+                <div>
+                    <div class="label">Remembered Nukes</div>
+                    <div class="hint">Space-post nuke results are kept locally until cleared. That persistence can later support export or review flows for labelers.</div>
+                </div>
+            </div>
+
+            <div class="row row-memory">
+                <div>
+                    <div class="memory-count" id="nukedPostCount">0 remembered posts</div>
+                    <div class="hint">Clear this if you want to re-run or rebuild the remembered list.</div>
+                </div>
+                <button class="button button-danger button-compact" id="clearNukedPosts" type="button">Clear</button>
+            </div>
+        </section>
     </main>
 
     <script src="js/popup.js"></script>

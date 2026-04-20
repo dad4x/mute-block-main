@@ -16,7 +16,18 @@ Current repo reality:
 
 - `mute-block-main` does not yet subscribe to labelers, fetch labels, resolve DIDs, or expose labeler-management UI
 - the extension does already have the local execution pieces this design would eventually feed into, including page-local actions, batch profile opening, and queued `Nuke 'Em` execution
+- the extension also now keeps a persistent local record of remembered space-post nuke results, with local clearing and pruning controls; that is still local-only, but it is a realistic seed for later reviewed export into shared labeling workflows
 - the immediate release situation is uneven because Firefox store updates are stuck and the published Firefox add-on is still on `1.2`
+
+## UI Planning Note
+
+If shared moderation or labeler-management UI is added later, the current preferred layout options are:
+
+- leave the popup as a quick-action surface and move larger lists such as `Categorized Spaces` to a dedicated extension page
+- use a tabbed extension page for `Settings`, `Spaces`, and `Remembered Nukes`
+- optionally keep only a launcher button in the popup for opening that management page
+
+That matters because list-heavy management screens are already pushing beyond what the popup is good at, while an extension page can support wider layouts, tabs, and richer filtering.
 
 ## Summary
 

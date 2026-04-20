@@ -4,7 +4,7 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 
 ## Current Status
 
-- Source and local build artifacts are currently at `1.4.92`.
+- Source and local build artifacts are currently at `1.4.118`.
 - Chrome is the current release track.
 - Firefox store updates are currently blocked, so the published Firefox add-on is still on `1.2` until that pipeline is sorted out.
 
@@ -13,6 +13,9 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 - `Mute Block` and `Mute Block Close` actions on supported Quora profile pages
 - `Original Poster Profile` helper on supported log/question contexts
 - bulk `Open Profiles` and `Nuke 'Em` flows on supported follower, following, contributor, and related people-list contexts
+- space classification (`Asset`, `Neutral`, `Target`) with persistent popup-managed space records
+- asset-space feed scanning with per-post and page-level `Nuke 'Em` actions
+- persistent remembered space-post nuke state, which can be cleared from the popup and auto-pruned by age and entry cap when you want to keep the local list bounded
 - local settings for `FOP Button Delay`, `Auto Switch To Answers`, `FOP Flip Delay`, and `Profiles Per Batch`
 
 ## Download Links

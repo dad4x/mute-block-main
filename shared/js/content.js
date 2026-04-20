@@ -1,5 +1,23 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const {
+    MAX_REMEMBERED_NUKED_POSTS_KEY,
+    NUKED_POST_RETENTION_DAYS_KEY,
+    SPACE_NUKED_POSTS_KEY,
+    getPrunedNukedPosts,
+    haveSameNukedPostKeys
+} = require('./nukedPosts')
+const {
+    SPACE_CATEGORIES,
+    SPACE_REGISTRY_KEY,
+    buildSpaceRecord,
+    extractSpaceSlug,
+    getDocumentCanonicalUrl,
+    getSpaceCategoryLongLabel,
+    getSpaceName,
+    normalizeSpaceCategory,
+    normalizeSpaceUrl
+} = require('./spaceRegistry')
 
 let profilesModalTimeout
 let profileButtonsTimeout
@@ -22,15 +40,33 @@ let questionPageFollowUpTimeouts = []
 let spacePostBtnTimeout
 let spacePostBtnPending = false
 let spacePostFollowUpTimeouts = []
+let spaceClassificationTimeout
+let spaceClassificationPending = false
+let spaceAssetNukeTimeout
+let spaceAssetNukePending = false
 let closeTabRetryTimeouts = []
 let blockedCloseCheckTimeouts = []
 let currentUrl = location.href
 let settings = {...defaults}
+let spaceRegistry = {}
+let spaceNukedPosts = {}
+let spacePendingNukedPosts = {}
+let spaceFeedNukingPostKeys = new Set()
+let profileDisplayNamesByHref = {}
+let ownedNukeStatusCache = {
+    active: 0,
+    owned: 0,
+    queued: 0,
+    paused: false
+}
+let ownedNukeStatusPromise = null
 let activeProfileModal = null
 let handledModalProfileUrls = new Set()
 let initialized = false
 const PROFILE_ACTION_BUTTON_ORDER = ['mute-block-close', 'mute-block', 'close-tab']
 const SPACE_POST_NUKE_MIN_PROFILES = 2
+const SPACE_FEED_POST_NUKE_MIN_PROFILES = 1
+const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 
 addEventListener('unhandledrejection', event => {
     if(isExtensionContextInvalidatedError(event.reason) || isRuntimeConnectionError(event.reason)) {
@@ -58,9 +94,17 @@ async function init() {
     if(!bodyReady || !document.body) return
 
     settings = await safeStorageGet(defaults)
+    spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
+    const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
+    spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
+    spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
+        await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
+    }
     browser.runtime.onMessage.addListener(onMessage)
     browser.storage.onChanged.addListener(onStorageChanged)
     installNavigationHooks()
+    await reconcileReloadCanceledNukes()
 
     const page = getPageType()
 
@@ -82,6 +126,8 @@ async function init() {
     }
     else if(page === 'space') {
         injectSpaceSidebarOpenProfilesBtn()
+        scheduleSpaceClassificationControls(0)
+        scheduleSpaceAssetNukeControls(200)
     }
 
     startObserver()
@@ -93,6 +139,25 @@ function onStorageChanged(changes, areaName) {
     for(const [key, change] of Object.entries(changes)) {
         if(Object.prototype.hasOwnProperty.call(defaults, key)) {
             settings[key] = change.newValue
+        }
+        else if(key === SPACE_REGISTRY_KEY) {
+            spaceRegistry = change.newValue || {}
+            if(getPageType() === 'space') {
+                scheduleSpaceClassificationControls(0)
+                scheduleSpaceAssetNukeControls(0)
+            }
+        }
+        else if(key === SPACE_NUKED_POSTS_KEY) {
+            spaceNukedPosts = change.newValue || {}
+            if(getPageType() === 'space') {
+                scheduleSpaceAssetNukeControls(0)
+            }
+        }
+        else if(key === SPACE_PENDING_NUKED_POSTS_KEY) {
+            spacePendingNukedPosts = change.newValue || {}
+            if(getPageType() === 'space') {
+                scheduleSpaceAssetNukeControls(0)
+            }
         }
     }
 }
@@ -127,6 +192,31 @@ async function safeSendRuntimeMessage(message, fallback = null) {
     }
 }
 
+async function safeStorageSet(value) {
+    try {
+        await browser.storage.local.set(value)
+    }
+    catch(error) {
+        if(isExtensionContextInvalidatedError(error)) return
+        throw error
+    }
+}
+
+async function reconcileReloadCanceledNukes() {
+    const result = await safeSendRuntimeMessage({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []})
+    const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
+    if(!canceledUrls.length) return
+
+    await removePendingSpaceFeedUrls(canceledUrls)
+}
+
+function pruneRememberedSpaceNukes(records) {
+    return getPrunedNukedPosts(records, {
+        retentionDays: settings[NUKED_POST_RETENTION_DAYS_KEY],
+        maxEntries: settings[MAX_REMEMBERED_NUKED_POSTS_KEY]
+    })
+}
+
 async function notifyQueuedTabComplete() {
     const result = await safeSendRuntimeMessage({action: 'release-tab-slot'}, null)
     return !!result?.released
@@ -145,7 +235,31 @@ async function getOwnedNukeStatus() {
     return {
         active: Number.parseInt(result?.active, 10) || 0,
         owned: Number.parseInt(result?.owned, 10) || 0,
-        queued: Number.parseInt(result?.queued, 10) || 0
+        queued: Number.parseInt(result?.queued, 10) || 0,
+        paused: !!result?.paused
+    }
+}
+
+function updateOwnedNukeStatusCache(status = null) {
+    ownedNukeStatusCache = {
+        active: Number.parseInt(status?.active, 10) || 0,
+        owned: Number.parseInt(status?.owned, 10) || 0,
+        queued: Number.parseInt(status?.queued, 10) || 0,
+        paused: !!status?.paused
+    }
+
+    return ownedNukeStatusCache
+}
+
+async function refreshOwnedNukeStatusCache() {
+    if(ownedNukeStatusPromise) return ownedNukeStatusPromise
+
+    ownedNukeStatusPromise = (async () => updateOwnedNukeStatusCache(await getOwnedNukeStatus()))()
+    try {
+        return await ownedNukeStatusPromise
+    }
+    finally {
+        ownedNukeStatusPromise = null
     }
 }
 
@@ -154,15 +268,26 @@ function formatNukeProgressLabel(label, status = null) {
     return `${label} [t:${status.owned} a:${status.active} q:${status.queued}]`
 }
 
-async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalMs = 1000) {
+function hasOwnedNukeWorkInFlight(status = ownedNukeStatusCache) {
+    return (Number.parseInt(status?.active, 10) || 0) > 0 ||
+        (Number.parseInt(status?.owned, 10) || 0) > 0 ||
+        (Number.parseInt(status?.queued, 10) || 0) > 0
+}
+
+async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalMs = 1000, options = {}) {
     const startedAt = Date.now()
     let nextSweepAt = 0
+    const allowPause = !!options.allowPause
 
     while(Date.now() - startedAt < timeoutMs) {
-        const status = await getOwnedNukeStatus()
+        const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus())
         if(status.owned <= 0 && status.queued <= 0) {
             setNukeButtonDone(button)
             return true
+        }
+        if(allowPause && status.paused) {
+            setNukeButtonIdle(button)
+            return false
         }
 
         setNukeButtonWorking(button, formatNukeProgressLabel('Fallout settling...', status))
@@ -173,7 +298,11 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalM
         await sleep(intervalMs)
     }
 
-    const status = await getOwnedNukeStatus()
+    const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+    if(allowPause && status.paused) {
+        setNukeButtonIdle(button)
+        return false
+    }
     setNukeButtonWorking(button, formatNukeProgressLabel('Fallout settling...', status))
     return false
 }
@@ -185,6 +314,7 @@ function startObserver() {
             currentUrl = location.href
             resetQuestionPageBtn()
             resetSpacePostNukeBtn()
+            resetSpaceAssetNukeControls()
 
             const nextProfileKey = getProfileKey(currentUrl)
             if(previousProfileKey !== nextProfileKey) {
@@ -203,6 +333,16 @@ function startObserver() {
         }
         else if(page === 'space-post' && !document.querySelector('.mb-ext_post-nuke-btn')) {
             scheduleSpacePostNukeBtn(300)
+        }
+        else if(page === 'space') {
+            injectSpaceSidebarOpenProfilesBtn()
+            if(shouldRefreshSpaceClassificationControls()) {
+                scheduleSpaceClassificationControls(120)
+            }
+
+            if(shouldRefreshSpaceAssetNukeControls()) {
+                scheduleSpaceAssetNukeControls(180)
+            }
         }
 
         let modal = document.querySelector('[role="dialog"][aria-modal="true"]:not([data-mb-checked])')
@@ -325,10 +465,13 @@ function ensureProfileButtons() {
 function onMessage(request, sender, sendResponse) {
     if(request.action === 'close-if-blocked') {
         if(getPageType() === 'profile' && isProfileBlocked()) {
-            setTimeout(() => {
-                void requestCloseTab(1, 0, false)
-            }, 0)
-            return {willClose: true}
+            return (async () => {
+                await confirmCurrentProfileBlockedSpaceFeedEntries()
+                setTimeout(() => {
+                    void requestCloseTab(1, 0, false)
+                }, 0)
+                return {willClose: true}
+            })()
         }
 
         scheduleBlockedProfileCloseChecks()
@@ -508,7 +651,7 @@ function removeQuestionPageBtn(button) {
 function setNukeButtonIdle(button, label = `Nuke 'Em`) {
     if(!button) return
     button.dataset.mbNukeState = 'idle'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
     button.innerText = label
 }
 
@@ -523,19 +666,28 @@ function setNukeButtonWorking(button, label = 'Nuking...') {
 function setNukeButtonDone(button, label = 'Nuked') {
     if(!button) return
     button.dataset.mbNukeState = 'done'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--working')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working')
     button.classList.add('mb-ext_nuke-profiles-btn--done')
     button.innerText = label
+}
+
+function setMuteBlockHelp(element, helpText) {
+    if(!element) return
+
+    const text = `${helpText} (Mute Block)`
+    element.title = text
+    element.setAttribute('aria-label', text)
 }
 
 async function animateNukeButtonPress(button) {
     if(!button) return
 
-    button.classList.remove('mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
-    await sleep(250)
-    button.classList.add('mb-ext_nuke-profiles-btn--flash')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash')
+    button.classList.remove('mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-    await sleep(750)
+    button.classList.add('mb-ext_nuke-profiles-btn--pressed')
+    button.classList.add('mb-ext_nuke-profiles-btn--flash')
+    await sleep(430)
     button.classList.remove('mb-ext_nuke-profiles-btn--flash')
 }
 
@@ -553,6 +705,7 @@ function installNavigationHooks() {
             clearProfileButtonsFollowUps()
             resetQuestionPageBtn()
             resetSpacePostNukeBtn()
+            resetSpaceAssetNukeControls()
 
             if(getPageType() === 'profile') {
                 ensureProfileButtons()
@@ -562,6 +715,11 @@ function installNavigationHooks() {
             else if(getPageType() === 'space-post') {
                 scheduleSpacePostNukeBtn()
                 scheduleSpacePostFollowUps()
+            }
+            else if(getPageType() === 'space') {
+                injectSpaceSidebarOpenProfilesBtn()
+                scheduleSpaceClassificationControls(0)
+                scheduleSpaceAssetNukeControls(200)
             }
             else if(getPageType() === 'question') {
                 ensureQuestionPageFOPBtn()
@@ -584,6 +742,93 @@ function installNavigationHooks() {
     }
 }
 
+function shouldRefreshSpaceClassificationControls() {
+    const header = getSpaceHeaderContainer()
+    const space = resolveCurrentSpaceDescriptor()
+    if(!header || !space) return false
+
+    const host = header.querySelector('.mb-ext_space-category-host')
+    if(!host) return true
+    if(host.dataset.mbSpaceKey !== space.key) return true
+
+    const activeCategory = getStoredSpaceCategory(space)
+    if((host.dataset.mbSpaceCategory || '') !== activeCategory) return true
+
+    const buttons = Array.from(host.querySelectorAll('.mb-ext_space-category-btn'))
+    if(buttons.length !== SPACE_CATEGORIES.length) return true
+
+    return SPACE_CATEGORIES.some(category => {
+        const button = host.querySelector(`.mb-ext_space-category-btn[data-category="${category}"]`)
+        if(!button) return true
+
+        const isActive = category === activeCategory
+        return button.dataset.active !== (isActive ? 'true' : 'false')
+    })
+}
+
+function scheduleSpaceClassificationControls(delay = 150) {
+    if(spaceClassificationPending && delay !== 0) return
+
+    spaceClassificationPending = true
+    clearTimeout(spaceClassificationTimeout)
+    spaceClassificationTimeout = setTimeout(() => {
+        spaceClassificationTimeout = null
+        spaceClassificationPending = false
+        syncSpaceClassificationControls()
+    }, Math.max(0, delay))
+}
+
+function shouldRefreshSpaceAssetNukeControls() {
+    if(getPageType() !== 'space') return false
+
+    const space = resolveCurrentSpaceDescriptor()
+    const main = document.querySelector('#mainContent')
+    const liveTimestampCount = getVisibleSpaceFeedTimestamps().length
+    const storedTimestampCount = Number.parseInt(main?.dataset.mbSpaceFeedTimestampCount || '-1', 10)
+    const liveCardCount = getSpaceFeedCardRoots().length
+    const storedCardCount = Number.parseInt(main?.dataset.mbSpaceFeedCardCount || '-1', 10)
+    const storedEntryCount = Number.parseInt(main?.dataset.mbSpaceFeedEntryCount || '-1', 10)
+    const hasStatusButton = !!document.querySelector('.mb-ext_space-feed-status-btn')
+
+    if(!hasStatusButton) return true
+    if(storedTimestampCount !== liveTimestampCount) return true
+    if(storedCardCount !== liveCardCount) return true
+
+    if(isNukableSpacePage()) {
+        if(storedEntryCount < 0) return true
+        if(storedEntryCount > 0) {
+            if(!document.querySelector('.mb-ext_space-feed-nuke-btn')) return true
+            if(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host').length < storedEntryCount) return true
+        }
+        return false
+    }
+
+    return !!document.querySelector('.mb-ext_space-feed-nuke-host, .mb-ext_space-feed-post-nuke-host')
+}
+
+function resetSpaceAssetNukeControls() {
+    clearTimeout(spaceAssetNukeTimeout)
+    spaceAssetNukeTimeout = null
+    spaceAssetNukePending = false
+}
+
+function scheduleSpaceAssetNukeControls(delay = 180) {
+    if(spaceAssetNukePending && delay !== 0) return
+
+    spaceAssetNukePending = true
+    clearTimeout(spaceAssetNukeTimeout)
+    spaceAssetNukeTimeout = setTimeout(() => {
+        void (async () => {
+            spaceAssetNukeTimeout = null
+            spaceAssetNukePending = false
+            if(getPageType() === 'space') {
+                await refreshOwnedNukeStatusCache()
+            }
+            syncSpaceFeedNukeControls()
+        })()
+    }, Math.max(0, delay))
+}
+
 function getPageType() {
     const params = new URLSearchParams(location.search)
 
@@ -593,11 +838,11 @@ function getPageType() {
     else if(/\/log(?:$|[/?#])/i.test(location.pathname) || /question\slog/i.test(document.title)) {
         return 'question-log'
     }
-    else if(isSpacePostPage()) {
-        return 'space-post'
-    }
     else if(document.querySelector('.puppeteer_test_tribe_info_header')) {
         return 'space'
+    }
+    else if(isSpacePostPage()) {
+        return 'space-post'
     }
     else if(isQuestionPage()) {
         return 'question'
@@ -643,6 +888,10 @@ function isQuestionPage() {
 }
 
 function isSpacePostPage() {
+    if(document.querySelector('.puppeteer_test_tribe_info_header')) {
+        return false
+    }
+
     const hasTimestamp = !!document.querySelector('a.post_timestamp, .post_timestamp')
     if(!hasTimestamp) return false
 
@@ -1218,12 +1467,13 @@ function syncActiveProfileModal(modal = getProfilePeopleModal()) {
 }
 
 function getModalItemProfileHref(item) {
-    return item?.querySelector('a[href*="/profile/"]')?.href || null
+    return normalizeQuoraProfileHref(item?.querySelector('a[href*="/profile/"]')?.href || '') || null
 }
 
 function isModalItemHandled(item) {
     const href = getModalItemProfileHref(item)
-    return item?.dataset?.mbOpened === 'true' || (!!href && handledModalProfileUrls.has(href))
+    const identityKey = getNormalizedProfileIdentityKey(href)
+    return item?.dataset?.mbOpened === 'true' || (!!identityKey && handledModalProfileUrls.has(identityKey))
 }
 
 function getUnhandledProfileModalItems(modal = getProfilePeopleModal()) {
@@ -1234,8 +1484,9 @@ function getUnhandledProfileModalItems(modal = getProfilePeopleModal()) {
 function markModalItemsHandled(items, backgroundColor = '#d4edda') {
     for(const item of items) {
         const href = getModalItemProfileHref(item)
+        const identityKey = getNormalizedProfileIdentityKey(href)
         item.dataset.mbOpened = true
-        if(href) handledModalProfileUrls.add(href)
+        if(identityKey) handledModalProfileUrls.add(identityKey)
         item.style.backgroundColor = backgroundColor
     }
 }
@@ -1372,14 +1623,16 @@ function getMuteConfirmAction() {
     if(buttons.length) return buttons[0].button
 
     const container = getMuteConfirmContainer()
-    if(!container) return null
+    if(container) {
+        const containerButtons = getVisibleActionButtons(container)
+            .filter(button => /\bconfirm\b/i.test(getElementText(button)))
+            .map(button => ({button, score: scoreActionCandidate(button, /\bconfirm\b/i, getElementText(container)) + 500}))
 
-    const containerButtons = getVisibleActionButtons(container)
-        .filter(button => /\bconfirm\b/i.test(getElementText(button)))
-        .map(button => ({button, score: scoreActionCandidate(button, /\bconfirm\b/i, getElementText(container)) + 500}))
+        containerButtons.sort((left, right) => right.score - left.score)
+        if(containerButtons.length) return containerButtons[0].button
+    }
 
-    containerButtons.sort((left, right) => right.score - left.score)
-    return containerButtons[0]?.button || null
+    return getDialogPrimaryAction(getDialogRoots(), /\bconfirm\b|\bmute\b/i)
 }
 
 function isMuteConfirmPending() {
@@ -1435,14 +1688,16 @@ function getBlockConfirmAction() {
     if(buttons.length) return buttons[0].button
 
     const container = getBlockConfirmContainer()
-    if(!container) return null
+    if(container) {
+        const containerButtons = getVisibleActionButtons(container)
+            .filter(button => /\bblock\b/i.test(getElementText(button)))
+            .map(button => ({button, score: scoreActionCandidate(button, /\bblock\b/i, getElementText(container)) + 500}))
 
-    const containerButtons = getVisibleActionButtons(container)
-        .filter(button => /\bblock\b/i.test(getElementText(button)))
-        .map(button => ({button, score: scoreActionCandidate(button, /\bblock\b/i, getElementText(container)) + 500}))
+        containerButtons.sort((left, right) => right.score - left.score)
+        if(containerButtons.length) return containerButtons[0].button
+    }
 
-    containerButtons.sort((left, right) => right.score - left.score)
-    return containerButtons[0]?.button || null
+    return getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b/i)
 }
 
 function isBlockConfirmPending() {
@@ -1737,7 +1992,10 @@ function scheduleBlockedProfileCloseChecks(delays = [0, 100, 250, 500, 1000, 200
             if(getPageType() !== 'profile') return
 
             if(isProfileBlocked()) {
-                void requestCloseTab(1, 0, false)
+                void (async () => {
+                    await confirmCurrentProfileBlockedSpaceFeedEntries()
+                    await requestCloseTab(1, 0, false)
+                })()
                 return
             }
 
@@ -1746,7 +2004,8 @@ function scheduleBlockedProfileCloseChecks(delays = [0, 100, 250, 500, 1000, 200
                     const menuBlocked = await readProfileMenuState(/\bblock\b/i, /\bunblock\b/i, 700, 100)
                     if(menuBlocked === 'inverse') {
                         rememberProfileBlocked()
-                        void requestCloseTab(1, 0, false)
+                        await confirmCurrentProfileBlockedSpaceFeedEntries()
+                        await requestCloseTab(1, 0, false)
                     }
                 })()
             }
@@ -1854,6 +2113,7 @@ function injectCloseTabBtn() {
     btn = document.createElement('button')
     btn.innerText = 'Close tab'
     btn.classList.add('mb-ext_close-tab-btn')
+    setMuteBlockHelp(btn, 'Close this tab')
 
     bindSinglePressAction(btn, async () => {
         btn.disabled = true
@@ -1887,6 +2147,7 @@ function toggleMuteBlockBtn() {
         let btn = document.createElement('button')
         btn.innerText = 'Mute Block'
         btn.classList.add('mb-ext_mute-block-btn')
+        setMuteBlockHelp(btn, 'Mute and block this profile')
 
         bindSinglePressAction(btn, () => handleMuteBlockClick(btn))
         insertProfileActionButton(btn, target, 'mute-block')
@@ -1909,6 +2170,7 @@ function toggleMuteBlockCloseBtn() {
         let btn = document.createElement('button')
         btn.innerText = 'Mute Block Close'
         btn.classList.add('mb-ext_mute-block-close-btn')
+        setMuteBlockHelp(btn, 'Mute and block this profile, then close the tab')
 
         bindSinglePressAction(btn, () => handleMuteBlockClick(btn, true))
         insertProfileActionButton(btn, target, 'mute-block-close')
@@ -1945,6 +2207,7 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
         }
 
         if(isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
             if(closeAfterSuccess) {
                 button.innerText = 'Closing...'
                 await new Promise(resolve => requestAnimationFrame(resolve))
@@ -1957,6 +2220,10 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
         }
 
         const completed = await muteProfile()
+
+        if(completed || isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
+        }
 
         if(completed && closeAfterSuccess) {
             button.innerText = 'Closing...'
@@ -2026,6 +2293,7 @@ async function injectQuestionPageFOPBtn() {
         anchor.classList.add('mb-ext_find-op-btn')
         anchor.target = '_blank'
         anchor.href = getQuestionOriginalPosterLookupHref()
+        setMuteBlockHelp(anchor, 'Open the original poster profile from the question log')
 
         return anchor
     }
@@ -2096,13 +2364,288 @@ function normalizeQuoraProfileHref(href) {
 
     try {
         const url = new URL(href, location.origin)
-        if(!/^\/profile\/[^/?#]+/i.test(url.pathname)) return null
+        url.search = ''
+        url.hash = ''
+        const pathMatch = url.pathname.match(/^\/profile\/([^/?#]+)(?:\/(followers|following))?\/?$/i)
+        if(!pathMatch?.[1]) return null
 
-        return `${url.origin}${url.pathname.replace(/\/$/, '')}`
+        const slug = pathMatch[1]
+        const decodedSlug = sanitizeProfileHrefSlug(decodeURIComponent(slug))
+        if(!decodedSlug) return null
+        if(/[\/\\?#]/.test(decodedSlug)) return null
+        if(/[\u0000-\u001F\u007F]/.test(decodedSlug)) return null
+
+        return `https://www.quora.com/profile/${encodeURIComponent(decodedSlug)}`
     }
     catch {
         return null
     }
+}
+
+function sanitizeProfileHrefSlug(slug) {
+    let value = `${slug || ''}`.normalize('NFKC').replace(/[?#].*$/g, '').trim()
+    if(!value) return ''
+
+    const cutPatterns = [
+        /-amp-(?:ch|oid|share|srid|target|targ|target-type|type)/i,
+        /-(?:ch|oid|share|srid|target|target_type|type)-/i,
+        /-(?:followers?|following)-/i,
+        /-https?$/i,
+        /-https?-/i,
+        /-(?:followers?|following)$/i
+    ]
+
+    let cutIndex = -1
+    for(const pattern of cutPatterns) {
+        const match = pattern.exec(value)
+        if(!match) continue
+        if(cutIndex === -1 || match.index < cutIndex) {
+            cutIndex = match.index
+        }
+    }
+
+    if(cutIndex >= 0) {
+        value = value.slice(0, cutIndex)
+    }
+
+    return value.replace(/[-_\s]+$/g, '').trim()
+}
+
+function getQuoraProfileSlugData(href) {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    if(!normalizedHref) return null
+
+    try {
+        const url = new URL(normalizedHref)
+        const slug = url.pathname.replace(/^\/profile\//i, '')
+        const decodedSlug = decodeURIComponent(slug)
+        const normalizedSlug = decodedSlug.normalize('NFKC')
+        if(!normalizedSlug) return null
+
+        return {
+            href: normalizedHref,
+            decodedSlug,
+            normalizedSlug
+        }
+    }
+    catch {
+        return null
+    }
+}
+
+function getNormalizedProfileIdentityKey(href) {
+    const slugData = getQuoraProfileSlugData(href)
+    if(!slugData) return ''
+
+    return slugData.normalizedSlug.toLocaleLowerCase()
+}
+
+function getNormalizedProfileHrefList(urls) {
+    const normalizedUrls = []
+    const seen = new Set()
+
+    for(const url of urls || []) {
+        const normalized = normalizeQuoraProfileHref(url)
+        const identityKey = getNormalizedProfileIdentityKey(normalized)
+        if(!normalized || !identityKey || seen.has(identityKey)) continue
+
+        seen.add(identityKey)
+        normalizedUrls.push(normalized)
+    }
+
+    return normalizedUrls
+}
+
+function normalizeQuoraPostHref(href) {
+    if(!href) return null
+
+    try {
+        const url = new URL(href, location.origin)
+        url.hash = ''
+
+        const pathname = url.pathname.replace(/\/$/, '')
+        if(!pathname || pathname === '/') return null
+
+        const oid = url.searchParams.get('oid')
+        return oid ? `${url.origin}${pathname}?oid=${oid}` : `${url.origin}${pathname}`
+    }
+    catch {
+        return null
+    }
+}
+
+function getProfileUrlsFromText(text) {
+    const urls = []
+    const seen = new Set()
+    const matches = `${text || ''}`.matchAll(/https?:\/\/www\.quora\.com\/profile\/[^\s<>"'`)\]]+/gi)
+
+    for(const match of matches) {
+        const rawHref = `${match?.[0] || ''}`.replace(/[),.;:!?]+$/g, '')
+        const href = normalizeQuoraProfileHref(rawHref)
+        if(!href || seen.has(href)) continue
+
+        seen.add(href)
+        urls.push(href)
+    }
+
+    return urls
+}
+
+function normalizeRememberedProfileDisplayName(label) {
+    const normalizedLabel = `${label || ''}`.replace(/\s+/g, ' ').trim()
+    if(!normalizedLabel) return ''
+
+    const embeddedProfileMatch = normalizedLabel.match(/https?:\/\/www\.quora\.com\/profile\/[^\s<>"'`)\]]+/i)
+    if(embeddedProfileMatch?.[0]) {
+        const href = normalizeQuoraProfileHref(embeddedProfileMatch[0].replace(/[),.;:!?]+$/g, ''))
+        const slugData = getQuoraProfileSlugData(href)
+        if(slugData?.normalizedSlug) {
+            return sanitizeProfileDisplaySlug(slugData.normalizedSlug)
+        }
+    }
+
+    if(/^https?:\/\//i.test(normalizedLabel)) return ''
+
+    const cleanedLabel = normalizedLabel
+        .replace(/^(?:quora|profile)\s+/i, '')
+        .replace(/(?:[-_\s]+)(?:followers?|following)$/i, '')
+        .trim()
+
+    if(!cleanedLabel) return ''
+    if(/^(?:quora|profile|followers?|following)$/i.test(cleanedLabel)) return ''
+
+    return cleanedLabel
+}
+
+function rememberProfileDisplayName(href, label) {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    const normalizedLabel = normalizeRememberedProfileDisplayName(label)
+    if(!normalizedHref || !normalizedLabel) return
+
+    profileDisplayNamesByHref[normalizedHref] = normalizedLabel
+}
+
+function rememberVisibleProfileDisplayNames(root) {
+    if(!root) return
+
+    for(const link of Array.from(root.querySelectorAll('a[href*="/profile/"]'))) {
+        const label = getElementText(link)
+        if(!label) continue
+
+        rememberProfileDisplayName(link.href, label)
+    }
+}
+
+function getTrailingTitleNameCandidate(text) {
+    const normalized = `${text || ''}`.replace(/\s+/g, ' ').trim()
+    if(!normalized) return ''
+
+    const patterns = [
+        /[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})$/,
+        /[.?!]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})$/
+    ]
+
+    for(const pattern of patterns) {
+        const match = normalized.match(pattern)
+        if(match?.[1]) return match[1].trim()
+    }
+
+    return ''
+}
+
+function getProfileSlugText(href) {
+    const slugData = getQuoraProfileSlugData(href)
+    if(!slugData) return ''
+
+    const cleanSlug = sanitizeProfileDisplaySlug(slugData.normalizedSlug)
+
+    return cleanSlug.replace(/-/g, ' ').toLocaleLowerCase()
+}
+
+function getProfileDisplayName(href) {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    const cachedName = normalizedHref ? profileDisplayNamesByHref[normalizedHref] : ''
+    if(cachedName) return cachedName
+
+    const slugData = getQuoraProfileSlugData(href)
+    if(!slugData) return ''
+
+    const cleanSlug = sanitizeProfileDisplaySlug(slugData.normalizedSlug)
+
+    return cleanSlug
+}
+
+function sanitizeProfileDisplaySlug(slug) {
+    return sanitizeProfileHrefSlug(
+        `${slug || ''}`
+            .replace(/(?:^|[-_\s])(?:ch|oid|share|srid|target_type)=.*$/i, '')
+            .replace(/(?:[-_\s])(?:https?|amp|ch|oid|share|srid|target|target_type|type)(?:[-_\s].*)?$/i, '')
+    )
+}
+
+function buildNukeTargetsHelpText(baseText, urls) {
+    const uniqueNames = []
+    const seenNames = new Set()
+
+    for(const url of urls || []) {
+        const name = getProfileDisplayName(url)
+        if(!name) continue
+
+        const key = name.toLowerCase()
+        if(seenNames.has(key)) continue
+        seenNames.add(key)
+        uniqueNames.push(name)
+    }
+
+    if(!uniqueNames.length) return baseText
+
+    const previewNames = uniqueNames.map(name => `- ${name}`)
+
+    return [
+        baseText,
+        '',
+        'Will nuke:',
+        ...previewNames
+    ].join('\n')
+}
+
+function getNearbyProfileUrlsForName(postRoot, nameCandidate, excludedHref = '') {
+    if(!postRoot || !nameCandidate) return []
+
+    const candidate = nameCandidate.toLowerCase()
+    const scopes = []
+
+    for(const nextScope of [
+        postRoot.parentElement,
+        postRoot.closest('.dom_annotate_multifeed_bundle_TribeContentBundle'),
+        postRoot.closest('.dom_annotate_multifeed_tribe_top_items'),
+        getSpaceFeedContentRoot()
+    ]) {
+        if(nextScope && !scopes.includes(nextScope)) {
+            scopes.push(nextScope)
+        }
+    }
+
+    for(const scope of scopes) {
+        const matches = []
+        const seen = new Set()
+
+        for(const link of Array.from(scope.querySelectorAll('a[href*="/profile/"]'))) {
+            const href = normalizeQuoraProfileHref(link.href)
+            if(!href || href === excludedHref || seen.has(href)) continue
+
+            const linkText = getElementText(link).toLowerCase()
+            const slugText = getProfileSlugText(href)
+            if(!linkText.includes(candidate) && !slugText.includes(candidate)) continue
+
+            seen.add(href)
+            matches.push(href)
+        }
+
+        if(matches.length === 1) return matches
+    }
+
+    return []
 }
 
 function getOriginalPosterProfileHrefFromInlineData() {
@@ -2553,7 +3096,7 @@ function getSpacePostListedProfileLinks() {
 
 function setSpacePostNukeUrls(button, urls) {
     if(!button) return
-    button.dataset.mbNukeUrls = JSON.stringify(urls || [])
+    button.dataset.mbNukeUrls = JSON.stringify(getNormalizedProfileHrefList(urls))
 }
 
 function getSpacePostNukeUrls(button) {
@@ -2561,7 +3104,7 @@ function getSpacePostNukeUrls(button) {
 
     try {
         const urls = JSON.parse(button.dataset.mbNukeUrls || '[]')
-        return Array.isArray(urls) ? urls : []
+        return Array.isArray(urls) ? getNormalizedProfileHrefList(urls) : []
     }
     catch {
         return []
@@ -2640,6 +3183,7 @@ function injectSpacePostNukeBtn() {
         btn = document.createElement('button')
         btn.innerText = `Nuke 'Em`
         btn.classList.add('mb-ext_nuke-profiles-btn', 'mb-ext_post-nuke-btn')
+        setMuteBlockHelp(btn, buildNukeTargetsHelpText('Queue detected profiles from this post for mute and block', urls))
         btn.addEventListener('click', async () => {
             const liveUrls = getSpacePostListedProfileLinks()
             const currentUrls = liveUrls.length ? liveUrls : getSpacePostNukeUrls(btn)
@@ -2683,6 +3227,7 @@ function injectSpacePostNukeBtn() {
     }
 
     setSpacePostNukeUrls(btn, urls)
+    setMuteBlockHelp(btn, buildNukeTargetsHelpText('Queue detected profiles from this post for mute and block', urls))
     host.classList.add('mb-ext_post-header-host', 'mb-ext_post-nuke-slot')
 
     if(btn.parentElement !== host) {
@@ -2704,6 +3249,7 @@ function injectSpaceSidebarOpenProfilesBtn() {
         let btn = document.createElement('button')
         btn.innerText = 'View Contributors'
         btn.classList.add('mb-ext_open-profiles-btn', 'mb-ext_view-contributors-btn')
+        setMuteBlockHelp(btn, 'Open the contributor list for this space')
         btn.addEventListener('click', () => viewLink.click())
 
         viewLink.insertAdjacentElement('afterend', btn)
@@ -2724,6 +3270,7 @@ function injectSpaceSidebarOpenProfilesBtn() {
         </svg>`
 
         btn.classList.add('mb-ext_open-profiles-btn')
+        setMuteBlockHelp(btn, 'Open listed contributor profiles in background tabs')
         btn.addEventListener('click', e => {
             let items = document.querySelectorAll('.tribe_page_header_people_list_item:not([data-mb-opened])')
 
@@ -2739,6 +3286,1379 @@ function injectSpaceSidebarOpenProfilesBtn() {
 
         qbox.insertAdjacentElement('afterend', btn)
     }
+}
+
+function getSpaceHeaderContainer() {
+    return document.querySelector('.puppeteer_test_tribe_info_header')
+}
+
+function getSpaceHeaderTitleRow(header = getSpaceHeaderContainer()) {
+    if(!header) return null
+
+    const title = header.querySelector('.puppeteer_test_tribe_name')
+    if(!title) return null
+
+    return title.closest('.q-flex') || title.closest('div')
+}
+
+function getSpaceHeaderTitleAnchor(header = getSpaceHeaderContainer()) {
+    if(!header) return null
+    return header.querySelector('.puppeteer_test_tribe_name')?.closest('span, div, a') || null
+}
+
+function getSpaceHeaderOuterRow(header = getSpaceHeaderContainer()) {
+    if(!header) return null
+    return header.querySelector('#mainContent')?.parentElement || null
+}
+
+function resolveCurrentSpaceDescriptor() {
+    const header = getSpaceHeaderContainer()
+    if(!header) return null
+
+    const url = normalizeSpaceUrl(getDocumentCanonicalUrl(document))
+    if(!url) return null
+
+    return {
+        key: `quora-space:${url}`,
+        url,
+        slug: extractSpaceSlug(url),
+        name: getSpaceName(document, header)
+    }
+}
+
+function getStoredSpaceCategory(space) {
+    if(!space?.key) return ''
+    return normalizeSpaceCategory(spaceRegistry?.[space.key]?.category)
+}
+
+function getSpaceCategoryForButtonState(category, activeCategory) {
+    if(activeCategory) return category === activeCategory ? 'active' : 'inactive'
+    return category === 'neutral' ? 'active' : 'inactive'
+}
+
+function getSpaceCategoryHelpText(category) {
+    if(category === 'asset') return "Posts here may be scanned for Nuke 'Em candidates"
+    if(category === 'neutral') return 'Treat this space as neutral'
+    if(category === 'target') return 'Consider this space hostile'
+    return 'Set Mute Block space classification'
+}
+
+function syncSpaceClassificationControls() {
+    const header = getSpaceHeaderContainer()
+    const space = resolveCurrentSpaceDescriptor()
+    if(!header || !space) return false
+
+    let host = header.querySelector('.mb-ext_space-category-host')
+    if(!host) {
+        host = document.createElement('div')
+        host.className = 'mb-ext_space-category-host'
+    }
+
+    const titleRow = getSpaceHeaderTitleRow(header)
+    const outerRow = getSpaceHeaderOuterRow(header)
+    if(titleRow && outerRow) {
+        if(host.parentElement !== header) {
+            header.appendChild(host)
+        }
+
+        const titleRowRect = titleRow.getBoundingClientRect()
+        const outerRowRect = outerRow.getBoundingClientRect()
+        const headerRect = header.getBoundingClientRect()
+        const topOffset = Math.max(0, Math.round(titleRowRect.top - headerRect.top))
+        const rightOffset = Math.max(0, Math.round(headerRect.right - outerRowRect.right))
+
+        host.style.top = `${topOffset}px`
+        host.style.right = `${rightOffset}px`
+    }
+    else if(host.parentElement !== header) {
+        header.appendChild(host)
+        host.style.top = ''
+        host.style.right = ''
+    }
+
+    const activeCategory = getStoredSpaceCategory(space)
+    let segmented = host.querySelector('.mb-ext_space-category-segmented')
+    if(!segmented) {
+        segmented = document.createElement('div')
+        segmented.className = 'mb-ext_space-category-segmented'
+        host.appendChild(segmented)
+    }
+
+    const buttons = Array.from(segmented.querySelectorAll('.mb-ext_space-category-btn'))
+    const alreadySynced = host.dataset.mbSpaceKey === space.key &&
+        (host.dataset.mbSpaceCategory || '') === activeCategory &&
+        buttons.length === SPACE_CATEGORIES.length &&
+        SPACE_CATEGORIES.every(category => {
+            const button = segmented.querySelector(`.mb-ext_space-category-btn[data-category="${category}"]`)
+            if(!button) return false
+
+            const isActive = category === activeCategory
+            return button.dataset.active === (isActive ? 'true' : 'false') &&
+                button.getAttribute('aria-pressed') === (isActive ? 'true' : 'false') &&
+                button.textContent === getSpaceCategoryLongLabel(category)
+        })
+
+    if(alreadySynced) {
+        return true
+    }
+
+    host.dataset.mbSpaceKey = space.key
+    host.dataset.mbSpaceCategory = activeCategory
+
+    for(const category of SPACE_CATEGORIES) {
+        let button = segmented.querySelector(`.mb-ext_space-category-btn[data-category="${category}"]`)
+        const visualState = getSpaceCategoryForButtonState(category, activeCategory)
+        const isActive = visualState === 'active'
+
+        if(!button) {
+            button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'mb-ext_space-category-btn'
+            button.dataset.category = category
+            button.addEventListener('click', () => {
+                const currentSpace = resolveCurrentSpaceDescriptor()
+                if(currentSpace) {
+                    void setCurrentSpaceCategory(currentSpace, category)
+                }
+            })
+            segmented.appendChild(button)
+        }
+
+        button.dataset.active = isActive ? 'true' : 'false'
+        button.dataset.visualState = visualState
+        button.setAttribute('aria-pressed', isActive ? 'true' : 'false')
+        button.textContent = getSpaceCategoryLongLabel(category)
+        button.classList.toggle('mb-ext_space-category-btn--active', isActive)
+        setMuteBlockHelp(button, getSpaceCategoryHelpText(category))
+    }
+
+    for(const button of Array.from(segmented.querySelectorAll('.mb-ext_space-category-btn'))) {
+        if(!SPACE_CATEGORIES.includes(button.dataset.category)) {
+            button.remove()
+        }
+    }
+
+    return true
+}
+
+async function setCurrentSpaceCategory(space, category) {
+    const nextRecord = buildSpaceRecord(space, category, spaceRegistry?.[space.key] || null)
+    if(!nextRecord) return
+
+    spaceRegistry = {
+        ...spaceRegistry,
+        [space.key]: nextRecord
+    }
+
+    syncSpaceClassificationControls()
+    scheduleSpaceAssetNukeControls(0)
+    await safeStorageSet({[SPACE_REGISTRY_KEY]: spaceRegistry})
+}
+
+function getClosestCommonAncestor(nodes) {
+    const elements = (Array.isArray(nodes) ? nodes : []).filter(node => node?.nodeType === Node.ELEMENT_NODE)
+    if(!elements.length) return null
+    if(elements.length === 1) return elements[0]?.parentElement || null
+
+    const path = []
+    let node = elements[0]
+    while(node) {
+        path.push(node)
+        node = node.parentElement
+    }
+
+    return path.find(candidate => elements.every(element => candidate.contains(element))) || null
+}
+
+function isAssetSpacePage() {
+    const space = resolveCurrentSpaceDescriptor()
+    return getStoredSpaceCategory(space) === 'asset'
+}
+
+function isTargetSpacePage() {
+    const space = resolveCurrentSpaceDescriptor()
+    return getStoredSpaceCategory(space) === 'target'
+}
+
+function isNukableSpacePage() {
+    return isAssetSpacePage() || isTargetSpacePage()
+}
+
+function getPostActionLabel(candidate) {
+    if(!candidate) return ''
+    return `${candidate.getAttribute?.('aria-label') || ''} ${getElementText(candidate)}`.replace(/\s+/g, ' ').trim()
+}
+
+function isSpaceFeedActionLabel(label) {
+    return /(?:^|\s)(?:upvote|comment|share|save)(?:\s|$)/i.test(label || '')
+}
+
+function getSpaceFeedTabButtons() {
+    const root = document.querySelector('#mainContent, main, [role="main"]') || document
+    const tabs = Array.from(root.querySelectorAll('[role="tab"]'))
+    const matched = tabs.filter(tab => /^(?:about|posts|questions)$/i.test(getElementText(tab)) || /^(?:about|main|questions)$/i.test(tab.id || ''))
+
+    matched.sort((left, right) => {
+        const leftRect = left.getBoundingClientRect()
+        const rightRect = right.getBoundingClientRect()
+        return leftRect.top - rightRect.top || leftRect.left - rightRect.left
+    })
+
+    return matched
+}
+
+function getSpaceFeedTabRow() {
+    const explicitRow = document.querySelector('#mainContent .q-box.qu-overflowX--hidden.qu-whiteSpace--nowrap')
+    if(explicitRow) return explicitRow
+
+    const tabs = getSpaceFeedTabButtons()
+    if(tabs.length < 2) return null
+
+    return tabs[0].closest('[role="tablist"]') || getClosestCommonAncestor(tabs) || null
+}
+
+function getSpaceFeedBar() {
+    const row = getSpaceFeedTabRow()
+    if(!row) return null
+
+    const bar = row.closest('.q-box.qu-mb--small.qu-borderBottom.qu-borderColor--darken') || row
+    bar.classList.add('mb-ext_space-feed-tab-bar')
+    return bar
+}
+
+function getSpaceFeedTopButtonHost() {
+    const bar = getSpaceFeedBar()
+    if(!bar) return null
+
+    let host = bar.querySelector(':scope > .mb-ext_space-feed-nuke-host')
+    if(host) return host
+
+    host = document.createElement('div')
+    host.className = 'mb-ext_space-feed-nuke-host'
+    bar.appendChild(host)
+    return host
+}
+
+function getSpaceFeedStatusHost() {
+    const bar = getSpaceFeedBar()
+    if(!bar) return null
+
+    let host = bar.querySelector(':scope > .mb-ext_space-feed-status-host')
+    if(host) return host
+
+    host = document.createElement('div')
+    host.className = 'mb-ext_space-feed-status-host'
+    bar.appendChild(host)
+    return host
+}
+
+function getSpaceFeedContentRoot() {
+    return document.querySelector('main, [role="main"], #mainContent') || document.body
+}
+
+function getVisibleSpaceFeedTimestamps() {
+    const timestamps = Array.from(document.querySelectorAll('a.post_timestamp'))
+
+    timestamps.sort((left, right) => {
+        const leftRect = left.getBoundingClientRect()
+        const rightRect = right.getBoundingClientRect()
+        return leftRect.top - rightRect.top || leftRect.left - rightRect.left
+    })
+
+    return timestamps
+}
+
+function isSpaceFeedRootCandidate(node, timestamp) {
+    if(!node || node.nodeType !== Node.ELEMENT_NODE) return false
+
+    const timestamps = Array.from(node.querySelectorAll('a.post_timestamp'))
+    return timestamps.length === 1 && timestamps[0] === timestamp
+}
+
+function getSpaceFeedPreferredRoot(timestamp) {
+    if(!timestamp) return null
+
+    return timestamp.closest('.puppeteer_test_tribe_post_item_feed_story, .dom_annotate_multifeed_bundle_TribeContentBundle, article, [role="article"]')
+}
+
+function getSpaceFeedCardRoots() {
+    const root = getSpaceFeedContentRoot()
+    if(!root) return []
+
+    const roots = []
+    const seen = new Set()
+
+    for(const timestamp of getVisibleSpaceFeedTimestamps()) {
+        let matched = getSpaceFeedPreferredRoot(timestamp)
+        let node = timestamp.parentElement
+
+        while(node && node !== root) {
+            if(isSpaceFeedRootCandidate(node, timestamp)) {
+                matched = node
+            }
+
+            node = node.parentElement
+        }
+
+        if(!matched) {
+            const directCard = timestamp.closest('.q-click-wrapper, article, [role="article"], .q-box')
+            if(isSpaceFeedRootCandidate(directCard, timestamp)) {
+                matched = directCard
+            }
+        }
+
+        if(matched && !seen.has(matched)) {
+            seen.add(matched)
+            roots.push(matched)
+        }
+    }
+
+    return roots
+}
+
+function getSpaceFeedPostRoot(timestamp) {
+    if(!timestamp) return null
+
+    return getSpaceFeedCardRoots().find(root => root.querySelector('a.post_timestamp') === timestamp) || null
+}
+
+function getSpaceFeedPostUrl(timestamp) {
+    return normalizeQuoraPostHref(timestamp?.href || '')
+}
+
+function getSpaceFeedPostKey(postRoot, timestamp) {
+    const postUrl = getSpaceFeedPostUrl(timestamp)
+    if(postUrl) return `space-post:${postUrl}`
+
+    const snippet = getElementText(postRoot).replace(/\s+/g, ' ').trim().slice(0, 120)
+    if(!snippet) return ''
+
+    return `space-post-text:${snippet.toLowerCase()}`
+}
+
+function getSpaceFeedPostHeaderProfileHref(postRoot, timestamp) {
+    if(!postRoot) return null
+
+    const timestampNode = timestamp || postRoot.querySelector('a.post_timestamp')
+    const profileLinks = Array.from(postRoot.querySelectorAll('a[href*="/profile/"]')).filter(isVisible)
+
+    let headerProfileHref = null
+
+    for(const link of profileLinks) {
+        const href = normalizeQuoraProfileHref(link.href)
+        if(!href) continue
+        rememberProfileDisplayName(href, getElementText(link))
+
+        if(timestampNode && (link.compareDocumentPosition(timestampNode) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+            headerProfileHref = href
+        }
+    }
+
+    return headerProfileHref || normalizeQuoraProfileHref(profileLinks[0]?.href) || null
+}
+
+function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
+    if(!postRoot) return []
+
+    const urls = []
+    const seen = new Set()
+    const timestamps = []
+    const posterScopeSelector =
+        '.standalone_featurable,' +
+        '[data-is-quora-embed="true"],' +
+        '[data-type="hyperlink_embed"],' +
+        '.puppeteer_test_tribe_post_item_feed_story,' +
+        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
+        'article,' +
+        '[role="article"],' +
+        '.q-box'
+    const addPosterHref = href => {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref || seen.has(normalizedHref)) return
+
+        seen.add(normalizedHref)
+        urls.push(normalizedHref)
+    }
+    const addPosterScope = (scope, scopes) => {
+        if(!(scope instanceof Element) || !postRoot.contains(scope) || scopes.includes(scope)) return
+        scopes.push(scope)
+    }
+    const addTimestamp = candidate => {
+        if(candidate instanceof Element && candidate.matches('a.post_timestamp') && !timestamps.includes(candidate)) {
+            timestamps.push(candidate)
+        }
+    }
+
+    addTimestamp(timestamp)
+
+    for(const candidate of Array.from(postRoot.querySelectorAll('a.post_timestamp'))) {
+        addTimestamp(candidate)
+    }
+
+    for(const currentTimestamp of timestamps) {
+        const scopes = []
+        let scope = currentTimestamp.closest(posterScopeSelector) || currentTimestamp.parentElement
+
+        while(scope && scope !== postRoot) {
+            addPosterScope(scope, scopes)
+            scope = scope.parentElement
+        }
+
+        addPosterScope(postRoot, scopes)
+
+        for(const candidateScope of scopes) {
+            addPosterHref(getSpaceFeedPostHeaderProfileHref(candidateScope, currentTimestamp))
+        }
+    }
+
+    if(!urls.length) {
+        const profileLinks = Array.from(postRoot.querySelectorAll('a[href*="/profile/"]')).filter(isVisible)
+
+        for(const currentTimestamp of timestamps) {
+            for(const link of profileLinks) {
+                const href = normalizeQuoraProfileHref(link.href)
+                if(!href) continue
+
+                rememberProfileDisplayName(href, getElementText(link))
+                if(currentTimestamp && !(link.compareDocumentPosition(currentTimestamp) & Node.DOCUMENT_POSITION_FOLLOWING)) continue
+
+                addPosterHref(href)
+            }
+        }
+    }
+
+    return urls
+}
+
+function getSpaceFeedEmbeddedPosterProfileUrls(postRoot) {
+    if(!postRoot) return []
+
+    const urls = []
+    const seen = new Set()
+    const posterScopeSelector =
+        '.standalone_featurable,' +
+        '[data-is-quora-embed="true"],' +
+        '[data-type="hyperlink_embed"],' +
+        '.puppeteer_test_tribe_post_item_feed_story,' +
+        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
+        'article,' +
+        '[role="article"],' +
+        '.q-box'
+    const embedRoots = []
+    const addEmbedRoot = root => {
+        if(!(root instanceof Element) || !postRoot.contains(root) || embedRoots.includes(root)) return
+        embedRoots.push(root)
+    }
+    const addPosterHref = href => {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref || seen.has(normalizedHref)) return
+
+        seen.add(normalizedHref)
+        urls.push(normalizedHref)
+    }
+
+    for(const embed of Array.from(postRoot.querySelectorAll(
+        '.standalone_featurable[data-is-quora-embed="true"],' +
+        '[data-type="hyperlink_embed"],' +
+        'a[href^="https://qr.ae/"]'
+    ))) {
+        addEmbedRoot(embed.closest('.standalone_featurable, [data-is-quora-embed="true"], [data-type="hyperlink_embed"]') || embed)
+    }
+
+    for(const embedRoot of embedRoots) {
+        let scope = embedRoot.closest(posterScopeSelector) || embedRoot.parentElement
+        const scopes = []
+
+        while(scope && scope !== postRoot) {
+            if(postRoot.contains(scope) && !scopes.includes(scope)) {
+                scopes.push(scope)
+            }
+            scope = scope.parentElement
+        }
+
+        if(!scopes.includes(postRoot)) {
+            scopes.push(postRoot)
+        }
+
+        for(const candidateScope of scopes) {
+            addPosterHref(getSpaceFeedPostHeaderProfileHref(candidateScope, embedRoot))
+        }
+    }
+
+    return urls
+}
+
+function getSpaceFeedPostContentScopes(postRoot) {
+    if(!postRoot) return []
+
+    const scopes = []
+    const addScope = scope => {
+        if(scope && !scopes.includes(scope)) {
+            scopes.push(scope)
+        }
+    }
+
+    for(const scope of Array.from(postRoot.querySelectorAll(
+        '.standalone_featurable,' +
+        '[data-is-quora-embed="true"],' +
+        '[data-type="hyperlink_embed"],' +
+        '.qu-userSelect--text,' +
+        '.doc,' +
+        '.qtext_para'
+    ))) {
+        addScope(scope)
+    }
+
+    if(!scopes.length) {
+        addScope(postRoot)
+    }
+
+    return scopes
+}
+
+function isSpaceFeedCandidateProfileLink(link, postRoot) {
+    if(!link || !postRoot || !isVisible(link)) return false
+    if(!normalizeQuoraProfileHref(link.href)) return false
+
+    if(link.closest(
+        '.mb-ext_space-feed-post-nuke-host,' +
+        '.comment_and_ad_container,' +
+        '[role="button"],' +
+        'button'
+    )) {
+        return false
+    }
+
+    const actionLabel = getPostActionLabel(link)
+    if(/\b(comment|share|upvote|downvote|more)\b/i.test(actionLabel)) {
+        return false
+    }
+
+    return postRoot.contains(link)
+}
+
+function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
+    if(!postRoot) return []
+    rememberVisibleProfileDisplayNames(postRoot)
+
+    const headerProfileHref = getSpaceFeedPostHeaderProfileHref(postRoot, timestamp)
+    const posterProfileUrls = getSpaceFeedPosterProfileUrls(postRoot, timestamp)
+    const sharedPosterUrls = posterProfileUrls.filter(href => href !== headerProfileHref)
+    if(isTargetSpacePage()) {
+        return posterProfileUrls
+    }
+    if(isAssetSpacePage() && sharedPosterUrls.length) {
+        return sharedPosterUrls
+    }
+
+    const urls = []
+    const seen = new Set()
+
+    for(const scope of getSpaceFeedPostContentScopes(postRoot)) {
+        for(const link of Array.from(scope.querySelectorAll('a[href*="/profile/"]'))) {
+            if(!isSpaceFeedCandidateProfileLink(link, postRoot)) continue
+
+            const href = normalizeQuoraProfileHref(link.href)
+            if(!href || href === headerProfileHref || seen.has(href)) continue
+
+            seen.add(href)
+            urls.push(href)
+        }
+    }
+
+    const fallbackUrls = [
+        ...getSpaceFeedPostContentScopes(postRoot).flatMap(scope => getProfileUrlsFromText(getElementText(scope)))
+    ]
+
+    for(const href of fallbackUrls) {
+        if(!href || href === headerProfileHref || seen.has(href)) continue
+
+        seen.add(href)
+        urls.push(href)
+    }
+
+    if(!urls.length) {
+        const titleAnchor = postRoot.querySelector('.qu-fontWeight--bold a[href], a.post_timestamp')
+        const titleNameCandidate = getTrailingTitleNameCandidate(getElementText(titleAnchor) || getElementText(postRoot))
+
+        for(const href of getNearbyProfileUrlsForName(postRoot, titleNameCandidate, headerProfileHref)) {
+            if(!href || seen.has(href)) continue
+
+            seen.add(href)
+            urls.push(href)
+        }
+    }
+
+    return urls
+}
+
+function isSpaceFeedPostNuked(postKey) {
+    return !!(postKey && spaceNukedPosts?.[postKey])
+}
+
+function isSpaceFeedPostNuking(postKey) {
+    return !!(postKey && spaceFeedNukingPostKeys.has(postKey))
+}
+
+function isSpaceFeedPostPending(postKey) {
+    if(!postKey) return false
+
+    const record = spacePendingNukedPosts?.[postKey]
+    if(!record) return false
+
+    const remainingUrls = Array.isArray(record.remainingUrls)
+        ? record.remainingUrls
+        : Array.isArray(record.allUrls)
+            ? record.allUrls
+            : Array.isArray(record.urls)
+                ? record.urls
+                : []
+
+    return remainingUrls.length > 0
+}
+
+function isSpaceFeedPostBusy(postKey) {
+    return isSpaceFeedPostNuking(postKey) || isSpaceFeedPostPending(postKey)
+}
+
+function getStoredSpaceFeedRecordUrls(record, preferredKey = 'remainingUrls') {
+    if(!record || typeof record !== 'object') return []
+
+    const urls = preferredKey === 'allUrls'
+        ? Array.isArray(record.allUrls)
+            ? record.allUrls
+            : Array.isArray(record.urls)
+                ? record.urls
+                : []
+        : Array.isArray(record.remainingUrls)
+            ? record.remainingUrls
+            : Array.isArray(record.allUrls)
+                ? record.allUrls
+                : Array.isArray(record.urls)
+                    ? record.urls
+                    : []
+
+    return getNormalizedProfileHrefList(urls)
+}
+
+function getPendingSpaceFeedUrlSet(postKey) {
+    const record = postKey ? spacePendingNukedPosts?.[postKey] : null
+    return new Set(getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
+}
+
+function getQueueableSpaceFeedEntryUrls(entry) {
+    if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
+
+    const pendingUrls = getPendingSpaceFeedUrlSet(entry.postKey)
+    return getNormalizedProfileHrefList(entry.candidateUrls || []).filter(url => !pendingUrls.has(url))
+}
+
+function getSpaceFeedActionElements(postRoot) {
+    const actions = Array.from(postRoot.querySelectorAll('button, a, [role="button"]'))
+        .filter(candidate => isSpaceFeedActionLabel(getPostActionLabel(candidate)))
+
+    return actions
+}
+
+function getSpaceFeedPostButtonHost(postRoot) {
+    if(!postRoot) return null
+
+    const timestamp = postRoot.querySelector('a.post_timestamp')
+    const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
+    const parent = postRoot
+
+    let host = parent.querySelector(':scope > .mb-ext_space-feed-post-nuke-host')
+    if(host) return host
+
+    host = document.createElement('div')
+    host.className = 'mb-ext_space-feed-post-nuke-host mb-ext_post-nuke-slot'
+    parent.classList.add('mb-ext_post-card')
+
+    if(headerContainer && postRoot.contains(headerContainer)) {
+        headerContainer.classList.add('mb-ext_post-header-host')
+
+        const headerRect = headerContainer.getBoundingClientRect()
+        const parentRect = parent.getBoundingClientRect()
+        const top = Math.max(10, Math.round(headerRect.top - parentRect.top + headerRect.height / 2))
+        host.style.top = `${top}px`
+    }
+
+    parent.appendChild(host)
+    return host
+}
+
+function setSpaceFeedButtonUrls(button, urls) {
+    if(!button) return
+    button.dataset.mbSpaceFeedUrls = JSON.stringify(getNormalizedProfileHrefList(urls))
+}
+
+function getSpaceFeedButtonUrls(button) {
+    if(!button) return []
+
+    try {
+        const urls = JSON.parse(button.dataset.mbSpaceFeedUrls || '[]')
+        return Array.isArray(urls) ? getNormalizedProfileHrefList(urls) : []
+    }
+    catch {
+        return []
+    }
+}
+
+function getSpaceFeedPostEntries() {
+    const entries = []
+    const roots = getSpaceFeedCardRoots()
+    const contentRoot = getSpaceFeedContentRoot()
+
+    for(const postRoot of roots) {
+        const timestamp = postRoot.querySelector('a.post_timestamp')
+        if(!timestamp) continue
+
+        const postKey = getSpaceFeedPostKey(postRoot, timestamp)
+        if(!postKey) continue
+
+        let candidateUrls = getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)
+        let node = postRoot.parentElement
+
+        while(!candidateUrls.length && node && node !== contentRoot) {
+            if(isSpaceFeedRootCandidate(node, timestamp)) {
+                candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
+            }
+
+            node = node.parentElement
+        }
+
+        entries.push({
+            postKey,
+            postRoot,
+            postUrl: getSpaceFeedPostUrl(timestamp),
+            candidateUrls
+        })
+    }
+
+    return entries
+}
+
+function getSpaceFeedDetectionSnapshot(entries = null) {
+    const space = resolveCurrentSpaceDescriptor()
+    const category = getStoredSpaceCategory(space) || 'unset'
+    const timestamps = getVisibleSpaceFeedTimestamps()
+    const documentTimestamps = document.querySelectorAll('a.post_timestamp').length
+    const documentProfiles = document.querySelectorAll('a[href*="/profile/"]').length
+    const cards = getSpaceFeedCardRoots()
+    const nextEntries = Array.isArray(entries) ? entries : getSpaceFeedPostEntries()
+    const actionableEntries = nextEntries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
+    const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
+
+    return {
+        pageType: getPageType() || 'unknown',
+        category,
+        timestamps: timestamps.length,
+        documentTimestamps,
+        documentProfiles,
+        cards: cards.length,
+        entries: nextEntries.length,
+        actionable: actionableEntries.length,
+        pending: pendingEntries.length,
+        topButton: !!document.querySelector('.mb-ext_space-feed-nuke-btn'),
+        postButtons: document.querySelectorAll('.mb-ext_space-feed-post-nuke-btn').length
+    }
+}
+
+function formatSpaceFeedStatusLabel(snapshot) {
+    return '(MB)'
+}
+
+function formatSpaceFeedStatusDetails(snapshot) {
+    return [
+        `page: ${snapshot.pageType}`,
+        `category: ${snapshot.category}`,
+        `timestamps: ${snapshot.timestamps}`,
+        `document_timestamps: ${snapshot.documentTimestamps}`,
+        `document_profiles: ${snapshot.documentProfiles}`,
+        `cards: ${snapshot.cards}`,
+        `entries: ${snapshot.entries}`,
+        `actionable: ${snapshot.actionable}`,
+        `pending: ${snapshot.pending}`,
+        `top_button: ${snapshot.topButton}`,
+        `post_buttons: ${snapshot.postButtons}`
+    ].join('\n')
+}
+
+function showCopyableText(title, text) {
+    const message = `${title}\n\n${text}`
+
+    try {
+        window.prompt(title, text)
+        return
+    }
+    catch {
+        alert(message)
+    }
+}
+
+function syncSpaceFeedStatusButton(entries = null) {
+    if(getPageType() !== 'space') return false
+
+    const host = getSpaceFeedStatusHost()
+    if(!host) return false
+
+    const snapshot = getSpaceFeedDetectionSnapshot(entries)
+    let button = host.querySelector('.mb-ext_space-feed-status-btn')
+
+    if(!button) {
+        button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'mb-ext_space-feed-status-btn'
+        button.addEventListener('click', () => {
+            scheduleSpaceAssetNukeControls(0)
+            showCopyableText('Mute Block status', formatSpaceFeedStatusDetails(getSpaceFeedDetectionSnapshot()))
+        })
+        host.appendChild(button)
+    }
+
+    button.textContent = formatSpaceFeedStatusLabel(snapshot)
+    setMuteBlockHelp(button, formatSpaceFeedStatusDetails(snapshot).replace(/\n/g, ' | '))
+    return true
+}
+
+async function markSpaceFeedPostsNuked(space, entries) {
+    if(!space?.key || !Array.isArray(entries) || !entries.length) return
+
+    let changed = false
+    const nextRecords = {
+        ...spaceNukedPosts
+    }
+
+    for(const entry of entries) {
+        if(!entry?.postKey) continue
+
+        nextRecords[entry.postKey] = {
+            ...(spaceNukedPosts?.[entry.postKey] || {}),
+            postKey: entry.postKey,
+            postUrl: entry.postUrl || spaceNukedPosts?.[entry.postKey]?.postUrl || '',
+            spaceKey: space.key,
+            spaceUrl: space.url,
+            urls: Array.from(new Set(entry.candidateUrls || [])),
+            updatedAt: Date.now()
+        }
+        changed = true
+    }
+
+    if(!changed) return
+
+    spaceNukedPosts = pruneRememberedSpaceNukes(nextRecords)
+    syncSpaceFeedNukeControls()
+    await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
+}
+
+async function registerPendingSpaceFeedEntries(space, entries) {
+    if(!space?.key || !Array.isArray(entries) || !entries.length) return
+
+    let changed = false
+    const nextRecords = {
+        ...spacePendingNukedPosts
+    }
+
+    for(const entry of entries) {
+        if(!entry?.postKey) continue
+
+        const entryUrls = getNormalizedProfileHrefList(entry.candidateUrls || [])
+        if(!entryUrls.length) continue
+
+        const existing = nextRecords[entry.postKey] || {}
+        const existingAllUrls = getStoredSpaceFeedRecordUrls(existing, 'allUrls')
+        const existingRemainingUrls = getStoredSpaceFeedRecordUrls(existing, 'remainingUrls')
+        const allUrls = getNormalizedProfileHrefList([...existingAllUrls, ...entryUrls])
+        const remainingUrls = getNormalizedProfileHrefList([...existingRemainingUrls, ...entryUrls])
+
+        nextRecords[entry.postKey] = {
+            ...existing,
+            postKey: entry.postKey,
+            postUrl: entry.postUrl || existing.postUrl || '',
+            spaceKey: space.key,
+            spaceUrl: space.url,
+            allUrls,
+            remainingUrls,
+            updatedAt: Date.now()
+        }
+        changed = true
+    }
+
+    if(!changed) return
+
+    spacePendingNukedPosts = nextRecords
+    await safeStorageSet({[SPACE_PENDING_NUKED_POSTS_KEY]: nextRecords})
+}
+
+async function removePendingSpaceFeedUrls(urls) {
+    const normalizedUrls = new Set(getNormalizedProfileHrefList(urls))
+    if(!normalizedUrls.size) return
+
+    let changed = false
+    const nextRecords = {
+        ...spacePendingNukedPosts
+    }
+
+    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
+        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
+        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+        const nextAllUrls = allUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileHref(url)))
+        const nextRemainingUrls = remainingUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileHref(url)))
+
+        if(nextAllUrls.length === allUrls.length && nextRemainingUrls.length === remainingUrls.length) {
+            continue
+        }
+
+        changed = true
+
+        if(nextRemainingUrls.length <= 0) {
+            delete nextRecords[postKey]
+            continue
+        }
+
+        nextRecords[postKey] = {
+            ...record,
+            allUrls: nextAllUrls,
+            remainingUrls: nextRemainingUrls,
+            updatedAt: Date.now()
+        }
+    }
+
+    if(!changed) return
+
+    spacePendingNukedPosts = nextRecords
+    await safeStorageSet({[SPACE_PENDING_NUKED_POSTS_KEY]: nextRecords})
+}
+
+async function confirmSpaceFeedProfileBlocked(profileHref) {
+    const confirmedHref = normalizeQuoraProfileHref(profileHref)
+    if(!confirmedHref) return false
+
+    let changedPending = false
+    let changedNuked = false
+    const nextPending = {
+        ...spacePendingNukedPosts
+    }
+    const nextNuked = {
+        ...spaceNukedPosts
+    }
+
+    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
+        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
+        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+        if(!remainingUrls.includes(confirmedHref)) continue
+
+        const nextRemainingUrls = remainingUrls.filter(url => url !== confirmedHref)
+        changedPending = true
+
+        if(nextRemainingUrls.length > 0) {
+            nextPending[postKey] = {
+                ...record,
+                remainingUrls: nextRemainingUrls,
+                updatedAt: Date.now()
+            }
+            continue
+        }
+
+        delete nextPending[postKey]
+        nextNuked[postKey] = {
+            ...(spaceNukedPosts?.[postKey] || {}),
+            postKey,
+            postUrl: record.postUrl || spaceNukedPosts?.[postKey]?.postUrl || '',
+            spaceKey: record.spaceKey || spaceNukedPosts?.[postKey]?.spaceKey || '',
+            spaceUrl: record.spaceUrl || spaceNukedPosts?.[postKey]?.spaceUrl || '',
+            urls: getNormalizedProfileHrefList(allUrls.length ? allUrls : remainingUrls),
+            updatedAt: Date.now()
+        }
+        changedNuked = true
+    }
+
+    if(!changedPending && !changedNuked) return false
+
+    spacePendingNukedPosts = nextPending
+    if(changedNuked) {
+        spaceNukedPosts = pruneRememberedSpaceNukes(nextNuked)
+    }
+
+    const payload = {
+        [SPACE_PENDING_NUKED_POSTS_KEY]: nextPending
+    }
+
+    if(changedNuked) {
+        payload[SPACE_NUKED_POSTS_KEY] = spaceNukedPosts
+    }
+
+    await safeStorageSet(payload)
+    return true
+}
+
+async function confirmCurrentProfileBlockedSpaceFeedEntries() {
+    if(getPageType() !== 'profile') return false
+    return confirmSpaceFeedProfileBlocked(location.href)
+}
+
+function removeSpaceFeedNukeButtons() {
+    for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-nuke-host, .mb-ext_space-feed-post-nuke-host'))) {
+        host.remove()
+    }
+
+    for(const root of Array.from(document.querySelectorAll('[data-mb-space-feed-post-key]'))) {
+        delete root.dataset.mbSpaceFeedPostKey
+    }
+}
+
+function removeSpaceFeedNukeControls() {
+    removeSpaceFeedNukeButtons()
+    document.querySelector('.mb-ext_space-feed-status-host')?.remove()
+
+    const main = document.querySelector('#mainContent')
+    if(main) delete main.dataset.mbSpaceFeedCardCount
+    if(main) delete main.dataset.mbSpaceFeedEntryCount
+    if(main) delete main.dataset.mbSpaceFeedTimestampCount
+}
+
+function getPendingSpaceFeedEntries(entries) {
+    return entries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES && isSpaceFeedPostPending(entry.postKey))
+}
+
+function getLiveSpaceFeedEntryUrls(entry) {
+    if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
+
+    const pendingUrls = Array.from(getPendingSpaceFeedUrlSet(entry.postKey))
+    const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
+    return getNormalizedProfileHrefList([...pendingUrls, ...queueableUrls])
+}
+
+function getLiveSpaceFeedEntries(entries) {
+    return entries.flatMap(entry => {
+        const liveUrls = getLiveSpaceFeedEntryUrls(entry)
+        if(liveUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) return []
+
+        return [{
+            ...entry,
+            candidateUrls: liveUrls
+        }]
+    })
+}
+
+function getQueueableSpaceFeedEntries(entries) {
+    return entries.flatMap(entry => {
+        const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
+        if(queueableUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) return []
+
+        return [{
+            ...entry,
+            candidateUrls: queueableUrls
+        }]
+    })
+}
+
+function getDedupedSpaceFeedUrls(entries) {
+    const urls = []
+    const seen = new Set()
+
+    for(const entry of entries) {
+        for(const url of entry.candidateUrls || []) {
+            const normalized = normalizeQuoraProfileHref(url)
+            if(!normalized || seen.has(normalized)) continue
+            seen.add(normalized)
+            urls.push(normalized)
+        }
+    }
+
+    return urls
+}
+
+async function nukeSpaceFeedEntries(button, entries) {
+    if(!button || !entries.length) return false
+
+    const space = resolveCurrentSpaceDescriptor()
+    const urls = getDedupedSpaceFeedUrls(entries)
+    if(!space) return false
+    if(!urls.length) {
+        alert('No candidate profiles were detected')
+        return false
+    }
+
+    updateOwnedNukeStatusCache({
+        ...ownedNukeStatusCache,
+        queued: Math.max(1, Number.parseInt(ownedNukeStatusCache?.queued, 10) || 0),
+        paused: false
+    })
+    for(const entry of entries) {
+        if(entry?.postKey) {
+            spaceFeedNukingPostKeys.add(entry.postKey)
+        }
+    }
+    await registerPendingSpaceFeedEntries(space, entries)
+    syncSpaceFeedNukeControls()
+    await animateNukeButtonPress(button)
+    setNukeButtonWorking(button)
+
+    try {
+        let launched = false
+        const result = await safeSendRuntimeMessage({
+            action: 'enqueue-tabs',
+            urls,
+            tabAction: 'nuke',
+            maxConcurrent: getProfilesPerBatch()
+        }, {queued: 0})
+
+        if((result?.queued || 0) > 0) {
+            launched = true
+            syncSpaceFeedNukeControls()
+            await waitForOwnedNukeTabsToDrain(button, 180000, 1000, {allowPause: true})
+            return true
+        }
+
+        const sweep = await sweepBlockedProfileTabs()
+        if(sweep.owned > 0) {
+            launched = true
+            syncSpaceFeedNukeControls()
+            await waitForOwnedNukeTabsToDrain(button, 180000, 1000, {allowPause: true})
+            return true
+        }
+
+        if(!launched) {
+            await removePendingSpaceFeedUrls(urls)
+        }
+        setNukeButtonIdle(button)
+        alert('Nothing was queued')
+        return false
+    }
+    finally {
+        for(const entry of entries) {
+            if(entry?.postKey) {
+                spaceFeedNukingPostKeys.delete(entry.postKey)
+            }
+        }
+        updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+        syncSpaceFeedNukeControls()
+        scheduleSpaceAssetNukeControls(0)
+    }
+}
+
+async function pauseSpaceFeedQueue(button) {
+    if(!button) return false
+
+    const result = await safeSendRuntimeMessage({action: 'pause-owner-nukes'}, {canceledUrls: []})
+    const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
+    updateOwnedNukeStatusCache({
+        ...ownedNukeStatusCache,
+        queued: 0,
+        paused: true
+    })
+    if(canceledUrls.length) {
+        await removePendingSpaceFeedUrls(canceledUrls)
+    }
+
+    setNukeButtonIdle(button)
+    scheduleSpaceAssetNukeControls(0)
+    return canceledUrls.length > 0
+}
+
+function syncSpaceFeedTopNukeButton(entries) {
+    const host = getSpaceFeedTopButtonHost()
+    if(!host) return false
+
+    const totalEntries = Array.isArray(entries) ? entries : []
+    const actionableEntries = entries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
+    const liveEntries = getLiveSpaceFeedEntries(totalEntries)
+    const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
+    const queueableEntries = getQueueableSpaceFeedEntries(actionableEntries)
+    const busyEntries = actionableEntries.filter(entry => isSpaceFeedPostBusy(entry.postKey))
+    const hasNukedEntries = totalEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))
+    const ownerPaused = ownedNukeStatusCache.paused
+    const ownerRunning = hasOwnedNukeWorkInFlight()
+    const shouldPromptScroll = !ownerRunning && !ownerPaused && !busyEntries.length && !queueableEntries.length && !liveEntries.length && totalEntries.length > 0 && !hasNukedEntries
+    if(!totalEntries.length) {
+        host.remove()
+        return false
+    }
+
+    let button = host.querySelector('.mb-ext_space-feed-nuke-btn')
+    if(!button) {
+        button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-nuke-btn'
+        setMuteBlockHelp(button, 'Queue detected profiles from visible posts in this space for mute and block')
+        button.addEventListener('click', () => {
+            if(button.dataset.mbNukeState === 'working') {
+                void pauseSpaceFeedQueue(button)
+                return
+            }
+
+            const currentEntries = getSpaceFeedPostEntries()
+            const liveEntries = getLiveSpaceFeedEntries(currentEntries)
+            if(!liveEntries.length) {
+                if(currentEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))) {
+                    setNukeButtonDone(button)
+                    return
+                }
+
+                setNukeButtonIdle(button)
+                return
+            }
+
+            void nukeSpaceFeedEntries(button, liveEntries)
+        })
+        host.appendChild(button)
+    }
+
+    setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(liveEntries))
+    setMuteBlockHelp(button, shouldPromptScroll ? 'No visible targets. Scroll for more posts to scan.' : buildNukeTargetsHelpText('Queue detected profiles from visible posts in this space for mute and block', getSpaceFeedButtonUrls(button)))
+
+    if(ownerPaused && busyEntries.length) {
+        setNukeButtonIdle(button)
+        button.disabled = false
+    }
+    else if(ownerRunning && busyEntries.length) {
+        setNukeButtonWorking(button)
+        button.disabled = false
+    }
+    else if(busyEntries.length) {
+        setNukeButtonIdle(button)
+        button.disabled = false
+    }
+    else if(shouldPromptScroll) {
+        setNukeButtonIdle(button, 'Scroll for More')
+        button.disabled = false
+    }
+    else if(queueableEntries.length) {
+        setNukeButtonIdle(button)
+        button.disabled = false
+    }
+    else if(hasNukedEntries || actionableEntries.length) {
+        setNukeButtonDone(button)
+        button.disabled = true
+    }
+    else {
+        setNukeButtonIdle(button)
+        button.disabled = false
+    }
+
+    return true
+}
+
+function syncSpaceFeedPostButtons(entries) {
+    const activeKeys = new Set()
+
+    for(const entry of entries) {
+        const liveUrls = getLiveSpaceFeedEntryUrls(entry)
+        const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
+        const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES
+        const postBusy = isSpaceFeedPostBusy(entry.postKey)
+        const ownerRunning = hasOwnedNukeWorkInFlight()
+        const shouldShowButton = hasCandidates || postBusy || isSpaceFeedPostNuked(entry.postKey)
+        if(!shouldShowButton) {
+            delete entry.postRoot.dataset.mbSpaceFeedPostKey
+            continue
+        }
+
+        const host = getSpaceFeedPostButtonHost(entry.postRoot)
+        if(!host) continue
+
+        entry.postRoot.dataset.mbSpaceFeedPostKey = entry.postKey
+        activeKeys.add(entry.postKey)
+
+        let button = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
+        if(!button) {
+            button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-post-nuke-btn'
+            setMuteBlockHelp(button, 'Queue detected profiles from this post in this space for mute and block')
+            button.addEventListener('click', () => {
+                if(button.dataset.mbNukeState === 'working') {
+                    void pauseSpaceFeedQueue(button)
+                    return
+                }
+
+                const postKey = button.dataset.mbPostKey || ''
+                if(!postKey || isSpaceFeedPostNuked(postKey)) {
+                    setNukeButtonDone(button)
+                    button.disabled = true
+                    return
+                }
+
+                const liveEntry = getSpaceFeedPostEntries().find(candidate => candidate.postKey === postKey)
+                const liveUrls = getQueueableSpaceFeedEntryUrls(liveEntry)
+                const urls = liveUrls.length ? liveUrls : getSpaceFeedButtonUrls(button)
+                if(!urls.length) return
+
+                void nukeSpaceFeedEntries(button, [{
+                    postKey,
+                    postUrl: liveEntry?.postUrl || button.dataset.mbPostUrl || '',
+                    candidateUrls: urls
+                }])
+            })
+            host.appendChild(button)
+        }
+
+        button.dataset.mbPostKey = entry.postKey
+        button.dataset.mbPostUrl = entry.postUrl || ''
+        setSpaceFeedButtonUrls(button, liveUrls)
+        setMuteBlockHelp(button, buildNukeTargetsHelpText('Queue detected profiles from this post in this space for mute and block', getSpaceFeedButtonUrls(button)))
+
+        if(isSpaceFeedPostNuked(entry.postKey)) {
+            setNukeButtonDone(button)
+            button.disabled = true
+        }
+        else if(ownedNukeStatusCache.paused && postBusy) {
+            setNukeButtonIdle(button)
+            button.disabled = false
+        }
+        else if(ownerRunning && postBusy) {
+            setNukeButtonWorking(button)
+            button.disabled = false
+        }
+        else if(postBusy || hasCandidates) {
+            setNukeButtonIdle(button)
+            button.disabled = false
+        }
+        else {
+            setNukeButtonIdle(button)
+            button.disabled = false
+        }
+    }
+
+    for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
+        const button = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
+        if(!button || !activeKeys.has(button.dataset.mbPostKey || '')) {
+            host.remove()
+        }
+    }
+
+    for(const root of Array.from(document.querySelectorAll('[data-mb-space-feed-post-key]'))) {
+        if(!activeKeys.has(root.dataset.mbSpaceFeedPostKey || '')) {
+            delete root.dataset.mbSpaceFeedPostKey
+        }
+    }
+}
+
+function syncSpaceFeedNukeControls() {
+    if(getPageType() !== 'space') {
+        removeSpaceFeedNukeControls()
+        return false
+    }
+
+    const entries = getSpaceFeedPostEntries()
+    const main = document.querySelector('#mainContent')
+    if(main) {
+        main.dataset.mbSpaceFeedTimestampCount = `${getVisibleSpaceFeedTimestamps().length}`
+        main.dataset.mbSpaceFeedCardCount = `${getSpaceFeedCardRoots().length}`
+        main.dataset.mbSpaceFeedEntryCount = `${entries.length}`
+    }
+
+    syncSpaceFeedStatusButton(entries)
+
+    if(!isNukableSpacePage()) {
+        removeSpaceFeedNukeButtons()
+        return true
+    }
+
+    syncSpaceFeedTopNukeButton(entries)
+    syncSpaceFeedPostButtons(entries)
+    return true
 }
 
 function injectModalOpenProfilesBtn() {
@@ -2766,12 +4686,14 @@ function injectModalOpenProfilesBtn() {
         <path d="M15 4h5v5" />
     </svg>`
     btn.disabled = false
+    setMuteBlockHelp(btn, 'Open listed profiles from this modal in background tabs')
 
     let nukeBtn = modal.querySelector('.mb-ext_nuke-profiles-btn')
     if(!nukeBtn) {
         nukeBtn = document.createElement('button')
         nukeBtn.innerText = `Nuke 'Em`
         nukeBtn.classList.add('mb-ext_nuke-profiles-btn')
+        setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(items)))
         nukeBtn.addEventListener('click', () => void nukeModalProfiles())
         dismissBtn.parentElement.insertAdjacentElement('beforeend', nukeBtn)
     }
@@ -2779,6 +4701,7 @@ function injectModalOpenProfilesBtn() {
     if(nukeBtn.dataset.mbNukeState !== 'working' && nukeBtn.dataset.mbNukeState !== 'done') {
         setNukeButtonIdle(nukeBtn)
     }
+    setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(items)))
     nukeBtn.disabled = false
 }
 
@@ -2847,18 +4770,7 @@ function getHandledProfileModalItems(modal = getProfilePeopleModal()) {
 }
 
 function getModalProfileLinks(items) {
-    const urls = []
-    const seen = new Set()
-
-    for(const item of items) {
-        const href = getModalItemProfileHref(item)
-        if(!href || seen.has(href)) continue
-
-        seen.add(href)
-        urls.push(href)
-    }
-
-    return urls
+    return getNormalizedProfileHrefList(items.map(item => getModalItemProfileHref(item)))
 }
 
 function openModalProfiles(afterTimeout = false) {
@@ -3030,17 +4942,19 @@ async function maybeRunAutoProfileAction() {
         }
 
         if(isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
             await closeQueuedBlockedTab()
             return
         }
 
-        const ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton(), 15000, 250)
+        const ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton(), 25000, 250)
         if(!ready) {
             await abandonQueuedTab('Profile actions not ready')
             return
         }
 
         if(isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
             await closeQueuedBlockedTab()
             return
         }
@@ -3054,12 +4968,14 @@ async function maybeRunAutoProfileAction() {
         }
 
         if(isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
             await closeQueuedBlockedTab()
             return
         }
 
         const blocked = await waitForCondition(() => isProfileBlocked(), 2500, 250)
         if(blocked || isProfileBlocked()) {
+            await confirmCurrentProfileBlockedSpaceFeedEntries()
             await closeQueuedBlockedTab()
         }
         else {
@@ -3072,8 +4988,9 @@ async function maybeRunAutoProfileAction() {
 }
 
 function reportActionIssue(message, silent = false) {
+    if(silent) return
     console.warn(message)
-    if(!silent) alert(message)
+    alert(message)
 }
 
 async function muteProfile(options = {}) {

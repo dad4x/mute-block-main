@@ -21,8 +21,19 @@ Current repo reality:
 
 - there is no labeler service in this repository
 - there is no current operational need to host one for the extension's shipped feature set
+- the extension now has persistent local memory of remembered space-post `Nuke 'Em` results, with manual clearing plus local auto-pruning by age and entry cap
 - if shared moderation or collaboration features are pursued later, this note is the operational checklist
 - Firefox release status is currently lagging because store updates are stuck on `1.2`
+
+## UI Planning Note
+
+For later UI cleanup, keep these extension-management options in mind:
+
+- keep the popup focused on quick controls and move `Categorized Spaces` to a dedicated extension page
+- use a dedicated extension page with tabs such as `Settings`, `Spaces`, and `Remembered Nukes`
+- keep the popup minimal and replace the inline spaces list with a `Manage Spaces` button that opens the full page
+
+This does not need to be implemented now, but it is the current direction for separating quick actions from larger management lists.
 
 ## Scope
 
@@ -37,6 +48,12 @@ These should not be collapsed into one system.
 The extension is the local action engine.
 The labeler is the shared publication and subscription service.
 Owned Quora spaces are a possible Quora-native workflow surface for human review, categorization, and reporting.
+
+One practical consequence of the current extension design:
+
+- the persistent remembered-nuke list is already a plausible precursor to a reviewed export workflow
+- that means a future labeler pipeline does not need to start from raw page scraping alone
+- it could also start from locally accumulated candidate/result lists that are reviewed before publication
 
 ## First Practical Question: Do We Actually Need To Host A Labeler?
 
