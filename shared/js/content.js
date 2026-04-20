@@ -350,10 +350,7 @@ function startObserver() {
 
         modal.dataset.mbChecked = true
 
-        let tabs = Array.from(modal.querySelectorAll('[role="tab"]'))
-        let tabMatched = tabs.some(tab => /\bfollower(?:s)?\b|\bfollowing\b/i.test(tab.innerText))
-
-        if(tabMatched) {
+        if(isProfilePeopleModal(modal)) {
             await sleep(1e3)
 
             let items = getUnhandledProfileModalItems(modal)
@@ -1433,9 +1430,11 @@ function getProfilePeopleModal() {
         const tabText = tabs.map(getElementText).join(' ')
         const items = dialog.querySelectorAll('[role="listitem"]')
         const profileLinks = dialog.querySelectorAll('a[href*="/profile/"]')
+        const dialogText = getElementText(dialog)
 
         let score = 0
         if(/\bfollower(?:s)?\b|\bfollowing\b/i.test(tabText)) score += 500
+        if(/\bcontributor(?:s)?\b/i.test(dialogText)) score += 500
         if(items.length) score += 150
         if(profileLinks.length) score += 150
 
@@ -1451,6 +1450,18 @@ function getProfileModalItems(modal = getProfilePeopleModal()) {
     return Array.from(modal.querySelectorAll('[role="listitem"]')).filter(item => {
         return isVisible(item) && item.querySelector('a[href*="/profile/"]')
     })
+}
+
+function isProfilePeopleModal(modal) {
+    if(!modal) return false
+
+    const tabs = Array.from(modal.querySelectorAll('[role="tab"]')).filter(isVisible)
+    const tabText = tabs.map(getElementText).join(' ')
+    if(/\bfollower(?:s)?\b|\bfollowing\b/i.test(tabText)) return true
+
+    const modalText = getElementText(modal)
+    return /\bcontributor(?:s)?\b/i.test(modalText) &&
+        !!modal.querySelector('[role="listitem"] a[href*="/profile/"]')
 }
 
 function syncActiveProfileModal(modal = getProfilePeopleModal()) {
