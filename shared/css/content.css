@@ -140,7 +140,7 @@
 }
 
 .mb-ext_nuke-profiles-btn--flash {
-    animation: mb-ext-nuke-double-flash 420ms ease-out;
+    animation: mb-ext-nuke-double-flash 350ms ease-out;
 }
 
 @keyframes mb-ext-nuke-double-flash {
@@ -276,8 +276,11 @@
 
 .mb-ext_space-category-host {
     display: inline-flex;
-    position: absolute;
+    position: static;
+    align-items: center;
     justify-content: flex-end;
+    margin-right: 12px;
+    flex: 0 0 auto;
     z-index: 2;
 }
 

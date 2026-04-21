@@ -496,6 +496,7 @@ function onMessage(request, sender, sendResponse) {
             break
         case 'profile-followers-loaded':
         case 'profile-following-loaded': {
+            injectModalOpenProfilesBtn()
             let btn = document.querySelector('.mb-ext_open-profiles-btn, .mb-ext_nuke-profiles-btn')
 
             if(btn && btn.disabled) {
@@ -684,7 +685,7 @@ async function animateNukeButtonPress(button) {
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
     button.classList.add('mb-ext_nuke-profiles-btn--pressed')
     button.classList.add('mb-ext_nuke-profiles-btn--flash')
-    await sleep(430)
+    await sleep(360)
     button.classList.remove('mb-ext_nuke-profiles-btn--flash')
 }
 
@@ -1658,7 +1659,7 @@ function getBlockConfirmContainer() {
             if(!/\bblock\b|\bblocked\b|\bunblock\b/i.test(text)) return false
 
             const buttons = getVisibleActionButtons(element)
-            return buttons.some(button => /\bblock\b/i.test(getElementText(button))) &&
+            return buttons.some(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button))) &&
                 buttons.some(button => /\bcancel\b/i.test(getElementText(button)))
         })
         .map(element => {
@@ -1675,11 +1676,11 @@ function getBlockConfirmContainer() {
 function getBlockConfirmCandidates() {
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
-        .filter(button => /\bblock\b/i.test(getElementText(button)))
+        .filter(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button)))
         .map(button => {
             const context = getBestActionContext(button)
             const contextText = context?.text || ''
-            let score = scoreActionCandidate(button, /\bblock\b/i, contextText)
+            let score = scoreActionCandidate(button, /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i, contextText)
 
             if(/\bblock this profile\b|\bblock this person\b|\bblock\b|\bblocked\b/i.test(contextText)) score += 1200
             if(/\bmuted\b|\bmuting this person\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
@@ -1701,14 +1702,14 @@ function getBlockConfirmAction() {
     const container = getBlockConfirmContainer()
     if(container) {
         const containerButtons = getVisibleActionButtons(container)
-            .filter(button => /\bblock\b/i.test(getElementText(button)))
-            .map(button => ({button, score: scoreActionCandidate(button, /\bblock\b/i, getElementText(container)) + 500}))
+            .filter(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button)))
+            .map(button => ({button, score: scoreActionCandidate(button, /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i, getElementText(container)) + 500}))
 
         containerButtons.sort((left, right) => right.score - left.score)
         if(containerButtons.length) return containerButtons[0].button
     }
 
-    return getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b/i)
+    return getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i)
 }
 
 function isBlockConfirmPending() {
@@ -3346,6 +3347,46 @@ function getSpaceHeaderOuterRow(header = getSpaceHeaderContainer()) {
     return header.querySelector('#mainContent')?.parentElement || null
 }
 
+function getSpaceHeaderActionControl(header = getSpaceHeaderContainer()) {
+    if(!header) return null
+
+    const controls = Array.from(header.querySelectorAll('button, [role="button"], a'))
+        .filter(control => control.offsetParent !== null)
+
+    const ranked = controls
+        .map(control => {
+            const label = `${control.getAttribute?.('aria-label') || ''} ${getElementText(control)}`.replace(/\s+/g, ' ').trim()
+            let score = 0
+
+            if(/\b(following|follow|requested|join|joined)\b/i.test(label)) score += 100
+            if(/\bnotification|notifications\b/i.test(label)) score += 40
+            if(control.querySelector?.('svg')) score += 5
+
+            return {control, score}
+        })
+        .filter(entry => entry.score > 0)
+        .sort((left, right) => right.score - left.score)
+
+    return ranked[0]?.control || null
+}
+
+function getSpaceHeaderActionRow(header = getSpaceHeaderContainer()) {
+    const control = getSpaceHeaderActionControl(header)
+    if(!control) return null
+
+    return control.closest('.q-flex, [class*="q-flex"], [class*="q-inlineFlex"]') || control.parentElement || null
+}
+
+function getSpaceHeaderActionInsertBefore(row) {
+    if(!row) return null
+
+    return Array.from(row.children).find(child => {
+        if(child.classList?.contains('mb-ext_space-category-host')) return false
+        if(child.matches?.('button, [role="button"], a')) return true
+        return !!child.querySelector?.('button, [role="button"], a')
+    }) || null
+}
+
 function resolveCurrentSpaceDescriptor() {
     const header = getSpaceHeaderContainer()
     if(!header) return null
@@ -3389,21 +3430,24 @@ function syncSpaceClassificationControls() {
         host.className = 'mb-ext_space-category-host'
     }
 
-    const titleRow = getSpaceHeaderTitleRow(header)
-    const outerRow = getSpaceHeaderOuterRow(header)
-    if(titleRow && outerRow) {
-        if(host.parentElement !== header) {
-            header.appendChild(host)
+    const actionRow = getSpaceHeaderActionRow(header)
+    if(actionRow) {
+        const insertBefore = getSpaceHeaderActionInsertBefore(actionRow)
+
+        if(host.parentElement !== actionRow) {
+            if(insertBefore) {
+                actionRow.insertBefore(host, insertBefore)
+            }
+            else {
+                actionRow.appendChild(host)
+            }
+        }
+        else if(insertBefore && host.nextElementSibling !== insertBefore) {
+            actionRow.insertBefore(host, insertBefore)
         }
 
-        const titleRowRect = titleRow.getBoundingClientRect()
-        const outerRowRect = outerRow.getBoundingClientRect()
-        const headerRect = header.getBoundingClientRect()
-        const topOffset = Math.max(0, Math.round(titleRowRect.top - headerRect.top))
-        const rightOffset = Math.max(0, Math.round(headerRect.right - outerRowRect.right))
-
-        host.style.top = `${topOffset}px`
-        host.style.right = `${rightOffset}px`
+        host.style.top = ''
+        host.style.right = ''
     }
     else if(host.parentElement !== header) {
         header.appendChild(host)
@@ -3995,15 +4039,50 @@ function getSpaceFeedActionElements(postRoot) {
     return actions
 }
 
+function getSpaceFeedPostAnchorContainer(postRoot) {
+    if(!postRoot) return null
+
+    const main = document.querySelector('#mainContent, main, [role="main"]') || document.body
+    let anchorContainer = postRoot
+    let node = postRoot.parentElement
+
+    while(node) {
+        if(node.nodeType !== Node.ELEMENT_NODE) {
+            node = node.parentElement
+            continue
+        }
+
+        const rect = node.getBoundingClientRect()
+        const currentRect = anchorContainer.getBoundingClientRect()
+        const isMeaningfullyWider = rect.width >= currentRect.width + 24
+        const isReasonableHeight = rect.height <= currentRect.height * 1.75
+        const isNotTooWide = rect.width <= postRoot.getBoundingClientRect().width * 1.5
+
+        if(isMeaningfullyWider && isReasonableHeight && isNotTooWide) {
+            anchorContainer = node
+        }
+
+        if(node === main) break
+        node = node.parentElement
+    }
+
+    return anchorContainer
+}
+
 function getSpaceFeedPostButtonHost(postRoot) {
     if(!postRoot) return null
 
     const timestamp = postRoot.querySelector('a.post_timestamp')
     const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
-    const parent = postRoot
+    const parent = getSpaceFeedPostAnchorContainer(postRoot) || postRoot
 
     let host = parent.querySelector(':scope > .mb-ext_space-feed-post-nuke-host')
     if(host) return host
+
+    const strayHost = postRoot.querySelector('.mb-ext_space-feed-post-nuke-host')
+    if(strayHost && strayHost.parentElement !== parent) {
+        strayHost.remove()
+    }
 
     host = document.createElement('div')
     host.className = 'mb-ext_space-feed-post-nuke-host mb-ext_post-nuke-slot'
@@ -5114,12 +5193,31 @@ async function blockProfile(options = {}) {
     const initialMutationCount = profileBlockMutationCount
     blockOpt.click()
 
-    let blockBtn = await waitForAction(() => getBlockConfirmAction(), 8000, 250)
-    if(!blockBtn) {
+    const confirmState = await waitForAction(() => {
+        const confirmButton = getBlockConfirmAction()
+        if(confirmButton) return {type: 'confirm', button: confirmButton}
+        if(profileBlockMutationCount > initialMutationCount || isProfileBlocked()) return {type: 'blocked'}
+        if(getMenuAction(/\bunblock\b/i)) return {type: 'blocked'}
+        return null
+    }, 8000, 250)
+
+    if(!confirmState) {
+        const blockedAppliedEarly = await waitForProfileMenuState('inverse', /\bblock\b/i, /\bunblock\b/i, 1500, 200)
+        if(blockedAppliedEarly || isProfileBlocked()) {
+            rememberProfileBlocked()
+            return true
+        }
+
         reportActionIssue('Block button not found', silent)
         return false
     }
 
+    if(confirmState.type === 'blocked') {
+        rememberProfileBlocked()
+        return true
+    }
+
+    let blockBtn = confirmState.button
     blockBtn.click()
 
     const mutationSeen = await waitForCondition(() => profileBlockMutationCount > initialMutationCount, 5000, 250)
