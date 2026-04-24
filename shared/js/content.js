@@ -44,6 +44,7 @@ let spaceClassificationTimeout
 let spaceClassificationPending = false
 let spaceAssetNukeTimeout
 let spaceAssetNukePending = false
+let suppressSpaceAssetNukeRefreshUntil = 0
 let closeTabRetryTimeouts = []
 let blockedCloseCheckTimeouts = []
 let currentUrl = location.href
@@ -335,13 +336,15 @@ function startObserver() {
             scheduleSpacePostNukeBtn(300)
         }
         else if(page === 'space') {
-            injectSpaceSidebarOpenProfilesBtn()
-            if(shouldRefreshSpaceClassificationControls()) {
-                scheduleSpaceClassificationControls(120)
-            }
+            if(!areExtensionOnlyMutations(mutations)) {
+                injectSpaceSidebarOpenProfilesBtn()
+                if(shouldRefreshSpaceClassificationControls()) {
+                    scheduleSpaceClassificationControls(120)
+                }
 
-            if(shouldRefreshSpaceAssetNukeControls()) {
-                scheduleSpaceAssetNukeControls(180)
+                if(Date.now() >= suppressSpaceAssetNukeRefreshUntil) {
+                    scheduleSpaceAssetNukeControls(180)
+                }
             }
         }
 
@@ -357,6 +360,38 @@ function startObserver() {
             if(items.length) injectModalOpenProfilesBtn()
         }
     }).observe(document.body, {childList: true, subtree: true})
+}
+
+function isExtensionOwnedNode(node) {
+    let current = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement || null
+
+    while(current) {
+        const classNames = Array.from(current.classList || [])
+        if(classNames.some(name => name.startsWith('mb-ext_'))) return true
+        current = current.parentElement
+    }
+
+    return false
+}
+
+function areExtensionOnlyMutations(mutations) {
+    let sawExtensionNode = false
+
+    for(const mutation of mutations || []) {
+        if(mutation.type !== 'childList') return false
+
+        for(const node of Array.from(mutation.addedNodes || [])) {
+            if(!isExtensionOwnedNode(node)) return false
+            sawExtensionNode = true
+        }
+
+        for(const node of Array.from(mutation.removedNodes || [])) {
+            if(!isExtensionOwnedNode(node)) return false
+            sawExtensionNode = true
+        }
+    }
+
+    return sawExtensionNode
 }
 
 function syncProfileButtons() {
@@ -786,7 +821,9 @@ function shouldRefreshSpaceAssetNukeControls() {
     const liveCardCount = getSpaceFeedCardRoots().length
     const storedCardCount = Number.parseInt(main?.dataset.mbSpaceFeedCardCount || '-1', 10)
     const storedEntryCount = Number.parseInt(main?.dataset.mbSpaceFeedEntryCount || '-1', 10)
+    const storedPostButtonCount = Number.parseInt(main?.dataset.mbSpaceFeedPostButtonCount || '-1', 10)
     const hasStatusButton = !!document.querySelector('.mb-ext_space-feed-status-btn')
+    const livePostButtonCount = document.querySelectorAll('.mb-ext_space-feed-post-nuke-host').length
 
     if(!hasStatusButton) return true
     if(storedTimestampCount !== liveTimestampCount) return true
@@ -796,7 +833,8 @@ function shouldRefreshSpaceAssetNukeControls() {
         if(storedEntryCount < 0) return true
         if(storedEntryCount > 0) {
             if(!document.querySelector('.mb-ext_space-feed-nuke-btn')) return true
-            if(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host').length < storedEntryCount) return true
+            if(storedPostButtonCount < 0) return true
+            if(livePostButtonCount !== storedPostButtonCount) return true
         }
         return false
     }
@@ -822,6 +860,7 @@ function scheduleSpaceAssetNukeControls(delay = 180) {
             if(getPageType() === 'space') {
                 await refreshOwnedNukeStatusCache()
             }
+            suppressSpaceAssetNukeRefreshUntil = Date.now() + 250
             syncSpaceFeedNukeControls()
         })()
     }, Math.max(0, delay))
@@ -2378,7 +2417,7 @@ function normalizeQuoraProfileHref(href) {
         const url = new URL(href, location.origin)
         url.search = ''
         url.hash = ''
-        const pathMatch = url.pathname.match(/^\/profile\/([^/?#]+)(?:\/(followers|following))?\/?$/i)
+        const pathMatch = url.pathname.match(/^\/profile\/([^/?#]+)(?:\/(followers|following|log))?\/?$/i)
         if(!pathMatch?.[1]) return null
 
         const slug = pathMatch[1]
@@ -2401,10 +2440,10 @@ function sanitizeProfileHrefSlug(slug) {
     const cutPatterns = [
         /-amp-(?:ch|oid|share|srid|target|targ|target-type|type)/i,
         /-(?:ch|oid|share|srid|target|target_type|type)-/i,
-        /-(?:followers?|following)-/i,
+        /-(?:followers?|following|log)-/i,
         /-https?$/i,
         /-https?-/i,
-        /-(?:followers?|following)$/i
+        /-(?:followers?|following|log)$/i
     ]
 
     let cutIndex = -1
@@ -2523,6 +2562,41 @@ function getProfileUrlsFromText(text) {
 
 function isTruncatedQuoraProfileTextUrl(href) {
     return /\/profile\/[^/\s<>"'`)\]]*(?:\.{3,}|…)/i.test(`${href || ''}`)
+}
+
+function getProfileUrlsFromSpacePostHref(href) {
+    const normalizedPostHref = normalizeQuoraPostHref(href)
+    if(!normalizedPostHref) return []
+
+    const urls = []
+    const seen = new Set()
+    const addSlug = slug => {
+        const cleanSlug = sanitizeProfileHrefSlug(slug)
+        if(!cleanSlug) return
+
+        const profileHref = normalizeQuoraProfileHref(`https://www.quora.com/profile/${encodeURIComponent(cleanSlug)}`)
+        if(!profileHref || seen.has(profileHref)) return
+
+        seen.add(profileHref)
+        urls.push(profileHref)
+    }
+
+    try {
+        const url = new URL(normalizedPostHref, location.origin)
+        const decodedPath = decodeURIComponent(url.pathname || '').replace(/^\/+/, '')
+        const matches = decodedPath.matchAll(/(?:^|[-_/])https?-www-quora-com-profile-([^/?#]+)/gi)
+
+        for(const match of matches) {
+            if(match?.[1]) {
+                addSlug(match[1])
+            }
+        }
+    }
+    catch {
+        return urls
+    }
+
+    return urls
 }
 
 function normalizeRememberedProfileDisplayName(label) {
@@ -3657,7 +3731,13 @@ function isSpaceFeedRootCandidate(node, timestamp) {
 function getSpaceFeedPreferredRoot(timestamp) {
     if(!timestamp) return null
 
-    return timestamp.closest('.puppeteer_test_tribe_post_item_feed_story, .dom_annotate_multifeed_bundle_TribeContentBundle, article, [role="article"]')
+    return timestamp.closest(
+        '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
+        '.puppeteer_test_tribe_post_item_feed_story,' +
+        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
+        'article,' +
+        '[role="article"]'
+    )
 }
 
 function getSpaceFeedCardRoots() {
@@ -3845,6 +3925,10 @@ function getSpaceFeedEmbeddedPosterProfileUrls(postRoot) {
     }
 
     for(const embedRoot of embedRoots) {
+        for(const link of Array.from(embedRoot.querySelectorAll('a[href*="/profile/"]'))) {
+            addPosterHref(link.href)
+        }
+
         let scope = embedRoot.closest(posterScopeSelector) || embedRoot.parentElement
         const scopes = []
 
@@ -3926,22 +4010,33 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
     if(isTargetSpacePage()) {
         return posterProfileUrls
     }
-    if(isAssetSpacePage() && sharedPosterUrls.length) {
-        return sharedPosterUrls
-    }
 
     const urls = []
     const seen = new Set()
+    const addUrl = href => {
+        if(!href || href === headerProfileHref || seen.has(href)) return
+
+        seen.add(href)
+        urls.push(href)
+    }
+
+    if(isAssetSpacePage()) {
+        for(const href of [
+            ...sharedPosterUrls,
+            ...getSpaceFeedEmbeddedPosterProfileUrls(postRoot),
+            ...getProfileUrlsFromSpacePostHref(timestamp?.href || '')
+        ]) {
+            addUrl(href)
+        }
+    }
 
     for(const scope of getSpaceFeedPostContentScopes(postRoot)) {
         for(const link of Array.from(scope.querySelectorAll('a[href*="/profile/"]'))) {
             if(!isSpaceFeedCandidateProfileLink(link, postRoot)) continue
 
             const href = normalizeQuoraProfileHref(link.href)
-            if(!href || href === headerProfileHref || seen.has(href)) continue
-
-            seen.add(href)
-            urls.push(href)
+            if(!href) continue
+            addUrl(href)
         }
     }
 
@@ -3950,10 +4045,7 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
     ]
 
     for(const href of fallbackUrls) {
-        if(!href || href === headerProfileHref || seen.has(href)) continue
-
-        seen.add(href)
-        urls.push(href)
+        addUrl(href)
     }
 
     if(!urls.length) {
@@ -3961,10 +4053,7 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
         const titleNameCandidate = getTrailingTitleNameCandidate(getElementText(titleAnchor) || getElementText(postRoot))
 
         for(const href of getNearbyProfileUrlsForName(postRoot, titleNameCandidate, headerProfileHref)) {
-            if(!href || seen.has(href)) continue
-
-            seen.add(href)
-            urls.push(href)
+            addUrl(href)
         }
     }
 
@@ -4162,6 +4251,7 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
     const nextEntries = Array.isArray(entries) ? entries : getSpaceFeedPostEntries()
     const actionableEntries = nextEntries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
     const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
+    const expectedPostButtons = getExpectedSpaceFeedPostButtonCount(nextEntries)
 
     return {
         pageType: getPageType() || 'unknown',
@@ -4173,6 +4263,7 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
         entries: nextEntries.length,
         actionable: actionableEntries.length,
         pending: pendingEntries.length,
+        expectedPostButtons,
         topButton: !!document.querySelector('.mb-ext_space-feed-nuke-btn'),
         postButtons: document.querySelectorAll('.mb-ext_space-feed-post-nuke-btn').length
     }
@@ -4193,6 +4284,7 @@ function formatSpaceFeedStatusDetails(snapshot) {
         `entries: ${snapshot.entries}`,
         `actionable: ${snapshot.actionable}`,
         `pending: ${snapshot.pending}`,
+        `expected_post_buttons: ${snapshot.expectedPostButtons}`,
         `top_button: ${snapshot.topButton}`,
         `post_buttons: ${snapshot.postButtons}`
     ].join('\n')
@@ -4428,7 +4520,19 @@ function removeSpaceFeedNukeControls() {
     const main = document.querySelector('#mainContent')
     if(main) delete main.dataset.mbSpaceFeedCardCount
     if(main) delete main.dataset.mbSpaceFeedEntryCount
+    if(main) delete main.dataset.mbSpaceFeedPostButtonCount
     if(main) delete main.dataset.mbSpaceFeedTimestampCount
+}
+
+function getExpectedSpaceFeedPostButtonCount(entries) {
+    const list = Array.isArray(entries) ? entries : []
+
+    return list.filter(entry => {
+        const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
+        const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES
+        const postBusy = isSpaceFeedPostBusy(entry.postKey)
+        return hasCandidates || postBusy || isSpaceFeedPostNuked(entry.postKey)
+    }).length
 }
 
 function getPendingSpaceFeedEntries(entries) {
@@ -4585,10 +4689,6 @@ function syncSpaceFeedTopNukeButton(entries) {
     const ownerPaused = ownedNukeStatusCache.paused
     const ownerRunning = hasOwnedNukeWorkInFlight()
     const shouldPromptScroll = !ownerRunning && !ownerPaused && !busyEntries.length && !queueableEntries.length && !liveEntries.length && totalEntries.length > 0 && !hasNukedEntries
-    if(!totalEntries.length) {
-        host.remove()
-        return false
-    }
 
     let button = host.querySelector('.mb-ext_space-feed-nuke-btn')
     if(!button) {
@@ -4617,6 +4717,14 @@ function syncSpaceFeedTopNukeButton(entries) {
             void nukeSpaceFeedEntries(button, liveEntries)
         })
         host.appendChild(button)
+    }
+
+    if(!totalEntries.length) {
+        setSpaceFeedButtonUrls(button, [])
+        setMuteBlockHelp(button, 'Scanning visible posts in this space for profiles to nuke')
+        setNukeButtonIdle(button, 'Scanning...')
+        button.disabled = true
+        return true
     }
 
     setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(liveEntries))
@@ -4761,6 +4869,7 @@ function syncSpaceFeedNukeControls() {
         main.dataset.mbSpaceFeedTimestampCount = `${getVisibleSpaceFeedTimestamps().length}`
         main.dataset.mbSpaceFeedCardCount = `${getSpaceFeedCardRoots().length}`
         main.dataset.mbSpaceFeedEntryCount = `${entries.length}`
+        main.dataset.mbSpaceFeedPostButtonCount = `${getExpectedSpaceFeedPostButtonCount(entries)}`
     }
 
     syncSpaceFeedStatusButton(entries)
