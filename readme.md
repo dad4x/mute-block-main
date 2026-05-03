@@ -4,7 +4,7 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 
 ## Current Status
 
-- Source and local build artifacts are currently at `1.5.0` on the refactor branch.
+- Source and local build artifacts are currently at `1.5.1` on the refactor branch.
 - The `release/1.4` branch remains the maintenance lane for the `1.4.247` baseline.
 - The `1.5` series is an internal architecture refactor of the accreted `1.4` nuke, queue, and state code; see [refactor-1.5-plan.md](refactor-1.5-plan.md).
 - Chrome is the current release track.
