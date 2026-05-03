@@ -1,6 +1,7 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
 const pendingTabActions = new Map()
+const queuedTabMetadata = new Map()
 const queuedTabActions = []
 const activeQueuedTabs = new Set()
 const ownedTabIdsByParent = new Map()
@@ -8,8 +9,542 @@ const owningParentByChild = new Map()
 const canceledQueuedUrlsByOwner = new Map()
 const pausedQueuedOwners = new Set()
 const OWNED_TAB_STATE_KEY = 'mbOwnedTabIdsByParent'
+const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
+const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
+const STALE_ACTIVE_QUEUED_TAB_MS = 15000
+const STALE_ACTIVE_ACTION_QUEUED_TAB_MS = 30000
+const STALE_CLOSE_REQUESTED_QUEUED_TAB_MS = 8000
 let persistOwnedTabIdsTimeout = null
 let queuedTabConcurrency = 1
+let profileNukeProgress = {}
+const QUORA_NON_PROFILE_ROOT_PATHS = new Set([
+    'answer',
+    'bookmarks',
+    'business',
+    'careers',
+    'contact',
+    'following',
+    'messages',
+    'notifications',
+    'profile',
+    'question',
+    'search',
+    'settings',
+    'space',
+    'spaces',
+    'topic',
+    'unanswered'
+])
+
+function sanitizeProfileHrefSlug(slug) {
+    let value = `${slug || ''}`.normalize('NFKC').replace(/[?#].*$/g, '').trim()
+    if(!value) return ''
+
+    const cutPatterns = [
+        /-amp-(?:ch|oid|share|srid|target|targ|target-type|type)/i,
+        /-(?:ch|oid|share|srid|target|target_type|type)-/i,
+        /-(?:followers?|following|log)-/i,
+        /-https?$/i,
+        /-https?-/i,
+        /-(?:followers?|following|log)$/i
+    ]
+
+    let cutIndex = -1
+    for(const pattern of cutPatterns) {
+        const match = pattern.exec(value)
+        if(!match) continue
+        if(cutIndex === -1 || match.index < cutIndex) {
+            cutIndex = match.index
+        }
+    }
+
+    if(cutIndex >= 0) {
+        value = value.slice(0, cutIndex)
+    }
+
+    value = stripDescriptiveProfileSuffix(value)
+    value = stripTrailingProfileArtifactToken(value)
+    return value.replace(/[-_\s]+$/g, '').trim()
+}
+
+function stripDescriptiveProfileSuffix(value) {
+    const tokens = `${value || ''}`.split('-').filter(Boolean)
+    if(tokens.length < 2) return `${value || ''}`
+
+    const descriptiveWords = new Set([
+        'a', 'about', 'again', 'and', 'asking', 'bio', 'comment', 'comments',
+        'details', 'for', 'from', 'he', 'her', 'hers', 'his', 'lets', 'made',
+        'my', 'of', 'par', 'peoples', 'question', 'quora', 'see', 'she',
+        'some', 'that', 'the', 'their', 'this', 'those', 'try', 'weird'
+    ])
+    const isDescriptiveToken = token => {
+        const normalized = `${token || ''}`.toLowerCase()
+        return descriptiveWords.has(normalized) || /^[a-z]{1,3}$/.test(normalized)
+    }
+    const suffixLooksDescriptive = suffixTokens => {
+        if(!suffixTokens.length) return false
+        if(suffixTokens.length >= 2 && suffixTokens.some(isDescriptiveToken)) return true
+
+        const first = `${suffixTokens[0] || ''}`.toLowerCase()
+        return ['bio', 'details', 'quora'].includes(first)
+    }
+
+    let anchorIndex = tokens.findIndex((token, index) => index > 0 && /^\d+$/.test(token))
+    if(anchorIndex >= 0 && suffixLooksDescriptive(tokens.slice(anchorIndex + 1))) {
+        return tokens.slice(0, anchorIndex + 1).join('-')
+    }
+
+    anchorIndex = tokens.findIndex((token, index) => /\d+$/.test(token) && index < tokens.length - 1)
+    if(anchorIndex >= 0 && suffixLooksDescriptive(tokens.slice(anchorIndex + 1))) {
+        return tokens.slice(0, anchorIndex + 1).join('-')
+    }
+
+    return `${value || ''}`
+}
+
+function stripTrailingProfileArtifactToken(value) {
+    const tokens = `${value || ''}`.split('-').filter(Boolean)
+    if(tokens.length < 2) return `${value || ''}`
+
+    const lastToken = `${tokens[tokens.length - 1] || ''}`.toLowerCase()
+    const previousToken = `${tokens[tokens.length - 2] || ''}`.toLowerCase()
+
+    if(lastToken === 'ch') {
+        if(!/^\d+$/.test(previousToken)) return `${value || ''}`
+        tokens.pop()
+        return tokens.join('-')
+    }
+
+    if(['oid', 'share', 'srid', 'target', 'target_type', 'type'].includes(lastToken)) {
+        tokens.pop()
+        return tokens.join('-')
+    }
+
+    if(['answers', 'posts', 'questions'].includes(lastToken) && tokens.length >= 3) {
+        tokens.pop()
+        return tokens.join('-')
+    }
+
+    return `${value || ''}`
+}
+
+function isLikelyDirectProfileSlug(slug) {
+    const value = `${slug || ''}`.trim()
+    if(!value) return false
+    if(/[\/\\?#]/.test(value)) return false
+
+    const tokens = value.split('-').filter(Boolean)
+    if(tokens.length < 2) return false
+
+    const isNameishToken = token => /^[A-Z][A-Za-z0-9]*$/.test(token) || /^[A-Z0-9]{2,}$/.test(token)
+
+    if(tokens.some(token => /^\d+$/.test(token))) return true
+    if(tokens.some(token => /^[A-F0-9]{2}$/i.test(token))) return true
+
+    if(/^(?:a|an|are|can|could|did|do|does|how|is|should|the|what|when|where|who|why|will|would)$/i.test(tokens[0] || '')) {
+        if(/^the$/i.test(tokens[0]) && tokens.length >= 3 && tokens.every(isNameishToken)) {
+            return true
+        }
+
+        return false
+    }
+
+    let nameishTokenCount = 0
+    for(const token of tokens) {
+        if(isNameishToken(token)) {
+            nameishTokenCount += 1
+        }
+    }
+
+    return nameishTokenCount >= 2
+}
+
+function getLikelyQuoraProfileSlug(pathname) {
+    const parts = `${pathname || ''}`.split('/').filter(Boolean)
+    if(!parts.length) return ''
+
+    const firstPart = `${parts[0] || ''}`
+    if(firstPart.toLowerCase() === 'profile') {
+        return parts.length >= 2 ? `${parts[1] || ''}` : ''
+    }
+
+    if(parts.length !== 1 || QUORA_NON_PROFILE_ROOT_PATHS.has(firstPart.toLowerCase())) return ''
+    if(!/-/.test(firstPart)) return ''
+
+    const decodedSlug = sanitizeProfileHrefSlug(decodeURIComponent(firstPart))
+    if(!decodedSlug) return ''
+    if(!isLikelyDirectProfileSlug(decodedSlug)) return ''
+
+    return firstPart
+}
+
+function normalizeQuoraProfileUrl(href) {
+    if(!href) return null
+
+    try {
+        const url = new URL(href)
+        const hostname = `${url.hostname || ''}`.toLowerCase()
+        const isPrimaryQuoraHost = hostname === 'quora.com' || hostname === 'www.quora.com'
+        const isQuoraSubdomain = hostname.endsWith('.quora.com')
+        if(!isPrimaryQuoraHost && !isQuoraSubdomain) {
+            return null
+        }
+
+        url.search = ''
+        url.hash = ''
+        const pathParts = url.pathname.split('/').filter(Boolean)
+        if(isQuoraSubdomain && !isPrimaryQuoraHost && pathParts[0]?.toLowerCase() !== 'profile') {
+            return null
+        }
+
+        const slug = getLikelyQuoraProfileSlug(url.pathname)
+        if(!slug) return null
+
+        const decodedSlug = sanitizeProfileHrefSlug(decodeURIComponent(slug))
+        if(!decodedSlug) return null
+        if(/[\/\\?#]/.test(decodedSlug)) return null
+        if(/[\u0000-\u001F\u007F]/.test(decodedSlug)) return null
+
+        return `https://www.quora.com/profile/${encodeURIComponent(decodedSlug)}`
+    }
+    catch {
+        return null
+    }
+}
+
+function normalizeTabTargetUrl(url) {
+    return normalizeQuoraProfileUrl(url) || url
+}
+
+function pruneProfileNukeProgress(records, maxEntries = MAX_PROFILE_NUKE_PROGRESS_ENTRIES) {
+    const entries = Object.entries(records || {})
+        .filter(([key, value]) => !!key && value && typeof value === 'object')
+        .sort((left, right) => {
+            const leftUpdatedAt = Number.isFinite(left[1].updatedAt) ? left[1].updatedAt : 0
+            const rightUpdatedAt = Number.isFinite(right[1].updatedAt) ? right[1].updatedAt : 0
+            return rightUpdatedAt - leftUpdatedAt || left[0].localeCompare(right[0])
+        })
+
+    if(maxEntries > 0 && entries.length > maxEntries) {
+        entries.length = maxEntries
+    }
+
+    return Object.fromEntries(entries)
+}
+
+function mergeProfileProgressEvents(existingEvents = [], incomingEvents = []) {
+    const seen = new Set()
+    const merged = []
+
+    for(const value of [...existingEvents, ...incomingEvents]) {
+        const normalized = `${value || ''}`.trim()
+        if(!normalized || seen.has(normalized)) continue
+        seen.add(normalized)
+        merged.push(normalized)
+    }
+
+    merged.sort()
+    return merged.slice(-12)
+}
+
+function mergeUniqueStringList(...values) {
+    const seen = new Set()
+    const merged = []
+
+    for(const value of values.flat()) {
+        const normalized = `${value || ''}`.trim()
+        if(!normalized || seen.has(normalized)) continue
+        seen.add(normalized)
+        merged.push(normalized)
+    }
+
+    return merged
+}
+
+function mergeStoredProfileProgressRecord(existing = null, incoming = null, normalizedHref = '') {
+    const left = existing && typeof existing === 'object' ? existing : {}
+    const right = incoming && typeof incoming === 'object' ? incoming : {}
+    const leftUpdatedAt = Number.isFinite(left.updatedAt) ? left.updatedAt : 0
+    const rightUpdatedAt = Number.isFinite(right.updatedAt) ? right.updatedAt : 0
+    const newer = rightUpdatedAt >= leftUpdatedAt ? right : left
+    const older = newer === right ? left : right
+
+    const merged = {
+        ...older,
+        ...newer,
+        profileHref: normalizedHref || newer.profileHref || older.profileHref || ''
+    }
+
+    merged.updatedAt = Math.max(leftUpdatedAt, rightUpdatedAt, Date.now())
+
+    if(left.postKeys || right.postKeys) {
+        merged.postKeys = mergeUniqueStringList(left.postKeys || [], right.postKeys || [])
+    }
+    if(left.postUrls || right.postUrls) {
+        merged.postUrls = mergeUniqueStringList(left.postUrls || [], right.postUrls || [])
+    }
+
+    const mergedEvents = mergeProfileProgressEvents(left.events || [], right.events || [])
+    if(mergedEvents.length) {
+        merged.events = mergedEvents
+    }
+
+    return merged
+}
+
+function normalizeStoredProfileNukeProgress(records) {
+    const nextRecords = {}
+    const entries = Object.entries(records || {})
+        .filter(([key, value]) => !!key && value && typeof value === 'object')
+        .sort((left, right) => {
+            const leftUpdatedAt = Number.isFinite(left[1]?.updatedAt) ? left[1].updatedAt : 0
+            const rightUpdatedAt = Number.isFinite(right[1]?.updatedAt) ? right[1].updatedAt : 0
+            return leftUpdatedAt - rightUpdatedAt || left[0].localeCompare(right[0])
+        })
+
+    for(const [key, value] of entries) {
+        const normalizedHref = normalizeQuoraProfileUrl(value?.profileHref || key || '')
+        if(!normalizedHref) continue
+
+        nextRecords[normalizedHref] = mergeStoredProfileProgressRecord(
+            nextRecords[normalizedHref] || null,
+            value,
+            normalizedHref
+        )
+    }
+
+    return pruneProfileNukeProgress(nextRecords)
+}
+
+function normalizeProgressPatch(profileHref, patch = {}, existing = null) {
+    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
+    if(!normalizedHref) return null
+
+    const previous = existing || profileNukeProgress?.[normalizedHref] || {}
+    const next = {
+        ...previous,
+        ...patch,
+        profileHref: normalizedHref,
+        updatedAt: Date.now()
+    }
+
+    if(patch.postKeys || previous.postKeys) {
+        next.postKeys = mergeUniqueStringList(previous.postKeys || [], patch.postKeys || [])
+    }
+    if(patch.postUrls || previous.postUrls) {
+        next.postUrls = mergeUniqueStringList(previous.postUrls || [], patch.postUrls || [])
+    }
+
+    const event = `${patch.event || ''}`.trim()
+    if(event) {
+        next.events = [
+            ...(Array.isArray(previous.events) ? previous.events : []),
+            `${new Date().toISOString()} ${event}`
+        ].slice(-12)
+    }
+
+    delete next.event
+    return next
+}
+
+async function loadProfileNukeProgress() {
+    try {
+        const stored = await browser.storage.local.get({[PROFILE_NUKE_PROGRESS_KEY]: {}})
+        const nextProgress = normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
+        profileNukeProgress = nextProgress
+        if(JSON.stringify(nextProgress) !== JSON.stringify(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})) {
+            await browser.storage.local.set({[PROFILE_NUKE_PROGRESS_KEY]: nextProgress})
+        }
+    }
+    catch {
+        profileNukeProgress = {}
+    }
+}
+
+const profileNukeProgressReady = loadProfileNukeProgress()
+
+async function persistProfileNukeProgress() {
+    profileNukeProgress = pruneProfileNukeProgress(profileNukeProgress)
+
+    try {
+        await browser.storage.local.set({[PROFILE_NUKE_PROGRESS_KEY]: profileNukeProgress})
+    }
+    catch {}
+}
+
+async function recordProfileNukeProgress(profileHref, patch = {}) {
+    await profileNukeProgressReady
+
+    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
+    if(!normalizedHref) return null
+
+    const nextRecord = normalizeProgressPatch(normalizedHref, patch)
+    if(!nextRecord) return null
+
+    profileNukeProgress = {
+        ...profileNukeProgress,
+        [normalizedHref]: nextRecord
+    }
+    await persistProfileNukeProgress()
+    return nextRecord
+}
+
+async function recordProfileNukeProgressBatch(updates = []) {
+    await profileNukeProgressReady
+
+    let changed = false
+    const nextProgress = {
+        ...profileNukeProgress
+    }
+
+    for(const update of updates) {
+        const normalizedHref = normalizeQuoraProfileUrl(update?.profileHref || update?.href || '')
+        if(!normalizedHref) continue
+
+        const nextRecord = normalizeProgressPatch(normalizedHref, update?.patch || {}, nextProgress[normalizedHref] || null)
+        if(!nextRecord) continue
+
+        nextProgress[normalizedHref] = nextRecord
+        changed = true
+    }
+
+    if(!changed) return false
+
+    profileNukeProgress = nextProgress
+    await persistProfileNukeProgress()
+    return true
+}
+
+function getQueuedTabMetadata(tabId) {
+    return queuedTabMetadata.get(tabId) || null
+}
+
+function setQueuedTabMetadata(tabId, metadata = {}) {
+    if(!tabId) return
+    queuedTabMetadata.set(tabId, {
+        ...(queuedTabMetadata.get(tabId) || {}),
+        ...metadata,
+        updatedAt: Date.now()
+    })
+}
+
+function clearQueuedTabMetadata(tabId) {
+    if(!tabId) return
+    queuedTabMetadata.delete(tabId)
+}
+
+async function buildTabCreateOptions(action = {}) {
+    const options = {
+        url: normalizeTabTargetUrl(action.url),
+        active: false
+    }
+
+    if(action.ownerWindowId) {
+        options.windowId = action.ownerWindowId
+    }
+    if(action.ownerWindowId && action.ownerTabId && `${action.tabAction || ''}` !== 'nuke') {
+        options.openerTabId = action.ownerTabId
+    }
+
+    return options
+}
+
+async function createOwnedTab(action = {}) {
+    const options = await buildTabCreateOptions(action)
+
+    try {
+        return await browser.tabs.create(options)
+    }
+    catch(error) {
+        if(!options.windowId && !options.openerTabId) throw error
+
+        const fallbackOptions = {
+            url: options.url,
+            active: options.active
+        }
+        return browser.tabs.create(fallbackOptions)
+    }
+}
+
+async function restoreOwnerTabFocus(metadata = null) {
+    const ownerTabId = metadata?.ownerTabId || null
+    if(!ownerTabId || !metadata?.foregroundPromotedAt) return false
+
+    try {
+        const ownerTab = await browser.tabs.get(ownerTabId)
+        if(metadata?.ownerWindowId || ownerTab?.windowId) {
+            try {
+                await browser.windows.update(metadata.ownerWindowId || ownerTab.windowId, {focused: true})
+            }
+            catch {}
+        }
+        await browser.tabs.update(ownerTabId, {active: true})
+        return true
+    }
+    catch {
+        return false
+    }
+}
+
+async function promoteQueuedTab(tabId, reason = '') {
+    if(!tabId) return {promoted: false}
+
+    const metadata = getQueuedTabMetadata(tabId)
+    if(!metadata) return {promoted: false}
+
+    try {
+        const tab = await browser.tabs.get(tabId)
+        if(metadata?.ownerWindowId || tab?.windowId) {
+            try {
+                await browser.windows.update(metadata.ownerWindowId || tab.windowId, {focused: true})
+            }
+            catch {}
+        }
+        await browser.tabs.update(tabId, {active: true})
+        setQueuedTabMetadata(tabId, {
+            foregroundPromotedAt: Date.now(),
+            foregroundPromotionReason: `${reason || ''}`.trim()
+        })
+        if(metadata.profileHref) {
+            await recordProfileNukeProgress(metadata.profileHref, {
+                event: `Queued tab promoted to the foreground${reason ? ` (${reason})` : ''}`
+            })
+        }
+        return {promoted: true}
+    }
+    catch {
+        return {promoted: false}
+    }
+}
+
+function markQueuedTabClosing(tabId, reason = '') {
+    if(!tabId) return
+    setQueuedTabMetadata(tabId, {
+        closeRequestedAt: Date.now(),
+        closeReason: `${reason || ''}`.trim()
+    })
+}
+
+function getErrorPageUrl(url = '') {
+    const value = `${url || ''}`.trim()
+    if(!value) return ''
+
+    if(/^(?:chrome|edge|about|moz-extension|chrome-error):/i.test(value)) return value
+
+    try {
+        const parsed = new URL(value)
+        const hostname = `${parsed.hostname || ''}`.toLowerCase()
+        if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return value
+        if(hostname && hostname !== 'quora.com' && hostname !== 'www.quora.com' && !hostname.endsWith('.quora.com')) {
+            return value
+        }
+    }
+    catch {
+        return value
+    }
+
+    return ''
+}
 
 function serializeOwnedTabIdsByParent() {
     const serialized = {}
@@ -136,8 +671,18 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
 
     for(const tabId of ownedTabIds) {
         try {
-            const response = await sendTabMessage(tabId, {action: 'close-if-blocked'})
-            if(response?.willClose) signaled += 1
+            const metadata = getQueuedTabMetadata(tabId)
+            if(metadata?.closeRequestedAt) continue
+            const response = await sendTabMessage(tabId, {
+                action: 'close-if-blocked',
+                requestedProfileHref: metadata?.profileHref || ''
+            })
+            if(response?.willClose) {
+                signaled += 1
+                releaseQueuedTab(tabId)
+                markQueuedTabClosing(tabId, 'background-blocked-sweep')
+                await browser.tabs.remove(tabId).catch(() => {})
+            }
         }
         catch {}
     }
@@ -145,7 +690,159 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
     return {owned: ownedTabIds.length, signaled}
 }
 
-function getOwnedNukeStatus(parentTabId) {
+function isTerminalProfileNukeRecord(record) {
+    return !!record && (
+        !!record.blockSucceeded ||
+        record.status === 'blocked' ||
+        record.status === 'already-blocked' ||
+        record.status === 'error' ||
+        record.status === 'error-page' ||
+        record.status === 'profile-unavailable' ||
+        record.status === 'interrupted'
+    )
+}
+
+function isTransientProfileNukeStatus(status) {
+    return new Set([
+        'queued',
+        'tab-opening',
+        'tab-opened',
+        'awaiting-visibility',
+        'page-ready',
+        'muting',
+        'blocking'
+    ]).has(`${status || ''}`.trim())
+}
+
+function getProgressHeartbeatAt(record) {
+    return Number.isFinite(record?.updatedAt) ? record.updatedAt : 0
+}
+
+function getActiveQueuedTabStaleTimeoutMs(record) {
+    const status = `${record?.status || ''}`.trim()
+    if(status === 'muting' || status === 'blocking') {
+        return STALE_ACTIVE_ACTION_QUEUED_TAB_MS
+    }
+
+    return STALE_ACTIVE_QUEUED_TAB_MS
+}
+
+function cleanupQueuedTabState(tabId) {
+    if(!tabId) return
+    releaseQueuedTab(tabId)
+    unregisterOwnedTab(tabId)
+    clearQueuedTabMetadata(tabId)
+}
+
+async function pruneQueuedTabActions(ownerTabId = null) {
+    await profileNukeProgressReady
+
+    const seenQueuedKeys = new Set()
+    for(const tabId of Array.from(activeQueuedTabs)) {
+        const metadata = getQueuedTabMetadata(tabId)
+        const normalizedHref = normalizeQuoraProfileUrl(metadata?.profileHref || '')
+        const ownerId = metadata?.ownerTabId || owningParentByChild.get(tabId) || null
+        if(!normalizedHref || !ownerId) continue
+        if(ownerTabId && ownerId !== ownerTabId) continue
+        seenQueuedKeys.add(`${ownerId}|${normalizedHref}|nuke`)
+    }
+
+    for(let index = queuedTabActions.length - 1; index >= 0; index -= 1) {
+        const action = queuedTabActions[index]
+        const actionOwnerTabId = action?.ownerTabId || null
+        if(ownerTabId && actionOwnerTabId !== ownerTabId) continue
+
+        const normalizedHref = normalizeQuoraProfileUrl(action?.url || '')
+        const actionKey = `${actionOwnerTabId}|${normalizedHref}|${action?.tabAction || ''}`
+        const record = normalizedHref ? profileNukeProgress?.[normalizedHref] || null : null
+        const dropAction = isTerminalProfileNukeRecord(record) || seenQueuedKeys.has(actionKey)
+
+        if(!dropAction) {
+            seenQueuedKeys.add(actionKey)
+            continue
+        }
+
+        if(actionOwnerTabId && action?.url) {
+            rememberCanceledOwnerUrls(actionOwnerTabId, [action.url])
+        }
+        queuedTabActions.splice(index, 1)
+    }
+}
+
+async function sweepStaleQueuedTabs(parentTabId = null) {
+    await pruneQueuedTabActions(parentTabId)
+    const now = Date.now()
+    const activeTabIds = Array.from(activeQueuedTabs)
+
+    for(const tabId of activeTabIds) {
+        const metadata = getQueuedTabMetadata(tabId)
+
+        try {
+            await browser.tabs.get(tabId)
+        }
+        catch {
+            cleanupQueuedTabState(tabId)
+            continue
+        }
+
+        const progressRecord = metadata?.profileHref
+            ? profileNukeProgress?.[normalizeQuoraProfileUrl(metadata.profileHref)] || null
+            : null
+        const metadataUpdatedAt = Number.isFinite(metadata?.updatedAt)
+            ? metadata.updatedAt
+            : Number.isFinite(metadata?.openedAt)
+                ? metadata.openedAt
+                : 0
+        const lastUpdatedAt = Math.max(metadataUpdatedAt, getProgressHeartbeatAt(progressRecord))
+        const staleTimeoutMs = getActiveQueuedTabStaleTimeoutMs(progressRecord)
+
+        if(progressRecord && isTerminalProfileNukeRecord(progressRecord) && !metadata?.closeRequestedAt) {
+            markQueuedTabClosing(tabId, 'terminal-progress-record')
+            cleanupQueuedTabState(tabId)
+            try {
+                await browser.tabs.remove(tabId)
+            }
+            catch {}
+            continue
+        }
+
+        const closeRequestedAt = Number.isFinite(metadata?.closeRequestedAt) ? metadata.closeRequestedAt : 0
+        if(closeRequestedAt && now - closeRequestedAt >= STALE_CLOSE_REQUESTED_QUEUED_TAB_MS) {
+            cleanupQueuedTabState(tabId)
+            try {
+                await browser.tabs.remove(tabId)
+            }
+            catch {}
+            continue
+        }
+
+        if(metadata?.closeRequestedAt || !lastUpdatedAt || now - lastUpdatedAt < staleTimeoutMs) {
+            continue
+        }
+
+        markQueuedTabClosing(tabId, 'stale-active-tab')
+        if(metadata?.profileHref) {
+            void recordProfileNukeProgress(metadata.profileHref, {
+                status: 'interrupted',
+                finalError: 'Queued tab timed out waiting for completion',
+                errorPageUrl: metadata.lastUrl || '',
+                event: 'Queued tab closed after timing out waiting for completion'
+            })
+        }
+        cleanupQueuedTabState(tabId)
+        try {
+            await browser.tabs.remove(tabId)
+        }
+        catch {}
+    }
+
+    if(parentTabId) {
+        await getLiveOwnedTabIds(parentTabId)
+    }
+}
+
+async function getOwnedNukeStatus(parentTabId) {
+    await sweepStaleQueuedTabs(parentTabId)
     const owned = ownedTabIdsByParent.get(parentTabId)?.size || 0
     const active = Array.from(activeQueuedTabs).filter(tabId => owningParentByChild.get(tabId) === parentTabId).length
     const queued = queuedTabActions.filter(action => action.ownerTabId === parentTabId && action.tabAction === 'nuke').length
@@ -187,6 +884,37 @@ function consumeCanceledOwnerUrls(ownerTabId) {
     return urls
 }
 
+async function stopOwnerNukes(ownerTabId, options = {}) {
+    if(!ownerTabId) return {canceledUrls: [], ownedTabIds: []}
+
+    const {
+        closeOwnedTabs = true,
+        keepTabId = null,
+        reason = 'owner-stop-request'
+    } = options
+
+    pausedQueuedOwners.add(ownerTabId)
+    const canceledUrls = cancelQueuedOwnerActions(ownerTabId, 'nuke')
+    rememberCanceledOwnerUrls(ownerTabId, canceledUrls)
+
+    const ownedTabIds = closeOwnedTabs
+        ? (await getLiveOwnedTabIds(ownerTabId)).filter(tabId => tabId && tabId !== keepTabId)
+        : []
+
+    for(const tabId of ownedTabIds) {
+        markQueuedTabClosing(tabId, reason)
+    }
+
+    if(ownedTabIds.length) {
+        try {
+            await browser.tabs.remove(ownedTabIds)
+        }
+        catch {}
+    }
+
+    return {canceledUrls, ownedTabIds}
+}
+
 function releaseQueuedTab(tabId) {
     pendingTabActions.delete(tabId)
 
@@ -197,6 +925,7 @@ function releaseQueuedTab(tabId) {
 
 async function fillQueuedTabs() {
     await ownedTabIdsReady
+    await sweepStaleQueuedTabs()
 
     while(activeQueuedTabs.size < queuedTabConcurrency && queuedTabActions.length) {
         const next = queuedTabActions.shift()
@@ -207,10 +936,29 @@ async function fillQueuedTabs() {
 
         try {
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
-            const tab = await browser.tabs.create({url: next.url, active: false})
+            const tab = await createOwnedTab(next)
             activeQueuedTabs.add(tab.id)
-            pendingTabActions.set(tab.id, next.tabAction)
+            pendingTabActions.set(tab.id, {
+                action: next.tabAction || null,
+                targetUrl: next.url || ''
+            })
+            setQueuedTabMetadata(tab.id, {
+                profileHref: normalizeQuoraProfileUrl(next.url),
+                ownerTabId: next.ownerTabId || null,
+                ownerWindowId: next.ownerWindowId || null,
+                tabAction: next.tabAction || null,
+                openedAt: Date.now(),
+                lastUrl: tab.url || normalizeTabTargetUrl(next.url)
+            })
             registerOwnedTab(next.ownerTabId, tab.id)
+            await recordProfileNukeProgress(next.url, {
+                status: 'tab-opening',
+                tabOpenedAt: Date.now(),
+                ownerTabId: next.ownerTabId || null,
+                ownerWindowId: next.ownerWindowId || null,
+                lastUrl: tab.url || normalizeTabTargetUrl(next.url),
+                event: 'Background opened a queued tab'
+            })
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
         }
         catch {}
@@ -225,13 +973,87 @@ browser.runtime.onInstalled.addListener(details => {
 
 browser.tabs.onRemoved.addListener(tabId => {
     void ownedTabIdsReady.then(() => {
+        const metadata = getQueuedTabMetadata(tabId)
+        const isOwnerTab = ownedTabIdsByParent.has(tabId)
+        if(metadata?.profileHref) {
+            const progressRecord = profileNukeProgress?.[normalizeQuoraProfileUrl(metadata.profileHref)] || null
+            const shouldInterruptClosedTransient =
+                progressRecord &&
+                !isTerminalProfileNukeRecord(progressRecord) &&
+                isTransientProfileNukeStatus(progressRecord.status)
+
+            void recordProfileNukeProgress(metadata.profileHref, {
+                ...(shouldInterruptClosedTransient ? {
+                    status: 'interrupted',
+                    finalError: progressRecord?.finalError || (
+                        metadata?.closeReason
+                            ? `Queued tab closed before reaching a terminal state (${metadata.closeReason})`
+                            : 'Queued tab closed before reaching a terminal state'
+                    )
+                } : {}),
+                tabClosedAt: Date.now(),
+                closedByExtension: !!metadata.closeRequestedAt,
+                closeReason: metadata.closeReason || '',
+                event: 'Queued tab closed'
+            })
+        }
+        void restoreOwnerTabFocus(metadata)
+        if(isOwnerTab) {
+            void stopOwnerNukes(tabId, {
+                closeOwnedTabs: true,
+                reason: 'owner-tab-closed'
+            })
+        }
         pausedQueuedOwners.delete(tabId)
         releaseQueuedTab(tabId)
         unregisterOwnedTab(tabId)
+        clearQueuedTabMetadata(tabId)
     })
 })
 
-browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    const metadata = getQueuedTabMetadata(tabId)
+    if(metadata?.profileHref) {
+        const lastUrl = `${changeInfo.url || tab?.url || metadata.lastUrl || ''}`.trim()
+        if(lastUrl) {
+            const errorPageUrl = getErrorPageUrl(lastUrl)
+            const resolvedProfileHref = normalizeQuoraProfileUrl(lastUrl) || ''
+            const remappedFromRequested = !!(
+                metadata.profileHref &&
+                resolvedProfileHref &&
+                resolvedProfileHref !== metadata.profileHref
+            )
+            setQueuedTabMetadata(tabId, {lastUrl})
+            void recordProfileNukeProgress(metadata.profileHref, {
+                lastUrl,
+                resolvedProfileHref,
+                remappedFromRequested,
+                errorPageUrl,
+                event: changeInfo.url ? `Tab navigated to ${lastUrl}` : ''
+            })
+
+            if(errorPageUrl && /^(?:chrome|edge|about|moz-extension|chrome-error):/i.test(errorPageUrl)) {
+                releaseQueuedTab(tabId)
+                markQueuedTabClosing(tabId, 'browser-error-page')
+                void recordProfileNukeProgress(metadata.profileHref, {
+                    status: 'error-page',
+                    finalError: 'Queued tab navigated to a browser error page',
+                    errorPageUrl,
+                    event: 'Queued tab closed after navigating to a browser error page'
+                })
+                if(metadata.ownerTabId) {
+                    void sendTabMessage(metadata.ownerTabId, {
+                        status: 'owner-nuke-url-failed',
+                        url: metadata.profileHref,
+                        reason: 'Queued tab navigated to a browser error page'
+                    })
+                }
+                void browser.tabs.remove(tabId).catch(() => {})
+                return
+            }
+        }
+    }
+
     if(changeInfo.status !== 'loading') return
 
     pausedQueuedOwners.add(tabId)
@@ -241,22 +1063,33 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if(request.action === 'create-tab') {
-        return browser.tabs.create({url: request.url, active: false}).then(tab => {
-            if(request.tabAction) pendingTabActions.set(tab.id, request.tabAction)
+        return createOwnedTab({
+            url: request.url,
+            ownerTabId: sender.tab?.id || null,
+            ownerWindowId: sender.tab?.windowId || null
+        }).then(tab => {
+            if(request.tabAction) {
+                pendingTabActions.set(tab.id, {
+                    action: request.tabAction,
+                    targetUrl: request.url || ''
+                })
+            }
             return {tabId: tab.id}
         })
     }
     else if(request.action === 'enqueue-tabs') {
-        const urls = Array.isArray(request.urls) ? request.urls.filter(Boolean) : []
+        const urls = Array.isArray(request.urls) ? request.urls.map(normalizeTabTargetUrl).filter(Boolean) : []
         if(!urls.length) return Promise.resolve({queued: 0})
         const ownerTabId = sender.tab?.id || null
+        const ownerWindowId = sender.tab?.windowId || null
 
         return ownedTabIdsReady.then(() => {
             pausedQueuedOwners.delete(ownerTabId)
-            queuedTabConcurrency = Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1)
+            const requestedConcurrency = Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1)
+            queuedTabConcurrency = requestedConcurrency
 
             for(const url of urls) {
-                queuedTabActions.push({url, tabAction: request.tabAction || null, ownerTabId})
+                queuedTabActions.push({url, tabAction: request.tabAction || null, ownerTabId, ownerWindowId})
             }
 
             void sweepOwnedBlockedProfileTabs(ownerTabId)
@@ -270,6 +1103,9 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = pendingTabActions.get(tabId) || null
         pendingTabActions.delete(tabId)
         return Promise.resolve(action)
+    }
+    else if(request.action === 'promote-queued-tab') {
+        return promoteQueuedTab(sender.tab?.id || null, request.reason || '')
     }
     else if(request.action === 'release-tab-slot') {
         const tabId = sender.tab?.id
@@ -299,13 +1135,19 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         releaseQueuedTab(tabId)
 
         if(tabId) {
-            setTimeout(() => {
-                void browser.tabs.remove(tabId).catch(() => {})
-            }, 0)
-            return Promise.resolve({closed: true})
+            markQueuedTabClosing(tabId, 'content-close-request')
+            return browser.tabs.remove(tabId)
+                .then(() => ({closed: true}))
+                .catch(() => ({closed: false}))
         }
 
         return Promise.resolve({closed: false})
+    }
+    else if(request.action === 'record-nuke-progress') {
+        return recordProfileNukeProgress(request.profileHref, request.patch || {}).then(record => ({recorded: !!record}))
+    }
+    else if(request.action === 'record-nuke-progress-batch') {
+        return recordProfileNukeProgressBatch(Array.isArray(request.updates) ? request.updates : []).then(recorded => ({recorded: !!recorded}))
     }
     else if(request.action === 'get-owned-nuke-status') {
         return ownedTabIdsReady.then(async () => {
