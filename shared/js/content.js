@@ -55,6 +55,8 @@ let spaceFeedProgressReconcileTimeout = null
 let spaceFeedProgressReconcilePending = false
 let suppressSpaceAssetNukeRefreshUntil = 0
 let latestSpaceFeedEntries = []
+let spaceFeedEntryCache = new Map()
+let spaceFeedRootCache = new WeakMap()
 let closeTabRetryTimeouts = []
 let blockedCloseCheckTimeouts = []
 let currentUrl = location.href
@@ -784,6 +786,7 @@ function startObserver() {
             resetQuestionPageBtn()
             resetSpacePostNukeBtn()
             resetSpaceAssetNukeControls()
+            resetSpaceFeedScanCache()
 
             const nextProfileKey = getProfileKey(currentUrl)
             if(previousProfileKey !== nextProfileKey) {
@@ -805,6 +808,7 @@ function startObserver() {
         }
         else if(page === 'space') {
             if(!areExtensionOnlyMutations(mutations)) {
+                invalidateSpaceFeedEntryCacheForMutations(mutations)
                 injectSpaceSidebarOpenProfilesBtn()
                 if(shouldRefreshSpaceClassificationControls()) {
                     scheduleSpaceClassificationControls(120)
@@ -833,19 +837,74 @@ function startObserver() {
 function installSpaceFeedViewportRefresh() {
     if(spaceAssetNukeViewportListenerInstalled) return
 
-    const scheduleFromViewport = () => {
+    const scheduleFromResize = () => {
         if(getPageType() !== 'space') return
 
         clearTimeout(spaceAssetNukeViewportTimeout)
         spaceAssetNukeViewportTimeout = setTimeout(() => {
             spaceAssetNukeViewportTimeout = null
-            scheduleSpaceAssetNukeControls(0)
-        }, 90)
+            syncSpaceFeedCachedViewportControls()
+        }, 160)
     }
 
-    window.addEventListener('scroll', scheduleFromViewport, {passive: true})
-    window.addEventListener('resize', scheduleFromViewport, {passive: true})
+    window.addEventListener('resize', scheduleFromResize, {passive: true})
     spaceAssetNukeViewportListenerInstalled = true
+}
+
+function resetSpaceFeedScanCache() {
+    latestSpaceFeedEntries = []
+    spaceFeedEntryCache = new Map()
+    spaceFeedRootCache = new WeakMap()
+}
+
+function getSpaceFeedPostRootFromMutationNode(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement || null
+    if(!element || isExtensionOwnedNode(element)) return null
+
+    const timestamp = element.matches?.('a.post_timestamp')
+        ? element
+        : element.querySelector?.('a.post_timestamp') || null
+    if(timestamp) {
+        return getSpaceFeedPostRoot(timestamp) || getSpaceFeedPreferredRoot(timestamp)
+    }
+
+    const markedRoot = element.closest?.('[data-mb-space-feed-post-key]')
+    if(markedRoot) return markedRoot
+
+    const likelyRoot = element.closest?.(
+        '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
+        '.puppeteer_test_tribe_post_item_feed_story,' +
+        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
+        'article,' +
+        '[role="article"]'
+    )
+    return likelyRoot?.querySelector?.('a.post_timestamp') ? likelyRoot : null
+}
+
+function invalidateSpaceFeedEntryCacheForMutations(mutations) {
+    if(!spaceFeedEntryCache.size) return
+
+    for(const mutation of mutations || []) {
+        for(const node of [...Array.from(mutation.addedNodes || []), ...Array.from(mutation.removedNodes || [])]) {
+            const postRoot = getSpaceFeedPostRootFromMutationNode(node)
+            const timestamp = postRoot?.querySelector?.('a.post_timestamp')
+            if(!postRoot || !timestamp) continue
+
+            const postKey = getSpaceFeedPostKey(postRoot, timestamp)
+            if(postKey) {
+                spaceFeedEntryCache.delete(postKey)
+            }
+        }
+    }
+}
+
+function syncSpaceFeedCachedViewportControls() {
+    if(getPageType() !== 'space' || !latestSpaceFeedEntries.length || !isNukableSpacePage()) return false
+
+    const entries = getLatestSpaceFeedEntries()
+    syncSpaceFeedTopNukeButton(entries)
+    syncSpaceFeedTopBarLayout()
+    return true
 }
 
 function isExtensionOwnedNode(node) {
@@ -4507,23 +4566,7 @@ function getSpaceFeedCardRoots() {
     const seen = new Set()
 
     for(const timestamp of getVisibleSpaceFeedTimestamps()) {
-        let matched = getSpaceFeedPreferredRoot(timestamp)
-        let node = timestamp.parentElement
-
-        while(node && node !== root) {
-            if(isSpaceFeedRootCandidate(node, timestamp)) {
-                matched = node
-            }
-
-            node = node.parentElement
-        }
-
-        if(!matched) {
-            const directCard = timestamp.closest('.q-click-wrapper, article, [role="article"], .q-box')
-            if(isSpaceFeedRootCandidate(directCard, timestamp)) {
-                matched = directCard
-            }
-        }
+        const matched = getSpaceFeedCardRootForTimestamp(timestamp, root)
 
         if(matched && !seen.has(matched)) {
             seen.add(matched)
@@ -4534,10 +4577,47 @@ function getSpaceFeedCardRoots() {
     return roots
 }
 
+function getSpaceFeedCardRootForTimestamp(timestamp, root = getSpaceFeedContentRoot()) {
+    if(!timestamp || !root) return null
+
+    const preferredRoot = getSpaceFeedPreferredRoot(timestamp)
+    const cached = spaceFeedRootCache.get(timestamp)
+    if(cached?.isConnected &&
+        cached.contains(timestamp) &&
+        root.contains(cached) &&
+        (cached === preferredRoot || isSpaceFeedRootCandidate(cached, timestamp))) {
+        return cached
+    }
+
+    let matched = preferredRoot
+    let node = timestamp.parentElement
+
+    while(node && node !== root) {
+        if(isSpaceFeedRootCandidate(node, timestamp)) {
+            matched = node
+        }
+
+        node = node.parentElement
+    }
+
+    if(!matched) {
+        const directCard = timestamp.closest('.q-click-wrapper, article, [role="article"], .q-box')
+        if(isSpaceFeedRootCandidate(directCard, timestamp)) {
+            matched = directCard
+        }
+    }
+
+    if(matched) {
+        spaceFeedRootCache.set(timestamp, matched)
+    }
+
+    return matched
+}
+
 function getSpaceFeedPostRoot(timestamp) {
     if(!timestamp) return null
 
-    return getSpaceFeedCardRoots().find(root => root.querySelector('a.post_timestamp') === timestamp) || null
+    return getSpaceFeedCardRootForTimestamp(timestamp) || null
 }
 
 function getSpaceFeedPostUrl(timestamp) {
@@ -5003,6 +5083,7 @@ function getSpaceFeedPostEntries() {
     const entries = []
     const roots = getSpaceFeedCardRoots()
     const contentRoot = getSpaceFeedContentRoot()
+    const activeKeys = new Set()
 
     for(const postRoot of roots) {
         const timestamp = postRoot.querySelector('a.post_timestamp')
@@ -5010,24 +5091,47 @@ function getSpaceFeedPostEntries() {
 
         const postKey = getSpaceFeedPostKey(postRoot, timestamp)
         if(!postKey) continue
+        activeKeys.add(postKey)
 
-        let candidateUrls = getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)
-        let node = postRoot.parentElement
+        const postUrl = getSpaceFeedPostUrl(timestamp)
+        const cached = spaceFeedEntryCache.get(postKey)
+        let candidateUrls = null
 
-        while(!candidateUrls.length && node && node !== contentRoot) {
-            if(isSpaceFeedRootCandidate(node, timestamp)) {
-                candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
+        if(cached?.postRoot === postRoot && cached.postUrl === postUrl && postRoot.isConnected) {
+            candidateUrls = [...cached.candidateUrls]
+        }
+        else {
+            candidateUrls = getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)
+            let node = postRoot.parentElement
+
+            while(!candidateUrls.length && node && node !== contentRoot) {
+                if(isSpaceFeedRootCandidate(node, timestamp)) {
+                    candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
+                }
+
+                node = node.parentElement
             }
 
-            node = node.parentElement
+            candidateUrls = getNormalizedProfileHrefList(candidateUrls)
+            spaceFeedEntryCache.set(postKey, {
+                postRoot,
+                postUrl,
+                candidateUrls
+            })
         }
 
         entries.push({
             postKey,
             postRoot,
-            postUrl: getSpaceFeedPostUrl(timestamp),
+            postUrl,
             candidateUrls
         })
+    }
+
+    for(const [postKey, cached] of spaceFeedEntryCache) {
+        if(!activeKeys.has(postKey) || !cached?.postRoot?.isConnected) {
+            spaceFeedEntryCache.delete(postKey)
+        }
     }
 
     return entries
@@ -5038,6 +5142,7 @@ function setLatestSpaceFeedEntries(entries) {
         postKey: entry?.postKey || '',
         postUrl: entry?.postUrl || '',
         candidateUrls: getNormalizedProfileHrefList(entry?.candidateUrls || []),
+        postRoot: entry?.postRoot || null,
         viewportTop: entry?.postRoot?.getBoundingClientRect?.().top ?? null,
         viewportBottom: entry?.postRoot?.getBoundingClientRect?.().bottom ?? null
     })).filter(entry => !!entry.postKey)
@@ -5045,12 +5150,20 @@ function setLatestSpaceFeedEntries(entries) {
 
 function getLatestSpaceFeedEntries() {
     return latestSpaceFeedEntries.map(entry => ({
+        ...getUpdatedSpaceFeedEntryViewport(entry),
         postKey: entry.postKey,
         postUrl: entry.postUrl,
-        candidateUrls: [...entry.candidateUrls],
-        viewportTop: entry.viewportTop,
-        viewportBottom: entry.viewportBottom
+        candidateUrls: [...entry.candidateUrls]
     }))
+}
+
+function getUpdatedSpaceFeedEntryViewport(entry) {
+    const rect = entry?.postRoot?.isConnected ? entry.postRoot.getBoundingClientRect() : null
+
+    return {
+        viewportTop: rect?.top ?? entry?.viewportTop ?? null,
+        viewportBottom: rect?.bottom ?? entry?.viewportBottom ?? null
+    }
 }
 
 function getSpaceFeedDetectionSnapshot(entries = null) {
