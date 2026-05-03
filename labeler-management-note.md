@@ -19,6 +19,7 @@ This note is still planning material only.
 
 Current repo reality:
 
+- `refactor/1.5` is reorganizing the local nuke, queue, and progress-state internals before shared moderation work
 - there is no labeler service in this repository
 - there is no current operational need to host one for the extension's shipped feature set
 - the extension now has persistent local memory of remembered space-post `Nuke 'Em` results, with manual clearing plus local auto-pruning by age and entry cap

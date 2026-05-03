@@ -11,6 +11,7 @@ This note should be read as a collaboration memo
 
 Current repo reality:
 
+- `refactor/1.5` is the active internal architecture reset for queueing, target selection, and state handling
 - `mute-block-main` already ships extension-native execution on current Quora pages
 - Blockzooka still looks valuable as a source of workflow knowledge, collection heuristics, and operator experience
 - there is no direct import bridge today between Blockzooka outputs and the extension

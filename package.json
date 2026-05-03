@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.4.247",
+  "version": "1.5.0",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -9,7 +9,7 @@
     "build:firefox": "web-ext build --config=firefox-config.cjs",
     "chrome": "web-ext run --config=chrome-config.cjs",
     "firefox": "web-ext run --config=firefox-config.cjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/subject.test.js"
   },
   "keywords": [],
   "author": "",

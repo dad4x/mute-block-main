@@ -14,6 +14,7 @@ This remains a forward-looking bridge design.
 
 Current repo reality:
 
+- `refactor/1.5` is now the architecture reset branch for the accreted local nuke, queue, and state code
 - `mute-block-main` does not yet subscribe to labelers, fetch labels, resolve DIDs, or expose labeler-management UI
 - the extension does already have the local execution pieces this design would eventually feed into, including page-local actions, batch profile opening, and queued `Nuke 'Em` execution
 - the extension also now keeps a persistent local record of remembered space-post nuke results, with local clearing and pruning controls; that is still local-only, but it is a realistic seed for later reviewed export into shared labeling workflows
