@@ -18,6 +18,7 @@ This note is still design/reference material, not a description of shipped proto
 
 Current repo reality:
 
+- the `1.5` series is an internal refactor of local nuke, queue, and state architecture, not an atproto feature release
 - the extension currently acts as a local Quora action tool with local settings and queued tab execution
 - there is no implemented atproto labeler intake, modlist import, DID management, or remote moderation sync in the codebase today
 - this document remains useful as a model for how to separate published judgments from local enforcement if shared moderation features are added later

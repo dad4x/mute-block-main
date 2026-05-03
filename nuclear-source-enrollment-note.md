@@ -10,6 +10,7 @@ This note describes a possible next layer on top of the current extension, not a
 
 Current repo reality:
 
+- `refactor/1.5` is now implementing the architecture reset described by this note, starting with shared subject normalization and then moving toward explicit targets, runs, and progress events
 - `Nuke 'Em` already exists for supported page-local contexts and uses the background queued-tab executor
 - `Open Profiles` and related modal/page actions already exist
 - there is no persisted space-classification registry, no `asset` / `target` UI, and no labeler-backed space workflow yet

@@ -13,6 +13,7 @@ This file is research context, not an implementation plan.
 
 Current repo reality:
 
+- the `1.5` series is focused on local architecture cleanup before any labeler or atproto integration
 - the extension does not currently ship atproto integration
 - the value of this note is to calibrate expectations before any future labeler work begins
 - the present release situation is still constrained by Firefox updates being stuck on `1.2`
