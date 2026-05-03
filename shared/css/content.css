@@ -245,12 +245,13 @@
 .mb-ext_space-feed-tab-bar {
     position: relative;
     padding-right: 360px;
+    min-height: 40px;
 }
 
 .mb-ext_space-feed-status-host {
     position: absolute;
     top: 50%;
-    right: 132px;
+    right: 144px;
     transform: translateY(-50%);
     display: inline-flex;
     align-items: center;

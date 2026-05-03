@@ -36,6 +36,10 @@ function normalizeSpaceUrl(url) {
         parsed.search = ''
         parsed.hash = ''
 
+        if(parsed.hostname !== 'www.quora.com' && parsed.hostname.endsWith('.quora.com')) {
+            return `${parsed.protocol}//${parsed.hostname}`
+        }
+
         let pathname = parsed.pathname.replace(/\/+$/, '')
         if(!pathname) pathname = '/'
 

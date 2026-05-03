@@ -4,9 +4,11 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 
 ## Current Status
 
-- Source and local build artifacts are currently at `1.4.118`.
+- Source and local build artifacts are currently at `1.4.247`.
 - Chrome is the current release track.
 - Firefox store updates are currently blocked, so the published Firefox add-on is still on `1.2` until that pipeline is sorted out.
+- Within one installed extension copy, local state persists across normal page reloads.
+- Across some manual local extension replacements, browser local storage may come back empty, which can drop remembered space tags and queued-profile progress history.
 
 ## Current Feature Surface
 
@@ -73,6 +75,20 @@ Ensure you have the following installed:
 - **Run in Firefox**: `npm run firefox` This will starts the firefox browswer with extension installed
 
 In practice, run `npm run prod` before creating release zips so the packaged files match the current source.
+
+## Known Local State Limitation
+
+- The extension currently stores space classifications, remembered post state, and queued profile-progress history in extension local storage.
+- That state survives normal browsing and hard page reloads inside one installed extension copy.
+- It may not survive every manual local extension replacement or reinstall, depending on whether the browser treats the new package as the same extension identity.
+
+## Future Work
+
+- Add explicit export and import support for local state so space tags and nuke/progress history can be carried across rebuilds, reinstalls, and replacement-style local updates.
+- Cover at least:
+  - space classifications
+  - remembered nuked post state
+  - queued/profile progress history
 
 ### Resources
 
