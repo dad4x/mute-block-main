@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mute Block Coordinator</title>
+    <link rel="stylesheet" href="css/coordinator.css">
+</head>
+<body>
+    <main class="coordinator">
+        <header class="coordinator-header">
+            <div class="brand">
+                <img class="brand-mark" src="icons/116.png" alt="" aria-hidden="true">
+                <div>
+                    <h1>Mute Block Coordinator</h1>
+                    <div class="version" id="appVersion">v0.0.0</div>
+                </div>
+            </div>
+            <div class="header-status">
+                <div class="status-pill" id="refreshState">Loading</div>
+            </div>
+        </header>
+
+        <section class="summary-grid" aria-label="Coordinator summary">
+            <div class="summary-tile">
+                <div class="summary-label">Queued</div>
+                <div class="summary-value" id="queuedCount">0</div>
+            </div>
+            <div class="summary-tile">
+                <div class="summary-label">Active</div>
+                <div class="summary-value" id="activeCount">0</div>
+            </div>
+            <div class="summary-tile">
+                <div class="summary-label">Terminal</div>
+                <div class="summary-value" id="terminalCount">0</div>
+            </div>
+            <div class="summary-tile">
+                <div class="summary-label">Events</div>
+                <div class="summary-value" id="eventCount">0</div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Runs</h2>
+                <div class="panel-actions">
+                    <span id="runCount">0 runs</span>
+                    <button class="clear-button" id="clearCompletedRunsButton" type="button">Clear Completed</button>
+                </div>
+            </div>
+            <div class="list" id="runList"></div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Events</h2>
+                <div class="panel-actions">
+                    <span id="eventListCount">0 events</span>
+                    <button class="clear-button" id="clearEventsButton" type="button">Clear</button>
+                </div>
+            </div>
+            <div class="list list--compact" id="eventList"></div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Queue</h2>
+                <div class="panel-actions">
+                    <span id="retryFailedCount">0 retryable</span>
+                    <button class="clear-button" id="retryFailedButton" type="button">Retry Failed</button>
+                    <span id="queueCount">0 items</span>
+                </div>
+            </div>
+            <div class="panel-note" id="retryFailedState">Idle retry is off</div>
+            <div class="list" id="queueList"></div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Existing Progress</h2>
+                <span id="legacyCount">0 records</span>
+            </div>
+            <div class="legacy-grid">
+                <div>
+                    <div class="summary-label">Profile Progress</div>
+                    <div class="legacy-value" id="profileProgressCount">0</div>
+                </div>
+                <div>
+                    <div class="summary-label">Pending Posts</div>
+                    <div class="legacy-value" id="pendingPostCount">0</div>
+                </div>
+                <div>
+                    <div class="summary-label">Remembered Posts</div>
+                    <div class="legacy-value" id="rememberedPostCount">0</div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="js/coordinator.js"></script>
+</body>
+</html>

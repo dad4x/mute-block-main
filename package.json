@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.5.1",
+  "version": "1.5.83",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -19,5 +19,8 @@
     "laravel-mix": "^6.0.49",
     "web-ext-plugin": "^2.9.0",
     "webextension-polyfill": "^0.12.0"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.43.0"
   }
 }

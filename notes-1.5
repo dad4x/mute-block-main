@@ -1,0 +1,150 @@
+I think it's time for another step-back, as we did with the 1.5 refactor.
+
+We've nibbled and backed ourselves into a model that wasn't really planned in
+having state in the storage and a coordinator, but without working our first a
+strategy for serialization and recovery.  We seem to have grown barnacle of
+recovery willy-nilly all over the place.
+
+Mutiple entities can add things to a queue, which has an in-memory and a
+persistent representation.  Those two need to be synced from time to time.
+
+The queue needs to be de-duped.  When/where is less clear.  If it's always
+de-duped on entry, then there are never any dupes to recover; but reality
+shows when that happens, we still want to recover.
+
+When we're working on items, we launch dedicated tabs to each 'job'.  That
+'job' can get disconnected from the coordinator tab that might get closed
+during the run of the job.
+
+There is memory state that is independent of tabs -- in the service worker? --
+that we must maintain consistently.
+
+Possibly profile page user-level mute-block and mute-block-close operations
+should go through the queue instead of being direct as they are now.
+
+We should be recovering after:
+
+- browser restart;
+- coordinator destruction by a user
+- worker tab destruction by a user
+- extension reload during operation.
+
+Some possible premises:
+- true state is persistent.
+- in memory state 'owned' by the service worker, with tracking of coordinator
+and one-shot tabs.
+- coordinator uses state and launches one-shot worker tabs.
+- things check the service worker state and suicide if problems
+- next click brings back needed coordinator and/or one-shot tabs.
+
+Coordination note for the other Codex session:
+
+We think the deeper problem is architectural, not just another missing recovery
+case.  The short-term 1.5.x debugging session can still fix concrete breakages
+that block use today, but should avoid adding broad new recovery behavior until
+we have a clearer state model.  Otherwise we will keep growing more partial
+repair paths around the same confused ownership model.
+
+Terminology:
+
+- "durable" means on-disk browser extension storage.
+- The service worker is the in-memory orchestrator and mutation authority, not
+  the durable state holder.
+- Transient worker tabs do not have direct access to service-worker variables.
+  They must interact through service-worker messages or ports.
+- The coordinator page is a view/control surface.  Its existence should not be
+  required for a job to continue or recover.
+- Worker tabs are disposable executors.  Their disappearance should be handled
+  by reconciling durable job state against live tabs.
+
+Suggested invariant:
+
+Persistent storage is the source of truth for every job that must survive
+browser restart, extension reload, coordinator close, worker tab close, or
+service-worker suspension.  Service-worker memory may cache currently live tabs,
+pending messages, timers, scheduling locks, and concurrency counters, but it
+must be rebuildable from storage plus the set of currently open tabs.
+
+The state we likely need per job:
+
+- canonical dedupe key
+- action kind, such as mute-block or mute-block-close
+- run id and owner/source information
+- current status
+- attempt id or attempt counter
+- claimed worker tab id, if any
+- lease or heartbeat timestamp, if we use one
+- terminal outcome and error, if terminal
+- created, updated, and terminal timestamps
+
+The important design move is to define a state table before adding more
+recovery code.  For each status, write down:
+
+- who may transition into it
+- who may transition out of it
+- whether it may survive restart
+- what the reconciler should do if the service worker starts and finds it
+- what the reconciler should do if the claimed tab is gone
+- what the reconciler should do if the coordinator is gone
+
+Deduping should happen on entry, but that is not enough.  We still need
+repair-time dedupe because extension reloads, interrupted writes, old storage,
+and bugs can leave duplicates behind.  The durable invariant should be one
+active job per canonical subject/action/run scope, with repair collapsing
+violations deterministically.
+
+Direct profile-page mute-block and mute-block-close operations probably should
+go through the same durable queue path as coordinator-originated jobs.  Keeping
+two execution paths means keeping two recovery models.
+
+For tactical debugging, try to classify each observed failure as one of these
+questions rather than adding a local patch immediately:
+
+- Did durable storage have enough information to explain the intended work?
+- Did more than one writer mutate durable state independently?
+- Did service-worker memory contain facts that should have been durable?
+- Did a worker tab proceed without successfully claiming durable work?
+- Did coordinator UI state get treated as execution truth?
+- Did storage and in-memory queues disagree, and which one should have won?
+
+If a short-term fix is needed, prefer one that moves the code toward these
+invariants: service-worker-mediated writes, durable job records, disposable
+worker tabs, coordinator as UI only, and a single reconciler for stale
+nonterminal states.
+
+Handoff for a fresh /new design context:
+
+Start from this note and do design work first.  Do not begin by editing code.
+The goal is to produce the durable job/state-machine model that the debugging
+session can compare against.
+
+The fresh context should focus on:
+
+- define the durable job record shape
+- define canonical dedupe key and dedupe scope
+- define statuses and allowed transitions
+- define which actor may write each transition
+- define service-worker command/query protocol for transient worker tabs
+- define coordinator responsibilities as UI/control only
+- define worker-tab responsibilities as disposable executors only
+- define startup/reload/tab-close/coordinator-close reconciliation rules
+- decide how profile-page direct mute-block actions join the queue model
+- identify migration rules for existing `mbProfileNukeProgress`,
+  `mbCoordinatorQueue`, and `mbCoordinatorRuns` state
+
+Suggested output from the fresh context:
+
+- one state table
+- one durable record schema
+- one reconciler rule table
+- one message protocol sketch
+- one incremental refactor plan split into safe slices
+
+The tactical debugging context can keep fixing concrete 1.5.x breakages, but
+new broad recovery behavior should be checked against the model from the fresh
+design context before being added.
+
+Design output started from this handoff:
+
+- `top-level-rethink-1.5.md`
+- `top-level-rethink-1.5-execution-plan.md`

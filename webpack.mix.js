@@ -18,6 +18,9 @@ mix.options({
 .js('./shared/js/popup.js', 'chrome/js')
 .js('./shared/js/popup.js', 'firefox/js')
 
+.js('./shared/js/coordinator.js', 'chrome/js')
+.js('./shared/js/coordinator.js', 'firefox/js')
+
 .js('./shared/js/sw.js', 'chrome/js')
 .js('./shared/js/sw.js', 'firefox/js')
 
@@ -26,6 +29,9 @@ mix.options({
 
 .copy('./shared/popup.html', 'chrome/popup.html')
 .copy('./shared/popup.html', 'firefox/popup.html')
+
+.copy('./shared/coordinator.html', 'chrome/coordinator.html')
+.copy('./shared/coordinator.html', 'firefox/coordinator.html')
 
 .copy('./shared/icons', 'chrome/icons')
 .copy('./shared/icons', 'firefox/icons')
