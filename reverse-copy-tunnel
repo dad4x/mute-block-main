@@ -1,0 +1,7 @@
+echo Tunnel for codex to copy to laptop
+
+ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+    -R 10022:127.0.0.1:22 \
+    dbrower@phoenix92608.dev3sub2phx.databasede3phx.oraclevcn.com
+
+

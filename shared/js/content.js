@@ -24,6 +24,9 @@ const {
     sanitizeProfileHrefSlug
 } = require('./subject')
 
+const SPACE_FEED_PROFILES_PER_BATCH = 5
+const CONTENT_SCRIPT_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
 let profilesModalTimeout
 let profileButtonsTimeout
 let profileButtonsRefreshTimeout
@@ -45,16 +48,20 @@ let questionPageFollowUpTimeouts = []
 let spacePostBtnTimeout
 let spacePostBtnPending = false
 let spacePostFollowUpTimeouts = []
+let spacePageFollowUpTimeouts = []
 let spaceClassificationTimeout
 let spaceClassificationPending = false
 let spaceAssetNukeTimeout
 let spaceAssetNukePending = false
+let spaceAssetNukeScheduledAt = 0
 let spaceAssetNukeViewportTimeout = null
 let spaceAssetNukeViewportListenerInstalled = false
 let spaceFeedProgressReconcileTimeout = null
 let spaceFeedProgressReconcilePending = false
 let suppressSpaceAssetNukeRefreshUntil = 0
+let spaceFeedScrollActiveUntil = 0
 let latestSpaceFeedEntries = []
+let discoveredSpaceFeedEntries = new Map()
 let spaceFeedEntryCache = new Map()
 let spaceFeedRootCache = new WeakMap()
 let closeTabRetryTimeouts = []
@@ -66,6 +73,8 @@ let spaceNukedPosts = {}
 let spacePendingNukedPosts = {}
 let profileNukeProgress = {}
 let spaceFeedNukingPostKeys = new Set()
+let activeSpaceFeedNukeMode = ''
+let activeSpaceFeedNukeRunId = ''
 let profileDisplayNamesByHref = {}
 let ownedNukeStatusCache = {
     active: 0,
@@ -76,20 +85,42 @@ let ownedNukeStatusCache = {
 let ownedNukeStatusPromise = null
 let activeProfileModal = null
 let handledModalProfileUrls = new Set()
+let queuedModalNukeProfileUrls = new Set()
 let initialized = false
+let alreadyBlockedCoordinatorRepairKey = ''
 const PROFILE_ACTION_BUTTON_ORDER = ['mute-block-close', 'mute-block', 'close-tab']
 const SPACE_POST_NUKE_MIN_PROFILES = 2
 const SPACE_FEED_POST_NUKE_MIN_PROFILES = 1
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
+const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
+const SPACE_FEED_SCROLL_IDLE_MS = 450
+const SPACE_FEED_SCROLL_REFRESH_GRACE_MS = 120
+const SPACE_FEED_PROGRESS_REFRESH_IDLE_MS = 320
+const SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX = 1800
+const SPACE_FEED_SCAN_MAX_TIMESTAMPS = 60
+const SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES = 160
+const SPACE_FEED_SCAN_SAMPLE_STEP_PX = 140
+const SPACE_FEED_SCAN_SAMPLE_X_RATIOS = [0.28, 0.5, 0.72]
+const MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES = 80
+const MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES = 4
+const SPACE_FEED_ROOT_SELECTOR =
+    '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
+    '.puppeteer_test_tribe_post_item_feed_story,' +
+    '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
+    'article,' +
+    '[role="article"]'
+const UNMUTE_ACTION_REGEX = /\bun[\s-]*mute\b/i
+const UNBLOCK_ACTION_REGEX = /\bun[\s-]*block\b/i
 const TRANSIENT_PROFILE_NUKE_STATUSES = new Set([
     'queued',
     'tab-opening',
     'tab-opened',
     'awaiting-visibility',
     'page-ready',
+    'retrying',
     'muting',
     'blocking'
 ])
@@ -158,14 +189,13 @@ async function init() {
         scheduleSpacePostFollowUps()
     }
     else if(page === 'space') {
-        injectSpaceSidebarOpenProfilesBtn()
-        scheduleSpaceClassificationControls(0)
-        scheduleSpaceAssetNukeControls(200)
+        activateSpacePageControls(200)
         setTimeout(() => {
             void reconcileStaleSpaceFeedProgress()
         }, 350)
     }
 
+    scheduleSpacePageFollowUps()
     void maybeRunAutoProfileAction()
     installSpaceFeedViewportRefresh()
     startObserver()
@@ -188,20 +218,20 @@ function onStorageChanged(changes, areaName) {
         else if(key === SPACE_NUKED_POSTS_KEY) {
             spaceNukedPosts = change.newValue || {}
             if(getPageType() === 'space') {
-                scheduleSpaceAssetNukeControls(0)
+                scheduleSpaceFeedProgressDrivenRefresh()
             }
         }
         else if(key === SPACE_PENDING_NUKED_POSTS_KEY) {
             spacePendingNukedPosts = change.newValue || {}
             if(getPageType() === 'space') {
-                scheduleSpaceAssetNukeControls(0)
+                scheduleSpaceFeedProgressDrivenRefresh()
             }
         }
         else if(key === PROFILE_NUKE_PROGRESS_KEY) {
             profileNukeProgress = normalizeStoredProfileNukeProgress(change.newValue || {})
             if(getPageType() === 'space') {
                 void reconcileStaleSpaceFeedProgress()
-                scheduleSpaceAssetNukeControls(0)
+                scheduleSpaceFeedProgressDrivenRefresh()
             }
         }
     }
@@ -248,6 +278,17 @@ async function safeSendRuntimeMessage(message, fallback = null) {
     }
 }
 
+async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = 12000) {
+    const timeoutMarker = {timedOut: true}
+    const timeout = new Promise(resolve => setTimeout(() => resolve(timeoutMarker), timeoutMs))
+    const result = await Promise.race([
+        safeSendRuntimeMessage(message, fallback),
+        timeout
+    ])
+
+    return result === timeoutMarker ? fallback : result
+}
+
 async function safeStorageSet(value) {
     const storageArea = getStorageArea()
     if(!storageArea?.set) return
@@ -273,26 +314,13 @@ function isTransientProfileNukeStatus(status) {
     return TRANSIENT_PROFILE_NUKE_STATUSES.has(`${status || ''}`.trim())
 }
 
-function getProfileNukeRecordAgeMs(record, now = Date.now()) {
-    const updatedAt = Number.isFinite(record?.updatedAt) ? record.updatedAt : 0
-    if(!updatedAt) return Number.POSITIVE_INFINITY
-    return Math.max(0, now - updatedAt)
-}
-
 function getPendingSpaceFeedRecord(postKey) {
     return postKey ? spacePendingNukedPosts?.[postKey] || null : null
 }
 
-function shouldReconcilePendingProfileRecord(record, pendingRecord, now = Date.now(), allowStale = true) {
+function shouldReconcilePendingProfileRecord(record, pendingRecord) {
     if(!pendingRecord) return false
-
-    const pendingAgeMs = Number.isFinite(pendingRecord.updatedAt)
-        ? Math.max(0, now - pendingRecord.updatedAt)
-        : Number.POSITIVE_INFINITY
-
-    if(!record) {
-        return allowStale && pendingAgeMs >= STALE_PROFILE_NUKE_PROGRESS_MS
-    }
+    if(!record) return false
 
     if(isSuccessfulProfileNukeRecord(record) ||
         record.status === 'profile-unavailable' ||
@@ -305,11 +333,11 @@ function shouldReconcilePendingProfileRecord(record, pendingRecord, now = Date.n
         return false
     }
 
-    if(record.tabClosedAt || record.closeReason || record.errorPageUrl || record.finalError) {
+    if(record.tabClosedAt || record.slotReleasedAt || record.closeReason || record.errorPageUrl || record.finalError) {
         return true
     }
 
-    return allowStale && getProfileNukeRecordAgeMs(record, now) >= STALE_PROFILE_NUKE_PROGRESS_MS
+    return false
 }
 
 function isSpaceLinkedProfileNukeRecord(record) {
@@ -322,15 +350,15 @@ function isSpaceLinkedProfileNukeRecord(record) {
         record.events.some(event => `${event || ''}`.includes('Queued from space feed'))
 }
 
-function shouldReconcileStoredProfileRecord(record, now = Date.now(), allowStale = true) {
+function shouldReconcileStoredProfileRecord(record) {
     if(!record || !isTransientProfileNukeStatus(record.status)) return false
     if(!isSpaceLinkedProfileNukeRecord(record)) return false
 
-    if(record.tabClosedAt || record.closeReason || record.errorPageUrl || record.finalError) {
+    if(record.tabClosedAt || record.slotReleasedAt || record.closeReason || record.errorPageUrl || record.finalError) {
         return true
     }
 
-    return allowStale && getProfileNukeRecordAgeMs(record, now) >= STALE_PROFILE_NUKE_PROGRESS_MS
+    return false
 }
 
 function getReconciledProfileRecordPatch(record) {
@@ -348,14 +376,12 @@ function getReconciledProfileRecordPatch(record) {
 async function reconcileStaleSpaceFeedProgress(entries = null) {
     if(getPageType() !== 'space') return false
 
-    const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus())
-    const allowStaleReconcile = !hasOwnedNukeWorkInFlight(status)
-    const now = Date.now()
+    updateOwnedNukeStatusCache(await getOwnedNukeStatus())
     const urlsToClear = new Set()
     const updatesByHref = new Map()
 
     for(const [profileHref, record] of Object.entries(profileNukeProgress || {})) {
-        if(!shouldReconcileStoredProfileRecord(record, now, allowStaleReconcile)) continue
+        if(!shouldReconcileStoredProfileRecord(record)) continue
         updatesByHref.set(profileHref, {
             profileHref,
             patch: getReconciledProfileRecordPatch(record)
@@ -371,7 +397,7 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
             if(!normalizedUrl) continue
 
             const record = getProfileNukeProgressRecord(normalizedUrl)
-            if(!shouldReconcilePendingProfileRecord(record, pendingRecord, now, allowStaleReconcile)) continue
+            if(!shouldReconcilePendingProfileRecord(record, pendingRecord)) continue
 
             urlsToClear.add(normalizedUrl)
 
@@ -528,6 +554,11 @@ function normalizeProfileProgressPatch(href, patch = {}, existing = null) {
         updatedAt: Date.now()
     }
 
+    if(next.blockSucceeded && next.status === 'interrupted') {
+        next.status = next.foundBlockedBeforeQueue ? 'already-blocked' : 'blocked'
+        next.finalError = ''
+    }
+
     if(patch.postKeys || previous.postKeys) {
         next.postKeys = mergeUniqueStringList(previous.postKeys || [], patch.postKeys || [])
     }
@@ -547,6 +578,11 @@ function normalizeProfileProgressPatch(href, patch = {}, existing = null) {
         next.displayName = previous.displayName || getProfileDisplayName(normalizedHref) || ''
     }
 
+    const successChanged = isSuccessfulProfileNukeRecord(next) && !isSuccessfulProfileNukeRecord(previous)
+    if(isSettledProfileNukeRecord(next) && (successChanged || !(Number.isFinite(next.terminalAt) && next.terminalAt > 0))) {
+        next.terminalAt = Date.now()
+    }
+
     delete next.event
     return next
 }
@@ -555,9 +591,16 @@ function buildQueuedProfileProgressPatch(event, extraPatch = {}) {
     return {
         status: 'queued',
         queuedAt: Date.now(),
+        runId: '',
+        queueIndex: 0,
         foundBlockedBeforeQueue: false,
+        tabCreatedAt: 0,
         tabOpenedAt: 0,
+        contentOpenedAt: 0,
         tabClosedAt: 0,
+        closeRequestedAt: 0,
+        slotReleasedAt: 0,
+        terminalAt: 0,
         closeReason: '',
         closedByExtension: false,
         openedViablePage: false,
@@ -596,12 +639,15 @@ async function recordProfileNukeProgress(href, patch = {}) {
         [normalizedHref]: nextRecord
     })
 
-    await persistProfileNukeProgressLocally()
-    await safeSendRuntimeMessage({
+    const result = await safeSendRuntimeMessageWithTimeout({
         action: 'record-nuke-progress',
         profileHref: normalizedHref,
         patch
-    }, null)
+    }, null, 2500)
+    if(!result?.recorded) {
+        await persistProfileNukeProgressLocally()
+    }
+    await repairCoordinatorQueueRowFromProfileProgress(normalizedHref, nextRecord)
 
     return nextRecord
 }
@@ -627,9 +673,61 @@ async function recordProfileNukeProgressBatch(updates) {
     if(!normalizedUpdates.length) return false
 
     profileNukeProgress = pruneProfileNukeProgress(nextProgress)
-    await persistProfileNukeProgressLocally()
-    await safeSendRuntimeMessage({action: 'record-nuke-progress-batch', updates: normalizedUpdates}, null)
+    const result = await safeSendRuntimeMessageWithTimeout({
+        action: 'record-nuke-progress-batch',
+        updates: normalizedUpdates
+    }, null, 2500)
+    if(!result?.recorded) {
+        await persistProfileNukeProgressLocally()
+    }
     return true
+}
+
+async function repairCoordinatorQueueRowFromProfileProgress(href, record = null) {
+    if(!isSuccessfulProfileNukeRecord(record)) return false
+
+    const normalizedHref = normalizeQuoraProfileHref(href || record?.profileHref || '')
+    if(!normalizedHref) return false
+
+    for(let attempt = 0; attempt < 4; attempt += 1) {
+        const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
+        const queue = stored[COORDINATOR_QUEUE_KEY] || {}
+        const item = queue[normalizedHref]
+        if(!item) return false
+        if(`${item.status || ''}` === 'succeeded') return true
+
+        const now = Date.now()
+        const terminalAt = Number.parseInt(record.terminalAt || record.blockedAt || record.updatedAt, 10) || now
+        const nextItem = {
+            ...item,
+            status: 'succeeded',
+            outcome: record.status === 'already-blocked' ? 'already-blocked' : 'blocked',
+            error: '',
+            updatedAt: Math.max(Number.parseInt(item.updatedAt, 10) || 0, Number.parseInt(record.updatedAt, 10) || 0, now),
+            terminalAt,
+            tabId: null,
+            milestones: {
+                ...(item.milestones || {}),
+                muteAttemptedAt: record.muteAttemptedAt || item.milestones?.muteAttemptedAt || 0,
+                blockAttemptedAt: record.blockAttemptedAt || item.milestones?.blockAttemptedAt || 0,
+                tabClosedAt: record.tabClosedAt || item.milestones?.tabClosedAt || 0
+            }
+        }
+
+        await safeStorageSet({
+            [COORDINATOR_QUEUE_KEY]: {
+                ...queue,
+                [normalizedHref]: nextItem
+            }
+        })
+
+        await sleep(50 + attempt * 100)
+        const verified = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
+        const verifiedItem = verified[COORDINATOR_QUEUE_KEY]?.[normalizedHref]
+        if(`${verifiedItem?.status || ''}` === 'succeeded') return true
+    }
+
+    return false
 }
 
 function getProfileNukeProgressRecord(href) {
@@ -647,13 +745,50 @@ async function persistProfileNukeProgressLocally() {
 }
 
 async function recordCurrentProfileNukeProgress(patch = {}) {
+    const securityVerificationReason = getSecurityVerificationReason()
     return recordProfileNukeProgress(location.href, {
         lastUrl: location.href,
         pageType: getPageType() || 'unknown',
-        securityVerification: isSecurityVerificationPage(),
+        securityVerification: !!securityVerificationReason,
+        securityVerificationReason,
         unavailableReason: getProfileUnavailableReason() || '',
         ...patch
     })
+}
+
+async function maybeRecordAlreadyBlockedCoordinatorProfile() {
+    if(getPageType() !== 'profile' || !isProfileBlocked()) return
+
+    const href = normalizeQuoraProfileHref(location.href)
+    if(!href) return
+
+    const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
+    const item = stored[COORDINATOR_QUEUE_KEY]?.[href]
+    if(!item || `${item.status || ''}` === 'succeeded') return
+
+    const repairKey = [
+        href,
+        item.status || '',
+        item.outcome || '',
+        item.updatedAt || 0,
+        item.terminalAt || 0
+    ].join('|')
+    if(repairKey === alreadyBlockedCoordinatorRepairKey) return
+    alreadyBlockedCoordinatorRepairKey = repairKey
+
+    await recordProfileNukeProgress(href, {
+        status: 'already-blocked',
+        openedViablePage: true,
+        foundBlockedBeforeQueue: true,
+        blockSucceeded: true,
+        blockedAt: Date.now(),
+        lastUrl: location.href,
+        resolvedProfileHref: href,
+        remappedFromRequested: false,
+        finalError: '',
+        event: 'Visible profile was already blocked; repairing coordinator row'
+    })
+    await confirmCurrentProfileBlockedSpaceFeedEntries(href)
 }
 
 async function notifyQueuedTabComplete() {
@@ -670,27 +805,29 @@ async function sweepBlockedProfileTabs() {
 }
 
 async function getOwnedNukeStatus() {
-    const result = await safeSendRuntimeMessage({action: 'get-owned-nuke-status'}, null)
-    return {
-        active: Number.parseInt(result?.active, 10) || 0,
-        owned: Number.parseInt(result?.owned, 10) || 0,
-        queued: Number.parseInt(result?.queued, 10) || 0,
-        paused: !!result?.paused
-    }
+    const result = await safeSendRuntimeMessageWithTimeout({action: 'get-owned-nuke-status'}, null, 2500)
+    return normalizeOwnedNukeStatus(result)
 }
 
-function updateOwnedNukeStatusCache(status = null) {
-    ownedNukeStatusCache = {
+function normalizeOwnedNukeStatus(status = null) {
+    const next = {
         active: Number.parseInt(status?.active, 10) || 0,
         owned: Number.parseInt(status?.owned, 10) || 0,
         queued: Number.parseInt(status?.queued, 10) || 0,
-        paused: !!status?.paused
+        paused: false
     }
+    next.paused = !!status?.paused && hasOwnedNukeWorkInFlight(next)
+    return next
+}
+
+function updateOwnedNukeStatusCache(status = null) {
+    ownedNukeStatusCache = normalizeOwnedNukeStatus(status)
 
     return ownedNukeStatusCache
 }
 
-async function promoteCurrentQueuedTab(reason = 'hidden-tab-stall') {
+async function promoteCurrentQueuedTab(reason = 'hidden-tab-stall', allowForegroundFallback = true) {
+    if(!allowForegroundFallback) return false
     if(document.visibilityState === 'visible') return false
 
     const response = await safeSendRuntimeMessage({
@@ -716,6 +853,38 @@ async function refreshOwnedNukeStatusCache() {
 function formatNukeProgressLabel(label, status = null) {
     if(!status) return label
     return `${label} [t:${status.owned} a:${status.active} q:${status.queued}]`
+}
+
+function formatSpaceFeedNukingLabel(entries = [], label = 'Nuking...') {
+    const remaining = getDedupedSpaceFeedUrls(entries).length
+    return remaining > 0 ? `${label} ${remaining} left` : label
+}
+
+function getSpaceFeedNukeButtonMode(button) {
+    return button?.classList?.contains('mb-ext_space-feed-post-single-nuke-btn') ? 'single' : 'batch'
+}
+
+function rememberActiveSpaceFeedNukeMode(button, runId) {
+    activeSpaceFeedNukeMode = getSpaceFeedNukeButtonMode(button)
+    activeSpaceFeedNukeRunId = runId || ''
+}
+
+function clearInactiveSpaceFeedNukeMode() {
+    if(spaceFeedNukingPostKeys.size || hasOwnedNukeWorkInFlight() || hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
+
+    activeSpaceFeedNukeMode = ''
+    activeSpaceFeedNukeRunId = ''
+    return true
+}
+
+function isActiveSpaceFeedNukeMode(mode, localBusy = false) {
+    return activeSpaceFeedNukeMode === mode &&
+        (localBusy || hasOwnedNukeWorkInFlight())
+}
+
+function isUnknownSpaceFeedNukeActive(localBusy = false) {
+    return !activeSpaceFeedNukeMode &&
+        (localBusy || hasOwnedNukeWorkInFlight())
 }
 
 function hasOwnedNukeWorkInFlight(status = ownedNukeStatusCache) {
@@ -808,13 +977,19 @@ function startObserver() {
         }
         else if(page === 'space') {
             if(!areExtensionOnlyMutations(mutations)) {
-                invalidateSpaceFeedEntryCacheForMutations(mutations)
+                const hasStructuralFeedChange = hasSpaceFeedStructuralMutations(mutations)
+                if(hasStructuralFeedChange) {
+                    invalidateSpaceFeedEntryCacheForMutations(mutations)
+                }
                 injectSpaceSidebarOpenProfilesBtn()
                 if(shouldRefreshSpaceClassificationControls()) {
                     scheduleSpaceClassificationControls(120)
                 }
 
-                if(Date.now() >= suppressSpaceAssetNukeRefreshUntil) {
+                const hasMissingFeedControls = !document.querySelector('.mb-ext_space-feed-status-btn')
+                if((hasStructuralFeedChange || hasMissingFeedControls) &&
+                    Date.now() >= suppressSpaceAssetNukeRefreshUntil &&
+                    shouldRefreshSpaceAssetNukeControls(mutations)) {
                     scheduleSpaceAssetNukeControls(180)
                 }
             }
@@ -847,12 +1022,26 @@ function installSpaceFeedViewportRefresh() {
         }, 160)
     }
 
+    const scheduleFromScroll = () => {
+        if(getPageType() !== 'space') return
+
+        spaceFeedScrollActiveUntil = Date.now() + SPACE_FEED_SCROLL_IDLE_MS
+        clearTimeout(spaceAssetNukeViewportTimeout)
+        spaceAssetNukeViewportTimeout = setTimeout(() => {
+            spaceAssetNukeViewportTimeout = null
+            syncSpaceFeedCachedViewportControls()
+            scheduleSpaceAssetNukeControls(0)
+        }, SPACE_FEED_SCROLL_IDLE_MS)
+    }
+
     window.addEventListener('resize', scheduleFromResize, {passive: true})
+    window.addEventListener('scroll', scheduleFromScroll, {passive: true})
     spaceAssetNukeViewportListenerInstalled = true
 }
 
 function resetSpaceFeedScanCache() {
     latestSpaceFeedEntries = []
+    discoveredSpaceFeedEntries = new Map()
     spaceFeedEntryCache = new Map()
     spaceFeedRootCache = new WeakMap()
 }
@@ -871,13 +1060,7 @@ function getSpaceFeedPostRootFromMutationNode(node) {
     const markedRoot = element.closest?.('[data-mb-space-feed-post-key]')
     if(markedRoot) return markedRoot
 
-    const likelyRoot = element.closest?.(
-        '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
-        '.puppeteer_test_tribe_post_item_feed_story,' +
-        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
-        'article,' +
-        '[role="article"]'
-    )
+    const likelyRoot = element.closest?.(SPACE_FEED_ROOT_SELECTOR)
     return likelyRoot?.querySelector?.('a.post_timestamp') ? likelyRoot : null
 }
 
@@ -898,12 +1081,57 @@ function invalidateSpaceFeedEntryCacheForMutations(mutations) {
     }
 }
 
+function isSpaceFeedMutationSignalNode(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement || null
+    if(!element || isExtensionOwnedNode(element)) return false
+
+    if(element.matches?.('a.post_timestamp, a[href*="/profile/"]')) return true
+    return !!element.querySelector?.('a.post_timestamp, a[href*="/profile/"]')
+}
+
+function hasSpaceFeedStructuralMutations(mutations) {
+    for(const mutation of mutations || []) {
+        if(mutation.type === 'childList') {
+            const nodes = [...Array.from(mutation.addedNodes || []), ...Array.from(mutation.removedNodes || [])]
+            if(nodes.some(isSpaceFeedMutationSignalNode)) return true
+        }
+        else if(mutation.type === 'attributes' && mutation.attributeName === 'href') {
+            if(isSpaceFeedMutationSignalNode(mutation.target)) return true
+        }
+    }
+
+    return false
+}
+
 function syncSpaceFeedCachedViewportControls() {
     if(getPageType() !== 'space' || !latestSpaceFeedEntries.length || !isNukableSpacePage()) return false
 
     const entries = getLatestSpaceFeedEntries()
     syncSpaceFeedTopNukeButton(entries)
     syncSpaceFeedTopBarLayout()
+    return true
+}
+
+function getCachedSpaceFeedEntries() {
+    return latestSpaceFeedEntries.map(entry => ({
+        ...entry,
+        postKey: entry.postKey,
+        postUrl: entry.postUrl,
+        candidateUrls: [...entry.candidateUrls]
+    }))
+}
+
+function scheduleSpaceFeedProgressDrivenRefresh() {
+    if(getPageType() !== 'space') return false
+
+    const entries = getCachedSpaceFeedEntries()
+    if(entries.length && isNukableSpacePage()) {
+        syncSpaceFeedTopNukeButton(entries)
+        syncSpaceFeedTopBarLayout()
+        scheduleSpaceFeedProgressReconciliation(entries, 250)
+    }
+
+    scheduleSpaceAssetNukeControls(hasOwnedNukeWorkInFlight() ? 800 : SPACE_FEED_PROGRESS_REFRESH_IDLE_MS)
     return true
 }
 
@@ -943,6 +1171,7 @@ function syncProfileButtons() {
     injectCloseTabBtn()
     toggleMuteBlockBtn()
     toggleMuteBlockCloseBtn()
+    void maybeRecordAlreadyBlockedCoordinatorProfile()
 }
 
 function hasProfileButtons() {
@@ -1211,6 +1440,39 @@ function scheduleSpacePostFollowUps() {
     }
 }
 
+function clearSpacePageFollowUps() {
+    for(const timeoutId of spacePageFollowUpTimeouts) {
+        clearTimeout(timeoutId)
+    }
+
+    spacePageFollowUpTimeouts = []
+}
+
+function activateSpacePageControls(assetDelay = 180) {
+    if(getPageType() !== 'space') return false
+
+    injectSpaceSidebarOpenProfilesBtn()
+    scheduleSpaceClassificationControls(0)
+    if(shouldRefreshSpaceAssetNukeControls(null)) {
+        scheduleSpaceAssetNukeControls(assetDelay)
+    }
+
+    return true
+}
+
+function scheduleSpacePageFollowUps() {
+    clearSpacePageFollowUps()
+
+    const delays = [800, 2000, 5000, 10000]
+    for(const delay of delays) {
+        const timeoutId = setTimeout(() => {
+            activateSpacePageControls(0)
+        }, delay)
+
+        spacePageFollowUpTimeouts.push(timeoutId)
+    }
+}
+
 function resetSpacePostNukeBtn() {
     clearTimeout(spacePostBtnTimeout)
     spacePostBtnPending = false
@@ -1337,15 +1599,14 @@ function installNavigationHooks() {
                 scheduleSpacePostFollowUps()
             }
             else if(getPageType() === 'space') {
-                injectSpaceSidebarOpenProfilesBtn()
-                scheduleSpaceClassificationControls(0)
-                scheduleSpaceAssetNukeControls(200)
+                activateSpacePageControls(200)
             }
             else if(getPageType() === 'question') {
                 ensureQuestionPageFOPBtn()
                 scheduleQuestionPageFollowUps()
             }
 
+            scheduleSpacePageFollowUps()
             void maybeRunAutoProfileAction()
         }, 0)
     }
@@ -1400,23 +1661,16 @@ function scheduleSpaceClassificationControls(delay = 150) {
     }, Math.max(0, delay))
 }
 
-function shouldRefreshSpaceAssetNukeControls() {
+function shouldRefreshSpaceAssetNukeControls(mutations = null) {
     if(getPageType() !== 'space') return false
 
-    const space = resolveCurrentSpaceDescriptor()
     const main = document.querySelector('#mainContent')
-    const liveTimestampCount = getVisibleSpaceFeedTimestamps().length
-    const storedTimestampCount = Number.parseInt(main?.dataset.mbSpaceFeedTimestampCount || '-1', 10)
-    const liveCardCount = getSpaceFeedCardRoots().length
-    const storedCardCount = Number.parseInt(main?.dataset.mbSpaceFeedCardCount || '-1', 10)
     const storedEntryCount = Number.parseInt(main?.dataset.mbSpaceFeedEntryCount || '-1', 10)
     const storedPostButtonCount = Number.parseInt(main?.dataset.mbSpaceFeedPostButtonCount || '-1', 10)
     const hasStatusButton = !!document.querySelector('.mb-ext_space-feed-status-btn')
     const livePostButtonCount = document.querySelectorAll('.mb-ext_space-feed-post-nuke-host').length
 
     if(!hasStatusButton) return true
-    if(storedTimestampCount !== liveTimestampCount) return true
-    if(storedCardCount !== liveCardCount) return true
 
     if(isNukableSpacePage()) {
         if(storedEntryCount < 0) return true
@@ -1425,7 +1679,7 @@ function shouldRefreshSpaceAssetNukeControls() {
             if(storedPostButtonCount < 0) return true
             if(livePostButtonCount !== storedPostButtonCount) return true
         }
-        return false
+        return !mutations || hasSpaceFeedStructuralMutations(mutations)
     }
 
     return !!document.querySelector('.mb-ext_space-feed-nuke-host, .mb-ext_space-feed-post-nuke-host')
@@ -1435,26 +1689,54 @@ function resetSpaceAssetNukeControls() {
     clearTimeout(spaceAssetNukeTimeout)
     spaceAssetNukeTimeout = null
     spaceAssetNukePending = false
+    spaceAssetNukeScheduledAt = 0
     clearTimeout(spaceAssetNukeViewportTimeout)
     spaceAssetNukeViewportTimeout = null
+    clearSpacePageFollowUps()
+}
+
+function getSpaceAssetNukeRefreshDelay(delay) {
+    if(delay === 0) return 0
+
+    const scrollRemaining = spaceFeedScrollActiveUntil - Date.now()
+    return Math.max(0, delay, scrollRemaining > 0 ? scrollRemaining + SPACE_FEED_SCROLL_REFRESH_GRACE_MS : 0)
 }
 
 function scheduleSpaceAssetNukeControls(delay = 180) {
-    if(spaceAssetNukePending && delay !== 0) return
+    const adjustedDelay = getSpaceAssetNukeRefreshDelay(delay)
+    const scheduledAt = Date.now() + adjustedDelay
+
+    if(spaceAssetNukePending && delay !== 0 && scheduledAt <= spaceAssetNukeScheduledAt + 40) return
 
     spaceAssetNukePending = true
+    spaceAssetNukeScheduledAt = scheduledAt
     clearTimeout(spaceAssetNukeTimeout)
     spaceAssetNukeTimeout = setTimeout(() => {
         void (async () => {
             spaceAssetNukeTimeout = null
             spaceAssetNukePending = false
+            spaceAssetNukeScheduledAt = 0
             if(getPageType() === 'space') {
                 await refreshOwnedNukeStatusCache()
             }
             suppressSpaceAssetNukeRefreshUntil = Date.now() + 250
             syncSpaceFeedNukeControls()
         })()
-    }, Math.max(0, delay))
+    }, adjustedDelay)
+}
+
+function isQuoraSpaceSubdomainRootPage() {
+    const host = location.hostname.toLowerCase()
+    if(host === 'www.quora.com' || !host.endsWith('.quora.com')) return false
+
+    const rootPath = location.pathname.replace(/\/+$/, '')
+    if(rootPath !== '') return false
+    if(isSecurityVerificationPage()) return false
+
+    return !!document.querySelector(
+        'a.post_timestamp, .post_timestamp, ' +
+        'link[href*="page-TribeMainPageLoadable"], script[src*="page-TribeMainPageLoadable"]'
+    )
 }
 
 function getPageType() {
@@ -1470,6 +1752,9 @@ function getPageType() {
         return 'topic'
     }
     else if(document.querySelector('.puppeteer_test_tribe_info_header')) {
+        return 'space'
+    }
+    else if(isQuoraSpaceSubdomainRootPage()) {
         return 'space'
     }
     else if(isSpacePostPage()) {
@@ -1603,15 +1888,34 @@ function getQuestionMain() {
     return null
 }
 
-function isSecurityVerificationPage() {
+function getSecurityVerificationReason() {
     const title = (document.title || '').toLowerCase()
     const bodyText = (document.body?.innerText || '').toLowerCase()
 
-    return title.includes('just a moment') ||
-        title.includes('security verification') ||
-        bodyText.includes('performing security verification') ||
-        bodyText.includes('verify you are human') ||
-        !!document.querySelector('[name="cf-turnstile-response"], .cf-turnstile, #challenge-stage')
+    if(title.includes('just a moment')) return 'title:just-a-moment'
+    if(title.includes('security verification')) return 'title:security-verification'
+    if(bodyText.includes('performing security verification')) return 'body:performing-security-verification'
+    if(bodyText.includes('verify you are human')) return 'body:verify-you-are-human'
+
+    return ''
+}
+
+function isSecurityVerificationPage() {
+    return !!getSecurityVerificationReason()
+}
+
+function isSecurityVerificationProgressRecord(record) {
+    if(!record?.securityVerification) return false
+
+    const text = [
+        record.securityVerificationReason,
+        record.finalError,
+        record.errorPageUrl,
+        record.lastUrl,
+        ...(Array.isArray(record.events) ? record.events : [])
+    ].join(' ')
+
+    return /security verification|verify you are human|just a moment|performing security verification|challenge-platform|cdn-cgi|turnstile/i.test(text)
 }
 
 function getProfileUnavailableReason() {
@@ -2187,10 +2491,12 @@ function syncActiveProfileModal(modal = getProfilePeopleModal()) {
     if(modal && modal !== activeProfileModal) {
         activeProfileModal = modal
         handledModalProfileUrls = new Set()
+        queuedModalNukeProfileUrls = new Set()
     }
     else if(!modal) {
         activeProfileModal = null
         handledModalProfileUrls = new Set()
+        queuedModalNukeProfileUrls = new Set()
     }
 
     return modal
@@ -2221,7 +2527,8 @@ function hasVisibleFollowProxy(root) {
 }
 
 function isModalItemQueueable(item) {
-    return !!getModalItemProfileHref(item) && hasVisibleFollowProxy(item)
+    const href = getModalItemProfileHref(item)
+    return !!href && !isProfileNukeSucceeded(href) && hasVisibleFollowProxy(item)
 }
 
 function isModalItemHandled(item) {
@@ -2230,13 +2537,26 @@ function isModalItemHandled(item) {
     return item?.dataset?.mbOpened === 'true' || (!!identityKey && handledModalProfileUrls.has(identityKey))
 }
 
+function isModalItemNukeQueued(item) {
+    const href = getModalItemProfileHref(item)
+    const identityKey = getNormalizedProfileIdentityKey(href)
+    return item?.dataset?.mbNukeQueued === 'true' || (!!identityKey && queuedModalNukeProfileUrls.has(identityKey))
+}
+
 function getUnhandledProfileModalItems(modal = getProfilePeopleModal()) {
     modal = syncActiveProfileModal(modal)
     return getProfileModalItems(modal).filter(item => !isModalItemHandled(item))
 }
 
-function getQueueableProfileModalItems(modal = getProfilePeopleModal()) {
+function getOpenableProfileModalItems(modal = getProfilePeopleModal()) {
     return getUnhandledProfileModalItems(modal).filter(isModalItemQueueable)
+}
+
+function getNukeableProfileModalItems(modal = getProfilePeopleModal()) {
+    modal = syncActiveProfileModal(modal)
+    return getProfileModalItems(modal)
+        .filter(item => !isModalItemNukeQueued(item))
+        .filter(isModalItemQueueable)
 }
 
 function markModalItemsHandled(items, backgroundColor = '#d4edda') {
@@ -2245,6 +2565,16 @@ function markModalItemsHandled(items, backgroundColor = '#d4edda') {
         const identityKey = getNormalizedProfileIdentityKey(href)
         item.dataset.mbOpened = true
         if(identityKey) handledModalProfileUrls.add(identityKey)
+        item.style.backgroundColor = backgroundColor
+    }
+}
+
+function markModalItemsNukeQueued(items, backgroundColor = '#f8d7da') {
+    for(const item of items) {
+        const href = getModalItemProfileHref(item)
+        const identityKey = getNormalizedProfileIdentityKey(href)
+        item.dataset.mbNukeQueued = true
+        if(identityKey) queuedModalNukeProfileUrls.add(identityKey)
         item.style.backgroundColor = backgroundColor
     }
 }
@@ -2284,8 +2614,7 @@ function findOverlayAction(regex, roots) {
         const match = candidates.find(candidate => {
             if(!isVisible(candidate)) return false
 
-            const label = `${candidate.getAttribute('aria-label') || ''} ${getElementText(candidate)}`
-            return regex.test(label)
+            return matchesActionLabel(regex, getActionCandidateLabel(candidate))
         })
 
         if(match) return match
@@ -2301,8 +2630,7 @@ function getVisibleAction(regex, root = document) {
         if(shouldIgnoreActionCandidate(candidate)) return false
         if(!isVisible(candidate)) return false
 
-        const label = `${candidate.getAttribute('aria-label') || ''} ${getElementText(candidate)}`
-        return regex.test(label)
+        return matchesActionLabel(regex, getActionCandidateLabel(candidate))
     }) || null
 }
 
@@ -2311,6 +2639,57 @@ function getMenuAction(regex) {
     if(match) return match
 
     return getVisibleAction(regex)
+}
+
+function getActionCandidateLabel(candidate) {
+    return `${candidate?.getAttribute?.('aria-label') || ''} ${getElementText(candidate)}`.replace(/\s+/g, ' ').trim()
+}
+
+function matchesActionLabel(matcher, label) {
+    if(typeof matcher === 'function') return !!matcher(label)
+    if(Array.isArray(matcher)) return matcher.some(entry => matchesActionLabel(entry, label))
+    if(matcher?.test) {
+        matcher.lastIndex = 0
+        return matcher.test(label)
+    }
+
+    return false
+}
+
+function isUnmuteActionLabel(label) {
+    return UNMUTE_ACTION_REGEX.test(`${label || ''}`)
+}
+
+function isMuteActionLabel(label) {
+    return /\bmute\b/i.test(`${label || ''}`) && !isUnmuteActionLabel(label)
+}
+
+function isUnblockActionLabel(label) {
+    return UNBLOCK_ACTION_REGEX.test(`${label || ''}`)
+}
+
+function isBlockActionLabel(label) {
+    return /\bblock\b/i.test(`${label || ''}`) && !isUnblockActionLabel(label)
+}
+
+function getVisibleProfileMenuActionLabels() {
+    const labels = []
+    const seen = new Set()
+    const roots = getOverlayRoots(false)
+
+    for(const root of roots) {
+        for(const candidate of Array.from(root.querySelectorAll('.puppeteer_test_popover_item, [role="menuitem"], button, [role="button"], a'))) {
+            if(!isVisible(candidate)) continue
+
+            const label = getActionCandidateLabel(candidate)
+            if(!label || seen.has(label)) continue
+
+            seen.add(label)
+            labels.push(label)
+        }
+    }
+
+    return labels.slice(0, 20)
 }
 
 function getDialogAction(regex) {
@@ -2420,8 +2799,15 @@ function getBlockConfirmContainer() {
 }
 
 function getBlockConfirmCandidates() {
+    const dialogRoots = getDialogRoots()
+    const confirmContainer = getBlockConfirmContainer()
+    const isInBlockConfirmSurface = button => {
+        if(confirmContainer?.contains(button)) return true
+        return dialogRoots.some(root => root.contains(button))
+    }
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
+        .filter(isInBlockConfirmSurface)
         .filter(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button)))
         .map(button => {
             const context = getBestActionContext(button)
@@ -2442,9 +2828,6 @@ function getBlockConfirmCandidates() {
 }
 
 function getBlockConfirmAction() {
-    const buttons = getBlockConfirmCandidates()
-    if(buttons.length) return buttons[0].button
-
     const container = getBlockConfirmContainer()
     if(container) {
         const containerButtons = getVisibleActionButtons(container)
@@ -2455,7 +2838,11 @@ function getBlockConfirmAction() {
         if(containerButtons.length) return containerButtons[0].button
     }
 
-    return getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i)
+    const dialogPrimary = getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i)
+    if(dialogPrimary) return dialogPrimary
+
+    const buttons = getBlockConfirmCandidates()
+    return buttons[0]?.button || null
 }
 
 function isBlockConfirmPending() {
@@ -2608,6 +2995,42 @@ async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = 5000, in
     return action
 }
 
+async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex, options = {}) {
+    const {
+        timeoutMs = 5000,
+        intervalMs = 250,
+        promotionReason = 'profile-menu-action-not-found',
+        silent = false,
+        allowForegroundFallback = true
+    } = options
+
+    let state = await waitForMenuState(primaryRegex, inverseRegex, timeoutMs, intervalMs)
+    if(state || document.visibilityState === 'visible') return state
+    if(!allowForegroundFallback) return null
+
+    await recordCurrentProfileNukeProgress({
+        event: 'Profile menu action was not visible in the background; requesting foreground fallback'
+    })
+
+    const promoted = await promoteCurrentQueuedTab(promotionReason, allowForegroundFallback)
+    if(!promoted) return null
+
+    await sleep(300)
+    state = await waitForMenuState(primaryRegex, inverseRegex, 2000, 200)
+    if(state) return state
+
+    if(isProfileMenuOpen()) {
+        await closeProfileMenu()
+        await sleep(250)
+    }
+
+    const opened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
+    if(!opened) return null
+
+    await sleep(300)
+    return waitForMenuState(primaryRegex, inverseRegex, timeoutMs, intervalMs)
+}
+
 async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = 2500, intervalMs = 200) {
     const opened = await ensureProfileMenuOpen()
     if(!opened) return null
@@ -2758,7 +3181,7 @@ function scheduleBlockedProfileCloseChecks(delays = [0, 100, 250, 500, 1000, 200
 
             if(getProfileMenuButton()) {
                 void (async () => {
-                    const menuBlocked = await readProfileMenuState(/\bblock\b/i, /\bunblock\b/i, 700, 100)
+                    const menuBlocked = await readProfileMenuState(isBlockActionLabel, isUnblockActionLabel, 700, 100)
                     if(menuBlocked === 'inverse') {
                         rememberProfileBlocked()
                         await confirmCurrentProfileBlockedSpaceFeedEntries()
@@ -3218,7 +3641,7 @@ function formatProfileActionDebugSummary(reason = 'Profile action issue') {
 function logProfileActionDebug(reason) {
     const summary = formatProfileActionDebugSummary(reason)
     if(summary && summary !== reason) {
-        console.error(summary)
+        console.info(summary)
     }
 }
 
@@ -4067,8 +4490,11 @@ function injectSpacePostNukeBtn() {
         setMuteBlockHelp(btn, buildNukeTargetsHelpText('Queue detected profiles from this post for mute and block', urls))
         btn.addEventListener('click', async () => {
             const liveUrls = getSpacePostListedProfileLinks()
-            const currentUrls = liveUrls.length ? liveUrls : getSpacePostNukeUrls(btn)
-            if(!currentUrls.length) return
+            const currentUrls = getUnsuccessfulProfileNukeUrls(liveUrls.length ? liveUrls : getSpacePostNukeUrls(btn))
+            if(!currentUrls.length) {
+                setNukeButtonDone(btn, 'Done')
+                return
+            }
 
             await animateNukeButtonPress(btn)
             btn.disabled = true
@@ -4527,16 +4953,151 @@ function getSpaceFeedContentRoot() {
     return document.querySelector('main, [role="main"], #mainContent') || document.body
 }
 
-function getVisibleSpaceFeedTimestamps() {
-    const timestamps = Array.from(document.querySelectorAll('a.post_timestamp'))
+function getSpaceFeedTimestampScanDistance(timestamp) {
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
+    const rect = timestamp?.getBoundingClientRect?.() || null
+    if(!rect) return Number.POSITIVE_INFINITY
+    if(rect.bottom >= 0 && rect.top <= viewportHeight) return 0
+    if(rect.top > viewportHeight) return rect.top - viewportHeight
+    return Math.abs(rect.bottom)
+}
 
-    timestamps.sort((left, right) => {
-        const leftRect = left.getBoundingClientRect()
-        const rightRect = right.getBoundingClientRect()
-        return leftRect.top - rightRect.top || leftRect.left - rightRect.left
-    })
+function isSpaceFeedTimestampInScanWindow(timestamp) {
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
+    const rect = timestamp?.getBoundingClientRect?.() || null
+    if(!rect) return false
+
+    return rect.bottom >= -SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX &&
+        rect.top <= viewportHeight + SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX
+}
+
+function compareElementsByDocumentOrder(left, right) {
+    if(left === right) return 0
+
+    const position = left.compareDocumentPosition(right)
+    if(position & Node.DOCUMENT_POSITION_PRECEDING) return 1
+    if(position & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+    return 0
+}
+
+function addSpaceFeedTimestampCandidate(timestamps, seen, candidate) {
+    if(!(candidate instanceof Element)) return false
+    if(!candidate.matches('a.post_timestamp')) return false
+    if(seen.has(candidate)) return false
+    if(!isSpaceFeedTimestampInScanWindow(candidate)) return false
+
+    seen.add(candidate)
+    timestamps.push(candidate)
+    return true
+}
+
+function collectSampledSpaceFeedTimestampsFromElement(element, timestamps, seen, contentRoot) {
+    if(!(element instanceof Element) || !contentRoot?.contains(element)) return
+
+    addSpaceFeedTimestampCandidate(timestamps, seen, element)
+
+    const visitedRoots = new Set()
+    let current = element
+
+    while(current &&
+        current !== contentRoot &&
+        current !== document.body &&
+        current !== document.documentElement &&
+        timestamps.length < SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
+        const root = current.matches?.(SPACE_FEED_ROOT_SELECTOR)
+            ? current
+            : current.closest?.(SPACE_FEED_ROOT_SELECTOR)
+        if(!root || visitedRoots.has(root) || !contentRoot.contains(root)) break
+
+        visitedRoots.add(root)
+        const timestamp = root.matches?.('a.post_timestamp')
+            ? root
+            : root.querySelector?.('a.post_timestamp')
+        addSpaceFeedTimestampCandidate(timestamps, seen, timestamp)
+        current = root.parentElement
+    }
+}
+
+function getViewportSampledSpaceFeedTimestamps() {
+    const contentRoot = getSpaceFeedContentRoot()
+    const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
+    if(!contentRoot || viewportWidth <= 0 || viewportHeight <= 0 || !document.elementsFromPoint) return []
+
+    const timestamps = []
+    const seen = new Set()
+    const xs = SPACE_FEED_SCAN_SAMPLE_X_RATIOS
+        .map(ratio => Math.max(1, Math.min(viewportWidth - 2, Math.round(viewportWidth * ratio))))
+    const ys = []
+    const addY = y => {
+        const bounded = Math.max(1, Math.min(viewportHeight - 2, Math.round(y)))
+        if(!ys.includes(bounded)) ys.push(bounded)
+    }
+
+    addY(16)
+    for(let y = SPACE_FEED_SCAN_SAMPLE_STEP_PX; y < viewportHeight; y += SPACE_FEED_SCAN_SAMPLE_STEP_PX) {
+        addY(y)
+    }
+    addY(viewportHeight - 16)
+
+    for(const y of ys) {
+        for(const x of xs) {
+            for(const element of document.elementsFromPoint(x, y)) {
+                collectSampledSpaceFeedTimestampsFromElement(element, timestamps, seen, contentRoot)
+                if(timestamps.length >= SPACE_FEED_SCAN_MAX_TIMESTAMPS) break
+            }
+            if(timestamps.length >= SPACE_FEED_SCAN_MAX_TIMESTAMPS) break
+        }
+        if(timestamps.length >= SPACE_FEED_SCAN_MAX_TIMESTAMPS) break
+    }
+
+    return timestamps.sort(compareElementsByDocumentOrder)
+}
+
+function getBoundedVisibleSpaceFeedTimestamps() {
+    const nodes = Array.from(document.querySelectorAll('a.post_timestamp'))
+        .slice(0, SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES)
+    const timestamps = nodes
+        .map((timestamp, index) => ({
+            timestamp,
+            index,
+            distance: getSpaceFeedTimestampScanDistance(timestamp)
+        }))
+        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp))
+
+    if(timestamps.length <= SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
+        return timestamps.map(entry => entry.timestamp)
+    }
 
     return timestamps
+        .sort((left, right) => left.distance - right.distance || left.index - right.index)
+        .slice(0, SPACE_FEED_SCAN_MAX_TIMESTAMPS)
+        .sort((left, right) => left.index - right.index)
+        .map(entry => entry.timestamp)
+}
+
+function getVisibleSpaceFeedTimestamps() {
+    const sampledTimestamps = getViewportSampledSpaceFeedTimestamps()
+    if(sampledTimestamps.length) return sampledTimestamps
+    if(hasActivePendingSpaceFeedWork()) return getBoundedVisibleSpaceFeedTimestamps()
+
+    const timestamps = Array.from(document.querySelectorAll('a.post_timestamp'))
+        .map((timestamp, index) => ({
+            timestamp,
+            index,
+            distance: getSpaceFeedTimestampScanDistance(timestamp)
+        }))
+        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp))
+
+    if(timestamps.length <= SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
+        return timestamps.map(entry => entry.timestamp)
+    }
+
+    return timestamps
+        .sort((left, right) => left.distance - right.distance || left.index - right.index)
+        .slice(0, SPACE_FEED_SCAN_MAX_TIMESTAMPS)
+        .sort((left, right) => left.index - right.index)
+        .map(entry => entry.timestamp)
 }
 
 function isSpaceFeedRootCandidate(node, timestamp) {
@@ -4549,13 +5110,7 @@ function isSpaceFeedRootCandidate(node, timestamp) {
 function getSpaceFeedPreferredRoot(timestamp) {
     if(!timestamp) return null
 
-    return timestamp.closest(
-        '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
-        '.puppeteer_test_tribe_post_item_feed_story,' +
-        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
-        'article,' +
-        '[role="article"]'
-    )
+    return timestamp.closest(SPACE_FEED_ROOT_SELECTOR)
 }
 
 function getSpaceFeedCardRoots() {
@@ -4917,24 +5472,37 @@ function isSpaceFeedPostNuking(postKey) {
 }
 
 function isSpaceFeedPostPending(postKey) {
-    if(!postKey) return false
-
-    const record = spacePendingNukedPosts?.[postKey]
-    if(!record) return false
-
-    const remainingUrls = Array.isArray(record.remainingUrls)
-        ? record.remainingUrls
-        : Array.isArray(record.allUrls)
-            ? record.allUrls
-            : Array.isArray(record.urls)
-                ? record.urls
-                : []
-
-    return remainingUrls.length > 0
+    return getActivePendingSpaceFeedUrls(postKey).length > 0
 }
 
 function isSpaceFeedPostBusy(postKey) {
     return isSpaceFeedPostNuking(postKey) || isSpaceFeedPostPending(postKey)
+}
+
+function hasActivePendingSpaceFeedWork(entries = null) {
+    const postKeys = Array.isArray(entries) ?
+        entries.map(entry => entry?.postKey).filter(Boolean) :
+        Object.keys(spacePendingNukedPosts || {})
+
+    for(const postKey of postKeys) {
+        if(getActivePendingSpaceFeedUrls(postKey).length) return true
+    }
+
+    return false
+}
+
+function clearStaleLocalSpaceFeedBusyState() {
+    const queueingButtons = document.querySelectorAll('.mb-ext_space-feed-nuke-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-queue-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-nuke-btn[data-mb-queueing="true"]')
+
+    if(!spaceFeedNukingPostKeys.size && !queueingButtons.length) return false
+    if(hasOwnedNukeWorkInFlight() || hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
+
+    spaceFeedNukingPostKeys.clear()
+    for(const button of Array.from(queueingButtons)) {
+        delete button.dataset.mbQueueing
+    }
+
+    return true
 }
 
 function getStoredSpaceFeedRecordUrls(record, preferredKey = 'remainingUrls') {
@@ -4958,8 +5526,7 @@ function getStoredSpaceFeedRecordUrls(record, preferredKey = 'remainingUrls') {
 }
 
 function getPendingSpaceFeedUrlSet(postKey) {
-    const record = postKey ? spacePendingNukedPosts?.[postKey] : null
-    return new Set(getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
+    return new Set(getActivePendingSpaceFeedUrls(postKey))
 }
 
 function isSuccessfulProfileNukeRecord(record) {
@@ -4970,8 +5537,60 @@ function isSuccessfulProfileNukeRecord(record) {
     )
 }
 
+function isSettledProfileNukeRecord(record) {
+    if(isSuccessfulProfileNukeRecord(record)) return true
+
+    const status = `${record?.status || ''}`.trim()
+    return status === 'profile-unavailable' ||
+        status === 'error' ||
+        status === 'error-page' ||
+        status === 'interrupted'
+}
+
 function isProfileNukeSucceeded(href) {
     return isSuccessfulProfileNukeRecord(getProfileNukeProgressRecord(href))
+}
+
+function isProfileNukeSettled(href) {
+    return isSettledProfileNukeRecord(getProfileNukeProgressRecord(href))
+}
+
+function isRetryableProfileNukeRecord(record) {
+    const status = `${record?.status || ''}`.trim()
+    if(isSecurityVerificationProgressRecord(record)) return false
+    if(status === 'interrupted') return true
+    if(status === 'error') return true
+
+    return false
+}
+
+function isProfileNukeRetryBlocked(href) {
+    const record = getProfileNukeProgressRecord(href)
+    return isSettledProfileNukeRecord(record) && !isRetryableProfileNukeRecord(record)
+}
+
+function getUnsuccessfulProfileNukeUrls(urls) {
+    return getNormalizedProfileHrefList(urls || []).filter(url => !isProfileNukeSucceeded(url))
+}
+
+function isActivePendingSpaceFeedProfileUrl(url) {
+    const record = getProfileNukeProgressRecord(url)
+    if(!record) return true
+    if(isSuccessfulProfileNukeRecord(record)) return false
+    if(isSettledProfileNukeRecord(record)) return false
+
+    const status = `${record.status || ''}`.trim()
+    return !status || isTransientProfileNukeStatus(status)
+}
+
+function getActivePendingSpaceFeedUrls(postKey) {
+    const record = postKey ? spacePendingNukedPosts?.[postKey] : null
+    return getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+        .filter(url => isActivePendingSpaceFeedProfileUrl(url))
+}
+
+function getSuccessfulProfileNukeUrls(urls) {
+    return getNormalizedProfileHrefList(urls || []).filter(url => isProfileNukeSucceeded(url))
 }
 
 function getSucceededSpaceFeedEntryUrls(entry) {
@@ -4987,7 +5606,7 @@ function getQueueableSpaceFeedEntryUrls(entry) {
     if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
 
     const pendingUrls = getPendingSpaceFeedUrlSet(entry.postKey)
-    return getNormalizedProfileHrefList(entry.candidateUrls || []).filter(url => !pendingUrls.has(url) && !isProfileNukeSucceeded(url))
+    return getNormalizedProfileHrefList(entry.candidateUrls || []).filter(url => !pendingUrls.has(url) && !isProfileNukeRetryBlocked(url))
 }
 
 function getSpaceFeedActionElements(postRoot) {
@@ -5010,6 +5629,8 @@ function getSpaceFeedPostAnchorContainer(postRoot) {
             continue
         }
 
+        if(node === main || node === document.body || node === document.documentElement) break
+
         const rect = node.getBoundingClientRect()
         const currentRect = anchorContainer.getBoundingClientRect()
         const isMeaningfullyWider = rect.width >= currentRect.width + 24
@@ -5020,19 +5641,24 @@ function getSpaceFeedPostAnchorContainer(postRoot) {
             anchorContainer = node
         }
 
-        if(node === main) break
         node = node.parentElement
     }
 
     return anchorContainer
 }
 
+function isSpaceFeedDocumentLevelElement(element) {
+    return element === document.body || element === document.documentElement
+}
+
 function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
     if(!postRoot) return null
+    if(isSpaceFeedDocumentLevelElement(postRoot)) return null
 
     const timestamp = postRoot.querySelector('a.post_timestamp')
     const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
     const parent = getSpaceFeedPostAnchorContainer(postRoot) || postRoot
+    if(isSpaceFeedDocumentLevelElement(parent)) return null
 
     let host = Array.from(parent.querySelectorAll(':scope > .mb-ext_space-feed-post-nuke-host'))
         .find(candidate => (candidate.dataset.mbPostHostKey || '') === postKey)
@@ -5065,6 +5691,26 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
 function setSpaceFeedButtonUrls(button, urls) {
     if(!button) return
     button.dataset.mbSpaceFeedUrls = JSON.stringify(getNormalizedProfileHrefList(urls))
+}
+
+function ensureCurrentInstanceClickHandler(button, handlerKey, handler) {
+    if(!button) return button
+    if(button.dataset.mbHandlerInstance === CONTENT_SCRIPT_INSTANCE_ID &&
+        button.dataset.mbClickHandler === handlerKey) {
+        return button
+    }
+
+    const activeButton = button.dataset.mbHandlerInstance || button.dataset.mbClickHandler
+        ? button.cloneNode(true)
+        : button
+    if(activeButton !== button) {
+        button.replaceWith(activeButton)
+    }
+
+    activeButton.dataset.mbHandlerInstance = CONTENT_SCRIPT_INSTANCE_ID
+    activeButton.dataset.mbClickHandler = handlerKey
+    activeButton.addEventListener('click', handler)
+    return activeButton
 }
 
 function getSpaceFeedButtonUrls(button) {
@@ -5137,15 +5783,61 @@ function getSpaceFeedPostEntries() {
     return entries
 }
 
+function buildSpaceFeedEntrySnapshot(entry, previous = null) {
+    const previousUrls = getNormalizedProfileHrefList(previous?.candidateUrls || [])
+    const currentUrls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+    const rect = entry?.postRoot?.isConnected ? entry.postRoot.getBoundingClientRect() : null
+    const previousViewport = previous ? getUpdatedSpaceFeedEntryViewport(previous) : {}
+
+    return {
+        postKey: entry?.postKey || previous?.postKey || '',
+        postUrl: entry?.postUrl || previous?.postUrl || '',
+        candidateUrls: getNormalizedProfileHrefList([...previousUrls, ...currentUrls]),
+        postRoot: entry?.postRoot?.isConnected
+            ? entry.postRoot
+            : previous?.postRoot?.isConnected
+                ? previous.postRoot
+                : null,
+        viewportTop: rect?.top ?? previousViewport.viewportTop ?? null,
+        viewportBottom: rect?.bottom ?? previousViewport.viewportBottom ?? null
+    }
+}
+
+function rememberDiscoveredSpaceFeedEntries(entries) {
+    for(const entry of Array.isArray(entries) ? entries : []) {
+        if(!entry?.postKey) continue
+
+        const snapshot = buildSpaceFeedEntrySnapshot(entry, discoveredSpaceFeedEntries.get(entry.postKey))
+        if(!snapshot.candidateUrls.length) continue
+
+        discoveredSpaceFeedEntries.set(snapshot.postKey, snapshot)
+    }
+}
+
+function getDiscoveredSpaceFeedEntries() {
+    return Array.from(discoveredSpaceFeedEntries.values()).map(entry => ({
+        ...getUpdatedSpaceFeedEntryViewport(entry),
+        postKey: entry.postKey,
+        postUrl: entry.postUrl,
+        candidateUrls: [...entry.candidateUrls],
+        postRoot: entry.postRoot || null
+    }))
+}
+
 function setLatestSpaceFeedEntries(entries) {
-    latestSpaceFeedEntries = (Array.isArray(entries) ? entries : []).map(entry => ({
-        postKey: entry?.postKey || '',
-        postUrl: entry?.postUrl || '',
-        candidateUrls: getNormalizedProfileHrefList(entry?.candidateUrls || []),
-        postRoot: entry?.postRoot || null,
-        viewportTop: entry?.postRoot?.getBoundingClientRect?.().top ?? null,
-        viewportBottom: entry?.postRoot?.getBoundingClientRect?.().bottom ?? null
-    })).filter(entry => !!entry.postKey)
+    rememberDiscoveredSpaceFeedEntries(entries)
+    latestSpaceFeedEntries = getDiscoveredSpaceFeedEntries().map(entry => {
+        const rect = entry?.postRoot?.getBoundingClientRect?.() || null
+
+        return {
+            postKey: entry?.postKey || '',
+            postUrl: entry?.postUrl || '',
+            candidateUrls: getNormalizedProfileHrefList(entry?.candidateUrls || []),
+            postRoot: entry?.postRoot || null,
+            viewportTop: rect?.top ?? null,
+            viewportBottom: rect?.bottom ?? null
+        }
+    }).filter(entry => !!entry.postKey)
 }
 
 function getLatestSpaceFeedEntries() {
@@ -5173,7 +5865,10 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
     const documentTimestamps = document.querySelectorAll('a.post_timestamp').length
     const documentProfiles = document.querySelectorAll('a[href*="/profile/"]').length
     const cards = getSpaceFeedCardRoots()
-    const nextEntries = Array.isArray(entries) ? entries : getSpaceFeedPostEntries()
+    if(!Array.isArray(entries)) {
+        rememberDiscoveredSpaceFeedEntries(getSpaceFeedPostEntries())
+    }
+    const nextEntries = Array.isArray(entries) ? entries : getDiscoveredSpaceFeedEntries()
     const actionableEntries = nextEntries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
     const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
     const expectedPostButtons = getExpectedSpaceFeedPostButtonCount(nextEntries)
@@ -5236,12 +5931,168 @@ function formatSpaceFeedStatusSummary(snapshot) {
     ].join('\n')
 }
 
+function getProfileProgressTime(record, key) {
+    const value = Number(record?.[key])
+    return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function getPositiveDurationMs(start, end) {
+    return Number.isFinite(start) && start > 0 && Number.isFinite(end) && end >= start
+        ? end - start
+        : null
+}
+
+function formatDurationMs(value) {
+    if(!Number.isFinite(value)) return 'n/a'
+    if(value < 1000) return `${Math.round(value)}ms`
+    return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)}s`
+}
+
+function formatDurationValueMs(value) {
+    return Number.isFinite(value) ? `${Math.round(value)}` : ''
+}
+
+function getProfileProgressOutcome(record) {
+    if(!record) return 'none'
+    if(isSuccessfulProfileNukeRecord(record)) return record.status === 'already-blocked' ? 'already-blocked' : 'blocked'
+    if(record.status === 'profile-unavailable') return 'profile-unavailable'
+    if(isSecurityVerificationProgressRecord(record)) return 'security-verification'
+    if(record.blockError) return `block-error:${record.blockError}`
+    if(record.muteError) return `mute-error:${record.muteError}`
+    if(record.finalError) return `error:${record.finalError}`
+    return record.status || 'unknown'
+}
+
+function getProfileProgressPhaseDurations(record) {
+    const queuedAt = getProfileProgressTime(record, 'queuedAt')
+    const tabCreatedAt = getProfileProgressTime(record, 'tabCreatedAt') || getProfileProgressTime(record, 'tabOpenedAt')
+    const contentOpenedAt = getProfileProgressTime(record, 'contentOpenedAt')
+    const actionReadyAt = getProfileProgressTime(record, 'actionReadyAt')
+    const muteAttemptedAt = getProfileProgressTime(record, 'muteAttemptedAt')
+    const mutedAt = getProfileProgressTime(record, 'mutedAt')
+    const blockAttemptedAt = getProfileProgressTime(record, 'blockAttemptedAt')
+    const blockedAt = getProfileProgressTime(record, 'blockedAt')
+    const terminalAt = getProfileProgressTime(record, 'terminalAt')
+    const slotReleasedAt = getProfileProgressTime(record, 'slotReleasedAt')
+    const closeRequestedAt = getProfileProgressTime(record, 'closeRequestedAt')
+    const tabClosedAt = getProfileProgressTime(record, 'tabClosedAt')
+
+    return {
+        queueWaitMs: getPositiveDurationMs(queuedAt, tabCreatedAt),
+        contentOpenMs: getPositiveDurationMs(tabCreatedAt, contentOpenedAt),
+        profileReadyMs: getPositiveDurationMs(contentOpenedAt || tabCreatedAt, actionReadyAt),
+        muteMs: getPositiveDurationMs(muteAttemptedAt, mutedAt),
+        blockMs: getPositiveDurationMs(blockAttemptedAt, blockedAt),
+        totalMs: getPositiveDurationMs(queuedAt, terminalAt || tabClosedAt || slotReleasedAt),
+        slotReleaseMs: getPositiveDurationMs(terminalAt, slotReleasedAt),
+        closeMs: getPositiveDurationMs(closeRequestedAt, tabClosedAt)
+    }
+}
+
+function getDurationStats(values) {
+    const sorted = values.filter(Number.isFinite).sort((left, right) => left - right)
+    if(!sorted.length) return null
+
+    const percentile = ratio => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio))]
+    const sum = sorted.reduce((total, value) => total + value, 0)
+    return {
+        count: sorted.length,
+        avg: sum / sorted.length,
+        p50: percentile(0.5),
+        p90: percentile(0.9),
+        max: sorted[sorted.length - 1]
+    }
+}
+
+function formatDurationStats(label, values) {
+    const stats = getDurationStats(values)
+    if(!stats) return `${label}: none`
+    return `${label}: count=${stats.count} avg=${formatDurationMs(stats.avg)} p50=${formatDurationMs(stats.p50)} p90=${formatDurationMs(stats.p90)} max=${formatDurationMs(stats.max)}`
+}
+
+function getSpaceFeedTimingRecords(snapshot) {
+    const recordsByHref = new Map()
+    const actionableEntries = Array.isArray(snapshot?.actionableEntries) ? snapshot.actionableEntries : []
+
+    for(const entry of actionableEntries) {
+        for(const url of getNormalizedProfileHrefList(entry.candidateUrls || [])) {
+            if(recordsByHref.has(url)) continue
+            const record = getProfileNukeProgressRecord(url)
+            if(record) {
+                recordsByHref.set(url, record)
+            }
+        }
+    }
+
+    return Array.from(recordsByHref.entries()).map(([url, record]) => ({url, record}))
+}
+
+function formatSpaceFeedTimingSummary(snapshot) {
+    const records = getSpaceFeedTimingRecords(snapshot)
+    const runRecords = records.filter(item => item.record?.runId)
+    const latestRunId = runRecords
+        .map(item => item.record)
+        .sort((left, right) => (getProfileProgressTime(right, 'queuedAt') - getProfileProgressTime(left, 'queuedAt')) || `${right.runId}`.localeCompare(`${left.runId}`))[0]?.runId || ''
+    const scoped = latestRunId
+        ? runRecords.filter(item => item.record.runId === latestRunId)
+        : records
+
+    if(!scoped.length) return 'timing_summary: none'
+
+    const phaseRows = scoped.map(item => ({
+        ...item,
+        phases: getProfileProgressPhaseDurations(item.record),
+        outcome: getProfileProgressOutcome(item.record)
+    }))
+    const outcomeCounts = new Map()
+    for(const row of phaseRows) {
+        outcomeCounts.set(row.outcome, (outcomeCounts.get(row.outcome) || 0) + 1)
+    }
+
+    const lines = [
+        `timing_run_id: ${latestRunId || 'unscoped'}`,
+        `timing_profiles: ${phaseRows.length}`,
+        `timing_outcomes: ${Array.from(outcomeCounts.entries()).map(([key, count]) => `${key}=${count}`).join(', ')}`
+    ]
+
+    const phaseKeys = [
+        ['timing_queue_wait', 'queueWaitMs'],
+        ['timing_content_open', 'contentOpenMs'],
+        ['timing_profile_ready', 'profileReadyMs'],
+        ['timing_mute', 'muteMs'],
+        ['timing_block', 'blockMs'],
+        ['timing_total', 'totalMs'],
+        ['timing_slot_release', 'slotReleaseMs'],
+        ['timing_close', 'closeMs']
+    ]
+
+    for(const [label, key] of phaseKeys) {
+        lines.push(formatDurationStats(label, phaseRows.map(row => row.phases[key])))
+    }
+
+    const slowest = phaseRows
+        .filter(row => Number.isFinite(row.phases.totalMs))
+        .sort((left, right) => right.phases.totalMs - left.phases.totalMs)
+        .slice(0, 10)
+
+    if(slowest.length) {
+        lines.push('timing_slowest_profiles:')
+        for(const row of slowest) {
+            lines.push(`- ${row.url} outcome=${row.outcome} queue_index=${row.record.queueIndex || ''} total=${formatDurationMs(row.phases.totalMs)} queue=${formatDurationMs(row.phases.queueWaitMs)} open=${formatDurationMs(row.phases.contentOpenMs)} ready=${formatDurationMs(row.phases.profileReadyMs)} mute=${formatDurationMs(row.phases.muteMs)} block=${formatDurationMs(row.phases.blockMs)}`)
+        }
+    }
+
+    return lines.join('\n')
+}
+
 function formatSpaceFeedStatusDetails(snapshot) {
     const lines = [
         'report_format: detailed-v2',
         `report_generated_at: ${new Date().toISOString()}`,
         '',
-        formatSpaceFeedStatusSummary(snapshot)
+        formatSpaceFeedStatusSummary(snapshot),
+        '',
+        formatSpaceFeedTimingSummary(snapshot)
     ]
 
     const actionableEntries = Array.isArray(snapshot?.actionableEntries) ? snapshot.actionableEntries : []
@@ -5280,6 +6131,11 @@ function formatSpaceFeedStatusDetails(snapshot) {
             }
 
             lines.push(`${prefix}_status: ${record.status || 'unknown'}`)
+            lines.push(`${prefix}_outcome: ${getProfileProgressOutcome(record)}`)
+            if(record.runId) lines.push(`${prefix}_run_id: ${record.runId}`)
+            if(record.queueIndex) lines.push(`${prefix}_queue_index: ${record.queueIndex}`)
+            if(record.retryAttempt) lines.push(`${prefix}_retry_attempt: ${record.retryAttempt}`)
+            if(record.maxRetries !== undefined) lines.push(`${prefix}_max_retries: ${record.maxRetries}`)
             lines.push(`${prefix}_found_blocked_before_queue: ${!!record.foundBlockedBeforeQueue}`)
             lines.push(`${prefix}_tab_opened: ${!!record.tabOpenedAt}`)
             lines.push(`${prefix}_opened_viable_page: ${!!record.openedViablePage}`)
@@ -5288,6 +6144,16 @@ function formatSpaceFeedStatusDetails(snapshot) {
             lines.push(`${prefix}_block_attempted: ${!!record.blockAttempted}`)
             lines.push(`${prefix}_block_succeeded: ${!!record.blockSucceeded}`)
             lines.push(`${prefix}_closed: ${!!record.tabClosedAt}`)
+
+            const phases = getProfileProgressPhaseDurations(record)
+            lines.push(`${prefix}_queue_wait_ms: ${formatDurationValueMs(phases.queueWaitMs)}`)
+            lines.push(`${prefix}_content_open_ms: ${formatDurationValueMs(phases.contentOpenMs)}`)
+            lines.push(`${prefix}_profile_ready_ms: ${formatDurationValueMs(phases.profileReadyMs)}`)
+            lines.push(`${prefix}_mute_ms: ${formatDurationValueMs(phases.muteMs)}`)
+            lines.push(`${prefix}_block_ms: ${formatDurationValueMs(phases.blockMs)}`)
+            lines.push(`${prefix}_total_ms: ${formatDurationValueMs(phases.totalMs)}`)
+            lines.push(`${prefix}_slot_release_ms: ${formatDurationValueMs(phases.slotReleaseMs)}`)
+            lines.push(`${prefix}_close_ms: ${formatDurationValueMs(phases.closeMs)}`)
 
             if(record.lastUrl) lines.push(`${prefix}_last_url: ${record.lastUrl}`)
             if(record.resolvedProfileHref) lines.push(`${prefix}_resolved_profile_url: ${record.resolvedProfileHref}`)
@@ -5299,7 +6165,10 @@ function formatSpaceFeedStatusDetails(snapshot) {
             if(record.muteError) lines.push(`${prefix}_mute_error: ${record.muteError}`)
             if(record.blockError) lines.push(`${prefix}_block_error: ${record.blockError}`)
             if(record.finalError) lines.push(`${prefix}_final_error: ${record.finalError}`)
-            lines.push(`${prefix}_security_verification: ${!!record.securityVerification}`)
+            lines.push(`${prefix}_security_verification: ${isSecurityVerificationProgressRecord(record)}`)
+            if(record.securityVerification && !isSecurityVerificationProgressRecord(record)) {
+                lines.push(`${prefix}_raw_security_verification: true`)
+            }
 
             if(Array.isArray(record.events) && record.events.length) {
                 lines.push(`${prefix}_events:`)
@@ -5451,7 +6320,6 @@ function syncSpaceFeedStatusButton(entries = null) {
     const host = getSpaceFeedStatusHost()
     if(!host) return false
 
-    const snapshot = getSpaceFeedDetectionSnapshot(entries)
     let button = host.querySelector('.mb-ext_space-feed-status-btn')
 
     if(!button) {
@@ -5465,7 +6333,7 @@ function syncSpaceFeedStatusButton(entries = null) {
         host.appendChild(button)
     }
 
-    button.textContent = formatSpaceFeedStatusLabel(snapshot)
+    button.textContent = formatSpaceFeedStatusLabel(entries)
     setMuteBlockHelp(button, 'Open the full candidate/progress report for this space page')
     return true
 }
@@ -5543,6 +6411,17 @@ async function removePendingSpaceFeedUrls(urls) {
     const normalizedUrls = new Set(getNormalizedProfileHrefList(urls))
     if(!normalizedUrls.size) return
 
+    const serviceResult = await safeSendRuntimeMessage({
+        action: 'remove-pending-space-feed-urls',
+        urls: Array.from(normalizedUrls)
+    }, null)
+    if(serviceResult) {
+        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
+            spacePendingNukedPosts = serviceResult.pendingPosts
+        }
+        return
+    }
+
     let changed = false
     const nextRecords = {
         ...spacePendingNukedPosts
@@ -5615,6 +6494,20 @@ async function confirmSpaceFeedProfileBlocked(profileHref) {
     const confirmedHref = normalizeQuoraProfileHref(profileHref)
     if(!confirmedHref) return false
 
+    const serviceResult = await safeSendRuntimeMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: [confirmedHref]
+    }, null)
+    if(serviceResult) {
+        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
+            spacePendingNukedPosts = serviceResult.pendingPosts
+        }
+        if(serviceResult.nukedPosts && typeof serviceResult.nukedPosts === 'object') {
+            spaceNukedPosts = pruneRememberedSpaceNukes(serviceResult.nukedPosts)
+        }
+        return !!serviceResult.confirmed
+    }
+
     let changedPending = false
     let changedNuked = false
     const nextPending = {
@@ -5673,6 +6566,30 @@ async function confirmSpaceFeedProfileBlocked(profileHref) {
     return true
 }
 
+async function confirmSucceededSpaceFeedProfiles(urls) {
+    const succeededUrls = getSuccessfulProfileNukeUrls(urls)
+    if(!succeededUrls.length) return []
+
+    const serviceResult = await safeSendRuntimeMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: succeededUrls
+    }, null)
+    if(serviceResult) {
+        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
+            spacePendingNukedPosts = serviceResult.pendingPosts
+        }
+        if(serviceResult.nukedPosts && typeof serviceResult.nukedPosts === 'object') {
+            spaceNukedPosts = pruneRememberedSpaceNukes(serviceResult.nukedPosts)
+        }
+        return succeededUrls
+    }
+
+    for(const url of succeededUrls) {
+        await confirmSpaceFeedProfileBlocked(url)
+    }
+    return succeededUrls
+}
+
 async function confirmCurrentProfileBlockedSpaceFeedEntries(profileHref = '') {
     if(getPageType() !== 'profile') return false
 
@@ -5720,6 +6637,11 @@ function getPendingSpaceFeedEntries(entries) {
     return entries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES && isSpaceFeedPostPending(entry.postKey))
 }
 
+function isSpaceFeedPostSettled(entry) {
+    const urls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+    return urls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES && urls.every(url => isProfileNukeRetryBlocked(url))
+}
+
 function scheduleSpaceFeedProgressReconciliation(entries = null, delay = 80) {
     if(spaceFeedProgressReconcilePending && delay !== 0) return
 
@@ -5761,6 +6683,7 @@ function getLiveSpaceFeedEntryUrls(entry) {
     if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
 
     const pendingUrls = Array.from(getPendingSpaceFeedUrlSet(entry.postKey))
+        .filter(url => !isProfileNukeSucceeded(url))
     const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
     return getNormalizedProfileHrefList([...pendingUrls, ...queueableUrls])
 }
@@ -5832,34 +6755,156 @@ function getQueueableSpaceFeedEntries(entries) {
     })
 }
 
+function getButtonFallbackSpaceFeedEntries(button) {
+    const urls = getSpaceFeedButtonUrls(button)
+    if(!urls.length) return []
+
+    return [{
+        postKey: button?.dataset?.mbPostKey || '',
+        postUrl: button?.dataset?.mbPostUrl || '',
+        candidateUrls: urls
+    }]
+}
+
+function getSpaceFeedEntriesMatchingUrls(entries, urls) {
+    const urlSet = new Set(getNormalizedProfileHrefList(urls))
+    if(!urlSet.size) return []
+
+    return (Array.isArray(entries) ? entries : []).flatMap(entry => {
+        const candidateUrls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+            .filter(url => urlSet.has(url) && !isProfileNukeRetryBlocked(url))
+        if(!candidateUrls.length) return []
+
+        return [{
+            ...entry,
+            candidateUrls
+        }]
+    })
+}
+
+function getClickedSpaceFeedEntries(button, currentEntries) {
+    const buttonUrls = getSpaceFeedButtonUrls(button)
+    if(buttonUrls.length) {
+        const matchedEntries = getSpaceFeedEntriesMatchingUrls(currentEntries, buttonUrls)
+        if(matchedEntries.length) return getLiveSpaceFeedEntries(matchedEntries)
+
+        return getButtonFallbackSpaceFeedEntries(button)
+    }
+
+    return getLiveSpaceFeedEntries(currentEntries)
+}
+
 function getDedupedSpaceFeedUrls(entries) {
-    const urls = []
-    const seen = new Set()
+    return getSpaceFeedProfilePostAssociations(entries).map(association => association.profileHref)
+}
+
+function getSpaceFeedProfilePostAssociations(entries) {
+    const associations = new Map()
 
     for(const entry of entries) {
+        const postKey = entry?.postKey || ''
+        const postUrl = entry?.postUrl || ''
+
         for(const url of entry.candidateUrls || []) {
             const normalized = normalizeQuoraProfileHref(url)
-            if(!normalized || seen.has(normalized)) continue
-            seen.add(normalized)
-            urls.push(normalized)
+            if(!normalized) continue
+
+            let association = associations.get(normalized)
+            if(!association) {
+                association = {
+                    profileHref: normalized,
+                    postKeys: [],
+                    postUrls: [],
+                    evidence: []
+                }
+                associations.set(normalized, association)
+            }
+
+            if(postKey && !association.postKeys.includes(postKey)) {
+                association.postKeys.push(postKey)
+            }
+            if(postUrl && !association.postUrls.includes(postUrl)) {
+                association.postUrls.push(postUrl)
+            }
+
+            const evidenceKey = `${postKey}|${postUrl}`
+            if((postKey || postUrl) && !association.evidence.some(evidence => `${evidence.postKey}|${evidence.postUrl}` === evidenceKey)) {
+                association.evidence.push({
+                    postKey,
+                    postUrl,
+                    collector: 'profile-links',
+                    sourcePageUrl: location.href
+                })
+            }
         }
     }
 
-    return urls
+    return Array.from(associations.values())
+}
+
+async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations) {
+    if(!space || !runId || !Array.isArray(profileAssociations) || !profileAssociations.length) {
+        return null
+    }
+
+    const source = {
+        type: 'space-feed',
+        pageUrl: location.href,
+        spaceKey: space.key || '',
+        spaceCategory: getStoredSpaceCategory(space)
+    }
+
+    return safeSendRuntimeMessage({
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: runId,
+            sourceType: 'space-feed',
+            sourcePageUrl: location.href
+        },
+        source,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: getSpaceFeedProfilesPerBatch(),
+            noForegroundFallback: true
+        },
+        items: profileAssociations.map(association => ({
+            runId,
+            dedupeKey: association.profileHref,
+            targetProfileHref: association.profileHref,
+            requestedUrl: association.profileHref,
+            source,
+            evidence: association.evidence || []
+        }))
+    }, null)
 }
 
 async function nukeSpaceFeedEntries(button, entries) {
     if(!button || !entries.length) return false
 
     const space = resolveCurrentSpaceDescriptor()
-    const urls = getDedupedSpaceFeedUrls(entries)
-    const postKeys = entries.map(entry => entry?.postKey).filter(Boolean)
-    const postUrls = entries.map(entry => entry?.postUrl).filter(Boolean)
     if(!space) return false
+
+    await confirmSucceededSpaceFeedProfiles(entries.flatMap(entry => entry.candidateUrls || []))
+
+    const unfinishedEntries = entries.flatMap(entry => {
+        const candidateUrls = getUnsuccessfulProfileNukeUrls(entry?.candidateUrls || [])
+        if(!candidateUrls.length) return []
+
+        return [{
+            ...entry,
+            candidateUrls
+        }]
+    })
+    const profileAssociations = getSpaceFeedProfilePostAssociations(unfinishedEntries)
+    const urls = profileAssociations.map(association => association.profileHref)
+    const runId = `space-feed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     if(!urls.length) {
-        alert('No candidate profiles were detected')
-        return false
+        syncSpaceFeedNukeControls()
+        setNukeButtonDone(button, 'Done')
+        return true
     }
+
+    rememberActiveSpaceFeedNukeMode(button, runId)
 
     updateOwnedNukeStatusCache({
         ...ownedNukeStatusCache,
@@ -5867,64 +6912,57 @@ async function nukeSpaceFeedEntries(button, entries) {
         paused: false
     })
     button.dataset.mbQueueing = 'true'
-    for(const entry of entries) {
+    for(const entry of unfinishedEntries) {
         if(entry?.postKey) {
             spaceFeedNukingPostKeys.add(entry.postKey)
         }
     }
     await animateNukeButtonPress(button)
-    setNukeButtonWorking(button, formatNukeProgressLabel('Queueing...', ownedNukeStatusCache))
+    setNukeButtonWorking(button, 'Queueing...')
 
     try {
-        await recordProfileNukeProgressBatch(urls.map(url => ({
-            profileHref: url,
+        await recordProfileNukeProgressBatch(profileAssociations.map((association, index) => ({
+            profileHref: association.profileHref,
             patch: buildQueuedProfileProgressPatch('Queued from space feed', {
-                postKeys,
-                postUrls
+                runId,
+                queueIndex: index + 1,
+                postKeys: association.postKeys,
+                postUrls: association.postUrls
             })
         })))
-        await registerPendingSpaceFeedEntries(space, entries)
+        await registerPendingSpaceFeedEntries(space, unfinishedEntries)
         syncSpaceFeedNukeControls()
-        setNukeButtonWorking(button, formatNukeProgressLabel('Nuking...', ownedNukeStatusCache))
+        setNukeButtonWorking(button, formatSpaceFeedNukingLabel(unfinishedEntries))
 
-        let launched = false
-        const result = await safeSendRuntimeMessage({
-            action: 'enqueue-tabs',
-            urls,
-            tabAction: 'nuke',
-            maxConcurrent: getProfilesPerBatch()
-        }, {queued: 0})
+        const result = await enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations)
 
-        if((result?.queued || 0) > 0) {
-            launched = true
+        if((result?.executionQueued || result?.queued || result?.merged || 0) > 0) {
             syncSpaceFeedNukeControls()
-            await waitForOwnedNukeTabsToDrain(button, 180000, 1000, {allowPause: true})
+            setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())))
             return true
         }
 
         const sweep = await sweepBlockedProfileTabs()
         if(sweep.owned > 0) {
-            launched = true
             syncSpaceFeedNukeControls()
-            await waitForOwnedNukeTabsToDrain(button, 180000, 1000, {allowPause: true})
+            setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())))
             return true
         }
 
-        if(!launched) {
-            await removePendingSpaceFeedUrls(urls)
-        }
+        await removePendingSpaceFeedUrls(urls)
         setNukeButtonIdle(button)
         alert('Nothing was queued')
         return false
     }
     finally {
         delete button.dataset.mbQueueing
-        for(const entry of entries) {
+        for(const entry of unfinishedEntries) {
             if(entry?.postKey) {
                 spaceFeedNukingPostKeys.delete(entry.postKey)
             }
         }
         updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+        clearInactiveSpaceFeedNukeMode()
         syncSpaceFeedNukeControls()
         scheduleSpaceAssetNukeControls(0)
     }
@@ -5933,7 +6971,8 @@ async function nukeSpaceFeedEntries(button, entries) {
 async function pauseSpaceFeedQueue(button) {
     if(!button) return false
 
-    const result = await safeSendRuntimeMessage({action: 'pause-owner-nukes'}, {canceledUrls: []})
+    const result = await safeSendRuntimeMessage({action: 'pause-coordinator-nukes'}, null) ||
+        await safeSendRuntimeMessage({action: 'pause-owner-nukes'}, {canceledUrls: []})
     const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
     updateOwnedNukeStatusCache({
         ...ownedNukeStatusCache,
@@ -5960,10 +6999,17 @@ function syncSpaceFeedTopNukeButton(entries) {
     const queueableEntries = getQueueableSpaceFeedEntries(actionableEntries)
     const busyEntries = actionableEntries.filter(entry => isSpaceFeedPostBusy(entry.postKey))
     const hasNukedEntries = totalEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))
+    const allActionableEntriesSettled = actionableEntries.length > 0 &&
+        actionableEntries.every(entry => isSpaceFeedPostSettled(entry) || isSpaceFeedPostNuked(entry.postKey))
     const allActionableEntriesNuked = actionableEntries.length > 0 &&
         actionableEntries.every(entry => isSpaceFeedPostNuked(entry.postKey))
     const ownerPaused = ownedNukeStatusCache.paused
     const ownerRunning = hasOwnedNukeWorkInFlight()
+    const localBusy = !!(ownerRunning || busyEntries.length || pendingEntries.length)
+    const batchNukeActive = isActiveSpaceFeedNukeMode('batch', localBusy)
+    const singleNukeActive = isActiveSpaceFeedNukeMode('single', localBusy)
+    const unknownNukeActive = isUnknownSpaceFeedNukeActive(localBusy)
+    const displayEntries = singleNukeActive ? queueableEntries : liveEntries
     const shouldPromptScroll = !ownerRunning && !ownerPaused && !busyEntries.length && !queueableEntries.length && !liveEntries.length && totalEntries.length > 0 && !hasNukedEntries
 
     let button = host.querySelector('.mb-ext_space-feed-nuke-btn')
@@ -5972,28 +7018,29 @@ function syncSpaceFeedTopNukeButton(entries) {
         button.type = 'button'
         button.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-nuke-btn'
         setMuteBlockHelp(button, 'Queue detected profiles from visible posts in this space for mute and block')
-        button.addEventListener('click', () => {
-            if(button.dataset.mbNukeState === 'working' || hasOwnedNukeWorkInFlight()) {
-                void pauseSpaceFeedQueue(button)
-                return
-            }
-
-            const currentEntries = getLatestSpaceFeedEntries()
-            const liveEntries = getLiveSpaceFeedEntries(currentEntries)
-            if(!liveEntries.length) {
-                if(currentEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))) {
-                    setNukeButtonDone(button)
-                    return
-                }
-
-                setNukeButtonIdle(button)
-                return
-            }
-
-            void nukeSpaceFeedEntries(button, liveEntries)
-        })
         host.appendChild(button)
     }
+    button = ensureCurrentInstanceClickHandler(button, 'space-feed-top', event => {
+        const activeButton = event.currentTarget
+        if(activeButton.dataset.mbNukeState === 'working') {
+            void pauseSpaceFeedQueue(activeButton)
+            return
+        }
+
+        const currentEntries = getLatestSpaceFeedEntries()
+        const entriesToNuke = getClickedSpaceFeedEntries(activeButton, currentEntries)
+        if(!entriesToNuke.length) {
+            if(currentEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))) {
+                setNukeButtonDone(activeButton)
+                return
+            }
+
+            setNukeButtonIdle(activeButton)
+            return
+        }
+
+        void nukeSpaceFeedEntries(activeButton, entriesToNuke)
+    })
 
     const queueSubmissionPending = button.dataset.mbQueueing === 'true'
 
@@ -6005,26 +7052,24 @@ function syncSpaceFeedTopNukeButton(entries) {
         return true
     }
 
-    setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(liveEntries))
+    setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(displayEntries))
     setMuteBlockHelp(button, shouldPromptScroll ? 'No visible targets. Scroll for more posts to scan.' : buildNukeTargetsHelpText('Queue detected profiles from visible posts in this space for mute and block', getSpaceFeedButtonUrls(button)))
 
-    if(queueSubmissionPending && (busyEntries.length || queueableEntries.length || ownerRunning)) {
-        setNukeButtonWorking(button, ownerRunning
-            ? formatNukeProgressLabel('Nuking...', ownedNukeStatusCache)
-            : 'Nuking...')
+    if((queueSubmissionPending && (busyEntries.length || queueableEntries.length || ownerRunning)) || batchNukeActive || unknownNukeActive) {
+        setNukeButtonWorking(button, formatSpaceFeedNukingLabel(liveEntries))
         button.disabled = false
     }
-    else if(ownerRunning) {
-        setNukeButtonWorking(button, formatNukeProgressLabel('Nuking...', ownedNukeStatusCache))
-        button.disabled = false
-    }
-    else if(ownerPaused && busyEntries.length) {
+    else if(ownerPaused && hasOwnedNukeWorkInFlight(ownedNukeStatusCache) && busyEntries.length) {
         setNukeButtonIdle(button, formatNukeProgressLabel('Paused', ownedNukeStatusCache))
         button.disabled = false
     }
-    else if(busyEntries.length || pendingEntries.length) {
-        setNukeButtonWorking(button, formatNukeProgressLabel('Settling...', ownedNukeStatusCache))
+    else if(singleNukeActive && queueableEntries.length) {
+        setNukeButtonIdle(button)
         button.disabled = false
+    }
+    else if(singleNukeActive) {
+        setNukeButtonIdle(button)
+        button.disabled = true
     }
     else if(shouldPromptScroll) {
         setNukeButtonIdle(button, 'Scroll for More')
@@ -6038,25 +7083,39 @@ function syncSpaceFeedTopNukeButton(entries) {
         setNukeButtonDone(button)
         button.disabled = true
     }
+    else if(allActionableEntriesSettled) {
+        setNukeButtonDone(button, 'Done')
+        button.disabled = true
+    }
     else {
-        setNukeButtonIdle(button)
-        button.disabled = false
+        setNukeButtonDone(button, 'Done')
+        button.disabled = true
     }
 
     return true
 }
 
-function syncSpaceFeedPostButtons(entries) {
+function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
     const activeKeys = new Set()
+    const aggregateEntries = getLiveSpaceFeedEntries(aggregateSourceEntries)
+    const queueableAggregateEntries = getQueueableSpaceFeedEntries(aggregateSourceEntries)
+    const ownerRunning = hasOwnedNukeWorkInFlight()
+    const aggregateBusy = aggregateSourceEntries.some(entry => isSpaceFeedPostBusy(entry.postKey))
+    const batchNukeActive = isActiveSpaceFeedNukeMode('batch', ownerRunning || aggregateBusy)
+    const singleNukeActive = isActiveSpaceFeedNukeMode('single', ownerRunning || aggregateBusy)
+    const unknownNukeActive = isUnknownSpaceFeedNukeActive(ownerRunning || aggregateBusy)
+    const aggregateButtonEntries = singleNukeActive ? queueableAggregateEntries : aggregateEntries
+    const aggregateUrls = getDedupedSpaceFeedUrls(aggregateButtonEntries)
+    const aggregateCount = aggregateUrls.length
 
     for(const entry of entries) {
         const liveUrls = getLiveSpaceFeedEntryUrls(entry)
         const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
         const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES
         const postBusy = isSpaceFeedPostBusy(entry.postKey)
-        const ownerRunning = hasOwnedNukeWorkInFlight()
-        const shouldShowButton = hasCandidates || postBusy || isSpaceFeedPostNuked(entry.postKey)
-        if(!shouldShowButton) {
+        const postNuked = isSpaceFeedPostNuked(entry.postKey)
+        const shouldShowControls = aggregateCount > 0 || hasCandidates || postBusy || postNuked
+        if(!shouldShowControls) {
             delete entry.postRoot.dataset.mbSpaceFeedPostKey
             continue
         }
@@ -6067,60 +7126,119 @@ function syncSpaceFeedPostButtons(entries) {
         entry.postRoot.dataset.mbSpaceFeedPostKey = entry.postKey
         activeKeys.add(entry.postKey)
 
-        let button = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
-        if(!button) {
-            button = document.createElement('button')
-            button.type = 'button'
-            button.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-post-nuke-btn'
-            setMuteBlockHelp(button, 'Queue detected profiles from this post in this space for mute and block')
-            button.addEventListener('click', () => {
-                if(button.dataset.mbNukeState === 'working') {
-                    void pauseSpaceFeedQueue(button)
-                    return
-                }
-
-                const postKey = button.dataset.mbPostKey || ''
-                if(!postKey || isSpaceFeedPostNuked(postKey)) {
-                    setNukeButtonDone(button)
-                    button.disabled = true
-                    return
-                }
-
-                const liveEntry = getLatestSpaceFeedEntries().find(candidate => candidate.postKey === postKey)
-                const liveUrls = getQueueableSpaceFeedEntryUrls(liveEntry)
-                const urls = liveUrls.length ? liveUrls : getSpaceFeedButtonUrls(button)
-                if(!urls.length) return
-
-                void nukeSpaceFeedEntries(button, [{
-                    postKey,
-                    postUrl: liveEntry?.postUrl || button.dataset.mbPostUrl || '',
-                    candidateUrls: urls
-                }])
-            })
-            host.appendChild(button)
+        let queueButton = host.querySelector('.mb-ext_space-feed-post-queue-btn')
+        if(!queueButton) {
+            queueButton = document.createElement('button')
+            queueButton.type = 'button'
+            queueButton.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-post-queue-btn'
+            setMuteBlockHelp(queueButton, 'Queue all currently detected profiles from visible posts in this space')
+            host.appendChild(queueButton)
         }
+        queueButton = ensureCurrentInstanceClickHandler(queueButton, 'space-feed-post-queue', event => {
+            const activeButton = event.currentTarget
+            if(activeButton.dataset.mbNukeState === 'working') {
+                void pauseSpaceFeedQueue(activeButton)
+                return
+            }
 
-        button.dataset.mbPostKey = entry.postKey
-        button.dataset.mbPostUrl = entry.postUrl || ''
-        setSpaceFeedButtonUrls(button, liveUrls)
-        setMuteBlockHelp(button, buildNukeTargetsHelpText('Queue detected profiles from this post in this space for mute and block', getSpaceFeedButtonUrls(button)))
+            const entriesToNuke = getClickedSpaceFeedEntries(activeButton, getLatestSpaceFeedEntries())
+            if(!entriesToNuke.length) {
+                setNukeButtonIdle(activeButton, `Nuke 'Em 0`)
+                activeButton.disabled = true
+                return
+            }
 
-        if(isSpaceFeedPostNuked(entry.postKey)) {
-            setNukeButtonDone(button)
-            button.disabled = true
+            void nukeSpaceFeedEntries(activeButton, entriesToNuke)
+        })
+
+        let singleButton = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
+        if(!singleButton) {
+            singleButton = document.createElement('button')
+            singleButton.type = 'button'
+            singleButton.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-post-nuke-btn mb-ext_space-feed-post-single-nuke-btn'
+            setMuteBlockHelp(singleButton, 'Queue only this post profile for mute and block')
+            host.appendChild(singleButton)
+        }
+        singleButton = ensureCurrentInstanceClickHandler(singleButton, 'space-feed-post-single', event => {
+            const activeButton = event.currentTarget
+            if(activeButton.dataset.mbNukeState === 'working') {
+                void pauseSpaceFeedQueue(activeButton)
+                return
+            }
+
+            const postKey = activeButton.dataset.mbPostKey || ''
+            if(!postKey || isSpaceFeedPostNuked(postKey)) {
+                setNukeButtonDone(activeButton)
+                activeButton.disabled = true
+                return
+            }
+
+            const liveEntry = getLatestSpaceFeedEntries().find(candidate => candidate.postKey === postKey)
+            const liveUrls = getQueueableSpaceFeedEntryUrls(liveEntry)
+            const urls = liveUrls.length ? liveUrls : getSpaceFeedButtonUrls(activeButton)
+            if(!urls.length) return
+
+            void nukeSpaceFeedEntries(activeButton, [{
+                postKey,
+                postUrl: liveEntry?.postUrl || activeButton.dataset.mbPostUrl || '',
+                candidateUrls: urls
+            }])
+        })
+
+        queueButton.dataset.mbPostKey = entry.postKey
+        setSpaceFeedButtonUrls(queueButton, aggregateUrls)
+        setMuteBlockHelp(queueButton, aggregateCount > 0
+            ? buildNukeTargetsHelpText(`Queue ${aggregateCount} currently detected profile${aggregateCount === 1 ? '' : 's'} from visible posts in this space`, aggregateUrls)
+            : 'No currently detected profiles are queueable from visible posts in this space')
+
+        if(batchNukeActive || unknownNukeActive) {
+            setNukeButtonWorking(queueButton, formatSpaceFeedNukingLabel(aggregateEntries))
+            queueButton.disabled = false
         }
         else {
-            // Keep per-post buttons visually stable while background queue state churns.
-            // The top-level button and MB Info carry queue progress; per-post buttons stay actionable.
-            setNukeButtonIdle(button)
-            button.disabled = false
+            setNukeButtonIdle(queueButton, `Nuke 'Em ${aggregateCount}`)
+            queueButton.disabled = aggregateCount < 1
+        }
+
+        singleButton.dataset.mbPostKey = entry.postKey
+        singleButton.dataset.mbPostUrl = entry.postUrl || ''
+        setSpaceFeedButtonUrls(singleButton, liveUrls)
+        setMuteBlockHelp(singleButton, buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton)))
+        singleButton.classList.remove('mb-ext_space-feed-post-single-nuke-btn--neutral')
+
+        if(postNuked) {
+            setNukeButtonDone(singleButton)
+            singleButton.disabled = true
+        }
+        else if(batchNukeActive || unknownNukeActive) {
+            setNukeButtonIdle(singleButton, 'Mute-Block')
+            singleButton.classList.add('mb-ext_space-feed-post-single-nuke-btn--neutral')
+            singleButton.disabled = true
+        }
+        else if(postBusy) {
+            setNukeButtonWorking(singleButton, formatSpaceFeedNukingLabel([{
+                ...entry,
+                candidateUrls: liveUrls
+            }]))
+            singleButton.disabled = false
+        }
+        else if(hasCandidates) {
+            setNukeButtonIdle(singleButton, 'Mute-Block')
+            singleButton.disabled = false
+        }
+        else {
+            setNukeButtonIdle(singleButton, 'Mute-Block')
+            singleButton.disabled = true
         }
     }
 
     for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
         const button = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
         const postKey = button?.dataset.mbPostKey || host.dataset.mbPostHostKey || ''
-        if(!button || !activeKeys.has(postKey) || postKey !== (host.dataset.mbPostHostKey || postKey)) {
+        if(!button ||
+            isSpaceFeedDocumentLevelElement(host.parentElement) ||
+            !activeKeys.has(postKey) ||
+            postKey !== (host.dataset.mbPostHostKey || postKey)) {
             host.remove()
         }
     }
@@ -6137,7 +7255,7 @@ function syncSpaceFeedPostButtons(entries) {
     }
 
     for(const root of Array.from(document.querySelectorAll('[data-mb-space-feed-post-key]'))) {
-        if(!activeKeys.has(root.dataset.mbSpaceFeedPostKey || '')) {
+        if(isSpaceFeedDocumentLevelElement(root) || !activeKeys.has(root.dataset.mbSpaceFeedPostKey || '')) {
             delete root.dataset.mbSpaceFeedPostKey
         }
     }
@@ -6149,15 +7267,19 @@ function syncSpaceFeedNukeControls() {
         return false
     }
 
-    const entries = getSpaceFeedPostEntries()
-    setLatestSpaceFeedEntries(entries)
+    const scannedEntries = getSpaceFeedPostEntries()
+    setLatestSpaceFeedEntries(scannedEntries)
+    const entries = getLatestSpaceFeedEntries()
     scheduleSpaceFeedProgressReconciliation(entries)
+    clearStaleLocalSpaceFeedBusyState()
+    clearInactiveSpaceFeedNukeMode()
     const main = document.querySelector('#mainContent')
     if(main) {
-        main.dataset.mbSpaceFeedTimestampCount = `${getVisibleSpaceFeedTimestamps().length}`
-        main.dataset.mbSpaceFeedCardCount = `${getSpaceFeedCardRoots().length}`
+        main.dataset.mbSpaceFeedTimestampCount = `${entries.length}`
+        main.dataset.mbSpaceFeedCardCount = `${entries.length}`
         main.dataset.mbSpaceFeedEntryCount = `${entries.length}`
-        main.dataset.mbSpaceFeedPostButtonCount = `${getExpectedSpaceFeedPostButtonCount(entries)}`
+        main.dataset.mbSpaceFeedVisibleEntryCount = `${scannedEntries.length}`
+        main.dataset.mbSpaceFeedPostButtonCount = `${getExpectedSpaceFeedPostButtonCount(scannedEntries)}`
     }
 
     syncSpaceFeedStatusButton(entries)
@@ -6169,7 +7291,7 @@ function syncSpaceFeedNukeControls() {
 
     syncSpaceFeedTopNukeButton(entries)
     syncSpaceFeedTopBarLayout()
-    syncSpaceFeedPostButtons(entries)
+    syncSpaceFeedPostButtons(scannedEntries, entries)
     return true
 }
 
@@ -6177,8 +7299,10 @@ function injectModalOpenProfilesBtn() {
     const modal = syncActiveProfileModal(getProfilePeopleModal())
     if(!modal) return
 
-    let items = getQueueableProfileModalItems(modal)
-    if(!items.length) {
+    const openItems = getOpenableProfileModalItems(modal)
+    const nukeItems = getNukeableProfileModalItems(modal)
+    const isModalNuking = modal.dataset.mbNuking === 'true'
+    if(!openItems.length && !nukeItems.length && !isModalNuking) {
         modal.querySelector('.mb-ext_open-profiles-btn')?.remove()
         modal.querySelector('.mb-ext_nuke-profiles-btn')?.remove()
         return
@@ -6188,37 +7312,51 @@ function injectModalOpenProfilesBtn() {
     if(!dismissBtn?.parentElement) return
 
     let btn = modal.querySelector('.mb-ext_open-profiles-btn')
-    if(!btn) {
+    if(!btn && openItems.length) {
         btn = document.createElement('button')
         btn.classList.add('mb-ext_open-profiles-btn')
-        btn.addEventListener('click', () => openModalProfiles())
         dismissBtn.parentElement.insertAdjacentElement('beforeend', btn)
     }
 
-    btn.innerHTML = `${getModalOpenProfilesLabel(modal)} <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    if(btn && openItems.length) {
+        btn = ensureCurrentInstanceClickHandler(btn, 'modal-open-profiles', () => openModalProfiles())
+        btn.innerHTML = `${getModalOpenProfilesLabel(modal)} <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
         <path stroke="none" d="M0 0h24v24H0z" fill="none"/>
         <path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" />
         <path d="M11 13l9 -9" />
         <path d="M15 4h5v5" />
     </svg>`
-    btn.disabled = false
-    setMuteBlockHelp(btn, 'Open listed profiles from this modal in background tabs')
+        btn.disabled = isModalNuking
+        setMuteBlockHelp(btn, 'Open listed profiles from this modal in background tabs')
+    }
+    else {
+        btn?.remove()
+    }
 
     let nukeBtn = modal.querySelector('.mb-ext_nuke-profiles-btn')
-    if(!nukeBtn) {
+    if(!nukeBtn && (nukeItems.length || isModalNuking)) {
         nukeBtn = document.createElement('button')
         nukeBtn.innerText = `Nuke 'Em`
         nukeBtn.classList.add('mb-ext_nuke-profiles-btn')
-        setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(items)))
-        nukeBtn.addEventListener('click', () => void nukeModalProfiles())
         dismissBtn.parentElement.insertAdjacentElement('beforeend', nukeBtn)
     }
 
-    if(nukeBtn.dataset.mbNukeState !== 'working' && nukeBtn.dataset.mbNukeState !== 'done') {
-        setNukeButtonIdle(nukeBtn)
+    if(nukeBtn && (nukeItems.length || isModalNuking)) {
+        nukeBtn = ensureCurrentInstanceClickHandler(nukeBtn, 'modal-nuke-profiles', () => void nukeModalProfiles())
+        if(isModalNuking) {
+            setNukeButtonWorking(nukeBtn)
+            nukeBtn.disabled = true
+        }
+        else if(nukeBtn.dataset.mbNukeState !== 'working') {
+            setNukeButtonIdle(nukeBtn)
+            nukeBtn.disabled = false
+        }
+        setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(nukeItems)))
     }
-    setMuteBlockHelp(nukeBtn, buildNukeTargetsHelpText('Queue listed profiles from this modal for mute and block', getModalProfileLinks(items)))
-    nukeBtn.disabled = false
+    else if(nukeBtn) {
+        setNukeButtonDone(nukeBtn)
+        nukeBtn.disabled = true
+    }
 }
 
 function getModalOpenProfilesLabel(modal = getProfilePeopleModal()) {
@@ -6233,6 +7371,10 @@ function getProfilesPerBatch() {
     const value = Number.parseInt(settings.profilesPerBatch, 10)
     if(!Number.isFinite(value) || value < 1) return defaults.profilesPerBatch
     return value
+}
+
+function getSpaceFeedProfilesPerBatch() {
+    return SPACE_FEED_PROFILES_PER_BATCH
 }
 
 function getModalProfileActionButtons(modal = getProfilePeopleModal()) {
@@ -6289,6 +7431,72 @@ function getModalProfileLinks(items) {
     return getNormalizedProfileHrefList((items || []).filter(isModalItemQueueable).map(item => getModalItemProfileHref(item)))
 }
 
+function getProfileModalScrollContainer(modal = getProfilePeopleModal()) {
+    if(!modal) return null
+
+    const candidates = [modal, ...Array.from(modal.querySelectorAll('*'))]
+        .filter(element => {
+            if(!isVisible(element)) return false
+            if(element.scrollHeight <= element.clientHeight + 20) return false
+
+            const style = getComputedStyle(element)
+            return /(auto|scroll|overlay)/i.test(`${style.overflowY || ''}`) ||
+                element.querySelectorAll?.('[role="listitem"]').length > 0
+        })
+        .map(element => ({
+            element,
+            listItems: element.querySelectorAll?.('[role="listitem"]').length || 0,
+            scrollable: Math.max(0, element.scrollHeight - element.clientHeight)
+        }))
+        .filter(candidate => candidate.scrollable > 0)
+
+    candidates.sort((left, right) => {
+        if(!!right.listItems !== !!left.listItems) return right.listItems - left.listItems
+        return right.scrollable - left.scrollable
+    })
+
+    return candidates[0]?.element || null
+}
+
+function getProfileModalScrollSignature(modal = getProfilePeopleModal()) {
+    const scroller = getProfileModalScrollContainer(modal)
+    if(!scroller) return 'no-scroll'
+
+    return [
+        Math.round(scroller.scrollTop),
+        Math.round(scroller.scrollHeight),
+        Math.round(scroller.clientHeight),
+        getProfileModalItems(modal).map(getModalItemProfileHref).filter(Boolean).join('|')
+    ].join(':')
+}
+
+async function scrollProfileModalForMore(modal = getProfilePeopleModal()) {
+    const scroller = getProfileModalScrollContainer(modal)
+    if(!scroller) return false
+
+    const beforeTop = scroller.scrollTop
+    const beforeHeight = scroller.scrollHeight
+    const beforeSignature = getProfileModalScrollSignature(modal)
+    const maxTop = Math.max(0, beforeHeight - scroller.clientHeight)
+    const step = Math.max(240, Math.round(scroller.clientHeight * 0.85))
+    const nextTop = Math.min(maxTop, beforeTop + step)
+
+    if(nextTop > beforeTop + 1) {
+        scroller.scrollTop = nextTop
+    }
+    else {
+        scroller.scrollTop = maxTop
+    }
+
+    scroller.dispatchEvent(new Event('scroll', {bubbles: true}))
+    scroller.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: step}))
+    await sleep(900)
+
+    return scroller.scrollTop > beforeTop + 1 ||
+        scroller.scrollHeight > beforeHeight + 1 ||
+        getProfileModalScrollSignature(modal) !== beforeSignature
+}
+
 function openModalProfiles(afterTimeout = false) {
     const modal = syncActiveProfileModal(getProfilePeopleModal())
     if(!modal) return
@@ -6305,7 +7513,7 @@ function openModalProfiles(afterTimeout = false) {
         markModalItemsHandled(items, '#d4edda')
     }
 
-    const listItems = getQueueableProfileModalItems(modal)
+    const listItems = getOpenableProfileModalItems(modal)
 
     let openProfilesBtn = getModalProfileActionButtons(modal).open
     if(!openProfilesBtn) return
@@ -6346,7 +7554,7 @@ async function nukeModalProfiles() {
 
     if(modal.dataset.mbNuking === 'true') return
 
-    let items = getQueueableProfileModalItems(modal)
+    let items = getNukeableProfileModalItems(modal)
     if(!items.length) {
         const buttons = getModalProfileActionButtons(modal)
         setNukeButtonDone(buttons.nuke, 'Rubble')
@@ -6360,58 +7568,73 @@ async function nukeModalProfiles() {
 
     try {
         const maxConcurrent = getProfilesPerBatch()
+        const urlsToQueue = []
+        const queuedUrls = new Set()
         let idlePasses = 0
+        let scrollPasses = 0
 
-        while(idlePasses < 3) {
-            items = getQueueableProfileModalItems(modal)
+        while(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES &&
+            scrollPasses < MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES) {
+            items = getNukeableProfileModalItems(modal)
 
             if(items.length) {
-                const urls = getModalProfileLinks(items)
+                const urls = getModalProfileLinks(items).filter(url => !queuedUrls.has(url))
 
                 if(urls.length) {
-                    await recordProfileNukeProgressBatch(urls.map(url => ({
-                        profileHref: url,
-                        patch: buildQueuedProfileProgressPatch('Queued from modal')
-                    })))
-                    const result = await safeSendRuntimeMessage({
-                        action: 'enqueue-tabs',
-                        urls,
-                        tabAction: 'nuke',
-                        maxConcurrent
-                    }, {queued: 0})
-
-                    if((result?.queued || 0) <= 0) {
-                        const sweep = await sweepBlockedProfileTabs()
-                        if(sweep.owned > 0) {
-                            await waitForOwnedNukeTabsToDrain(buttons.nuke)
-                            break
-                        }
-
-                        setNukeButtonDone(buttons.nuke, 'Rubble')
-                        return
+                    for(const url of urls) {
+                        queuedUrls.add(url)
+                        urlsToQueue.push(url)
                     }
 
-                    markModalItemsHandled(items, '#f8d7da')
-                    items[items.length - 1].scrollIntoView({block: 'nearest'})
+                    markModalItemsNukeQueued(items, '#f8d7da')
                     idlePasses = 0
+                    items[items.length - 1].scrollIntoView({block: 'nearest'})
+                    if(await scrollProfileModalForMore(modal)) {
+                        scrollPasses += 1
+                        idlePasses = 0
+                    }
                 }
                 else {
                     idlePasses += 1
                 }
             }
             else {
-                idlePasses += 1
+                if(await scrollProfileModalForMore(modal)) {
+                    scrollPasses += 1
+                    idlePasses = 0
+                }
+                else {
+                    idlePasses += 1
+                }
             }
 
-            if(idlePasses < 3) await sleep(1500)
+            if(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES) await sleep(900)
         }
 
-        await waitForOwnedNukeTabsToDrain(buttons.nuke)
+        if(urlsToQueue.length) {
+            await recordProfileNukeProgressBatch(urlsToQueue.map(url => ({
+                profileHref: url,
+                patch: buildQueuedProfileProgressPatch('Queued from modal')
+            })))
+            const result = await safeSendRuntimeMessageWithTimeout({
+                action: 'enqueue-tabs',
+                urls: urlsToQueue,
+                tabAction: 'nuke',
+                noForegroundFallback: true,
+                maxConcurrent
+            }, {queued: 0, timedOut: true})
+
+            if((result?.queued || 0) <= 0) {
+                await sweepBlockedProfileTabs()
+            }
+
+            await waitForOwnedNukeTabsToDrain(buttons.nuke)
+        }
     }
     finally {
         delete modal.dataset.mbNuking
 
-        if(getUnhandledProfileModalItems(modal).length) {
+        if(getUnhandledProfileModalItems(modal).length || getNukeableProfileModalItems(modal).length) {
             resetModalProfileActionButtons(modal)
         }
         else {
@@ -6441,6 +7664,7 @@ async function maybeRunAutoProfileAction() {
         : autoProfileAction
 
     if(claimedAction?.action !== 'nuke') return
+    const allowForegroundFallback = !claimedAction?.noForegroundFallback
 
     autoProfileActionPending = true
     autoProfileAction = null
@@ -6452,12 +7676,14 @@ async function maybeRunAutoProfileAction() {
             ? normalizeQuoraProfileHref(location.href)
             : ''
         const remappedFromRequested = !!(queuedProfileHref && resolvedProfileHref && queuedProfileHref !== resolvedProfileHref)
+        const securityVerificationReason = getSecurityVerificationReason()
         const sharedPatch = {
             lastUrl: location.href,
             resolvedProfileHref: resolvedProfileHref || '',
             remappedFromRequested,
             pageType: getPageType() || 'unknown',
-            securityVerification: isSecurityVerificationPage(),
+            securityVerification: !!securityVerificationReason,
+            securityVerificationReason,
             unavailableReason: getProfileUnavailableReason() || '',
             ...patch
         }
@@ -6471,6 +7697,7 @@ async function maybeRunAutoProfileAction() {
         await recordQueuedProfileProgress({
             status: 'tab-opened',
             tabOpenedAt: Date.now(),
+            contentOpenedAt: Date.now(),
             openedViablePage: false,
             event: 'Queued tab opened'
         })
@@ -6487,19 +7714,21 @@ async function maybeRunAutoProfileAction() {
             queuedTabReleased = await notifyQueuedTabComplete()
             return queuedTabReleased
         }
-        const closeQueuedBlockedTab = async () => {
+        const closeQueuedBlockedTab = async (patch = {}) => {
+            const foundBlockedBeforeQueue = !!patch.foundBlockedBeforeQueue
             await recordQueuedProfileProgress({
-                status: 'blocked',
+                status: foundBlockedBeforeQueue ? 'already-blocked' : 'blocked',
                 blockSucceeded: true,
                 blockedAt: Date.now(),
                 finalError: '',
-                event: 'Profile confirmed blocked'
+                event: foundBlockedBeforeQueue ? 'Profile confirmed already blocked' : 'Profile confirmed blocked',
+                ...patch
             })
             await releaseQueuedTabSlot()
             await requestCloseTab()
         }
         const skipQueuedUnavailableTab = async message => {
-            console.warn(message)
+            console.info(message)
             await recordQueuedProfileProgress({
                 status: 'profile-unavailable',
                 openedViablePage: false,
@@ -6512,7 +7741,7 @@ async function maybeRunAutoProfileAction() {
             await requestCloseTab(2, 100, true)
         }
         const abandonQueuedTab = async message => {
-            console.warn(message)
+            console.info(message)
             await recordQueuedProfileProgress({
                 status: 'error',
                 openedViablePage: false,
@@ -6546,7 +7775,7 @@ async function maybeRunAutoProfileAction() {
         }
 
         if(isProfileBlocked()) {
-            await recordQueuedProfileProgress({
+            await closeQueuedBlockedTab({
                 status: 'already-blocked',
                 openedViablePage: true,
                 foundBlockedBeforeQueue: true,
@@ -6555,7 +7784,6 @@ async function maybeRunAutoProfileAction() {
                 event: 'Profile was already blocked before actions'
             })
             await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
-            await closeQueuedBlockedTab()
             return
         }
 
@@ -6564,13 +7792,14 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
-        let ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton() || !!getProfileUnavailableReason(), 25000, 250)
-        if(!ready && document.visibilityState !== 'visible') {
+        const initialReadyTimeoutMs = document.visibilityState === 'visible' || !allowForegroundFallback ? 25000 : 3500
+        let ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton() || !!getProfileUnavailableReason(), initialReadyTimeoutMs, 250)
+        if(!ready && document.visibilityState !== 'visible' && allowForegroundFallback) {
             await recordQueuedProfileProgress({
                 event: 'Profile actions stalled in a background tab; requesting foreground fallback'
             })
 
-            const promoted = await promoteCurrentQueuedTab('profile-actions-not-ready')
+            const promoted = await promoteCurrentQueuedTab('profile-actions-not-ready', allowForegroundFallback)
             if(promoted) {
                 await recordQueuedProfileProgress({
                     event: 'Queued tab promoted to the foreground after hidden-tab stall'
@@ -6591,7 +7820,7 @@ async function maybeRunAutoProfileAction() {
         }
 
         if(isProfileBlocked()) {
-            await recordQueuedProfileProgress({
+            await closeQueuedBlockedTab({
                 status: 'already-blocked',
                 openedViablePage: true,
                 foundBlockedBeforeQueue: true,
@@ -6600,7 +7829,6 @@ async function maybeRunAutoProfileAction() {
                 event: 'Profile reached blocked state before mute/block actions'
             })
             await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
-            await closeQueuedBlockedTab()
             return
         }
 
@@ -6612,7 +7840,7 @@ async function maybeRunAutoProfileAction() {
         })
 
         if(!isProfileBlocked()) {
-            const completed = await muteProfile({allowBlockFallback: true, silent: true})
+            const completed = await muteProfile({allowBlockFallback: true, silent: true, allowForegroundFallback})
             if(!completed && !isProfileBlocked()) {
                 if(getProfileUnavailableReason()) {
                     await skipQueuedUnavailableTab('Profile unavailable')
@@ -6672,7 +7900,7 @@ function reportActionIssue(message, silent = false) {
 }
 
 async function muteProfile(options = {}) {
-    const {allowBlockFallback = false, silent = false} = options
+    const {allowBlockFallback = false, silent = false, allowForegroundFallback = true} = options
     await recordCurrentProfileNukeProgress({
         status: 'muting',
         muteAttempted: true,
@@ -6680,19 +7908,25 @@ async function muteProfile(options = {}) {
         event: 'Mute flow started'
     })
 
-    const menuOpened = await ensureProfileMenuOpen(2500, silent)
+    const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
         await recordCurrentProfileNukeProgress({
             muteSucceeded: false,
             muteError: 'Profile menu did not open',
             event: 'Mute flow fell back because the profile menu did not open'
         })
-        return allowBlockFallback ? blockProfile({silent}) : false
+        return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
     }
 
     await sleep(500)
 
-    const muteState = await waitForMenuState(/\bmute\b/i, /\bunmute\b/i, 5000, 250)
+    const muteState = await waitForMenuStateWithForegroundFallback(isMuteActionLabel, isUnmuteActionLabel, {
+        timeoutMs: 5000,
+        intervalMs: 250,
+        promotionReason: 'mute-option-not-found',
+        silent,
+        allowForegroundFallback
+    })
     if(muteState?.state === 'inverse') {
         await recordCurrentProfileNukeProgress({
             muteSucceeded: true,
@@ -6702,15 +7936,16 @@ async function muteProfile(options = {}) {
         await closeProfileMenu()
     }
     else {
-        let muteBtn = muteState?.button || getMenuAction(/\bmute\b/i)
+        let muteBtn = muteState?.button || getMenuAction(isMuteActionLabel)
         if(!muteBtn) {
             await recordCurrentProfileNukeProgress({
                 muteSucceeded: false,
                 muteError: 'Mute option not found',
+                menuActionLabels: getVisibleProfileMenuActionLabels(),
                 event: 'Mute option not found'
             })
             reportActionIssue('Mute option not found', silent)
-            return allowBlockFallback ? blockProfile({silent}) : false
+            return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
         muteBtn.click()
@@ -6723,7 +7958,7 @@ async function muteProfile(options = {}) {
                 event: 'Mute confirm button not found'
             })
             reportActionIssue('Confirm button not found', silent)
-            return allowBlockFallback ? blockProfile({silent}) : false
+            return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
         confirmBtn.click()
@@ -6742,10 +7977,10 @@ async function muteProfile(options = {}) {
                 event: 'Mute confirm did not complete'
             })
             reportActionIssue('Mute confirm did not complete', silent)
-            return allowBlockFallback ? blockProfile({silent}) : false
+            return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
-        const mutedApplied = await waitForProfileMenuState('inverse', /\bmute\b/i, /\bunmute\b/i, 8000, 500)
+        const mutedApplied = await waitForProfileMenuState('inverse', isMuteActionLabel, isUnmuteActionLabel, 8000, 500)
         if(!mutedApplied) {
             await recordCurrentProfileNukeProgress({
                 muteSucceeded: false,
@@ -6753,7 +7988,7 @@ async function muteProfile(options = {}) {
                 event: 'Mute did not take effect'
             })
             reportActionIssue('Mute did not take effect', silent)
-            return allowBlockFallback ? blockProfile({silent}) : false
+            return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
         await recordCurrentProfileNukeProgress({
@@ -6765,11 +8000,11 @@ async function muteProfile(options = {}) {
         await sleep(300)
     }
 
-    return blockProfile({silent})
+    return blockProfile({silent, allowForegroundFallback})
 }
 
 async function blockProfile(options = {}) {
-    const {silent = false} = options
+    const {silent = false, allowForegroundFallback = true} = options
 
     if(isProfileBlocked()) {
         await recordCurrentProfileNukeProgress({
@@ -6790,7 +8025,7 @@ async function blockProfile(options = {}) {
         event: 'Block flow started'
     })
 
-    const menuOpened = await ensureProfileMenuOpen(2500, silent)
+    const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
@@ -6802,7 +8037,13 @@ async function blockProfile(options = {}) {
 
     await sleep(500)
 
-    const blockState = await waitForMenuState(/\bblock\b/i, /\bunblock\b/i, 5000, 250)
+    const blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
+        timeoutMs: 5000,
+        intervalMs: 250,
+        promotionReason: 'block-option-not-found',
+        silent,
+        allowForegroundFallback
+    })
     if(blockState?.state === 'inverse') {
         await closeProfileMenu()
         rememberProfileBlocked()
@@ -6816,7 +8057,7 @@ async function blockProfile(options = {}) {
         return true
     }
 
-    let blockOpt = blockState?.button || getMenuAction(/\bblock\b/i)
+    let blockOpt = blockState?.button || getMenuAction(isBlockActionLabel)
     if(!blockOpt) {
         if(isProfileBlocked()) {
             await recordCurrentProfileNukeProgress({
@@ -6831,6 +8072,7 @@ async function blockProfile(options = {}) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Block option not found',
+            menuActionLabels: getVisibleProfileMenuActionLabels(),
             event: 'Block option not found'
         })
         reportActionIssue('Block option not found', silent)
@@ -6844,12 +8086,12 @@ async function blockProfile(options = {}) {
         const confirmButton = getBlockConfirmAction()
         if(confirmButton) return {type: 'confirm', button: confirmButton}
         if(profileBlockMutationCount > initialMutationCount || isProfileBlocked()) return {type: 'blocked'}
-        if(getMenuAction(/\bunblock\b/i)) return {type: 'blocked'}
+        if(getMenuAction(isUnblockActionLabel)) return {type: 'blocked'}
         return null
     }, 8000, 250)
 
     if(!confirmState) {
-        const blockedAppliedEarly = await waitForProfileMenuState('inverse', /\bblock\b/i, /\bunblock\b/i, 1500, 200)
+        const blockedAppliedEarly = await waitForProfileMenuState('inverse', isBlockActionLabel, isUnblockActionLabel, 1500, 200)
         if(blockedAppliedEarly || isProfileBlocked()) {
             rememberProfileBlocked()
             await recordCurrentProfileNukeProgress({
@@ -6906,7 +8148,7 @@ async function blockProfile(options = {}) {
 
     const blockedApplied = mutationSeen || await waitForCondition(() => isProfileBlocked(), 8000, 250)
     if(!blockedApplied) {
-        const blockedViaMenu = await waitForProfileMenuState('inverse', /\bblock\b/i, /\bunblock\b/i, 6000, 500)
+            const blockedViaMenu = await waitForProfileMenuState('inverse', isBlockActionLabel, isUnblockActionLabel, 6000, 500)
         if(!blockedViaMenu) {
             await recordCurrentProfileNukeProgress({
                 blockSucceeded: false,
@@ -6951,13 +8193,13 @@ function isProfileMenuOpen() {
     })
 }
 
-async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false) {
+async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowForegroundFallback = true) {
     if(isProfileMenuOpen()) return true
     if(!toggleMenu(silent)) return false
 
     let opened = await waitForCondition(() => isProfileMenuOpen(), timeoutMs, 100)
-    if(!opened && document.visibilityState !== 'visible') {
-        const promoted = await promoteCurrentQueuedTab('profile-menu-not-open')
+    if(!opened && document.visibilityState !== 'visible' && allowForegroundFallback) {
+        const promoted = await promoteCurrentQueuedTab('profile-menu-not-open', allowForegroundFallback)
         if(promoted) {
             await sleep(300)
             if(!isProfileMenuOpen()) {

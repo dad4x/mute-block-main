@@ -1,0 +1,267 @@
+body {
+    margin: 0;
+    font: 14px/1.4 system-ui, sans-serif;
+    background: #f4f5f7;
+    color: #1f2937;
+}
+
+.coordinator {
+    margin: 0 auto;
+    max-width: 1120px;
+    padding: 20px;
+}
+
+.coordinator-header {
+    align-items: center;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    padding: 16px 18px;
+}
+
+.brand {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    min-width: 0;
+}
+
+.brand-mark {
+    display: block;
+    height: 40px;
+    object-fit: contain;
+    width: 40px;
+}
+
+.header-status {
+    align-items: center;
+    display: flex;
+    flex-shrink: 0;
+}
+
+h1,
+h2 {
+    line-height: 1.2;
+    margin: 0;
+}
+
+h1 {
+    font-size: 24px;
+}
+
+h2 {
+    font-size: 16px;
+}
+
+.version {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+.status-pill {
+    background: #eef2ff;
+    border-radius: 999px;
+    color: #3730a3;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 6px 10px;
+}
+
+.summary-grid {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin-bottom: 16px;
+}
+
+.summary-tile,
+.panel {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+}
+
+.summary-tile {
+    padding: 14px;
+}
+
+.summary-label {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.summary-value {
+    font-size: 28px;
+    font-weight: 800;
+    margin-top: 4px;
+}
+
+.panel {
+    margin-bottom: 16px;
+    overflow: hidden;
+}
+
+.panel-head {
+    align-items: center;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    justify-content: space-between;
+    padding: 12px 14px;
+}
+
+.panel-head span,
+.panel-actions span {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.panel-actions {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+}
+
+.clear-button {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    color: #374151;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.clear-button:hover {
+    background: #f9fafb;
+}
+
+.clear-button:disabled {
+    cursor: default;
+    opacity: 0.55;
+}
+
+.panel-note {
+    border-bottom: 1px solid #f0f1f3;
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 8px 14px;
+}
+
+.list {
+    display: flex;
+    flex-direction: column;
+    max-height: 360px;
+    overflow-y: auto;
+}
+
+.list--compact {
+    max-height: 260px;
+}
+
+.empty {
+    color: #6b7280;
+    padding: 18px 14px;
+}
+
+.row {
+    border-bottom: 1px solid #f0f1f3;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: minmax(180px, 1fr) 120px 140px 160px;
+    padding: 12px 14px;
+}
+
+.row:last-child {
+    border-bottom: 0;
+}
+
+.row--event {
+    grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
+}
+
+.row-title {
+    font-weight: 700;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.row-subtitle {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 2px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.badge {
+    align-self: start;
+    background: #e5e7eb;
+    border-radius: 999px;
+    color: #374151;
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 8px;
+    text-align: center;
+}
+
+.badge--active,
+.badge--queued {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.badge--succeeded {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.badge--failed,
+.badge--canceled,
+.badge--enqueued {
+    background: #f3f4f6;
+    color: #374151;
+}
+
+.legacy-grid {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    padding: 14px;
+}
+
+.legacy-value {
+    font-size: 22px;
+    font-weight: 800;
+    margin-top: 4px;
+}
+
+@media (max-width: 760px) {
+    .coordinator {
+        padding: 12px;
+    }
+
+    .summary-grid,
+    .legacy-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .row {
+        grid-template-columns: 1fr;
+    }
+}

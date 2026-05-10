@@ -1,0 +1,8 @@
+# setup a browser control channel for one started by wb-chrome.ps1
+
+echo Browser control tunnel
+
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+    -R 9223:127.0.0.1:9222 \
+    dbrower@phoenix92608.dev3sub2phx.databasede3phx.oraclevcn.com
+
