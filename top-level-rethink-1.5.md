@@ -5,6 +5,10 @@ queue/coordinator reset. It is a design artifact only: no behavior should be
 changed until an implementation slice is chosen from the plan below. The
 execution plan is in `top-level-rethink-1.5-execution-plan.md`.
 
+Update: the current `1.5.x` state has been preserved on `refactor/1.5`; this
+model is now the basis for the `1.6` main-line reset, with public release
+targeted as `2.0`.
+
 ## Premises
 
 - Durable browser storage is the source of truth for work that must survive
