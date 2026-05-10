@@ -4,9 +4,11 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 
 ## Current Status
 
-- Source and local build artifacts are currently at `1.5.1` on the refactor branch.
+- Source is now on the `1.6.0` main development line.
 - The `release/1.4` branch remains the maintenance lane for the `1.4.247` baseline.
-- The `1.5` series is an internal architecture refactor of the accreted `1.4` nuke, queue, and state code; see [refactor-1.5-plan.md](refactor-1.5-plan.md).
+- The `refactor/1.5` branch is preserved as the last `1.5.x` coordinator/debugging lane.
+- The `1.6` series is the active durable job/state-machine reset of the accreted nuke, queue, and recovery code; see [refactor-1.6-plan.md](refactor-1.6-plan.md).
+- The public release target for the completed reset is `2.0`.
 - Chrome is the current release track.
 - Firefox store updates are currently blocked, so the published Firefox add-on is still on `1.2` until that pipeline is sorted out.
 - Within one installed extension copy, local state persists across normal page reloads.

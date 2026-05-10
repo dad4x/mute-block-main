@@ -3,6 +3,8 @@
 This is the implementation plan for `top-level-rethink-1.5.md`. It is meant to
 keep the reset incremental: first create an authoritative model, then route
 existing behavior through it, then retire the duplicate queue/progress paths.
+Although written from the late `1.5` rethink, this plan now executes on the
+`1.6` main line. The public release target is `2.0`.
 
 ## Execution Rules
 
