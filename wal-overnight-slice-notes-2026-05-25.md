@@ -254,3 +254,38 @@ pressure remains a separate performance/reliability follow-up.
   expected stale raw active-vs-WAL-succeeded count. Dashboard sanity showed 162
   ready, 292 succeeded, 0 soft-fail, 47 hard-fail, and 80 per-row cancel
   buttons for 80 displayed rows.
+
+## Slice 19: active-transition rollback WAL migration
+
+- Operation migrated: `rollbackFailedQueuedTabOpen` now applies its queue-row
+  repair through WAL-backed `rollback-active-transition`.
+- Authority boundary: the rollback path loads the WAL-recovered queue/runs
+  projection, validates the attempted row attempt id/number and tab id, then
+  revalidates the current row through `coordinatorAuthority.applyWithinStorageUpdate()`
+  before returning the row to `queued`. The mutator rejects missing/terminal
+  rows, stale attempts, tab changes, and target identity changes before durable
+  acknowledgement.
+- Persistence boundary: queue-row rollback is durable when the queue WAL append
+  succeeds. Compact queue/content projections are updated by the WAL projection
+  follow-up. Run recompute remains a derived `queue: false` repair save;
+  derived-save failure records diagnostics and schedules repair without
+  poisoning the durable rollback.
+- Still snapshot-backed: active transition/open ownership, enqueue, manual
+  retry/requeue, bulk pause/cancel, resolver remap/unresolved,
+  active-without-runtime requeue, tab-wide lease release, and other cross-row
+  cleanup remain deferred.
+- Validation: covered by `active transition rollback is WAL-backed and recovers
+  after restart`, `active transition rollback rejects stale attempt before WAL
+  append`, and `active transition rollback WAL append failure leaves row
+  active`; `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`,
+  `node -c test/swSynthetic.test.js`, `node test/p1-contract.test.js`, and
+  `node test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.559`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.559.zip` and
+  `firefox/mute_block-1.6.559.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.559` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 462 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and empty active WAL tail. Dashboard sanity showed 100 ready, 283
+  succeeded, 0 soft-fail, 56 hard-fail, 1 active, and 80 per-row cancel buttons
+  for 80 displayed rows.
