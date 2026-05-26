@@ -2542,11 +2542,18 @@ test('space feed action buttons keep Nuke Em labels', () => {
     const source = readRepoFile('shared/js/content.js')
     const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
     const postBody = extractFunction(source, 'function syncSpaceFeedPostButtons(renderModel)')
+    const globalWorkLabelBody = extractFunction(source, 'function formatSpaceFeedGlobalWorkLabel()')
+    const postWorkLabelBody = extractFunction(source, 'function formatSpaceFeedPostWorkLabel()')
 
     assert.match(topBody, /Nuke 'Em/)
     assert.match(postBody, /Nuke 'Em/)
+    assert.match(globalWorkLabelBody, /Nuking\.\.\./)
+    assert.match(postWorkLabelBody, /Nuking this/)
     assert.doesNotMatch(topBody, /Queue visible/)
     assert.doesNotMatch(postBody, /Queue visible/)
+    assert.doesNotMatch(globalWorkLabelBody, /Space jobs/)
+    assert.doesNotMatch(postWorkLabelBody, /This post:/)
+    assert.doesNotMatch(postWorkLabelBody, /left/)
 })
 
 test('dashboard has reversible pause and explicit current work cancel', () => {

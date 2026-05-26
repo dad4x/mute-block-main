@@ -1374,14 +1374,12 @@ function formatNukeProgressLabel(label, status = null) {
     return `${label} [t:${status.owned} a:${status.active} q:${status.queued}]`
 }
 
-function formatSpaceFeedGlobalWorkLabel(count = 0) {
-    const remaining = Number.parseInt(count, 10) || 0
-    return remaining > 0 ? `Space jobs: ${remaining} left` : 'Space jobs'
+function formatSpaceFeedGlobalWorkLabel() {
+    return 'Nuking...'
 }
 
-function formatSpaceFeedPostWorkLabel(count = 0) {
-    const remaining = Number.parseInt(count, 10) || 0
-    return remaining > 0 ? `This post: ${remaining} left` : 'This post queued'
+function formatSpaceFeedPostWorkLabel() {
+    return 'Nuking this'
 }
 
 function formatSpaceFeedNukingLabel(entries = []) {
