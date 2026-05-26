@@ -289,3 +289,43 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and empty active WAL tail. Dashboard sanity showed 100 ready, 283
   succeeded, 0 soft-fail, 56 hard-fail, 1 active, and 80 per-row cancel buttons
   for 80 displayed rows.
+
+## Slice 20: active-without-runtime reconcile WAL migration
+
+- Operation migrated: `requeueDurableActiveCoordinatorItemWithoutActor` now
+  applies its queue-row requeue/timeout repair through WAL-backed
+  `repair-active-without-actor`.
+- Authority boundary: the reconcile path loads the WAL-recovered
+  queue/runs/progress projection, validates expected attempt id/number and
+  progress compatibility, checks that any persisted tab is stale, then
+  revalidates the current row through
+  `coordinatorAuthority.applyWithinStorageUpdate()` before assigning a fresh
+  queued attempt or terminal timeout. The mutator rejects missing/non-active
+  rows, stale attempts, and target identity changes before durable
+  acknowledgement.
+- Persistence boundary: queue-row requeue/timeout is durable when the queue WAL
+  append succeeds. Compact queue/content projections are updated by the WAL
+  projection follow-up. Runs/progress recompute remains a derived `queue: false`
+  repair save; derived-save failure records diagnostics and schedules repair
+  without poisoning the durable row repair.
+- Still snapshot-backed: active transition/open ownership, enqueue, manual
+  retry/requeue, bulk pause/cancel, resolver remap/unresolved, tab-wide lease
+  release, and other cross-row cleanup remain deferred.
+- Validation: covered by `authority reconcile requeues durable active row
+  without runtime actor through WAL`, `authority reconcile rejects stale
+  active-without-actor attempt before WAL append`, `authority reconcile
+  active-without-actor WAL append failure leaves row active`, and `authority
+  reconcile terminalizes exhausted active-without-actor row through WAL`;
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, `SW_SCENARIO_FUZZ_SEED=0x5eed
+  SW_SCENARIO_FUZZ_STEPS=36 node test/swScenarioFuzz.test.js`, and `npm test`
+  passed. Version bumped to `1.6.560`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.560.zip` and `firefox/mute_block-1.6.560.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.560` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 456 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and empty active WAL tail. Dashboard
+  sanity showed 72 ready, 304 succeeded, 8 soft-fail, 49 hard-fail, 0 active,
+  and 72 per-row cancel buttons for 80 displayed rows.

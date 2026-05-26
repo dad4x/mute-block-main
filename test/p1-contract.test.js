@@ -1302,7 +1302,12 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(activeWithoutActorMutationBody, /loadCoordinatorCurrentAuthorityState\(\)/)
     assert.match(activeWithoutActorMutationBody, /currentAuthorityState/)
     assert.match(activeWithoutActorMutationBody, /buildRequeuedActiveCoordinatorItemWithoutActor/)
-    assert.match(activeWithoutActorMutationBody, /saveCoordinatorState\(\{[\s\S]*queue,[\s\S]*runs:[\s\S]*progress:[\s\S]*\}, \{[\s\S]*reason: 'repair'/)
+    assert.match(activeWithoutActorMutationBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'repair-active-without-actor'/)
+    assert.match(activeWithoutActorMutationBody, /expectedAttemptId/)
+    assert.match(activeWithoutActorMutationBody, /expectedAttemptNumber/)
+    assert.match(activeWithoutActorMutationBody, /reason: 'ordinaryMutation'/)
+    assert.match(activeWithoutActorMutationBody, /metricPath: 'repair\.activeWithoutActor\.save'/)
+    assert.match(activeWithoutActorMutationBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined,[\s\S]*progress: progressChanged \? pruneProfileNukeProgress\(progress\) : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'repair',[\s\S]*queueOperation: 'repair-active-without-actor-derived'/)
 })
 
 test('stale-attempt diagnostics are serialized with coordinator updates', () => {
