@@ -3,6 +3,7 @@ body {
     font: 14px/1.4 system-ui, sans-serif;
     background: #f7f7f8;
     color: #1f2937;
+    min-height: 100vh;
 }
 
 .popup {
@@ -108,6 +109,7 @@ body {
 
 .actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
 }
 
@@ -308,4 +310,106 @@ body {
 
 .popup-space-button--target {
     background: #111827;
+}
+
+@media (min-width: 720px) {
+    body {
+        background: #f4f5f7;
+    }
+
+    .popup {
+        box-sizing: border-box;
+        display: grid;
+        gap: 16px;
+        margin: 0 auto;
+        max-width: 1120px;
+        padding: 20px;
+        width: 100%;
+    }
+
+    .header {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        color: #1f2937;
+        padding: 16px 18px;
+    }
+
+    .header-main {
+        align-items: center;
+        gap: 10px;
+    }
+
+    .header-title {
+        font-size: 24px;
+        font-weight: 800;
+        line-height: 1.2;
+    }
+
+    .header-version {
+        background: #f3f4f6;
+        border-radius: 999px;
+        color: #6b7280;
+        font-weight: 700;
+        padding: 4px 8px;
+    }
+
+    .header-close {
+        display: none;
+    }
+
+    .form {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        padding: 0;
+    }
+
+    .section {
+        margin-bottom: 0;
+        padding: 16px;
+    }
+
+    .row {
+        align-items: flex-start;
+    }
+
+    .input,
+    .select {
+        box-sizing: border-box;
+        min-width: 120px;
+    }
+
+    .checkbox {
+        margin-top: 2px;
+    }
+
+    .actions,
+    .status {
+        grid-column: 1 / -1;
+    }
+
+    .actions {
+        justify-content: flex-end;
+    }
+
+    .button {
+        flex: 0 0 auto;
+        min-width: 120px;
+    }
+
+    .section-spaces,
+    .section-memory {
+        margin: 0;
+    }
+
+    .space-list {
+        max-height: min(420px, 42vh);
+    }
+}
+
+@media (min-width: 1040px) {
+    .form {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
 }

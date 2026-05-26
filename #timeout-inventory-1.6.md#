@@ -1,0 +1,178 @@
+# Timeout Inventory for 1.6
+
+Status: current-source inventory after the `1.6.72` repeatability checkpoint.
+
+Scope: source files under `shared/js`. Generated `chrome/` and `firefox/`
+outputs are intentionally ignored. Values below describe the current behavior,
+not the desired final scheduler design.
+
+## Summary
+
+The important timeout families are:
+
+- queue/scheduler stale-tab deadlines in `shared/js/sw.js`
+- coordinator page heartbeat, repair, and retry loops in `shared/js/coordinator.js`
+- content-script message bounds, source-page drain waits, and UI refresh debounces
+  in `shared/js/content.js`
+- profile action waits for Quora menus, confirmation dialogs, and post-action
+  verification in `shared/js/content.js`
+
+The architectural concern is not that these timeouts exist. The concern is that
+some worker-side profile menu waits now compensate for missing scheduler-owned
+foreground control. Those should be treated as tactical repeatability work until
+the durable scheduler owns interactive leases.
+
+## Service Worker Queue Deadlines
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `10000ms` | `STALE_ACTIVE_QUEUED_TAB_MS` in `shared/js/sw.js` | Default stale timeout for active queued tabs that are not in a background/no-foreground path and not in an action phase. | Keeps foreground-capable workers from lingering forever when no fresh progress heartbeat arrives. The value is short enough to expose stuck tabs during manual runs. | Replace with milestone lease once attempt ids and scheduler leases exist. Age-only stale handling is too coarse. |
+| `45000ms` | `STALE_BACKGROUND_OPENING_QUEUED_TAB_MS` in `shared/js/sw.js` | Background `noForegroundFallback` worker has not reported `contentOpenedAt`. | Background tabs can load slowly, and older evidence showed the service worker could close them before content script startup. This gives page load and injection a realistic window. | Keep as default page-load lease, but attach it to explicit `opening` state. |
+| `35000ms` | `STALE_BACKGROUND_READY_QUEUED_TAB_MS` in `shared/js/sw.js` | Background `noForegroundFallback` worker has content open but no `actionReadyAt`. | Aligns with content-side readiness waits so the service worker does not close a tab while content is still waiting for Quora profile controls. | Keep as profile-ready lease, but make it milestone-owned rather than metadata-owned. |
+| `30000ms` | `STALE_ACTIVE_ACTION_QUEUED_TAB_MS` in `shared/js/sw.js` | Worker is in `muting`, `blocking`, `unmuting`, or `unblocking`. | Action phases involve Quora menus and confirmation surfaces. They need a longer deadline than basic tab startup. | Keep the idea, but split by action and foreground lease in the durable scheduler. |
+| `8000ms` | `STALE_CLOSE_REQUESTED_QUEUED_TAB_MS` in `shared/js/sw.js` | Tab was asked to close but is still tracked. | Bounds close accounting so a tab that ignores or delays close does not hold a worker slot forever. | Keep. This is cleanup policy, not a band-aid. |
+| `0` | `STALE_QUEUED_TAB_MAX_RETRIES` in `shared/js/sw.js` | Internal stale active tab replacement retries. | Retry amplification made Quora pressure worse in earlier runs, so stale tabs now fail/interrupted instead of auto-amplifying. | Keep at zero until retry policy is explicit and attempt ids exist. |
+| `250ms` | `schedulePersistOwnedTabIdsByParent()` in `shared/js/sw.js` | Debounce persisted owner-tab state writes. | Avoids writing storage for every tab bookkeeping mutation while keeping recovery state fresh. | Keep. |
+| `3000ms` | `sendTabMessage()` in `shared/js/sw.js` | Bound tab message delivery. | Prevents a stale or transitioning content script from wedging service-worker cleanup or settlement work. | Keep. |
+
+## Coordinator Page Loops
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `5000ms` | `COORDINATOR_RESUME_INTERVAL_MS` in `shared/js/coordinator.js` | Coordinator page periodically asks service worker to resume pending queue work. | The coordinator is still helping repair/resume after reloads and service-worker restarts. Five seconds is responsive without hammering storage/runtime messages. | Later, durable scheduler should need less UI-page heartbeat help. |
+| `5000ms` | `COORDINATOR_FAILED_RETRY_INTERVAL_MS` in `shared/js/coordinator.js` | Idle retry loop for retryable failed rows. | Gives active work time to drain and keeps retry-failed mode from spinning. | Keep as operator retry poll, but retry policy should move to scheduler/job state. |
+| `5000ms` | `sendRuntimeMessageWithTimeout()` default in `shared/js/coordinator.js` | Bound coordinator-to-service-worker requests such as page-ready, repair, and resume. | Prevents coordinator UI from hanging if the service worker is waking, restarting, or unavailable. | Keep. |
+| `10000ms` | `retry-coordinator-failed` call in `shared/js/coordinator.js` | Bound failed-row retry request. | Retrying may inspect queue state and enqueue work; it gets more time than simple status/repair calls. | Keep, but revisit after retry is scheduler-native. |
+| `1000ms` | `scheduleCoordinatorStorageRepair()` in `shared/js/coordinator.js` | Debounce repair after progress/storage mismatch. | Coalesces rapid progress updates before asking the service worker to repair coordinator storage. | Keep. |
+
+## Content-Script Runtime Message Bounds
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `12000ms` | `safeSendRuntimeMessageWithTimeout()` default in `shared/js/content.js` | General content-to-service-worker request bound. | Old fallback default for heavier operations, including modal enqueue. It avoids indefinite hangs when runtime messaging stalls. | Too broad for most calls. Prefer call-specific bounds. |
+| `2500ms` | `get-owned-nuke-status` in `shared/js/content.js` | Source page reads owned/active/queued status. | Added after `Scanning...` could wedge if owned-work status stalled. The UI can render with fallback zero and refresh later. | Keep. |
+| `2500ms` | `settle-terminal-coordinator-items` in `shared/js/content.js` | Space page asks service worker to settle terminal items. | Settlement should be bounded so stale source pages do not block rendering. | Keep, but final settlement owner should be service worker. |
+| `2500ms` | `record-nuke-progress` and `record-nuke-progress-batch` in `shared/js/content.js` | Worker/source progress writes through service worker. | Lets the page fall back to local storage if the service worker does not answer quickly. | Keep during compatibility, remove local fallback dependence later. |
+| `2500ms` | `clear-profile-nuke-state` in `shared/js/content.js` | Manual/unblock cleanup of persistent nuke state. | Bounds the reverse-state cleanup path so profile buttons recover even if service worker response is slow. | Keep. |
+| `2500ms` | `promote-queued-tab` in `shared/js/content.js` | Worker requests foreground promotion. | This is tactical. It made hidden-tab profile menu interaction reliable enough to reproduce. | Replace with scheduler-owned foreground lease. |
+| `5000ms` | profile-page `enqueue-coordinator-items` for `Unblock Unmute` in `shared/js/content.js` | Queue one reverse action from the green profile button. | User-facing click should either queue promptly or return to Retry. Five seconds is a reasonable UI bound. | Keep. |
+
+## Source-Page Drain and Refresh Waits
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `180000ms` | `waitForOwnedNukeTabsToDrain()` in `shared/js/content.js` | Old source-page wait for owned tabs to drain. | Three minutes bounded older parent-page UX while workers ran. Current coordinator-owned work should not rely on this for completion. | Retire or narrow as source-page settlement moves fully behind service worker. |
+| `1000ms` | `waitForOwnedNukeTabsToDrain()` interval | Poll owned/queued status while draining. | Human-visible progress does not need sub-second polling. | Keep if this path remains. |
+| `4000ms` | `waitForOwnedNukeTabsToDrain()` sweep cadence | Periodically sweep blocked profile tabs while waiting. | Helps close already-settled tabs during long drain waits without sweeping every poll. | Keep only as compatibility cleanup. |
+| `5000ms`, `25ms` interval | content `init()` body wait | Wait for `document.body` before injecting controls. | Content script can run before body exists. Five seconds is enough to avoid waiting forever on broken pages. | Keep. |
+| `350ms` | space-page initial stale reconciliation | Run space-feed stale reconciliation shortly after startup. | Gives initial Quora render a moment before reconciling old pending state. | Keep as startup debounce. |
+| `80ms` | `scheduleSpaceFeedProgressReconciliation()` default | Debounce pending-post reconciliation. | Coalesces progress updates while keeping source page labels responsive. | Keep. |
+| `250ms` | `suppressSpaceAssetNukeRefreshUntil` after asset refresh | Short suppression after feed control sync. | Avoids immediate self-triggered refresh loops from extension DOM changes. | Keep. |
+
+## UI Injection and Page-Render Debounces
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `400ms` | `scheduleProfileButtonsRefresh()` default | Debounce profile button refresh. | Avoids fighting Quora DOM churn while still restoring buttons quickly. | Keep. |
+| `400ms`, `1000ms`, `2000ms`, `3500ms` | `scheduleProfileButtonsFollowUps()` | Follow-up profile button injection after page load. | Quora profile controls often appear after initial content-script startup. | Keep. |
+| `50ms` initial, then `20 * 250ms` | `ensureProfileButtons()` retry loop | Retry profile button injection for about five seconds. | Covers delayed profile DOM without observing forever. | Keep. |
+| `1000ms` default, then `20 * 750ms` | `ensureQuestionPageFOPBtn()` using `settings.fopDelay` | Inject original-poster finder button. | Question pages load their target controls asynchronously. | Keep; unrelated to current queue performance. |
+| `1500ms`, `4000ms`, `8000ms`, `12000ms` | question-page follow-ups | Re-inject original-poster controls after late page render. | Quora question pages mutate after route changes. | Keep; unrelated to current queue performance. |
+| `150ms` default | `scheduleSpacePostNukeBtn()` | Inject a space-post nuke button. | Small debounce for page structure to settle. | Keep. |
+| `800ms`, `2000ms`, `5000ms` | space-post follow-ups | Retry space-post button injection. | Space posts can render late. | Keep. |
+| `800ms`, `2000ms`, `5000ms`, `10000ms` | space-page follow-ups | Retry space page controls after late async render. | Space pages often become identifiable after initial startup. | Keep. |
+| `120ms` | mutation-triggered space classification refresh | Debounce category controls after structural feed changes. | Avoids repainting controls on every mutation. | Keep. |
+| `150ms` default | `scheduleSpaceClassificationControls()` | Debounce category controls. | Same as above. | Keep. |
+| `180ms` default | `scheduleSpaceAssetNukeControls()` | Debounce feed nuke control scan. | Gives Quora feed mutations time to settle. | Keep. |
+| `160ms` | resize-triggered viewport sync | Sync visible feed controls after resize. | Quick enough for viewport changes without scanning on every resize event. | Keep. |
+| `450ms` plus `120ms` grace | scroll-triggered feed refresh | Wait for scroll idle before scanning visible feed entries. | Avoids expensive feed scanning while the user is actively scrolling. | Keep. |
+
+## Modal Profile Scanning
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `1000ms` | people/contributor modal loaded wait | Wait after Quora reports a modal loaded before reading profile rows. | Modal rows can arrive just after the message. | Keep. |
+| `2000ms` | profile followers/following modal loaded wait | Longer wait before reopening profile modal processing. | Follower/following lists render more slowly. | Keep. |
+| `5000ms` | `profilesModalTimeout` fallback | Continue opening profiles after a partially filled modal batch stalls. | Gives Quora time to append more rows after scroll. | Keep for modal workflow. |
+| `900ms` | modal scroll wait | Wait after synthetic scroll/wheel events. | Quora virtualized modals need time to load next rows. | Keep. |
+| `80` passes, `4` idle passes | modal nuke scan caps | Bound modal scrolling while collecting profiles. | Prevents infinite modal scans on virtualized lists. At 900ms waits, the scan can run for roughly a minute in worst case. | Keep unless modal workflow becomes coordinator-native. |
+
+## Worker Tab Readiness
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `5000ms` | queued worker waits for profile/security/unavailable page type | Give navigation time to land on a profile or known failure page. | Detects bad redirects/security pages without hanging. | Keep, but make this an `opening`/`claimed` lease. |
+| `25000ms` | visible or no-foreground profile-action readiness | Wait for profile controls when foreground interaction is allowed or background fallback is disabled. | Quora profile controls can be slow; this aligns with longer service-worker no-foreground deadlines. | Keep only as content-side worker wait; scheduler should own the corresponding lease. |
+| `3500ms` | hidden tab initial readiness before foreground fallback | Fast hidden-tab probe before asking for foreground. | Avoids waiting 25 seconds in a tab that probably cannot expose actionable menu controls while hidden. | Tactical. Replace with scheduler lease. |
+| `15000ms` | post-promotion readiness wait | After foreground promotion, wait for controls to become actionable. | Foreground tabs usually render controls soon after activation, but Quora can still be slow. | Keep under foreground lease, not as worker-owned contention. |
+| `3500ms` | queued unblock/unmute verification after action | Confirm reverse action before terminal success. | Keeps queued reverse operation from reporting success on a stale click. | Keep. |
+| `2500ms` | promotion fallback message bound | Worker asks service worker to promote current queued tab. | Made repeatability possible, but causes foreground contention. | Replace with scheduler-owned foreground lease. |
+
+## Profile Menu and Action Surface Waits
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `4000ms`, `200ms` interval | `waitForAction()` default | Generic action lookup. | Default for short-lived Quora UI surfaces. | Keep as helper default. |
+| `4000ms`, `200ms` interval | `waitForCondition()` default | Generic condition polling. | Default for bounded async DOM checks. | Keep as helper default. |
+| `4000ms`, `250ms` interval | `waitForConditionOrDomMutation()` default | DOM mutation assisted condition wait. | Avoids pure polling for menu/verification surfaces. | Keep. |
+| `2500ms` | `ensureProfileMenuOpen()` default | Open profile overflow menu. | Profile menu should open quickly once tab is foreground and controls exist. | Keep after foreground lease exists; current retries are tactical. |
+| `300ms`, `250ms`, `200ms`, `400ms` sleeps | foreground/menu retry glue | Let Quora process focus, menu open/close, and Escape. | These are mechanical UI settling waits. | Review after scheduler-owned foreground lease; do not add more without evidence. |
+| `1500ms`, first close window `600ms` | `closeProfileMenu()` | Close menu with Escape or toggle fallback. | Closing should be quick; fallback handles occasional Escape miss. | Keep. |
+| `8000ms`, `500ms` interval | `waitForProfileMenuState()` default | Verify menu state changed from action to inverse action. | Used for post-action verification where Quora may update menu state slowly. | Keep. |
+| `5000ms` | full mute/block/unblock/unmute menu option lookup | Find expected menu action after opening menu. | Gives Quora menu render enough time without hanging. | Keep, but depends on foreground lease. |
+| `2000ms` | best-effort unmute menu lookup | Shorter lookup when unmute is optional cleanup after unblock. | Unmute should not dominate reverse action if not offered. | Keep. |
+
+## Reverse `Unblock Unmute` Action
+w
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `3` attempts | `maxReverseAttempts` in `unblockUnmuteProfile()` | Retry unblock flow after transient failure, with best-effort unmute between attempts. | This was added to make the current test batch repeatable while Quora menus were unreliable. | Most band-aid-shaped value. Replace with attempt ids plus scheduler retry policy. |
+| `5000ms` | canonical route wait | Ensure profile URL has returned to canonical route before action. | Quora can route through noncanonical profile paths after unblock/unmute. | Keep. |
+| `5000ms` then `3000ms` retry | unblock confirm lookup | Wait for unblock confirmation, then retry by clicking unblock again if still visible. | Handles cases where first menu action opens slowly or click does not take. | Keep only until foreground lease reduces interaction races. |
+| `8000ms`, or `2500ms` when already done | unblock verification | Verify blocked state cleared or Block action is visible. | Avoids clearing persistent state before live Quora state changed. | Keep. |
+| `1500ms` | full unmute confirm lookup | Wait for optional unmute confirmation dialog. | Unmute sometimes uses a confirm surface; it should appear quickly. | Keep. |
+| `1000ms` | best-effort unmute confirm lookup | Shorter optional cleanup wait. | Best-effort unmute must not dominate unblock completion. | Keep. |
+| `2500ms`, `5000ms`, `8000ms` | unmute post-action verification windows | Verify unmuted state, including no-confirm and after-dismiss variants. | Quora may either confirm, directly apply, or leave a transient surface. | Keep but simplify once interaction phase is scheduler-owned. |
+| `750ms` | inter-attempt reverse delay | Let Quora route/menu state settle before retry. | Tactical settling delay after a failed reverse attempt. | Remove or move into explicit retry policy. |
+
+## Mute and Block Action Waits
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `2500ms` | mute/block profile menu open | Open profile overflow menu. | Should be quick in a foreground tab. | Keep after foreground lease exists. |
+| `5000ms` | mute/block option lookup | Find Mute or Block menu action. | Quora menu render can lag. | Keep. |
+| `3000ms` | block option lookup after reopen | Shorter second read after menu reopen. | Retry path should be faster once menu has been opened once. | Keep. |
+| `8000ms` | mute confirm lookup | Wait for Mute confirmation button. | Confirm surfaces can lag after menu selection. | Keep. |
+| `2500ms`, then `6000ms` retry | mute confirm close | Confirm dialog should close after click; retry once if it does not. | Avoids treating slow confirm close as immediate failure. | Keep. |
+| `8000ms` | mute applied verification | Verify menu flips to Unmute. | Ensures mute action took effect before block fallback/next step. | Keep. |
+| `8000ms` | block confirm lookup | Wait for Block confirmation or early blocked state. | Quora may either show confirm or update blocked state directly. | Keep. |
+| `1500ms` | early blocked menu-state check | Detect block applied before confirmation surfaced. | Avoids false failure when Quora applies early. | Keep. |
+| `5000ms` | block mutation wait | Watch for profile-block mutation after confirm click. | Mutation is faster evidence than text/menu polling when available. | Keep. |
+| `2500ms`, then `6000ms` retry | block confirm close | Confirm dialog should close; retry click if still present. | Prevents a missed confirm click from becoming an immediate failure. | Keep. |
+| `8000ms`, fallback `6000ms` menu check | block applied verification | Confirm profile is blocked after action. | This is the destructive action success criterion. | Keep. |
+| `3000ms` | button removal after block | Wait for local injected Mute Block button to disappear. | Keeps visible profile UI in sync after block. | Keep as UI polish, not scheduler policy. |
+
+## Tab Close and Already-Blocked Follow-Ups
+
+| Value | Source | Used for | Current justification | Review |
+| --- | --- | --- | --- | --- |
+| `3` attempts, `150ms` delay | `requestCloseTab()` default | Ask service worker/window to close a completed worker tab. | Closing can fail first through runtime or window API; quick retries are cheap. | Keep. |
+| `2` attempts, `100ms` delay | common cleanup close calls | Faster close path after known terminal/error state. | Cleanup should not block long after terminal state is recorded. | Keep. |
+| `500ms`, `1500ms`, `4000ms`, `10000ms`, `30000ms`, `60000ms` | close-tab follow-up schedule | Re-request close if first close attempt did not remove the tab. | Prevents orphan tabs from hanging around after the worker reports completion. | Keep until service-worker tab lifecycle is fully durable. |
+| `0ms`, `100ms`, `250ms`, `500ms`, `1000ms`, `2000ms`, `4000ms`, `8000ms` | blocked-profile close checks | Detect already-blocked profiles and close them promptly. | Covers Quora pages that show blocked state at different points in render. | Keep as compatibility cleanup. |
+
+## Architectural Notes
+
+- The service-worker stale constants are already close to the target shape from
+  the top-level rethink: opening, ready, action, and close deadlines. The next
+  step is to attach them to explicit job attempts and leases rather than
+  metadata plus progress heartbeat.
+- The foreground-promotion waits and `maxReverseAttempts = 3` are the main
+  tactical layer. They made the 8-profile repeatability case work, but they
+  should not be expanded.
+- Performance work should not start by shrinking these values. The current
+  slow batch time is more likely from foreground contention than from any one
+  large timeout.
+- The next scheduler slice should make one tab own the interactive foreground
+  lease while other tabs preload or wait. After that, these timeout values can
+  be retuned with cleaner evidence.

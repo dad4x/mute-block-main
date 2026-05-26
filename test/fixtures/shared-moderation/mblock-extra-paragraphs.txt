@@ -1,0 +1,47 @@
+Intro paragraph with ordinary human prose.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:paragraphs-001",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "events": [
+    {
+      "event_id": "evt-fixture-paragraphs-001",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Paragraph-One",
+      "occurred_at": "2026-05-20T00:11:00Z"
+    }
+  ]
+}
+MBLOCK:END
+
+Middle paragraph that should be ignored by the parser.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:paragraphs-002",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "events": [
+    {
+      "event_id": "evt-fixture-paragraphs-002",
+      "type": "profile.mute.add",
+      "subject": "quora-profile:Paragraph-Two",
+      "occurred_at": "2026-05-20T00:12:00Z"
+    }
+  ]
+}
+MBLOCK:END
+
+Closing paragraph.

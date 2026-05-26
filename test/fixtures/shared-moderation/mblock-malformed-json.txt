@@ -1,0 +1,11 @@
+Mute-Block shared moderation journal with malformed JSON.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:malformed",
+  "events": [
+    {"event_id": "evt-bad", "type": "profile.block.add"}
+  ]
+MBLOCK:END

@@ -1,0 +1,29 @@
+{
+  "labels": [
+    {
+      "src": "did:example:trusted",
+      "uri": "https://www.quora.com/profile/Watched-User",
+      "val": "quora-watch"
+    },
+    {
+      "src": "did:example:trusted",
+      "uri": "https://www.quora.com/profile/Watched-User",
+      "val": "quora-ai-spam"
+    },
+    {
+      "src": "did:example:strict",
+      "uri": "https://www.quora.com/profile/Watched-User",
+      "val": "quora-harassment"
+    }
+  ],
+  "policy": {
+    "defaultAction": "ignore",
+    "actionsByKey": {
+      "did:example:trusted:quora-watch": "warn",
+      "did:example:strict:quora-harassment": "mute_block"
+    },
+    "actionsByLabel": {
+      "quora-ai-spam": "queue"
+    }
+  }
+}

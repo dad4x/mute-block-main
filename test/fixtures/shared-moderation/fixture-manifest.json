@@ -1,0 +1,94 @@
+{
+  "fixtures": [
+    {
+      "name": "event-journal-duplicate-event.json",
+      "kind": "eventJournal",
+      "expectedOk": true
+    },
+    {
+      "name": "event-journal-missing-publisher.json",
+      "kind": "eventJournal",
+      "expectedOk": false
+    },
+    {
+      "name": "event-journal-url-rewritten-subject.json",
+      "kind": "eventJournal",
+      "expectedOk": false
+    },
+    {
+      "name": "event-journal-valid.json",
+      "kind": "eventJournal",
+      "expectedOk": true
+    },
+    {
+      "name": "event-journal-wrong-schema-version.json",
+      "kind": "eventJournal",
+      "expectedOk": false
+    },
+    {
+      "name": "import-inbox-input.json",
+      "kind": "json",
+      "expectedOk": true
+    },
+    {
+      "name": "label-policy-input.json",
+      "kind": "json",
+      "expectedOk": true
+    },
+    {
+      "name": "mblock-extra-paragraphs.txt",
+      "kind": "mblockText",
+      "expectedOk": true
+    },
+    {
+      "name": "mblock-json-looking-outside.txt",
+      "kind": "mblockText",
+      "expectedOk": true
+    },
+    {
+      "name": "mblock-malformed-json.txt",
+      "kind": "mblockText",
+      "expectedOk": false
+    },
+    {
+      "name": "mblock-multiple-blocks.txt",
+      "kind": "mblockText",
+      "expectedOk": true
+    },
+    {
+      "name": "mblock-quora-whitespace.txt",
+      "kind": "mblockText",
+      "expectedOk": true
+    },
+    {
+      "name": "mblock-truncated-end.txt",
+      "kind": "mblockText",
+      "expectedOk": false
+    },
+    {
+      "name": "mblock-valid.txt",
+      "kind": "mblockText",
+      "expectedOk": true
+    },
+    {
+      "name": "posted-proof-valid.json",
+      "kind": "json",
+      "expectedOk": true
+    },
+    {
+      "name": "roaming-profile-forbidden-fields.json",
+      "kind": "roamingProfile",
+      "expectedOk": false
+    },
+    {
+      "name": "roaming-profile-forbidden-nested-array.json",
+      "kind": "roamingProfile",
+      "expectedOk": false
+    },
+    {
+      "name": "roaming-profile-valid.json",
+      "kind": "roamingProfile",
+      "expectedOk": true
+    }
+  ]
+}

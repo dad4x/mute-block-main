@@ -1,5 +1,11 @@
 # External atproto Discussion Research Note
 
+Status: research context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). Use this as
+background for shared moderation and labeler decisions, not as an active plan.
+
 This note summarizes a small round of external research on public discussions of atproto, with emphasis on:
 
 - decentralization in practice

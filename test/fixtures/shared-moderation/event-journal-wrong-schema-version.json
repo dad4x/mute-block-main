@@ -1,0 +1,18 @@
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 99,
+  "document_id": "mbj:fixture:2026-05-20:wrong-version",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "events": [
+    {
+      "event_id": "evt-wrong-version",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Some-User",
+      "occurred_at": "2026-05-20T00:00:00Z"
+    }
+  ]
+}

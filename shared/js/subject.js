@@ -116,6 +116,7 @@ function isLikelyDirectProfileSlug(slug) {
 
     const tokens = value.split('-').filter(Boolean)
     if(tokens.length < 2) return false
+    if(tokens.length > 8) return false
 
     const isNameishToken = token => /^[A-Z][A-Za-z0-9]*$/.test(token) || /^[A-Z0-9]{2,}$/.test(token)
 

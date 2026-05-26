@@ -1,5 +1,12 @@
 # Labeler Management Note
 
+Status: future operations/design context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). Use this when shared
+moderation returns to hosted labeler operations; it is not an active runtime
+plan.
+
 This note is for design review only.
 
 Its purpose is to examine the practical management questions around using atproto labelers with `mute-block-main`, especially:

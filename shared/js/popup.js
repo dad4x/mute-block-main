@@ -48,6 +48,7 @@ async function init() {
     const spaceSortBy = document.getElementById('spaceSortBy')
     const spaceList = document.getElementById('spaceList')
     const clearNukedPosts = document.getElementById('clearNukedPosts')
+    const openCoordinator = document.getElementById('openCoordinator')
     const nukedPostCount = document.getElementById('nukedPostCount')
 
     const fopDelay = document.getElementById('fopDelay')
@@ -149,14 +150,23 @@ async function init() {
             return
         }
 
-        if(!window.confirm(`Clear remembered nuke state for ${count} posts?`)) {
+        if(!window.confirm(`Clear Recent History for ${count} ${count === 1 ? 'entry' : 'entries'}?`)) {
             return
         }
 
         popupState.nukedPosts = {}
         renderNukedPostCount(nukedPostCount)
         await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: {}})
-        showStatus(status, 'Remembered nukes cleared.')
+        showStatus(status, 'Recent History cleared.')
+    })
+
+    openCoordinator?.addEventListener('click', async () => {
+        const result = await browser.runtime.sendMessage({
+            action: 'open-coordinator',
+            active: true
+        }).catch(error => ({error: error?.message || `${error || ''}`}))
+
+        showStatus(status, result?.error ? 'Dashboard open failed.' : 'Dashboard opened.')
     })
 
     browser.storage.onChanged.addListener(changes => {
@@ -203,7 +213,7 @@ function showStatus(element, message) {
 
 function renderNukedPostCount(element) {
     const count = Object.keys(popupState.nukedPosts || {}).length
-    element.textContent = `${count} remembered post${count === 1 ? '' : 's'}`
+    element.textContent = `${count} history entr${count === 1 ? 'y' : 'ies'}`
 }
 
 async function updateSpaceCategory(spaceKey, category, container) {
