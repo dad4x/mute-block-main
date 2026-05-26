@@ -9083,11 +9083,11 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         button.disabled = false
     }
     else if(model?.singleNukeActive && queueableEntries.length) {
-        setNukeButtonIdle(button, `Queue visible ${queueableCount}`)
+        setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
     else if(model?.singleNukeActive) {
-        setNukeButtonIdle(button, 'Queue visible')
+        setNukeButtonIdle(button)
         button.disabled = true
     }
     else if(shouldPromptScroll) {
@@ -9095,7 +9095,7 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         button.disabled = false
     }
     else if(queueableEntries.length) {
-        setNukeButtonIdle(button, `Queue visible ${queueableCount}`)
+        setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
     else if(model?.allActionableEntriesNuked) {
@@ -9176,7 +9176,7 @@ function syncSpaceFeedPostButtons(renderModel) {
 
             const entriesToNuke = getClickedSpaceFeedEntries(activeButton, getLatestSpaceFeedEntries())
             if(!entriesToNuke.length) {
-                setNukeButtonIdle(activeButton, 'Queue visible 0')
+                setNukeButtonIdle(activeButton, `Nuke 'Em 0`)
                 activeButton.disabled = true
                 return
             }
@@ -9226,11 +9226,11 @@ function syncSpaceFeedPostButtons(renderModel) {
             : 'No currently detected targets are queueable from visible posts in this space')
 
         if(queueButton.dataset.mbQueueing === 'true') {
-            setNukeButtonWorking(queueButton, `Queueing visible ${aggregateCount}`)
+            setNukeButtonWorking(queueButton, `Nuking ${aggregateCount}`)
             queueButton.disabled = true
         }
         else {
-            setNukeButtonIdle(queueButton, `Queue visible ${aggregateCount}`)
+            setNukeButtonIdle(queueButton, `Nuke 'Em ${aggregateCount}`)
             queueButton.disabled = aggregateCount < 1
         }
 
