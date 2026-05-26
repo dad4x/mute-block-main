@@ -9631,6 +9631,47 @@ test('active transition rejects stale attempt before WAL append', async () => {
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
 })
 
+test('active transition rejects missing incoming attempt identity before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Missing-Incoming'
+    const runId = 'run-active-transition-missing-incoming'
+    const attemptId = 'attempt-active-transition-missing-incoming'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 432250,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 432250})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.transitionCoordinatorItemForQueuedTab({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke'
+    }, {
+        id: 633
+    }, {
+        openedAt: 432300,
+        retryAttempt: 0,
+        maxRetries: 2
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].status, 'queued')
+})
+
 test('active transition WAL append failure leaves row queued', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Append-Failure'
     const runId = 'run-active-transition-append-failure'

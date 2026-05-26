@@ -366,3 +366,33 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and empty active WAL tail. Dashboard sanity showed 72 ready, 304
   succeeded, 8 soft-fail, 49 hard-fail, 0 active, and 72 per-row cancel buttons
   for 80 displayed rows.
+
+## Slice 21 review closeout: active-transition attempt identity
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.561 review
+  finding on the already WAL-backed `active-transition` path.
+- Authority boundary: queued-tab active transition now rejects an incoming
+  transition that lacks attempt identity whenever the current/stored row has
+  attempt identity. The check runs before the WAL append and is mirrored inside
+  `coordinatorAuthority.applyWithinStorageUpdate()` so a row that gains attempt
+  identity during the serialized update cannot be claimed by an identity-less
+  active transition.
+- Persistence boundary: unchanged. Accepted active transitions are still durable
+  on queue WAL append; rejected missing-identity transitions leave raw snapshot
+  and current authority queued and append no WAL record.
+- Notes hygiene: `storage-authority-callsite-inventory-2026-05-20.md` was
+  updated so active transition, rollback, stale retry, active-without-actor
+  repair, and key-only terminalization no longer read as snapshot-backed work.
+- Validation: covered by `active transition rejects missing incoming attempt
+  identity before WAL append`; `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `node -c test/p1-contract.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`, and `npm test`
+  passed. Version bumped to `1.6.562`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.562.zip` and
+  `firefox/mute_block-1.6.562.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.562` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and empty active WAL tail. Dashboard sanity showed 64 ready, 270
+  succeeded, 15 soft-fail, 42 hard-fail, 1 active, and 65 per-row cancel
+  buttons for 80 displayed rows.
