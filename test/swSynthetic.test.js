@@ -144,6 +144,28 @@ function makeActiveCoordinatorRow({href, runId, attemptId, tabId = 501, now = 10
     }
 }
 
+function makeQueuedCoordinatorRow({href, runId, attemptId, now = 100000}) {
+    return {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        executorTabAction: 'nuke',
+        executorOwner: 'service-worker',
+        serviceWorkerOwned: true,
+        executorNoForegroundFallback: true,
+        executorMaxConcurrent: 1,
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: now - 1000,
+        updatedAt: now - 1000,
+        attemptId,
+        attemptNumber: 1,
+        milestones: {}
+    }
+}
+
 function makeCoordinatorRun({href, runId}) {
     return {
         id: runId,
@@ -7238,7 +7260,7 @@ test('first Quora activation lazily rolls a browser-startup metrics epoch', asyn
 test('first Quora tab observation clears stale pause and resumes persisted service-worker work', async () => {
     const href = 'https://www.quora.com/profile/Slow-Metrics'
     const runId = 'run-stale-pause-auto-resume'
-    const {browser: harnessBrowser, storage, timers} = loadServiceWorkerHarness({
+    const {browser: harnessBrowser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 20000,
         runStartupWork: true,
         storage: {
@@ -7297,11 +7319,12 @@ test('first Quora tab observation clears stale pause and resumes persisted servi
         {timers, tickMs: 600}
     )
     await waitFor(
-        () => storage.mbCoordinatorQueue[href]?.status === 'active',
-        'first Quora activation opened a tab but did not persist active queue state',
+        () => sw.coordinatorAuthority.current().queue[href]?.status === 'active',
+        'first Quora activation opened a tab but did not persist active queue authority state',
         {timers}
     )
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
 test('first Quora tab observation preserves explicit pause across extension reload', async () => {
@@ -8040,7 +8063,7 @@ test('queued work resumes after service worker restart once Quora was seen this 
         observedAt: 1
     }
 
-    const {timers, storage} = loadServiceWorkerHarness({now: 0, browser})
+    const {sw, timers, storage} = loadServiceWorkerHarness({now: 0, browser})
 
     const result = await browser.runtime.sendMessage({action: 'resume-coordinator-queue'})
 
@@ -8058,8 +8081,8 @@ test('queued work resumes after service worker restart once Quora was seen this 
         {timers, attempts: 40, tickMs: 1000}
     )
     await waitFor(
-        () => ['opening', 'active', 'acting', 'settling'].includes(storage.mbCoordinatorQueue[href].status),
-        'session-restored durable queued resume did not persist active queue state',
+        () => ['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status),
+        'session-restored durable queued resume did not persist active queue authority state',
         {timers, attempts: 40, tickMs: 1000}
     )
 })
@@ -8832,7 +8855,7 @@ test('queued profile actions are throttled and opened background', async () => {
     const secondHref = 'https://www.quora.com/profile/Synthetic-Legacy-Foreground-2'
     const runId = 'run-legacy-foreground-throttle'
     const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, storage, timers} = loadServiceWorkerHarness({now: 2500})
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({now: 2500})
 
     await browser.runtime.sendMessage({
         action: 'enqueue-coordinator-items',
@@ -8869,8 +8892,8 @@ test('queued profile actions are throttled and opened background', async () => {
     assert.equal(opened.length, 1)
     assert.equal(opened[0].active, true)
     await waitFor(
-        () => storage.mbCoordinatorQueue[opened[0].url]?.status === 'active',
-        'legacy foreground executor tab did not persist active state',
+        () => sw.coordinatorAuthority.current().queue[opened[0].url]?.status === 'active',
+        'legacy foreground executor tab did not persist active authority state',
         {timers}
     )
 
@@ -9226,8 +9249,8 @@ test('dashboard resume opens durable service-worker queued rows after volatile e
         {timers, attempts: 40, tickMs: 1000}
     )
     await waitFor(
-        () => ['opening', 'active', 'acting', 'settling'].includes(storage.mbCoordinatorQueue[href].status),
-        'async durable queued resume did not persist active queue state',
+        () => ['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status),
+        'async durable queued resume did not persist active queue authority state',
         {timers}
     )
 })
@@ -9502,6 +9525,161 @@ test('queued tab active transition timeout closes unconfirmed runtime tab', asyn
 
     assert.equal(listTabs(browser).some(candidate => candidate.id === createdTabId), false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+})
+
+test('active transition is WAL-backed and recovers after restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Wal'
+    const runId = 'run-active-transition-wal'
+    const attemptId = 'attempt-active-transition-wal'
+    const tabId = 630
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 431000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 431000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.transitionCoordinatorItemForQueuedTab({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        openedAt: 431050,
+        attemptId,
+        attemptNumber: 1,
+        retryAttempt: 0,
+        maxRetries: 2
+    })
+
+    assert.equal(result, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'active-transition')
+
+    const restarted = loadServiceWorkerHarness({
+        now: 431500,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'active')
+    assert.equal(hydrated.queue[href].tabId, tabId)
+})
+
+test('active transition rejects stale attempt before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Stale'
+    const runId = 'run-active-transition-stale'
+    const attemptId = 'attempt-active-transition-stale'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 432000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 432000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.transitionCoordinatorItemForQueuedTab({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId: 'stale-active-transition-attempt',
+        attemptNumber: 1
+    }, {
+        id: 631
+    }, {
+        openedAt: 432050,
+        attemptId: 'stale-active-transition-attempt',
+        attemptNumber: 1,
+        retryAttempt: 0,
+        maxRetries: 2
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
+test('active transition WAL append failure leaves row queued', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Append-Failure'
+    const runId = 'run-active-transition-append-failure'
+    const attemptId = 'attempt-active-transition-append-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 432500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 432500})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic active transition WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.transitionCoordinatorItemForQueuedTab({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: 632
+    }, {
+        openedAt: 432550,
+        attemptId,
+        attemptNumber: 1,
+        retryAttempt: 0,
+        maxRetries: 2
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
 })
 
 test('active transition rollback is WAL-backed and recovers after restart', async () => {
@@ -10428,7 +10606,7 @@ test('queued profile tab is requeued after the foreground-wait stale timeout ela
         storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(['queued', 'opening', 'active', 'acting', 'settling'].includes(recoveredQueue[href].status))
     assert.equal(recoveredQueue[href].retryCount, 1)
     assert.equal(recoveredQueue[href].retryAttempt, 1)
@@ -10490,7 +10668,7 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
         storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(recoveredQueue[href].status, 'queued')
     assert.equal(recoveredQueue[href].retryCount || 0, 0)
     assert.equal(recoveredQueue[href].retryAttempt || 0, 0)

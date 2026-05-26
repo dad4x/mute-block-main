@@ -420,6 +420,7 @@ module.exports.__test = {
     recordDeferredCoordinatorJobMilestone,
     resetQueueWakeupMetricsEpochAfterLoad,
     rollbackFailedQueuedTabOpen,
+    transitionCoordinatorItemForQueuedTab,
     requestCoordinatorActionLease,
     heartbeatCoordinatorActionLease,
     releaseCoordinatorActionLease,
