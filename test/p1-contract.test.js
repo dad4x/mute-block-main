@@ -2538,6 +2538,17 @@ test('space feed pause is explicit, not overloaded on working nuke buttons', () 
     assert.doesNotMatch(postBody, /dataset\.mbNukeState === 'working'[\s\S]{0,120}pauseSpaceFeedQueue/)
 })
 
+test('space feed action buttons keep Nuke Em labels', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
+    const postBody = extractFunction(source, 'function syncSpaceFeedPostButtons(renderModel)')
+
+    assert.match(topBody, /Nuke 'Em/)
+    assert.match(postBody, /Nuke 'Em/)
+    assert.doesNotMatch(topBody, /Queue visible/)
+    assert.doesNotMatch(postBody, /Queue visible/)
+})
+
 test('dashboard has reversible pause and explicit current work cancel', () => {
     const html = readRepoFile('shared/coordinator.html')
     const dashboard = readRepoFile('shared/js/coordinator.js')
