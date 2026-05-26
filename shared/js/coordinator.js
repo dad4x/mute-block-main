@@ -479,12 +479,14 @@ function render() {
     const terminalCount = getQueueTerminalCount(queueItems)
     const secondsPerBlock = getSecondsPerActualBlock(queueItems, getCurrentMetricsEpochStartedAt())
     const failedCount = getQueueStatusCount('failed', queueItems)
+    const succeededCount = getQueueStatusCount('succeeded', queueItems)
     const retryableFailureShapeCount = queueItems.filter(isRetryableFailedQueueItem).length
     const retryableFailedCount = queueItems.filter(isEligibleRetryFailedQueueItem).length
     const exhaustedRetryableFailedCount = Math.max(0, retryableFailureShapeCount - retryableFailedCount)
+    const hardFailedCount = Math.max(0, failedCount - retryableFailedCount)
 
     setText('queuedCount', queuedCount)
-    setText('currentWorkReadyCount', `${queuedCount} ready`)
+    setText('currentWorkReadyCount', `${queuedCount} ready, ${succeededCount} succeeded, ${retryableFailedCount} soft-fail ${hardFailedCount} hard-fail`)
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
     setText('terminalCount', terminalCount)
@@ -493,7 +495,6 @@ function render() {
     setText('runCount', `${runItems.length} run${runItems.length === 1 ? '' : 's'}`)
     const queueTotalCount = getQueueTotalCount(queueItems)
     setText('queueCount', `${queueTotalCount} job${queueTotalCount === 1 ? '' : 's'}${state.queueTruncated ? ` (${queueItems.length} shown)` : ''}`)
-    setText('retryFailedCount', `${retryableFailedCount} eligible / ${failedCount} failed`)
     setText('refreshState', getRefreshStateText())
 
     renderRuns(runItems)
@@ -591,37 +592,37 @@ function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exha
     const waitText = getRetryFailedWorkWaitText({hasPendingWork, hasActiveWork})
     const button = document.getElementById('retryFailedButton')
     if(button) {
-        button.textContent = 'Idle Retry'
+        button.textContent = 'Retry Soft-Fails'
         button.setAttribute('aria-pressed', retryFailedActive ? 'true' : 'false')
-        button.title = retryFailedActive ? 'Turn idle retry off' : 'Turn idle retry on'
+        button.title = retryFailedActive ? 'Turn soft-fail retry off' : 'Turn soft-fail retry on'
         button.disabled = false
     }
 
     const lastReason = retryFailedLastResult?.reason || ''
     let stateText = ''
     if(retryFailedActive && waitText) {
-        stateText = `Idle retry on; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry on; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(retryFailedActive && retryableFailedCount <= 0 && exhaustedRetryableFailedCount > 0) {
-        stateText = `Idle retry on; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry on; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(retryFailedActive && retryableFailedCount <= 0) {
-        stateText = `Idle retry on; no retryable failures${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry on; no soft-failures${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(retryFailedActive) {
-        stateText = `Idle retry on${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry on${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(waitText) {
-        stateText = `Idle retry off; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry off; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(retryableFailedCount <= 0 && exhaustedRetryableFailedCount > 0) {
-        stateText = `Idle retry off; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry off; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
     }
     else if(retryableFailedCount <= 0) {
-        stateText = `Idle retry off; no retryable failures${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry off; no soft-failures${lastReason ? ` (${lastReason})` : ''}`
     }
     else {
-        stateText = `Idle retry off${lastReason ? ` (${lastReason})` : ''}`
+        stateText = `Soft-fail retry off${lastReason ? ` (${lastReason})` : ''}`
     }
     setText('retryFailedState', stateText)
 }
@@ -666,6 +667,32 @@ async function requeueFailed() {
         reason: result?.error
             ? 'requeue-failed'
             : `requeued-${Number.parseInt(result?.selected, 10) || 0}`
+    }
+    await loadState()
+    render()
+}
+
+async function cancelCurrentWorkItem(item = {}) {
+    if(!isPendingQueueStatus(`${item?.status || ''}`.trim())) return
+
+    const storageKey = `${item.storageKey || ''}`.trim()
+    const profileHref = getQueueItemHref('', item)
+    retryFailedLastResult = {reason: 'canceling-one-current-work'}
+    render()
+
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'cancel-coordinator-current-work-item',
+        storageKey,
+        coordinatorKey: storageKey,
+        profileHref
+    }, null, 10000).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+
+    retryFailedLastResult = {
+        reason: result?.error
+            ? 'cancel-one-current-work-failed'
+            : `canceled-${(Number.parseInt(result?.canceledUrls?.length, 10) || 0) + (Number.parseInt(result?.canceledWorkKeys?.length, 10) || 0)}`
     }
     await loadState()
     render()
@@ -1558,6 +1585,7 @@ function renderQueue(items) {
                 titleHref,
                 subtitleHref: sourcePageUrl
             }),
+            buildQueueCancelCell(item),
             buildBadge(item.status || 'unknown'),
             buildTextCell(item.outcome || item.error || '', getOutcomeHelp(item.outcome || item.error || '')),
             buildQueueTimingCell(item),
@@ -1625,6 +1653,26 @@ function buildQueueTimingCell(item = {}) {
             ? `${terminalAt ? 'active to terminal' : 'active elapsed'} ${formatDuration(activeDurationMs)}`
             : ''
     ].filter(Boolean).join('\n')
+    return cell
+}
+
+function buildQueueCancelCell(item = {}) {
+    const cell = document.createElement('div')
+    cell.className = 'row-cancel-cell'
+
+    if(!isPendingQueueStatus(`${item?.status || ''}`.trim())) return cell
+
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'clear-button row-action-button row-cancel-button'
+    button.textContent = 'Cancel'
+    button.title = 'Cancel this queued Current Work item'
+    button.addEventListener('click', event => {
+        event.preventDefault()
+        button.disabled = true
+        void cancelCurrentWorkItem(item)
+    })
+    cell.appendChild(button)
     return cell
 }
 
