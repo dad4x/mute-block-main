@@ -329,3 +329,40 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and empty active WAL tail. Dashboard
   sanity showed 72 ready, 304 succeeded, 8 soft-fail, 49 hard-fail, 0 active,
   and 72 per-row cancel buttons for 80 displayed rows.
+
+## Slice 21: active queued-tab transition WAL migration
+
+- Operation migrated: `transitionCoordinatorItemForQueuedTabLocked` now applies
+  queued-tab open/active ownership through WAL-backed `active-transition`.
+- Authority boundary: active transition loads the WAL-recovered queue/runs
+  projection, validates the queued row, action kind, current metadata, target
+  identity, and attempt identity when the stored row already has one, then
+  revalidates through `coordinatorAuthority.applyWithinStorageUpdate()` before
+  marking the row active/opening. Legacy queued rows without attempt identity
+  can still be claimed, but any current row with a different attempt is rejected
+  before durable acknowledgement.
+- Persistence boundary: queue-row active transition is durable when the queue
+  WAL append succeeds. Compact queue/content projections are updated by the WAL
+  projection follow-up. Runs recompute remains a derived `queue: false`
+  ordinary-mutation save; derived-save failure records diagnostics and
+  schedules repair without poisoning the durable active transition. Tests that
+  previously polled raw `mbCoordinatorQueue` for active rows now assert current
+  authority because the raw snapshot can legitimately remain queued.
+- Still snapshot-backed: enqueue, manual retry/requeue, bulk pause/cancel,
+  resolver remap/unresolved, action-lease request, tab-wide lease release, and
+  other cross-row cleanup remain deferred.
+- Validation: covered by `active transition is WAL-backed and recovers after
+  restart`, `active transition rejects stale attempt before WAL append`, and
+  `active transition WAL append failure leaves row queued`; `node -c
+  shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.561`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.561.zip` and
+  `firefox/mute_block-1.6.561.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.561` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 456 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and empty active WAL tail. Dashboard sanity showed 72 ready, 304
+  succeeded, 8 soft-fail, 49 hard-fail, 0 active, and 72 per-row cancel buttons
+  for 80 displayed rows.

@@ -147,7 +147,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'current-work-item-cancel',
     'stale-retry',
     'rollback-active-transition',
-    'repair-active-without-actor'
+    'repair-active-without-actor',
+    'active-transition'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -8322,9 +8323,12 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
         ownerTabId: action?.ownerTabId || null,
         ownerWindowId: action?.ownerWindowId || null
     }
-    const state = await loadCoordinatorQueueRunsProjection()
-    const queue = state.queue
-    const runs = state.runs
+    const state = await loadCoordinatorQueueRunsProjection({
+        metricPath: 'activeTransition.load'
+    })
+    let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = currentAuthorityState.runs
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
     if(!item) return false
@@ -8352,27 +8356,86 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
     const latestMetadata = getQueuedTabMetadata(tabId)
     if(latestMetadata?.closeRequestedAt || latestMetadata?.closeReason) return false
 
-    queue[itemKey] = nextItem
+    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+    const itemCoordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
+    const expectedAttemptId = getAttemptIdFromValue(item) ? getAttemptIdFromValue(record) : ''
+    const expectedAttemptNumber = getAttemptNumberFromValue(item) ? getAttemptNumberFromValue(record) : 0
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'active-transition',
+        rowKey: itemKey,
+        expectedAttemptId,
+        expectedAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'activeTransition.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            const currentMetadata = getQueuedTabMetadata(tabId)
+            if(currentMetadata?.closeRequestedAt || currentMetadata?.closeReason) {
+                return context.reject('queued-tab-closing')
+            }
+            if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
+                return context.reject('missing-or-terminal-row')
+            }
+            if(!shouldApplyProgressToCoordinatorItem(currentItem, record)) {
+                return context.reject('action-kind-changed')
+            }
+            if(hasMismatchedCoordinatorAttempt(currentItem, record)) {
+                return context.reject('stale-attempt', {staleAttempt: true})
+            }
+            if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== itemHref ||
+                getCoordinatorItemQueueKey(currentItem, itemKey) !== itemCoordinatorKey) {
+                return context.reject('row-target-changed-before-authority-apply')
+            }
+            const transitionedItem = transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
+                now
+            })
+            return transitionedItem
+        }
+    })
+
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) return false
+    currentAuthorityState = coordinatorAuthority.current()
+    const nextQueue = currentAuthorityState.queue
+    const durableItem = authorityResult.nextRow || nextQueue[itemKey] || nextItem
     const affectedRunIds = new Set()
-    if(nextItem.runId) affectedRunIds.add(nextItem.runId)
+    if(durableItem.runId) affectedRunIds.add(durableItem.runId)
     if(href) {
         for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
             affectedRunIds.add(runId)
         }
     }
     const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
         : runs
+    const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: runsChanged ? nextRuns : undefined
+        }, {
+            queue: false,
+            runs: runsChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'active-transition-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'active-transition-derived-save-failed',
+            error?.message || 'Active transition derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('activeTransition.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'active-transition-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
 
-    const saved = await saveCoordinatorQueueRunsProjection(queue, nextRuns, {
-        queueChanged: true,
-        runsChanged: JSON.stringify(nextRuns) !== JSON.stringify(runs),
-        reason: 'ordinaryMutation',
-        queueOperation: 'active-transition',
-        queueChangedRows: 1
-    })
-
-    return saved !== false
+    return true
 }
 
 async function confirmQueuedTabDurablyActive(action = {}, tab = {}, details = {}) {
