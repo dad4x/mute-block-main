@@ -3764,11 +3764,12 @@ test('authority reconcile reclaims durable active row without confirmed runtime 
     const result = await sw.runCoordinatorAuthorityReconcileActions('missing-runtime-test')
 
     assert.equal(result.requeued, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.notEqual(storage.mbCoordinatorQueue[href].attemptId, attemptId)
-    assert.equal(storage.mbCoordinatorQueue[href].attemptNumber, 2)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, storage.mbCoordinatorQueue[href].attemptId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
     assert.equal(sw.state().activeQueuedTabs.length, 0)
 })
 
@@ -4022,8 +4023,9 @@ test('authority reconcile rejects persisted tab id reuse with unrelated live tab
 
     assert.equal(result.adopted, 0)
     assert.equal(result.requeued, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.notEqual(storage.mbCoordinatorQueue[href].attemptId, attemptId)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
     assert.equal(browser.__tabs.has(tabId), true)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(sw.state().activeQueuedTabs.includes(tabId), false)
@@ -4097,8 +4099,9 @@ test('authority reconcile treats missing active anchors as reclaimable despite p
 
     assert.equal(result.adopted, 0)
     assert.equal(result.requeued, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.notEqual(storage.mbCoordinatorQueue[href].attemptId, attemptId)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
     assert.equal(browser.__tabs.has(tabId), true)
     assert.equal(browser.__removedTabs.includes(tabId), false)
 })
@@ -9867,7 +9870,7 @@ test('claim-tab-action ignores queued storage rows without durable active owners
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
 })
 
-test('authority reconcile requeues durable active row without runtime actor using fresh token', async () => {
+test('authority reconcile requeues durable active row without runtime actor through WAL', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor'
     const runId = 'run-active-no-actor'
     const {sw, storage} = loadServiceWorkerHarness({
@@ -9926,12 +9929,216 @@ test('authority reconcile requeues durable active row without runtime actor usin
     const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor')
 
     assert.equal(result.requeued, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.notEqual(storage.mbCoordinatorQueue[href].attemptId, 'attempt-active-no-actor')
-    assert.equal(storage.mbCoordinatorQueue[href].attemptNumber, 2)
-    assert.equal(storage.mbCoordinatorQueue[href].tabId, null)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, 'attempt-active-no-actor')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, storage.mbCoordinatorQueue[href].attemptId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+
+    const restarted = loadServiceWorkerHarness({
+        now: 3950,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'queued')
+    assert.equal(hydrated.queue[href].attemptNumber, 2)
+    assert.equal(hydrated.queue[href].tabId, null)
+})
+
+test('authority reconcile rejects stale active-without-actor attempt before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Stale'
+    const runId = 'run-active-no-actor-stale'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 3910,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId: 'attempt-active-no-actor-stale',
+                        tabId: 702,
+                        now: 3910
+                    }),
+                    retryAttempt: 0,
+                    maxRetries: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId: 702,
+                    tabOpenedAt: 3500,
+                    attemptId: 'attempt-active-no-actor-stale',
+                    attemptNumber: 1,
+                    retryAttempt: 0,
+                    maxRetries: 1
+                }
+            }
+        }
+    })
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    let queueReads = 0
+    browser.storage.local.get = async defaults => {
+        const result = await originalGet(defaults)
+        const readsQueue = defaults &&
+            typeof defaults === 'object' &&
+            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue')
+        if(readsQueue) {
+            queueReads += 1
+            if(queueReads === 1) {
+                storage.mbCoordinatorQueue[href] = {
+                    ...storage.mbCoordinatorQueue[href],
+                    attemptId: 'attempt-active-no-actor-newer',
+                    attemptNumber: 2
+                }
+            }
+        }
+        return result
+    }
+
+    const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor-stale')
+
+    assert.equal(result.changed, false)
+    assert.equal(result.requeued, 0)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].attemptId, 'attempt-active-no-actor-newer')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
+test('authority reconcile active-without-actor WAL append failure leaves row active', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Append-Failure'
+    const runId = 'run-active-no-actor-append-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 3920,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId: 'attempt-active-no-actor-append-failure',
+                        tabId: 703,
+                        now: 3920
+                    }),
+                    retryAttempt: 0,
+                    maxRetries: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId: 703,
+                    tabOpenedAt: 3500,
+                    attemptId: 'attempt-active-no-actor-append-failure',
+                    attemptNumber: 1,
+                    retryAttempt: 0,
+                    maxRetries: 1
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic active-without-actor WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor-append-failure')
+
+    assert.equal(result.changed, false)
+    assert.equal(result.requeued, 0)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+})
+
+test('authority reconcile terminalizes exhausted active-without-actor row through WAL', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Exhausted'
+    const runId = 'run-active-no-actor-exhausted'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 3930,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId: 'attempt-active-no-actor-exhausted',
+                        tabId: 704,
+                        now: 3930
+                    }),
+                    retryAttempt: 1,
+                    maxRetries: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId: 704,
+                    tabOpenedAt: 3500,
+                    attemptId: 'attempt-active-no-actor-exhausted',
+                    attemptNumber: 1,
+                    retryAttempt: 1,
+                    maxRetries: 1
+                }
+            }
+        }
+    })
+
+    const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor-exhausted')
+
+    assert.equal(result.failed, 1)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'interrupted')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+
+    const restarted = loadServiceWorkerHarness({
+        now: 3960,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'failed')
 })
 
 test('authority reconcile does not requeue stale raw active row after WAL terminalization', async () => {

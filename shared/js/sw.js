@@ -146,7 +146,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'repair-key-only-terminalize',
     'current-work-item-cancel',
     'stale-retry',
-    'rollback-active-transition'
+    'rollback-active-transition',
+    'repair-active-without-actor'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -2178,7 +2179,7 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         return {changed: false, reason: 'invalid-item'}
     }
 
-    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState()
+    let currentAuthorityState = await loadCoordinatorCurrentAuthorityState()
     const queue = currentAuthorityState.queue
     const runs = currentAuthorityState.runs
     const progress = currentAuthorityState.progress
@@ -2204,8 +2205,39 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
 
     const now = Date.now()
     const reconcileReason = `${operation.reconcileReason || 'reconcile-active-without-actor'}`.trim()
-    const nextItem = buildRequeuedActiveCoordinatorItemWithoutActor(current, currentRecord, now, reconcileReason)
-    queue[itemKey] = nextItem
+    const currentHref = getCoordinatorItemHref(current) || normalizeQuoraProfileUrl(itemKey)
+    const currentCoordinatorKey = getCoordinatorItemQueueKey(current, itemKey)
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'repair-active-without-actor',
+        rowKey: itemKey,
+        expectedAttemptId,
+        expectedAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'repair.activeWithoutActor.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            if(!isActiveCoordinatorStatus(currentItem?.status)) {
+                return context.reject('row-changed')
+            }
+            if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== currentHref ||
+                getCoordinatorItemQueueKey(currentItem, itemKey) !== currentCoordinatorKey) {
+                return context.reject('row-target-changed-before-authority-apply')
+            }
+            return buildRequeuedActiveCoordinatorItemWithoutActor(currentItem, currentRecord, now, reconcileReason)
+        }
+    })
+
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
+        return {
+            changed: false,
+            reason: authorityResult?.reason || 'authority-apply-failed'
+        }
+    }
+
+    currentAuthorityState = coordinatorAuthority.current()
+    const nextQueue = currentAuthorityState.queue
+    const nextItem = authorityResult.nextRow || nextQueue[itemKey] || null
+    if(!nextItem) return {changed: false, reason: 'authority-row-missing-after-apply'}
 
     let progressChanged = false
     if(href && !isTerminalCoordinatorStatus(nextItem.status)) {
@@ -2253,22 +2285,37 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         }
     }
     const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
         : runs
-    const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
-
-    await saveCoordinatorState({
-        queue,
-        runs: runsChanged ? nextRuns : undefined,
-        progress: progressChanged ? pruneProfileNukeProgress(progress) : undefined
-    }, {
-        queue: true,
-        runs: runsChanged,
-        progress: progressChanged,
-        reason: 'repair',
-        queueOperation: 'repair-active-without-actor',
-        queueChangedRows: 1
-    })
+    const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: runsChanged ? nextRuns : undefined,
+            progress: progressChanged ? pruneProfileNukeProgress(progress) : undefined
+        }, {
+            queue: false,
+            runs: runsChanged,
+            progress: progressChanged,
+            reason: 'repair',
+            queueOperation: 'repair-active-without-actor-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'repair-active-without-actor-derived-save-failed',
+            error?.message || 'Active-without-actor derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('repair.activeWithoutActor.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'repair-active-without-actor-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
 
     return {
         changed: true,
