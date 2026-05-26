@@ -1,5 +1,11 @@
 # Blockzooka Write-Up
 
+Status: external reference context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). Use this as
+background comparison material, not as an active plan.
+
 This is a functional summary of what "Blockzooka" appears to be, based on:
 
 - the saved Quora pages in `/home/dbrower/src/blockzooka`

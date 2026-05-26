@@ -1,0 +1,10 @@
+{
+  "document_id": "mbj:fixture:2026-05-20:001",
+  "post_url": "https://muteblockdevelopment.quora.com/mock-journal",
+  "posted_at": "2026-05-20T00:05:00Z",
+  "verified_event_ids": [
+    "evt-fixture-block-001",
+    "evt-fixture-space-001"
+  ],
+  "raw_block_hash": "fixture-hash"
+}

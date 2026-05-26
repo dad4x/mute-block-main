@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard</title>
+    <link rel="stylesheet" href="css/coordinator.css">
+</head>
+<body>
+    <main class="coordinator">
+        <header class="coordinator-header">
+            <div class="brand">
+                <img class="brand-mark" src="icons/116.png" alt="" aria-hidden="true">
+                <div>
+                    <h1>Mute Block Dashboard</h1>
+                    <div class="version" id="appVersion">v0.0.0</div>
+                </div>
+            </div>
+            <div class="header-status">
+                <button class="clear-button" id="openPreferencesButton" type="button">Preferences</button>
+                <div class="status-pill" id="refreshState">Loading</div>
+            </div>
+        </header>
+
+        <section class="panel-stack" aria-label="Dashboard details">
+            <section class="panel" data-panel-scroll-target="queueList">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="queueList" aria-expanded="true" aria-controls="queueList" aria-label="Collapse Current Work">v</button>
+                        <h2 title="Current Work is the durable operational job set. Status shows execution state; outcome shows terminal result or current error.">Current Work</h2>
+                    </div>
+                    <div class="panel-actions panel-actions--queue">
+                        <div class="panel-actions-row">
+                            <span id="currentWorkReadyCount">0 ready</span>
+                            <span id="retryFailedCount">0 retryable</span>
+                            <button class="clear-button" id="requeueFailedButton" type="button">Requeue Failed</button>
+                            <button class="clear-button" id="pauseCurrentWorkButton" type="button">Pause</button>
+                            <span class="pause-state" id="pauseCurrentWorkState">Running</span>
+                            <button class="clear-button clear-button--danger" id="cancelCurrentWorkButton" type="button">Cancel Current Work</button>
+                            <button class="clear-button" id="retryFailedButton" type="button" aria-pressed="false">Idle Retry</button>
+                            <span id="queueCount">0 jobs</span>
+                        </div>
+                        <div class="panel-action-state" id="retryFailedState">Idle retry is off</div>
+                    </div>
+                </div>
+                <div class="list" id="queueList"></div>
+            </section>
+
+            <section class="summary-grid" aria-label="Dashboard summary">
+                <div class="summary-tile">
+                    <div class="summary-label" title="Current Work jobs ready for a worker slot.">Ready to Run</div>
+                    <div class="summary-value" id="queuedCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Jobs currently opening, active, acting, or settling.">Active</div>
+                    <div class="summary-value" id="activeCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Average active seconds per successful block completed in the current metrics epoch. Already-blocked rows are excluded.">secs / block</div>
+                    <div class="summary-value" id="secondsPerBlock">--</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>
+                    <div class="summary-value" id="terminalCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Recent dashboard enqueue, retry, pause, and repair events.">Events</div>
+                    <div class="summary-value" id="eventCount">0</div>
+                </div>
+            </section>
+
+            <section class="panel" data-panel-scroll-target="metricsJournal">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="metricsList" aria-expanded="true" aria-controls="metricsList" aria-label="Collapse Metrics">v</button>
+                        <h2 title="Queue wakeup metrics show scheduler pumps, nudges, repairs, and per-cycle journal entries.">Metrics</h2>
+                    </div>
+                    <div class="panel-actions">
+                        <span id="metricsUpdated">No metrics yet</span>
+                        <button class="clear-button" id="resetMetricsButton" type="button">Reset metrics</button>
+                    </div>
+                </div>
+                <div class="metrics-panel" id="metricsList">
+                    <div class="metrics-grid" id="metricsGrid"></div>
+                    <div class="list list--compact metrics-journal" id="metricsJournal"></div>
+                </div>
+            </section>
+
+            <section class="panel" data-panel-scroll-target="runList">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="runList" aria-expanded="true" aria-controls="runList" aria-label="Collapse Runs">v</button>
+                        <h2 title="Runs group targets by enqueue request, source, retry action, and submitted time.">Runs</h2>
+                    </div>
+                    <div class="panel-actions">
+                        <span id="runCount">0 runs</span>
+                        <button class="clear-button" id="clearCompletedRunsButton" type="button">Clear Completed</button>
+                    </div>
+                </div>
+                <div class="list" id="runList"></div>
+            </section>
+
+            <section class="panel" data-panel-scroll-target="eventList">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="eventList" aria-expanded="true" aria-controls="eventList" aria-label="Collapse Events">v</button>
+                        <h2 title="Events show recent dashboard actions and their source or target context.">Events</h2>
+                    </div>
+                    <div class="panel-actions">
+                        <span id="eventListCount">0 events</span>
+                        <button class="clear-button" id="clearEventsButton" type="button">Clear</button>
+                    </div>
+                </div>
+                <div class="list list--compact" id="eventList"></div>
+            </section>
+        </section>
+
+    </main>
+
+    <script src="js/coordinator.js"></script>
+</body>
+</html>

@@ -1,5 +1,12 @@
 # Space Nuke BiDi Debugging Notes 2026-05-07
 
+Status: historical live-debugging setup.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). Use this for old
+Firefox/BiDi setup context only; current live validation should follow the repo
+rule to use direct CDP for Chrome live probes.
+
 This note captures the working setup for live Firefox/Quora debugging from this checkout. It is meant as a reproducible handoff for a later Codex session.
 
 ## Context

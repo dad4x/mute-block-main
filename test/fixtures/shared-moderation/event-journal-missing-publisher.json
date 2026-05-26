@@ -1,0 +1,13 @@
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:missing-publisher",
+  "events": [
+    {
+      "event_id": "evt-missing-publisher",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Some-User",
+      "occurred_at": "2026-05-20T00:00:00Z"
+    }
+  ]
+}

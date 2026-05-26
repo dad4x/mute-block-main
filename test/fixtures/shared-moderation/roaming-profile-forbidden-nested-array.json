@@ -1,0 +1,25 @@
+{
+  "schema": "com.muteblock.roamingProfile",
+  "schema_version": 1,
+  "document_id": "mbrp:fixture:2026-05-20:nested-forbidden",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "settings": {
+    "shared_export_space_url": "https://muteblockdevelopment.quora.com/",
+    "profiles": [
+      {
+        "storage_profile_id": "mb-profile-hidden-in-array"
+      }
+    ],
+    "history": [
+      {
+        "execution_history": [
+          "private local action"
+        ]
+      }
+    ]
+  }
+}

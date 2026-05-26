@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mute Block</title>
+    <title>Preferences</title>
     <link rel="stylesheet" href="css/popup.css">
 </head>
 <body>
@@ -60,8 +60,8 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">Remembered Nuke Retention (days)</div>
-                        <div class="hint">Auto-prune remembered space-post results older than this. Use `0` to disable age pruning.</div>
+                        <div class="label">Recent History Retention (days)</div>
+                        <div class="hint">Auto-prune persisted space-post results older than this. Use `0` to disable age pruning.</div>
                     </div>
                     <input class="input" id="nukedPostRetentionDays" type="number" min="0" required>
                 </div>
@@ -70,8 +70,8 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">Remembered Nuke Entry Cap</div>
-                        <div class="hint">Keep at most this many remembered posts, trimming the oldest first. Use `0` to disable the cap.</div>
+                        <div class="label">Recent History Entry Cap</div>
+                        <div class="hint">Keep at most this many persisted history entries, trimming the oldest first. Use `0` to disable the cap.</div>
                     </div>
                     <input class="input" id="maxRememberedNukedPosts" type="number" min="0" required>
                 </div>
@@ -80,6 +80,7 @@
             <div class="actions">
                 <button class="button button-primary" type="submit">Save</button>
                 <button class="button button-secondary" type="reset">Reset</button>
+                <button class="button button-secondary" id="openCoordinator" type="button">Dashboard</button>
             </div>
 
             <div class="status" id="status" hidden></div>
@@ -106,15 +107,15 @@
         <section class="section section-memory">
             <div class="section-head">
                 <div>
-                    <div class="label">Remembered Nukes</div>
+                    <div class="label">Recent History</div>
                     <div class="hint">Space-post nuke results are kept locally until cleared. That persistence can later support export or review flows for labelers.</div>
                 </div>
             </div>
 
             <div class="row row-memory">
                 <div>
-                    <div class="memory-count" id="nukedPostCount">0 remembered posts</div>
-                    <div class="hint">Clear this if you want to re-run or rebuild the remembered list.</div>
+                    <div class="memory-count" id="nukedPostCount">0 history entries</div>
+                    <div class="hint">Clear this if you want to re-run or rebuild the persisted history.</div>
                 </div>
                 <button class="button button-danger button-compact" id="clearNukedPosts" type="button">Clear</button>
             </div>

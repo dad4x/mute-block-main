@@ -1,0 +1,42 @@
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:001",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "source_instance": {
+    "storage_profile_id": "mb-profile-fixture-001",
+    "storage_profile_label": "Chrome profile: fixture"
+  },
+  "transport": {
+    "kind": "quora-space-post",
+    "space": "https://muteblockdevelopment.quora.com/",
+    "post_url": "https://muteblockdevelopment.quora.com/mock-journal"
+  },
+  "events": [
+    {
+      "event_id": "evt-fixture-block-001",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Some-User",
+      "occurred_at": "2026-05-20T00:00:00Z",
+      "provenance": {
+        "kind": "local-action",
+        "attempt_id": "attempt-fixture-001",
+        "source_space": "https://target-space.quora.com/"
+      }
+    },
+    {
+      "event_id": "evt-fixture-space-001",
+      "type": "space.classification.set",
+      "space": "https://target-space.quora.com/",
+      "classification": {
+        "category": "target",
+        "mode": "reviewed"
+      },
+      "occurred_at": "2026-05-20T00:01:00Z"
+    }
+  ]
+}

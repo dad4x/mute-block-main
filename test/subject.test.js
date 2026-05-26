@@ -46,6 +46,18 @@ test('allows explicit profile paths on Quora subdomains', () => {
 
 test('rejects likely question slugs', () => {
     assert.equal(getLikelyQuoraProfileSlug('/What-is-this-question'), '')
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/If-you-love-this-country-Democrats-want-you-dead-Will-you-be-thinking-of-that-when-you-go-to-the-polls-this-November'),
+        null
+    )
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/IN-the-MONTHS-LEADING-UP-TO-the-JFK-ASSASSINATION-were-there-ANY-OCCURANCES-THAT-MIGHT-HAVE-ENRAGED-HIS-ADVERSARIES-TO-the-POINT-of-WANTING-HIM-ELIMINATED-in-A-BRUTAL-AND-SAVAGE-MANNER-AS-HE-WAS'),
+        null
+    )
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/Apparently-the-Pentagon-is-considering-handing-over-the-Falkland-Islands-over-to-Argentina-as-punishment-Does-this-not-show-the-might-and-power-of-the-USA-to-anybody-who-dares-to-defy-it'),
+        null
+    )
 })
 
 test('preserves title-case direct profile slugs beginning with The', () => {
