@@ -8340,8 +8340,22 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
             incomingAttemptId: getAttemptIdFromValue(record),
             expectedAttemptId: getAttemptIdFromValue(item),
             senderTabId: tab?.id || null,
-                message: 'Ignored queued tab transition from stale attempt'
-            })
+            message: 'Ignored queued tab transition from stale attempt'
+        })
+        return false
+    }
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const currentAttemptNumber = getAttemptNumberFromValue(item)
+    const incomingAttemptId = getAttemptIdFromValue(record)
+    const incomingAttemptNumber = getAttemptNumberFromValue(record)
+    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
+        await recordStaleAttemptDiagnostic({
+            profileHref: href,
+            incomingAttemptId,
+            expectedAttemptId: currentAttemptId,
+            senderTabId: tab?.id || null,
+            message: 'Ignored queued tab transition without required attempt identity'
+        })
         return false
     }
 
@@ -8358,8 +8372,8 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
 
     const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
     const itemCoordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-    const expectedAttemptId = getAttemptIdFromValue(item) ? getAttemptIdFromValue(record) : ''
-    const expectedAttemptNumber = getAttemptNumberFromValue(item) ? getAttemptNumberFromValue(record) : 0
+    const expectedAttemptId = currentAttemptId ? incomingAttemptId : ''
+    const expectedAttemptNumber = currentAttemptNumber ? incomingAttemptNumber : 0
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
         operationKind: 'active-transition',
         rowKey: itemKey,
@@ -8381,6 +8395,10 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
             }
             if(hasMismatchedCoordinatorAttempt(currentItem, record)) {
                 return context.reject('stale-attempt', {staleAttempt: true})
+            }
+            if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
+                (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
+                return context.reject('missing-attempt-identity', {staleAttempt: true})
             }
             if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== itemHref ||
                 getCoordinatorItemQueueKey(currentItem, itemKey) !== itemCoordinatorKey) {
