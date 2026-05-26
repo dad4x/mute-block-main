@@ -50,7 +50,7 @@ async function settle(env, rounds = 4) {
     }
 }
 
-async function settleWithFakeTimers(promise, env, steps = [0, 1000, 5000, 15000, 30000, 60000, 120000, 180000]) {
+async function settleWithFakeTimers(promise, env, steps = [0, 1000, 5000, 15000, 30000, 60000, 120000, 180000, 30000]) {
     let settled = false
     let settledValue
     let settledError

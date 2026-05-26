@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict')
 const {
     getLikelyQuoraProfileSlug,
+    isLikelyExplicitProfileTargetHref,
+    isLikelyExplicitProfileTargetSlug,
     normalizeQuoraProfileHref,
     sanitizeProfileHrefSlug
 } = require('../shared/js/subject')
@@ -67,4 +69,17 @@ test('preserves title-case direct profile slugs beginning with The', () => {
 test('strips known URL artifact tails from slugs', () => {
     assert.equal(sanitizeProfileHrefSlug('Some-User-42-answers'), 'Some-User-42')
     assert.equal(sanitizeProfileHrefSlug('Some-User-42-His-bio'), 'Some-User-42')
+})
+
+test('rejects prose-contaminated explicit profile target slugs', () => {
+    assert.equal(isLikelyExplicitProfileTargetSlug('Darlene-McConnell-61'), true)
+    assert.equal(isLikelyExplicitProfileTargetHref('https://www.quora.com/profile/Darlene-McConnell-61'), true)
+    assert.equal(
+        isLikelyExplicitProfileTargetSlug('Abner-Zefers-freely-states-hes-a-troll-It-saves-so-much-time-checking-t'),
+        false
+    )
+    assert.equal(
+        isLikelyExplicitProfileTargetHref('https://www.quora.com/profile/Abner-Zefers-freely-states-hes-a-troll-It-saves-so-much-time-checking-t'),
+        false
+    )
 })

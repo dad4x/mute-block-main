@@ -326,23 +326,43 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     )
 })
 
-test('single current work cancel only terminalizes the selected pending row', async () => {
+test('single current work cancel WAL-terminalizes only the selected pending row', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Cancel-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Cancel-B'
     const runId = 'run-single-cancel'
     const rowA = {
-        ...makeActiveCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-cancel-a', tabId: null, now: 500000}),
+        runId,
         status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefA,
+        requestedUrl: hrefA,
+        dedupeKey: hrefA,
+        coordinatorKey: hrefA,
+        queuedAt: 499000,
         activeAt: 0,
-        tabId: null
+        updatedAt: 499500,
+        tabId: null,
+        attemptId: 'attempt-cancel-a',
+        attemptNumber: 1,
+        milestones: {}
     }
     const rowB = {
-        ...makeActiveCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-cancel-b', tabId: null, now: 500000}),
+        runId,
         status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefB,
+        requestedUrl: hrefB,
+        dedupeKey: hrefB,
+        coordinatorKey: hrefB,
+        queuedAt: 499000,
         activeAt: 0,
-        tabId: null
+        updatedAt: 499500,
+        tabId: null,
+        attemptId: 'attempt-cancel-b',
+        attemptNumber: 1,
+        milestones: {}
     }
-    const {browser, storage, timers} = loadServiceWorkerHarness({
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
         now: 500000,
         storage: {
             mbCoordinatorPaused: false,
@@ -374,10 +394,18 @@ test('single current work cancel only terminalizes the selected pending row', as
     assert.equal(result.canceledUrls.length, 1)
     assert.equal(result.canceledUrls[0], hrefA)
     assert.equal(result.canceledWorkKeys.length, 0)
-    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'canceled')
-    assert.equal(storage.mbCoordinatorQueue[hrefA].outcome, 'paused')
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefA].outcome, 'paused')
     assert.notEqual(storage.mbCoordinatorQueue[hrefB].status, 'canceled')
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'current-work-item-cancel')
+    assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[hrefA].status, 'canceled')
     assert.equal(
         (storage.mbCoordinatorQueueView.counts.queued || 0) +
             (storage.mbCoordinatorQueueView.counts.opening || 0) +
@@ -386,6 +414,256 @@ test('single current work cancel only terminalizes the selected pending row', as
             (storage.mbCoordinatorQueueView.counts.settling || 0),
         1
     )
+})
+
+test('queue accounting audit explains raw WAL drift without writing storage', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Accounting-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Accounting-B'
+    const runId = 'run-accounting-audit'
+    const rowA = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefA,
+        requestedUrl: hrefA,
+        dedupeKey: hrefA,
+        coordinatorKey: hrefA,
+        queuedAt: 500000,
+        updatedAt: 500000,
+        tabId: null,
+        attemptId: 'attempt-accounting-a',
+        attemptNumber: 1,
+        milestones: {}
+    }
+    const rowB = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefB,
+        requestedUrl: hrefB,
+        dedupeKey: hrefB,
+        coordinatorKey: hrefB,
+        queuedAt: 500001,
+        updatedAt: 500001,
+        tabId: null,
+        attemptId: 'attempt-accounting-b',
+        attemptNumber: 1,
+        milestones: {}
+    }
+    const {browser, storage, timers} = loadServiceWorkerHarness({
+        now: 500000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: rowA,
+                [hrefB]: rowB
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB],
+                    targetWorkKeys: [hrefA, hrefB]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work-item',
+        storageKey: hrefA,
+        coordinatorKey: hrefA,
+        profileHref: hrefA
+    }), timers)
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
+
+    const before = JSON.stringify({
+        queue: storage.mbCoordinatorQueue,
+        queueWal: storage.mbCoordinatorQueueWal,
+        queueView: storage.mbCoordinatorQueueView
+    })
+    const accounting = await browser.runtime.sendMessage({
+        action: 'get-coordinator-queue-accounting',
+        reason: 'synthetic-test'
+    })
+
+    assert.equal(JSON.stringify({
+        queue: storage.mbCoordinatorQueue,
+        queueWal: storage.mbCoordinatorQueueWal,
+        queueView: storage.mbCoordinatorQueueView
+    }), before)
+    assert.equal(accounting.readOnly, true)
+    assert.equal(accounting.consistent, true)
+    assert.equal(JSON.stringify(accounting.raw.counts), JSON.stringify({queued: 2}))
+    assert.equal(accounting.recovered.counts.queued, 1)
+    assert.equal(accounting.recovered.counts.canceled, 1)
+    assert.equal(accounting.currentWork.ready, 1)
+    assert.equal(accounting.currentWork.terminal, 1)
+    assert.equal(accounting.wal.recovered, true)
+    assert.equal(accounting.wal.activeTailRecords, 1)
+    assert.equal(JSON.stringify(accounting.rawDivergences), JSON.stringify(['raw-vs-recovered-counts']))
+    assert.equal(JSON.stringify(accounting.mismatches), JSON.stringify([]))
+})
+
+test('queue accounting audit flags stale compact dashboard counts', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Accounting-Stale-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Accounting-Stale-B'
+    const runId = 'run-accounting-audit-stale'
+    const rowA = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefA,
+        requestedUrl: hrefA,
+        dedupeKey: hrefA,
+        coordinatorKey: hrefA,
+        queuedAt: 500000,
+        updatedAt: 500000,
+        tabId: null,
+        attemptId: 'attempt-accounting-stale-a',
+        attemptNumber: 1,
+        milestones: {}
+    }
+    const rowB = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: hrefB,
+        requestedUrl: hrefB,
+        dedupeKey: hrefB,
+        coordinatorKey: hrefB,
+        queuedAt: 500001,
+        updatedAt: 500001,
+        tabId: null,
+        attemptId: 'attempt-accounting-stale-b',
+        attemptNumber: 1,
+        milestones: {}
+    }
+    const {browser, storage, timers} = loadServiceWorkerHarness({
+        now: 500000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: rowA,
+                [hrefB]: rowB
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB],
+                    targetWorkKeys: [hrefA, hrefB]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work-item',
+        storageKey: hrefA,
+        coordinatorKey: hrefA,
+        profileHref: hrefA
+    }), timers)
+    storage.mbCoordinatorQueueView = {
+        ...storage.mbCoordinatorQueueView,
+        counts: {queued: 2},
+        authoritativeCounts: {queued: 2},
+        items: []
+    }
+
+    const before = JSON.stringify({
+        queue: storage.mbCoordinatorQueue,
+        queueWal: storage.mbCoordinatorQueueWal,
+        queueView: storage.mbCoordinatorQueueView
+    })
+    const accounting = await browser.runtime.sendMessage({
+        action: 'get-coordinator-queue-accounting',
+        reason: 'synthetic-stale-view'
+    })
+
+    assert.equal(JSON.stringify({
+        queue: storage.mbCoordinatorQueue,
+        queueWal: storage.mbCoordinatorQueueWal,
+        queueView: storage.mbCoordinatorQueueView
+    }), before)
+    assert.equal(accounting.consistent, false)
+    assert.equal(JSON.stringify(accounting.rawDivergences), JSON.stringify(['raw-vs-recovered-counts']))
+    assert.equal(JSON.stringify(accounting.mismatches), JSON.stringify([
+        'stored-view-vs-recovered-counts',
+        'stored-view-vs-recovered-authoritative-counts'
+    ]))
+    assert.equal(JSON.stringify(accounting.storedView.counts), JSON.stringify({queued: 2}))
+    assert.equal(accounting.rebuiltView.counts.queued, 1)
+    assert.equal(accounting.rebuiltView.counts.canceled, 1)
+})
+
+test('single current work cancel WAL append failure leaves selected row pending', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Cancel-Wal-Failure'
+    const runId = 'run-single-cancel-wal-failure'
+    const row = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 500000,
+        activeAt: 0,
+        updatedAt: 500500,
+        tabId: null,
+        attemptId: 'attempt-cancel-wal-failure',
+        attemptNumber: 1,
+        milestones: {}
+    }
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 501000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: row
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic current work item cancel WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work-item',
+        storageKey: href,
+        coordinatorKey: href,
+        profileHref: href
+    }), timers)
+
+    assert.equal(result.canceledUrls.length, 0)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
 })
 
 test('progress shadow WAL append uses bounded incremental replay', async () => {
@@ -9792,9 +10070,16 @@ test('queued profile tab is requeued after the foreground-wait stale timeout ela
     assert.ok(browser.__removedTabs.includes(firstTab.id))
     assert.equal(browser.__tabs.has(firstTab.id), false)
     assert.equal(sw.state().activeQueuedTabs.includes(firstTab.id), false)
-    assert.ok(['queued', 'opening', 'active', 'acting', 'settling'].includes(storage.mbCoordinatorQueue[href].status))
-    assert.equal(storage.mbCoordinatorQueue[href].retryCount, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].retryAttempt, 1)
+    const recoveredQueue = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.ok(['queued', 'opening', 'active', 'acting', 'settling'].includes(recoveredQueue[href].status))
+    assert.equal(recoveredQueue[href].retryCount, 1)
+    assert.equal(recoveredQueue[href].retryAttempt, 1)
 })
 
 test('loading queued tab becomes queue-load pressure without consuming row retry budget', async () => {
@@ -9847,10 +10132,17 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
     assert.ok(browser.__removedTabs.includes(firstTab.id))
     assert.equal(browser.__tabs.has(firstTab.id), false)
     assert.equal(sw.state().activeQueuedTabs.includes(firstTab.id), false)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueue[href].retryCount || 0, 0)
-    assert.equal(storage.mbCoordinatorQueue[href].retryAttempt || 0, 0)
-    assert.equal(storage.mbCoordinatorQueue[href].loadPressureRequeueCount, 1)
+    const recoveredQueue = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(recoveredQueue[href].status, 'queued')
+    assert.equal(recoveredQueue[href].retryCount || 0, 0)
+    assert.equal(recoveredQueue[href].retryAttempt || 0, 0)
+    assert.equal(recoveredQueue[href].loadPressureRequeueCount, 1)
     assert.equal(sw.state().queueLoadThrottle.active, true)
     assert.equal(sw.state().queueLoadThrottle.concurrency, 1)
     assert.equal(listTabs(browser).some(candidate => candidate.url === href), false)

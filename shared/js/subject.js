@@ -109,6 +109,48 @@ function stripTrailingProfileArtifactToken(value) {
     return `${value || ''}`
 }
 
+function isLikelyExplicitProfileTargetSlug(slug) {
+    const value = sanitizeProfileHrefSlug(slug)
+    if(!value) return false
+
+    const tokens = value.split('-').filter(Boolean)
+    if(tokens.length < 2) return false
+
+    const proseTokens = new Set([
+        'about', 'again', 'answer', 'answers', 'because', 'checking',
+        'comment', 'comments', 'does', 'freely', 'from', 'have', 'hes',
+        'into', 'made', 'much', 'post', 'question', 'saves', 'says', 'she',
+        'states', 'that', 'their', 'this', 'time', 'troll', 'what', 'when',
+        'where', 'with', 'without'
+    ])
+    const isNameishToken = token => /^[A-Z][A-Za-z0-9]*$/.test(token) ||
+        /^[A-Z0-9]{2,}$/.test(token) ||
+        /^\d+$/.test(token)
+    const proseCount = tokens.filter(token => proseTokens.has(`${token || ''}`.toLowerCase())).length
+    if(proseCount >= 2) return false
+
+    const nonNameishCount = tokens.filter(token => !isNameishToken(token)).length
+    if(tokens.length > 4 && nonNameishCount >= 2) return false
+    if(tokens.length > 6 && !tokens.some(token => /^\d+$/.test(token))) return false
+    if(tokens.length > 8) return false
+
+    return true
+}
+
+function isLikelyExplicitProfileTargetHref(href) {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    if(!normalizedHref) return false
+
+    try {
+        const url = new URL(normalizedHref)
+        const slug = decodeURIComponent(url.pathname.replace(/^\/profile\//i, ''))
+        return isLikelyExplicitProfileTargetSlug(slug)
+    }
+    catch {
+        return false
+    }
+}
+
 function isLikelyDirectProfileSlug(slug) {
     const value = `${slug || ''}`.trim()
     if(!value) return false
@@ -205,6 +247,8 @@ function normalizeTabTargetUrl(url) {
 module.exports = {
     QUORA_NON_PROFILE_ROOT_PATHS,
     getLikelyQuoraProfileSlug,
+    isLikelyExplicitProfileTargetHref,
+    isLikelyExplicitProfileTargetSlug,
     isLikelyDirectProfileSlug,
     normalizeQuoraProfileHref,
     normalizeTabTargetUrl,
