@@ -143,7 +143,9 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'action-lease-heartbeat',
     'action-lease-release',
     'repair-non-profile-landing',
-    'repair-key-only-terminalize'
+    'repair-key-only-terminalize',
+    'current-work-item-cancel',
+    'stale-retry'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -3614,6 +3616,158 @@ function buildCoordinatorQueueView(queue = {}, now = Date.now()) {
         itemLimit: MAX_COORDINATOR_QUEUE_VIEW_ITEMS,
         truncated: entries.length > items.length,
         items
+    }
+}
+
+function makeCoordinatorQueueAccountingCounts(queue = {}) {
+    const counts = {}
+    const authoritativeCounts = {}
+    for(const item of Object.values(queue || {})) {
+        const status = `${item?.status || ''}`.trim() || 'unknown'
+        counts[status] = (counts[status] || 0) + 1
+        if(isCoordinatorQueueAuthoritativeItem(item)) {
+            authoritativeCounts[status] = (authoritativeCounts[status] || 0) + 1
+        }
+    }
+
+    return {
+        total: Object.keys(queue || {}).length,
+        counts,
+        authoritativeCounts
+    }
+}
+
+function normalizeCoordinatorQueueViewAccounting(view = null) {
+    if(!view || typeof view !== 'object') {
+        return {
+            present: false,
+            total: 0,
+            counts: {},
+            authoritativeCounts: {},
+            itemCount: 0,
+            itemLimit: 0,
+            truncated: false,
+            updatedAt: 0
+        }
+    }
+
+    const items = Array.isArray(view.items) ? view.items : []
+    return {
+        present: true,
+        total: Number.parseInt(view.total, 10) || items.length,
+        counts: normalizeObjectNumberMap(view.counts || {}),
+        authoritativeCounts: normalizeObjectNumberMap(view.authoritativeCounts || {}),
+        itemCount: items.length,
+        itemLimit: Number.parseInt(view.itemLimit, 10) || 0,
+        truncated: view.truncated === true,
+        updatedAt: Number.parseInt(view.updatedAt, 10) || 0
+    }
+}
+
+function areCoordinatorAccountingCountsEqual(left = {}, right = {}) {
+    const keys = new Set([
+        ...Object.keys(left || {}),
+        ...Object.keys(right || {})
+    ])
+    for(const key of keys) {
+        if((Number(left?.[key]) || 0) !== (Number(right?.[key]) || 0)) return false
+    }
+    return true
+}
+
+function makeCoordinatorQueueAccountingComparison(source = {}, target = {}, prefix = '') {
+    const mismatches = []
+    if((Number(source.total) || 0) !== (Number(target.total) || 0)) {
+        mismatches.push(`${prefix}total`)
+    }
+    if(!areCoordinatorAccountingCountsEqual(source.counts, target.counts)) {
+        mismatches.push(`${prefix}counts`)
+    }
+    if(!areCoordinatorAccountingCountsEqual(source.authoritativeCounts, target.authoritativeCounts)) {
+        mismatches.push(`${prefix}authoritative-counts`)
+    }
+    return mismatches
+}
+
+function summarizeCoordinatorQueueWalAccounting(walStore = null, recovery = {}) {
+    const activeGenerationId = walStore?.meta?.activeCheckpoint || recovery?.wal?.generationId || ''
+    const records = activeGenerationId ? getWalRecordsForGeneration(walStore, activeGenerationId) : []
+    const checkpoints = walStore && typeof walStore === 'object' && walStore.checkpoints && typeof walStore.checkpoints === 'object'
+        ? Object.keys(walStore.checkpoints)
+        : []
+    const generations = walStore && typeof walStore === 'object' && walStore.wal && typeof walStore.wal === 'object'
+        ? Object.keys(walStore.wal)
+        : []
+    const ignored = Array.isArray(recovery?.wal?.projected?.ignored) ? recovery.wal.projected.ignored : []
+    const applied = Array.isArray(recovery?.wal?.projected?.applied) ? recovery.wal.projected.applied : []
+
+    return {
+        present: !!walStore,
+        recovered: recovery?.recovered === true,
+        recoveryReason: recovery?.reason || '',
+        activeGenerationId,
+        checkpointCount: checkpoints.length,
+        generationCount: generations.length,
+        activeTailRecords: records.length,
+        appliedRecords: applied.length,
+        ignoredRecords: ignored.length,
+        nextSeq: Number.parseInt(walStore?.meta?.nextSeq, 10) || 0
+    }
+}
+
+function makeCoordinatorCurrentWorkAccounting(queue = {}) {
+    const counts = makeCoordinatorQueueAccountingCounts(queue).counts
+    const ready = Number(counts.queued) || 0
+    const active = ['opening', 'active', 'acting', 'settling']
+        .reduce((total, status) => total + (Number(counts[status]) || 0), 0)
+    const succeeded = Number(counts.succeeded) || 0
+    const failed = Number(counts.failed) || 0
+
+    return {
+        ready,
+        active,
+        succeeded,
+        failed,
+        terminal: Object.entries(counts)
+            .filter(([status]) => isTerminalCoordinatorStatus(status))
+            .reduce((total, [, count]) => total + (Number(count) || 0), 0)
+    }
+}
+
+async function getCoordinatorQueueAccounting(request = {}) {
+    const stored = await metricStorageGet({
+        [COORDINATOR_QUEUE_KEY]: {},
+        [COORDINATOR_QUEUE_WAL_KEY]: null,
+        [COORDINATOR_QUEUE_VIEW_KEY]: null
+    }, {metricPath: 'queueAccounting.read'})
+    const rawQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY] || {})
+    const walStore = stored[COORDINATOR_QUEUE_WAL_KEY] || null
+    const recovery = recoverCoordinatorQueueFromWal(rawQueue, walStore)
+    const recoveredQueue = normalizeCoordinatorMap(recovery.queue || rawQueue)
+    const raw = makeCoordinatorQueueAccountingCounts(rawQueue)
+    const recovered = makeCoordinatorQueueAccountingCounts(recoveredQueue)
+    const storedView = normalizeCoordinatorQueueViewAccounting(stored[COORDINATOR_QUEUE_VIEW_KEY])
+    const rebuiltView = normalizeCoordinatorQueueViewAccounting(buildCoordinatorQueueView(recoveredQueue))
+    const rawDivergences = makeCoordinatorQueueAccountingComparison(raw, recovered, 'raw-vs-recovered-')
+    const viewMismatches = makeCoordinatorQueueAccountingComparison(storedView, rebuiltView, 'stored-view-vs-recovered-')
+    const mismatches = []
+
+    if(storedView.present && viewMismatches.length) mismatches.push(...viewMismatches)
+    if(walStore && recovery.recovered !== true) mismatches.push('wal-recovery-failed')
+
+    return {
+        readOnly: true,
+        reason: `${request.reason || ''}`.trim() || 'manual',
+        generatedAt: Date.now(),
+        consistent: !viewMismatches.length && (!walStore || recovery.recovered === true),
+        raw,
+        recovered,
+        storedView,
+        rebuiltView,
+        currentWork: makeCoordinatorCurrentWorkAccounting(recoveredQueue),
+        wal: summarizeCoordinatorQueueWalAccounting(walStore, recovery),
+        rawDivergences,
+        mismatches
     }
 }
 
@@ -9161,14 +9315,18 @@ async function pauseStoredCoordinatorWork(options = {}) {
 
 async function cancelStoredCoordinatorWork(options = {}) {
     const reason = `${options.reason || 'coordinator-pause-request'}`.trim()
+    const coordinatorKey = `${options.coordinatorKey || ''}`.trim()
+    const storageKey = `${options.storageKey || ''}`.trim()
+    const profileHref = normalizeQuoraProfileUrl(options.profileHref || '')
+    const hasTarget = !!(coordinatorKey || storageKey || profileHref)
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
-            kind: 'cancelStoredWork',
+            kind: hasTarget ? 'cancelStoredWorkItem' : 'cancelStoredWork',
             reason: 'ordinaryMutation',
             cancelReason: reason,
-            coordinatorKey: options.coordinatorKey || '',
-            storageKey: options.storageKey || '',
-            profileHref: options.profileHref || ''
+            coordinatorKey,
+            storageKey,
+            profileHref
         })
     })
 }
@@ -9196,7 +9354,8 @@ async function cancelCoordinatorCurrentWorkItem(request = {}) {
     return {
         canceledUrls: storedResult.canceledUrls || [],
         canceledWorkKeys: storedResult.canceledWorkKeys || [],
-        ownedTabIds
+        ownedTabIds,
+        reason: storedResult.reason || ''
     }
 }
 
@@ -11801,6 +11960,9 @@ async function mutateCoordinatorProjection(operation = {}) {
     if(kind === 'cancelStoredWork') {
         return mutateCoordinatorStoredWorkCancel(operation)
     }
+    if(kind === 'cancelStoredWorkItem') {
+        return mutateCoordinatorStoredWorkItemCancel(operation)
+    }
     if(kind === 'transitionQueuedTabActive') {
         return mutateCoordinatorQueuedTabActiveTransition(operation)
     }
@@ -12025,6 +12187,196 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     }
 }
 
+function findCoordinatorStoredWorkCancelTarget(queue = {}, operation = {}) {
+    const targetStorageKey = `${operation.storageKey || ''}`.trim()
+    const targetCoordinatorKey = `${operation.coordinatorKey || ''}`.trim()
+    const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
+    if(!targetStorageKey && !targetCoordinatorKey && !targetHref) {
+        return {entry: null, matches: [], reason: 'missing-current-work-item-target'}
+    }
+
+    const matches = []
+    for(const [itemKey, item] of Object.entries(queue || {})) {
+        if(!item || typeof item !== 'object') continue
+        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+        const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
+        if(itemKey !== targetStorageKey &&
+            itemKey !== targetCoordinatorKey &&
+            href !== targetHref &&
+            coordinatorKey !== targetCoordinatorKey &&
+            coordinatorKey !== targetStorageKey) {
+            continue
+        }
+        matches.push({itemKey, item, href, coordinatorKey})
+    }
+
+    if(matches.length !== 1) {
+        return {
+            entry: null,
+            matches,
+            reason: matches.length ? 'ambiguous-current-work-item-target' : 'missing-current-work-item-target'
+        }
+    }
+    return {entry: matches[0], matches, reason: ''}
+}
+
+async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') {
+        return {canceledUrls: [], canceledWorkKeys: [], ownedTabIds: [], reason: 'invalid-cancel-reason'}
+    }
+
+    const reason = `${operation.cancelReason || 'coordinator-pause-request'}`.trim()
+    const state = await loadCoordinatorState()
+    let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const target = findCoordinatorStoredWorkCancelTarget(currentAuthorityState.queue, operation)
+    if(!target.entry) {
+        return {canceledUrls: [], canceledWorkKeys: [], ownedTabIds: [], reason: target.reason}
+    }
+
+    const {itemKey, item, href, coordinatorKey} = target.entry
+    const status = `${item.status || ''}`.trim()
+    if(!isPendingCoordinatorStatus(status)) {
+        return {canceledUrls: [], canceledWorkKeys: [], ownedTabIds: [], reason: 'terminal-current-work-item'}
+    }
+    if(!href && !coordinatorKey) {
+        return {canceledUrls: [], canceledWorkKeys: [], ownedTabIds: [], reason: 'missing-current-work-item-identity'}
+    }
+
+    const now = Date.now()
+    const existingProgress = href ? state.progress[href] || profileNukeProgress?.[href] || null : null
+    const tabId = getPersistedQueuedTabId(item, existingProgress)
+    const nextItem = buildTerminalCoordinatorQueueItem(item, {
+        status: 'canceled',
+        outcome: 'paused',
+        error: 'Paused by user',
+        now,
+        reason
+    })
+    const expectedAttemptId = getAttemptIdFromValue(item)
+    const expectedAttemptNumber = getAttemptNumberFromValue(item)
+
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'current-work-item-cancel',
+        rowKey: itemKey,
+        expectedAttemptId,
+        expectedAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'currentWork.itemCancel.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            const currentStatus = `${currentItem?.status || ''}`.trim()
+            if(!currentItem || !isPendingCoordinatorStatus(currentStatus)) {
+                return context.reject('terminal-current-work-item')
+            }
+            const currentHref = getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)
+            const currentCoordinatorKey = getCoordinatorItemQueueKey(currentItem, itemKey)
+            if(currentHref !== href || currentCoordinatorKey !== coordinatorKey) {
+                return context.reject('row-target-changed-before-authority-apply')
+            }
+            if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
+                return context.reject('row-changed-before-authority-apply')
+            }
+            return nextItem
+        }
+    })
+
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
+        return {
+            canceledUrls: [],
+            canceledWorkKeys: [],
+            ownedTabIds: tabId ? [tabId] : [],
+            reason: authorityResult?.reason || 'authority-apply-failed'
+        }
+    }
+
+    currentAuthorityState = coordinatorAuthority.current()
+    const nextQueue = currentAuthorityState.queue
+    const affectedRunIds = new Set(nextItem.runId ? [nextItem.runId] : [])
+    if(href) {
+        for(const runId of getCoordinatorRunIdsForHref(state.runs, href)) {
+            affectedRunIds.add(runId)
+        }
+    }
+
+    const runs = affectedRunIds.size
+        ? recomputeCoordinatorRuns(nextQueue, state.runs, affectedRunIds)
+        : state.runs
+    const runsChanged = affectedRunIds.size && JSON.stringify(runs) !== JSON.stringify(state.runs)
+    const events = normalizeCoordinatorEvents(state.events)
+    events.push({
+        id: makeId('event'),
+        runId: nextItem.runId || '',
+        itemId: itemKey,
+        type: 'paused',
+        message: 'Paused 1 coordinator target',
+        at: now,
+        details: {
+            reason,
+            canceledUrls: href ? [href] : [],
+            canceledWorkKeys: href ? [] : [coordinatorKey]
+        }
+    })
+
+    let progressChanged = false
+    const progress = {...state.progress}
+    if(href) {
+        const nextProgress = makeTerminalProgressRecordFromCoordinatorItem(
+            href,
+            nextItem,
+            existingProgress,
+            'Paused by user'
+        )
+        if(nextProgress && JSON.stringify(nextProgress) !== JSON.stringify(existingProgress || null)) {
+            progress[href] = nextProgress
+            progressChanged = true
+        }
+    }
+    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
+    if(progressChanged) {
+        profileNukeProgress = prunedProgress
+    }
+
+    let derivedSaved = false
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: runsChanged ? runs : undefined,
+            events,
+            progress: progressChanged ? prunedProgress : undefined
+        }, {
+            queue: false,
+            runs: runsChanged,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'current-work-item-cancel-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'current-work-item-cancel-derived-save-failed',
+            error?.message || 'Current Work item cancel derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('currentWork.itemCancel.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'current-work-item-cancel-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
+
+    return {
+        canceledUrls: href ? [href] : [],
+        canceledWorkKeys: href ? [] : [coordinatorKey],
+        ownedTabIds: tabId ? [tabId] : [],
+        persistence: authorityResult.persistence || null,
+        derivedSaved
+    }
+}
+
 async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
     if(snapshotReason !== 'ordinaryMutation') {
@@ -12233,9 +12585,12 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
     const coordinatorKey = operation.coordinatorKey || action?.coordinatorKey || (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
     if(!action || (!href && !coordinatorKey)) return false
 
-    const state = await loadCoordinatorQueueRunsProjection()
-    const queue = state.queue
-    const runs = state.runs
+    const state = await loadCoordinatorQueueRunsProjection({
+        metricPath: 'staleRetry.load'
+    })
+    let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = currentAuthorityState.runs
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
     if(!item || isTerminalCoordinatorStatus(item.status)) return false
@@ -12252,69 +12607,119 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
     if(!attemptId || !attemptNumber) return false
 
     const at = Number.parseInt(operation.at, 10) || Date.now()
-    const loadPressureRequeue = action.loadPressureRequeue === true
-    const retryCount = loadPressureRequeue
-        ? getCoordinatorFailureRetryCount(item)
-        : Math.max(
-            getCoordinatorFailureRetryCount(item) + 1,
-            Number.parseInt(action.retryAttempt, 10) || 0
-        )
-    const reduced = reduceJobEvent(item, {
-        type: JOB_EVENT_RETRY,
-        sourceAttemptId,
-        sourceAttemptNumber,
-        attemptId,
-        attemptNumber,
-        at,
-        retryCount,
-        lastRetryAt: loadPressureRequeue ? item.lastRetryAt || 0 : at
-    })
-    if(!reduced.accepted) return false
+    const buildNextRetryItem = currentItem => {
+        const loadPressureRequeue = action.loadPressureRequeue === true
+        const retryCount = loadPressureRequeue
+            ? getCoordinatorFailureRetryCount(currentItem)
+            : Math.max(
+                getCoordinatorFailureRetryCount(currentItem) + 1,
+                Number.parseInt(action.retryAttempt, 10) || 0
+            )
+        const reduced = reduceJobEvent(currentItem, {
+            type: JOB_EVENT_RETRY,
+            sourceAttemptId,
+            sourceAttemptNumber,
+            attemptId,
+            attemptNumber,
+            at,
+            retryCount,
+            lastRetryAt: loadPressureRequeue ? currentItem.lastRetryAt || 0 : at
+        })
+        if(!reduced.accepted) return null
 
-    const actionKind = getCoordinatorActionKindForRequestedAction(action.actionKind || action.tabAction || item.actionKind || '')
-    queue[itemKey] = applyCoordinatorJobEnvelope({
-        ...reduced.item,
-        targetProfileHref: href || reduced.item.targetProfileHref || '',
-        requestedUrl: normalizeCoordinatorRequestedUrl(action.requestedUrl || action.url || reduced.item.requestedUrl || ''),
-        coordinatorKey,
-        actionKind,
-        executorTabAction: getCoordinatorExecutorTabActionForActionKind(actionKind),
-        executorNoForegroundFallback: action.noForegroundFallback === true,
-        serviceWorkerOwned: true,
-        retryAttempt: Number.parseInt(action.retryAttempt, 10) || 0,
-        maxRetries: Number.parseInt(action.maxRetries, 10) || 0,
-        maxAttempts: (Number.parseInt(action.maxRetries, 10) || 0) + 1,
-        loadPressureRequeueCount: loadPressureRequeue
-            ? (Number.parseInt(item.loadPressureRequeueCount, 10) || 0) + 1
-            : Number.parseInt(item.loadPressureRequeueCount, 10) || 0,
-        lastLoadPressureAt: loadPressureRequeue ? at : Number.parseInt(item.lastLoadPressureAt, 10) || 0
-    }, {
-        runId: reduced.item.runId || action.runId || '',
-        source: reduced.item.source || {},
-        targetProfileHref: href,
-        requestedUrl: action.requestedUrl || action.url || '',
-        coordinatorKey,
-        actionKind
+        const actionKind = getCoordinatorActionKindForRequestedAction(action.actionKind || action.tabAction || currentItem.actionKind || '')
+        return applyCoordinatorJobEnvelope({
+            ...reduced.item,
+            targetProfileHref: href || reduced.item.targetProfileHref || '',
+            requestedUrl: normalizeCoordinatorRequestedUrl(action.requestedUrl || action.url || reduced.item.requestedUrl || ''),
+            coordinatorKey,
+            actionKind,
+            executorTabAction: getCoordinatorExecutorTabActionForActionKind(actionKind),
+            executorNoForegroundFallback: action.noForegroundFallback === true,
+            serviceWorkerOwned: true,
+            retryAttempt: Number.parseInt(action.retryAttempt, 10) || 0,
+            maxRetries: Number.parseInt(action.maxRetries, 10) || 0,
+            maxAttempts: (Number.parseInt(action.maxRetries, 10) || 0) + 1,
+            loadPressureRequeueCount: loadPressureRequeue
+                ? (Number.parseInt(currentItem.loadPressureRequeueCount, 10) || 0) + 1
+                : Number.parseInt(currentItem.loadPressureRequeueCount, 10) || 0,
+            lastLoadPressureAt: loadPressureRequeue ? at : Number.parseInt(currentItem.lastLoadPressureAt, 10) || 0
+        }, {
+            runId: reduced.item.runId || action.runId || '',
+            source: reduced.item.source || {},
+            targetProfileHref: href,
+            requestedUrl: action.requestedUrl || action.url || '',
+            coordinatorKey,
+            actionKind
+        })
+    }
+
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'stale-retry',
+        rowKey: itemKey,
+        expectedAttemptId: sourceAttemptId,
+        expectedAttemptNumber: sourceAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'staleRetry.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
+                return context.reject('missing-or-terminal-row')
+            }
+            const currentHref = getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)
+            const currentCoordinatorKey = getCoordinatorItemQueueKey(currentItem, itemKey)
+            if(currentHref !== (getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)) ||
+                currentCoordinatorKey !== getCoordinatorItemQueueKey(item, itemKey)) {
+                return context.reject('row-target-changed-before-authority-apply')
+            }
+            const nextItem = buildNextRetryItem(currentItem)
+            if(!nextItem) return context.reject('retry-reducer-rejected')
+            return nextItem
+        }
     })
 
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) return false
+
+    currentAuthorityState = coordinatorAuthority.current()
+    const nextQueue = currentAuthorityState.queue
+    const nextItem = authorityResult.nextRow || nextQueue[itemKey] || null
     const affectedRunIds = new Set()
-    if(queue[itemKey].runId) affectedRunIds.add(queue[itemKey].runId)
+    if(nextItem?.runId) affectedRunIds.add(nextItem.runId)
     if(href) {
         for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
             affectedRunIds.add(runId)
         }
     }
     const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
         : runs
-
-    await saveCoordinatorQueueRunsProjection(queue, nextRuns, {
-        queueChanged: true,
-        runsChanged: JSON.stringify(nextRuns) !== JSON.stringify(runs),
-        reason: 'ordinaryMutation',
-        queueOperation: 'stale-retry',
-        queueChangedRows: 1
-    })
+    const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: runsChanged ? nextRuns : undefined
+        }, {
+            queue: false,
+            runs: runsChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'stale-retry-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'stale-retry-derived-save-failed',
+            error?.message || 'Stale retry derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('staleRetry.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'stale-retry-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
 
     return true
 }
@@ -18565,6 +18970,9 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     else if(request.action === 'refresh-coordinator-queue-view') {
         return refreshCoordinatorQueueViewForDashboard(request.reason || 'dashboard-refresh')
+    }
+    else if(request.action === 'get-coordinator-queue-accounting') {
+        return getCoordinatorQueueAccounting(request)
     }
     else if(request.action === 'refresh-queue-wakeup-metrics-view') {
         return refreshQueueWakeupMetricsViewForDashboard(request.reason || 'dashboard-refresh')

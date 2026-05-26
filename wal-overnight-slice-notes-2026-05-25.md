@@ -1,11 +1,18 @@
 # WAL Overnight Slice Notes - 2026-05-25
 
-Status: completed after Slice 15. The overnight slice closed at version
-`1.6.550` with source tests passing and Chrome/Firefox zip artifacts
-regenerated. The repo is back to the normal review-and-plan cadence; do not
-migrate enqueue, claim/open, retry/requeue, pause/cancel, resolver
+Status: resumed after Slice 15. The overnight slice closed at version
+`1.6.550`; normal review-and-plan cadence resumed before Slice 16. Do not
+migrate enqueue, claim/open, retry/requeue, bulk pause/cancel, resolver
 remap/unresolved, or cross-row cleanup directly to WAL without a fresh
 review/planning pass.
+
+Current gate: broad WAL migration remains paused after Slice 17 pending review.
+Version `1.6.556` fixed the asset-space target-resolution correctness gate by
+rejecting prose-contaminated profile slugs from text and post-URL artifact
+extraction. Version `1.6.557` adds a read-only queue accounting audit so raw
+snapshot drift, WAL-recovered authority, and compact dashboard projection counts
+can be compared before migrating additional mutation paths. Storage-timeout
+pressure remains a separate performance/reliability follow-up.
 
 ## Slice 1: action lease heartbeat/release
 
@@ -156,3 +163,94 @@ review/planning pass.
   passed. Version bumped to `1.6.550`; `npm run prod`, `npm run build:chrome`,
   and `npm run build:firefox` produced `chrome/mute_block-1.6.550.zip` and
   `firefox/mute_block-1.6.550.zip`.
+
+## Slice 16: single current-work item cancel WAL migration
+
+- Operation migrated: targeted `cancel-coordinator-current-work-item` queue-row
+  terminalization now uses explicit `cancelStoredWorkItem` projection handling
+  and WAL-backed `current-work-item-cancel`.
+- Authority boundary: only the selected pending row is eligible. The mutator
+  resolves one target by storage key, coordinator key, or profile href; rejects
+  missing, ambiguous, terminal, or identity-changing rows; and revalidates the
+  current row through `coordinatorAuthority.applyWithinStorageUpdate()` before
+  writing the canceled terminal row.
+- Persistence boundary: queue-row cancellation is durable when the queue WAL
+  append succeeds. Runs/events/progress remain derived follow-up saves with
+  `queue: false`; derived-save failure records diagnostics and schedules
+  repair without poisoning the already-durable cancel. Bulk `Cancel Queue` and
+  pause remain snapshot-backed and review-gated.
+- Still snapshot-backed: bulk pause/cancel, enqueue, claim/open ownership,
+  retry/requeue, resolver remap/unresolved, active-without-runtime requeue,
+  tab-wide lease release, and other cross-row cleanup remain deferred.
+- Validation: covered by `single current work cancel WAL-terminalizes only the
+  selected pending row`, `single current work cancel WAL append failure leaves
+  selected row pending`, and the dashboard per-row cancel contract tests;
+  `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.555`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.555.zip` and
+  `firefox/mute_block-1.6.555.zip`.
+
+## Slice 17: queue accounting projection audit
+
+- Operation migrated: no new WAL operation. This is a read-only accounting and
+  observability slice.
+- Authority boundary: `get-coordinator-queue-accounting` compares the raw
+  `mbCoordinatorQueue` snapshot, WAL-recovered queue authority, stored compact
+  `mbCoordinatorQueueView`, and an in-memory rebuilt compact view. Raw snapshot
+  drift is reported separately as `rawDivergences`; only WAL recovery failures
+  or stored-view-vs-recovered mismatches make the audit inconsistent.
+- Persistence boundary: unchanged. The audit does not refresh, repair, or write
+  queue authority, queue WAL, or compact queue view state. It exists to explain
+  count drops before any further migration of enqueue, claim/open,
+  retry/requeue, bulk cancel, resolver remap/unresolved, or cross-row cleanup.
+- Still snapshot-backed: no queue mutation moved. Broad migration remains
+  review-gated until the accounting audit is reviewed against live 1.6.557
+  results.
+- Validation: covered by `queue accounting audit explains raw WAL drift without
+  writing storage` and `queue accounting audit flags stale compact dashboard
+  counts`; `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, and
+  `node -c tools/cdp/queue-accounting-audit.js` passed. Version bumped to
+  `1.6.557` before release rebuild. Live 1.6.557 CDP accounting audit after
+  rsync/reload reported `consistent: true`, 626 raw/recovered/view rows, no raw
+  divergences, no view mismatches, and an empty active WAL tail.
+
+## Slice 18: stale queued-tab retry WAL migration
+
+- Operation migrated: `advanceStaleRetryQueuedTab` queue-row mutation now uses
+  WAL-backed `stale-retry`.
+- Authority boundary: stale-tab retry loads the WAL-recovered queue/runs
+  projection, validates source attempt id/number before mutation, and revalidates
+  the row through `coordinatorAuthority.applyWithinStorageUpdate()` before
+  writing the fresh queued attempt. The mutator rejects terminal/missing rows,
+  changed target identity, stale attempts, and reducer rejection before durable
+  acknowledgement.
+- Persistence boundary: retry row advancement is durable when the queue WAL
+  append succeeds. Compact queue/content projections are updated by the WAL
+  projection follow-up. Run recompute remains a derived `queue: false`
+  compatibility save; derived-save failure records diagnostics and schedules
+  repair without poisoning the durable row retry. Runtime tab close/removal and
+  volatile queued action re-enqueue remain follow-up side effects.
+- Still snapshot-backed: manual retry/requeue, enqueue, claim/open ownership,
+  rollback active transition, bulk pause/cancel, resolver remap/unresolved,
+  active-without-runtime requeue, tab-wide lease release, and other cross-row
+  cleanup remain deferred.
+- Validation: covered by `stale queued tab retry gets a fresh attempt identity`,
+  `queued profile tab is requeued after the foreground-wait stale timeout
+  elapses`, and `loading queued tab becomes queue-load pressure without consuming
+  row retry budget`; `node -c shared/js/sw.js`, `node -c
+  test/p1-contract.test.js`, `node -c test/swSynthetic.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`,
+  `SW_SCENARIO_FUZZ_SEED=0x5eed SW_SCENARIO_FUZZ_STEPS=36 node
+  test/swScenarioFuzz.test.js`, and `npm test` passed. Version bumped to
+  `1.6.558`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.558.zip` and
+  `firefox/mute_block-1.6.558.zip`. After the Windows tunnels returned, bounded
+  rsync to the unpacked Chrome directory succeeded and CDP reload reported
+  extension `1.6.558` enabled with zero manifest/runtime errors. Live queue
+  accounting reported `consistent: true`, 528 raw/recovered/view rows, no view
+  mismatches, and WAL tail length 2; raw snapshot divergence was isolated to the
+  expected stale raw active-vs-WAL-succeeded count. Dashboard sanity showed 162
+  ready, 292 succeeded, 0 soft-fail, 47 hard-fail, and 80 per-row cancel
+  buttons for 80 displayed rows.

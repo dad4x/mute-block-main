@@ -34,6 +34,8 @@ const {
 } = require('./spaceRegistry')
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
+    isLikelyExplicitProfileTargetHref,
+    isLikelyExplicitProfileTargetSlug,
     normalizeQuoraProfileHref,
     sanitizeProfileHrefSlug
 } = require('./subject')
@@ -4821,6 +4823,7 @@ function getProfileUrlsFromText(text) {
 
         const cleanedHref = rawHref.replace(/[),.;:!?]+$/g, '')
         const href = normalizeQuoraProfileHref(cleanedHref)
+        if(!isLikelyExplicitProfileTargetHref(href)) continue
         if(!href || seen.has(href)) continue
 
         seen.add(href)
@@ -4916,12 +4919,15 @@ function getProfileUrlCandidatesFromSpacePostHref(href) {
         if(!profileHref || seen.has(profileHref)) return
 
         seen.add(profileHref)
+        const confidence = isLikelyExplicitProfileTargetSlug(cleanSlug)
+            ? (isLowConfidenceSpacePostProfileSlug(cleanSlug)
+                ? SPACE_FEED_CANDIDATE_CONFIDENCE_LOW
+                : SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM)
+            : SPACE_FEED_CANDIDATE_CONFIDENCE_LOW
         candidates.push({
             href: profileHref,
             collector: 'space-post-url-artifact',
-            confidence: isLowConfidenceSpacePostProfileSlug(cleanSlug)
-                ? SPACE_FEED_CANDIDATE_CONFIDENCE_LOW
-                : SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM,
+            confidence,
             source: 'post-url',
             rawSlug: `${slug || ''}`
         })
@@ -4946,7 +4952,9 @@ function getProfileUrlCandidatesFromSpacePostHref(href) {
 }
 
 function getProfileUrlsFromSpacePostHref(href) {
-    return getProfileUrlCandidatesFromSpacePostHref(href).map(candidate => candidate.href)
+    return getProfileUrlCandidatesFromSpacePostHref(href)
+        .filter(candidate => candidate.confidence !== SPACE_FEED_CANDIDATE_CONFIDENCE_LOW)
+        .map(candidate => candidate.href)
 }
 
 function normalizeRememberedProfileDisplayName(label) {

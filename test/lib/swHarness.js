@@ -414,6 +414,7 @@ module.exports.__test = {
     recoverStoredCoordinatorWork,
     repairCoordinatorStorageFromProgress,
     recordCoordinatorJobProgress,
+    getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
     refreshQueueWakeupMetricsViewForDashboard,
     recordDeferredCoordinatorJobMilestone,
