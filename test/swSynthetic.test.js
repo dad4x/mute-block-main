@@ -9501,6 +9501,151 @@ test('queued tab active transition timeout closes unconfirmed runtime tab', asyn
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
 })
 
+test('active transition rollback is WAL-backed and recovers after restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Wal'
+    const runId = 'run-rollback-wal'
+    const attemptId = 'attempt-rollback-wal'
+    const tabId = 640
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 433000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 433000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.rollbackFailedQueuedTabOpen({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        attemptId,
+        attemptNumber: 1
+    })
+
+    assert.equal(result, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLeaseReleaseReason, 'active-transition-failed')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'rollback-active-transition')
+
+    const restarted = loadServiceWorkerHarness({
+        now: 433500,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'queued')
+    assert.equal(hydrated.queue[href].tabId, null)
+})
+
+test('active transition rollback rejects stale attempt before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Stale'
+    const runId = 'run-rollback-stale'
+    const attemptId = 'attempt-rollback-stale'
+    const tabId = 641
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 434000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 434000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.rollbackFailedQueuedTabOpen({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'stale-rollback-attempt',
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        attemptId: 'stale-rollback-attempt',
+        attemptNumber: 1
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
+test('active transition rollback WAL append failure leaves row active', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Append-Failure'
+    const runId = 'run-rollback-append-failure'
+    const attemptId = 'attempt-rollback-append-failure'
+    const tabId = 642
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 435000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 435000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic rollback WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.rollbackFailedQueuedTabOpen({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        attemptId,
+        attemptNumber: 1
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+})
+
 test('late active confirmation rejects reclaimed attempt for the same tab', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Reclaimed-Active'
     const runId = 'run-reclaimed-active'

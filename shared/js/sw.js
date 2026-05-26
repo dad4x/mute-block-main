@@ -145,7 +145,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'repair-non-profile-landing',
     'repair-key-only-terminalize',
     'current-work-item-cancel',
-    'stale-retry'
+    'stale-retry',
+    'rollback-active-transition'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -12516,9 +12517,12 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     const coordinatorKey = operation.coordinatorKey || action?.coordinatorKey || (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
     if(!href && !coordinatorKey) return false
 
-    const state = await loadCoordinatorQueueRunsProjection()
-    const queue = state.queue
-    const runs = state.runs
+    const state = await loadCoordinatorQueueRunsProjection({
+        metricPath: 'rollbackActiveTransition.load'
+    })
+    let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = currentAuthorityState.runs
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
     if(!item || isTerminalCoordinatorStatus(item.status)) return false
@@ -12534,8 +12538,8 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     if(itemTabId && tabId && itemTabId !== tabId) return false
 
     const now = Date.now()
-    const nextItem = {
-        ...item,
+    const buildNextRollbackItem = currentItem => ({
+        ...currentItem,
         status: 'queued',
         outcome: '',
         error: '',
@@ -12547,33 +12551,85 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
         actionLeaseReleaseReason: 'active-transition-failed',
         milestones: {
             ...makeEmptyCoordinatorMilestones(),
-            ...(item.milestones || {}),
+            ...(currentItem.milestones || {}),
             closeRequestedAt: now,
             tabClosedAt: now
         }
-    }
+    })
 
-    queue[itemKey] = nextItem
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'rollback-active-transition',
+        rowKey: itemKey,
+        expectedAttemptId: getAttemptIdFromValue(attemptedRecord),
+        expectedAttemptNumber: getAttemptNumberFromValue(attemptedRecord),
+        reason: 'ordinaryMutation',
+        metricPath: 'rollbackActiveTransition.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
+                return context.reject('missing-or-terminal-row')
+            }
+            if(hasMismatchedCoordinatorAttempt(currentItem, attemptedRecord)) {
+                return context.reject('attempt-changed')
+            }
+            const currentTabId = normalizeTabId(currentItem.tabId)
+            if(currentTabId && tabId && currentTabId !== tabId) {
+                return context.reject('tab-changed')
+            }
+            const currentHref = getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)
+            const currentCoordinatorKey = getCoordinatorItemQueueKey(currentItem, itemKey)
+            if(currentHref !== (getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)) ||
+                currentCoordinatorKey !== getCoordinatorItemQueueKey(item, itemKey)) {
+                return context.reject('row-target-changed-before-authority-apply')
+            }
+            return buildNextRollbackItem(currentItem)
+        }
+    })
+
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) return false
+
+    currentAuthorityState = coordinatorAuthority.current()
+    const nextQueue = currentAuthorityState.queue
+    const nextItem = authorityResult.nextRow || nextQueue[itemKey] || null
     const affectedRunIds = new Set()
-    if(nextItem.runId) affectedRunIds.add(nextItem.runId)
+    if(nextItem?.runId) affectedRunIds.add(nextItem.runId)
     if(href) {
         for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
             affectedRunIds.add(runId)
         }
     }
     const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
         : runs
+    const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: runsChanged ? nextRuns : undefined
+        }, {
+            queue: false,
+            runs: runsChanged,
+            reason: 'repair',
+            queueOperation: 'rollback-active-transition-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'rollback-active-transition-derived-save-failed',
+            error?.message || 'Active transition rollback derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('rollbackActiveTransition.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'rollback-active-transition-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
 
-    const saved = await saveCoordinatorQueueRunsProjection(queue, nextRuns, {
-        queueChanged: true,
-        runsChanged: JSON.stringify(nextRuns) !== JSON.stringify(runs),
-        reason: 'repair',
-        queueOperation: 'rollback-active-transition',
-        queueChangedRows: 1
-    })
-
-    return saved !== false
+    return true
 }
 
 async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {

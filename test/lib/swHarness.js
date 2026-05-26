@@ -419,6 +419,7 @@ module.exports.__test = {
     refreshQueueWakeupMetricsViewForDashboard,
     recordDeferredCoordinatorJobMilestone,
     resetQueueWakeupMetricsEpochAfterLoad,
+    rollbackFailedQueuedTabOpen,
     requestCoordinatorActionLease,
     heartbeatCoordinatorActionLease,
     releaseCoordinatorActionLease,
