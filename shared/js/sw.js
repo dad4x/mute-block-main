@@ -9165,9 +9165,39 @@ async function cancelStoredCoordinatorWork(options = {}) {
         return mutateCoordinatorProjection({
             kind: 'cancelStoredWork',
             reason: 'ordinaryMutation',
-            cancelReason: reason
+            cancelReason: reason,
+            coordinatorKey: options.coordinatorKey || '',
+            storageKey: options.storageKey || '',
+            profileHref: options.profileHref || ''
         })
     })
+}
+
+async function cancelCoordinatorCurrentWorkItem(request = {}) {
+    const storedResult = await cancelStoredCoordinatorWork({
+        reason: 'current-work-item-cancel-request',
+        coordinatorKey: request.coordinatorKey || '',
+        storageKey: request.storageKey || '',
+        profileHref: request.profileHref || ''
+    })
+
+    const ownedTabIds = Array.from(new Set(storedResult.ownedTabIds || []))
+    for(const tabId of ownedTabIds) {
+        if(!tabId) continue
+        markQueuedTabClosing(tabId, 'current-work-item-cancel-request')
+        try {
+            await browser.tabs.remove(tabId)
+        }
+        catch {}
+    }
+
+    await pruneMissingQueuedTabRuntimeState('cancel-current-work-item-runtime-prune')
+
+    return {
+        canceledUrls: storedResult.canceledUrls || [],
+        canceledWorkKeys: storedResult.canceledWorkKeys || [],
+        ownedTabIds
+    }
 }
 
 function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
@@ -12002,6 +12032,10 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     }
 
     const reason = `${operation.cancelReason || 'coordinator-pause-request'}`.trim()
+    const targetStorageKey = `${operation.storageKey || ''}`.trim()
+    const targetCoordinatorKey = `${operation.coordinatorKey || ''}`.trim()
+    const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
+    const hasTarget = !!(targetStorageKey || targetCoordinatorKey || targetHref)
     const state = await loadCoordinatorState()
     const queue = {
         ...state.queue
@@ -12026,6 +12060,14 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
         if(!href && !coordinatorKey) continue
+        if(hasTarget &&
+            itemKey !== targetStorageKey &&
+            itemKey !== targetCoordinatorKey &&
+            href !== targetHref &&
+            coordinatorKey !== targetCoordinatorKey &&
+            coordinatorKey !== targetStorageKey) {
+            continue
+        }
 
         const existingProgress = href ? progress[href] || profileNukeProgress?.[href] || null : null
         const tabId = getPersistedQueuedTabId(item, existingProgress)
@@ -18483,6 +18525,9 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     else if(request.action === 'cancel-coordinator-current-work') {
         return cancelCoordinatorCurrentWork()
+    }
+    else if(request.action === 'cancel-coordinator-current-work-item') {
+        return cancelCoordinatorCurrentWorkItem(request)
     }
     else if(request.action === 'repair-coordinator-storage') {
         if(!quoraRuntimeActivated) {

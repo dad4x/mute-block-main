@@ -418,7 +418,7 @@ h2 {
 }
 
 .row--queue {
-    grid-template-columns: minmax(180px, 1fr) 120px 140px minmax(190px, 230px) 96px;
+    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
 }
 
 .row-time-cell {
@@ -444,9 +444,25 @@ h2 {
     min-width: 0;
 }
 
+.row-cancel-cell {
+    align-self: start;
+    display: flex;
+    justify-content: flex-start;
+    min-width: 0;
+}
+
 .row-action-button {
     padding: 6px 10px;
     white-space: nowrap;
+}
+
+.row-cancel-button {
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.row-cancel-button:hover:not(:disabled) {
+    background: #fef2f2;
 }
 
 .row-title {

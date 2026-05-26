@@ -326,6 +326,68 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     )
 })
 
+test('single current work cancel only terminalizes the selected pending row', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Cancel-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Cancel-B'
+    const runId = 'run-single-cancel'
+    const rowA = {
+        ...makeActiveCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-cancel-a', tabId: null, now: 500000}),
+        status: 'queued',
+        activeAt: 0,
+        tabId: null
+    }
+    const rowB = {
+        ...makeActiveCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-cancel-b', tabId: null, now: 500000}),
+        status: 'queued',
+        activeAt: 0,
+        tabId: null
+    }
+    const {browser, storage, timers} = loadServiceWorkerHarness({
+        now: 500000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: rowA,
+                [hrefB]: rowB
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB],
+                    targetWorkKeys: [hrefA, hrefB]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work-item',
+        storageKey: hrefA,
+        coordinatorKey: hrefA,
+        profileHref: hrefA
+    }), timers)
+
+    assert.equal(result.canceledUrls.length, 1)
+    assert.equal(result.canceledUrls[0], hrefA)
+    assert.equal(result.canceledWorkKeys.length, 0)
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'canceled')
+    assert.equal(storage.mbCoordinatorQueue[hrefA].outcome, 'paused')
+    assert.notEqual(storage.mbCoordinatorQueue[hrefB].status, 'canceled')
+    assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
+    assert.equal(
+        (storage.mbCoordinatorQueueView.counts.queued || 0) +
+            (storage.mbCoordinatorQueueView.counts.opening || 0) +
+            (storage.mbCoordinatorQueueView.counts.active || 0) +
+            (storage.mbCoordinatorQueueView.counts.acting || 0) +
+            (storage.mbCoordinatorQueueView.counts.settling || 0),
+        1
+    )
+})
+
 test('progress shadow WAL append uses bounded incremental replay', async () => {
     const runId = 'run-bounded-shadow-wal'
     const attemptId = 'attempt-bounded-shadow-wal'
