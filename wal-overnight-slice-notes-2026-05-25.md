@@ -956,6 +956,39 @@ pressure remains a separate performance/reliability follow-up.
   showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
   0 per-row cancel buttons for 80 displayed rows.
 
+## Slice 30: clear-profile queue removal WAL migration
+
+- Operation migrated: `clear-profile` was added as a queue-WAL removal
+  operation for `clearProfileNukeState`.
+- Authority boundary: clearing a profile now reads the WAL-recovered queue,
+  appends `map.remove` records for matching coordinator rows, and leaves the
+  raw `mbCoordinatorQueue` snapshot stale until compaction/checkpoint. The
+  compact queue view is updated from the WAL projection. Profile progress, run
+  target metadata, pending source-post memory, and remembered nuked-post memory
+  are saved only after durable queue removal; if the WAL append fails, those
+  derived/user-memory maps are left intact.
+- Coverage added: synthetic coverage proves a successful clear removes the row
+  from recovered WAL authority while raw queue still contains the stale row,
+  writes the derived progress/runs/pending/nuked cleanup, and appends a
+  `clear-profile` remove record. WAL-failure coverage proves no WAL means the
+  raw/recovered queue row, progress, run target, pending post, and remembered
+  nuked post remain intact and repair is scheduled. The WAL-failure regression
+  also verifies the volatile progress mirror is not cleared before durable
+  storage succeeds.
+- Inventory: the `clearProfileNukeState` direct-storage row now describes the
+  WAL-backed queue removal and derived cleanup boundary.
+- Validation: `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`,
+  `timeout 180 node test/swSynthetic.test.js`, `node test/p1-contract.test.js`,
+  and `npm test` passed. Version bumped to `1.6.582`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.582.zip` and `firefox/mute_block-1.6.582.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.582` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 420 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
+  showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
+  0 per-row cancel buttons for 80 displayed rows.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

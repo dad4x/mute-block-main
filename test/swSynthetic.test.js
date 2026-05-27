@@ -4606,6 +4606,169 @@ test('compatibility progress sync WAL failure leaves stale failed row authoritat
     assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.queueWalSaveFailed'], 1)
 })
 
+test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Wal'
+    const runId = 'run-clear-profile-wal'
+    const attemptId = 'attempt-clear-profile-wal'
+    const postKey = 'post-clear-profile-wal'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 278000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 278000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    runId,
+                    tabId: null,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 278000
+                }
+            },
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [href],
+                    remainingUrls: [href],
+                    updatedAt: 278000
+                }
+            },
+            mbSpaceNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    urls: [href],
+                    updatedAt: 278000
+                }
+            }
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'clear-profile-nuke-state',
+        profileHref: href,
+        reason: 'synthetic-clear'
+    }, {tab: {id: 12, windowId: 1}})
+
+    assert.equal(result.cleared, true)
+    assert.equal(result.queueChanged, true)
+    assert.equal(result.runsChanged, true)
+    assert.equal(result.progressChanged, true)
+    assert.equal(result.pendingChanged, true)
+    assert.equal(result.nukedChanged, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href], undefined)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(sw.state().profileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
+    assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
+    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
+
+    const records = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(records.length, 1)
+    assert.equal(records[0].operationKind, 'clear-profile')
+    assert.equal(records[0].removed, true)
+})
+
+test('clear profile state WAL failure leaves raw and derived state intact', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Wal-Failure'
+    const runId = 'run-clear-profile-wal-failure'
+    const attemptId = 'attempt-clear-profile-wal-failure'
+    const postKey = 'post-clear-profile-wal-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 278500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 278500})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    runId,
+                    tabId: null,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 278500
+                }
+            },
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal-failure',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [href],
+                    remainingUrls: [href],
+                    updatedAt: 278500
+                }
+            },
+            mbSpaceNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal-failure',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    urls: [href],
+                    updatedAt: 278500
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic clear profile WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'clear-profile-nuke-state',
+        profileHref: href,
+        reason: 'synthetic-clear-failure'
+    }, {tab: {id: 12, windowId: 1}})
+    browser.storage.local.set = originalSet
+
+    assert.equal(result.cleared, false)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.ok(sw.state().profileNukeProgress[href])
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
+    assert.ok(storage.mbSpacePendingNukedPosts[postKey])
+    assert.ok(storage.mbSpaceNukedPosts[postKey])
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'queued')
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+})
+
 test('top-level coordinator authority ignores caller currentAuthorityState', async () => {
     const href = 'https://www.quora.com/profile/Authority-Top-Level-Locked-Projection'
     const {sw, storage} = loadServiceWorkerHarness({
