@@ -912,6 +912,29 @@ pressure remains a separate performance/reliability follow-up.
   an active WAL tail with 4 applied records. Dashboard sanity showed 0 ready,
   404 succeeded, 14 soft-fail, 0 hard-fail, 0 active, and 0 per-row cancel
   buttons for 80 displayed rows.
+- Review closeout: reviewer found that after a successful
+  `compatibility-progress-sync` WAL append, a failing derived runs/progress save
+  could throw out of the path before scheduling materialization and before
+  terminal settlement. The derived save now mirrors the newer enqueue-derived
+  pattern: failures record `compatibility-progress-sync-derived-save-failed`,
+  increment `compatibilityProgressSync.derivedSaveFailed`, schedule stored-work
+  materialization, and do not poison the durable queue WAL row. Added synthetic
+  coverage that fails only the post-WAL runs/progress save, verifies raw queue
+  remains stale while recovered WAL authority is `succeeded`, verifies the stale
+  run metadata was not silently advanced, verifies repair was scheduled, and
+  proves terminal settlement still runs by clearing the pending source post.
+  Validation: `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`,
+  `node -c test/lib/swHarness.js`, `timeout 120 node test/swSynthetic.test.js`,
+  `node test/p1-contract.test.js`, and `npm test` passed. Version bumped to
+  `1.6.580`; `npm run prod`, `npm run build:chrome`, and
+  `npm run build:firefox` produced `chrome/mute_block-1.6.580.zip` and
+  `firefox/mute_block-1.6.580.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.580` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 421 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and an empty WAL tail. Dashboard sanity showed 0 ready,
+  391 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and 0 per-row cancel
+  buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
