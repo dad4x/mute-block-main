@@ -17522,6 +17522,7 @@ async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
     if(!item) return {resolved: false, reason: 'missing-coordinator-item'}
     if(isTerminalCoordinatorStatus(item.status)) return {resolved: false, reason: 'terminal-coordinator-item'}
     if(!isProfileResolutionItem(item)) return {resolved: false, reason: 'not-profile-resolution-item'}
+    if(!isActiveCoordinatorStatus(item.status)) return {resolved: false, reason: 'inactive-coordinator-item'}
 
     if(hasMismatchedCoordinatorAttempt(item, request)) {
         await recordStaleAttemptDiagnostic({
@@ -17532,6 +17533,20 @@ async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
             message: 'Ignored queued target resolution from stale attempt'
         })
         return {resolved: false, reason: 'stale-attempt'}
+    }
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const currentAttemptNumber = getAttemptNumberFromValue(item)
+    const incomingAttemptId = getAttemptIdFromValue(request)
+    const incomingAttemptNumber = getAttemptNumberFromValue(request)
+    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
+        await recordStaleAttemptDiagnostic({
+            profileHref: resolvedHref,
+            incomingAttemptId,
+            expectedAttemptId: currentAttemptId,
+            senderTabId: tabId,
+            message: 'Ignored queued target resolution without required attempt identity'
+        })
+        return {resolved: false, staleAttempt: true, reason: 'missing-attempt-identity'}
     }
 
     const existingResolvedItem = itemKey !== resolvedHref ? queue[resolvedHref] || null : null

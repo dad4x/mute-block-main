@@ -2679,6 +2679,8 @@ test('resolved profile handoff remaps queued tab metadata and pending action', (
     assert.match(resolveMutationBody, /loadCoordinatorState\(\{[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
     assert.match(resolveMutationBody, /terminal-coordinator-item/)
     assert.match(resolveMutationBody, /not-profile-resolution-item/)
+    assert.match(resolveMutationBody, /inactive-coordinator-item/)
+    assert.match(resolveMutationBody, /missing-attempt-identity/)
     assert.match(resolveMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
     assert.match(resolveMutationBody, /operationKind: 'resolver-remap'/)
     assert.match(resolveMutationBody, /removedRows/)
