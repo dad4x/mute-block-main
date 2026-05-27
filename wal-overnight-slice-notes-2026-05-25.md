@@ -757,6 +757,42 @@ pressure remains a separate performance/reliability follow-up.
   Dashboard sanity showed 170 ready, 336 succeeded, 0 soft-fail, 0 hard-fail, 1
   active, and 80 per-row cancel buttons.
 
+## Slice 27: source-post resolver remap WAL key-move migration
+
+- Operation migrated: `resolve-queued-profile-target` now delegates to
+  `mutateCoordinatorProjection({kind: 'resolveQueuedProfileTarget'})` and
+  persists `resolver-remap` queue authority through WAL-backed `map.set` plus
+  `map.remove` records before runtime tab metadata is remapped.
+- Authority boundary: the serialized mutator reloads WAL-recovered current
+  authority, repeats the source terminal/profile-resolution/stale-attempt
+  checks, repeats the destination conflict guard, and rejects non-resolution
+  source rows before any WAL append. Compatible existing succeeded destination
+  rows remain the only terminal overwrite case.
+- Persistence boundary: durable queue remap succeeds only after the queue WAL
+  append. Runs and pending-post source records are derived compatibility saves
+  with `queue: false`; derived-save failure records diagnostics, schedules
+  repair, and does not poison the durable remap.
+- Repair boundary: storage repair now also repairs resolver-pending source
+  records for successful remaps recovered from WAL when the derived pending-post
+  save failed.
+- Still snapshot-backed: enqueue/merge remains the large ordinary mutation
+  slice. It still has reset cleanup side effects that must be moved or gated
+  after durable persistence before WAL migration.
+- Inventory: resolver remap rows now describe the projection helper and
+  WAL-backed key-moving set/remove boundary.
+- Validation: `node -c shared/js/sw.js`, `node test/p1-contract.test.js`,
+  `node test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.574`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.574.zip` and
+  `firefox/mute_block-1.6.574.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.574` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 525 recovered/view rows, no view mismatches, active WAL
+  tail with 4 applied records, and raw-vs-recovered count divergence from
+  unapplied-to-raw WAL tail state. Dashboard sanity showed 79 ready, 407
+  succeeded, 1 soft-fail, 5 hard-fail, 0 active, and 79 per-row cancel buttons
+  for 80 displayed rows.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
