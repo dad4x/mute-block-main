@@ -5083,6 +5083,10 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended', records.length)
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxAppendBytes', getJsonByteSize(append.records || []))
+    if(activeQueueWakeupStorageContext) {
+        activeQueueWakeupStorageContext.coordinatorAuthorityQueueMutationApplied = true
+        activeQueueWakeupStorageContext.coordinatorAuthorityQueueOperation = operationKind
+    }
     try {
         appendCoordinatorAuthorityShadowWalRecords(records, {
             operationKind,
@@ -9469,6 +9473,15 @@ async function cancelCoordinatorCurrentWork() {
     const storedResult = await cancelStoredCoordinatorWork({
         reason: 'current-work-cancel-request'
     })
+    if(storedResult?.reason || storedResult?.persistence?.saved === false) {
+        return {
+            canceledUrls: storedResult?.canceledUrls || [],
+            canceledWorkKeys: storedResult?.canceledWorkKeys || [],
+            ownedTabIds: [],
+            reason: storedResult?.reason || 'cancel-persistence-failed',
+            persistence: storedResult?.persistence || null
+        }
+    }
 
     results.push(await stopOwnerNukes(SERVICE_WORKER_QUEUE_OWNER_ID, {
         closeOwnedTabs: true,
@@ -12559,7 +12572,7 @@ async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
         return {
             canceledUrls: [],
             canceledWorkKeys: [],
-            ownedTabIds: tabId ? [tabId] : [],
+            ownedTabIds: [],
             reason: authorityResult?.reason || 'authority-apply-failed'
         }
     }
@@ -12781,7 +12794,7 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
         return {
             canceledUrls: [],
             canceledWorkKeys: [],
-            ownedTabIds: Array.from(ownedTabIds),
+            ownedTabIds: [],
             reason: persistence?.reason || 'persistence-failed',
             persistence
         }
