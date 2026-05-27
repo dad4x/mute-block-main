@@ -765,9 +765,11 @@ pressure remains a separate performance/reliability follow-up.
   `map.remove` records before runtime tab metadata is remapped.
 - Authority boundary: the serialized mutator reloads WAL-recovered current
   authority, repeats the source terminal/profile-resolution/stale-attempt
-  checks, repeats the destination conflict guard, and rejects non-resolution
-  source rows before any WAL append. Compatible existing succeeded destination
-  rows remain the only terminal overwrite case.
+  checks, requires an active resolver source row, requires incoming attempt
+  identity when the durable source row has attempt identity, repeats the
+  destination conflict guard, and rejects non-resolution source rows before any
+  WAL append. Compatible existing succeeded destination rows remain the only
+  terminal overwrite case.
 - Persistence boundary: durable queue remap succeeds only after the queue WAL
   append. Runs and pending-post source records are derived compatibility saves
   with `queue: false`; derived-save failure records diagnostics, schedules
@@ -792,6 +794,20 @@ pressure remains a separate performance/reliability follow-up.
   unapplied-to-raw WAL tail state. Dashboard sanity showed 79 ready, 407
   succeeded, 1 soft-fail, 5 hard-fail, 0 active, and 79 per-row cancel buttons
   for 80 displayed rows.
+- Review closeout: reviewer follow-up found that resolver remap success could
+  accept inactive source rows and identity-less success messages. Local
+  follow-up now rejects queued/inactive source rows and missing incoming attempt
+  identity before WAL append, with synthetic coverage proving no WAL record, no
+  source-key move, and no runtime metadata remap. Version bumped to `1.6.575`;
+  `npm test`, `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` passed and produced `chrome/mute_block-1.6.575.zip` and
+  `firefox/mute_block-1.6.575.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.575` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 506 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and active WAL tail with 2 applied records. Dashboard sanity
+  showed 44 ready, 416 succeeded, 12 soft-fail, 0 hard-fail, 1 active, and 45
+  per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 

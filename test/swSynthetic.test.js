@@ -6371,6 +6371,164 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     assert.equal(hydrated.queue[resolvedHref].status, 'active')
 })
 
+test('profile resolver remap rejects queued source row before WAL append', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-queued-source'
+    const key = `resolve-profile:${requestedUrl}`
+    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Queued-Source'
+    const runId = 'run-resolver-remap-queued-source'
+    const attemptId = 'attempt-resolver-remap-queued-source'
+    const tabId = 62115
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426927,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425927,
+                    updatedAt: 425927,
+                    attemptId,
+                    attemptNumber: 1,
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        coordinatorKey: key,
+        requestedUrl,
+        profileHref: '',
+        resolveProfileFromPage: true,
+        resolutionMode: 'author-profile',
+        tabAction: 'resolve-profile',
+        actionKind: 'mute-block',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target',
+        requestedUrl,
+        coordinatorKey: key,
+        profileHref: resolvedHref,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {
+            id: tabId,
+            url: resolvedHref
+        }
+    })
+
+    assert.equal(result.resolved, false)
+    assert.equal(result.reason, 'inactive-coordinator-item')
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[key].status, 'queued')
+    assert.equal(currentAuthority.queue[resolvedHref], undefined)
+    const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
+    assert.equal(metadata.coordinatorKey, key)
+    assert.equal(metadata.profileHref, '')
+})
+
+test('profile resolver remap rejects missing incoming attempt identity before WAL append', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-missing-attempt'
+    const key = `resolve-profile:${requestedUrl}`
+    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Missing-Attempt'
+    const runId = 'run-resolver-remap-missing-attempt'
+    const attemptId = 'attempt-resolver-remap-missing-attempt'
+    const tabId = 62116
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426928,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425928,
+                    activeAt: 426428,
+                    updatedAt: 426428,
+                    attemptId,
+                    attemptNumber: 1,
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        coordinatorKey: key,
+        requestedUrl,
+        profileHref: '',
+        resolveProfileFromPage: true,
+        resolutionMode: 'author-profile',
+        tabAction: 'resolve-profile',
+        actionKind: 'mute-block',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target',
+        requestedUrl,
+        coordinatorKey: key,
+        profileHref: resolvedHref
+    }, {
+        tab: {
+            id: tabId,
+            url: resolvedHref
+        }
+    })
+
+    assert.equal(result.resolved, false)
+    assert.equal(result.reason, 'missing-attempt-identity')
+    assert.equal(result.staleAttempt, true)
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[key].status, 'active')
+    assert.equal(currentAuthority.queue[resolvedHref], undefined)
+    const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
+    assert.equal(metadata.coordinatorKey, key)
+    assert.equal(metadata.profileHref, '')
+})
+
 test('profile resolver remap WAL append failure leaves resolver row and runtime metadata unchanged', async () => {
     const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-append-failure'
     const key = `resolve-profile:${requestedUrl}`
