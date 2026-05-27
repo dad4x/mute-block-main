@@ -463,3 +463,39 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 61 ready, 274 succeeded, 19 soft-fail, 38 hard-fail, 0 active,
   and 61 per-row cancel buttons for 80 displayed rows.
+
+## Slice 22 review closeout: active-tab ownership and rollback identity
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.564 review
+  findings on the already WAL-backed `action-lease-request` and
+  `rollback-active-transition` paths.
+- Authority boundary: action-lease request now requires the current row to be
+  active and requires the requesting sender tab to match the durable active tab
+  (`tabId`/`activeTabId`) before any WAL append. The same active-status and
+  active-tab checks are repeated inside the serialized
+  `coordinatorAuthority.applyWithinStorageUpdate()` mutator so a queued row or
+  wrong-tab request cannot gain a lease after the precheck.
+- Rollback boundary: active-transition rollback now treats missing incoming
+  attempt identity as stale when the current row already has attempt id/number.
+  The guard runs before WAL append and again inside the authority mutator,
+  preventing an identity-less rollback from requeuing an active row.
+- Persistence boundary: unchanged. Accepted lease requests and rollbacks remain
+  durable only on queue WAL append; rejected wrong-tab, inactive-row, and
+  missing-identity requests leave raw snapshot/current authority unchanged and
+  append no WAL record.
+- Validation: covered by `action lease request rejects wrong active tab
+  before WAL append`, `action lease request rejects inactive row before WAL
+  append`, and `active transition rollback rejects missing incoming attempt
+  identity before WAL append`; `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `node -c test/p1-contract.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`, and `npm test`
+  passed. Version bumped to `1.6.565`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.565.zip` and
+  `firefox/mute_block-1.6.565.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.565` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 recovered/view rows, no view mismatches, and an
+  active WAL tail with 26 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 41 ready, 292 succeeded, 39 soft-fail, 19 hard-fail, 0 active,
+  and 41 per-row cancel buttons for 80 displayed rows.
