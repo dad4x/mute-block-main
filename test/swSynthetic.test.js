@@ -5680,6 +5680,256 @@ test('late unresolved resolver failure cannot regress a WAL-terminal resolver ro
     assert.equal(walRecordsAfter.length, walRecordsBefore.length)
 })
 
+test('unresolved resolver terminalization is WAL-backed and recovers after restart', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-unresolved-wal'
+    const key = `resolve-profile:${requestedUrl}`
+    const runId = 'run-unresolved-wal'
+    const attemptId = 'attempt-unresolved-wal'
+    const postKey = 'post-unresolved-wal'
+    const now = 426975
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: now - 1000,
+                    activeAt: now - 500,
+                    updatedAt: now - 500,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target-failed',
+        requestedUrl,
+        coordinatorKey: key,
+        attemptId,
+        attemptNumber: 1,
+        error: 'synthetic unresolved target'
+    }, {
+        tab: {
+            id: 623,
+            url: requestedUrl
+        }
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.status, 'skipped')
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'skipped')
+    assert.equal(storage.mbCoordinatorEvents.length, 1)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'resolver-unresolved')
+
+    const restarted = loadServiceWorkerHarness({
+        now: now + 1000,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[key].status, 'skipped')
+    assert.equal(hydrated.queue[key].actionLeaseReleaseReason, 'unresolved-resolution')
+})
+
+test('unresolved resolver WAL append failure leaves row active', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-unresolved-append-failure'
+    const key = `resolve-profile:${requestedUrl}`
+    const runId = 'run-unresolved-append-failure'
+    const attemptId = 'attempt-unresolved-append-failure'
+    const postKey = 'post-unresolved-append-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426980,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425980,
+                    activeAt: 426480,
+                    updatedAt: 426480,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic resolver unresolved WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target-failed',
+        requestedUrl,
+        coordinatorKey: key,
+        attemptId,
+        attemptNumber: 1,
+        error: 'synthetic unresolved append failure'
+    }, {
+        tab: {
+            id: 624,
+            url: requestedUrl
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
+})
+
+test('unresolved resolver derived save failure does not poison WAL terminalization', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-unresolved-derived-failure'
+    const key = `resolve-profile:${requestedUrl}`
+    const runId = 'run-unresolved-derived-failure'
+    const attemptId = 'attempt-unresolved-derived-failure'
+    const postKey = 'post-unresolved-derived-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426985,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425985,
+                    activeAt: 426485,
+                    updatedAt: 426485,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbSpacePendingNukedPosts) {
+            throw new Error('synthetic resolver unresolved derived save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target-failed',
+        requestedUrl,
+        coordinatorKey: key,
+        attemptId,
+        attemptNumber: 1,
+        error: 'synthetic unresolved derived failure'
+    }, {
+        tab: {
+            id: 625,
+            url: requestedUrl
+        }
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'skipped')
+    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.equal(storage.mbCoordinatorEvents.length, 1)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
+    assert.equal(sw.state().queueWakeupCounters['resolverUnresolved.derivedSaveFailed'] || 0, 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+})
+
 test('key-only terminalization rejects stale attempt before authority save', async () => {
     const key = 'resolve-profile:https://www.quora.com/q/example/post-key-only-stale'
     const requestedUrl = 'https://www.quora.com/q/example/post-key-only-stale'

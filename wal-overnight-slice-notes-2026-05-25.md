@@ -526,3 +526,36 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 41 ready, 292 succeeded, 39 soft-fail, 19 hard-fail, 0 active,
   and 41 per-row cancel buttons for 80 displayed rows.
+
+## Slice 23: unresolved resolver WAL migration
+
+- Operation migrated: `resolve-queued-profile-target-failed` now terminalizes
+  unresolved resolver rows through WAL-backed `resolver-unresolved` records.
+- Authority boundary: unresolved resolver failure loads the WAL-recovered
+  queue/runs projection, rejects missing/terminal/stale rows, requires incoming
+  attempt identity when the current resolver row has attempt identity, and
+  repeats those checks inside `coordinatorAuthority.applyWithinStorageUpdate()`
+  before building the skipped terminal row.
+- Persistence boundary: the resolver queue row is durable on queue WAL append.
+  Runs, unresolved-target event append, and resolver-pending source-post cleanup
+  are derived compatibility saves after WAL acknowledgement; derived-save
+  failure schedules repair without poisoning the durable terminal row.
+- Still snapshot-backed: resolver remap remains snapshot-backed because it can
+  move between source and destination rows and update pending source records.
+- Validation: covered by `unresolved resolver terminalization is
+  WAL-backed and recovers after restart`, `unresolved resolver WAL append
+  failure leaves row active`, `unresolved resolver derived save failure does
+  not poison WAL terminalization`, and the existing stale WAL-terminal
+  unresolved regression; `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `node -c test/p1-contract.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`, and `npm test`
+  passed. Version bumped to `1.6.567`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.567.zip` and
+  `firefox/mute_block-1.6.567.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.567` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 recovered/view rows, no view mismatches, and an
+  active WAL tail with 19 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
+  and 29 per-row cancel buttons for 80 displayed rows.

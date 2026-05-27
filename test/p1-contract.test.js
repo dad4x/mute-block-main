@@ -1739,10 +1739,18 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.match(helperBody, /delete nextPending\[recordKey\]/)
     assert.match(helperBody, /resolverPending: false/)
 
+    assert.match(unresolvedBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: 'resolver\.unresolved\.load'/)
+    assert.match(unresolvedBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
+    assert.match(unresolvedBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'resolver-unresolved'/)
+    assert.match(unresolvedBody, /expectedAttemptId: currentAttemptId \? incomingAttemptId : ''/)
+    assert.match(unresolvedBody, /missing-attempt-identity/)
     assert.match(unresolvedBody, /\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
     assert.match(unresolvedBody, /clearResolverPendingSpaceRecords\(pendingPosts, nextItem/)
     assert.match(unresolvedBody, /pendingPosts: pendingResult\.pendingPosts/)
     assert.match(unresolvedBody, /pendingPosts: pendingResult\.changed/)
+    assert.match(unresolvedBody, /queueOperation: 'resolver-unresolved-derived'/)
+    assert.doesNotMatch(unresolvedBody, /loadCoordinatorState\(/)
+    assert.doesNotMatch(unresolvedBody, /queue: true/)
     assert.doesNotMatch(unresolvedBody, /browser\.storage\.local\.set\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]: pendingResult\.pendingPosts\}\)/)
 })
 
