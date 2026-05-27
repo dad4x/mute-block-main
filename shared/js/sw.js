@@ -6551,6 +6551,7 @@ async function saveCoordinatorState(state = {}, changes = {}) {
         }
         if(changes.runs) payload[COORDINATOR_RUNS_KEY] = state.runs || {}
         if(changes.pendingPosts) payload[SPACE_PENDING_NUKED_POSTS_KEY] = state.pendingPosts || {}
+        if(changes.nukedPosts) payload[SPACE_NUKED_POSTS_KEY] = state.nukedPosts || {}
         if(changes.events) {
             payload[COORDINATOR_EVENTS_KEY] = normalizeCoordinatorEvents(state.events || [])
                 .concat(diagnosticEvents)
@@ -7013,6 +7014,141 @@ function shouldRestoreQueuedProgressRecordToCoordinatorQueue(href = '', record =
 
     const queuedAt = Number.parseInt(record?.queuedAt, 10) || 0
     return !queuedAt || now - queuedAt <= CURRENT_WORK_RETENTION_MS
+}
+
+function getCoordinatorQueueProfileHrefSet(queue = {}) {
+    const hrefs = new Set()
+
+    for(const [itemKey, item] of Object.entries(queue || {})) {
+        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+        if(href) hrefs.add(href)
+    }
+
+    return hrefs
+}
+
+function getClearProfileWalRemovedProfileHrefs(stored = {}) {
+    const walStore = stored?.[COORDINATOR_QUEUE_WAL_KEY] || null
+    const activeGenerationId = walStore?.meta?.activeCheckpoint || ''
+    if(!walStore || !activeGenerationId) return new Set()
+
+    return new Set(getWalRecordsForGeneration(walStore, activeGenerationId)
+        .filter(record => record?.kind === 'map.remove' &&
+            normalizeQueueWriteOperationName(record.operationKind || '') === 'clear-profile')
+        .map(record => normalizeQuoraProfileUrl(record.key || record.profileHref || ''))
+        .filter(Boolean))
+}
+
+function getRawCoordinatorQueueProfileHrefsRemovedFromAuthority(state = {}) {
+    const rawQueue = normalizeCoordinatorMap(state.stored?.[COORDINATOR_QUEUE_KEY] || {})
+    const liveHrefs = getCoordinatorQueueProfileHrefSet(state.queue || {})
+    const removedHrefs = new Set()
+
+    for(const href of getCoordinatorQueueProfileHrefSet(rawQueue)) {
+        if(!liveHrefs.has(href)) removedHrefs.add(href)
+    }
+
+    return removedHrefs
+}
+
+function removeProfileHrefFromProgressRecords(progress = {}, normalizedHref = '') {
+    let changed = false
+
+    for(const [key, record] of Object.entries(progress || {})) {
+        const href = normalizeQuoraProfileUrl(record?.profileHref || key || '')
+        if(href !== normalizedHref) continue
+
+        delete progress[key]
+        changed = true
+    }
+
+    return changed
+}
+
+function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
+    const removedHrefs = getClearProfileWalRemovedProfileHrefs(state.stored || {})
+    for(const href of getRawCoordinatorQueueProfileHrefsRemovedFromAuthority(state)) {
+        removedHrefs.add(href)
+    }
+    if(!removedHrefs.size) {
+        return {
+            changed: false,
+            progressChanged: false,
+            runsChanged: false,
+            pendingPostsChanged: false,
+            nukedPostsChanged: false,
+            affectedRunIds: [],
+            repaired: 0,
+            runs: state.runs || {},
+            pendingPosts: state.pendingPosts || {},
+            nukedPosts: state.nukedPosts || {}
+        }
+    }
+
+    const liveHrefs = getCoordinatorQueueProfileHrefSet(state.queue || {})
+    const progress = state.progress || {}
+    let runs = state.runs || {}
+    let pendingPosts = state.pendingPosts || {}
+    let nukedPosts = state.nukedPosts || {}
+    const affectedRunIds = new Set()
+    let progressChanged = false
+    let runsChanged = false
+    let pendingPostsChanged = false
+    let nukedPostsChanged = false
+    let repaired = 0
+
+    for(const href of removedHrefs) {
+        if(liveHrefs.has(href)) continue
+
+        let hrefChanged = false
+        if(removeProfileHrefFromProgressRecords(progress, href)) {
+            progressChanged = true
+            hrefChanged = true
+        }
+
+        const hrefRunIds = getCoordinatorRunIdsForHref(runs, href)
+        const runsResult = removeProfileHrefFromCoordinatorRuns(runs, state.queue || {}, href)
+        if(runsResult.changed) {
+            runs = runsResult.runs
+            runsChanged = true
+            hrefChanged = true
+            for(const runId of hrefRunIds) {
+                if(runId) affectedRunIds.add(runId)
+            }
+        }
+
+        const pendingResult = removeProfileHrefFromPendingSpaceRecords(pendingPosts, href)
+        if(pendingResult.changed) {
+            pendingPosts = pendingResult.records
+            pendingPostsChanged = true
+            hrefChanged = true
+        }
+
+        const nukedResult = removeProfileHrefFromRememberedNukedPosts(nukedPosts, href)
+        if(nukedResult.changed) {
+            nukedPosts = getPrunedNukedPosts(nukedResult.records, {
+                retentionDays: defaults.nukedPostRetentionDays,
+                maxEntries: defaults.maxRememberedNukedPosts
+            })
+            nukedPostsChanged = true
+            hrefChanged = true
+        }
+
+        if(hrefChanged) repaired += 1
+    }
+
+    return {
+        changed: progressChanged || runsChanged || pendingPostsChanged || nukedPostsChanged,
+        progressChanged,
+        runsChanged,
+        pendingPostsChanged,
+        nukedPostsChanged,
+        affectedRunIds: Array.from(affectedRunIds),
+        repaired,
+        runs,
+        pendingPosts,
+        nukedPosts
+    }
 }
 
 function restoreQueuedProgressRecordsToCoordinatorQueue(state = {}, options = {}) {
@@ -7552,20 +7688,24 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
 
 async function repairCoordinatorStorageFromProgressLocked() {
     const state = await loadCoordinatorState({
-        [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+        [SPACE_PENDING_NUKED_POSTS_KEY]: {},
+        [SPACE_NUKED_POSTS_KEY]: {}
     })
     const queue = state.queue
-    const runs = state.runs
+    let runs = state.runs
     const originalRuns = cloneCoordinatorAuthorityValue(runs)
     const events = state.events
     const progress = state.progress
     let pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    let nukedPosts = state.stored?.[SPACE_NUKED_POSTS_KEY] || {}
     state.pendingPosts = pendingPosts
+    state.nukedPosts = nukedPosts
     const now = Date.now()
     const liveProfileTabsByHref = await getLiveProfileTabsByHref()
     let changed = false
     let eventsChanged = false
     let pendingPostsChanged = false
+    let nukedPostsChanged = false
     let progressChanged = false
     let runsMetadataChanged = false
     let repaired = 0
@@ -7583,6 +7723,24 @@ async function repairCoordinatorStorageFromProgressLocked() {
     if(pruneCoordinatorCurrentWork(queue, now)) {
         changed = true
         recomputeAllRuns = true
+    }
+
+    const clearProfileMaterialized = materializeRemovedProfileDerivedStateFromAuthority(state)
+    if(clearProfileMaterialized.changed) {
+        runs = clearProfileMaterialized.runs || runs
+        pendingPosts = clearProfileMaterialized.pendingPosts || pendingPosts
+        nukedPosts = clearProfileMaterialized.nukedPosts || nukedPosts
+        state.runs = runs
+        state.pendingPosts = pendingPosts
+        state.nukedPosts = nukedPosts
+        progressChanged = progressChanged || clearProfileMaterialized.progressChanged
+        runsMetadataChanged = runsMetadataChanged || clearProfileMaterialized.runsChanged
+        pendingPostsChanged = pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
+        nukedPostsChanged = nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
+        repaired += clearProfileMaterialized.repaired || 0
+        for(const runId of clearProfileMaterialized.affectedRunIds || []) {
+            if(runId) affectedRunIds.add(runId)
+        }
     }
 
     const restoredQueued = restoreQueuedProgressRecordsToCoordinatorQueue(state, {now})
@@ -7844,19 +8002,22 @@ async function repairCoordinatorStorageFromProgressLocked() {
     if(runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
     if(eventsChanged) storagePatch[COORDINATOR_EVENTS_KEY] = events
     if(pendingPostsChanged) storagePatch[SPACE_PENDING_NUKED_POSTS_KEY] = pendingPosts
+    if(nukedPostsChanged) storagePatch[SPACE_NUKED_POSTS_KEY] = nukedPosts
 
     const saved = await saveCoordinatorState({
         queue: storagePatch[COORDINATOR_QUEUE_KEY],
         runs: storagePatch[COORDINATOR_RUNS_KEY],
         events: storagePatch[COORDINATOR_EVENTS_KEY],
         progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY],
-        pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY]
+        pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY],
+        nukedPosts: storagePatch[SPACE_NUKED_POSTS_KEY]
     }, {
         queue: changed,
         runs: runsChanged,
         events: eventsChanged,
         progress: progressChanged,
         pendingPosts: pendingPostsChanged,
+        nukedPosts: nukedPostsChanged,
         reason: 'repair',
         queueOperation: 'repair-progress',
         queueChangedRows: repaired
@@ -7880,6 +8041,7 @@ async function repairCoordinatorStorageFromProgressLocked() {
         repaired,
         queueChanged: changed,
         pendingPostsChanged,
+        nukedPostsChanged,
         runsChanged,
         eventsChanged,
         progressChanged,

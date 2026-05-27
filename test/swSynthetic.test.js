@@ -4689,6 +4689,103 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(records[0].removed, true)
 })
 
+test('clear profile state derived failure materializes cleanup without resurrecting queue row', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Derived-Failure'
+    const runId = 'run-clear-profile-derived-failure'
+    const attemptId = 'attempt-clear-profile-derived-failure'
+    const postKey = 'post-clear-profile-derived-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 278250,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 278250})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    runId,
+                    tabId: null,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 278250
+                }
+            },
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-derived-failure',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [href],
+                    remainingUrls: [href],
+                    updatedAt: 278250
+                }
+            },
+            mbSpaceNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-derived-failure',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    urls: [href],
+                    updatedAt: 278250
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    let failedDerivedSave = false
+    browser.storage.local.set = async payload => {
+        if(!failedDerivedSave &&
+            payload?.mbProfileNukeProgress &&
+            payload?.mbCoordinatorRuns &&
+            payload?.mbSpacePendingNukedPosts &&
+            payload?.mbSpaceNukedPosts) {
+            failedDerivedSave = true
+            throw new Error('synthetic clear profile derived failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'clear-profile-nuke-state',
+        profileHref: href,
+        reason: 'synthetic-clear-derived-failure'
+    }, {tab: {id: 12, windowId: 1}})
+    browser.storage.local.set = originalSet
+
+    assert.equal(result.cleared, true)
+    assert.equal(result.queueChanged, true)
+    assert.equal(result.derivedSaved, false)
+    assert.equal(failedDerivedSave, true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
+    assert.ok(storage.mbSpacePendingNukedPosts[postKey])
+    assert.ok(storage.mbSpaceNukedPosts[postKey])
+    assert.equal(sw.state().queueWakeupCounters['clearProfile.derivedSaveFailed'], 1)
+
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.equal(repair.queueChanged, false)
+    assert.equal(repair.queueCount, 0)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
+    assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
+    assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
+})
+
 test('clear profile state WAL failure leaves raw and derived state intact', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Wal-Failure'
     const runId = 'run-clear-profile-wal-failure'
