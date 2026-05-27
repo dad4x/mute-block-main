@@ -1007,6 +1007,30 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
   showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
   0 per-row cancel buttons for 80 displayed rows.
+- Review closeout 2: reviewer follow-up found that if the `clear-profile` WAL
+  removal succeeded but the post-WAL derived cleanup save failed, repair could
+  treat the stale queued progress record as stranded work and recreate the row
+  that WAL authority had just removed. Repair now materializes WAL-authority
+  profile removals before queued-progress restoration: stale progress, run
+  target metadata, pending source-post memory, and remembered nuked-post memory
+  are removed when the raw queue still has a profile row that current WAL
+  authority no longer has. `saveCoordinatorState()` also supports the
+  remembered-nukes repair payload so this cleanup can be persisted in the same
+  repair pass. Added synthetic coverage for post-WAL clear-profile derived save
+  failure; it verifies the raw snapshot can remain stale, recovered WAL queue
+  stays empty, repair does not resurrect the row, and progress/runs/pending/
+  nuked derived state is cleared. Validation: `node -c shared/js/sw.js`,
+  `node -c test/swSynthetic.test.js`, `timeout 180 node
+  test/swSynthetic.test.js`, `node test/p1-contract.test.js`, and `npm test`
+  passed. Version bumped to `1.6.584`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.584.zip` and `firefox/mute_block-1.6.584.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.584` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 420 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
+  showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
+  0 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
