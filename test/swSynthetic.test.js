@@ -10990,11 +10990,20 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
     assert.equal(storage.mbCoordinatorRuns[nextRunId], undefined)
 })
 
-test('enqueue derived save failure keeps WAL row durable and schedules repair', async () => {
+test('enqueue derived save failure keeps WAL row durable and repair rebuilds derived state', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Derived-Failure'
     const runId = 'run-enqueue-derived-failure'
     const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, sw, storage} = loadServiceWorkerHarness({now: 3075})
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        now: 3075,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
         if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !payload?.mbCoordinatorQueueWal) {
@@ -11005,7 +11014,12 @@ test('enqueue derived save failure keeps WAL row durable and schedules repair', 
 
     const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
         href,
-        runId
+        runId,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: 1,
+            noForegroundFallback: true
+        }
     }), sourceSender)
 
     assert.equal(enqueue.queued, 1)
@@ -11015,8 +11029,26 @@ test('enqueue derived save failure keeps WAL row durable and schedules repair', 
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
     assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
+    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
     assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
     browser.storage.local.set = originalSet
+
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.ok(repair.repaired > 0)
+    assert.equal(repair.runsChanged, true)
+    assert.equal(repair.progressChanged, true)
+    assert.equal(repair.eventsChanged, true)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgress[href].runId, runId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
+    assert.equal(storage.mbCoordinatorEvents.some(event =>
+        event.runId === runId &&
+        event.type === 'repair' &&
+        event.details?.reason === 'enqueue-derived-repair'
+    ), true)
 })
 
 test('executable enqueue preserves explicit pause and does not open worker tabs', async () => {

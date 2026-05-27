@@ -7337,12 +7337,119 @@ function repairResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = 
     }
 }
 
+function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
+    if(!item || typeof item !== 'object') return {changed: false}
+    if(`${item.status || ''}` !== 'queued') return {changed: false}
+
+    const runId = `${item.runId || ''}`.trim()
+    if(!runId) return {changed: false}
+
+    const runs = state.runs || {}
+    const events = state.events || []
+    const progress = state.progress || {}
+    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+    const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey) || href || itemKey
+    const sourcePageUrl = `${item?.source?.pageUrl || item?.source?.sourcePageUrl || ''}`.trim()
+    const run = runs[runId] || {}
+    const sourceType = run.sourceType || item?.source?.type || inferSourceTypeFromRunId(runId) || 'space-feed'
+    let runsChanged = false
+    let progressChanged = false
+    let eventsChanged = false
+    let repaired = 0
+
+    const targetProfileHrefs = new Set(getCoordinatorRunTargetHrefs(run))
+    const targetWorkKeys = new Set(Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [])
+    const sourcePages = new Set(Array.isArray(run.sourcePages) ? run.sourcePages : [])
+    if(href && !targetProfileHrefs.has(href)) {
+        targetProfileHrefs.add(href)
+        runsChanged = true
+    }
+    if(coordinatorKey && !targetWorkKeys.has(coordinatorKey)) {
+        targetWorkKeys.add(coordinatorKey)
+        runsChanged = true
+    }
+    if(sourcePageUrl && !sourcePages.has(sourcePageUrl)) {
+        sourcePages.add(sourcePageUrl)
+        runsChanged = true
+    }
+    if(!runs[runId]) runsChanged = true
+
+    if(runsChanged) {
+        runs[runId] = {
+            ...run,
+            id: runId,
+            sourceType,
+            createdAt: run.createdAt || item.createdAt || item.queuedAt || now,
+            updatedAt: Math.max(Number.parseInt(run.updatedAt, 10) || 0, Number.parseInt(item.updatedAt || item.queuedAt, 10) || now),
+            status: run.status || 'active',
+            paused: run.paused === true ? true : false,
+            sourcePages: Array.from(sourcePages),
+            targetProfileHrefs: Array.from(targetProfileHrefs),
+            targetWorkKeys: Array.from(targetWorkKeys)
+        }
+        repaired += 1
+    }
+
+    if(href && isCoordinatorQueueAuthoritativeItem(item) && !getCoordinatorProgressRecordForItem(itemKey, item, progress)) {
+        const resetRecord = normalizeProgressPatch(
+            href,
+            buildQueuedCoordinatorProgressResetPatch(item, {
+                now: Number.parseInt(item.queuedAt || item.updatedAt, 10) || now,
+                runId,
+                actionKind: item.actionKind || ''
+            }),
+            null
+        )
+        if(resetRecord) {
+            progress[href] = resetRecord
+            profileNukeProgress = {
+                ...profileNukeProgress,
+                [href]: resetRecord
+            }
+            progressChanged = true
+            repaired += 1
+        }
+    }
+
+    if((runsChanged || progressChanged) && !events.some(event =>
+        `${event?.runId || ''}` === runId &&
+        `${event?.type || ''}` === 'repair' &&
+        `${event?.details?.reason || ''}` === 'enqueue-derived-repair'
+    )) {
+        events.push({
+            id: makeId('event'),
+            runId,
+            itemId: coordinatorKey || itemKey,
+            type: 'repair',
+            message: 'Repaired derived enqueue state',
+            at: now,
+            details: {
+                reason: 'enqueue-derived-repair',
+                coordinatorKey,
+                targetProfileHref: href,
+                sourcePageUrl
+            }
+        })
+        eventsChanged = true
+    }
+
+    return {
+        changed: runsChanged || progressChanged || eventsChanged,
+        runsChanged,
+        progressChanged,
+        eventsChanged,
+        affectedRunIds: runsChanged || progressChanged || eventsChanged ? [runId] : [],
+        repaired
+    }
+}
+
 async function repairCoordinatorStorageFromProgressLocked() {
     const state = await loadCoordinatorState({
         [SPACE_PENDING_NUKED_POSTS_KEY]: {}
     })
     const queue = state.queue
     const runs = state.runs
+    const originalRuns = cloneCoordinatorAuthorityValue(runs)
     const events = state.events
     const progress = state.progress
     let pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
@@ -7353,6 +7460,7 @@ async function repairCoordinatorStorageFromProgressLocked() {
     let eventsChanged = false
     let pendingPostsChanged = false
     let progressChanged = false
+    let runsMetadataChanged = false
     let repaired = 0
     let recomputeAllRuns = false
     const affectedRunIds = new Set()
@@ -7375,6 +7483,7 @@ async function repairCoordinatorStorageFromProgressLocked() {
         changed = true
         eventsChanged = eventsChanged || restoredQueued.eventsChanged
         progressChanged = progressChanged || restoredQueued.progressChanged
+        runsMetadataChanged = true
         repaired += restoredQueued.restored
         for(const runId of restoredQueued.affectedRunIds || []) {
             if(runId) affectedRunIds.add(runId)
@@ -7418,6 +7527,17 @@ async function repairCoordinatorStorageFromProgressLocked() {
             pendingPosts = resolvedResolverPendingRepair.pendingPosts || pendingPosts
             pendingPostsChanged = pendingPostsChanged || resolvedResolverPendingRepair.pendingPostsChanged
             repaired += resolvedResolverPendingRepair.repaired || 0
+        }
+
+        const queuedDerivedRepair = repairQueuedCoordinatorDerivedStateLocked(state, itemKey, item, now)
+        if(queuedDerivedRepair.changed) {
+            runsMetadataChanged = runsMetadataChanged || queuedDerivedRepair.runsChanged
+            progressChanged = progressChanged || queuedDerivedRepair.progressChanged
+            eventsChanged = eventsChanged || queuedDerivedRepair.eventsChanged
+            repaired += queuedDerivedRepair.repaired || 0
+        }
+        for(const runId of queuedDerivedRepair.affectedRunIds || []) {
+            if(runId) affectedRunIds.add(runId)
         }
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -7605,7 +7725,7 @@ async function repairCoordinatorStorageFromProgressLocked() {
     const nextRuns = (recomputeAllRuns || affectedRunIds.size)
         ? recomputeCoordinatorRuns(queue, runs, recomputeAllRuns ? null : affectedRunIds)
         : runs
-    const runsChanged = nextRuns !== runs && JSON.stringify(nextRuns) !== JSON.stringify(runs)
+    const runsChanged = (runsMetadataChanged || nextRuns !== runs) && JSON.stringify(nextRuns) !== JSON.stringify(originalRuns)
     const storagePatch = {}
 
     if(progressChanged) {
