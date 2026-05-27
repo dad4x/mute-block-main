@@ -1189,6 +1189,7 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(requestMutationBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'action-lease-request'/)
     assert.match(requestMutationBody, /expectedAttemptId/)
     assert.match(requestMutationBody, /currentAuthorityState/)
+    assert.match(requestMutationBody, /missing-attempt-identity/)
     assert.match(requestMutationBody, /context\.reject\('action-lease-busy'\)/)
     assert.doesNotMatch(requestMutationBody, /clearExpiredCoordinatorActionLeases/)
     assert.doesNotMatch(requestMutationBody, /saveCoordinatorQueueProjection\(/)
