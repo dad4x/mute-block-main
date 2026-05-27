@@ -396,3 +396,41 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and empty active WAL tail. Dashboard sanity showed 64 ready, 270
   succeeded, 15 soft-fail, 42 hard-fail, 1 active, and 65 per-row cancel
   buttons for 80 displayed rows.
+
+## Slice 22: action-lease request and tab-release WAL migration
+
+- Operation migrated: `requestActionLease` now uses WAL-backed
+  `action-lease-request`, and `releaseActionLeasesForTab` now releases matching
+  tab lease rows through WAL-backed `action-lease-tab-release` records.
+- Authority boundary: lease request loads the WAL-recovered queue projection,
+  validates target row, terminal state, stale attempt identity, and active lease
+  arbitration before applying a single-row lease grant through
+  `coordinatorAuthority.applyWithinStorageUpdate()`. Tab-wide release scans the
+  WAL-recovered queue projection, then applies each matching lease release as a
+  row-authority mutation with attempt and lease-token revalidation inside the
+  serialized update.
+- Persistence boundary: accepted lease grants/releases are durable on queue WAL
+  append. WAL append failure rejects the grant/release and leaves the raw
+  snapshot/current authority unchanged. Rejected request paths no longer write
+  opportunistic expired-lease cleanup; expired leases are ignored by active
+  lease arbitration and can be handled by explicit repair instead of mixed into
+  request/release authority.
+- Still snapshot-backed: enqueue, manual retry/requeue, bulk pause/cancel,
+  resolver remap/unresolved, action-lease expired-row cleanup, and other
+  cross-row cleanup remain deferred.
+- Validation: covered by `action lease request is WAL-backed and recovers after
+  restart`, `action lease request WAL append failure rejects durable mutation`,
+  `action lease tab release is WAL-backed and recovers after restart`, and
+  `action lease tab release WAL append failure leaves lease active`; `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.563`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.563.zip` and
+  `firefox/mute_block-1.6.563.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.563` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and empty active WAL tail. Dashboard sanity showed 64 ready, 270
+  succeeded, 15 soft-fail, 42 hard-fail, 1 active, and 65 per-row cancel
+  buttons for 80 displayed rows.
