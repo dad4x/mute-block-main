@@ -152,7 +152,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'action-lease-request',
     'action-lease-tab-release',
     'resolver-unresolved',
-    'stored-work-cancel'
+    'stored-work-cancel',
+    'stored-work-pause'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -9386,6 +9387,18 @@ async function pauseCoordinatorNukesCleanup(pauseGeneration = coordinatorPauseGe
         reason: 'coordinator-pause-request',
         pauseGeneration
     })
+    if(storedResult?.stalePause === true) {
+        return {paused: false, stalePause: true, pausedUrls: [], ownedTabIds: []}
+    }
+    if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false) {
+        return {
+            paused: false,
+            pausedUrls: storedResult?.pausedUrls || [],
+            ownedTabIds: [],
+            reason: storedResult?.reason || 'pause-persistence-failed',
+            persistence: storedResult?.persistence || null
+        }
+    }
     if(!await isCoordinatorPauseGenerationCurrent(pauseGeneration)) {
         return {paused: false, stalePause: true, pausedUrls: [], ownedTabIds: []}
     }
@@ -9454,7 +9467,9 @@ async function pauseCoordinatorNukes() {
         scheduled: false,
         pausedUrls: cleanup.pausedUrls || [],
         ownedTabIds: cleanup.ownedTabIds || [],
-        stalePause: cleanup.stalePause === true
+        stalePause: cleanup.stalePause === true,
+        reason: cleanup.reason || '',
+        persistence: cleanup.persistence || null
     }
 }
 
@@ -12333,20 +12348,22 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     }
 
     const state = await loadCoordinatorState()
-    const queue = {
-        ...state.queue
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const nextQueue = {
+        ...queue
     }
     const progress = {
         ...state.progress
     }
-    const runs = normalizeCoordinatorMap(state.runs)
+    const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
     const now = Date.now()
     const affectedRunIds = new Set()
     const pausedUrls = []
     const pausedWorkKeys = []
     const ownedTabIds = new Set()
-    let queueChanged = false
     let progressChanged = false
+    const authorityResults = []
 
     for(const [itemKey, item] of Object.entries(queue || {})) {
         if(!item || typeof item !== 'object') continue
@@ -12362,14 +12379,28 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         const tabId = getPersistedQueuedTabId(item, existingProgress)
         if(tabId) ownedTabIds.add(tabId)
 
+        let nextItem = item
         if(status !== 'queued') {
-            queue[itemKey] = buildPausedCoordinatorQueueItem(item, now, reason)
-            queueChanged = true
+            nextItem = buildPausedCoordinatorQueueItem(item, now, reason)
+            nextQueue[itemKey] = nextItem
+            authorityResults.push(makeCoordinatorAuthorityApplyResult({
+                operationKind: 'stored-work-pause',
+                rowKey: itemKey,
+                reason: 'ordinaryMutation'
+            }, {
+                accepted: true,
+                changed: true,
+                durable: true,
+                reason: 'persisted',
+                previousRow: item,
+                nextRow: nextItem,
+                terminal: false
+            }))
         }
         if(href) pausedUrls.push(href)
         else pausedWorkKeys.push(coordinatorKey)
 
-        if(queue[itemKey].runId) affectedRunIds.add(queue[itemKey].runId)
+        if(nextItem.runId) affectedRunIds.add(nextItem.runId)
         if(href) {
             for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
                 affectedRunIds.add(runId)
@@ -12379,10 +12410,10 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         if(href) {
             const resetRecord = normalizeProgressPatch(
                 href,
-                buildQueuedCoordinatorProgressResetPatch(queue[itemKey], {
+                buildQueuedCoordinatorProgressResetPatch(nextItem, {
                     now,
-                    runId: queue[itemKey].runId || '',
-                    actionKind: queue[itemKey].actionKind || ''
+                    runId: nextItem.runId || '',
+                    actionKind: nextItem.actionKind || ''
                 }),
                 existingProgress
             )
@@ -12408,11 +12439,51 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: Array.from(ownedTabIds), stalePause: true}
     }
 
-    if(!queueChanged && !pausedUrls.length && !pausedWorkKeys.length) {
+    if(!authorityResults.length && !pausedUrls.length && !pausedWorkKeys.length) {
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: []}
     }
 
-    const nextRunsBase = recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+    let persistence = null
+    if(authorityResults.length) {
+        const nextProjection = makeCoordinatorAuthorityProjection({
+            ...state,
+            queue: nextQueue,
+            runs
+        })
+        try {
+            persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+                authorityResults,
+                nextProjection,
+                {
+                    operationKind: 'stored-work-pause',
+                    reason: 'ordinaryMutation',
+                    previousProjectionQueue: queue,
+                    metricPath: 'storedWork.pause.save.queueWal',
+                    projectionMetricPath: 'storedWork.pause.save.projection'
+                }
+            )
+        }
+        catch(error) {
+            persistence = {
+                saved: false,
+                reason: 'persistence-error',
+                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            }
+        }
+        if(persistence?.saved !== true) {
+            return {
+                pausedUrls: [],
+                pausedWorkKeys: [],
+                ownedTabIds: [],
+                reason: persistence?.reason || 'persistence-failed',
+                persistence
+            }
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    const currentQueue = coordinatorAuthority.current().queue
+    const nextRunsBase = recomputeCoordinatorRuns(currentQueue, runs, affectedRunIds)
     for(const runId of affectedRunIds) {
         if(!nextRunsBase[runId]) continue
         nextRunsBase[runId] = {
@@ -12447,20 +12518,36 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         await restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration)
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: Array.from(ownedTabIds), stalePause: true}
     }
-    await saveCoordinatorState({
-        queue,
-        runs: nextRunsBase,
-        events,
-        progress: prunedProgress
-    }, {
-        queue: queueChanged,
-        runs: true,
-        events: true,
-        progress: progressChanged,
-        reason: 'ordinaryMutation',
-        queueOperation: 'pause',
-        queueChangedRows: pausedUrls.length + pausedWorkKeys.length
-    })
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: nextRunsBase,
+            events,
+            progress: prunedProgress
+        }, {
+            queue: false,
+            runs: true,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'stored-work-pause-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'stored-work-pause-derived-save-failed',
+            error?.message || 'Stored work pause derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('storedWork.pause.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'stored-work-pause-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
     if(pauseGeneration && !isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)) {
         await restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration)
         scheduleCoordinatorPauseStateRepair('stale-pause-save-repair')
@@ -12470,7 +12557,9 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     return {
         pausedUrls,
         pausedWorkKeys,
-        ownedTabIds: Array.from(ownedTabIds)
+        ownedTabIds: Array.from(ownedTabIds),
+        persistence,
+        derivedSaved
     }
 }
 
