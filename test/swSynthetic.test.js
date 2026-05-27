@@ -4489,6 +4489,71 @@ test('compatibility progress sync derived save failure keeps WAL row durable and
     )
 })
 
+test('compatibility progress sync skips no-op derived save after WAL transition', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Noop-Derived'
+    const runId = 'run-compatibility-progress-noop-derived'
+    const attemptId = 'attempt-compatibility-progress-noop-derived'
+    const now = 276800
+    const progressRecord = {
+        profileHref: href,
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: now + 100,
+        terminalAt: now + 100,
+        runId,
+        tabId: 0,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1,
+        updatedAt: now + 100
+    }
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({href, runId, attemptId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'profile-search',
+                    status: 'complete',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href],
+                    createdAt: now,
+                    itemCount: 1,
+                    activeCount: 0,
+                    terminalCount: 1,
+                    updatedAt: now + 100
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: progressRecord
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    let derivedRunWrites = 0
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorRuns && !payload?.mbCoordinatorQueueWal) {
+            derivedRunWrites += 1
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
+    browser.storage.local.set = originalSet
+
+    assert.equal(result, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'succeeded')
+    assert.equal(derivedRunWrites, 0)
+    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
+    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+})
+
 test('compatibility progress sync WAL failure leaves stale failed row authoritative', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Wal-Failure'
     const runId = 'run-compatibility-progress-wal-failure'

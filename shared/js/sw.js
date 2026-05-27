@@ -6751,34 +6751,36 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
     if(runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
     if(progressChanged) storagePatch[PROFILE_NUKE_PROGRESS_KEY] = progress
 
-    let derivedSaved = true
-    try {
-        derivedSaved = await saveCoordinatorState({
-            runs: storagePatch[COORDINATOR_RUNS_KEY],
-            progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY]
-        }, {
-            queue: false,
-            runs: runsChanged,
-            progress: progressChanged,
-            progressChangedRows,
-            reason: 'compatibilityFlush',
-            queueOperation: changed ? 'compatibility-progress-sync-derived' : 'compatibility-progress-sync',
-            queueChangedRows: 0
-        })
-    }
-    catch(error) {
-        derivedSaved = false
-        recordCoordinatorDiagnosticEvent(
-            'compatibility-progress-sync-derived-save-failed',
-            error?.message || 'Compatibility progress sync derived save failed'
-        )
-    }
-    if(derivedSaved === false) {
-        incrementQueueWakeupMetric('compatibilityProgressSync.derivedSaveFailed')
-        scheduleStoredWorkRepair(1000, {
-            reason: 'compatibility-progress-sync-derived-save-failed',
-            edgeTriggered: true
-        })
+    if(runsChanged || progressChanged) {
+        let derivedSaved = true
+        try {
+            derivedSaved = await saveCoordinatorState({
+                runs: storagePatch[COORDINATOR_RUNS_KEY],
+                progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY]
+            }, {
+                queue: false,
+                runs: runsChanged,
+                progress: progressChanged,
+                progressChangedRows,
+                reason: 'compatibilityFlush',
+                queueOperation: changed ? 'compatibility-progress-sync-derived' : 'compatibility-progress-sync',
+                queueChangedRows: 0
+            })
+        }
+        catch(error) {
+            derivedSaved = false
+            recordCoordinatorDiagnosticEvent(
+                'compatibility-progress-sync-derived-save-failed',
+                error?.message || 'Compatibility progress sync derived save failed'
+            )
+        }
+        if(derivedSaved === false) {
+            incrementQueueWakeupMetric('compatibilityProgressSync.derivedSaveFailed')
+            scheduleStoredWorkRepair(1000, {
+                reason: 'compatibility-progress-sync-derived-save-failed',
+                edgeTriggered: true
+            })
+        }
     }
 
     if(terminalSettlementHrefs.size) {
