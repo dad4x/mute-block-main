@@ -434,3 +434,32 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and empty active WAL tail. Dashboard sanity showed 64 ready, 270
   succeeded, 15 soft-fail, 42 hard-fail, 1 active, and 65 per-row cancel
   buttons for 80 displayed rows.
+
+## Slice 22 review closeout: action-lease request attempt identity
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.563 review
+  finding on the already WAL-backed `action-lease-request` path.
+- Authority boundary: action-lease request now distinguishes incoming attempt
+  identity from stored row identity. If the current row has attempt id/number
+  and the incoming request lacks either value, the request is rejected before
+  any WAL append. The same missing-identity guard is mirrored inside the
+  serialized `coordinatorAuthority.applyWithinStorageUpdate()` mutator so a row
+  that gains attempt identity before the authority apply cannot be claimed by an
+  identity-less lease request.
+- Persistence boundary: unchanged. Accepted action-lease requests are durable
+  on queue WAL append; rejected missing-identity requests leave raw snapshot and
+  current authority unchanged and append no WAL record.
+- Validation: covered by `action lease request rejects missing incoming attempt
+  identity before WAL append`; `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `node -c test/p1-contract.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`, and `npm test`
+  passed. Version bumped to `1.6.564`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.564.zip` and
+  `firefox/mute_block-1.6.564.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.564` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 raw/recovered/view rows, no view mismatches, and an
+  active WAL tail with 31 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 61 ready, 274 succeeded, 19 soft-fail, 38 hard-fail, 0 active,
+  and 61 per-row cancel buttons for 80 displayed rows.

@@ -2636,6 +2636,43 @@ test('action lease request WAL append failure rejects durable mutation', async (
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, undefined)
 })
 
+test('action lease request rejects missing incoming attempt identity before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Request-Missing-Incoming'
+    const runId = 'run-lease-request-missing-incoming'
+    const attemptId = 'attempt-lease-request-missing-incoming'
+    const tabId = 6192
+    const now = 259750
+    const {storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const result = await sw.requestCoordinatorActionLease({
+        profileHref: href,
+        actionKind: 'mute-block',
+        reason: 'missing-incoming-request'
+    }, {
+        tab: {id: tabId}
+    })
+
+    assert.equal(result.granted, false)
+    assert.equal(result.staleAttempt, true)
+    assert.equal(result.reason, 'missing-attempt-identity')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].actionLease, undefined)
+})
+
 test('action lease heartbeat is WAL-backed and does not clear unrelated expired lease', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Lease-Heartbeat'
     const otherHref = 'https://www.quora.com/profile/Synthetic-Lease-Expired-Other'

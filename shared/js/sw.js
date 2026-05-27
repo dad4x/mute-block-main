@@ -13068,6 +13068,18 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
         })
         return {granted: false, staleAttempt: true, reason: 'stale-coordinator-attempt'}
     }
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const currentAttemptNumber = getAttemptNumberFromValue(item)
+    if((currentAttemptId && !attemptId) || (currentAttemptNumber && !attemptNumber)) {
+        await recordStaleAttemptDiagnostic({
+            profileHref,
+            incomingAttemptId: attemptId,
+            expectedAttemptId: currentAttemptId,
+            senderTabId: tabId,
+            message: 'Ignored action-lease request without required attempt identity'
+        })
+        return {granted: false, staleAttempt: true, reason: 'missing-attempt-identity'}
+    }
 
     const activeLease = findActiveCoordinatorActionLease(queue, now)
     if(activeLease && !isCoordinatorActionLeaseHolder(activeLease.lease, tabId, attemptId)) {
@@ -13081,11 +13093,13 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
         }
     }
 
-    const expectedAttemptId = attemptId || getAttemptIdFromValue(item)
-    const expectedAttemptNumber = attemptNumber || getAttemptNumberFromValue(item)
+    const expectedAttemptId = currentAttemptId ? attemptId : ''
+    const expectedAttemptNumber = currentAttemptNumber ? attemptNumber : 0
+    const leaseAttemptId = attemptId || currentAttemptId
+    const leaseAttemptNumber = attemptNumber || currentAttemptNumber
     const lease = makeCoordinatorActionLease(item, {
-        attemptId: expectedAttemptId,
-        attemptNumber: expectedAttemptNumber,
+        attemptId: leaseAttemptId,
+        attemptNumber: leaseAttemptNumber,
         actionKind: operation.actionKind || item.actionKind || '',
         reason: operation.requestReason || '',
         profileHref,
@@ -13113,17 +13127,21 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
             if(hasMismatchedCoordinatorAttempt(currentItem, {attemptId: expectedAttemptId, attemptNumber: expectedAttemptNumber})) {
                 return context.reject('stale-coordinator-attempt', {staleAttempt: true})
             }
+            if((getAttemptIdFromValue(currentItem) && !attemptId) ||
+                (getAttemptNumberFromValue(currentItem) && !attemptNumber)) {
+                return context.reject('missing-attempt-identity', {staleAttempt: true})
+            }
             const currentQueue = {
                 ...(currentAuthorityState.queue || {}),
                 [entry.key]: currentItem
             }
             const currentActiveLease = findActiveCoordinatorActionLease(currentQueue, now)
-            if(currentActiveLease && !isCoordinatorActionLeaseHolder(currentActiveLease.lease, tabId, expectedAttemptId)) {
+            if(currentActiveLease && !isCoordinatorActionLeaseHolder(currentActiveLease.lease, tabId, leaseAttemptId)) {
                 return context.reject('action-lease-busy')
             }
             const currentLease = makeCoordinatorActionLease(currentItem, {
-                attemptId: expectedAttemptId || getAttemptIdFromValue(currentItem),
-                attemptNumber: expectedAttemptNumber || getAttemptNumberFromValue(currentItem),
+                attemptId: leaseAttemptId || getAttemptIdFromValue(currentItem),
+                attemptNumber: leaseAttemptNumber || getAttemptNumberFromValue(currentItem),
                 actionKind: operation.actionKind || currentItem.actionKind || '',
                 reason: operation.requestReason || '',
                 profileHref,
