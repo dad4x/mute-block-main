@@ -626,3 +626,31 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
   and 29 per-row cancel buttons for 80 displayed rows.
+
+## Slice 24 review closeout: bulk-cancel durability before runtime cleanup
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.569 review
+  finding on the WAL-backed `stored-work-cancel` batch path.
+- Authority boundary: bulk current-work cancel now treats durable cancel
+  persistence failure as a hard stop. If the batch WAL append fails, the stored
+  cancel mutator returns no owned tab ids, and `cancelCoordinatorCurrentWork()`
+  returns the failure before `stopOwnerNukes()`, tab removal, pause-state
+  clearing, or runtime pruning.
+- Persistence boundary: runtime cleanup only follows a durable queue cancel.
+  WAL append failure leaves the row active/queued in raw storage and current
+  authority, appends no WAL record, and leaves live owned tabs open.
+- Storage-context guard: the reusable batch WAL helper now marks the active
+  storage-update context as having applied a coordinator authority queue
+  mutation after a successful WAL append, matching the single-row authority path
+  and preserving the stale outer queue-save guard for future batch callers.
+- Validation: covered by `bulk current work cancel WAL append failure does not
+  close active owned tab` plus updated P1 storage-authority contracts; `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.570`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.570.zip` and
+  `firefox/mute_block-1.6.570.zip`. Live Chrome push/validation is pending
+  because the reverse tunnels on `127.0.0.1:10022` and `127.0.0.1:9223` accepted
+  local connections but did not forward responses; bounded SSH, CDP, and rsync
+  probes timed out.
