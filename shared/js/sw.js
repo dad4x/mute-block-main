@@ -150,7 +150,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'repair-active-without-actor',
     'active-transition',
     'action-lease-request',
-    'action-lease-tab-release'
+    'action-lease-tab-release',
+    'resolver-unresolved'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -17012,14 +17013,18 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
     const outcome = `${request.outcome || 'unresolved-target'}`.trim()
 
     return enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorState({
-            [COORDINATOR_EVENTS_KEY]: undefined,
-            [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+        const currentAuthorityState = await loadCoordinatorQueueRunsProjection({
+            metricPath: 'resolver.unresolved.load'
         })
-        const queue = state.queue
-        const runs = state.runs
-        const events = state.events
-        const pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+        const stored = await metricStorageGet({
+            [COORDINATOR_EVENTS_KEY]: [],
+            [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+        }, {
+            metricPath: 'resolver.unresolved.derived.load'
+        })
+        const queue = currentAuthorityState.queue
+        const runs = currentAuthorityState.runs
+        const pendingPosts = stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}
         const itemKey = coordinatorKey && queue[coordinatorKey]
             ? coordinatorKey
             : makeProfileResolutionQueueKey(requestedUrl || '')
@@ -17036,10 +17041,23 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
             })
             return {recorded: false, reason: 'stale-attempt'}
         }
+        const currentAttemptId = getAttemptIdFromValue(item)
+        const currentAttemptNumber = getAttemptNumberFromValue(item)
+        const incomingAttemptId = getAttemptIdFromValue(request)
+        const incomingAttemptNumber = getAttemptNumberFromValue(request)
+        if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
+            await recordStaleAttemptDiagnostic({
+                incomingAttemptId,
+                expectedAttemptId: currentAttemptId,
+                senderTabId: tabId,
+                message: 'Ignored queued target resolution failure without required attempt identity'
+            })
+            return {recorded: false, staleAttempt: true, reason: 'missing-attempt-identity'}
+        }
 
         const now = Date.now()
-        const nextItem = {
-            ...item,
+        const buildNextUnresolvedItem = currentItem => ({
+            ...currentItem,
             status: 'skipped',
             outcome,
             error,
@@ -17050,23 +17068,63 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
             actionLeaseReleasedAt: now,
             actionLeaseReleaseReason: 'unresolved-resolution',
             milestones: {
-                ...(item.milestones || makeEmptyCoordinatorMilestones()),
+                ...(currentItem.milestones || makeEmptyCoordinatorMilestones()),
                 closeRequestedAt: now,
                 tabClosedAt: now
             }
-        }
-        queue[itemKey] = nextItem
+        })
 
+        const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+            operationKind: 'resolver-unresolved',
+            rowKey: itemKey,
+            expectedAttemptId: currentAttemptId ? incomingAttemptId : '',
+            expectedAttemptNumber: currentAttemptNumber ? incomingAttemptNumber : 0,
+            reason: 'ordinaryMutation',
+            metricPath: 'resolver.unresolved.save',
+            currentAuthorityState,
+            mutate(currentItem, context) {
+                if(!currentItem) return context.reject('missing-coordinator-item')
+                if(isTerminalCoordinatorStatus(currentItem.status)) {
+                    return context.reject('terminal-coordinator-item')
+                }
+                if(hasMismatchedCoordinatorAttempt(currentItem, request)) {
+                    return context.reject('stale-attempt', {staleAttempt: true})
+                }
+                if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
+                    (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
+                    return context.reject('missing-attempt-identity', {staleAttempt: true})
+                }
+                if(getCoordinatorItemQueueKey(currentItem, itemKey) !== getCoordinatorItemQueueKey(item, itemKey) ||
+                    normalizeCoordinatorRequestedUrl(currentItem.requestedUrl || stripProfileResolutionQueueKey(itemKey)) !==
+                        normalizeCoordinatorRequestedUrl(item.requestedUrl || stripProfileResolutionQueueKey(itemKey))) {
+                    return context.reject('row-target-changed-before-authority-apply')
+                }
+                return buildNextUnresolvedItem(currentItem)
+            }
+        })
+
+        if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
+            return {
+                recorded: false,
+                staleAttempt: authorityResult?.staleAttempt === true,
+                reason: authorityResult?.reason || 'authority-apply-failed'
+            }
+        }
+
+        const nextQueue = coordinatorAuthority.current().queue
+        const nextItem = authorityResult.nextRow || nextQueue[itemKey] || buildNextUnresolvedItem(item)
         const affectedRunIds = new Set()
         if(nextItem.runId) affectedRunIds.add(nextItem.runId)
         const nextRuns = affectedRunIds.size
-            ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+            ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
             : runs
+        const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
         const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, nextItem, {
             requestedUrl: nextItem.requestedUrl || requestedUrl,
             evidence: request.evidence || []
         })
 
+        const events = normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY] || [])
         events.push({
             id: makeId('event'),
             runId: nextItem.runId || '',
@@ -17081,20 +17139,36 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
             }
         })
 
-        await saveCoordinatorState({
-            queue,
-            runs: nextRuns,
-            events,
-            pendingPosts: pendingResult.pendingPosts
-        }, {
-            queue: true,
-            runs: JSON.stringify(nextRuns) !== JSON.stringify(runs),
-            events: true,
-            pendingPosts: pendingResult.changed,
-            reason: 'ordinaryMutation',
-            queueOperation: 'resolver-unresolved',
-            queueChangedRows: 1
-        })
+        let derivedSaved = true
+        try {
+            derivedSaved = await saveCoordinatorState({
+                runs: runsChanged ? nextRuns : undefined,
+                events,
+                pendingPosts: pendingResult.pendingPosts
+            }, {
+                queue: false,
+                runs: runsChanged,
+                events: true,
+                pendingPosts: pendingResult.changed,
+                reason: 'ordinaryMutation',
+                queueOperation: 'resolver-unresolved-derived',
+                queueChangedRows: 0
+            })
+        }
+        catch(saveError) {
+            derivedSaved = false
+            recordCoordinatorDiagnosticEvent(
+                'resolver-unresolved-derived-save-failed',
+                saveError?.message || 'Resolver unresolved derived save failed'
+            )
+        }
+        if(derivedSaved === false) {
+            incrementQueueWakeupMetric('resolverUnresolved.derivedSaveFailed')
+            scheduleStoredWorkRepair(1000, {
+                reason: 'resolver-unresolved-derived-save-failed',
+                edgeTriggered: true
+            })
+        }
 
         return {
             recorded: true,
