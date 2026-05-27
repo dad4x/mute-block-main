@@ -935,6 +935,26 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and an empty WAL tail. Dashboard sanity showed 0 ready,
   391 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and 0 per-row cancel
   buttons for 80 displayed rows.
+- Review closeout 2: reviewer follow-up found that the new derived-save guard
+  treated empty compatibility derived payloads as failures because
+  `saveCoordinatorState()` returns `false` for no-op saves. The
+  `compatibility-progress-sync` derived save is now gated on
+  `runsChanged || progressChanged`, so a real WAL authority transition with
+  already-current runs/progress state does not schedule false repair churn.
+  Added synthetic coverage for that WAL-only/no-derived-delta path and verified
+  no derived run write, no `compatibilityProgressSync.derivedSaveFailed`
+  counter, and no stored-work repair timeout. Validation: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `timeout 120 node
+  test/swSynthetic.test.js`, `node test/p1-contract.test.js`, and `npm test`
+  passed. Version bumped to `1.6.581`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.581.zip` and `firefox/mute_block-1.6.581.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.581` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 420 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
+  showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
+  0 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
