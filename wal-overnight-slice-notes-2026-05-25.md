@@ -559,3 +559,35 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
   and 29 per-row cancel buttons for 80 displayed rows.
+
+## Slice 23 review closeout: unresolved resolver row type and repair
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.567 review
+  findings on the WAL-backed `resolver-unresolved` path.
+- Authority boundary: `resolve-queued-profile-target-failed` now rejects
+  non-profile-resolution rows and inactive rows before any WAL append, and
+  repeats those guards inside the serialized authority mutator. A normal active
+  profile action row can no longer be terminalized by an unresolved resolver
+  message.
+- Repair boundary: if the WAL terminal row is durable but the derived
+  pending-post cleanup save fails, stored-work repair now clears resolver-pending
+  source records for terminal skipped unresolved resolver rows.
+- Inventory: the `markQueuedProfileResolutionUnresolved` call-site inventory now
+  reflects the WAL-backed authority row and derived compatibility cleanup
+  boundary.
+- Validation: covered by `unresolved resolver rejects non-resolution active row
+  before WAL append`, `unresolved resolver derived save failure does not poison
+  WAL terminalization`, and the updated P1 contract for resolver-pending repair;
+  `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.568`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.568.zip` and
+  `firefox/mute_block-1.6.568.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.568` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 recovered/view rows, no view mismatches, and an
+  active WAL tail with 19 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
+  and 29 per-row cancel buttons for 80 displayed rows.

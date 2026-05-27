@@ -7104,6 +7104,27 @@ function repairTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item 
     }
 }
 
+function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
+    if(!item || typeof item !== 'object') return {changed: false}
+    if(!isTerminalCoordinatorStatus(item.status) || !isProfileResolutionItem(item)) return {changed: false}
+    if(item.status !== 'skipped' || `${item.outcome || ''}`.trim() !== 'unresolved-target') return {changed: false}
+
+    const pendingPosts = state.pendingPosts || {}
+    const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, item, {
+        requestedUrl: getProfileResolutionRequestedUrl(item, itemKey),
+        evidence: item.evidence || []
+    })
+    if(!pendingResult.changed) return {changed: false}
+
+    state.pendingPosts = pendingResult.pendingPosts
+    return {
+        changed: true,
+        pendingPostsChanged: true,
+        pendingPosts: pendingResult.pendingPosts,
+        repaired: 1
+    }
+}
+
 async function repairCoordinatorStorageFromProgressLocked() {
     const state = await loadCoordinatorState({
         [SPACE_PENDING_NUKED_POSTS_KEY]: {}
@@ -7113,6 +7134,7 @@ async function repairCoordinatorStorageFromProgressLocked() {
     const events = state.events
     const progress = state.progress
     let pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    state.pendingPosts = pendingPosts
     const now = Date.now()
     const liveProfileTabsByHref = await getLiveProfileTabsByHref()
     let changed = false
@@ -7170,6 +7192,13 @@ async function repairCoordinatorStorageFromProgressLocked() {
         }
         for(const runId of terminalKeyOnlyDerivedRepair.affectedRunIds || []) {
             if(runId) affectedRunIds.add(runId)
+        }
+
+        const terminalResolverPendingRepair = repairTerminalResolverPendingSourceRecordsLocked(state, itemKey, item)
+        if(terminalResolverPendingRepair.changed) {
+            pendingPosts = terminalResolverPendingRepair.pendingPosts || pendingPosts
+            pendingPostsChanged = pendingPostsChanged || terminalResolverPendingRepair.pendingPostsChanged
+            repaired += terminalResolverPendingRepair.repaired || 0
         }
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -17031,6 +17060,8 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
         const item = itemKey ? queue[itemKey] : null
         if(!item) return {recorded: false, reason: 'missing-coordinator-item'}
         if(isTerminalCoordinatorStatus(item.status)) return {recorded: false, reason: 'terminal-coordinator-item'}
+        if(!isProfileResolutionItem(item)) return {recorded: false, reason: 'not-profile-resolution-item'}
+        if(!isActiveCoordinatorStatus(item.status)) return {recorded: false, reason: 'inactive-coordinator-item'}
 
         if(hasMismatchedCoordinatorAttempt(item, request)) {
             await recordStaleAttemptDiagnostic({
@@ -17086,6 +17117,12 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
                 if(!currentItem) return context.reject('missing-coordinator-item')
                 if(isTerminalCoordinatorStatus(currentItem.status)) {
                     return context.reject('terminal-coordinator-item')
+                }
+                if(!isProfileResolutionItem(currentItem)) {
+                    return context.reject('not-profile-resolution-item')
+                }
+                if(!isActiveCoordinatorStatus(currentItem.status)) {
+                    return context.reject('inactive-coordinator-item')
                 }
                 if(hasMismatchedCoordinatorAttempt(currentItem, request)) {
                     return context.reject('stale-attempt', {staleAttempt: true})
