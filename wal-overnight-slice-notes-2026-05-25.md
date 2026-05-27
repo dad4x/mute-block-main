@@ -591,3 +591,38 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
   and 29 per-row cancel buttons for 80 displayed rows.
+
+## Slice 24: bulk current-work cancel WAL batch migration
+
+- Operation migrated: dashboard `Cancel Queue` / `cancel-coordinator-current-work`
+  now terminalizes all currently pending queue rows through WAL-backed
+  `stored-work-cancel` records in one batch append.
+- Authority boundary: the bulk cancel path loads the WAL-recovered coordinator
+  state, selects pending rows only, builds terminal canceled rows in memory, and
+  appends the whole selected set to the queue WAL as one batch. WAL append
+  failure rejects the cancel without partially terminalizing later rows.
+- Persistence boundary: queue-row cancellation is durable when the queue WAL
+  batch append succeeds. Compact queue projection is refreshed by the WAL
+  projection follow-up. Runs, events, and progress mirror updates are derived
+  compatibility saves after WAL acknowledgement; derived-save failure records a
+  diagnostic and schedules repair without poisoning the already-durable cancel.
+- Still snapshot-backed: pause, manual retry/requeue, enqueue, and resolver remap
+  remain separate review-gated slices. The new batch WAL writer is only used for
+  same-key terminal row updates and is not a general key-moving requeue helper.
+- Validation: covered by `bulk current work cancel WAL-terminalizes all pending
+  rows as a batch`, `bulk current work cancel WAL append failure leaves rows
+  pending`, `bulk current work cancel derived failure does not poison WAL
+  terminalization`, and updated P1 storage-authority contracts; `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.569`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.569.zip` and
+  `firefox/mute_block-1.6.569.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.569` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 recovered/view rows, no view mismatches, and an
+  active WAL tail with 19 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 28 ready, 303 succeeded, 51 soft-fail, 8 hard-fail, 1 active,
+  and 29 per-row cancel buttons for 80 displayed rows.
