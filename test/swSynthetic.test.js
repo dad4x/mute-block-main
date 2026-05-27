@@ -6259,6 +6259,318 @@ test('late profile resolution cannot overwrite a newer active destination row', 
     assert.equal(storage.mbCoordinatorQueue[resolvedHref].attemptId, destinationAttemptId)
 })
 
+test('profile resolver remap is WAL-backed and recovers moved key', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-wal'
+    const key = `resolve-profile:${requestedUrl}`
+    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Wal'
+    const runId = 'run-resolver-remap-wal'
+    const attemptId = 'attempt-resolver-remap-wal'
+    const postKey = 'post-resolver-remap-wal'
+    const tabId = 6211
+    const now = 426925
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: now - 1000,
+                    activeAt: now - 500,
+                    updatedAt: now - 500,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        coordinatorKey: key,
+        requestedUrl,
+        profileHref: '',
+        resolveProfileFromPage: true,
+        resolutionMode: 'author-profile',
+        tabAction: 'resolve-profile',
+        actionKind: 'mute-block',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target',
+        requestedUrl,
+        coordinatorKey: key,
+        profileHref: resolvedHref,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {
+            id: tabId,
+            url: resolvedHref
+        }
+    })
+
+    assert.equal(result.resolved, true)
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
+    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, false)
+    assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].allUrls, [resolvedHref])
+    assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].remainingUrls, [resolvedHref])
+    const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
+    assert.equal(metadata.profileHref, resolvedHref)
+    assert.equal(metadata.coordinatorKey, resolvedHref)
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 2)
+    assert.equal(walRecords[0].operationKind, 'resolver-remap')
+    assert.equal(walRecords[0].kind, 'map.set')
+    assert.equal(walRecords[0].key, resolvedHref)
+    assert.equal(walRecords[1].operationKind, 'resolver-remap')
+    assert.equal(walRecords[1].kind, 'map.remove')
+    assert.equal(walRecords[1].key, key)
+
+    const restarted = loadServiceWorkerHarness({
+        now: now + 1000,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[key], undefined)
+    assert.equal(hydrated.queue[resolvedHref].status, 'active')
+})
+
+test('profile resolver remap WAL append failure leaves resolver row and runtime metadata unchanged', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-append-failure'
+    const key = `resolve-profile:${requestedUrl}`
+    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Append-Failure'
+    const runId = 'run-resolver-remap-append-failure'
+    const attemptId = 'attempt-resolver-remap-append-failure'
+    const postKey = 'post-resolver-remap-append-failure'
+    const tabId = 6212
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426930,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425930,
+                    activeAt: 426430,
+                    updatedAt: 426430,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        coordinatorKey: key,
+        requestedUrl,
+        profileHref: '',
+        resolveProfileFromPage: true,
+        resolutionMode: 'author-profile',
+        tabAction: 'resolve-profile',
+        actionKind: 'mute-block',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        action: 'resolve-profile',
+        targetUrl: '',
+        coordinatorKey: key,
+        requestedUrl,
+        actionKind: 'mute-block',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic resolver remap WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target',
+        requestedUrl,
+        coordinatorKey: key,
+        profileHref: resolvedHref,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {
+            id: tabId,
+            url: resolvedHref
+        }
+    })
+
+    assert.equal(result.resolved, false)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[key].status, 'active')
+    assert.equal(currentAuthority.queue[resolvedHref], undefined)
+    const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
+    assert.equal(metadata.coordinatorKey, key)
+    assert.equal(metadata.profileHref, '')
+})
+
+test('profile resolver remap derived save failure does not poison WAL remap', async () => {
+    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-derived-failure'
+    const key = `resolve-profile:${requestedUrl}`
+    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Derived-Failure'
+    const runId = 'run-resolver-remap-derived-failure'
+    const attemptId = 'attempt-resolver-remap-derived-failure'
+    const postKey = 'post-resolver-remap-derived-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426940,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [key]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'resolve-profile',
+                    requestedUrl,
+                    dedupeKey: key,
+                    coordinatorKey: key,
+                    resolveProfileFromPage: true,
+                    resolutionMode: 'author-profile',
+                    queuedAt: 425940,
+                    activeAt: 426440,
+                    updatedAt: 426440,
+                    attemptId,
+                    attemptNumber: 1,
+                    evidence: [{postKey, postUrl: requestedUrl}],
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: key, runId}),
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [key]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: requestedUrl,
+                    resolverPending: true,
+                    resolverUrl: requestedUrl
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbSpacePendingNukedPosts) {
+            throw new Error('synthetic resolver remap derived save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target',
+        requestedUrl,
+        coordinatorKey: key,
+        profileHref: resolvedHref,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {
+            id: 6213,
+            url: resolvedHref
+        }
+    })
+
+    assert.equal(result.resolved, true)
+    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
+    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
+    assert.equal(sw.state().queueWakeupCounters['resolver.resolve.derivedSaveFailed'] || 0, 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+
+    browser.storage.local.set = originalSet
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.equal(repair.pendingPostsChanged, true)
+    assert.notEqual(storage.mbSpacePendingNukedPosts[postKey]?.resolverPending, true)
+    if(storage.mbSpacePendingNukedPosts[postKey]) {
+        assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].allUrls, [resolvedHref])
+    }
+})
+
 test('late unresolved resolver failure cannot regress a WAL-terminal resolver row', async () => {
     const requestedUrl = 'https://www.quora.com/q/example/post-key-only-late-unresolved'
     const key = `resolve-profile:${requestedUrl}`

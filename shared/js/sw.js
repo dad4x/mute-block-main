@@ -155,7 +155,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'stored-work-cancel',
     'stored-work-pause',
     'retry',
-    'requeue'
+    'requeue',
+    'resolver-remap'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -7297,6 +7298,44 @@ function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = 
     }
 }
 
+function repairResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
+    if(!item || typeof item !== 'object') return {changed: false}
+    const resolvedHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+    if(!resolvedHref || isProfileResolutionItem(item)) return {changed: false}
+
+    const evidenceList = Array.isArray(item.evidence) ? item.evidence : []
+    if(!evidenceList.some(evidence => evidence?.postKey || evidence?.postUrl)) return {changed: false}
+
+    const pendingPosts = state.pendingPosts || {}
+    const hasMatchingPendingResolver = Object.values(pendingPosts || {}).some(record => {
+        if(record?.resolverPending !== true) return false
+
+        const recordPostKey = `${record?.postKey || ''}`.trim()
+        const recordUrls = new Set([
+            normalizeCoordinatorRequestedUrl(record?.resolverUrl || ''),
+            normalizeCoordinatorRequestedUrl(record?.postUrl || '')
+        ].filter(Boolean))
+        return evidenceList.some(evidence => {
+            const evidencePostKey = `${evidence?.postKey || ''}`.trim()
+            const evidencePostUrl = normalizeCoordinatorRequestedUrl(evidence?.postUrl || '')
+            return (evidencePostKey && evidencePostKey === recordPostKey) ||
+                (evidencePostUrl && recordUrls.has(evidencePostUrl))
+        })
+    })
+    if(!hasMatchingPendingResolver) return {changed: false}
+
+    const pendingResult = addResolvedProfileToPendingSpaceRecords(pendingPosts, item, resolvedHref)
+    if(!pendingResult.changed) return {changed: false}
+
+    state.pendingPosts = pendingResult.pendingPosts
+    return {
+        changed: true,
+        pendingPostsChanged: true,
+        pendingPosts: pendingResult.pendingPosts,
+        repaired: 1
+    }
+}
+
 async function repairCoordinatorStorageFromProgressLocked() {
     const state = await loadCoordinatorState({
         [SPACE_PENDING_NUKED_POSTS_KEY]: {}
@@ -7371,6 +7410,13 @@ async function repairCoordinatorStorageFromProgressLocked() {
             pendingPosts = terminalResolverPendingRepair.pendingPosts || pendingPosts
             pendingPostsChanged = pendingPostsChanged || terminalResolverPendingRepair.pendingPostsChanged
             repaired += terminalResolverPendingRepair.repaired || 0
+        }
+
+        const resolvedResolverPendingRepair = repairResolvedResolverPendingSourceRecordsLocked(state, itemKey, item)
+        if(resolvedResolverPendingRepair.changed) {
+            pendingPosts = resolvedResolverPendingRepair.pendingPosts || pendingPosts
+            pendingPostsChanged = pendingPostsChanged || resolvedResolverPendingRepair.pendingPostsChanged
+            repaired += resolvedResolverPendingRepair.repaired || 0
         }
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -12552,6 +12598,9 @@ async function mutateCoordinatorProjection(operation = {}) {
     if(kind === 'requeueFailedItems') {
         return mutateCoordinatorFailedItemsRequeue(operation)
     }
+    if(kind === 'resolveQueuedProfileTarget') {
+        return mutateCoordinatorQueuedProfileTargetResolve(operation)
+    }
 
     return {
         changed: false,
@@ -17423,6 +17472,256 @@ function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options 
     return {pendingPosts: nextPending, changed}
 }
 
+async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') {
+        return {resolved: false, reason: 'invalid-resolver-remap-reason'}
+    }
+
+    const request = operation.request && typeof operation.request === 'object' ? operation.request : {}
+    const resolvedHref = normalizeQuoraProfileUrl(operation.resolvedHref || request.profileHref || request.resolvedProfileHref || '')
+    if(!resolvedHref) return {resolved: false, reason: 'invalid-profile'}
+
+    const tabId = normalizeTabId(operation.tabId || null)
+    const requestedUrl = normalizeCoordinatorRequestedUrl(operation.requestedUrl || request.requestedUrl || '')
+    const oldKey = `${operation.oldKey || request.coordinatorKey || ''}`.trim()
+    const oldProfileHref = normalizeQuoraProfileUrl(operation.oldProfileHref || request.requestedProfileHref || '')
+
+    const state = await loadCoordinatorState({
+        [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+    })
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
+    const pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    const requestedResolutionKey = makeProfileResolutionQueueKey(requestedUrl || '')
+    const matchingResolutionEntry = requestedUrl
+        ? Object.entries(queue).find(([key, candidate]) => {
+            if(!isProfileResolutionItem(candidate)) return false
+
+            const candidateRequestedUrl = normalizeCoordinatorRequestedUrl(
+                candidate.requestedUrl || stripProfileResolutionQueueKey(key)
+            )
+            return candidateRequestedUrl === requestedUrl
+        })
+        : null
+    const itemKey = oldKey && queue[oldKey] && isProfileResolutionItem(queue[oldKey])
+        ? oldKey
+        : requestedResolutionKey && queue[requestedResolutionKey]
+            ? requestedResolutionKey
+            : matchingResolutionEntry?.[0] || (
+                oldKey && queue[oldKey]
+                    ? oldKey
+                    : oldProfileHref && queue[oldProfileHref]
+                        ? oldProfileHref
+                        : resolvedHref && queue[resolvedHref]
+                            ? resolvedHref
+                            : ''
+    )
+    const item = itemKey ? queue[itemKey] : null
+    if(!item) return {resolved: false, reason: 'missing-coordinator-item'}
+    if(isTerminalCoordinatorStatus(item.status)) return {resolved: false, reason: 'terminal-coordinator-item'}
+    if(!isProfileResolutionItem(item)) return {resolved: false, reason: 'not-profile-resolution-item'}
+
+    if(hasMismatchedCoordinatorAttempt(item, request)) {
+        await recordStaleAttemptDiagnostic({
+            profileHref: resolvedHref,
+            incomingAttemptId: getAttemptIdFromValue(request),
+            expectedAttemptId: getAttemptIdFromValue(item),
+            senderTabId: tabId,
+            message: 'Ignored queued target resolution from stale attempt'
+        })
+        return {resolved: false, reason: 'stale-attempt'}
+    }
+
+    const existingResolvedItem = itemKey !== resolvedHref ? queue[resolvedHref] || null : null
+    const resolvedDestinationConflict = getResolvedDestinationConflict(existingResolvedItem, item)
+    if(resolvedDestinationConflict) {
+        return {resolved: false, reason: resolvedDestinationConflict}
+    }
+    const existingResolvedSucceeded = existingResolvedItem?.status === 'succeeded'
+    const now = Date.now()
+    const mergeBase = existingResolvedSucceeded
+        ? {
+            ...item,
+            ...existingResolvedItem
+        }
+        : {
+            ...(existingResolvedItem || item),
+            ...item
+        }
+    const nextItem = applyCoordinatorJobEnvelope({
+        ...mergeBase,
+        targetProfileHref: resolvedHref,
+        dedupeKey: resolvedHref,
+        coordinatorKey: resolvedHref,
+        resolutionMode: '',
+        resolveProfileFromPage: false,
+        requestedUrl: item.requestedUrl || operation.requestedUrl || request.requestedUrl || resolvedHref,
+        status: existingResolvedSucceeded
+            ? 'succeeded'
+            : isTerminalCoordinatorStatus(item.status) ? item.status : 'active',
+        outcome: existingResolvedSucceeded ? existingResolvedItem.outcome || 'already-blocked' : item.outcome || '',
+        error: existingResolvedSucceeded ? '' : item.error || '',
+        tabId: tabId || item.tabId || null,
+        activeAt: item.activeAt || now,
+        terminalAt: existingResolvedSucceeded ? now : item.terminalAt || 0,
+        updatedAt: now,
+        evidence: mergeCoordinatorEvidence(existingResolvedItem?.evidence || [], item.evidence || []),
+        sources: mergeCoordinatorSources(existingResolvedItem?.sources || [], item.sources || (item.source ? [item.source] : []))
+    }, {
+        runInput: {id: item.runId || '', sourceType: item.source?.type || ''},
+        source: item.source || {},
+        runId: item.runId || '',
+        targetProfileHref: resolvedHref,
+        requestedUrl: item.requestedUrl || operation.requestedUrl || request.requestedUrl || resolvedHref,
+        coordinatorKey: resolvedHref,
+        actionKind: item.actionKind || ''
+    })
+
+    const nextQueue = {
+        ...queue,
+        [resolvedHref]: nextItem
+    }
+    const removedRows = []
+    if(itemKey !== resolvedHref) {
+        delete nextQueue[itemKey]
+        removedRows.push({
+            rowKey: itemKey,
+            previousRow: item,
+            operationKind: 'resolver-remap',
+            reason: 'ordinaryMutation'
+        })
+    }
+
+    const affectedRunIds = new Set()
+    if(nextItem.runId) affectedRunIds.add(nextItem.runId)
+    if(existingResolvedItem?.runId) affectedRunIds.add(existingResolvedItem.runId)
+    for(const runId of getCoordinatorRunIdsForHref(runs, oldProfileHref)) {
+        affectedRunIds.add(runId)
+    }
+    const nextRunsBase = {
+        ...runs
+    }
+    for(const runId of affectedRunIds) {
+        const run = nextRunsBase[runId]
+        if(!run) continue
+        nextRunsBase[runId] = {
+            ...run,
+            targetProfileHrefs: getNormalizedProfileHrefList([
+                ...getCoordinatorRunTargetHrefs(run),
+                resolvedHref
+            ]),
+            targetWorkKeys: mergeUniqueStringList(
+                Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [],
+                [resolvedHref]
+            ).filter(key => key !== itemKey),
+            updatedAt: now
+        }
+    }
+    const nextRuns = affectedRunIds.size
+        ? recomputeCoordinatorRuns(nextQueue, nextRunsBase, affectedRunIds)
+        : nextRunsBase
+
+    const authorityResult = makeCoordinatorAuthorityApplyResult({
+        operationKind: 'resolver-remap',
+        rowKey: resolvedHref,
+        reason: 'ordinaryMutation'
+    }, {
+        accepted: true,
+        changed: true,
+        durable: true,
+        reason: 'persisted',
+        previousRow: existingResolvedItem,
+        nextRow: nextItem,
+        terminal: isTerminalCoordinatorStatus(nextItem.status),
+        allowTerminalOverwrite: existingResolvedSucceeded
+    })
+    const nextProjection = makeCoordinatorAuthorityProjection({
+        ...state,
+        queue: nextQueue,
+        runs: nextRuns
+    })
+    let persistence = null
+    try {
+        persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+            [authorityResult],
+            nextProjection,
+            {
+                operationKind: 'resolver-remap',
+                reason: 'ordinaryMutation',
+                previousProjectionQueue: queue,
+                removedRows,
+                metricPath: 'resolver.resolve.save.queueWal',
+                projectionMetricPath: 'resolver.resolve.save.projection'
+            }
+        )
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {
+            resolved: false,
+            reason: persistence?.reason || 'resolver-remap-save-failed',
+            persistence
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    const currentQueue = coordinatorAuthority.current().queue
+    const currentRuns = affectedRunIds.size
+        ? recomputeCoordinatorRuns(currentQueue, nextRunsBase, affectedRunIds)
+        : nextRuns
+    const pendingResult = addResolvedProfileToPendingSpaceRecords(
+        pendingPosts,
+        nextItem,
+        resolvedHref
+    )
+
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: currentRuns,
+            pendingPosts: pendingResult.changed ? pendingResult.pendingPosts : undefined
+        }, {
+            queue: false,
+            runs: true,
+            pendingPosts: pendingResult.changed,
+            reason: 'ordinaryMutation',
+            queueOperation: 'resolver-remap-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'resolver-remap-derived-save-failed',
+            error?.message || 'Resolver remap derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('resolver.resolve.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'resolver-remap-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
+
+    return {
+        resolved: true,
+        profileHref: resolvedHref,
+        nextItem,
+        requestedUrl: nextItem.requestedUrl || requestedUrl,
+        persistence,
+        derivedSaved
+    }
+}
+
 async function resolveQueuedProfileTarget(request = {}, sender = {}) {
     const resolvedHref = normalizeQuoraProfileUrl(request.profileHref || request.resolvedProfileHref || '')
     if(!resolvedHref) return {resolved: false, reason: 'invalid-profile'}
@@ -17436,154 +17735,36 @@ async function resolveQueuedProfileTarget(request = {}, sender = {}) {
         normalizeQuoraProfileUrl(request.requestedUrl || '')
     const oldProfileHref = normalizeQuoraProfileUrl(metadata?.profileHref || request.requestedProfileHref || '')
 
-    return enqueueSpaceFeedStorageUpdate(async () => {
-        const currentAuthorityState = await loadCoordinatorQueueRunsProjection({
-            metricPath: 'resolver.resolve.load'
+    const result = await enqueueSpaceFeedStorageUpdate(() => {
+        return mutateCoordinatorProjection({
+            kind: 'resolveQueuedProfileTarget',
+            reason: 'ordinaryMutation',
+            request,
+            resolvedHref,
+            tabId,
+            requestedUrl,
+            oldKey,
+            oldProfileHref
         })
-        const stored = await metricStorageGet({
-            [SPACE_PENDING_NUKED_POSTS_KEY]: {}
-        }, {
-            metricPath: 'resolver.resolve.pending.load'
-        })
-        const queue = currentAuthorityState.queue
-        const runs = currentAuthorityState.runs
-        const requestedResolutionKey = makeProfileResolutionQueueKey(requestedUrl || '')
-        const matchingResolutionEntry = requestedUrl
-            ? Object.entries(queue).find(([key, candidate]) => {
-                if(!isProfileResolutionItem(candidate)) return false
-
-                const candidateRequestedUrl = normalizeCoordinatorRequestedUrl(
-                    candidate.requestedUrl || stripProfileResolutionQueueKey(key)
-                )
-                return candidateRequestedUrl === requestedUrl
-            })
-            : null
-        const itemKey = oldKey && queue[oldKey] && isProfileResolutionItem(queue[oldKey])
-            ? oldKey
-            : requestedResolutionKey && queue[requestedResolutionKey]
-                ? requestedResolutionKey
-                : matchingResolutionEntry?.[0] || (
-                    oldKey && queue[oldKey]
-                        ? oldKey
-                        : oldProfileHref && queue[oldProfileHref]
-                            ? oldProfileHref
-                            : resolvedHref && queue[resolvedHref]
-                                ? resolvedHref
-                                : ''
-        )
-        const item = itemKey ? queue[itemKey] : null
-        if(!item) return {resolved: false, reason: 'missing-coordinator-item'}
-        if(isTerminalCoordinatorStatus(item.status)) return {resolved: false, reason: 'terminal-coordinator-item'}
-
-        if(hasMismatchedCoordinatorAttempt(item, request)) {
-            await recordStaleAttemptDiagnostic({
-                profileHref: resolvedHref,
-                incomingAttemptId: getAttemptIdFromValue(request),
-                expectedAttemptId: getAttemptIdFromValue(item),
-                senderTabId: tabId,
-                message: 'Ignored queued target resolution from stale attempt'
-            })
-            return {resolved: false, reason: 'stale-attempt'}
+    }, {
+        reason: 'resolver-remap',
+        failureValue: {
+            resolved: false,
+            reason: 'resolver-remap-storage-update-failed',
+            storageTimedOut: true
         }
-
-        const existingResolvedItem = itemKey !== resolvedHref ? queue[resolvedHref] || null : null
-        const resolvedDestinationConflict = getResolvedDestinationConflict(existingResolvedItem, item)
-        if(resolvedDestinationConflict) {
-            return {resolved: false, reason: resolvedDestinationConflict}
-        }
-        const existingResolvedSucceeded = existingResolvedItem?.status === 'succeeded'
-        const now = Date.now()
-        const mergeBase = existingResolvedSucceeded
-            ? {
-                ...item,
-                ...existingResolvedItem
-            }
-            : {
-                ...(existingResolvedItem || item),
-                ...item
-            }
-        const nextItem = applyCoordinatorJobEnvelope({
-            ...mergeBase,
-            targetProfileHref: resolvedHref,
-            dedupeKey: resolvedHref,
-            coordinatorKey: resolvedHref,
-            resolutionMode: '',
-            resolveProfileFromPage: false,
-            requestedUrl: item.requestedUrl || metadata?.requestedUrl || request.requestedUrl || resolvedHref,
-            status: existingResolvedSucceeded
-                ? 'succeeded'
-                : isTerminalCoordinatorStatus(item.status) ? item.status : 'active',
-            outcome: existingResolvedSucceeded ? existingResolvedItem.outcome || 'already-blocked' : item.outcome || '',
-            error: existingResolvedSucceeded ? '' : item.error || '',
-            tabId: tabId || item.tabId || null,
-            activeAt: item.activeAt || now,
-            terminalAt: existingResolvedSucceeded ? now : item.terminalAt || 0,
-            updatedAt: now,
-            evidence: mergeCoordinatorEvidence(existingResolvedItem?.evidence || [], item.evidence || []),
-            sources: mergeCoordinatorSources(existingResolvedItem?.sources || [], item.sources || (item.source ? [item.source] : []))
-        }, {
-            runInput: {id: item.runId || '', sourceType: item.source?.type || ''},
-            source: item.source || {},
-            runId: item.runId || '',
-            targetProfileHref: resolvedHref,
-            requestedUrl: item.requestedUrl || metadata?.requestedUrl || request.requestedUrl || resolvedHref,
-            coordinatorKey: resolvedHref,
-            actionKind: item.actionKind || ''
-        })
-
-        if(itemKey !== resolvedHref) delete queue[itemKey]
-        queue[resolvedHref] = nextItem
-
-        const affectedRunIds = new Set()
-        if(nextItem.runId) affectedRunIds.add(nextItem.runId)
-        if(existingResolvedItem?.runId) affectedRunIds.add(existingResolvedItem.runId)
-        for(const runId of getCoordinatorRunIdsForHref(runs, oldProfileHref)) {
-            affectedRunIds.add(runId)
-        }
-        for(const runId of affectedRunIds) {
-            const run = runs[runId]
-            if(!run) continue
-            runs[runId] = {
-                ...run,
-                targetProfileHrefs: getNormalizedProfileHrefList([
-                    ...getCoordinatorRunTargetHrefs(run),
-                    resolvedHref
-                ]),
-                targetWorkKeys: mergeUniqueStringList(
-                    Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [],
-                    [resolvedHref]
-                ).filter(key => key !== itemKey),
-                updatedAt: now
-            }
-        }
-        const nextRuns = affectedRunIds.size
-            ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
-            : runs
-
-        const pendingResult = addResolvedProfileToPendingSpaceRecords(
-            stored[SPACE_PENDING_NUKED_POSTS_KEY] || {},
-            nextItem,
-            resolvedHref
-        )
-        const payload = {
-            [COORDINATOR_QUEUE_KEY]: queue,
-            [COORDINATOR_RUNS_KEY]: nextRuns
-        }
-        if(pendingResult.changed) {
-            payload[SPACE_PENDING_NUKED_POSTS_KEY] = pendingResult.pendingPosts
-        }
-        await metricStorageSet(payload, {
-            snapshotWriteReason: 'ordinaryMutation',
-            queueOperation: 'resolver-remap',
-            queueChangedRows: itemKey !== resolvedHref && existingResolvedItem ? 2 : 1
-        })
-
-        if(tabId) {
-            remapQueuedTabToResolvedProfile(tabId, nextItem, resolvedHref, nextItem.requestedUrl || requestedUrl)
-        }
-
-        return {resolved: true, profileHref: resolvedHref}
     })
+
+    if(result?.resolved === true && tabId && result.nextItem) {
+        remapQueuedTabToResolvedProfile(
+            tabId,
+            result.nextItem,
+            resolvedHref,
+            result.requestedUrl || requestedUrl
+        )
+    }
+
+    return result || {resolved: false, reason: 'resolver-remap-save-failed'}
 }
 
 async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) {
