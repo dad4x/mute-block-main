@@ -148,7 +148,9 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'stale-retry',
     'rollback-active-transition',
     'repair-active-without-actor',
-    'active-transition'
+    'active-transition',
+    'action-lease-request',
+    'action-lease-tab-release'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -13043,22 +13045,20 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
     }
 
     const now = Number.parseInt(operation.now, 10) || Date.now()
-    const state = await loadCoordinatorQueueProjection()
-    const queue = state.queue
-    let queueChanged = clearExpiredCoordinatorActionLeases(queue, now)
+    let currentAuthorityState = await loadCoordinatorQueueProjection({
+        metricPath: 'actionLease.request.load'
+    })
+    const queue = currentAuthorityState.queue
     const entry = findCoordinatorQueueEntryForHref(queue, profileHref)
     const item = entry?.item || null
 
     if(!item) {
-        await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
         return {granted: false, reason: 'missing-coordinator-item'}
     }
     if(isTerminalCoordinatorStatus(item.status)) {
-        await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
         return {granted: false, reason: 'terminal-coordinator-item'}
     }
     if(hasMismatchedCoordinatorAttempt(item, {attemptId, attemptNumber})) {
-        await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
         await recordStaleAttemptDiagnostic({
             profileHref,
             incomingAttemptId: attemptId,
@@ -13071,7 +13071,6 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
 
     const activeLease = findActiveCoordinatorActionLease(queue, now)
     if(activeLease && !isCoordinatorActionLeaseHolder(activeLease.lease, tabId, attemptId)) {
-        await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
         return {
             granted: false,
             actionLeaseBusy: true,
@@ -13082,32 +13081,81 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
         }
     }
 
+    const expectedAttemptId = attemptId || getAttemptIdFromValue(item)
+    const expectedAttemptNumber = attemptNumber || getAttemptNumberFromValue(item)
     const lease = makeCoordinatorActionLease(item, {
-        attemptId: attemptId || getAttemptIdFromValue(item),
-        attemptNumber: attemptNumber || getAttemptNumberFromValue(item),
+        attemptId: expectedAttemptId,
+        attemptNumber: expectedAttemptNumber,
         actionKind: operation.actionKind || item.actionKind || '',
         reason: operation.requestReason || '',
         profileHref,
         tabId
     }, {tab: {id: tabId}}, now)
     if(!lease) {
-        await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
         return {granted: false, reason: 'invalid-action-lease'}
     }
 
-    queue[entry.key] = {
-        ...item,
-        actionLease: lease,
-        actionLeaseReleasedAt: 0,
-        actionLeaseReleaseReason: '',
-        updatedAt: now
-    }
-    queueChanged = true
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'action-lease-request',
+        rowKey: entry.key,
+        expectedAttemptId,
+        expectedAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'actionLease.request.save',
+        currentAuthorityState,
+        mutate(currentItem, context) {
+            if(!currentItem) {
+                return context.reject('missing-coordinator-item')
+            }
+            if(isTerminalCoordinatorStatus(currentItem.status)) {
+                return context.reject('terminal-coordinator-item')
+            }
+            if(hasMismatchedCoordinatorAttempt(currentItem, {attemptId: expectedAttemptId, attemptNumber: expectedAttemptNumber})) {
+                return context.reject('stale-coordinator-attempt', {staleAttempt: true})
+            }
+            const currentQueue = {
+                ...(currentAuthorityState.queue || {}),
+                [entry.key]: currentItem
+            }
+            const currentActiveLease = findActiveCoordinatorActionLease(currentQueue, now)
+            if(currentActiveLease && !isCoordinatorActionLeaseHolder(currentActiveLease.lease, tabId, expectedAttemptId)) {
+                return context.reject('action-lease-busy')
+            }
+            const currentLease = makeCoordinatorActionLease(currentItem, {
+                attemptId: expectedAttemptId || getAttemptIdFromValue(currentItem),
+                attemptNumber: expectedAttemptNumber || getAttemptNumberFromValue(currentItem),
+                actionKind: operation.actionKind || currentItem.actionKind || '',
+                reason: operation.requestReason || '',
+                profileHref,
+                tabId
+            }, {tab: {id: tabId}}, now)
+            if(!currentLease) {
+                return context.reject('invalid-action-lease')
+            }
+            return {
+                ...currentItem,
+                actionLease: currentLease,
+                actionLeaseReleasedAt: 0,
+                actionLeaseReleaseReason: '',
+                updatedAt: now
+            }
+        }
+    })
 
-    await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-request', queueChangedRows: queueChanged ? 1 : 0})
+    if(authorityResult?.accepted === true && authorityResult?.durable === true) {
+        currentAuthorityState = coordinatorAuthority.current()
+        return {
+            granted: true,
+            actionLease: authorityResult.nextRow?.actionLease || currentAuthorityState.queue?.[entry.key]?.actionLease || lease,
+            persistence: authorityResult.persistence || null
+        }
+    }
+
     return {
-        granted: true,
-        actionLease: lease
+        granted: false,
+        actionLeaseBusy: authorityResult?.reason === 'action-lease-busy',
+        staleAttempt: authorityResult?.staleAttempt === true,
+        reason: authorityResult?.reason || 'authority-apply-failed'
     }
 }
 
@@ -13254,32 +13302,59 @@ async function mutateCoordinatorActionLeasesForTabRelease(operation = {}) {
 
     const now = Number.parseInt(operation.now, 10) || Date.now()
     const releaseReason = `${operation.releaseReason || 'tab-released'}`.trim()
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
+    let currentAuthorityState = await loadCoordinatorQueueProjection({
         metricPath: 'actionLease.tabRelease.load'
     })
     const queue = currentAuthorityState.queue
-    let queueChanged = clearExpiredCoordinatorActionLeases(queue, now)
     let released = false
     let releasedRows = 0
+    let failedRows = 0
+    let lastFailureReason = ''
 
     for(const [key, item] of Object.entries(queue || {})) {
         const lease = normalizeCoordinatorActionLease(item?.actionLease)
         if(!lease || lease.tabId !== tabId) continue
 
-        queue[key] = {
-            ...item,
-            actionLease: null,
-            actionLeaseReleasedAt: now,
-            actionLeaseReleaseReason: releaseReason,
-            updatedAt: now
+        const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+            operationKind: 'action-lease-tab-release',
+            rowKey: key,
+            expectedAttemptId: getAttemptIdFromValue(item) || lease.attemptId || '',
+            expectedAttemptNumber: getAttemptNumberFromValue(item) || lease.attemptNumber || 0,
+            reason: 'ordinaryMutation',
+            metricPath: 'actionLease.tabRelease.save',
+            currentAuthorityState,
+            mutate(currentItem, context) {
+                const currentLease = normalizeCoordinatorActionLease(currentItem?.actionLease)
+                if(!currentLease || currentLease.tabId !== tabId) {
+                    return context.reject('action-lease-lost')
+                }
+                if(lease.attemptId && currentLease.attemptId !== lease.attemptId) {
+                    return context.reject('action-lease-changed')
+                }
+                if(lease.attemptNumber && currentLease.attemptNumber !== lease.attemptNumber) {
+                    return context.reject('action-lease-changed')
+                }
+                return {
+                    ...currentItem,
+                    actionLease: null,
+                    actionLeaseReleasedAt: now,
+                    actionLeaseReleaseReason: releaseReason,
+                    updatedAt: now
+                }
+            }
+        })
+        if(authorityResult?.accepted === true && authorityResult?.durable === true) {
+            released = true
+            releasedRows += 1
+            currentAuthorityState = coordinatorAuthority.current()
         }
-        released = true
-        releasedRows += 1
-        queueChanged = true
+        else {
+            failedRows += 1
+            lastFailureReason = authorityResult?.reason || 'authority-apply-failed'
+        }
     }
 
-    await saveCoordinatorQueueProjection(queue, {queueChanged, reason: 'ordinaryMutation', queueOperation: 'lease-tab-release', queueChangedRows: releasedRows || (queueChanged ? 1 : 0)})
-    return {released}
+    return {released, releasedRows, failedRows, reason: lastFailureReason}
 }
 
 async function requestCoordinatorActionLease(request = {}, sender = {}) {

@@ -2540,6 +2540,102 @@ test('terminal settlement derived save failure does not poison authority settlem
     )
 })
 
+test('action lease request is WAL-backed and recovers after restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Request'
+    const runId = 'run-lease-request'
+    const attemptId = 'attempt-lease-request'
+    const tabId = 619
+    const now = 259000
+    const {storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const result = await sw.requestCoordinatorActionLease({
+        profileHref: href,
+        attemptId,
+        attemptNumber: 1,
+        actionKind: 'mute-block',
+        reason: 'test-request'
+    }, {
+        tab: {id: tabId}
+    })
+
+    assert.equal(result.granted, true)
+    assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
+    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.reason, 'test-request')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'action-lease-request')
+
+    const restarted = loadServiceWorkerHarness({
+        now: now + 1000,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].actionLease.reason, 'test-request')
+    assert.equal(hydrated.queue[href].actionLease.tabId, tabId)
+})
+
+test('action lease request WAL append failure rejects durable mutation', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Request-Append-Failure'
+    const runId = 'run-lease-request-append-failure'
+    const attemptId = 'attempt-lease-request-append-failure'
+    const tabId = 6191
+    const now = 259500
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic action lease request WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.requestCoordinatorActionLease({
+        profileHref: href,
+        attemptId,
+        attemptNumber: 1,
+        actionKind: 'mute-block',
+        reason: 'append-failure-request'
+    }, {
+        tab: {id: tabId}
+    })
+
+    assert.equal(result.granted, false)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, undefined)
+})
+
 test('action lease heartbeat is WAL-backed and does not clear unrelated expired lease', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Lease-Heartbeat'
     const otherHref = 'https://www.quora.com/profile/Synthetic-Lease-Expired-Other'
@@ -2775,6 +2871,116 @@ test('action lease tab release uses WAL terminal authority over stale raw lease'
     assert.equal(hydrated.queue[href].actionLease, null)
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'terminal-progress')
+})
+
+test('action lease tab release is WAL-backed and recovers after restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Tab-Release'
+    const runId = 'run-lease-tab-release'
+    const attemptId = 'attempt-lease-tab-release'
+    const tabId = 6261
+    const now = 261700
+    const {storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now}),
+                    actionLease: {
+                        kind: 'profile-menu',
+                        actionKind: 'mute-block',
+                        profileHref: href,
+                        tabId,
+                        attemptId,
+                        attemptNumber: 1,
+                        grantedAt: now - 5000,
+                        heartbeatAt: now - 1000,
+                        expiresAt: now + 10000,
+                        reason: 'tab-release'
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const result = await sw.releaseCoordinatorActionLeaseForTab(tabId, 'queued-tab-slot-release')
+
+    assert.equal(result.released, true)
+    assert.equal(result.releasedRows, 1)
+    assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'tab-release')
+    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLeaseReleaseReason, 'queued-tab-slot-release')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'action-lease-tab-release')
+
+    const restarted = loadServiceWorkerHarness({
+        now: now + 1000,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].actionLease, null)
+    assert.equal(hydrated.queue[href].actionLeaseReleaseReason, 'queued-tab-slot-release')
+})
+
+test('action lease tab release WAL append failure leaves lease active', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Tab-Release-Append-Failure'
+    const runId = 'run-lease-tab-release-append-failure'
+    const attemptId = 'attempt-lease-tab-release-append-failure'
+    const tabId = 6262
+    const now = 261800
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now}),
+                    actionLease: {
+                        kind: 'profile-menu',
+                        actionKind: 'mute-block',
+                        profileHref: href,
+                        tabId,
+                        attemptId,
+                        attemptNumber: 1,
+                        grantedAt: now - 5000,
+                        heartbeatAt: now - 1000,
+                        expiresAt: now + 10000,
+                        reason: 'tab-release-append-failure'
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic action lease tab release WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.releaseCoordinatorActionLeaseForTab(tabId, 'queued-tab-slot-release')
+
+    assert.equal(result.released, false)
+    assert.equal(result.failedRows, 1)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'tab-release-append-failure')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.reason, 'tab-release-append-failure')
 })
 
 test('action lease heartbeat WAL append failure rejects durable mutation', async () => {
@@ -8653,7 +8859,7 @@ test('confirmation promotion in no-foreground worker window briefly focuses and 
     assert.equal(browser.__windowUpdates.some(update =>
         update.windowId === workerWindowId && update.options?.focused === true
     ), true)
-    assert.equal(storage.mbCoordinatorQueue[href].actionLease.tabId, profileTab.id)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.tabId, profileTab.id)
 
     browser.__windowUpdates.splice(0, browser.__windowUpdates.length)
     const released = await browser.runtime.sendMessage({
@@ -8974,7 +9180,7 @@ test('begin-profile-action grants initial action gate without foreground promoti
     assert.equal((await browser.tabs.get(tab.id)).active, false)
     const metadata = sw.state().queuedTabMetadata.find(([tabId]) => tabId === tab.id)?.[1] || {}
     assert.equal(metadata.foregroundPromotionReason || '', '')
-    assert.equal(storage.mbCoordinatorQueue[href].actionLease.tabId, tab.id)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.tabId, tab.id)
 })
 
 test('begin-profile-action promotes a hidden confirmation action', async () => {
@@ -9050,7 +9256,7 @@ test('begin-profile-action promotes a hidden confirmation action', async () => {
     assert.equal((await browser.tabs.get(tab.id)).active, true)
     const metadata = sw.state().queuedTabMetadata.find(([tabId]) => tabId === tab.id)?.[1] || {}
     assert.equal(metadata.foregroundPromotionReason, 'block-confirmation')
-    assert.equal(storage.mbCoordinatorQueue[href].actionLease.tabId, tab.id)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.tabId, tab.id)
 })
 
 test('begin-profile-action denies and releases lease when foreground promotion fails', async () => {
