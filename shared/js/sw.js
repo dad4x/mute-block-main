@@ -138,6 +138,7 @@ const MAX_PROGRESS_SHADOW_WAL_RECORDS = 128
 const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = 128
 const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'terminal-progress',
+    'direct-progress',
     'row-event-progress-milestone',
     'terminal-settlement',
     'action-lease-heartbeat',
@@ -19193,7 +19194,6 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         const terminalSettlementHrefs = new Set()
         const terminalCompatibilityProgressRecords = {}
         let queueChanged = false
-        let snapshotQueueChanged = false
         let progressChanged = false
         let progressChangedRows = 0
 
@@ -19265,49 +19265,39 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                         now: Date.now()
                     })
                     if(JSON.stringify(nextItem) !== JSON.stringify(item)) {
-                        if(mappedTerminal) {
-                            const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-                                operationKind: 'terminal-progress',
-                                rowKey: normalizedHref,
-                                expectedAttemptId: getAttemptIdFromValue(item),
-                                expectedAttemptNumber: getAttemptNumberFromValue(item),
-                                reason: 'ordinaryMutation',
-                                metricPath: 'terminalProgress.save',
-                                currentAuthorityState,
-                                mutate(currentItem) {
-                                    if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
-                                        return {
-                                            accepted: false,
-                                            reason: 'row-changed-before-authority-apply'
-                                        }
+                        const queueOperationKind = mappedTerminal ? 'terminal-progress' : 'direct-progress'
+                        const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+                            operationKind: queueOperationKind,
+                            rowKey: normalizedHref,
+                            expectedAttemptId: getAttemptIdFromValue(item),
+                            expectedAttemptNumber: getAttemptNumberFromValue(item),
+                            reason: 'ordinaryMutation',
+                            metricPath: 'terminalProgress.save',
+                            currentAuthorityState,
+                            mutate(currentItem) {
+                                if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
+                                    return {
+                                        accepted: false,
+                                        reason: 'row-changed-before-authority-apply'
                                     }
-                                    return nextItem
                                 }
-                            })
+                                return nextItem
+                            }
+                        })
 
-                            if(authorityResult?.accepted === true && authorityResult?.durable === true) {
-                                currentAuthorityState = coordinatorAuthority.current()
-                                queue = currentAuthorityState.queue
-                                queueChanged = true
-                                terminalSettlementHrefs.add(normalizedHref)
-                            }
-                            else {
-                                results[normalizedHref] = {
-                                    recorded: false,
-                                    terminal: false,
-                                    reason: authorityResult?.reason || 'authority-apply-failed'
-                                }
-                                continue
-                            }
+                        if(authorityResult?.accepted === true && authorityResult?.durable === true) {
+                            currentAuthorityState = coordinatorAuthority.current()
+                            queue = currentAuthorityState.queue
+                            queueChanged = true
+                            if(mappedTerminal) terminalSettlementHrefs.add(normalizedHref)
                         }
                         else {
-                            queue[normalizedHref] = nextItem
-                            currentAuthorityState = {
-                                ...currentAuthorityState,
-                                queue
+                            results[normalizedHref] = {
+                                recorded: false,
+                                terminal: false,
+                                reason: authorityResult?.reason || 'authority-apply-failed'
                             }
-                            queueChanged = true
-                            snapshotQueueChanged = true
+                            continue
                         }
 
                         if(nextItem.runId) affectedRunIds.add(nextItem.runId)
@@ -19359,7 +19349,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
             : runs
         const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
         if(runsChanged) runs = nextRuns
-        const deferCompatibilitySave = terminalSettlementHrefs.size > 0 && !snapshotQueueChanged
+        const terminalCompatibilityProgressRows = Object.keys(terminalCompatibilityProgressRecords).length
+        const deferCompatibilitySave = terminalSettlementHrefs.size > 0 &&
+            terminalCompatibilityProgressRows === progressChangedRows
 
         if(!deferCompatibilitySave) {
             await saveCoordinatorState({
@@ -19367,13 +19359,13 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                 runs,
                 progress
             }, {
-                queue: snapshotQueueChanged,
+                queue: false,
                 runs: runsChanged,
                 progress: progressChanged,
                 progressChangedRows,
                 reason: 'ordinaryMutation',
-                queueOperation: 'terminal-progress',
-                queueChangedRows: snapshotQueueChanged ? progressChangedRows : 0
+                queueOperation: terminalCompatibilityProgressRows === progressChangedRows ? 'terminal-progress' : 'direct-progress',
+                queueChangedRows: 0
             })
         }
         return {
