@@ -435,6 +435,7 @@ module.exports.__test = {
     scheduleStoredWorkRepair,
     settleTerminalCoordinatorItems,
     startQueueWakeupMetricsBackedStartupWork,
+    syncCoordinatorProgressRecords,
     sweepStaleQueuedTabs,
     switchCoordinatorAuthorityQueueWalCheckpoint,
     terminalizeCoordinatorKeyOnlyItem,
