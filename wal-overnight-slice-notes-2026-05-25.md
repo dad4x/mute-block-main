@@ -681,3 +681,39 @@ pressure remains a separate performance/reliability follow-up.
   tunnel on `127.0.0.1:10022` still timed out before authentication, so live
   Chrome could not be updated; CDP inspection showed the live unpacked extension
   still enabled at `1.6.569` with no manifest/runtime errors.
+
+## Slice 25: bulk current-work pause WAL batch migration
+
+- Operation migrated: dashboard/source-page pause (`pause-coordinator-nukes`)
+  now requeues active/opening/acting/settling queue rows through WAL-backed
+  `stored-work-pause` records in one batch append.
+- Authority boundary: the pause path loads the WAL-recovered coordinator state,
+  treats already queued rows as no-op paused work, and appends only rows that
+  need durable active-to-queued requeue. Pause cleanup stops before
+  `stopOwnerNukes()` or tab removal if the durable pause row mutation fails.
+- Persistence boundary: row requeue is durable when the queue WAL batch append
+  succeeds. The pause flag/generation remains a separate pause-control write.
+  Runs/events/progress reset compatibility saves happen after WAL acknowledgement
+  with `queue: false`; derived-save failure records diagnostics and schedules
+  repair without poisoning the durable row pause.
+- Still snapshot-backed: manual retry/requeue, enqueue, and resolver remap
+  remain separate review-gated slices. The batch WAL writer is still limited to
+  same-key row updates and is not used for failed-item key moves.
+- Inventory: the stored-work pause call-site inventory now reflects the
+  WAL-backed row mutation and derived compatibility boundary.
+- Validation: covered by `bulk current work pause WAL-requeues active rows as a
+  batch`, `bulk current work pause WAL append failure does not close active
+  owned tab`, and updated P1 storage-authority contracts; `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.572`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.572.zip` and
+  `firefox/mute_block-1.6.572.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.572` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 364 recovered/view rows, no view mismatches, and an active
+  WAL tail with 7 applied records; raw-vs-recovered count divergence is from
+  unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard sanity
+  showed 4 ready, 327 succeeded, 4 soft-fail, 0 hard-fail, 0 active, and 4
+  per-row cancel buttons for 80 displayed rows.

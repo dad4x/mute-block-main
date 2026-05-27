@@ -1040,6 +1040,144 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
     assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
 })
 
+test('bulk current work pause WAL-requeues active rows as a batch', async () => {
+    const hrefActive = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Active'
+    const hrefQueued = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Queued'
+    const runId = 'run-bulk-pause'
+    const attemptId = 'attempt-bulk-pause-active'
+    const tabId = 703
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 504000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefActive]: makeActiveCoordinatorRow({href: hrefActive, runId, attemptId, tabId, now: 504000}),
+                [hrefQueued]: makeQueuedCoordinatorRow({href: hrefQueued, runId, attemptId: 'attempt-bulk-pause-queued', now: 504000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefActive, hrefQueued],
+                    targetWorkKeys: [hrefActive, hrefQueued]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [hrefActive]: {
+                    profileHref: hrefActive,
+                    status: 'tab-opened',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 503700
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: hrefActive,
+        active: false
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'pause-coordinator-nukes'
+    }), timers)
+
+    assert.equal(result.paused, true)
+    assert.equal(result.pausedUrls.length, 2)
+    assert.equal(storage.mbCoordinatorPaused, true)
+    assert.equal(storage.mbCoordinatorQueue[hrefActive].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[hrefQueued].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefActive].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefQueued].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 2)
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
+    assert.equal(storage.mbCoordinatorEvents[0].type, 'paused')
+    assert.equal(browser.__removedTabs.includes(tabId), true)
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'stored-work-pause')
+    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    assert.equal(recovered[hrefActive].status, 'queued')
+    assert.equal(recovered[hrefQueued].status, 'queued')
+})
+
+test('bulk current work pause WAL append failure does not close active owned tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Wal-Failure'
+    const runId = 'run-bulk-pause-wal-failure'
+    const attemptId = 'attempt-bulk-pause-wal-failure'
+    const tabId = 704
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 505000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 505000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opened',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 504700
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic bulk current work pause WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'pause-coordinator-nukes'
+    }), timers)
+
+    assert.equal(result.paused, false)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(result.ownedTabIds.length, 0)
+    assert.equal(storage.mbCoordinatorPaused, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(browser.__removedTabs.includes(tabId), false)
+    assert.equal(browser.__tabs.has(tabId), true)
+})
+
 test('progress shadow WAL append uses bounded incremental replay', async () => {
     const runId = 'run-bounded-shadow-wal'
     const attemptId = 'attempt-bounded-shadow-wal'
