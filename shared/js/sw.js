@@ -12662,6 +12662,11 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
         attemptNumber: Number.parseInt(details.attemptNumber, 10) || getAttemptNumberFromValue(action)
     }
     if(hasMismatchedCoordinatorAttempt(item, attemptedRecord)) return false
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const currentAttemptNumber = getAttemptNumberFromValue(item)
+    const incomingAttemptId = getAttemptIdFromValue(attemptedRecord)
+    const incomingAttemptNumber = getAttemptNumberFromValue(attemptedRecord)
+    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) return false
 
     const itemTabId = normalizeTabId(item.tabId)
     const tabId = normalizeTabId(tab?.id)
@@ -12690,8 +12695,8 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
         operationKind: 'rollback-active-transition',
         rowKey: itemKey,
-        expectedAttemptId: getAttemptIdFromValue(attemptedRecord),
-        expectedAttemptNumber: getAttemptNumberFromValue(attemptedRecord),
+        expectedAttemptId: currentAttemptId ? incomingAttemptId : '',
+        expectedAttemptNumber: currentAttemptNumber ? incomingAttemptNumber : 0,
         reason: 'ordinaryMutation',
         metricPath: 'rollbackActiveTransition.save',
         currentAuthorityState,
@@ -12701,6 +12706,10 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
             }
             if(hasMismatchedCoordinatorAttempt(currentItem, attemptedRecord)) {
                 return context.reject('attempt-changed')
+            }
+            if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
+                (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
+                return context.reject('missing-attempt-identity', {staleAttempt: true})
             }
             const currentTabId = normalizeTabId(currentItem.tabId)
             if(currentTabId && tabId && currentTabId !== tabId) {
@@ -13058,6 +13067,13 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
     if(isTerminalCoordinatorStatus(item.status)) {
         return {granted: false, reason: 'terminal-coordinator-item'}
     }
+    if(!isActiveCoordinatorStatus(item.status)) {
+        return {granted: false, reason: 'inactive-coordinator-item'}
+    }
+    const itemTabId = normalizeTabId(item.tabId || item.activeTabId || null)
+    if(itemTabId !== tabId) {
+        return {granted: false, reason: 'active-tab-mismatch'}
+    }
     if(hasMismatchedCoordinatorAttempt(item, {attemptId, attemptNumber})) {
         await recordStaleAttemptDiagnostic({
             profileHref,
@@ -13123,6 +13139,13 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
             }
             if(isTerminalCoordinatorStatus(currentItem.status)) {
                 return context.reject('terminal-coordinator-item')
+            }
+            if(!isActiveCoordinatorStatus(currentItem.status)) {
+                return context.reject('inactive-coordinator-item')
+            }
+            const currentItemTabId = normalizeTabId(currentItem.tabId || currentItem.activeTabId || null)
+            if(currentItemTabId !== tabId) {
+                return context.reject('active-tab-mismatch')
             }
             if(hasMismatchedCoordinatorAttempt(currentItem, {attemptId: expectedAttemptId, attemptNumber: expectedAttemptNumber})) {
                 return context.reject('stale-coordinator-attempt', {staleAttempt: true})
