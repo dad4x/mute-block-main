@@ -11051,6 +11051,102 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     ), true)
 })
 
+test('enqueue resetExisting derived save failure repair replaces stale progress attempt', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Reset-Derived-Failure'
+    const oldRunId = 'run-enqueue-reset-derived-old'
+    const nextRunId = 'run-enqueue-reset-derived-next'
+    const oldAttemptId = 'attempt-enqueue-reset-derived-old'
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        now: 3090,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId: oldRunId, attemptId: oldAttemptId, tabId: 791, now: 3090})
+            },
+            mbCoordinatorRuns: {
+                [oldRunId]: makeCoordinatorRun({href, runId: oldRunId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opened',
+                    runId: oldRunId,
+                    tabId: 791,
+                    actionKind: 'mute-block',
+                    attemptId: oldAttemptId,
+                    attemptNumber: 1,
+                    blockAttempted: true,
+                    blockSucceeded: false,
+                    updatedAt: 3080
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic reset enqueue derived save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const enqueue = await browser.runtime.sendMessage({
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: nextRunId,
+            sourceType: 'space-feed',
+            resetExisting: true
+        },
+        source: {
+            type: 'space-feed',
+            pageUrl: 'https://www.quora.com/space/example'
+        },
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: 1,
+            noForegroundFallback: true
+        },
+        items: [{
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            resetExisting: true
+        }]
+    }, sourceSender)
+
+    assert.equal(enqueue.merged, 1)
+    assert.equal(enqueue.durable, true)
+    assert.equal(enqueue.derivedSaved, false)
+    const walRow = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(walRow.status, 'queued')
+    assert.equal(walRow.runId, nextRunId)
+    assert.notEqual(walRow.attemptId, oldAttemptId)
+    assert.equal(walRow.attemptNumber, 2)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
+    assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
+    browser.storage.local.set = originalSet
+
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.ok(repair.repaired > 0)
+    assert.equal(repair.progressChanged, true)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgress[href].runId, nextRunId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, walRow.attemptId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptNumber, walRow.attemptNumber)
+    assert.equal(storage.mbProfileNukeProgress[href].tabId, null)
+    assert.equal(storage.mbProfileNukeProgress[href].blockAttempted, false)
+    assert.equal(storage.mbCoordinatorRuns[nextRunId].targetProfileHrefs.includes(href), true)
+    assert.equal(storage.mbCoordinatorEvents.some(event =>
+        event.runId === nextRunId &&
+        event.type === 'repair' &&
+        event.details?.reason === 'enqueue-derived-repair'
+    ), true)
+})
+
 test('executable enqueue preserves explicit pause and does not open worker tabs', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Paused-Enqueue'
     const runId = 'run-paused-executable-enqueue'

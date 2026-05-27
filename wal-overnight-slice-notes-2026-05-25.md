@@ -859,6 +859,25 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and an active WAL tail with 1 applied
   record. Dashboard sanity showed 32 ready, 407 succeeded, 12 soft-fail,
   0 hard-fail, 1 active, and 33 per-row cancel buttons for 80 displayed rows.
+- Review closeout 2: reviewer follow-up found that resetExisting enqueue could
+  leave an old same-href progress record with the previous attempt id after an
+  `enqueue-derived` save failure. The derived-state repair materializer now
+  rebuilds queued service-worker progress when the existing record is missing
+  or stale/missing attempt identity for the durable queued WAL row. Added a
+  synthetic resetExisting regression that preserves the old active progress
+  through the failed derived save, then verifies repair replaces it with queued
+  progress carrying the WAL row attempt id/number and clears old active fields.
+  Validation: `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`,
+  `timeout 120 node test/swSynthetic.test.js`, `node test/p1-contract.test.js`,
+  and `npm test` passed. Version bumped to `1.6.578`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.578.zip` and `firefox/mute_block-1.6.578.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.578` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 463 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an active WAL tail with 1 applied
+  record. Dashboard sanity showed 18 ready, 401 succeeded, 12 soft-fail,
+  0 hard-fail, 1 active, and 19 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
