@@ -1732,6 +1732,8 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
     const unresolvedBody = extractFunction(source, 'async function markQueuedProfileResolutionUnresolved(request = {}, sender = {})')
+    const repairHelperBody = extractFunction(source, 'function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
+    const repairBody = extractFunction(source, 'async function repairCoordinatorStorageFromProgressLocked()')
 
     assert.match(helperBody, /resolverPending !== true/)
     assert.match(helperBody, /record\?\.resolverUrl/)
@@ -1744,6 +1746,10 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.match(unresolvedBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'resolver-unresolved'/)
     assert.match(unresolvedBody, /expectedAttemptId: currentAttemptId \? incomingAttemptId : ''/)
     assert.match(unresolvedBody, /missing-attempt-identity/)
+    assert.match(unresolvedBody, /isProfileResolutionItem\(item\)/)
+    assert.match(unresolvedBody, /isActiveCoordinatorStatus\(item\.status\)/)
+    assert.match(unresolvedBody, /isProfileResolutionItem\(currentItem\)/)
+    assert.match(unresolvedBody, /isActiveCoordinatorStatus\(currentItem\.status\)/)
     assert.match(unresolvedBody, /\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
     assert.match(unresolvedBody, /clearResolverPendingSpaceRecords\(pendingPosts, nextItem/)
     assert.match(unresolvedBody, /pendingPosts: pendingResult\.pendingPosts/)
@@ -1752,6 +1758,10 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.doesNotMatch(unresolvedBody, /loadCoordinatorState\(/)
     assert.doesNotMatch(unresolvedBody, /queue: true/)
     assert.doesNotMatch(unresolvedBody, /browser\.storage\.local\.set\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]: pendingResult\.pendingPosts\}\)/)
+    assert.match(repairHelperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
+    assert.match(repairHelperBody, /isProfileResolutionItem\(item\)/)
+    assert.match(repairHelperBody, /clearResolverPendingSpaceRecords\(pendingPosts, item/)
+    assert.match(repairBody, /repairTerminalResolverPendingSourceRecordsLocked\(state, itemKey, item\)/)
 })
 
 test('failed resolver requeue preserves source-post resolution mode', () => {

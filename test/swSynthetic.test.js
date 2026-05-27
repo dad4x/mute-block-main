@@ -5847,6 +5847,47 @@ test('unresolved resolver WAL append failure leaves row active', async () => {
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
 })
 
+test('unresolved resolver rejects non-resolution active row before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Not-Resolver-Unresolved'
+    const runId = 'run-not-resolver-unresolved'
+    const attemptId = 'attempt-not-resolver-unresolved'
+    const tabId = 6241
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 426982,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 426982})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resolve-queued-profile-target-failed',
+        requestedUrl: href,
+        coordinatorKey: href,
+        attemptId,
+        attemptNumber: 1,
+        error: 'synthetic non-resolver unresolved'
+    }, {
+        tab: {
+            id: tabId,
+            url: href
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.reason, 'not-profile-resolution-item')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
 test('unresolved resolver derived save failure does not poison WAL terminalization', async () => {
     const requestedUrl = 'https://www.quora.com/q/example/post-unresolved-derived-failure'
     const key = `resolve-profile:${requestedUrl}`
@@ -5928,6 +5969,13 @@ test('unresolved resolver derived save failure does not poison WAL terminalizati
         sw.state().hasStoredWorkRepairTimeout ||
             (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
     )
+
+    browser.storage.local.set = originalSet
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.equal(repair.pendingPostsChanged, true)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'skipped')
 })
 
 test('key-only terminalization rejects stale attempt before authority save', async () => {
