@@ -151,7 +151,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'active-transition',
     'action-lease-request',
     'action-lease-tab-release',
-    'resolver-unresolved'
+    'resolver-unresolved',
+    'stored-work-cancel'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -5015,6 +5016,118 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         projectionSaved,
         snapshotSaved: false,
         walSaved: true
+    }
+}
+
+async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], nextProjection = {}, options = {}) {
+    const operationKind = normalizeQueueWriteOperationName(options.operationKind || 'authority-row-batch-mutation')
+    const records = (Array.isArray(results) ? results : [])
+        .map(result => makeCoordinatorAuthorityShadowWalRecord({
+            ...result,
+            operationKind: result.operationKind || operationKind,
+            durable: true
+        }))
+        .filter(Boolean)
+    if(!records.length) {
+        return {
+            saved: false,
+            backend: 'queue-wal',
+            reason: 'not-row-mutation'
+        }
+    }
+
+    const storedWal = normalizeCoordinatorQueueWalStore(
+        nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY],
+        options.previousProjectionQueue || {}
+    )
+    const appendRecords = records.map(record => {
+        const next = cloneCoordinatorAuthorityValue(record)
+        delete next.id
+        delete next.seq
+        return next
+    })
+    const append = appendWalRecordsToGeneration(storedWal, appendRecords, {
+        segmentId: `queue-authority-${operationKind}-batch-${Date.now()}`
+    })
+    if(append?.rejected) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendRejected')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-batch-append-rejected',
+            append.reason || 'Coordinator authority queue WAL batch append was rejected'
+        )
+        return {
+            saved: false,
+            backend: 'queue-wal',
+            reason: append.reason || 'append-rejected'
+        }
+    }
+
+    const walSaved = await metricStorageSet({
+        [COORDINATOR_QUEUE_WAL_KEY]: append.store
+    }, {
+        metricPath: options.metricPath || `authority.${operationKind}.queueWal.save`,
+        queueOperation: operationKind,
+        queueChangedRows: records.length,
+        coordinatorAuthorityWrite: true
+    })
+    if(walSaved === false) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendSuppressed')
+        return {
+            saved: false,
+            backend: 'queue-wal',
+            reason: 'wal-storage-suppressed',
+            append
+        }
+    }
+
+    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended', records.length)
+    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxAppendBytes', getJsonByteSize(append.records || []))
+    try {
+        appendCoordinatorAuthorityShadowWalRecords(records, {
+            operationKind,
+            reason: options.reason || 'ordinaryMutation'
+        })
+    }
+    catch {}
+
+    let projectionSaved = true
+    try {
+        const projectionPayload = buildCoordinatorQueueDerivedProjectionPayload(nextProjection.queue || {})
+        const saved = await metricStorageSet(projectionPayload, {
+            metricPath: options.projectionMetricPath || `authority.${operationKind}.projection.save`,
+            queueOperation: `${operationKind}-projection`,
+            queueChangedRows: records.length,
+            coordinatorAuthorityWrite: true
+        })
+        projectionSaved = saved !== false
+    }
+    catch(error) {
+        projectionSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-batch-projection-failed',
+            error?.message || 'Coordinator authority queue WAL batch projection update failed'
+        )
+    }
+    if(!projectionSaved) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'queue-wal-batch-projection-failed',
+            edgeTriggered: true
+        })
+    }
+    else {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionSaved')
+    }
+
+    return {
+        saved: true,
+        backend: 'queue-wal',
+        append,
+        projectionSaved,
+        snapshotSaved: false,
+        walSaved: true,
+        records
     }
 }
 
@@ -12550,9 +12663,8 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
     const hasTarget = !!(targetStorageKey || targetCoordinatorKey || targetHref)
     const state = await loadCoordinatorState()
-    const queue = {
-        ...state.queue
-    }
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
     const progress = {
         ...state.progress
     }
@@ -12561,7 +12673,10 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const canceledUrls = []
     const canceledWorkKeys = []
     const ownedTabIds = new Set()
-    let queueChanged = false
+    const authorityResults = []
+    const nextQueue = {
+        ...queue
+    }
     let progressChanged = false
 
     for(const [itemKey, item] of Object.entries(queue || {})) {
@@ -12593,8 +12708,7 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
             now,
             reason
         })
-        queue[itemKey] = nextItem
-        queueChanged = true
+        nextQueue[itemKey] = nextItem
         if(href) canceledUrls.push(href)
         else canceledWorkKeys.push(coordinatorKey)
 
@@ -12617,13 +12731,65 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
                 progressChanged = true
             }
         }
+
+        authorityResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'stored-work-cancel',
+            rowKey: itemKey,
+            reason: 'ordinaryMutation'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: item,
+            nextRow: nextItem,
+            terminal: true
+        }))
     }
 
-    if(!queueChanged) {
+    if(!authorityResults.length) {
         return {canceledUrls: [], canceledWorkKeys: [], ownedTabIds: []}
     }
 
-    const runs = recomputeCoordinatorRuns(queue, state.runs, affectedRunIds)
+    const nextProjection = makeCoordinatorAuthorityProjection({
+        ...state,
+        queue: nextQueue,
+        runs: currentAuthorityState.runs
+    })
+    let persistence = null
+    try {
+        persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+            authorityResults,
+            nextProjection,
+            {
+                operationKind: 'stored-work-cancel',
+                reason: 'ordinaryMutation',
+                previousProjectionQueue: queue,
+                metricPath: 'storedWork.cancel.save.queueWal',
+                projectionMetricPath: 'storedWork.cancel.save.projection'
+            }
+        )
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {
+            canceledUrls: [],
+            canceledWorkKeys: [],
+            ownedTabIds: Array.from(ownedTabIds),
+            reason: persistence?.reason || 'persistence-failed',
+            persistence
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    const currentQueue = coordinatorAuthority.current().queue
+    const runs = recomputeCoordinatorRuns(currentQueue, state.runs, affectedRunIds)
     const events = normalizeCoordinatorEvents(state.events)
     events.push({
         id: makeId('event'),
@@ -12644,25 +12810,43 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
         profileNukeProgress = prunedProgress
     }
 
-    await saveCoordinatorState({
-        queue,
-        runs,
-        events,
-        progress: prunedProgress
-    }, {
-        queue: true,
-        runs: true,
-        events: true,
-        progress: progressChanged,
-        reason: 'ordinaryMutation',
-        queueOperation: 'cancel',
-        queueChangedRows: canceledUrls.length + canceledWorkKeys.length
-    })
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs,
+            events,
+            progress: progressChanged ? prunedProgress : undefined
+        }, {
+            queue: false,
+            runs: true,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'stored-work-cancel-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'stored-work-cancel-derived-save-failed',
+            error?.message || 'Stored Work cancel derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('storedWork.cancel.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'stored-work-cancel-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
 
     return {
         canceledUrls,
         canceledWorkKeys,
-        ownedTabIds: Array.from(ownedTabIds)
+        ownedTabIds: Array.from(ownedTabIds),
+        persistence,
+        derivedSaved
     }
 }
 

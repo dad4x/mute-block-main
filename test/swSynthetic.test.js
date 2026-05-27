@@ -438,6 +438,81 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     )
 })
 
+test('bulk current work cancel WAL-terminalizes all pending rows as a batch', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-B'
+    const hrefDone = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Done'
+    const runId = 'run-bulk-cancel'
+    const makeRow = (href, attemptNumber = 1) => ({
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 500100,
+        activeAt: 0,
+        updatedAt: 500500,
+        tabId: null,
+        attemptId: `attempt-bulk-cancel-${attemptNumber}`,
+        attemptNumber,
+        milestones: {}
+    })
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 501000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: makeRow(hrefA, 1),
+                [hrefB]: makeRow(hrefB, 2),
+                [hrefDone]: {
+                    ...makeRow(hrefDone, 3),
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    terminalAt: 500700
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB, hrefDone],
+                    targetWorkKeys: [hrefA, hrefB, hrefDone]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work'
+    }), timers)
+
+    assert.equal(result.canceledUrls.length, 2)
+    assert.equal(result.canceledUrls.includes(hrefA), true)
+    assert.equal(result.canceledUrls.includes(hrefB), true)
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[hrefDone].status, 'succeeded')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'canceled')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefDone].status, 'succeeded')
+    assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 2)
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 2)
+    assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
+    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    assert.equal(recovered[hrefA].status, 'canceled')
+    assert.equal(recovered[hrefB].status, 'canceled')
+    assert.equal(recovered[hrefDone].status, 'succeeded')
+})
+
 test('queue accounting audit explains raw WAL drift without writing storage', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Accounting-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Accounting-B'
@@ -686,6 +761,142 @@ test('single current work cancel WAL append failure leaves selected row pending'
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
+})
+
+test('bulk current work cancel WAL append failure leaves rows pending', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Wal-Failure-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Wal-Failure-B'
+    const runId = 'run-bulk-cancel-wal-failure'
+    const makeRow = (href, attemptNumber = 1) => ({
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 501000,
+        activeAt: 0,
+        updatedAt: 501500,
+        tabId: null,
+        attemptId: `attempt-bulk-cancel-wal-failure-${attemptNumber}`,
+        attemptNumber,
+        milestones: {}
+    })
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 502000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: makeRow(hrefA, 1),
+                [hrefB]: makeRow(hrefB, 2)
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB],
+                    targetWorkKeys: [hrefA, hrefB]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic bulk current work cancel WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work'
+    }), timers)
+
+    assert.equal(result.canceledUrls.length, 0)
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'queued')
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[hrefA].status, 'queued')
+    assert.equal(currentAuthority.queue[hrefB].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
+})
+
+test('bulk current work cancel derived failure does not poison WAL terminalization', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-B'
+    const runId = 'run-bulk-cancel-derived-failure'
+    const makeRow = (href, attemptNumber = 1) => ({
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 502000,
+        activeAt: 0,
+        updatedAt: 502500,
+        tabId: null,
+        attemptId: `attempt-bulk-cancel-derived-failure-${attemptNumber}`,
+        attemptNumber,
+        milestones: {}
+    })
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 503000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: makeRow(hrefA, 1),
+                [hrefB]: makeRow(hrefB, 2)
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [hrefA, hrefB],
+                    targetWorkKeys: [hrefA, hrefB]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents) {
+            throw new Error('synthetic bulk current work cancel derived failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work'
+    }), timers)
+
+    assert.equal(result.canceledUrls.length, 2)
+    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
+    assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'canceled')
+    assert.equal(storage.mbCoordinatorEvents.length, 1)
+    assert.equal(storage.mbCoordinatorEvents[0].type, 'stored-work-cancel-derived-save-failed')
+    assert.equal(sw.state().queueWakeupCounters['storedWork.cancel.derivedSaveFailed'] || 0, 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 2)
+    assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
 })
 
 test('progress shadow WAL append uses bounded incremental replay', async () => {
