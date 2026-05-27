@@ -828,8 +828,9 @@ pressure remains a separate performance/reliability follow-up.
 - Coverage added/updated: storage-only enqueue asserts WAL recovery without a
   raw queue snapshot; executable enqueue timeout now wedges `mbCoordinatorQueueWal`;
   reset-existing WAL failure keeps the active owned tab open; derived-save
-  failure keeps the WAL row durable and schedules repair; stale raw-queue
-  enqueue-adjacent assertions now read recovered authority.
+  failure keeps the WAL row durable, schedules repair, and repair rebuilds
+  missing runs/events/progress derived state; stale raw-queue enqueue-adjacent
+  assertions now read recovered authority.
 - Validation: `node -c shared/js/sw.js`, `node test/p1-contract.test.js`,
   `node test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
   `1.6.576`; `npm run prod`, `npm run build:chrome`, and `npm run
@@ -841,6 +842,23 @@ pressure remains a separate performance/reliability follow-up.
   mismatches, and an active WAL tail with 2 applied records. Dashboard sanity
   showed 44 ready, 416 succeeded, 12 soft-fail, 0 hard-fail, 1 active, and 45
   per-row cancel buttons for 80 displayed rows.
+- Review closeout: reviewer follow-up found that the scheduled repair after
+  `enqueue-derived` save failure was a no-op for WAL-only enqueue rows with no
+  progress record. Local follow-up now repairs queued WAL-derived rows back
+  into run metadata, service-worker queued progress, and a repair event, and
+  tracks in-place run metadata changes so `repairCoordinatorStorageFromProgress`
+  persists the rebuilt runs map. The synthetic derived-save failure regression
+  now runs repair and verifies `runsChanged`, `progressChanged`, `eventsChanged`,
+  restored target/work keys, queued progress attempt identity, and the repair
+  event. Version bumped to `1.6.577`; `npm test`, `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` passed and produced
+  `chrome/mute_block-1.6.577.zip` and `firefox/mute_block-1.6.577.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.577` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 485 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an active WAL tail with 1 applied
+  record. Dashboard sanity showed 32 ready, 407 succeeded, 12 soft-fail,
+  0 hard-fail, 1 active, and 33 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
@@ -855,3 +873,15 @@ pressure remains a separate performance/reliability follow-up.
   checkpoint generation switch at the soft segment threshold, and hard-block new
   durable queue WAL appends at the hard threshold until the generation switch
   completes.
+
+## Deferred follow-up: repair terminology
+
+- Do not derail the current WAL migration slices for this rename.
+- The target vocabulary is captured in [architecture.md](architecture.md):
+  ordinary WAL-authority convergence should be described as `reconcile`,
+  `materialize`, `recover`, `apply`, `resolve`, or `audit` depending on the
+  role. Once WAL is authority, missing or stale derived state is expected
+  projection/materialization work, not normally "repair".
+- Long term, `repair` should disappear from ordinary scheduler, derived-state,
+  and compatibility paths. Keep it only for true authority corruption or
+  explicitly labeled legacy cleanup while old snapshot-era states still exist.
