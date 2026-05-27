@@ -129,7 +129,7 @@ rg -n "metricStorageSet\(" shared/js/sw.js
 | cancelCoordinatorCurrentWork | mbCoordinatorPaused, mbCoordinatorPauseGeneration | Clears pause state after cancel. | ordinaryMutation | Keep as pause-state helper. |
 | pauseStoredCoordinatorWork | mbCoordinatorPaused, mbCoordinatorPauseGeneration | Writes pause flag inside serialized pause path. | ordinaryMutation | Keep as pause-state helper. |
 | enqueueCoordinatorItems | mbCoordinatorPaused, mbCoordinatorPauseGeneration | Clears pause flag when execute request arrives. | ordinaryMutation | Keep as pause-state helper. |
-| clearProfileNukeState | mbProfileNukeProgress, mbCoordinatorQueue, mbCoordinatorRuns, pending/nuked post maps | User clears a profile's stored state. | ordinaryMutation | Split authority deletion from user-memory cleanup. |
+| clearProfileNukeState | mbProfileNukeProgress, mbCoordinatorQueue, mbCoordinatorRuns, pending/nuked post maps | User clears a profile's stored state. | ordinaryMutation | Queue row deletion is WAL-backed through `clear-profile`; progress/runs/pending/nuked maps are derived cleanup after durable queue authority. |
 | removePendingSpaceFeedUrls | mbSpacePendingNukedPosts | User-memory pending post cleanup. | userMemoryNonAuthority | Keep outside coordinator authority. |
 | removePendingSpaceFeedEntries | mbSpacePendingNukedPosts | User-memory pending post cleanup. | userMemoryNonAuthority | Keep outside coordinator authority. |
 | confirmSpaceFeedProfilesBlocked | pending/nuked post maps | User-memory confirmation; separately syncs coordinator progress. | userMemoryNonAuthority | Keep user-memory write separate from coordinator sync. |

@@ -158,6 +158,7 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'requeue',
     'resolver-remap',
     'enqueue',
+    'clear-profile',
     'compatibility-progress-sync'
 ])
 let persistOwnedTabIdsTimeout = null
@@ -12432,18 +12433,15 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
     }
 
     return enqueueSpaceFeedStorageUpdate(async () => {
-        const stored = await metricStorageGet({
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
-            [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_RUNS_KEY]: {},
+        const state = await loadCoordinatorState({
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
         })
-        const progress = normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
-        const queue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY])
-        const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY])
-        const pendingPosts = stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-        const nukedPosts = stored[SPACE_NUKED_POSTS_KEY] || {}
+        const progress = normalizeStoredProfileNukeProgress(state.progress || {})
+        const queue = normalizeCoordinatorMap(state.queue || {})
+        const runs = normalizeCoordinatorMap(state.runs || {})
+        const pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+        const nukedPosts = state.stored?.[SPACE_NUKED_POSTS_KEY] || {}
         const nextProgress = {
             ...progress
         }
@@ -12452,6 +12450,7 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
         }
         let progressChanged = false
         let queueChanged = false
+        const removedRows = []
         const matchingQueueEntries = Object.entries(queue || {})
             .filter(([itemKey, item]) => {
                 const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -12467,6 +12466,12 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
 
         for(const [itemKey] of matchingQueueEntries) {
             if(preserveCoordinatorState) continue
+            removedRows.push({
+                rowKey: itemKey,
+                previousRow: queue[itemKey],
+                reason: 'ordinaryMutation',
+                operationKind: 'clear-profile'
+            })
             delete nextQueue[itemKey]
             queueChanged = true
         }
@@ -12479,11 +12484,7 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
         const payload = {}
 
         if(progressChanged) {
-            profileNukeProgress = nextProgress
             payload[PROFILE_NUKE_PROGRESS_KEY] = nextProgress
-        }
-        if(queueChanged) {
-            payload[COORDINATOR_QUEUE_KEY] = nextQueue
         }
         if(runsResult.changed) {
             payload[COORDINATOR_RUNS_KEY] = runsResult.runs
@@ -12498,16 +12499,93 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
             })
         }
 
-        if(Object.keys(payload).length) {
-            await metricStorageSet(payload, {
-                snapshotWriteReason: 'ordinaryMutation',
-                queueOperation: 'clear-profile',
-                queueChangedRows: queueChanged ? 1 : 0
+        let persistence = null
+        if(queueChanged) {
+            const nextProjection = makeCoordinatorAuthorityProjection({
+                ...state,
+                queue: nextQueue,
+                runs: runsResult.runs
             })
+            try {
+                persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+                    [],
+                    nextProjection,
+                    {
+                        operationKind: 'clear-profile',
+                        reason: 'ordinaryMutation',
+                        removedRows,
+                        previousProjectionQueue: queue,
+                        metricPath: 'clearProfile.save.queueWal',
+                        projectionMetricPath: 'clearProfile.save.projection'
+                    }
+                )
+            }
+            catch(error) {
+                persistence = {
+                    saved: false,
+                    reason: 'persistence-error',
+                    error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                }
+            }
+            if(persistence?.saved !== true) {
+                incrementQueueWakeupMetric('clearProfile.queueWalSaveFailed')
+                recordCoordinatorDiagnosticEvent(
+                    'clear-profile-queue-wal-save-failed',
+                    persistence?.reason || 'Clear profile queue WAL save failed'
+                )
+                scheduleStoredWorkRepair(1000, {
+                    reason: 'clear-profile-queue-wal-save-failed',
+                    edgeTriggered: true
+                })
+                return {
+                    cleared: false,
+                    reason: persistence?.reason || 'persistence-failed',
+                    profileHref: normalizedHref,
+                    progressChanged: false,
+                    queueChanged: false,
+                    runsChanged: false,
+                    coordinatorStatePreserved: preserveCoordinatorState,
+                    pendingChanged: false,
+                    nukedChanged: false,
+                    persistence
+                }
+            }
+            await coordinatorAuthority.hydrate()
+        }
+
+        let derivedSaved = true
+        const derivedChanged = !!Object.keys(payload).length
+        if(derivedChanged) {
+            try {
+                derivedSaved = await metricStorageSet(payload, {
+                    snapshotWriteReason: 'ordinaryMutation',
+                    metricPath: queueChanged ? 'clearProfile.derived.save' : 'clearProfile.save',
+                    queueOperation: queueChanged ? 'clear-profile-derived' : 'clear-profile',
+                    queueChangedRows: 0
+                })
+            }
+            catch(error) {
+                derivedSaved = false
+                recordCoordinatorDiagnosticEvent(
+                    'clear-profile-derived-save-failed',
+                    error?.message || 'Clear profile derived save failed'
+                )
+            }
+            if(derivedSaved === false) {
+                incrementQueueWakeupMetric('clearProfile.derivedSaveFailed')
+                scheduleStoredWorkRepair(1000, {
+                    reason: 'clear-profile-derived-save-failed',
+                    edgeTriggered: true
+                })
+            }
+        }
+
+        if(progressChanged && derivedSaved !== false) {
+            profileNukeProgress = nextProgress
         }
 
         return {
-            cleared: !!Object.keys(payload).length,
+            cleared: queueChanged || (derivedChanged && derivedSaved !== false),
             reason,
             profileHref: normalizedHref,
             progressChanged,
@@ -12516,9 +12594,17 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
             coordinatorStatePreserved: preserveCoordinatorState,
             pendingChanged: pendingResult.changed,
             nukedChanged: nukedResult.changed,
-            profileNukeProgress: payload[PROFILE_NUKE_PROGRESS_KEY] || nextProgress,
-            pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || pendingPosts,
-            nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || nukedPosts
+            profileNukeProgress: derivedSaved !== false && payload[PROFILE_NUKE_PROGRESS_KEY]
+                ? payload[PROFILE_NUKE_PROGRESS_KEY]
+                : progress,
+            pendingPosts: derivedSaved !== false && payload[SPACE_PENDING_NUKED_POSTS_KEY]
+                ? payload[SPACE_PENDING_NUKED_POSTS_KEY]
+                : pendingPosts,
+            nukedPosts: derivedSaved !== false && payload[SPACE_NUKED_POSTS_KEY]
+                ? payload[SPACE_NUKED_POSTS_KEY]
+                : nukedPosts,
+            persistence,
+            derivedSaved
         }
     })
 }
