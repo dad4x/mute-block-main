@@ -499,3 +499,30 @@ pressure remains a separate performance/reliability follow-up.
   from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
   sanity showed 41 ready, 292 succeeded, 39 soft-fail, 19 hard-fail, 0 active,
   and 41 per-row cancel buttons for 80 displayed rows.
+
+## Slice 22 review closeout: rollback active-row requirement
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.565 review
+  finding on the already WAL-backed `rollback-active-transition` path.
+- Authority boundary: active-transition rollback now requires the current row
+  to be active before any WAL append, and repeats the same active-status guard
+  inside the serialized `coordinatorAuthority.applyWithinStorageUpdate()`
+  mutator. A matching-attempt queued row can no longer append a rollback or
+  stamp active-transition close milestones.
+- Persistence boundary: unchanged. Accepted rollbacks remain durable only on
+  queue WAL append; rejected inactive-row rollbacks leave raw snapshot/current
+  authority unchanged and append no WAL record.
+- Validation: covered by `active transition rollback rejects queued row
+  before WAL append`; `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `node -c test/p1-contract.test.js`, `node
+  test/p1-contract.test.js`, `node test/swSynthetic.test.js`, and `npm test`
+  passed. Version bumped to `1.6.566`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.566.zip` and
+  `firefox/mute_block-1.6.566.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.566` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 409 recovered/view rows, no view mismatches, and an
+  active WAL tail with 26 applied records; raw-vs-recovered count divergence is
+  from unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard
+  sanity showed 41 ready, 292 succeeded, 39 soft-fail, 19 hard-fail, 0 active,
+  and 41 per-row cancel buttons for 80 displayed rows.

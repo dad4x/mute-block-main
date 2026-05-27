@@ -12656,6 +12656,7 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
     if(!item || isTerminalCoordinatorStatus(item.status)) return false
+    if(!isActiveCoordinatorStatus(item.status)) return false
 
     const attemptedRecord = {
         attemptId: details.attemptId || getAttemptIdFromValue(action),
@@ -12703,6 +12704,9 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
         mutate(currentItem, context) {
             if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
                 return context.reject('missing-or-terminal-row')
+            }
+            if(!isActiveCoordinatorStatus(currentItem.status)) {
+                return context.reject('inactive-coordinator-item')
             }
             if(hasMismatchedCoordinatorAttempt(currentItem, attemptedRecord)) {
                 return context.reject('attempt-changed')

@@ -10183,6 +10183,50 @@ test('active transition rollback rejects missing incoming attempt identity befor
     assert.equal(currentAuthority.queue[href].attemptId, attemptId)
 })
 
+test('active transition rollback rejects queued row before WAL append', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Queued-Row'
+    const runId = 'run-rollback-queued-row'
+    const attemptId = 'attempt-rollback-queued-row'
+    const tabId = 6412
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 434750,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 434750})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.rollbackFailedQueuedTabOpen({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        attemptId,
+        attemptNumber: 1
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[href].actionLeaseReleaseReason, undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].status, 'queued')
+    assert.equal(currentAuthority.queue[href].actionLeaseReleaseReason, undefined)
+})
+
 test('active transition rollback WAL append failure leaves row active', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Rollback-Append-Failure'
     const runId = 'run-rollback-append-failure'
