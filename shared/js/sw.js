@@ -7390,7 +7390,18 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
         repaired += 1
     }
 
-    if(href && isCoordinatorQueueAuthoritativeItem(item) && !getCoordinatorProgressRecordForItem(itemKey, item, progress)) {
+    const existingProgressRecord = href ? getCoordinatorProgressRecordForItem(itemKey, item, progress) : null
+    const itemAttemptId = getAttemptIdFromValue(item)
+    const itemAttemptNumber = getAttemptNumberFromValue(item)
+    const recordAttemptId = getAttemptIdFromValue(existingProgressRecord)
+    const recordAttemptNumber = getAttemptNumberFromValue(existingProgressRecord)
+    const staleProgressAttempt = existingProgressRecord && (
+        hasMismatchedCoordinatorAttempt(item, existingProgressRecord) ||
+        (itemAttemptId && !recordAttemptId) ||
+        (itemAttemptNumber && !recordAttemptNumber)
+    )
+
+    if(href && isCoordinatorQueueAuthoritativeItem(item) && (!existingProgressRecord || staleProgressAttempt)) {
         const resetRecord = normalizeProgressPatch(
             href,
             buildQueuedCoordinatorProgressResetPatch(item, {
