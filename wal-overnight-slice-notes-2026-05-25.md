@@ -879,6 +879,40 @@ pressure remains a separate performance/reliability follow-up.
   record. Dashboard sanity showed 18 ready, 401 succeeded, 12 soft-fail,
   0 hard-fail, 1 active, and 19 per-row cancel buttons for 80 displayed rows.
 
+## Slice 29: compatibility progress sync WAL migration
+
+- Operation migrated: `compatibility-progress-sync` was added as a queue-WAL
+  batch operation for `syncCoordinatorProgressRecordsLocked`.
+- Authority boundary: compatibility progress can still repair stale failed
+  queue rows when same-attempt successful progress is the better authority, but
+  the queue transition now persists through `mbCoordinatorQueueWal` first.
+  Runs/progress are derived compatibility saves with `queue: false`; if the WAL
+  append fails, derived saves are skipped and the stale failed row remains the
+  recovered authority.
+- Correctness fix discovered during the slice: the href normalization loop no
+  longer passes `normalizeQuoraProfileUrl` directly to `Array.map`, because the
+  array index was being passed as the helper `baseUrl` parameter and could make
+  compatibility sync silently no-op.
+- Coverage added/updated: synthetic coverage proves successful compatibility
+  progress repairs a stale failed row through WAL authority while raw snapshot
+  remains stale; WAL failure coverage proves no WAL means the stale failed row
+  remains authoritative and run metadata is not advanced. The P1 contract now
+  pins the WAL batch helper and the `queue: false` derived save boundary.
+- Inventory: `syncCoordinatorProgressRecordsLocked` rows now describe the
+  WAL-backed compatibility queue repair and derived runs/progress state.
+- Validation: `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`,
+  `node test/p1-contract.test.js`, `timeout 120 node test/swSynthetic.test.js`,
+  and `npm test` passed. Version bumped to `1.6.579`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.579.zip` and `firefox/mute_block-1.6.579.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.579` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 449 recovered/view rows, no view
+  mismatches, raw-vs-recovered count divergence from active WAL tail state, and
+  an active WAL tail with 4 applied records. Dashboard sanity showed 0 ready,
+  404 succeeded, 14 soft-fail, 0 hard-fail, 0 active, and 0 per-row cancel
+  buttons for 80 displayed rows.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

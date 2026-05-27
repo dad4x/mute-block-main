@@ -157,7 +157,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'retry',
     'requeue',
     'resolver-remap',
-    'enqueue'
+    'enqueue',
+    'compatibility-progress-sync'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -6574,7 +6575,7 @@ async function saveCoordinatorState(state = {}, changes = {}) {
 }
 
 async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
-    const hrefs = Object.keys(progressRecords || {}).map(normalizeQuoraProfileUrl).filter(Boolean)
+    const hrefs = Object.keys(progressRecords || {}).map(href => normalizeQuoraProfileUrl(href)).filter(Boolean)
     if(!hrefs.length) return false
 
     const state = await loadCoordinatorState({
@@ -6582,16 +6583,23 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
         [PROFILE_NUKE_PROGRESS_KEY]: undefined
     })
     const queue = state.queue
+    const nextQueue = {
+        ...queue
+    }
     const runs = state.runs
+    const progress = {
+        ...state.progress
+    }
     let changed = false
     const now = Date.now()
     const affectedRunIds = new Set()
     const terminalSettlementHrefs = new Set()
+    const authorityResults = []
     let progressChanged = false
     let progressChangedRows = 0
 
     for(const href of hrefs) {
-        const item = queue[href]
+        const item = nextQueue[href]
         const record = progressRecords[href] || profileNukeProgress[href] || null
         if(!item || !record) continue
         if(!shouldApplyProgressToCoordinatorItem(item, record)) continue
@@ -6672,34 +6680,88 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
         })
 
         if(JSON.stringify(nextItem) === JSON.stringify(item)) continue
-        queue[href] = nextItem
+        nextQueue[href] = nextItem
+        authorityResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'compatibility-progress-sync',
+            rowKey: href,
+            reason: 'compatibilityFlush'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: item,
+            nextRow: nextItem,
+            terminal: mappedTerminal,
+            allowTerminalOverwrite: resetRetry || isTerminalCoordinatorStatus(item.status)
+        }))
         if(nextItem.runId) affectedRunIds.add(nextItem.runId)
         if(mappedTerminal) terminalSettlementHrefs.add(href)
         changed = true
     }
 
     const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(queue, runs, affectedRunIds)
+        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
         : runs
     const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
     const storagePatch = {}
 
-    if(changed) storagePatch[COORDINATOR_QUEUE_KEY] = queue
+    if(changed) {
+        const nextProjection = makeCoordinatorAuthorityProjection({
+            ...state,
+            queue: nextQueue,
+            runs: nextRuns
+        })
+        let persistence = null
+        try {
+            persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+                authorityResults,
+                nextProjection,
+                {
+                    operationKind: 'compatibility-progress-sync',
+                    reason: 'compatibilityFlush',
+                    previousProjectionQueue: queue,
+                    metricPath: 'compatibilityProgressSync.save.queueWal',
+                    projectionMetricPath: 'compatibilityProgressSync.save.projection'
+                }
+            )
+        }
+        catch(error) {
+            persistence = {
+                saved: false,
+                reason: 'persistence-error',
+                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            }
+        }
+        if(persistence?.saved !== true) {
+            incrementQueueWakeupMetric('compatibilityProgressSync.queueWalSaveFailed')
+            recordCoordinatorDiagnosticEvent(
+                'compatibility-progress-sync-queue-wal-save-failed',
+                persistence?.reason || 'Compatibility progress sync queue WAL save failed'
+            )
+            scheduleStoredWorkRepair(1000, {
+                reason: 'compatibility-progress-sync-queue-wal-save-failed',
+                edgeTriggered: true
+            })
+            return false
+        }
+
+        await coordinatorAuthority.hydrate()
+    }
     if(runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
     if(progressChanged) storagePatch[PROFILE_NUKE_PROGRESS_KEY] = progress
 
     await saveCoordinatorState({
-        queue: storagePatch[COORDINATOR_QUEUE_KEY],
         runs: storagePatch[COORDINATOR_RUNS_KEY],
         progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY]
     }, {
-        queue: changed,
+        queue: false,
         runs: runsChanged,
         progress: progressChanged,
         progressChangedRows,
         reason: 'compatibilityFlush',
-        queueOperation: 'compatibility-progress-sync',
-        queueChangedRows: changed ? progressChangedRows : 0
+        queueOperation: changed ? 'compatibility-progress-sync-derived' : 'compatibility-progress-sync',
+        queueChangedRows: 0
     })
 
     if(terminalSettlementHrefs.size) {

@@ -4360,6 +4360,109 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
     )
 })
 
+test('compatibility progress sync repairs stale failed queue rows through WAL authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Wal'
+    const runId = 'run-compatibility-progress-wal'
+    const attemptId = 'attempt-compatibility-progress-wal'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 276000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({href, runId, attemptId, now: 276000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocked',
+                    blockSucceeded: true,
+                    blockedAt: 276100,
+                    terminalAt: 276100,
+                    runId,
+                    tabId: 0,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 276100
+                }
+            }
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: [href]
+    }, {tab: {id: 12, windowId: 1}})
+
+    assert.equal(result.confirmed, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'succeeded')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
+    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 1)
+    const records = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(records.some(record => record.operationKind === 'compatibility-progress-sync'), true)
+    assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
+})
+
+test('compatibility progress sync WAL failure leaves stale failed row authoritative', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Wal-Failure'
+    const runId = 'run-compatibility-progress-wal-failure'
+    const attemptId = 'attempt-compatibility-progress-wal-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 277000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({href, runId, attemptId, now: 277000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocked',
+                    blockSucceeded: true,
+                    blockedAt: 277100,
+                    terminalAt: 277100,
+                    runId,
+                    tabId: 0,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 277100
+                }
+            }
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic compatibility progress WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: [href]
+    }, {tab: {id: 12, windowId: 1}})
+
+    assert.equal(result.confirmed, false)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, undefined)
+    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.queueWalSaveFailed'], 1)
+})
+
 test('top-level coordinator authority ignores caller currentAuthorityState', async () => {
     const href = 'https://www.quora.com/profile/Authority-Top-Level-Locked-Projection'
     const {sw, storage} = loadServiceWorkerHarness({
