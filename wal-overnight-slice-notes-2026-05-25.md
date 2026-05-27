@@ -1031,6 +1031,27 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
   showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
   0 per-row cancel buttons for 80 displayed rows.
+- Next slice: direct nonterminal `recordCoordinatorJobProgressRecords()`
+  queue transitions now append queue WAL records instead of mutating the raw
+  `mbCoordinatorQueue` snapshot. Nonterminal direct progress uses the new
+  `direct-progress` operation kind; terminal progress keeps
+  `terminal-progress`. The compatibility save now writes only derived
+  runs/progress state (`queue: false`), so the raw queue snapshot can remain
+  stale while recovered WAL authority carries the current row. Added synthetic
+  coverage for nonterminal direct progress restart recovery, WAL append
+  failure, and stale runtime-resume assertions that must read recovered
+  authority rather than the raw snapshot. Validation: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `timeout 240 node
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.585`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.585.zip` and `firefox/mute_block-1.6.585.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.585` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 420 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
+  showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
+  0 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 

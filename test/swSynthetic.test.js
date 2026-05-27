@@ -2808,6 +2808,107 @@ test('terminal authority queue WAL append failure rejects durable queue mutation
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
+test('direct nonterminal job progress is WAL-backed and recovers after restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Nonterminal-Progress-Wal'
+    const runId = 'run-nonterminal-progress-wal'
+    const attemptId = 'attempt-nonterminal-progress-wal'
+    const tabId = 527
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 253500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253500})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocking',
+        blockAttemptedAt: 253600,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {senderTabId: tabId})
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.terminal, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.notEqual(storage.mbCoordinatorQueue[href].milestones.blockAttemptedAt, 253600)
+    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253600)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'direct-progress')
+
+    const restarted = loadServiceWorkerHarness({
+        now: 253700,
+        storage
+    })
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'active')
+    assert.equal(hydrated.queue[href].milestones.blockAttemptedAt, 253600)
+})
+
+test('direct nonterminal job progress WAL append failure rejects durable queue mutation', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Nonterminal-Progress-Wal-Failure'
+    const runId = 'run-nonterminal-progress-wal-failure'
+    const attemptId = 'attempt-nonterminal-progress-wal-failure'
+    const tabId = 528
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253800,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253800})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic nonterminal progress WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocking',
+        blockAttemptedAt: 253900,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {senderTabId: tabId})
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.terminal, false)
+    assert.equal(result.results?.[href]?.reason || result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+})
+
 test('terminal authority queue WAL projection failure does not poison durable acknowledgement', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Wal-Projection-Failure'
     const runId = 'run-terminal-wal-projection-failure'
@@ -9721,11 +9822,11 @@ test('content ready message opens the Quora runtime gate and resumes stored work
         {timers, tickMs: 600}
     )
     await waitFor(
-        () => storage.mbCoordinatorQueue[href]?.status === 'active',
+        () => getRecoveredCoordinatorQueue(storage)[href]?.status === 'active',
         'content ready message opened a tab but did not persist active queue state',
         {timers}
     )
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
 })
 
 test('manual metrics reset is bounded when metrics storage is wedged', async () => {
@@ -10626,7 +10727,7 @@ test('service-worker no-foreground destructive work uses worker window without f
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
     assert.equal(profileTab?.windowId, workerWindow.id)
     assert.equal(profileTab?.active, true)
-    assert.equal(storage.mbCoordinatorQueue[href].tabId, profileTab.id)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, profileTab.id)
     await waitFor(
         () => storage.mbProfileNukeProgress[href]?.actionSurfaceMode === 'worker-window',
         'worker action surface progress was not recorded',
@@ -12626,11 +12727,11 @@ test('resume ignores provisional queued tab runtime ownership', async () => {
     resumePromise.catch(() => null)
 
     await waitFor(
-        () => storage.mbCoordinatorQueue[href].status === 'active',
+        () => getRecoveredCoordinatorQueue(storage)[href]?.status === 'active',
         'resume did not ignore provisional runtime ownership and claim durable row',
         {timers, attempts: 40, tickMs: 1000}
     )
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
 })
 
 test('claim-tab-action ignores queued storage rows without durable active ownership', async () => {
