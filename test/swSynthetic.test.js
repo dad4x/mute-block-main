@@ -4674,6 +4674,8 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(sw.state().profileNukeProgress[href], undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
+    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
+    assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
     assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
     assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)

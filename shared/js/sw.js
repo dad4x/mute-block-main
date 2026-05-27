@@ -4286,6 +4286,14 @@ function getCoordinatorRunTargetHrefs(run = {}) {
     return getNormalizedProfileHrefList(run?.targetProfileHrefs || [])
 }
 
+function isCoordinatorRunWorkKeyForProfileHref(workKey = '', normalizedHref = '') {
+    const key = `${workKey || ''}`.trim()
+    if(!key || !normalizedHref) return false
+    if(key === normalizedHref) return true
+
+    return normalizeQuoraProfileUrl(key) === normalizedHref
+}
+
 function getCoordinatorRunItems(queue = {}, runId = '', existingRun = {}) {
     const targetHrefs = new Set(getCoordinatorRunTargetHrefs(existingRun))
 
@@ -4305,7 +4313,12 @@ function getCoordinatorRunIdsForHref(runs = {}, href = '') {
     if(!normalizedHref) return []
 
     return Object.values(runs || {})
-        .filter(run => getCoordinatorRunTargetHrefs(run).includes(normalizedHref))
+        .filter(run => {
+            if(getCoordinatorRunTargetHrefs(run).includes(normalizedHref)) return true
+
+            return (Array.isArray(run?.targetWorkKeys) ? run.targetWorkKeys : [])
+                .some(key => isCoordinatorRunWorkKeyForProfileHref(key, normalizedHref))
+        })
         .map(run => run?.id || run?.runId || '')
         .filter(Boolean)
 }
@@ -4330,6 +4343,7 @@ function recomputeCoordinatorRuns(queue = {}, runs = {}, runIds = null) {
             }
             const runItems = getCoordinatorRunItems(queue, runId, existing)
             const targetHrefs = getCoordinatorRunTargetHrefs(existing)
+            const targetWorkKeys = Array.isArray(existing.targetWorkKeys) ? existing.targetWorkKeys : []
             const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
             const activeCount = runItems.filter(item => isActiveCoordinatorStatus(item?.status)).length
             const latestItemUpdatedAt = runItems.reduce((latest, item) => {
@@ -4343,7 +4357,7 @@ function recomputeCoordinatorRuns(queue = {}, runs = {}, runIds = null) {
                 sourceType: existing.sourceType || runItems[0]?.source?.type || 'space-feed',
                 createdAt: existing.createdAt || runItems[0]?.createdAt || Date.now(),
                 targetProfileHrefs: targetHrefs,
-                itemCount: targetHrefs.length || runItems.length || Number.parseInt(existing.itemCount, 10) || 0,
+                itemCount: targetHrefs.length || runItems.length || targetWorkKeys.length || 0,
                 activeCount,
                 terminalCount,
                 status: getCoordinatorRunStatus(runItems, existing),
@@ -12403,12 +12417,20 @@ function removeProfileHrefFromCoordinatorRuns(runs = {}, queue = {}, normalizedH
 
     for(const [runId, run] of Object.entries(runs || {})) {
         const targetProfileHrefs = getCoordinatorRunTargetHrefs(run)
-        if(!targetProfileHrefs.includes(normalizedHref)) continue
+        const targetWorkKeys = Array.isArray(run?.targetWorkKeys) ? run.targetWorkKeys : []
+        const nextTargetProfileHrefs = targetProfileHrefs.filter(href => href !== normalizedHref)
+        const nextTargetWorkKeys = targetWorkKeys
+            .filter(key => !isCoordinatorRunWorkKeyForProfileHref(key, normalizedHref))
+        if(nextTargetProfileHrefs.length === targetProfileHrefs.length &&
+            nextTargetWorkKeys.length === targetWorkKeys.length) {
+            continue
+        }
 
         affectedRunIds.add(runId)
         nextRuns[runId] = {
             ...run,
-            targetProfileHrefs: targetProfileHrefs.filter(href => href !== normalizedHref),
+            targetProfileHrefs: nextTargetProfileHrefs,
+            targetWorkKeys: nextTargetWorkKeys,
             updatedAt: Date.now()
         }
         changed = true
