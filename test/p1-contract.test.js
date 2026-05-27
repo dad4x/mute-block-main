@@ -1270,9 +1270,9 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(cancelStoredMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
     assert.match(cancelStoredMutationBody, /operationKind: 'stored-work-cancel'/)
     assert.match(cancelStoredMutationBody, /if\(persistence\?\.saved !== true\) \{[\s\S]*ownedTabIds: \[\],[\s\S]*reason: persistence\?\.reason \|\| 'persistence-failed'/)
-    assert.match(currentWorkCancelBody, /if\(storedResult\?\.reason \|\| storedResult\?\.persistence\?\.saved === false\) \{[\s\S]*ownedTabIds: \[\],[\s\S]*reason: storedResult\?\.reason \|\| 'cancel-persistence-failed'/)
+    assert.match(currentWorkCancelBody, /if\(!storedResult \|\| typeof storedResult !== 'object' \|\| storedResult\?\.reason \|\| storedResult\?\.persistence\?\.saved === false\) \{[\s\S]*ownedTabIds: \[\],[\s\S]*reason: storedResult\?\.reason \|\| 'cancel-persistence-failed'/)
     assert.ok(
-        currentWorkCancelBody.indexOf('if(storedResult?.reason || storedResult?.persistence?.saved === false)') <
+        currentWorkCancelBody.indexOf("if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false)") <
             currentWorkCancelBody.indexOf('stopOwnerNukes(SERVICE_WORKER_QUEUE_OWNER_ID')
     )
     assert.match(cancelStoredMutationBody, /coordinatorAuthority\.hydrate\(\)/)

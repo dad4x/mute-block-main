@@ -9473,7 +9473,7 @@ async function cancelCoordinatorCurrentWork() {
     const storedResult = await cancelStoredCoordinatorWork({
         reason: 'current-work-cancel-request'
     })
-    if(storedResult?.reason || storedResult?.persistence?.saved === false) {
+    if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false) {
         return {
             canceledUrls: storedResult?.canceledUrls || [],
             canceledWorkKeys: storedResult?.canceledWorkKeys || [],

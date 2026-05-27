@@ -892,6 +892,81 @@ test('bulk current work cancel WAL append failure does not close active owned ta
     assert.equal(browser.__tabs.has(tabId), true)
 })
 
+test('bulk current work cancel storage fallback does not close active owned tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Active-Storage-Fallback'
+    const runId = 'run-bulk-cancel-active-storage-fallback'
+    const attemptId = 'attempt-bulk-cancel-active-storage-fallback'
+    const tabId = 702
+    let finishFirst = null
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 503000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 503000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opened',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 502700
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
+
+    const first = sw.enqueueSpaceFeedStorageUpdate(
+        () => new Promise(resolve => {
+            finishFirst = () => resolve('first-late-ok')
+        }),
+        {timeoutMs: 1000, failureValue: 'first-timeout'}
+    )
+    await flushAsync(20)
+    assert.equal(typeof finishFirst, 'function')
+    await timers.tick(1000)
+    assert.equal(await first, 'first-timeout')
+
+    const resultPromise = browser.runtime.sendMessage({
+        action: 'cancel-coordinator-current-work'
+    })
+    await flushAsync(20)
+    await timers.tick(15000)
+    const result = await resultPromise
+
+    assert.equal(result.canceledUrls.length, 0)
+    assert.equal(result.reason, 'cancel-persistence-failed')
+    assert.equal(result.ownedTabIds.length, 0)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(browser.__removedTabs.includes(tabId), false)
+    assert.equal(browser.__tabs.has(tabId), true)
+
+    finishFirst()
+    await flushAsync(50)
+})
+
 test('bulk current work cancel derived failure does not poison WAL terminalization', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-B'

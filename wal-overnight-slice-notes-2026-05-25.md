@@ -654,3 +654,30 @@ pressure remains a separate performance/reliability follow-up.
   because the reverse tunnels on `127.0.0.1:10022` and `127.0.0.1:9223` accepted
   local connections but did not forward responses; bounded SSH, CDP, and rsync
   probes timed out.
+
+## Slice 24 review closeout: bulk-cancel storage fallback hard stop
+
+- Operation migrated: no new WAL operation. This closes the post-1.6.570 review
+  finding on the same WAL-backed `stored-work-cancel` batch path.
+- Authority boundary: `cancelCoordinatorCurrentWork()` now also treats
+  non-object storage-update fallback results as durable cancel failure. If
+  `enqueueSpaceFeedStorageUpdate()` returns `false` after a storage timeout or
+  abandoned serialized update, bulk cancel returns `cancel-persistence-failed`
+  before `stopOwnerNukes()`, tab removal, pause-state clearing, or runtime
+  pruning.
+- Persistence boundary: unchanged. Runtime cleanup only follows an object-shaped
+  successful stored cancel result; storage timeout/fallback leaves raw storage
+  active, appends no WAL record, and leaves the owned tab open.
+- Traceability: annotated tag `v1.6.570` now points at the committed
+  `1.6.570` release bundle.
+- Validation: covered by `bulk current work cancel storage fallback does not
+  close active owned tab` plus updated P1 storage-authority contracts; `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.571`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.571.zip` and
+  `firefox/mute_block-1.6.571.zip`. CDP was reachable again, but the SSH copy
+  tunnel on `127.0.0.1:10022` still timed out before authentication, so live
+  Chrome could not be updated; CDP inspection showed the live unpacked extension
+  still enabled at `1.6.569` with no manifest/runtime errors.
