@@ -44,7 +44,7 @@ rg -n "metricStorageSet\(" shared/js/sw.js
 
 | Function | Operation | Authority Reason | Current Risk | Intended Disposition |
 | --- | --- | --- | --- | --- |
-| syncCoordinatorProgressRecordsLocked | Applies compatibility progress records back into queue/runs/progress. | compatibilityFlush | Progress mirror can still influence queue state. | Quarantine behind explicit compatibility flush, then replace with reducer/WAL projection reconciliation. |
+| syncCoordinatorProgressRecordsLocked | Applies compatibility progress records back into queue/runs/progress. | compatibilityFlush | Queue row compatibility sync is WAL-backed through `compatibility-progress-sync`; runs/progress remain derived compatibility saves. | Keep the compatibility lane WAL-guarded until it can be deleted or replaced by explicit reducer events. |
 | repairCoordinatorStorageFromProgressLocked | Repairs queue/runs/progress/events/pending-posts from durable progress, WAL-only queued rows, and live tabs. | repair | Broad repair path can become a second authority if expanded; enqueue-derived recovery is now an explicit derived-state rebuild that does not change queue authority. | Keep only explicit repair events; delete legacy progress-to-terminal inference where reducer authority can replace it. |
 | transitionCoordinatorItemForQueuedTabLocked | Marks queued tab open/active through `mutateCoordinatorProjection({kind: 'transitionQueuedTabActive'})` and recomputes runs. | ordinaryMutation | Queue row active transition is WAL-backed; runs remain a derived compatibility save. | Keep active transition and rollback WAL-backed as a pair; open-tab side effects stay outside queue authority. |
 | rollbackFailedQueuedTabOpen | Rolls an attempted active transition back to queued. | repair | Wrapper delegates to `mutateCoordinatorQueuedTabOpenRollback`. | Keep wrapper thin; durable row mutation belongs in the projection operation. |
@@ -83,7 +83,7 @@ rg -n "metricStorageSet\(" shared/js/sw.js
 
 | Function | Operation | Authority Reason | Current Risk | Intended Disposition |
 | --- | --- | --- | --- | --- |
-| syncCoordinatorProgressRecordsLocked | Loads queue/runs/progress to apply compatibility progress records. | compatibilityFlush | Progress mirror can feed queue authority. | Quarantine/remove after reducer operation path exists. |
+| syncCoordinatorProgressRecordsLocked | Loads queue/runs/progress to apply compatibility progress records. | compatibilityFlush | WAL-recovered queue read plus WAL-backed queue row repair; derived runs/progress can lag if compatibility save fails. | Keep only for compatibility bridge cases and delete once reducer/WAL event paths cover the callers. |
 | repairCoordinatorStorageFromProgressLocked | Loads all coordinator maps plus pending posts for repair. | repair | Broad repair can mask stale authority. | Keep only explicit, test-covered repair operations. |
 | confirmQueuedTabDurablyActive | Loads queue through `loadCoordinatorQueueProjection()` to validate durable active state. | displayRead | Full-state load removed; read-only validation is acceptable. | Keep as read-only projection helper. |
 | transitionCoordinatorItemForQueuedTabLocked | Loads queue/runs through `loadCoordinatorQueueRunsProjection()` for queued tab active transition. | ordinaryMutation | WAL-recovered projection read with WAL-backed row write; derived run save can lag durable queue authority. | Keep scheduler/resume tests on current-authority reads until raw snapshot compatibility is deleted. |
