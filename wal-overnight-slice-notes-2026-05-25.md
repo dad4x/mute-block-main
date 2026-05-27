@@ -717,3 +717,56 @@ pressure remains a separate performance/reliability follow-up.
   unapplied-to-raw WAL tail state, not projection inconsistency. Dashboard sanity
   showed 4 ready, 327 succeeded, 4 soft-fail, 0 hard-fail, 0 active, and 4
   per-row cancel buttons for 80 displayed rows.
+
+## Slice 26: manual failed retry/requeue WAL key-move migration
+
+- Operations migrated: dashboard/source-page manual failed retry
+  (`retry-coordinator-failed`) and failed requeue
+  (`requeue-coordinator-failed`) now persist queue row resets through
+  WAL-backed `retry` and `requeue` batch records before executor reconcile.
+- Authority boundary: both wrappers delegate selection to explicit projection
+  operations. The durable queue append can emit `map.set` plus `map.remove`
+  records so resolver requeue/retry can move from a failed source key to a
+  profile-resolution key without leaving the old authority row in WAL recovery.
+- Persistence boundary: terminal failed rows are allowed to transition back to
+  queued only through explicit retry/requeue WAL records with
+  `allowTerminalOverwrite`. Runs/events/progress resets remain derived
+  compatibility saves with `queue: false`; derived-save failure schedules
+  repair and does not poison the durable row reset.
+- Failure boundary: if the queue WAL append fails or the serialized storage
+  update falls back, retry/requeue return no selected durable rows and do not
+  start executor reconcile, open tabs, or write derived events.
+- Still snapshot-backed: enqueue/merge and resolver remap remain separate
+  review-gated slices. Physical WAL segmentation remains a follow-up adapter
+  change, not part of this correctness slice.
+- Inventory: retry/requeue rows now reflect the projection helper boundary and
+  WAL set/remove records for key-moving failed-item resets.
+- Validation: covered by `manual failed retry WAL moves resolver rows without
+  leaving stale source key`, `manual failed requeue WAL append failure does not
+  start executor or write derived state`, existing no-foreground retry/requeue
+  executor tests, and updated P1 storage-authority contracts; `node -c
+  shared/js/sw.js`, `node test/p1-contract.test.js`, `node
+  test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.573`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.573.zip` and
+  `firefox/mute_block-1.6.573.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.573` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 536 recovered/view rows, no view mismatches, active WAL
+  tail with 4 applied records, and one active row over stale raw queued state.
+  Dashboard sanity showed 170 ready, 336 succeeded, 0 soft-fail, 0 hard-fail, 1
+  active, and 80 per-row cancel buttons.
+
+## Deferred follow-up: physical WAL segmentation
+
+- Do not derail the current correctness/migration slices for this.
+- The current queue WAL has the right logical record shape, but the live storage
+  metrics show the physical adapter still rewrites the whole
+  `mbCoordinatorQueueWal` blob per append.
+- Follow-up design note:
+  `queue-wal-segmented-record-followup-2026-05-27.md`.
+- Target direction: one WAL record per bounded segment key, a small manifest
+  cursor, separate `recordSeq` from generation-local `segmentNo`, schedule a
+  checkpoint generation switch at the soft segment threshold, and hard-block new
+  durable queue WAL appends at the hard threshold until the generation switch
+  completes.

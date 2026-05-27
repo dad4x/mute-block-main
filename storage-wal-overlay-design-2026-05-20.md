@@ -38,6 +38,7 @@ Related notes:
 - `batching-metrics.md`
 - `queue-wakeup-metrics-model-2026-05-20.md`
 - `reconciler-first-fallback-architecture-2026-05-20.md`
+- `queue-wal-segmented-record-followup-2026-05-27.md`
 
 ## Current Problem
 

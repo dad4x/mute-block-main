@@ -166,6 +166,36 @@ function makeQueuedCoordinatorRow({href, runId, attemptId, now = 100000}) {
     }
 }
 
+function makeFailedCoordinatorRow({href, runId, attemptId, requestedUrl = href, now = 100000, evidence = [], error = 'Queued tab timed out before completion'}) {
+    return {
+        runId,
+        status: 'failed',
+        outcome: 'timeout',
+        error,
+        actionKind: 'mute-block',
+        executorTabAction: 'nuke',
+        executorOwner: 'service-worker',
+        serviceWorkerOwned: true,
+        executorNoForegroundFallback: true,
+        executorMaxConcurrent: 1,
+        targetProfileHref: href,
+        requestedUrl,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: now - 2000,
+        activeAt: now - 1000,
+        updatedAt: now - 500,
+        terminalAt: now - 500,
+        tabId: null,
+        attemptId,
+        attemptNumber: 1,
+        retryCount: 0,
+        lastRetryAt: 0,
+        evidence,
+        milestones: {}
+    }
+}
+
 function makeCoordinatorRun({href, runId}) {
     return {
         id: runId,
@@ -1176,6 +1206,144 @@ test('bulk current work pause WAL append failure does not close active owned tab
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
+})
+
+test('manual failed retry WAL moves resolver rows without leaving stale source key', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Failed-Retry-Move'
+    const questionUrl = 'https://www.quora.com/unanswered/Synthetic-failed-retry-move-question'
+    const retryKey = `resolve-profile:${questionUrl}`
+    const runId = 'run-failed-retry-move'
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 506000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: 'attempt-failed-retry-move',
+                    requestedUrl: href,
+                    now: 506000,
+                    error: 'Did not land on a profile page; question: /unanswered/Synthetic-failed-retry-move-question',
+                    evidence: [{
+                        collector: 'synthetic',
+                        postUrl: questionUrl
+                    }]
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'failed',
+                    outcome: 'timeout',
+                    runId,
+                    actionKind: 'mute-block',
+                    attemptId: 'attempt-failed-retry-move',
+                    attemptNumber: 1,
+                    updatedAt: 505500
+                }
+            }
+        }
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'retry-coordinator-failed',
+        retryLimit: 2,
+        maxItems: 1
+    }), timers)
+
+    assert.equal(result.selected, 1)
+    assert.equal(result.queued, 1)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    assert.equal(storage.mbCoordinatorQueue[retryKey], undefined)
+    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
+    assert.equal(storage.mbCoordinatorQueueView.counts.failed || 0, 0)
+    assert.equal(storage.mbCoordinatorEvents.at(-1).type, 'retry')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
+    assert.equal(currentAuthority[href], undefined)
+    assert.equal(currentAuthority[retryKey].status, 'queued')
+    assert.equal(currentAuthority[retryKey].resolveProfileFromPage, true)
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 2)
+    assert.deepEqual(walRecords.map(record => record.kind), ['map.set', 'map.remove'])
+    assert.equal(walRecords[0].operationKind, 'retry')
+    assert.equal(walRecords[1].key, href)
+    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    assert.equal(recovered[href], undefined)
+    assert.equal(recovered[retryKey].status, 'queued')
+})
+
+test('manual failed requeue WAL append failure does not start executor or write derived state', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Failed-Requeue-Wal-Failure'
+    const questionUrl = 'https://www.quora.com/unanswered/Synthetic-failed-requeue-wal-failure-question'
+    const runId = 'run-failed-requeue-wal-failure'
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 507000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: 'attempt-failed-requeue-wal-failure',
+                    requestedUrl: href,
+                    now: 507000,
+                    evidence: [{
+                        collector: 'synthetic',
+                        postUrl: questionUrl
+                    }]
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic failed requeue WAL failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'requeue-coordinator-failed',
+        maxItems: 1
+    }), timers)
+
+    assert.equal(result.selected, 0)
+    assert.equal(result.queued, 0)
+    assert.equal(result.reason, 'persistence-error')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    const currentAuthority = await sw.coordinatorAuthority.hydrate()
+    assert.equal(currentAuthority.queue[href].status, 'failed')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(browser.__tabs.size, 0)
+    assert.equal(sw.state().queuedTabActions.length, 0)
 })
 
 test('progress shadow WAL append uses bounded incremental replay', async () => {

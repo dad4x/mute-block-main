@@ -153,7 +153,9 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'action-lease-tab-release',
     'resolver-unresolved',
     'stored-work-cancel',
-    'stored-work-pause'
+    'stored-work-pause',
+    'retry',
+    'requeue'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -4772,6 +4774,7 @@ function makeCoordinatorAuthorityApplyResult(operation = {}, overrides = {}) {
         staleAttempt,
         terminal,
         operation: operationRecord,
+        allowTerminalOverwrite: overrides.allowTerminalOverwrite === true || operation.allowTerminalOverwrite === true,
         persistence: makeCoordinatorAuthorityPersistenceResult(overrides.persistence || {})
     }
 }
@@ -4835,6 +4838,44 @@ function makeCoordinatorAuthorityShadowWalRecord(result = {}) {
         attemptNumber,
         status,
         terminal: result.terminal === true || isTerminalCoordinatorStatus(nextRow?.status),
+        allowTerminalOverwrite: result.allowTerminalOverwrite === true,
+        at,
+        seq: 1
+    }
+}
+
+function makeCoordinatorAuthorityQueueWalRemoveRecord(removal = {}, options = {}) {
+    const rowKey = normalizeCoordinatorAuthorityRowKey(removal.rowKey || removal.coordinatorKey || removal.profileHref || '')
+    if(!rowKey) return null
+
+    const previousRow = cloneCoordinatorAuthorityValue(removal.previousRow || removal.row || null)
+    const operationKind = normalizeQueueWriteOperationName(removal.operationKind || options.operationKind || 'authority-row-remove')
+    const attemptId = getAttemptIdFromValue(previousRow || removal)
+    const attemptNumber = getAttemptNumberFromValue(previousRow || removal)
+    const runId = `${previousRow?.runId || removal.runId || ''}`.trim()
+    const status = `${previousRow?.status || removal.status || ''}`.trim()
+    const at = Number.parseInt(removal.at || previousRow?.updatedAt || previousRow?.terminalAt, 10) || Date.now()
+
+    return {
+        kind: 'map.remove',
+        area: 'queue',
+        key: rowKey,
+        dedupeKey: [
+            'queue',
+            operationKind,
+            'remove',
+            rowKey,
+            attemptId,
+            attemptNumber || '',
+            status
+        ].filter(value => value !== '').join(':'),
+        operationKind,
+        reason: removal.reason || options.reason || '',
+        runId,
+        attemptId,
+        attemptNumber,
+        status,
+        removed: true,
         at,
         seq: 1
     }
@@ -5022,13 +5063,26 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
 
 async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], nextProjection = {}, options = {}) {
     const operationKind = normalizeQueueWriteOperationName(options.operationKind || 'authority-row-batch-mutation')
-    const records = (Array.isArray(results) ? results : [])
+    const setRecords = (Array.isArray(results) ? results : [])
         .map(result => makeCoordinatorAuthorityShadowWalRecord({
             ...result,
             operationKind: result.operationKind || operationKind,
             durable: true
         }))
         .filter(Boolean)
+    const removeRecords = (Array.isArray(options.removedRows) ? options.removedRows : [])
+        .map(removal => makeCoordinatorAuthorityQueueWalRemoveRecord({
+            ...removal,
+            operationKind: removal.operationKind || operationKind
+        }, {
+            operationKind,
+            reason: options.reason || 'ordinaryMutation'
+        }))
+        .filter(Boolean)
+    const records = [
+        ...setRecords,
+        ...removeRecords
+    ]
     if(!records.length) {
         return {
             saved: false,
@@ -10351,6 +10405,229 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
     }
 }
 
+async function mutateCoordinatorFailedItemsRetry(operation = {}) {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') {
+        return {queued: 0, selected: 0, remainingRetryable: 0, reason: 'invalid-retry-reason'}
+    }
+
+    const request = operation.request && typeof operation.request === 'object' ? operation.request : {}
+    const retryLimit = Math.max(1, Number.parseInt(operation.retryLimit || request.retryLimit, 10) || 2)
+    const maxItems = Math.max(1, Number.parseInt(operation.maxItems || request.maxItems, 10) || 1)
+    const state = await loadCoordinatorState()
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
+    const events = normalizeCoordinatorEvents(state.events)
+    const progress = {
+        ...state.progress
+    }
+    let progressChanged = false
+
+    profileNukeProgress = progress
+
+    if(hasStoredCoordinatorWork(queue)) {
+        return {
+            queued: 0,
+            selected: 0,
+            remainingRetryable: getCoordinatorRetryableFailureCandidates(queue, progress, retryLimit).length,
+            reason: 'queue-busy'
+        }
+    }
+
+    const candidates = getCoordinatorRetryableFailureCandidates(queue, progress, retryLimit)
+    const selected = candidates.slice(0, maxItems)
+
+    if(!selected.length) {
+        return {
+            queued: 0,
+            selected: 0,
+            remainingRetryable: 0,
+            reason: 'no-retryable-failed-items'
+        }
+    }
+
+    const now = Date.now()
+    const runId = makeId('retry-failed')
+    const selectedItems = []
+    const nextQueue = {...queue}
+    const authorityResults = []
+    const removedRows = []
+
+    for(const candidate of selected) {
+        const item = candidate.item
+        const retryCount = getCoordinatorFailureRetryCount(item) + 1
+        const reset = buildFailedCoordinatorResetItem(candidate.itemKey, item, {
+            now,
+            runId,
+            request,
+            retryCount,
+            lastRetryAt: now,
+            retryReason: `${item.outcome || 'failed'}${item.error ? `: ${item.error}` : ''}`,
+            requestedUrlMode: 'tab',
+            envelopeSourceType: 'failed-retry'
+        })
+        const previousDestinationRow = queue[reset.coordinatorKey] || null
+        nextQueue[reset.coordinatorKey] = reset.nextItem
+        if(reset.coordinatorKey !== candidate.itemKey) {
+            delete nextQueue[candidate.itemKey]
+            removedRows.push({
+                rowKey: candidate.itemKey,
+                previousRow: item,
+                operationKind: 'retry',
+                reason: 'ordinaryMutation'
+            })
+        }
+
+        for(const href of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
+            if(!progress[href]) continue
+            delete progress[href]
+            progressChanged = true
+        }
+        authorityResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'retry',
+            rowKey: reset.coordinatorKey,
+            reason: 'ordinaryMutation'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: previousDestinationRow,
+            nextRow: reset.nextItem,
+            terminal: false,
+            allowTerminalOverwrite: true
+        }))
+        selectedItems.push(reset.nextItem)
+    }
+
+    const sourcePages = getCoordinatorRetrySourcePages(selectedItems)
+    const targetProfileHrefs = getNormalizedProfileHrefList(selectedItems.map(item => item.targetProfileHref))
+    const targetWorkKeys = mergeUniqueStringList(selectedItems.map(item => item.coordinatorKey || item.targetProfileHref || item.dedupeKey || ''))
+
+    const nextRuns = {
+        ...runs,
+        [runId]: {
+            id: runId,
+            sourceType: 'failed-retry',
+            createdAt: now,
+            updatedAt: now,
+            status: 'active',
+            itemCount: selectedItems.length,
+            activeCount: 0,
+            terminalCount: 0,
+            paused: false,
+            sourcePages,
+            targetProfileHrefs,
+            targetWorkKeys
+        }
+    }
+    Object.assign(nextRuns, recomputeCoordinatorRuns(nextQueue, nextRuns, new Set([runId])))
+
+    events.push({
+        id: makeId('event'),
+        runId,
+        itemId: '',
+        type: 'retry',
+        message: `Retrying ${selectedItems.length} failed target${selectedItems.length === 1 ? '' : 's'}`,
+        at: now,
+        details: {
+            queued: selectedItems.length,
+            retryLimit,
+            targetProfileHrefs,
+            targetProfileHref: targetProfileHrefs.length === 1 ? targetProfileHrefs[0] : ''
+        }
+    })
+
+    const nextProjection = makeCoordinatorAuthorityProjection({
+        ...state,
+        queue: nextQueue,
+        runs: nextRuns
+    })
+    let persistence = null
+    try {
+        persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+            authorityResults,
+            nextProjection,
+            {
+                operationKind: 'retry',
+                reason: 'ordinaryMutation',
+                previousProjectionQueue: queue,
+                removedRows,
+                metricPath: 'failedRetry.save.queueWal',
+                projectionMetricPath: 'failedRetry.save.projection'
+            }
+        )
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {
+            queued: 0,
+            selected: 0,
+            remainingRetryable: candidates.length,
+            reason: persistence?.reason || 'retry-save-failed',
+            persistence
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
+    if(progressChanged) {
+        profileNukeProgress = prunedProgress
+    }
+
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: nextRuns,
+            events,
+            progress: progressChanged ? prunedProgress : undefined
+        }, {
+            queue: false,
+            runs: true,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'retry-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'retry-derived-save-failed',
+            error?.message || 'Retry derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('retry.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'retry-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
+
+    incrementQueueWakeupMetric('job.enqueued', selectedItems.length)
+    incrementQueueWakeupMetric('pump.changed.requeued', selectedItems.length)
+
+    return {
+        queued: selectedItems.length,
+        selected: selectedItems.length,
+        selectedItems,
+        remainingRetryable: Math.max(0, candidates.length - selectedItems.length),
+        runId,
+        reason: 'retry-persisted',
+        persistence,
+        derivedSaved
+    }
+}
+
 async function retryCoordinatorFailedItems(request = {}, sender = {}) {
     const ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID
     if(!ownerTabId) return {queued: 0, selected: 0, remainingRetryable: 0, reason: 'no-coordinator'}
@@ -10378,131 +10655,14 @@ async function retryCoordinatorFailedItems(request = {}, sender = {}) {
     const retryLimit = Math.max(1, Number.parseInt(request.retryLimit, 10) || 2)
     const maxItems = Math.max(1, Number.parseInt(request.maxItems, 10) || 1)
 
-    const persisted = await enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorState()
-        const queue = state.queue
-        const runs = state.runs
-        const events = state.events
-        const progress = state.progress
-        let progressChanged = false
-
-        profileNukeProgress = progress
-
-        if(hasStoredCoordinatorWork(queue)) {
-            return {
-                queued: 0,
-                selected: 0,
-                remainingRetryable: getCoordinatorRetryableFailureCandidates(queue, progress, retryLimit).length,
-                reason: 'queue-busy'
-            }
-        }
-
-        const candidates = getCoordinatorRetryableFailureCandidates(queue, progress, retryLimit)
-        const selected = candidates.slice(0, maxItems)
-
-        if(!selected.length) {
-            return {
-                queued: 0,
-                selected: 0,
-                remainingRetryable: 0,
-                reason: 'no-retryable-failed-items'
-            }
-        }
-
-        const now = Date.now()
-        const runId = makeId('retry-failed')
-        const selectedItems = []
-
-        for(const candidate of selected) {
-            const item = candidate.item
-            const retryCount = getCoordinatorFailureRetryCount(item) + 1
-            const reset = buildFailedCoordinatorResetItem(candidate.itemKey, item, {
-                now,
-                runId,
-                request,
-                retryCount,
-                lastRetryAt: now,
-                retryReason: `${item.outcome || 'failed'}${item.error ? `: ${item.error}` : ''}`,
-                requestedUrlMode: 'tab',
-                envelopeSourceType: 'failed-retry'
-            })
-            queue[reset.coordinatorKey] = reset.nextItem
-            if(reset.coordinatorKey !== candidate.itemKey) delete queue[candidate.itemKey]
-
-            for(const href of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
-                if(!progress[href]) continue
-                delete progress[href]
-                progressChanged = true
-            }
-            selectedItems.push(reset.nextItem)
-        }
-
-        const sourcePages = getCoordinatorRetrySourcePages(selectedItems)
-        const targetProfileHrefs = getNormalizedProfileHrefList(selectedItems.map(item => item.targetProfileHref))
-        const targetWorkKeys = mergeUniqueStringList(selectedItems.map(item => item.coordinatorKey || item.targetProfileHref || item.dedupeKey || ''))
-
-        runs[runId] = {
-            id: runId,
-            sourceType: 'failed-retry',
-            createdAt: now,
-            updatedAt: now,
-            status: 'active',
-            itemCount: selectedItems.length,
-            activeCount: 0,
-            terminalCount: 0,
-            paused: false,
-            sourcePages,
-            targetProfileHrefs,
-            targetWorkKeys
-        }
-        Object.assign(runs, recomputeCoordinatorRuns(queue, runs, new Set([runId])))
-
-        events.push({
-            id: makeId('event'),
-            runId,
-            itemId: '',
-            type: 'retry',
-            message: `Retrying ${selectedItems.length} failed target${selectedItems.length === 1 ? '' : 's'}`,
-            at: now,
-            details: {
-                queued: selectedItems.length,
-                retryLimit,
-                targetProfileHrefs,
-                targetProfileHref: targetProfileHrefs.length === 1 ? targetProfileHrefs[0] : ''
-            }
-        })
-
-        const saved = await saveCoordinatorState({queue, runs, events, progress}, {
-            queue: true,
-            runs: true,
-            events: true,
-            progress: progressChanged,
+    const persisted = await enqueueSpaceFeedStorageUpdate(() => {
+        return mutateCoordinatorProjection({
+            kind: 'retryFailedItems',
             reason: 'ordinaryMutation',
-            queueOperation: 'retry',
-            queueChangedRows: selectedItems.length
+            request,
+            retryLimit,
+            maxItems
         })
-        if(!saved) {
-            return {
-                queued: 0,
-                selected: 0,
-                remainingRetryable: candidates.length,
-                reason: 'retry-save-failed'
-            }
-        }
-        if(progressChanged) {
-            profileNukeProgress = progress
-        }
-        incrementQueueWakeupMetric('job.enqueued', selectedItems.length)
-        incrementQueueWakeupMetric('pump.changed.requeued', selectedItems.length)
-
-        return {
-            queued: selectedItems.length,
-            selected: selectedItems.length,
-            selectedItems,
-            remainingRetryable: Math.max(0, candidates.length - selectedItems.length),
-            runId,
-            reason: 'retry-persisted'
-        }
     }, {
         reason: 'retry-failed',
         failureValue: {
@@ -10540,6 +10700,237 @@ async function retryCoordinatorFailedItems(request = {}, sender = {}) {
     }
 }
 
+async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') {
+        return {queued: 0, executionQueued: 0, selected: 0, reason: 'invalid-requeue-reason'}
+    }
+
+    const request = operation.request && typeof operation.request === 'object' ? operation.request : {}
+    const requestedHrefs = new Set(getNormalizedProfileHrefList([
+        request.profileHref || '',
+        ...(Array.isArray(request.profileHrefs) ? request.profileHrefs : [])
+    ]))
+    const requestedKeys = new Set([
+        `${request.storageKey || request.coordinatorKey || ''}`.trim(),
+        ...(Array.isArray(request.storageKeys) ? request.storageKeys : []),
+        ...(Array.isArray(request.coordinatorKeys) ? request.coordinatorKeys : [])
+    ].map(value => `${value || ''}`.trim()).filter(Boolean))
+    const hasRequestedTargets = requestedHrefs.size > 0 || requestedKeys.size > 0
+
+    const state = await loadCoordinatorState()
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
+    const queue = currentAuthorityState.queue
+    const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
+    const events = normalizeCoordinatorEvents(state.events)
+    const progress = {
+        ...state.progress
+    }
+    const now = Date.now()
+    const runId = makeId('requeue-failed')
+    const selectedItems = []
+    const nextQueue = {...queue}
+    const authorityResults = []
+    const removedRows = []
+    let progressChanged = false
+
+    for(const [itemKey, item] of Object.entries(queue)) {
+        if(`${item?.status || ''}` !== 'failed') continue
+
+        const legacyHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+        const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
+        const repairAsResolution = !!resolutionRetryUrl
+        const href = repairAsResolution ? '' : legacyHref
+        const coordinatorKey = repairAsResolution
+            ? makeProfileResolutionQueueKey(resolutionRetryUrl)
+            : href || getCoordinatorItemQueueKey(item, itemKey)
+        if(!href && !coordinatorKey) continue
+        if(
+            hasRequestedTargets &&
+            !requestedHrefs.has(href) &&
+            !requestedHrefs.has(legacyHref) &&
+            !requestedKeys.has(itemKey) &&
+            !requestedKeys.has(coordinatorKey)
+        ) continue
+
+        const reset = buildFailedCoordinatorResetItem(itemKey, item, {
+            now,
+            runId,
+            request,
+            retryCount: 0,
+            lastRetryAt: 0,
+            retryReason: '',
+            maxConcurrent: Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1),
+            requestedUrlMode: 'coordinator',
+            envelopeSourceType: 'manual-requeue'
+        })
+        const previousDestinationRow = queue[reset.coordinatorKey] || null
+
+        nextQueue[reset.coordinatorKey] = reset.nextItem
+        for(const progressHref of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
+            if(!progress[progressHref]) continue
+            delete progress[progressHref]
+            progressChanged = true
+        }
+        selectedItems.push(reset.nextItem)
+        authorityResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'requeue',
+            rowKey: reset.coordinatorKey,
+            reason: 'ordinaryMutation'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: previousDestinationRow,
+            nextRow: reset.nextItem,
+            terminal: false,
+            allowTerminalOverwrite: true
+        }))
+        if(reset.coordinatorKey !== itemKey) {
+            delete nextQueue[itemKey]
+            removedRows.push({
+                rowKey: itemKey,
+                previousRow: item,
+                operationKind: 'requeue',
+                reason: 'ordinaryMutation'
+            })
+        }
+    }
+
+    if(!selectedItems.length) {
+        return {
+            queued: 0,
+            selected: 0,
+            reason: 'no-failed-items'
+        }
+    }
+
+    const sourcePages = getCoordinatorRetrySourcePages(selectedItems)
+    const targetProfileHrefs = getNormalizedProfileHrefList(selectedItems.map(item => item.targetProfileHref))
+    const targetWorkKeys = mergeUniqueStringList(selectedItems.map(item => item.coordinatorKey || item.targetProfileHref || item.dedupeKey || ''))
+
+    const nextRuns = {
+        ...runs,
+        [runId]: {
+            id: runId,
+            sourceType: 'failed-requeue',
+            createdAt: now,
+            updatedAt: now,
+            status: 'active',
+            itemCount: selectedItems.length,
+            activeCount: 0,
+            terminalCount: 0,
+            paused: false,
+            sourcePages,
+            targetProfileHrefs,
+            targetWorkKeys
+        }
+    }
+    Object.assign(nextRuns, recomputeCoordinatorRuns(nextQueue, nextRuns, new Set([runId])))
+
+    events.push({
+        id: makeId('event'),
+        runId,
+        itemId: '',
+        type: 'requeue',
+        message: `Requeued ${selectedItems.length} failed target${selectedItems.length === 1 ? '' : 's'}`,
+        at: now,
+        details: {
+            queued: selectedItems.length,
+            targetProfileHrefs,
+            targetProfileHref: targetProfileHrefs.length === 1 ? targetProfileHrefs[0] : ''
+        }
+    })
+
+    const nextProjection = makeCoordinatorAuthorityProjection({
+        ...state,
+        queue: nextQueue,
+        runs: nextRuns
+    })
+    let persistence = null
+    try {
+        persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+            authorityResults,
+            nextProjection,
+            {
+                operationKind: 'requeue',
+                reason: 'ordinaryMutation',
+                previousProjectionQueue: queue,
+                removedRows,
+                metricPath: 'failedRequeue.save.queueWal',
+                projectionMetricPath: 'failedRequeue.save.projection'
+            }
+        )
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {
+            queued: 0,
+            executionQueued: 0,
+            selected: 0,
+            reason: persistence?.reason || 'requeue-save-failed',
+            persistence
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
+    if(progressChanged) {
+        profileNukeProgress = prunedProgress
+    }
+
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({
+            runs: nextRuns,
+            events,
+            progress: progressChanged ? prunedProgress : undefined
+        }, {
+            queue: false,
+            runs: true,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'requeue-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'requeue-derived-save-failed',
+            error?.message || 'Requeue derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('requeue.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'requeue-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
+
+    incrementQueueWakeupMetric('job.enqueued', selectedItems.length)
+    incrementQueueWakeupMetric('pump.changed.requeued', selectedItems.length)
+
+    return {
+        queued: selectedItems.length,
+        selected: selectedItems.length,
+        selectedItems,
+        runId,
+        reason: 'requeue-persisted',
+        persistence,
+        derivedSaved
+    }
+}
+
 async function requeueCoordinatorFailedItems(request = {}, sender = {}) {
     const ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID
     if(!ownerTabId) return {queued: 0, selected: 0, reason: 'no-coordinator'}
@@ -10563,140 +10954,12 @@ async function requeueCoordinatorFailedItems(request = {}, sender = {}) {
         }
     }
 
-    const requestedHrefs = new Set(getNormalizedProfileHrefList([
-        request.profileHref || '',
-        ...(Array.isArray(request.profileHrefs) ? request.profileHrefs : [])
-    ]))
-    const requestedKeys = new Set([
-        `${request.storageKey || request.coordinatorKey || ''}`.trim(),
-        ...(Array.isArray(request.storageKeys) ? request.storageKeys : []),
-        ...(Array.isArray(request.coordinatorKeys) ? request.coordinatorKeys : [])
-    ].map(value => `${value || ''}`.trim()).filter(Boolean))
-    const hasRequestedTargets = requestedHrefs.size > 0 || requestedKeys.size > 0
-
-    const persisted = await enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorState()
-        const queue = state.queue
-        const runs = state.runs
-        const events = state.events
-        const progress = state.progress
-        const now = Date.now()
-        const runId = makeId('requeue-failed')
-        const selectedItems = []
-        let progressChanged = false
-
-        for(const [itemKey, item] of Object.entries(queue)) {
-            if(`${item?.status || ''}` !== 'failed') continue
-
-            const legacyHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-            const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-            const repairAsResolution = !!resolutionRetryUrl
-            const href = repairAsResolution ? '' : legacyHref
-            const coordinatorKey = repairAsResolution
-                ? makeProfileResolutionQueueKey(resolutionRetryUrl)
-                : href || getCoordinatorItemQueueKey(item, itemKey)
-            if(!href && !coordinatorKey) continue
-            if(
-                hasRequestedTargets &&
-                !requestedHrefs.has(href) &&
-                !requestedHrefs.has(legacyHref) &&
-                !requestedKeys.has(itemKey) &&
-                !requestedKeys.has(coordinatorKey)
-            ) continue
-
-            const reset = buildFailedCoordinatorResetItem(itemKey, item, {
-                now,
-                runId,
-                request,
-                retryCount: 0,
-                lastRetryAt: 0,
-                retryReason: '',
-                maxConcurrent: Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1),
-                requestedUrlMode: 'coordinator',
-                envelopeSourceType: 'manual-requeue'
-            })
-
-            queue[reset.coordinatorKey] = reset.nextItem
-            for(const progressHref of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
-                if(!progress[progressHref]) continue
-                delete progress[progressHref]
-                progressChanged = true
-            }
-            selectedItems.push(reset.nextItem)
-            if(reset.coordinatorKey !== itemKey) delete queue[itemKey]
-        }
-
-        if(!selectedItems.length) {
-            return {
-                queued: 0,
-                selected: 0,
-                reason: 'no-failed-items'
-            }
-        }
-
-        const sourcePages = getCoordinatorRetrySourcePages(selectedItems)
-        const targetProfileHrefs = getNormalizedProfileHrefList(selectedItems.map(item => item.targetProfileHref))
-        const targetWorkKeys = mergeUniqueStringList(selectedItems.map(item => item.coordinatorKey || item.targetProfileHref || item.dedupeKey || ''))
-
-        runs[runId] = {
-            id: runId,
-            sourceType: 'failed-requeue',
-            createdAt: now,
-            updatedAt: now,
-            status: 'active',
-            itemCount: selectedItems.length,
-            activeCount: 0,
-            terminalCount: 0,
-            paused: false,
-            sourcePages,
-            targetProfileHrefs,
-            targetWorkKeys
-        }
-        Object.assign(runs, recomputeCoordinatorRuns(queue, runs, new Set([runId])))
-
-        events.push({
-            id: makeId('event'),
-            runId,
-            itemId: '',
-            type: 'requeue',
-            message: `Requeued ${selectedItems.length} failed target${selectedItems.length === 1 ? '' : 's'}`,
-            at: now,
-            details: {
-                queued: selectedItems.length,
-                targetProfileHrefs,
-                targetProfileHref: targetProfileHrefs.length === 1 ? targetProfileHrefs[0] : ''
-            }
-        })
-
-        const saved = await saveCoordinatorState({queue, runs, events, progress}, {
-            queue: true,
-            runs: true,
-            events: true,
-            progress: progressChanged,
+    const persisted = await enqueueSpaceFeedStorageUpdate(() => {
+        return mutateCoordinatorProjection({
+            kind: 'requeueFailedItems',
             reason: 'ordinaryMutation',
-            queueOperation: 'requeue',
-            queueChangedRows: selectedItems.length
+            request
         })
-        if(!saved) {
-            return {
-                queued: 0,
-                executionQueued: 0,
-                selected: 0,
-                reason: 'requeue-save-failed'
-            }
-        }
-        if(progressChanged) {
-            profileNukeProgress = progress
-        }
-        incrementQueueWakeupMetric('job.enqueued', selectedItems.length)
-        incrementQueueWakeupMetric('pump.changed.requeued', selectedItems.length)
-        return {
-            queued: selectedItems.length,
-            selected: selectedItems.length,
-            selectedItems,
-            runId,
-            reason: 'requeue-persisted'
-        }
     }, {
         reason: 'requeue-failed',
         failureValue: {
@@ -12282,6 +12545,12 @@ async function mutateCoordinatorProjection(operation = {}) {
     }
     if(kind === 'terminalizeActiveNonProfileLanding') {
         return mutateCoordinatorActiveNonProfileLandingTerminalize(operation)
+    }
+    if(kind === 'retryFailedItems') {
+        return mutateCoordinatorFailedItemsRetry(operation)
+    }
+    if(kind === 'requeueFailedItems') {
+        return mutateCoordinatorFailedItemsRequeue(operation)
     }
 
     return {
