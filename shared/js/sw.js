@@ -156,7 +156,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'stored-work-pause',
     'retry',
     'requeue',
-    'resolver-remap'
+    'resolver-remap',
+    'enqueue'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -11115,13 +11116,16 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         [PROFILE_NUKE_PROGRESS_KEY]: undefined
     })
     const queue = state.queue
-    const runs = state.runs
-    const events = state.events
-    const progress = state.progress
+    const nextQueue = {...queue}
+    const runs = normalizeCoordinatorMap(state.runs)
+    const events = normalizeCoordinatorEvents(state.events)
+    const progress = {...state.progress}
     let queued = 0
     let merged = 0
     let progressChanged = false
     const progressResetRecords = {}
+    const authorityResults = []
+    const resetCleanupTargets = []
     const affectedRunIds = new Set([runId])
     const sourcePages = new Set([...(runs[runId]?.sourcePages || []), source.pageUrl || runInput.sourcePageUrl || ''].filter(Boolean))
     const targetProfileHrefs = new Set(getCoordinatorRunTargetHrefs(runs[runId] || {}))
@@ -11142,7 +11146,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         if(targetProfileHref) targetProfileHrefs.add(targetProfileHref)
         targetWorkKeys.add(coordinatorKey)
 
-        const existing = queue[coordinatorKey] || null
+        const existing = nextQueue[coordinatorKey] || null
         const requestedActionKindInput = rawItem?.actionKind || rawItem?.tabAction || executeInput.tabAction || ''
         const actionKind = requestedActionKindInput
             ? getCoordinatorActionKindForRequestedAction(requestedActionKindInput)
@@ -11161,12 +11165,12 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         const resetExisting = actionChanged || shouldResetCoordinatorItemForIncoming(existing, actionKind, rawItem, runInput, source)
         if(resetExisting) {
             if(targetProfileHref) {
-                await cancelCoordinatorExecutorsForReset(
-                    targetProfileHref,
+                resetCleanupTargets.push({
+                    href: targetProfileHref,
                     existing,
-                    state.progress?.[targetProfileHref] || null,
+                    record: progress[targetProfileHref] || null,
                     actionKind
-                )
+                })
                 for(const previousRunId of getCoordinatorRunIdsForHref(runs, targetProfileHref)) {
                     if(previousRunId === runId || !runs[previousRunId]) continue
                     affectedRunIds.add(previousRunId)
@@ -11244,7 +11248,21 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
             actionKind
         })
 
-        queue[coordinatorKey] = nextItem
+        nextQueue[coordinatorKey] = nextItem
+        authorityResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'enqueue',
+            rowKey: coordinatorKey,
+            reason: 'ordinaryMutation'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: existing,
+            nextRow: nextItem,
+            terminal: isTerminalCoordinatorStatus(nextItem.status),
+            allowTerminalOverwrite: resetExisting
+        }))
         if(hasExecuteInput && targetProfileHref && (resetExisting || !existing)) {
             const resetRecord = normalizeProgressPatch(
                 targetProfileHref,
@@ -11271,14 +11289,14 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         updatedAt: now,
         status: 'active',
         itemCount: targetWorkKeys.size || targetProfileHrefs.size || rawItems.length,
-        activeCount: Object.values(queue).filter(item => item?.runId === runId && isActiveCoordinatorStatus(item?.status)).length,
-        terminalCount: Object.values(queue).filter(item => item?.runId === runId && isTerminalCoordinatorStatus(item?.status)).length,
+        activeCount: Object.values(nextQueue).filter(item => item?.runId === runId && isActiveCoordinatorStatus(item?.status)).length,
+        terminalCount: Object.values(nextQueue).filter(item => item?.runId === runId && isTerminalCoordinatorStatus(item?.status)).length,
         paused: false,
         sourcePages: Array.from(sourcePages),
         targetProfileHrefs: Array.from(targetProfileHrefs),
         targetWorkKeys: Array.from(targetWorkKeys)
     }
-    Object.assign(runs, recomputeCoordinatorRuns(queue, runs, affectedRunIds))
+    Object.assign(runs, recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds))
 
     events.push({
         id: makeId('event'),
@@ -11294,15 +11312,88 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         }
     })
 
-    await saveCoordinatorState({queue, runs, events, progress}, {
-        queue: true,
-        runs: true,
-        events: true,
-        progress: progressChanged,
-        reason: 'ordinaryMutation',
-        queueOperation: 'enqueue',
-        queueChangedRows: queued + merged
+    if(!authorityResults.length) {
+        return {
+            queued: 0,
+            merged: 0,
+            executionQueued: 0,
+            runId,
+            coordinatorTabId: null,
+            coordinatorWindowId: null,
+            coordinatorReused: false,
+            executionDeferred: true
+        }
+    }
+
+    const nextProjection = makeCoordinatorAuthorityProjection({
+        ...state,
+        queue: nextQueue,
+        runs
     })
+    let persistence = null
+    try {
+        persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+            authorityResults,
+            nextProjection,
+            {
+                operationKind: 'enqueue',
+                reason: 'ordinaryMutation',
+                previousProjectionQueue: queue,
+                metricPath: 'enqueue.save.queueWal',
+                projectionMetricPath: 'enqueue.save.projection'
+            }
+        )
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {
+            queued: 0,
+            merged: 0,
+            executionQueued: 0,
+            runId,
+            coordinatorTabId: null,
+            coordinatorWindowId: null,
+            coordinatorReused: false,
+            executionDeferred: !hasExecuteInput,
+            durable: false,
+            reason: persistence?.reason || 'enqueue-save-failed',
+            persistence
+        }
+    }
+
+    await coordinatorAuthority.hydrate()
+    let derivedSaved = true
+    try {
+        derivedSaved = await saveCoordinatorState({runs, events, progress}, {
+            queue: false,
+            runs: true,
+            events: true,
+            progress: progressChanged,
+            reason: 'ordinaryMutation',
+            queueOperation: 'enqueue-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        derivedSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'enqueue-derived-save-failed',
+            error?.message || 'Enqueue derived save failed'
+        )
+    }
+    if(derivedSaved === false) {
+        incrementQueueWakeupMetric('enqueue.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'enqueue-derived-save-failed',
+            edgeTriggered: true
+        })
+    }
     if(progressChanged) {
         profileNukeProgress = {
             ...profileNukeProgress,
@@ -11318,7 +11409,11 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         coordinatorTabId: null,
         coordinatorWindowId: null,
         coordinatorReused: false,
-        executionDeferred: true
+        executionDeferred: true,
+        durable: true,
+        persistence,
+        derivedSaved,
+        resetCleanupTargets
     }
 }
 
@@ -11331,6 +11426,20 @@ async function finishCoordinatorEnqueue(request = {}, sender = {}, enqueueResult
             edgeTriggered: true
         })
         return
+    }
+    const acceptedItems = (Number.parseInt(enqueueResult?.queued, 10) || 0) +
+        (Number.parseInt(enqueueResult?.merged, 10) || 0)
+    if(acceptedItems <= 0 || enqueueResult?.durable === false || enqueueResult?.persistence?.saved === false) {
+        return
+    }
+
+    for(const cleanup of enqueueResult.resetCleanupTargets || []) {
+        await cancelCoordinatorExecutorsForReset(
+            cleanup.href,
+            cleanup.existing,
+            cleanup.record,
+            cleanup.actionKind
+        )
     }
 
     const executeInput = request.execute && typeof request.execute === 'object' ? request.execute : {}
