@@ -988,6 +988,25 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
   showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
   0 per-row cancel buttons for 80 displayed rows.
+- Review closeout: reviewer follow-up found that clear-profile derived run
+  cleanup removed the profile from `targetProfileHrefs` but left a profile-key
+  run's matching `targetWorkKeys` and old `itemCount`. The cleanup now treats
+  profile-equivalent work keys as affected run targets, removes them with the
+  profile href, and run recomputation no longer preserves stale
+  `itemCount` when there are no current targets or queue rows. The success
+  synthetic now asserts the cleared href is absent from both `targetProfileHrefs`
+  and `targetWorkKeys`, with `itemCount: 0`. Validation: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `timeout 180 node
+  test/swSynthetic.test.js`, `node test/p1-contract.test.js`, and `npm test`
+  passed. Version bumped to `1.6.583`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.583.zip` and `firefox/mute_block-1.6.583.zip`.
+  Bounded rsync to the unpacked Chrome directory succeeded and CDP reload
+  reported extension `1.6.583` enabled with zero manifest/runtime errors. Live
+  queue accounting reported `consistent: true`, 420 raw/recovered/view rows, no
+  raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
+  showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
+  0 per-row cancel buttons for 80 displayed rows.
 
 ## Deferred follow-up: physical WAL segmentation
 
