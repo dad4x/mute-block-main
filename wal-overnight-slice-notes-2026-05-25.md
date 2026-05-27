@@ -809,6 +809,39 @@ pressure remains a separate performance/reliability follow-up.
   showed 44 ready, 416 succeeded, 12 soft-fail, 0 hard-fail, 1 active, and 45
   per-row cancel buttons for 80 displayed rows.
 
+## Slice 28: enqueue/merge WAL migration
+
+- Operation migrated: `enqueue` was added to
+  `COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS`; `enqueueCoordinatorItemsStorageLocked`
+  now builds a next queue projection and persists accepted enqueue/merge rows
+  through `persistCoordinatorAuthorityQueueWalBatchMutation`.
+- Authority boundary: raw `mbCoordinatorQueue` is no longer the durable target
+  for newly enqueued rows. Tests and runtime follow-up paths use WAL-recovered
+  authority/current projection for enqueue-created work.
+- Side-effect boundary: reset cleanup for existing executor tabs moved out of
+  the storage mutation. `finishCoordinatorEnqueue()` runs reset cleanup and
+  reconcile only after the enqueue result has accepted durable rows; WAL append
+  failure leaves active owned tabs open and existing durable rows unchanged.
+- Derived state: runs/events/progress save as `enqueue-derived` with
+  `queue: false`. A derived-save failure records diagnostics, schedules repair,
+  and does not poison the durable queue WAL append.
+- Coverage added/updated: storage-only enqueue asserts WAL recovery without a
+  raw queue snapshot; executable enqueue timeout now wedges `mbCoordinatorQueueWal`;
+  reset-existing WAL failure keeps the active owned tab open; derived-save
+  failure keeps the WAL row durable and schedules repair; stale raw-queue
+  enqueue-adjacent assertions now read recovered authority.
+- Validation: `node -c shared/js/sw.js`, `node test/p1-contract.test.js`,
+  `node test/swSynthetic.test.js`, and `npm test` passed. Version bumped to
+  `1.6.576`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.576.zip` and
+  `firefox/mute_block-1.6.576.zip`. Bounded rsync to the unpacked Chrome
+  directory succeeded and CDP reload reported extension `1.6.576` enabled with
+  zero manifest/runtime errors. Live queue accounting reported
+  `consistent: true`, 506 raw/recovered/view rows, no raw divergences, no view
+  mismatches, and an active WAL tail with 2 applied records. Dashboard sanity
+  showed 44 ready, 416 succeeded, 12 soft-fail, 0 hard-fail, 1 active, and 45
+  per-row cancel buttons for 80 displayed rows.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

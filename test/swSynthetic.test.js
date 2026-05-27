@@ -88,6 +88,15 @@ function getProgressShardRecord(storage, href) {
     return null
 }
 
+function getRecoveredCoordinatorQueue(storage = {}) {
+    if(storage?.mbCoordinatorQueueWal) {
+        const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal)
+        const queue = recovered?.projected?.state?.queue || recovered?.state?.queue
+        if(queue && typeof queue === 'object') return queue
+    }
+    return storage?.mbCoordinatorQueue || {}
+}
+
 async function activateQuoraRuntime(browser, url = 'https://www.quora.com/profile/Synthetic-Activation') {
     await browser.tabs.onUpdated.emit(101, {
         status: 'loading',
@@ -10648,7 +10657,7 @@ test('queued profile actions are throttled and opened background', async () => {
     )
 
     const queuedHref = opened[0].url === firstHref ? secondHref : firstHref
-    assert.equal(storage.mbCoordinatorQueue[queuedHref].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[queuedHref].status, 'queued')
 })
 
 test('begin-profile-action grants initial action gate without foreground promotion', async () => {
@@ -10884,13 +10893,130 @@ test('storage-only coordinator enqueue stays durable without starting service-wo
     }), sourceSender)
 
     assert.equal(enqueue.executionDeferred, true)
-    assert.equal(storage.mbCoordinatorQueue[href].executorOwner, '')
-    assert.equal(storage.mbCoordinatorQueue[href].serviceWorkerOwned, false)
+    assert.equal(storage.mbCoordinatorQueue?.[href], undefined)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].executorOwner, '')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].serviceWorkerOwned, false)
 
     await flushAsync(8)
     await timers.tick(0)
 
     assert.deepEqual(listTabs(browser), [])
+})
+
+test('enqueue WAL append failure does not reset active owned tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Wal-Failure-Reset'
+    const runId = 'run-enqueue-wal-failure-existing'
+    const nextRunId = 'run-enqueue-wal-failure-reset'
+    const attemptId = 'attempt-enqueue-wal-failure-existing'
+    const tabId = 790
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, storage, timers} = loadServiceWorkerHarness({
+        now: 3050,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 3050})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opened',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 3050
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic enqueue WAL append failure')
+        }
+        return originalSet(payload)
+    }
+
+    const enqueue = await browser.runtime.sendMessage({
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: nextRunId,
+            sourceType: 'space-feed',
+            resetExisting: true
+        },
+        source: {
+            type: 'space-feed',
+            pageUrl: 'https://www.quora.com/space/example'
+        },
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: 1,
+            noForegroundFallback: true
+        },
+        items: [{
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            resetExisting: true
+        }]
+    }, sourceSender)
+
+    assert.equal(enqueue.queued, 0)
+    assert.equal(enqueue.merged, 0)
+    assert.equal(enqueue.durable, false)
+    assert.equal(enqueue.persistence.saved, false)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    browser.storage.local.set = originalSet
+
+    await flushAsync(20)
+    await timers.tick(0)
+
+    assert.equal(browser.__removedTabs.includes(tabId), false)
+    assert.equal(browser.__tabs.has(tabId), true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].tabId, tabId)
+    assert.equal(storage.mbCoordinatorRuns[nextRunId], undefined)
+})
+
+test('enqueue derived save failure keeps WAL row durable and schedules repair', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Derived-Failure'
+    const runId = 'run-enqueue-derived-failure'
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, sw, storage} = loadServiceWorkerHarness({now: 3075})
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic enqueue derived save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
+        href,
+        runId
+    }), sourceSender)
+
+    assert.equal(enqueue.queued, 1)
+    assert.equal(enqueue.durable, true)
+    assert.equal(enqueue.derivedSaved, false)
+    assert.equal(storage.mbCoordinatorQueue?.[href], undefined)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
+    assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
+    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    browser.storage.local.set = originalSet
 })
 
 test('executable enqueue preserves explicit pause and does not open worker tabs', async () => {
@@ -10921,7 +11047,7 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     assert.equal(enqueue.queued, 1)
     assert.equal(enqueue.executionDeferred, true)
     assert.equal(storage.mbCoordinatorPaused, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
 
     await flushAsync(20)
     await timers.tick(0)
@@ -10931,7 +11057,7 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     await flushAsync(20)
 
     assert.equal(storage.mbCoordinatorPaused, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.deepEqual(listTabs(browser), [])
 })
 
@@ -11193,7 +11319,7 @@ test('executable enqueue timeout does not start raw request executor work', asyn
     const originalSet = browser.storage.local.set
 
     browser.storage.local.set = async payload => {
-        if(Object.prototype.hasOwnProperty.call(payload || {}, 'mbCoordinatorQueue')) {
+        if(Object.prototype.hasOwnProperty.call(payload || {}, 'mbCoordinatorQueueWal')) {
             return new Promise(() => {})
         }
         return originalSet(payload)
@@ -11274,7 +11400,7 @@ test('queued tab active transition timeout closes unconfirmed runtime tab', asyn
     )
 
     assert.equal(listTabs(browser).some(candidate => candidate.id === createdTabId), false)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
 })
 
 test('active transition is WAL-backed and recovers after restart', async () => {
@@ -11734,8 +11860,9 @@ test('late active confirmation rejects reclaimed attempt for the same tab', asyn
         if(createdTabId && readsQueue && !readsRuns) {
             queueOnlyReadsAfterOpen += 1
             if(queueOnlyReadsAfterOpen === 1) {
+                storage.mbCoordinatorQueue = storage.mbCoordinatorQueue || {}
                 storage.mbCoordinatorQueue[href] = {
-                    ...storage.mbCoordinatorQueue[href],
+                    ...getRecoveredCoordinatorQueue(storage)[href],
                     status: 'active',
                     tabId: createdTabId,
                     activeTabId: createdTabId,
@@ -11769,8 +11896,9 @@ test('late active confirmation rejects reclaimed attempt for the same tab', asyn
         {timers}
     )
     assert.equal(tab.id, createdTabId)
+    storage.mbCoordinatorQueue = storage.mbCoordinatorQueue || {}
     storage.mbCoordinatorQueue[href] = {
-        ...storage.mbCoordinatorQueue[href],
+        ...getRecoveredCoordinatorQueue(storage)[href],
         status: 'active',
         tabId: createdTabId,
         activeTabId: createdTabId,
@@ -12480,7 +12608,7 @@ test('queued profile tab is requeued after the foreground-wait stale timeout ela
         storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.ok(['queued', 'opening', 'active', 'acting', 'settling'].includes(recoveredQueue[href].status))
     assert.equal(recoveredQueue[href].retryCount, 1)
     assert.equal(recoveredQueue[href].retryAttempt, 1)
@@ -12542,7 +12670,7 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
         storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(recoveredQueue[href].status, 'queued')
     assert.equal(recoveredQueue[href].retryCount || 0, 0)
     assert.equal(recoveredQueue[href].retryAttempt || 0, 0)
