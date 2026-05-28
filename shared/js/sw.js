@@ -7083,11 +7083,18 @@ function applyCoordinatorSourceMetadataRepair(item = {}, inferred = {}) {
     return changed ? next : item
 }
 
-function shouldRestoreQueuedProgressRecordToCoordinatorQueue(href = '', record = {}, queue = {}, now = Date.now()) {
+function shouldRestoreQueuedProgressRecordToCoordinatorQueue(href = '', record = {}, queue = {}, now = Date.now(), run = null) {
     if(!href || queue[href]) return false
     if(`${record?.status || ''}` !== 'queued') return false
     if(!`${record?.runId || ''}`.trim()) return false
     if(`${record?.actionKind || 'mute-block'}` === UNBLOCK_UNMUTE_ACTION_KIND) return false
+    if(!run || typeof run !== 'object') return false
+
+    const runTargetHrefs = new Set(getNormalizedProfileHrefList([
+        ...getCoordinatorRunTargetHrefs(run),
+        ...(Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [])
+    ]))
+    if(!runTargetHrefs.has(href)) return false
 
     const queuedAt = Number.parseInt(record?.queuedAt, 10) || 0
     return !queuedAt || now - queuedAt <= CURRENT_WORK_RETENTION_MS
@@ -7240,10 +7247,10 @@ function restoreQueuedProgressRecordsToCoordinatorQueue(state = {}, options = {}
 
     for(const [key, record] of Object.entries(progress || {})) {
         const href = normalizeQuoraProfileUrl(record?.profileHref || key || '')
-        if(!shouldRestoreQueuedProgressRecordToCoordinatorQueue(href, record, queue, now)) continue
-
         const runId = `${record.runId || ''}`.trim()
         const run = runs[runId] || {}
+        if(!shouldRestoreQueuedProgressRecordToCoordinatorQueue(href, record, queue, now, run)) continue
+
         const source = makeCoordinatorSourceFromRunMetadata(runId, run, events)
         const sourceType = source.type || 'profile-list'
         const sourcePageUrl = source.pageUrl || ''
