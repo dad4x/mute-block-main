@@ -1254,6 +1254,29 @@ pressure remains a separate performance/reliability follow-up.
   active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: moved content pages off raw coordinator queue/progress storage
+  reads. Non-search content initialization, profile queued-action fallback, and
+  profile/space/profile-search storage-change refreshes now use
+  `get-content-page-coordinator-state`, which reads compact queue/progress
+  projections and scoped shards. The content script no longer defines
+  `mbCoordinatorQueue` or `mbProfileNukeProgress` storage keys, no longer sends
+  the `normalize-profile-nuke-progress` startup action, and reacts to
+  `mbCoordinatorQueueView` / `mbProfileNukeProgressView` projection changes by
+  refreshing scoped runtime state. The service-worker legacy normalization
+  action remains for old live content-script callers only. Updated the
+  inventory and P1 contracts to forbid content-side raw queue/progress reads.
+  Validation: `node -c shared/js/content.js`, `node -c
+  test/p1-contract.test.js`, `timeout 120 node test/p1-contract.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.596`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.596.zip` and `firefox/mute_block-1.6.596.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.596`,
+  enabled, with zero manifest/runtime errors. As with the prior slice, the
+  first post-reload accounting audit timed out in `Runtime.evaluate`; a rerun
+  succeeded and was consistent: 413 total terminal rows, 383 succeeded, 24
+  skipped, 6 canceled, no active/queued/failed work, active WAL tail 0, and no
+  raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
