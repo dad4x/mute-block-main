@@ -1217,6 +1217,101 @@ test('bulk current work pause WAL append failure does not close active owned tab
     assert.equal(browser.__tabs.has(tabId), true)
 })
 
+test('runs paused update uses queue-runs projection without loading progress', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Runs-Paused-Projection'
+    const runId = 'run-runs-paused-projection'
+    const attemptId = 'attempt-runs-paused-projection'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 505500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 505500})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'paused',
+                    paused: true,
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    runId,
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 505400
+                }
+            }
+        }
+    })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
+
+    const result = await sw.setCoordinatorRunsPaused(false)
+
+    assert.equal(result.changed, true)
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'active')
+    assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
+})
+
+test('runs paused update failure schedules repair without throwing', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Runs-Paused-Failure'
+    const runId = 'run-runs-paused-failure'
+    const attemptId = 'attempt-runs-paused-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 505800,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 505800})
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'paused',
+                    paused: true,
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbCoordinatorRuns) {
+            throw new Error('synthetic runs paused save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.setCoordinatorRunsPaused(false)
+
+    assert.equal(result.changed, false)
+    assert.equal(result.reason, 'runs-paused-save-failed')
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
+    assert.equal(sw.state().queueWakeupCounters['runsPaused.derivedSaveFailed'], 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+})
+
 test('manual failed retry WAL moves resolver rows without leaving stale source key', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Failed-Retry-Move'
     const questionUrl = 'https://www.quora.com/unanswered/Synthetic-failed-retry-move-question'

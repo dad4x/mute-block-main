@@ -1069,6 +1069,26 @@ pressure remains a separate performance/reliability follow-up.
   `chrome/mute_block-1.6.586.zip` and `firefox/mute_block-1.6.586.zip`.
   Live Windows push/reload is pending because the `127.0.0.1:10022` tunnel
   refused the bounded rsync retry and CDP returned `ECONNRESET`.
+- Next slice: `setCoordinatorRunsPaused()` / `mutateCoordinatorRunsPausedSet()`
+  no longer load full coordinator state for run pause metadata. The helper now
+  reads only WAL-recovered queue/runs projection, writes runs as explicit
+  `runs-paused-derived` metadata, and catches save failure to record
+  diagnostics and schedule repair instead of throwing from fire-and-forget
+  resume cleanup. Added synthetic coverage that proves the helper does not read
+  `mbProfileNukeProgress` or events, plus a runs-save failure case that leaves
+  stored run metadata untouched and schedules repair. Validation: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `node -c test/lib/swHarness.js`, `timeout 240
+  node test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  and `timeout 300 npm test` passed. Version bumped to `1.6.587`; `npm run
+  prod`, `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.587.zip` and `firefox/mute_block-1.6.587.zip`.
+  Bounded `rsync` to the Windows unpacked Chrome tree succeeded after the
+  tunnel returned. CDP reload reported extension `1.6.587`, enabled, with zero
+  manifest/runtime errors; dashboard state showed no ready/active work and
+  `0 ready, 383 succeeded, 0 soft-fail 0 hard-fail`; queue accounting was
+  consistent across raw, recovered WAL, and compact view with 413 total
+  terminal rows, 383 succeeded, 24 skipped, 6 canceled, and no divergences.
 
 ## Deferred follow-up: physical WAL segmentation
 

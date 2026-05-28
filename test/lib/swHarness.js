@@ -433,6 +433,7 @@ module.exports.__test = {
     runStoredWorkRepairTick,
     saveCoordinatorState,
     scheduleStoredWorkRepair,
+    setCoordinatorRunsPaused,
     settleTerminalCoordinatorItems,
     startQueueWakeupMetricsBackedStartupWork,
     syncCoordinatorProgressRecords,
