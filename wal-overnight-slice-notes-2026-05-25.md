@@ -1475,6 +1475,24 @@ pressure remains a separate performance/reliability follow-up.
   no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: split terminal settlement into explicit authority and derived
+  materialization helpers. `settleTerminalCoordinatorItemsLocked()` now calls
+  `applyTerminalCoordinatorAuthoritySettlementLocked()` for WAL-backed
+  `terminal-settlement` row stamping and
+  `buildTerminalCoordinatorSettlementDerivedPayload()` for progress,
+  pending-post, and remembered-post payload construction. Validation: `node -c
+  shared/js/sw.js && node -c test/p1-contract.test.js && node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.607` for release packaging. `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.607.zip` and `firefox/mute_block-1.6.607.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.607`,
+  enabled, with zero manifest/runtime errors. Queue accounting audit was
+  consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6 canceled,
+  no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

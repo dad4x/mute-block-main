@@ -3407,6 +3407,23 @@ test('profile progress persistence is serialized with coordinator state', () => 
     assert.doesNotMatch(loadBody, /enqueueStoredCoordinatorQueueProgressSync/)
 })
 
+test('terminal settlement separates authority stamping from derived materialization', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const settlementBody = extractFunction(source, 'async function settleTerminalCoordinatorItemsLocked(options = {})')
+    const authorityBody = extractFunction(source, 'async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {})')
+    const derivedBody = extractFunction(source, 'function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {})')
+
+    assert.match(settlementBody, /applyTerminalCoordinatorAuthoritySettlementLocked\(\{[\s\S]*settlementKey,[\s\S]*sourceSettlementOutcome,[\s\S]*currentAuthorityState/)
+    assert.match(settlementBody, /buildTerminalCoordinatorSettlementDerivedPayload\(stored, progress, \{[\s\S]*confirmedHrefs,[\s\S]*clearedHrefs,[\s\S]*progressChanged/)
+    assert.match(authorityBody, /coordinatorAuthority\.applyWithinStorageUpdate/)
+    assert.match(authorityBody, /operationKind: 'terminal-settlement'/)
+    assert.doesNotMatch(authorityBody, /SPACE_PENDING_NUKED_POSTS_KEY|SPACE_NUKED_POSTS_KEY|PROFILE_NUKE_PROGRESS_KEY|metricStorageSet/)
+    assert.match(derivedBody, /SPACE_PENDING_NUKED_POSTS_KEY/)
+    assert.match(derivedBody, /SPACE_NUKED_POSTS_KEY/)
+    assert.match(derivedBody, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.doesNotMatch(derivedBody, /coordinatorAuthority|applyWithinStorageUpdate|metricStorageSet/)
+})
+
 test('space-feed enqueue does not create progress before durable enqueue', () => {
     const body = extractFunction(readRepoFile('shared/js/content.js'), 'async function nukeSpaceFeedEntries(button, entries)')
     const enqueueIndex = body.indexOf('const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations)')
