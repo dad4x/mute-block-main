@@ -72,6 +72,9 @@ async function init() {
     document.getElementById('cancelCurrentWorkButton')?.addEventListener('click', () => {
         void cancelCurrentWork()
     })
+    document.getElementById('startCoordinatorButton')?.addEventListener('click', () => {
+        void startQuoraRuntime()
+    })
     document.getElementById('openPreferencesButton')?.addEventListener('click', () => {
         void openPreferences()
     })
@@ -217,6 +220,19 @@ async function openPreferences() {
     const url = browser.runtime.getURL('popup.html')
     await browser.tabs.create({url, active: true}).catch(() => {
         window.open(url, '_blank', 'noopener')
+    })
+}
+
+async function startQuoraRuntime() {
+    const button = document.getElementById('startCoordinatorButton')
+    flashButton(button)
+    retryFailedLastResult = {reason: 'opening-quora'}
+    render()
+    await browser.tabs.create({
+        url: 'https://www.quora.com/',
+        active: true
+    }).catch(() => {
+        window.open('https://www.quora.com/', '_blank', 'noopener')
     })
 }
 
@@ -486,7 +502,12 @@ function render() {
     const hardFailedCount = Math.max(0, failedCount - retryableFailedCount)
 
     setText('queuedCount', queuedCount)
-    setText('currentWorkReadyCount', `${queuedCount} ready, ${succeededCount} succeeded, ${retryableFailedCount} soft-fail ${hardFailedCount} hard-fail`)
+    setText('currentWorkReadyCount', getCurrentWorkSummaryText(queueItems, {
+        queuedCount,
+        succeededCount,
+        retryableFailedCount,
+        hardFailedCount
+    }))
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
     setText('terminalCount', terminalCount)
@@ -505,6 +526,21 @@ function render() {
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
     syncRequeueFailedControls(failedCount)
     syncCurrentWorkPauseControls(queueItems)
+    syncStartCoordinatorControls()
+}
+
+function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
+    const totalCount = getQueueTotalCount(queueItems)
+    const shownCount = state.queueTruncated ? queueItems.length : totalCount
+    const showingText = state.queueTruncated
+        ? `Showing ${shownCount} of ${totalCount}`
+        : `Showing ${totalCount}`
+    const queuedCount = Number.parseInt(counts.queuedCount, 10) || 0
+    const succeededCount = Number.parseInt(counts.succeededCount, 10) || 0
+    const softFailedCount = Number.parseInt(counts.retryableFailedCount, 10) || 0
+    const hardFailedCount = Number.parseInt(counts.hardFailedCount, 10) || 0
+
+    return `${showingText}, ${queuedCount} queued, ${succeededCount} succeeded, ${softFailedCount} soft-fail, ${hardFailedCount} hard-fail`
 }
 
 async function clearEvents() {
@@ -592,7 +628,7 @@ function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exha
     const waitText = getRetryFailedWorkWaitText({hasPendingWork, hasActiveWork})
     const button = document.getElementById('retryFailedButton')
     if(button) {
-        button.textContent = 'Retry Soft-Fails'
+        button.textContent = retryFailedActive ? 'Disable Retry Soft-Fails' : 'Enable Retry Soft-Fails'
         button.setAttribute('aria-pressed', retryFailedActive ? 'true' : 'false')
         button.title = retryFailedActive ? 'Turn soft-fail retry off' : 'Turn soft-fail retry on'
         button.disabled = false
@@ -625,6 +661,17 @@ function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exha
         stateText = `Soft-fail retry off${lastReason ? ` (${lastReason})` : ''}`
     }
     setText('retryFailedState', stateText)
+}
+
+function syncStartCoordinatorControls() {
+    const button = document.getElementById('startCoordinatorButton')
+    if(!button) return
+
+    button.hidden = !state.requiresQuoraVisit
+    button.disabled = state.loading
+    button.title = state.requiresQuoraVisit
+        ? 'Open Quora to start Current Work'
+        : 'Quora runtime is available'
 }
 
 function getRetryFailedWorkWaitText({hasPendingWork = false, hasActiveWork = false} = {}) {
