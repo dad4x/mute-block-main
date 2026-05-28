@@ -1214,6 +1214,25 @@ pressure remains a separate performance/reliability follow-up.
   canceled, no active/queued/failed work, active WAL tail 0, and no
   raw/recovered/view mismatches.
 
+- Next slice: deleted the unused compatibility save helpers
+  `saveCoordinatorQueueProjection()` and `saveCoordinatorQueueRunsProjection()`.
+  All former queue/runs writers now go through explicit WAL-backed authority
+  operations or derived materialization saves, so keeping these broad
+  `saveCoordinatorState()` wrappers only preserved an obsolete full-snapshot
+  write path. Contract coverage now rejects reintroducing either helper in
+  `shared/js/sw.js`, while the inventory marks both rows as deleted
+  compatibility helpers. Validation: `node -c shared/js/sw.js`, `node -c
+  test/p1-contract.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.594`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.594.zip` and `firefox/mute_block-1.6.594.zip`.
+  Live Windows rsync push succeeded. CDP reload reported extension `1.6.594`,
+  enabled, with zero manifest/runtime errors. CDP queue accounting audit was
+  consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6 canceled,
+  no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

@@ -6707,43 +6707,6 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
     })
 }
 
-async function saveCoordinatorQueueProjection(queue = {}, options = {}) {
-    const queueChanged = !!options.queueChanged
-    const reason = normalizeSnapshotWriteReason(options.reason || 'ordinaryMutation')
-    if(reason !== 'ordinaryMutation') return false
-    return saveCoordinatorState({queue}, {
-        queue: queueChanged,
-        reason: 'ordinaryMutation',
-        queueOperation: options.queueOperation || 'queue-projection',
-        queueChangedRows: options.queueChangedRows
-    })
-}
-
-async function saveCoordinatorQueueRunsProjection(queue = {}, runs = {}, options = {}) {
-    const queueChanged = !!options.queueChanged
-    const runsChanged = !!options.runsChanged
-    const reason = normalizeSnapshotWriteReason(options.reason || 'ordinaryMutation')
-    if(reason === 'ordinaryMutation') {
-        return saveCoordinatorState({queue, runs}, {
-            queue: queueChanged,
-            runs: runsChanged,
-            reason: 'ordinaryMutation',
-            queueOperation: options.queueOperation || 'queue-runs-projection',
-            queueChangedRows: options.queueChangedRows
-        })
-    }
-    if(reason === 'repair') {
-        return saveCoordinatorState({queue, runs}, {
-            queue: queueChanged,
-            runs: runsChanged,
-            reason: 'repair',
-            queueOperation: options.queueOperation || 'repair',
-            queueChangedRows: options.queueChangedRows
-        })
-    }
-    return false
-}
-
 async function saveCoordinatorState(state = {}, changes = {}) {
     return runQueueWakeupMetricPhase('saveCoordinatorState', async () => {
         incrementQueueWakeupMetric('saveCoordinatorStateCalls')
