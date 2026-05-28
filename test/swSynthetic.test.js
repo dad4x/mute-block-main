@@ -5264,9 +5264,8 @@ test('compatibility progress sync restores stale terminal progress from terminal
     })
     const progressRecord = {
         profileHref: href,
-        status: 'blocked',
-        blockSucceeded: true,
-        blockedAt: 276100,
+        status: 'error-page',
+        finalError: 'Old browser error page',
         terminalAt: 276100,
         runId,
         tabId: 0,
@@ -5298,10 +5297,61 @@ test('compatibility progress sync restores stale terminal progress from terminal
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'interrupted')
-    assert.equal(storage.mbProfileNukeProgress[href].blockSucceeded, undefined)
     assert.equal(storage.mbProfileNukeProgress[href].finalError, terminalRow.error)
     assert.equal(sw.state().profileNukeProgress[href].status, 'interrupted')
     assert.equal(sw.state().profileNukeProgress[href].finalError, terminalRow.error)
+    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
+})
+
+test('compatibility progress sync preserves same-attempt success evidence over stale failed queue authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Success-Evidence'
+    const runId = 'run-compatibility-success-evidence'
+    const attemptId = 'attempt-compatibility-success-evidence'
+    const terminalRow = makeFailedCoordinatorRow({
+        href,
+        runId,
+        attemptId,
+        now: 276900,
+        error: 'Queued tab timed out before terminal success repair'
+    })
+    const progressRecord = {
+        profileHref: href,
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: 276850,
+        terminalAt: 276850,
+        runId,
+        tabId: 0,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1,
+        updatedAt: 276850
+    }
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 276900,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: terminalRow
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: progressRecord
+            }
+        }
+    })
+
+    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
+    assert.equal(storage.mbProfileNukeProgress[href].blockSucceeded, true)
+    assert.equal(storage.mbProfileNukeProgress[href].finalError || '', '')
     assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
 })
 

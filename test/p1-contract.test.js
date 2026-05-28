@@ -2933,7 +2933,7 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
     )
     const restoreBody = extractFunction(
         source,
-        'function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null, options = {})'
+        'function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null)'
     )
     const transitionBody = extractFunction(
         source,
@@ -2956,7 +2956,6 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
     assert.match(preferBody, /effectiveMapped\.status !== 'succeeded'/)
     assert.match(preferBody, /isSuccessfulProfileNukeRecord\(record\)/)
     assert.match(preferBody, /hasMismatchedCoordinatorAttempt\(item, record\)/)
-    assert.match(restoreBody, /options\.preferSuccessfulProgress !== false/)
     assert.match(restoreBody, /shouldPreferSuccessfulProgressOverTerminalCoordinatorItem\(item, record, mapped\)/)
     assert.match(transitionBody, /promoteTerminalCoordinatorItemFromSuccessfulProgress\(item, record, mapped/)
     assert.match(repairBody, /applyProgressRecordCoordinatorRepairActionLocked\(state, \{[\s\S]*kind: 'repairFromProgressRecord'[\s\S]*record,[\s\S]*mapped,[\s\S]*resetRetry/)
@@ -2965,7 +2964,8 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
     assert.match(progressRepairBody, /queue\[itemKey\] = nextItem/)
     assert.match(syncBody, /href => normalizeQuoraProfileUrl\(href\)/)
     assert.match(syncBody, /loadCoordinatorQueueProgressProjection\(\{[\s\S]*metricPath: 'compatibilityProgressSync\.load'/)
-    assert.match(syncBody, /shouldRestoreTerminalProgressFromCoordinatorItem\(item, record, \{[\s\S]*preferSuccessfulProgress: false[\s\S]*\}/)
+    assert.match(syncBody, /shouldRestoreTerminalProgressFromCoordinatorItem\(item, record\)/)
+    assert.doesNotMatch(syncBody, /preferSuccessfulProgress: false/)
     assert.match(syncBody, /queueOperation: 'compatibility-progress-sync'/)
     assert.match(syncBody, /queue: false/)
     assert.doesNotMatch(syncBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
