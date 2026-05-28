@@ -4815,7 +4815,7 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
     )
 })
 
-test('compatibility progress sync does not promote stale failed queue rows from the progress mirror', async () => {
+test('space-feed confirmation does not promote stale failed queue rows from the progress mirror', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Read-Only'
     const runId = 'run-compatibility-progress-read-only'
     const attemptId = 'attempt-compatibility-progress-read-only'
@@ -4859,13 +4859,13 @@ test('compatibility progress sync does not promote stale failed queue rows from 
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'failed')
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, undefined)
-    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.queueWalSaveFailed'] || 0, 0)
+    assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 0)
 })
 
-test('compatibility progress sync restores stale nonterminal progress from terminal queue authority', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Restore'
-    const runId = 'run-compatibility-progress-restore'
-    const attemptId = 'attempt-compatibility-progress-restore'
+test('space-feed confirmation does not rewrite legacy progress mirror from queue authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Retired'
+    const runId = 'run-compatibility-progress-retired'
+    const attemptId = 'attempt-compatibility-progress-retired'
     const terminalRow = {
         ...makeFailedCoordinatorRow({href, runId, attemptId, now: 276500}),
         status: 'succeeded',
@@ -4884,7 +4884,7 @@ test('compatibility progress sync restores stale nonterminal progress from termi
         attemptNumber: 1,
         updatedAt: 276100
     }
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 276500,
         storage: {
             mbCoordinatorPaused: false,
@@ -4897,123 +4897,24 @@ test('compatibility progress sync restores stale nonterminal progress from termi
             mbCoordinatorEvents: [],
             mbProfileNukeProgress: {
                 [href]: progressRecord
-            }
+            },
+            mbSpacePendingNukedPosts: {},
+            mbSpaceNukedPosts: {}
         }
     })
 
-    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
+    const result = await browser.runtime.sendMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: [href]
+    }, {tab: {id: 12, windowId: 1}})
 
-    assert.equal(result, true)
+    assert.equal(result.confirmed, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
-    assert.equal(storage.mbProfileNukeProgress[href].blockSucceeded, true)
-    assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
-    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
-})
-
-test('compatibility progress sync restores stale terminal progress from terminal queue authority', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Terminal-Drift'
-    const runId = 'run-compatibility-terminal-drift'
-    const attemptId = 'attempt-compatibility-terminal-drift'
-    const terminalRow = makeFailedCoordinatorRow({
-        href,
-        runId,
-        attemptId,
-        now: 276800,
-        error: 'Queued tab timed out after disappearing before completion'
-    })
-    const progressRecord = {
-        profileHref: href,
-        status: 'error-page',
-        finalError: 'Old browser error page',
-        terminalAt: 276100,
-        runId,
-        tabId: 0,
-        actionKind: 'mute-block',
-        attemptId,
-        attemptNumber: 1,
-        updatedAt: 276100
-    }
-    const {storage, sw} = loadServiceWorkerHarness({
-        now: 276800,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: terminalRow
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
-                [href]: progressRecord
-            }
-        }
-    })
-
-    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
-
-    assert.equal(result, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'interrupted')
-    assert.equal(storage.mbProfileNukeProgress[href].finalError, terminalRow.error)
-    assert.equal(sw.state().profileNukeProgress[href].status, 'interrupted')
-    assert.equal(sw.state().profileNukeProgress[href].finalError, terminalRow.error)
-    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
-})
-
-test('compatibility progress sync preserves same-attempt success evidence over stale failed queue authority', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Success-Evidence'
-    const runId = 'run-compatibility-success-evidence'
-    const attemptId = 'attempt-compatibility-success-evidence'
-    const terminalRow = makeFailedCoordinatorRow({
-        href,
-        runId,
-        attemptId,
-        now: 276900,
-        error: 'Queued tab timed out before terminal success repair'
-    })
-    const progressRecord = {
-        profileHref: href,
-        status: 'blocked',
-        blockSucceeded: true,
-        blockedAt: 276850,
-        terminalAt: 276850,
-        runId,
-        tabId: 0,
-        actionKind: 'mute-block',
-        attemptId,
-        attemptNumber: 1,
-        updatedAt: 276850
-    }
-    const {storage, sw} = loadServiceWorkerHarness({
-        now: 276900,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: terminalRow
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
-                [href]: progressRecord
-            }
-        }
-    })
-
-    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
-
-    assert.equal(result, false)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
-    assert.equal(storage.mbProfileNukeProgress[href].blockSucceeded, true)
-    assert.equal(storage.mbProfileNukeProgress[href].finalError || '', '')
-    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
+    const storedRecord = Object.values(storage.mbProfileNukeProgress || {})
+        .find(record => record?.profileHref === href)
+    assert.deepEqual(storedRecord, progressRecord)
+    assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 0)
 })
 
 test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {

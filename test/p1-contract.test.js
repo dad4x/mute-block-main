@@ -502,28 +502,18 @@ test('hidden queued profile actions use longer readiness when foreground is disa
     assert.match(body, /document\.visibilityState === 'visible'[\s\S]*VISIBLE_PROFILE_READY_MS[\s\S]*allowForegroundFallback[\s\S]*HIDDEN_PROFILE_READY_FAST_PROBE_MS[\s\S]*HIDDEN_PROFILE_READY_NO_FOREGROUND_MS/)
 })
 
-test('service-worker-owned progress mirror sync does not transition queue rows', () => {
+test('legacy progress mirror sync bridge is deleted', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const syncBody = extractFunction(
-        source,
-        'async function syncCoordinatorProgressRecordsLocked(progressRecords = {})'
-    )
-    const repairAuthoritativeBranch = source.slice(
-        source.indexOf('if(queueAuthoritative && !reconciledMissingActive)'),
-        source.indexOf('const mapped = mappedForAuthoritativeItem || getCoordinatorStatusFromProgress(record)', source.indexOf('if(queueAuthoritative && !reconciledMissingActive)'))
-    )
+    const releaseBody = extractFunction(source, 'async function releaseQueuedTab(tabId, options = {})')
+    const confirmBody = extractFunction(source, 'async function confirmSpaceFeedProfilesBlocked(profileHrefs = [])')
 
-    assert.match(syncBody, /loadCoordinatorQueueProgressProjection\(\{[\s\S]*metricPath: 'compatibilityProgressSync\.load'/)
-    assert.doesNotMatch(syncBody, /loadCoordinatorQueueRunsProgressProjection/)
-    assert.doesNotMatch(syncBody, /loadCoordinatorState\(/)
-    assert.doesNotMatch(syncBody, /transitionCoordinatorItemFromProgress/)
-    assert.doesNotMatch(syncBody, /persistCoordinatorAuthorityQueueWalBatchMutation/)
-    assert.doesNotMatch(syncBody, /settleTerminalCoordinatorItems/)
-    assert.match(repairAuthoritativeBranch, /shouldRestoreTerminalProgressFromCoordinatorItem\(item, record\)/)
-    assert.match(repairAuthoritativeBranch, /getPersistedLiveTabForCoordinatorItem\(item, record, itemKey\)/)
-    assert.match(repairAuthoritativeBranch, /hasLiveAuthoritativeTab/)
-    assert.doesNotMatch(repairAuthoritativeBranch, /applyProgressRecordCoordinatorRepairActionLocked/)
-    assert.match(repairAuthoritativeBranch, /continue/)
+    assert.doesNotMatch(source, /async function syncCoordinatorProgressRecordsLocked/)
+    assert.doesNotMatch(source, /function syncCoordinatorProgressRecords/)
+    assert.doesNotMatch(source, /enqueueCoordinatorProgressSync/)
+    assert.doesNotMatch(source, /enqueueStoredCoordinatorQueueProgressSync/)
+    assert.doesNotMatch(source, /compatibility-progress-sync/)
+    assert.doesNotMatch(releaseBody, /syncCoordinatorProgressRecords/)
+    assert.doesNotMatch(confirmBody, /PROFILE_NUKE_PROGRESS_KEY/)
 })
 
 test('stale active repair ignores queued mirror records as liveness', () => {
@@ -2137,7 +2127,7 @@ test('repair restores stranded queued progress records into Current Work', () =>
     assert.match(restoreBody, /serviceWorkerOwned: true/)
     assert.match(restoreBody, /buildQueuedCoordinatorProgressResetPatch/)
     assert.match(restoreBody, /recomputeCoordinatorRuns/)
-    assert.match(enqueueBody, /coordinatorProgressSyncPromise/)
+    assert.doesNotMatch(enqueueBody, /coordinatorProgressSyncPromise/)
 })
 
 test('dashboard ready is display-only until explicit resume', () => {
@@ -2950,14 +2940,6 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
         source,
         'function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})'
     )
-    const syncBody = extractFunction(
-        source,
-        'async function syncCoordinatorProgressRecordsLocked(progressRecords = {})'
-    )
-    const syncWrapperBody = extractFunction(
-        source,
-        'function syncCoordinatorProgressRecords(progressRecords = {})'
-    )
     const directBody = extractFunction(
         source,
         'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})'
@@ -2973,17 +2955,8 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
     assert.match(progressRepairBody, /matchesCoordinatorRepairOperationAttempt\(item, operation\)/)
     assert.match(progressRepairBody, /transitionCoordinatorItemFromProgress\(item, record, mapped/)
     assert.match(progressRepairBody, /queue\[itemKey\] = nextItem/)
-    assert.match(syncBody, /href => normalizeQuoraProfileUrl\(href\)/)
-    assert.match(syncBody, /loadCoordinatorQueueProgressProjection\(\{[\s\S]*metricPath: 'compatibilityProgressSync\.load'/)
-    assert.match(syncBody, /shouldRestoreTerminalProgressFromCoordinatorItem\(item, record\)/)
-    assert.doesNotMatch(syncBody, /preferSuccessfulProgress: false/)
-    assert.match(syncBody, /queueOperation: 'compatibility-progress-sync'/)
-    assert.match(syncBody, /queue: false/)
-    assert.doesNotMatch(syncBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
-    assert.doesNotMatch(syncBody, /transitionCoordinatorItemFromProgress\(/)
-    assert.doesNotMatch(syncBody, /await settleTerminalCoordinatorItemsLocked\({/)
-    assert.doesNotMatch(syncBody, /await settleTerminalCoordinatorItems\({/)
-    assert.match(syncWrapperBody, /enqueueSpaceFeedStorageUpdate\(\(\) => syncCoordinatorProgressRecordsLocked\(progressRecords\)\)/)
+    assert.doesNotMatch(source, /syncCoordinatorProgressRecordsLocked/)
+    assert.doesNotMatch(source, /syncCoordinatorProgressRecords\(progressRecords/)
     assert.match(directBody, /preferSuccessfulTerminal = shouldPreferSuccessfulProgressOverTerminalCoordinatorItem\(item, record, mapped\)/)
     assert.match(directBody, /patchCanTransitionStatus \|\| preferSuccessfulTerminal/)
 })
@@ -3346,17 +3319,15 @@ test('mute and unmute confirmations use robust confirmation activation', () => {
     assert.match(mismatchBody, /inverse-unmute-confirmation/)
 })
 
-test('space-feed confirmed progress sync does not self-queue storage updates', () => {
+test('space-feed confirmation no longer syncs legacy progress mirrors', () => {
     const source = readRepoFile('shared/js/sw.js')
     const confirmBody = extractFunction(source, 'async function confirmSpaceFeedProfilesBlocked(profileHrefs = [])')
-    const publicSyncBody = extractFunction(source, 'async function syncCoordinatorProgressForHrefs(profileHrefs = [])')
-    const lockedSyncBody = extractFunction(source, 'async function syncCoordinatorProgressForHrefsLocked(profileHrefs = [])')
 
-    assert.match(confirmBody, /syncCoordinatorProgressForHrefsLocked\(confirmedHrefs\)/)
-    assert.doesNotMatch(confirmBody, /await syncCoordinatorProgressForHrefs\(confirmedHrefs\)/)
-    assert.match(publicSyncBody, /enqueueSpaceFeedStorageUpdate\(\(\) => syncCoordinatorProgressForHrefsLocked\(profileHrefs\)\)/)
-    assert.match(lockedSyncBody, /syncCoordinatorProgressRecordsLocked\(records\)/)
-    assert.doesNotMatch(lockedSyncBody, /enqueueCoordinatorProgressSync\(records\)/)
+    assert.doesNotMatch(source, /async function syncCoordinatorProgressForHrefs/)
+    assert.doesNotMatch(source, /async function syncCoordinatorProgressForHrefsLocked/)
+    assert.doesNotMatch(confirmBody, /syncCoordinatorProgressForHrefs/)
+    assert.doesNotMatch(confirmBody, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.doesNotMatch(confirmBody, /saveCoordinatorState/)
 })
 
 test('pause cleanup cannot keep mutating after a newer pause generation wins', () => {
