@@ -13219,7 +13219,9 @@ async function mutateCoordinatorRunsPausedSet(operation = {}) {
     if(snapshotReason !== 'ordinaryMutation') return {changed: false, reason: 'invalid-runs-paused-reason'}
 
     const paused = operation.paused === true
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsProjection({
+        metricPath: 'runsPaused.load'
+    })
     const queue = state.queue
     const runs = normalizeCoordinatorMap(state.runs)
     const nextRuns = {...runs}
@@ -13241,7 +13243,32 @@ async function mutateCoordinatorRunsPausedSet(operation = {}) {
 
     if(!changed) return {changed: false}
     const recomputedRuns = recomputeCoordinatorRuns(queue, nextRuns, affectedRunIds)
-    await saveCoordinatorState({runs: recomputedRuns}, {runs: true, reason: 'ordinaryMutation'})
+    let saved = true
+    try {
+        saved = await saveCoordinatorState({
+            runs: recomputedRuns
+        }, {
+            runs: true,
+            reason: 'ordinaryMutation',
+            queueOperation: 'runs-paused-derived',
+            queueChangedRows: 0
+        })
+    }
+    catch(error) {
+        saved = false
+        recordCoordinatorDiagnosticEvent(
+            'runs-paused-derived-save-failed',
+            error?.message || 'Runs paused derived save failed'
+        )
+    }
+    if(saved === false) {
+        incrementQueueWakeupMetric('runsPaused.derivedSaveFailed')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'runs-paused-derived-save-failed',
+            edgeTriggered: true
+        })
+        return {changed: false, reason: 'runs-paused-save-failed'}
+    }
     return {changed: true}
 }
 
