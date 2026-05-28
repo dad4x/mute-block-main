@@ -1089,6 +1089,23 @@ pressure remains a separate performance/reliability follow-up.
   `0 ready, 383 succeeded, 0 soft-fail 0 hard-fail`; queue accounting was
   consistent across raw, recovered WAL, and compact view with 413 total
   terminal rows, 383 succeeded, 24 skipped, 6 canceled, and no divergences.
+- Reviewer follow-up on `1.6.587`: generic stored-work repair could not
+  reconstruct a failed run pause/unpause metadata save because the desired bit
+  lived only in `mbCoordinatorRuns`, and `recomputeCoordinatorRuns()` preserved
+  stale `existingRun.paused`. Fixed by teaching
+  `repairCoordinatorStorageFromProgressLocked()` to read durable
+  `mbCoordinatorPaused` and materialize that control bit back into pending run
+  metadata before recomputing runs. The runs-save failure regression now
+  restores the storage adapter and runs repair, asserting the failed unpause is
+  actually materialized as `status: active` and `paused: false`. Validation:
+  `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`,
+  `timeout 120 node test/p1-contract.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.588`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.588.zip` and `firefox/mute_block-1.6.588.zip`.
+  Live Windows push/reload is pending because the `127.0.0.1:10022` rsync
+  tunnel and the `127.0.0.1:9223` CDP endpoint both refused connections.
 
 ## Deferred follow-up: physical WAL segmentation
 

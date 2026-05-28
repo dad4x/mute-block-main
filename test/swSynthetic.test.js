@@ -1310,6 +1310,13 @@ test('runs paused update failure schedules repair without throwing', async () =>
         sw.state().hasStoredWorkRepairTimeout ||
             (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
     )
+
+    browser.storage.local.set = originalSet
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.equal(repair.runsChanged, true)
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'active')
+    assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
 })
 
 test('manual failed retry WAL moves resolver rows without leaving stale source key', async () => {

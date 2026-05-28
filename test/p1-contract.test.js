@@ -529,16 +529,19 @@ test('stale active repair ignores queued mirror records as liveness', () => {
 })
 
 test('repair returns after saving stale-active cleanup', () => {
-    const body = extractFunction(
-        readRepoFile('shared/js/sw.js'),
-        'async function repairCoordinatorStorageFromProgressLocked()'
-    )
+    const source = readRepoFile('shared/js/sw.js')
+    const body = extractFunction(source, 'async function repairCoordinatorStorageFromProgressLocked()')
+    const pauseMaterializerBody = extractFunction(source, 'function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, now = Date.now())')
     const saveIndex = body.indexOf('await saveCoordinatorState')
     const settleIndex = body.indexOf('await settleTerminalCoordinatorItemsLocked')
 
     assert.notEqual(saveIndex, -1)
     assert.notEqual(settleIndex, -1)
     assert.ok(saveIndex < settleIndex)
+    assert.match(body, /\[COORDINATOR_PAUSED_KEY\]: false/)
+    assert.match(body, /materializeCoordinatorRunsPausedStateFromControl\([\s\S]*state\.stored\?\.\[COORDINATOR_PAUSED_KEY\] === true/)
+    assert.match(pauseMaterializerBody, /isPendingCoordinatorStatus/)
+    assert.match(pauseMaterializerBody, /paused,\s*status,/)
 })
 
 test('space-feed storage update queue has a watchdog', () => {
