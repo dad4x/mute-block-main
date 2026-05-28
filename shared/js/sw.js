@@ -6514,32 +6514,6 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     })
 }
 
-async function loadCoordinatorQueueProgressProjection(options = {}) {
-    return runQueueWakeupMetricPhase('loadCoordinatorQueueProgressProjection', async () => {
-        const stored = await metricStorageGet({
-            [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
-            [PROFILE_NUKE_PROGRESS_KEY]: {}
-        }, {
-            metricPath: options.metricPath || 'coordinatorQueueProgressProjection.load'
-        })
-        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
-        ))
-        const queue = queueRecovery.queue
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
-        recordActiveStorageWorkSnapshot(queue)
-
-        return {
-            stored,
-            queue,
-            progress
-        }
-    })
-}
-
 async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorCurrentAuthorityState', async () => {
         const stored = await metricStorageGet({
