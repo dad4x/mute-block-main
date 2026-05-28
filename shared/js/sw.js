@@ -159,8 +159,7 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'requeue',
     'resolver-remap',
     'enqueue',
-    'clear-profile',
-    'compatibility-progress-sync'
+    'clear-profile'
 ])
 let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
@@ -6518,6 +6517,32 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     })
 }
 
+async function loadCoordinatorQueueProgressProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueProgressProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [PROFILE_NUKE_PROGRESS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueProgressProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            progress
+        }
+    })
+}
+
 async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorCurrentAuthorityState', async () => {
         const stored = await metricStorageGet({
@@ -6781,27 +6806,18 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
     const hrefs = Object.keys(progressRecords || {}).map(href => normalizeQuoraProfileUrl(href)).filter(Boolean)
     if(!hrefs.length) return false
 
-    const state = await loadCoordinatorQueueRunsProgressProjection({
+    const state = await loadCoordinatorQueueProgressProjection({
         metricPath: 'compatibilityProgressSync.load'
     })
     const queue = state.queue
-    const nextQueue = {
-        ...queue
-    }
-    const runs = state.runs
     const progress = {
         ...state.progress
     }
-    let changed = false
-    const now = Date.now()
-    const affectedRunIds = new Set()
-    const terminalSettlementHrefs = new Set()
-    const authorityResults = []
     let progressChanged = false
     let progressChangedRows = 0
 
     for(const href of hrefs) {
-        const item = nextQueue[href]
+        const item = queue[href]
         const record = progressRecords[href] || profileNukeProgress[href] || null
         if(!item || !record) continue
         if(!shouldApplyProgressToCoordinatorItem(item, record)) continue
@@ -6815,157 +6831,38 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
             })
             continue
         }
-        if(item && !isCoordinatorQueueAuthoritativeItem(item)) {
-            continue
-        }
-        if(isCoordinatorQueueAuthoritativeItem(item)) {
-            const mappedForAuthoritativeItem = getCoordinatorStatusFromProgress(record)
-            if(shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mappedForAuthoritativeItem)) {
-                // Fall through so a same-attempt success can repair a stale terminal timeout row.
-            }
-            else {
-                if(shouldRestoreTerminalProgressFromCoordinatorItem(item, record)) {
-                    const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
-                        href,
-                        item,
-                        record,
-                        'Restored terminal profile progress from authoritative queue row'
-                    )
-                    if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
-                        progress[href] = restoredRecord
-                        profileNukeProgress = {
-                            ...profileNukeProgress,
-                            [href]: restoredRecord
-                        }
-                        progressChanged = true
-                        progressChangedRows += 1
-                    }
-                }
-                continue
-            }
-        }
-        if(item.runId) affectedRunIds.add(item.runId)
-        for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
-            affectedRunIds.add(runId)
-        }
 
         const mapped = getCoordinatorStatusFromProgress(record)
-        if(!mapped.status) continue
-        const resetRetry = shouldResetCoordinatorFailureFromProgress(item, record, mapped)
-        const mappedTerminal = isTerminalCoordinatorStatus(mapped.status)
-        if(isTerminalCoordinatorStatus(item.status) && !mappedTerminal && !resetRetry) {
-            const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
-                href,
-                item,
-                record,
-                'Restored terminal profile progress after stale nonterminal write'
-            )
-            if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
-                progress[href] = restoredRecord
-                profileNukeProgress = {
-                    ...profileNukeProgress,
-                    [href]: restoredRecord
-                }
-                progressChanged = true
-                progressChangedRows += 1
+        if(!isTerminalCoordinatorStatus(item.status) || isTerminalCoordinatorStatus(mapped.status)) continue
+
+        const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
+            href,
+            item,
+            record,
+            'Restored terminal profile progress from authoritative queue row'
+        )
+        if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
+            progress[href] = restoredRecord
+            profileNukeProgress = {
+                ...profileNukeProgress,
+                [href]: restoredRecord
             }
-            continue
+            progressChanged = true
+            progressChangedRows += 1
         }
-        if(isTerminalCoordinatorStatus(item.status) && mappedTerminal && item.status === mapped.status && !resetRetry) {
-            continue
-        }
-        if(item.status !== 'queued' && mapped.status === 'queued' && !resetRetry) continue
-
-        const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-            now,
-            resetRetry
-        })
-
-        if(JSON.stringify(nextItem) === JSON.stringify(item)) continue
-        nextQueue[href] = nextItem
-        authorityResults.push(makeCoordinatorAuthorityApplyResult({
-            operationKind: 'compatibility-progress-sync',
-            rowKey: href,
-            reason: 'compatibilityFlush'
-        }, {
-            accepted: true,
-            changed: true,
-            durable: true,
-            reason: 'persisted',
-            previousRow: item,
-            nextRow: nextItem,
-            terminal: mappedTerminal,
-            allowTerminalOverwrite: resetRetry || isTerminalCoordinatorStatus(item.status)
-        }))
-        if(nextItem.runId) affectedRunIds.add(nextItem.runId)
-        if(mappedTerminal) terminalSettlementHrefs.add(href)
-        changed = true
     }
 
-    const nextRuns = affectedRunIds.size
-        ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
-        : runs
-    const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
-    const storagePatch = {}
-
-    if(changed) {
-        const nextProjection = makeCoordinatorAuthorityProjection({
-            ...state,
-            queue: nextQueue,
-            runs: nextRuns
-        })
-        let persistence = null
-        try {
-            persistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
-                authorityResults,
-                nextProjection,
-                {
-                    operationKind: 'compatibility-progress-sync',
-                    reason: 'compatibilityFlush',
-                    previousProjectionQueue: queue,
-                    metricPath: 'compatibilityProgressSync.save.queueWal',
-                    projectionMetricPath: 'compatibilityProgressSync.save.projection'
-                }
-            )
-        }
-        catch(error) {
-            persistence = {
-                saved: false,
-                reason: 'persistence-error',
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
-            }
-        }
-        if(persistence?.saved !== true) {
-            incrementQueueWakeupMetric('compatibilityProgressSync.queueWalSaveFailed')
-            recordCoordinatorDiagnosticEvent(
-                'compatibility-progress-sync-queue-wal-save-failed',
-                persistence?.reason || 'Compatibility progress sync queue WAL save failed'
-            )
-            scheduleStoredWorkRepair(1000, {
-                reason: 'compatibility-progress-sync-queue-wal-save-failed',
-                edgeTriggered: true
-            })
-            return false
-        }
-
-        await coordinatorAuthority.hydrate()
-    }
-    if(runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
-    if(progressChanged) storagePatch[PROFILE_NUKE_PROGRESS_KEY] = progress
-
-    if(runsChanged || progressChanged) {
+    if(progressChanged) {
         let derivedSaved = true
         try {
             derivedSaved = await saveCoordinatorState({
-                runs: storagePatch[COORDINATOR_RUNS_KEY],
-                progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY]
+                progress
             }, {
                 queue: false,
-                runs: runsChanged,
-                progress: progressChanged,
+                progress: true,
                 progressChangedRows,
                 reason: 'compatibilityFlush',
-                queueOperation: changed ? 'compatibility-progress-sync-derived' : 'compatibility-progress-sync',
+                queueOperation: 'compatibility-progress-sync',
                 queueChangedRows: 0
             })
         }
@@ -6985,13 +6882,7 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
         }
     }
 
-    if(terminalSettlementHrefs.size) {
-        await settleTerminalCoordinatorItemsLocked({
-            profileHrefs: Array.from(terminalSettlementHrefs)
-        })
-    }
-
-    return changed || runsChanged
+    return progressChanged
 }
 
 function syncCoordinatorProgressRecords(progressRecords = {}) {

@@ -1362,6 +1362,26 @@ pressure remains a separate performance/reliability follow-up.
   succeeded, 24 skipped, 6 canceled, no active/queued/failed work, active WAL
   tail 0, and no raw/recovered/view mismatches.
 
+- Next slice: removed `compatibility-progress-sync` as a queue authority
+  operation. The legacy progress sync path now loads only WAL-recovered
+  queue+progress state, never promotes queue rows from the progress mirror, and
+  only restores stale nonterminal progress records from terminal queue
+  authority. Added a narrow queue/progress projection loader, tightened the P1
+  contracts to forbid queue WAL append/transition/settlement in this path, and
+  replaced the synthetic compatibility-sync WAL-promotion cases with read-only
+  and terminal-progress-restoration coverage. Validation before packaging:
+  `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.601`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.601.zip` and `firefox/mute_block-1.6.601.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.601`,
+  enabled, with zero manifest/runtime errors. Queue accounting audit was
+  consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6 canceled,
+  no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
