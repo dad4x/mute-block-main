@@ -1128,6 +1128,7 @@ test('service worker local storage goes through production adapter seam', () => 
 
 test('coordinator projection mutation uses explicit operation shapes', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const authorityBody = extractFunction(source, 'function createCoordinatorAuthority()')
     const projectionBody = extractFunction(source, 'async function mutateCoordinatorProjection(operation = {})')
     const queueProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueProjection(options = {})')
     const queueRunsProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueRunsProjection(options = {})')
@@ -1190,6 +1191,9 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(projectionBody, /kind === 'retryFailedItems'/)
     assert.match(projectionBody, /kind === 'requeueFailedItems'/)
     assert.doesNotMatch(projectionBody, /callback|reducerCallback|operation\(/)
+    assert.doesNotMatch(source, /function loadCoordinatorState\(/)
+    assert.doesNotMatch(source, /loadCoordinatorState\(/)
+    assert.match(authorityBody, /loadCoordinatorCurrentAuthorityState\(defaults\)/)
     assert.match(queueProjectionBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_QUEUE_KEY\]: \{\}[\s\S]*\}, \{[\s\S]*metricPath: options\.metricPath \|\| 'coordinatorQueueProjection\.load'/)
     assert.match(queueProjectionBody, /normalizeCoordinatorMap\(stored\[COORDINATOR_QUEUE_KEY\]\)/)
     assert.doesNotMatch(queueProjectionBody, /COORDINATOR_RUNS_KEY|COORDINATOR_EVENTS_KEY|PROFILE_NUKE_PROGRESS_KEY|loadCoordinatorState\(/)

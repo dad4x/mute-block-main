@@ -4731,37 +4731,6 @@ function promoteTerminalCoordinatorItemFromSuccessfulProgress(item = {}, record 
     }
 }
 
-async function loadCoordinatorState(defaults = {}) {
-    return runQueueWakeupMetricPhase('loadCoordinatorState', async () => {
-        const stored = await metricStorageGet({
-            [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
-            [COORDINATOR_RUNS_KEY]: {},
-            [COORDINATOR_EVENTS_KEY]: [],
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
-            ...defaults
-        })
-        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
-        ))
-        const queue = queueRecovery.queue
-        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
-        recordActiveStorageWorkSnapshot(queue)
-
-        return {
-            stored,
-            queue,
-            runs,
-            events,
-            progress
-        }
-    })
-}
-
 function cloneCoordinatorAuthorityValue(value) {
     if(value === undefined) return undefined
     return JSON.parse(JSON.stringify(value))
@@ -6098,7 +6067,7 @@ function createCoordinatorAuthority() {
     let projection = makeCoordinatorAuthorityProjection()
 
     async function hydrate(defaults = {}) {
-        projection = makeCoordinatorAuthorityProjection(await loadCoordinatorState(defaults))
+        projection = makeCoordinatorAuthorityProjection(await loadCoordinatorCurrentAuthorityState(defaults))
         hydrated = true
         return current()
     }

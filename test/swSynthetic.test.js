@@ -8512,7 +8512,7 @@ test('direct raw queue storage writes maintain compact queue view', async () => 
 
 test('coordinator authority hydrates resident projection without storage writes', async () => {
     const href = 'https://www.quora.com/profile/Authority-Hydrate'
-    const {sw, storage} = loadServiceWorkerHarness({
+    const {browser, sw, storage} = loadServiceWorkerHarness({
         now: 3000,
         storage: {
             mbCoordinatorQueue: {
@@ -8531,6 +8531,11 @@ test('coordinator authority hydrates resident projection without storage writes'
                     queued: 1
                 }
             },
+            mbCoordinatorEvents: [{
+                id: 'event-authority-hydrate',
+                type: 'synthetic',
+                at: 2990
+            }],
             mbProfileNukeProgress: {
                 [href]: {
                     profileHref: href,
@@ -8541,6 +8546,12 @@ test('coordinator authority hydrates resident projection without storage writes'
             }
         }
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     assert.equal(sw.coordinatorAuthority.isHydrated(), false)
     const hydrated = await sw.coordinatorAuthority.hydrate()
@@ -8551,6 +8562,17 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(current.queue[href].attemptId, 'attempt-hydrate')
     assert.equal(current.runs['run-authority-hydrate'].queued, 1)
     assert.equal(current.progress[href].status, 'queued')
+    assert.deepEqual(current.events, [])
+    const hydrateDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbProfileNukeProgress'
+    ])
+    assert.ok(hydrateDefaults)
+    assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorEvents'), false)
+    assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpacePendingNukedPosts'), false)
+    assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpaceNukedPosts'), false)
 
     current.queue[href].status = 'mutated-outside-authority'
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')

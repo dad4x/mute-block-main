@@ -1193,6 +1193,27 @@ pressure remains a separate performance/reliability follow-up.
   canceled, no active/queued/failed work, active WAL tail 0, and no
   raw/recovered/view mismatches.
 
+- Next slice: removed the service-worker full snapshot loader entirely.
+  `coordinatorAuthority.hydrate()` now hydrates from
+  `loadCoordinatorCurrentAuthorityState()`, so resident authority startup gets
+  WAL-recovered queue/runs/progress without loading events or pending/nuked post
+  maps. Contract coverage now forbids `loadCoordinatorState()` in
+  `shared/js/sw.js` and pins hydrate to the current-authority projection.
+  Synthetic coverage verifies hydrate does not request `mbCoordinatorEvents`,
+  does not ingest stored events into the resident projection, and still clones
+  queue/runs/progress without storage writes. Validation so far:
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`, and
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.593`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.593.zip` and `firefox/mute_block-1.6.593.zip`.
+  Live Windows rsync push succeeded. CDP reload reported extension
+  `1.6.593`, enabled, with zero manifest/runtime errors. CDP queue accounting
+  audit was consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6
+  canceled, no active/queued/failed work, active WAL tail 0, and no
+  raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
