@@ -5892,6 +5892,50 @@ test('dashboard repair schedules progress-only queued Current Work repair', asyn
     assert.equal(storage.mbCoordinatorQueue[href].runId, runId)
 })
 
+test('dashboard repair does not restore queued progress missing run target metadata', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Orphan-Progress'
+    const runId = 'run-synthetic-orphan-progress'
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 100500,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    sourcePages: ['https://www.quora.com/space/example'],
+                    targetProfileHrefs: [],
+                    targetWorkKeys: [],
+                    status: 'active'
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    runId,
+                    queuedAt: 100000,
+                    actionKind: 'mute-block'
+                }
+            }
+        }
+    })
+
+    await activateQuoraRuntime(browser, 'https://www.quora.com/space/example')
+
+    const result = await browser.runtime.sendMessage({action: 'repair-coordinator-storage'})
+
+    assert.equal(result.reason, 'dashboard-repair-request-scheduled')
+    assert.equal(result.repairScheduled, true)
+    assert.equal(storage.mbCoordinatorQueue[href], undefined)
+
+    await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
+
+    assert.equal(storage.mbCoordinatorQueue[href], undefined)
+})
+
 test('authority reconcile reclaims durable active row without confirmed runtime actor', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Missing-Runtime'
     const runId = 'run-missing-runtime'
