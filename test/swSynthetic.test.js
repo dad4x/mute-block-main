@@ -395,6 +395,43 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     )
 })
 
+test('profile progress normalization is read-only for legacy compatibility storage', async () => {
+    const rawHref = 'https://quora.com/profile/Synthetic-Normalize-Progress'
+    const href = 'https://www.quora.com/profile/Synthetic-Normalize-Progress'
+    const browser = createFakeBrowser({
+        mbProfileNukeProgress: {
+            [rawHref]: {
+                profileHref: rawHref,
+                status: 'queued',
+                actionKind: 'mute-block',
+                updatedAt: 1000
+            }
+        }
+    })
+    const storageWrites = []
+    const originalSet = browser.storage.local.set
+    browser.storage.local.set = async payload => {
+        storageWrites.push(payload)
+        return originalSet(payload)
+    }
+    const {storage} = loadServiceWorkerHarness({
+        now: 2000,
+        browser
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'normalize-profile-nuke-progress'
+    })
+
+    assert.equal(result.normalized, true)
+    assert.equal(result.changed, true)
+    assert.equal(result.persisted, false)
+    assert.equal(result.profileNukeProgress[href].profileHref, href)
+    assert.equal(storage.mbProfileNukeProgress[rawHref].profileHref, rawHref)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storageWrites.some(payload => Object.prototype.hasOwnProperty.call(payload || {}, 'mbProfileNukeProgress')), false)
+})
+
 test('single current work cancel WAL-terminalizes only the selected pending row', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Cancel-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Cancel-B'

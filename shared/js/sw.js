@@ -12549,7 +12549,7 @@ function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null) {
     }
 }
 
-async function normalizeProfileNukeProgressStorage(options = {}) {
+async function normalizeProfileNukeProgressStorage() {
     const stored = await metricStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}})
     const storedProgress = stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}
     const nextProgress = normalizeStoredProfileNukeProgress(storedProgress)
@@ -12559,29 +12559,12 @@ async function normalizeProfileNukeProgressStorage(options = {}) {
     if(!changed) {
         return {normalized: true, changed: false, profileNukeProgress: nextProgress}
     }
-    if(options.persist === false) {
-        return {normalized: true, changed: true, persisted: false, profileNukeProgress: nextProgress}
-    }
-
-    return enqueueSpaceFeedStorageUpdate(async () => {
-        const lockedStored = await metricStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}})
-        const lockedStoredProgress = lockedStored?.[PROFILE_NUKE_PROGRESS_KEY] || {}
-        const lockedProgress = normalizeStoredProfileNukeProgress(lockedStoredProgress)
-        const lockedChanged = JSON.stringify(lockedProgress) !== JSON.stringify(lockedStoredProgress)
-        profileNukeProgress = lockedProgress
-        if(lockedChanged) {
-            await saveCoordinatorState({progress: lockedProgress}, {
-                progress: true,
-                reason: 'compatibilityFlush'
-            })
-        }
-        return {normalized: true, changed: lockedChanged, profileNukeProgress: lockedProgress}
-    })
+    return {normalized: true, changed: true, persisted: false, profileNukeProgress: nextProgress}
 }
 
 async function loadProfileNukeProgress() {
     try {
-        await normalizeProfileNukeProgressStorage({persist: false})
+        await normalizeProfileNukeProgressStorage()
     }
     catch {
         profileNukeProgress = {}

@@ -1233,6 +1233,27 @@ pressure remains a separate performance/reliability follow-up.
   no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: made `normalizeProfileNukeProgressStorage()` read-only. The
+  `normalize-profile-nuke-progress` startup/display compatibility action still
+  normalizes the legacy progress map into service-worker memory and returns the
+  normalized records to content, but it no longer rewrites the full
+  `mbProfileNukeProgress` blob just because stored legacy rows had canonical
+  drift. Updated the inventory to classify this path as a read-only display
+  fallback rather than a `compatibilityFlush`, and added synthetic coverage
+  proving normalization reports `persisted: false` and does not write the
+  legacy progress key. Validation: `node -c shared/js/sw.js`, `node -c
+  test/p1-contract.test.js`, `node -c test/swSynthetic.test.js`, `timeout 120
+  node test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`,
+  and `timeout 300 npm test` passed. Version bumped to `1.6.595`; `npm run
+  prod`, `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.595.zip` and `firefox/mute_block-1.6.595.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.595`,
+  enabled, with zero manifest/runtime errors. The first post-reload accounting
+  audit timed out in `Runtime.evaluate`; a rerun succeeded and was consistent:
+  413 total terminal rows, 383 succeeded, 24 skipped, 6 canceled, no
+  active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
