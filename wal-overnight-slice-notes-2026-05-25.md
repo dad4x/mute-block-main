@@ -1512,11 +1512,13 @@ pressure remains a separate performance/reliability follow-up.
 
 - Next slice: fixed `syncCoordinatorProgressRecordsLocked()` terminal
   progress drift restoration. The compatibility bridge now uses the terminal
-  queue-authority restoration helper for stale terminal mirror rows instead of
-  skipping every already-terminal progress record, and its local restoration
-  replaces stale successful terminal fields when WAL queue authority is failed,
-  skipped, or canceled. Queue authority remains read-only in this path: no
-  queue WAL record is appended and no progress record can promote a queue row.
+  queue-authority restoration helper for stale non-success terminal mirror rows
+  instead of skipping every already-terminal progress record. The bridge
+  preserves same-attempt successful terminal progress evidence over a failed,
+  skipped, or canceled queue row so the existing terminal-success repair path
+  can still promote stale queue authority when appropriate. Queue authority
+  remains read-only in this path: no queue WAL record is appended and no
+  progress record can promote a queue row.
   Validation: `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`,
   `node -c test/swSynthetic.test.js`, `timeout 120 node
   test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`, and
@@ -1530,6 +1532,26 @@ pressure remains a separate performance/reliability follow-up.
   no active/failed work, active WAL tail 129, and no raw/recovered/view
   mismatches. Raw snapshot still trails recovered WAL authority for the queued
   rows, reported as expected raw-vs-recovered divergences.
+
+- Follow-up release `1.6.610`: tightened the compatibility progress sync
+  terminal-drift fix so it preserves same-attempt successful terminal progress
+  evidence over stale failed/skipped/canceled queue rows. Non-success terminal
+  drift, such as an old `error-page` mirror over a WAL-authoritative failed
+  row, still restores from queue authority; successful terminal evidence stays
+  available for the existing queue-repair promotion path. Validation: `node -c
+  shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.610`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.610.zip` and `firefox/mute_block-1.6.610.zip`.
+  Live Windows rsync push succeeded. CDP reload reported extension `1.6.610`,
+  enabled, with zero manifest/runtime errors. A first read-only queue audit
+  caught a stale compact view; explicit `refresh-coordinator-queue-view`
+  materialized it from WAL authority, and the rerun audit was consistent: 523
+  total recovered/view rows, 383 succeeded, 24 skipped, 6 canceled, 109 queued,
+  1 failed, no active work, active WAL tail 133, and no view mismatches. Raw
+  snapshot still trails recovered WAL authority as expected.
 
 ## Deferred follow-up: physical WAL segmentation
 

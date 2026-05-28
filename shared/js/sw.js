@@ -4676,13 +4676,12 @@ function hasTerminalProgressDriftFromCoordinatorItem(item = null, record = null)
         (expectedError && recordError !== expectedError)
 }
 
-function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null, options = {}) {
+function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null) {
     if(!item || !isTerminalCoordinatorStatus(item?.status)) return false
     if(!record) return true
 
     const mapped = getCoordinatorStatusFromProgress(record)
-    const preferSuccessfulProgress = options.preferSuccessfulProgress !== false
-    if(preferSuccessfulProgress && shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)) return false
+    if(shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)) return false
     if(!isTerminalCoordinatorStatus(mapped.status)) return true
 
     return mapped.status !== item.status || hasTerminalProgressDriftFromCoordinatorItem(item, record)
@@ -6833,9 +6832,7 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
             continue
         }
 
-        if(!shouldRestoreTerminalProgressFromCoordinatorItem(item, record, {
-            preferSuccessfulProgress: false
-        })) continue
+        if(!shouldRestoreTerminalProgressFromCoordinatorItem(item, record)) continue
 
         const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
             href,
