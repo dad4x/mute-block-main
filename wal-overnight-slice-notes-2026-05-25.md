@@ -1510,6 +1510,27 @@ pressure remains a separate performance/reliability follow-up.
   succeeded, 24 skipped, 6 canceled, no active/queued/failed work, active WAL
   tail 0, and no raw/recovered/view mismatches.
 
+- Next slice: fixed `syncCoordinatorProgressRecordsLocked()` terminal
+  progress drift restoration. The compatibility bridge now uses the terminal
+  queue-authority restoration helper for stale terminal mirror rows instead of
+  skipping every already-terminal progress record, and its local restoration
+  replaces stale successful terminal fields when WAL queue authority is failed,
+  skipped, or canceled. Queue authority remains read-only in this path: no
+  queue WAL record is appended and no progress record can promote a queue row.
+  Validation: `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`,
+  `node -c test/swSynthetic.test.js`, `timeout 120 node
+  test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.609` for release
+  packaging. `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.609.zip` and
+  `firefox/mute_block-1.6.609.zip`. Live Windows rsync push succeeded. CDP
+  reload reported extension `1.6.609`, enabled, with zero manifest/runtime
+  errors. Queue accounting audit was internally consistent: recovered/current
+  view showed 523 total rows, 383 succeeded, 24 skipped, 6 canceled, 110 queued,
+  no active/failed work, active WAL tail 129, and no raw/recovered/view
+  mismatches. Raw snapshot still trails recovered WAL authority for the queued
+  rows, reported as expected raw-vs-recovered divergences.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

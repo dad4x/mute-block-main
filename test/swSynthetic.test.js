@@ -5251,6 +5251,60 @@ test('compatibility progress sync restores stale nonterminal progress from termi
     assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
 })
 
+test('compatibility progress sync restores stale terminal progress from terminal queue authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Terminal-Drift'
+    const runId = 'run-compatibility-terminal-drift'
+    const attemptId = 'attempt-compatibility-terminal-drift'
+    const terminalRow = makeFailedCoordinatorRow({
+        href,
+        runId,
+        attemptId,
+        now: 276800,
+        error: 'Queued tab timed out after disappearing before completion'
+    })
+    const progressRecord = {
+        profileHref: href,
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: 276100,
+        terminalAt: 276100,
+        runId,
+        tabId: 0,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1,
+        updatedAt: 276100
+    }
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 276800,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: terminalRow
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: progressRecord
+            }
+        }
+    })
+
+    const result = await sw.syncCoordinatorProgressRecords({[href]: progressRecord})
+
+    assert.equal(result, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'interrupted')
+    assert.equal(storage.mbProfileNukeProgress[href].blockSucceeded, undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].finalError, terminalRow.error)
+    assert.equal(sw.state().profileNukeProgress[href].status, 'interrupted')
+    assert.equal(sw.state().profileNukeProgress[href].finalError, terminalRow.error)
+    assert.equal(sw.state().queueWakeupCounters['compatibilityProgressSync.derivedSaveFailed'] || 0, 0)
+})
+
 test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Wal'
     const runId = 'run-clear-profile-wal'
