@@ -509,7 +509,7 @@ test('service-worker-owned progress mirror sync does not transition queue rows',
     )
     const repairAuthoritativeBranch = source.slice(
         source.indexOf('if(queueAuthoritative && !reconciledMissingActive)'),
-        source.indexOf('const mapped = mappedForAuthoritativeItem', source.indexOf('if(queueAuthoritative && !reconciledMissingActive)'))
+        source.indexOf('const mapped = mappedForAuthoritativeItem || getCoordinatorStatusFromProgress(record)', source.indexOf('if(queueAuthoritative && !reconciledMissingActive)'))
     )
 
     assert.match(syncBody, /loadCoordinatorQueueProgressProjection\(\{[\s\S]*metricPath: 'compatibilityProgressSync\.load'/)
@@ -518,7 +518,10 @@ test('service-worker-owned progress mirror sync does not transition queue rows',
     assert.doesNotMatch(syncBody, /transitionCoordinatorItemFromProgress/)
     assert.doesNotMatch(syncBody, /persistCoordinatorAuthorityQueueWalBatchMutation/)
     assert.doesNotMatch(syncBody, /settleTerminalCoordinatorItems/)
-    assert.match(repairAuthoritativeBranch, /isTerminalCoordinatorStatus\(mappedForAuthoritativeItem\.status\)/)
+    assert.match(repairAuthoritativeBranch, /shouldRestoreTerminalProgressFromCoordinatorItem\(item, record\)/)
+    assert.match(repairAuthoritativeBranch, /getPersistedLiveTabForCoordinatorItem\(item, record, itemKey\)/)
+    assert.match(repairAuthoritativeBranch, /hasLiveAuthoritativeTab/)
+    assert.doesNotMatch(repairAuthoritativeBranch, /applyProgressRecordCoordinatorRepairActionLocked/)
     assert.match(repairAuthoritativeBranch, /continue/)
 })
 

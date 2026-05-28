@@ -8509,12 +8509,12 @@ test('key-only terminalization derived failure does not poison authority termina
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
 })
 
-test('repair applies terminal error progress to active service-worker row', async () => {
+test('repair does not promote terminal error progress over active service-worker authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Error'
     const runId = 'run-terminal-error'
     const attemptId = 'attempt-terminal-error'
     const tabId = 322
-    const {sw, storage, timers} = loadServiceWorkerHarness({
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 400000,
         storage: {
             mbCoordinatorPaused: false,
@@ -8567,13 +8567,19 @@ test('repair applies terminal error progress to active service-worker row', asyn
             }
         }
     })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
 
     await settleWithFakeTimers(sw.runStoredWorkRepairTick('terminal-error-test'), timers)
 
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
-    assert.equal(storage.mbCoordinatorQueue[href].outcome, 'action-error')
-    assert.equal(storage.mbCoordinatorQueue[href].error, 'Profile actions not ready')
-    assert.match(storage.mbProfileNukeProgress[href].status, /^(?:error|interrupted)$/)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueue[href].outcome, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].error, undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'error')
     assert.equal(storage.mbProfileNukeProgress[href].finalError, 'Profile actions not ready')
 })
 
