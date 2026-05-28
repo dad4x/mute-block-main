@@ -1146,6 +1146,26 @@ pressure remains a separate performance/reliability follow-up.
   Live Windows push/reload is pending because the `127.0.0.1:10022` rsync
   tunnel and `127.0.0.1:9223` CDP endpoint both refused connections.
 
+- Next slice: added two targeted WAL-recovered projection loaders:
+  `loadCoordinatorQueueRunsPendingProjection()` for resolver remap and
+  `loadCoordinatorQueueRunsProgressPendingNukedProjection()` for clear-profile
+  cleanup. Moved clear-profile state deletion, resolver successful remap, and
+  direct/terminal progress recording off broad `loadCoordinatorState()` reads.
+  After this slice the remaining direct `loadCoordinatorState()` users in
+  `shared/js/sw.js` are the coordinator-authority hydration internals and the
+  broad repair/materialization path. Contract coverage pins the new helper
+  shapes and migrated call sites; synthetic coverage verifies clear-profile
+  does not read events, resolver remap does not read events/progress/nuked
+  posts, and direct progress does not read events or post maps. Validation:
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.591`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.591.zip` and `firefox/mute_block-1.6.591.zip`.
+  Live Windows push/reload remains blocked: rsync to `127.0.0.1:10022` refused
+  connection, and both CDP checks against `127.0.0.1:9223` refused connection.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
