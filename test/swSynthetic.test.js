@@ -2845,6 +2845,12 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     assert.ok(storage.mbCoordinatorQueueWal)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253600)
+    assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
+    await waitFor(
+        () => storage.mbProfileNukeProgress[href]?.status === 'blocking',
+        'direct progress compatibility save did not materialize progress',
+        {attempts: 20}
+    )
     assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
 
     const walRecords = getWalRecordsForGeneration(
@@ -2907,6 +2913,64 @@ test('direct nonterminal job progress WAL append failure rejects durable queue m
     assert.equal(storage.mbCoordinatorQueueWal, undefined)
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+})
+
+test('direct nonterminal job progress derived save failure does not poison WAL acknowledgement', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Nonterminal-Progress-Derived-Failure'
+    const runId = 'run-nonterminal-progress-derived-failure'
+    const attemptId = 'attempt-nonterminal-progress-derived-failure'
+    const tabId = 529
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253950,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253950})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbProfileNukeProgress && !payload?.mbCoordinatorQueueWal) {
+            throw new Error('synthetic direct progress derived save failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocking',
+        blockAttemptedAt: 253960,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {senderTabId: tabId})
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.terminal, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.notEqual(storage.mbCoordinatorQueue[href].milestones.blockAttemptedAt, 253960)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].milestones.blockAttemptedAt, 253960)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253960)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
+    await waitFor(
+        () => (sw.state().queueWakeupCounters['directProgress.compatibilitySaveFailed'] || 0) === 1,
+        'direct progress compatibility save failure was not recorded',
+        {attempts: 20}
+    )
+    assert.equal(sw.state().queueWakeupCounters['directProgress.compatibilitySaveFailed'] || 0, 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+    browser.storage.local.set = originalSet
 })
 
 test('terminal authority queue WAL projection failure does not poison durable acknowledgement', async () => {
@@ -10729,12 +10793,13 @@ test('service-worker no-foreground destructive work uses worker window without f
     assert.equal(profileTab?.active, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, profileTab.id)
     await waitFor(
-        () => storage.mbProfileNukeProgress[href]?.actionSurfaceMode === 'worker-window',
-        'worker action surface progress was not recorded',
+        () => sw.state().queuedTabMetadata.find(([tabId]) => tabId === profileTab.id)?.[1]?.actionSurfaceMode === 'worker-window',
+        'worker action surface metadata was not recorded',
         {timers, attempts: 20, tickMs: 100}
     )
-    assert.equal(storage.mbProfileNukeProgress[href].actionSurfaceMode, 'worker-window')
-    assert.equal(storage.mbProfileNukeProgress[href].actionSurfaceWindowId, workerWindow.id)
+    const metadata = sw.state().queuedTabMetadata.find(([tabId]) => tabId === profileTab.id)?.[1] || {}
+    assert.equal(metadata.actionSurfaceMode, 'worker-window')
+    assert.equal(metadata.actionSurfaceWindowId, workerWindow.id)
     assert.equal(browser.__windowUpdates.some(update =>
         update.windowId === workerWindow.id && update.options?.focused === true
     ), false)

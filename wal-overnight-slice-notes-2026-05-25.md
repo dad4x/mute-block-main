@@ -1052,6 +1052,23 @@ pressure remains a separate performance/reliability follow-up.
   raw divergences, no view mismatches, and an empty WAL tail. Dashboard sanity
   showed 0 ready, 390 succeeded, 0 soft-fail, 0 hard-fail, 0 active, and
   0 per-row cancel buttons for 80 displayed rows.
+- Review closeout: both reviewers found that direct nonterminal progress still
+  let the post-WAL derived runs/progress compatibility save poison the durable
+  acknowledgement, and one noted the direct path still used
+  `terminalProgress.save` metric attribution. Direct progress now defers
+  compatibility materialization through the same repair-scheduled follow-up
+  shape as terminal progress, but with `directProgress.*` metrics and
+  `direct-progress` queue-operation attribution. Added synthetic coverage for
+  WAL success plus derived-save failure; the caller still sees
+  `recorded: true`, recovered WAL authority carries the milestone, stale raw
+  progress remains absent, and repair is scheduled. Validation: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `timeout 240 node
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.586`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.586.zip` and `firefox/mute_block-1.6.586.zip`.
+  Live Windows push/reload is pending because the `127.0.0.1:10022` tunnel
+  refused the bounded rsync retry and CDP returned `ECONNRESET`.
 
 ## Deferred follow-up: physical WAL segmentation
 
