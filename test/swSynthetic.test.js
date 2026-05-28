@@ -388,11 +388,10 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(afterRepeat['progress.shadowWal.skippedNoChange'] || 0, 1)
     assert.equal(afterRepeat['rowEvent.queued-progress-milestone.shadowWal.skippedNoChange'] || 0, 1)
 
-    await waitFor(
-        () => storage.mbProfileNukeProgress[href]?.status === 'blocking',
-        'compatibility progress snapshot was not flushed',
-        {timers, tickMs: 30000, attempts: 3}
-    )
+    await timers.tick(30000)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
+    assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
+    assert.equal(afterRepeat['progress.compatibilityFlushScheduled'] || 0, 0)
 })
 
 test('profile progress load normalizes legacy compatibility storage read-only', async () => {
