@@ -1320,6 +1320,27 @@ pressure remains a separate performance/reliability follow-up.
   skipped, 6 canceled, no active/queued/failed work, active WAL tail 0, and no
   raw/recovered/view mismatches.
 
+- Review fix for the batch bridge: `record-nuke-progress-batch` now fails
+  closed if the WAL-recovered current queue authority projection cannot be
+  loaded. It records a diagnostic/metric and returns
+  `queue-authority-load-failed` before any legacy progress compatibility write,
+  so ambiguous no-attempt terminal batches cannot overwrite
+  `mbProfileNukeProgress` while the queue row remains active. Added a
+  regression that makes the projection storage get throw, verifies the active
+  row and progress mirror stay unchanged, and confirms no WAL or storage write
+  occurs. Validation before packaging: `node -c shared/js/sw.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. This is not included in `v1.6.598`; package as `1.6.599`. Version
+  bumped to `1.6.599`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.599.zip` and
+  `firefox/mute_block-1.6.599.zip`. Live Windows rsync push succeeded. CDP
+  reload reported extension `1.6.599`, enabled, with zero manifest/runtime
+  errors after a serial recheck. Queue accounting audit was consistent: 413
+  total terminal rows, 383 succeeded, 24 skipped, 6 canceled, no
+  active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
