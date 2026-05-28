@@ -8243,6 +8243,72 @@ function scheduleTerminalOwnedProfileTabCleanup(profileHrefs = [], delayMs = 0) 
     }, Math.max(0, Number.parseInt(delayMs, 10) || 0))
 }
 
+async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {}) {
+    const itemKey = `${options.itemKey || ''}`.trim()
+    const item = options.item || null
+    const settlementKey = `${options.settlementKey || ''}`
+    const sourceSettlementOutcome = `${options.sourceSettlementOutcome || ''}`.trim()
+    const now = Number.parseInt(options.now, 10) || Date.now()
+
+    return coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'terminal-settlement',
+        rowKey: itemKey,
+        expectedAttemptId: getAttemptIdFromValue(item),
+        expectedAttemptNumber: getAttemptNumberFromValue(item),
+        reason: 'ordinaryMutation',
+        metricPath: 'terminalSettlement.save',
+        currentAuthorityState: options.currentAuthorityState || null,
+        mutate(currentItem, context) {
+            if(!isTerminalCoordinatorStatus(currentItem?.status)) {
+                return context.reject('nonterminal-row')
+            }
+            if(getCoordinatorItemSettlementKey(currentItem) !== settlementKey) {
+                return context.reject('row-changed-before-authority-apply')
+            }
+            if(currentItem.sourceSettlementKey === settlementKey) {
+                return currentItem
+            }
+            return {
+                ...currentItem,
+                sourceSettledAt: now,
+                sourceSettlementKey: settlementKey,
+                sourceSettlementOutcome
+            }
+        }
+    })
+}
+
+function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {}) {
+    const confirmedHrefs = options.confirmedHrefs || new Set()
+    const clearedHrefs = options.clearedHrefs || new Set()
+    const progressChanged = options.progressChanged === true
+    const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    const currentNuked = stored?.[SPACE_NUKED_POSTS_KEY] || {}
+    const confirmedResult = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
+    const clearedResult = removeProfileHrefFromPendingSpaceRecords(confirmedResult.nextPending, Array.from(clearedHrefs))
+    const prunedNuked = confirmedResult.changedNuked
+        ? getPrunedNukedPosts(confirmedResult.nextNuked, {
+            retentionDays: defaults.nukedPostRetentionDays,
+            maxEntries: defaults.maxRememberedNukedPosts
+        })
+        : confirmedResult.nextNuked
+    const payload = {}
+
+    if(progressChanged) payload[PROFILE_NUKE_PROGRESS_KEY] = pruneProfileNukeProgress(progress)
+    if(confirmedResult.changedPending || clearedResult.changed) {
+        payload[SPACE_PENDING_NUKED_POSTS_KEY] = clearedResult.records
+    }
+    if(confirmedResult.changedNuked) {
+        payload[SPACE_NUKED_POSTS_KEY] = prunedNuked
+    }
+
+    return {
+        payload,
+        pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || null,
+        nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || null
+    }
+}
+
 async function settleTerminalCoordinatorItemsLocked(options = {}) {
     const requestedHrefs = getNormalizedProfileHrefList(options.profileHrefs || [])
 
@@ -8329,31 +8395,13 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
             clearedHrefs.add(href)
         }
 
-        const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-            operationKind: 'terminal-settlement',
-            rowKey: itemKey,
-            expectedAttemptId: getAttemptIdFromValue(item),
-            expectedAttemptNumber: getAttemptNumberFromValue(item),
-            reason: 'ordinaryMutation',
-            metricPath: 'terminalSettlement.save',
+        const authorityResult = await applyTerminalCoordinatorAuthoritySettlementLocked({
+            itemKey,
+            item,
+            settlementKey,
+            sourceSettlementOutcome,
+            now,
             currentAuthorityState,
-            mutate(currentItem, context) {
-                if(!isTerminalCoordinatorStatus(currentItem?.status)) {
-                    return context.reject('nonterminal-row')
-                }
-                if(getCoordinatorItemSettlementKey(currentItem) !== settlementKey) {
-                    return context.reject('row-changed-before-authority-apply')
-                }
-                if(currentItem.sourceSettlementKey === settlementKey) {
-                    return currentItem
-                }
-                return {
-                    ...currentItem,
-                    sourceSettledAt: now,
-                    sourceSettlementKey: settlementKey,
-                    sourceSettlementOutcome
-                }
-            }
         })
 
         if(authorityResult?.accepted === true && authorityResult?.durable === true) {
@@ -8384,25 +8432,12 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         return {settled: 0, confirmed: 0, cleared: 0, progressRestored: 0, pendingPosts: null, nukedPosts: null}
     }
 
-    const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-    const currentNuked = stored?.[SPACE_NUKED_POSTS_KEY] || {}
-    const confirmedResult = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
-    const clearedResult = removeProfileHrefFromPendingSpaceRecords(confirmedResult.nextPending, Array.from(clearedHrefs))
-    const prunedNuked = confirmedResult.changedNuked
-        ? getPrunedNukedPosts(confirmedResult.nextNuked, {
-            retentionDays: defaults.nukedPostRetentionDays,
-            maxEntries: defaults.maxRememberedNukedPosts
-        })
-        : confirmedResult.nextNuked
-    const payload = {}
-
-    if(progressChanged) payload[PROFILE_NUKE_PROGRESS_KEY] = pruneProfileNukeProgress(progress)
-    if(confirmedResult.changedPending || clearedResult.changed) {
-        payload[SPACE_PENDING_NUKED_POSTS_KEY] = clearedResult.records
-    }
-    if(confirmedResult.changedNuked) {
-        payload[SPACE_NUKED_POSTS_KEY] = prunedNuked
-    }
+    const derivedSettlement = buildTerminalCoordinatorSettlementDerivedPayload(stored, progress, {
+        confirmedHrefs,
+        clearedHrefs,
+        progressChanged
+    })
+    const payload = derivedSettlement.payload
 
     if(Object.keys(payload).length) {
         let derivedSaved = false
@@ -8437,8 +8472,8 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         confirmed: confirmedHrefs.size,
         cleared: clearedHrefs.size,
         progressRestored,
-        pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || null,
-        nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || null
+        pendingPosts: derivedSettlement.pendingPosts,
+        nukedPosts: derivedSettlement.nukedPosts
     }
 }
 
