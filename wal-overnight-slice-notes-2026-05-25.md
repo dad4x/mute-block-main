@@ -1341,6 +1341,27 @@ pressure remains a separate performance/reliability follow-up.
   active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: narrowed the single-record `record-nuke-progress` compatibility
+  bridge to match the batch bridge. For requests without queued-tab metadata,
+  the service worker now loads WAL-recovered current queue authority before any
+  legacy progress write, fails closed with `queue-authority-load-failed` if
+  authority cannot be proven, rejects missing incoming attempt identity for
+  current rows, and routes matching-attempt current rows through
+  `recordCoordinatorJobProgressRecords()` / queue WAL. Only non-current legacy
+  profile progress still falls back to `recordProfileNukeProgress()`. Added
+  synthetic coverage for missing-attempt rejection, authority-load failure with
+  no storage write, and matching-attempt WAL terminalization. Validation:
+  `node -c shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `node -c
+  test/p1-contract.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.600`; `npm run prod`, `npm run build:chrome`,
+  and `npm run build:firefox` produced `chrome/mute_block-1.6.600.zip` and
+  `firefox/mute_block-1.6.600.zip`. Live Windows rsync push succeeded. CDP
+  reload reported extension `1.6.600`, enabled, with zero manifest/runtime
+  errors. Queue accounting audit was consistent: 413 total terminal rows, 383
+  succeeded, 24 skipped, 6 canceled, no active/queued/failed work, active WAL
+  tail 0, and no raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

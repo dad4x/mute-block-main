@@ -18178,6 +18178,102 @@ async function recordProfileNukeProgressFromRequest(request = {}, sender = {}) {
         })
     }
 
+    const profileHref = normalizeQuoraProfileUrl(request.profileHref || request.href || '')
+    if(profileHref) {
+        const patch = request.patch && typeof request.patch === 'object' ? request.patch : {}
+        let currentQueue = {}
+        try {
+            const currentAuthorityState = await loadCoordinatorQueueProjection({
+                metricPath: 'progress.validate.load'
+            })
+            currentQueue = currentAuthorityState?.queue || {}
+        }
+        catch(error) {
+            incrementQueueWakeupMetric('progress.authorityLoadFailed')
+            recordCoordinatorDiagnosticEvent(
+                'progress-authority-load-failed',
+                error?.message || 'Progress authority load failed'
+            )
+            return {
+                recorded: false,
+                durable: false,
+                compatibility: false,
+                authority: false,
+                reason: 'queue-authority-load-failed'
+            }
+        }
+
+        const entry = currentQueue[profileHref]
+            ? {key: profileHref, item: currentQueue[profileHref]}
+            : findCoordinatorQueueEntryForHref(currentQueue, profileHref)
+        const item = entry?.item || null
+        const attemptPatch = {
+            ...patch,
+            attemptId: patch.attemptId || request.attemptId || '',
+            attemptNumber: patch.attemptNumber || request.attemptNumber || 0
+        }
+        const itemMatchesProgress = item && shouldApplyProgressToCoordinatorItem(item, attemptPatch)
+        const currentAttemptId = getAttemptIdFromValue(item)
+        const currentAttemptNumber = getAttemptNumberFromValue(item)
+        const incomingAttemptId = getAttemptIdFromValue(attemptPatch)
+        const incomingAttemptNumber = getAttemptNumberFromValue(attemptPatch)
+
+        if(itemMatchesProgress &&
+            ((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber))) {
+            await recordStaleAttemptDiagnostic({
+                profileHref,
+                incomingAttemptId,
+                expectedAttemptId: currentAttemptId,
+                senderTabId: tabId,
+                message: 'Ignored progress without required attempt identity'
+            })
+            return {recorded: false, staleAttempt: true, reason: 'missing-attempt-identity'}
+        }
+
+        if(!await validateProgressAttempt(profileHref, attemptPatch, sender)) {
+            return {recorded: false, staleAttempt: true, reason: 'stale-attempt'}
+        }
+
+        if(itemMatchesProgress && hasMismatchedCoordinatorAttempt(item, attemptPatch)) {
+            await recordStaleAttemptDiagnostic({
+                profileHref,
+                incomingAttemptId,
+                expectedAttemptId: currentAttemptId,
+                senderTabId: tabId,
+                message: 'Ignored progress from stale coordinator attempt'
+            })
+            return {recorded: false, staleAttempt: true, reason: 'stale-attempt'}
+        }
+
+        if(itemMatchesProgress && isCoordinatorQueueAuthoritativeItem(item)) {
+            const authorityPatch = {
+                ...patch,
+                actionKind: patch.actionKind || item.actionKind || '',
+                runId: patch.runId || item.runId || '',
+                attemptId: incomingAttemptId,
+                attemptNumber: incomingAttemptNumber,
+                ownerTabId: patch.ownerTabId || item.ownerTabId || null,
+                ownerWindowId: patch.ownerWindowId || item.ownerWindowId || null
+            }
+            const mapped = getCoordinatorStatusFromProgress(authorityPatch)
+            const authorityResult = await recordCoordinatorJobProgressRecords({
+                [profileHref]: authorityPatch
+            }, {
+                expectTerminal: isTerminalCoordinatorStatus(mapped.status),
+                senderTabId: tabId
+            })
+            if(authorityResult?.terminal) scheduleQueuedWorkContinuation('terminal-job-progress')
+
+            return {
+                recorded: authorityResult?.recorded === true,
+                terminal: authorityResult?.terminal === true,
+                compatibility: false,
+                authority: true,
+                results: authorityResult?.results || {}
+            }
+        }
+    }
+
     return recordJobProgressFromRequest(request, sender, {
         compatibility: true
     })

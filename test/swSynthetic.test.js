@@ -3192,6 +3192,60 @@ test('compatibility progress batch rejects missing attempt for current coordinat
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
 })
 
+test('compatibility progress single rejects missing attempt for current coordinator row', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Single-Missing-Attempt'
+    const runId = 'run-single-missing-attempt'
+    const attemptId = 'attempt-single-missing-attempt'
+    const tabId = 533
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253972,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253972})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 253962
+                }
+            }
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress',
+        profileHref: href,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            terminalAt: 253982,
+            actionKind: 'mute-block',
+            runId,
+            tabId
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.staleAttempt, true)
+    assert.equal(result.reason, 'missing-attempt-identity')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
+})
+
 test('compatibility progress batch fails closed when authority projection cannot load', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Batch-Authority-Load-Failure'
     const runId = 'run-batch-authority-load-failure'
@@ -3267,6 +3321,79 @@ test('compatibility progress batch fails closed when authority projection cannot
     browser.storage.local.set = originalSet
 })
 
+test('compatibility progress single fails closed when authority projection cannot load', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Single-Authority-Load-Failure'
+    const runId = 'run-single-authority-load-failure'
+    const attemptId = 'attempt-single-authority-load-failure'
+    const tabId = 534
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253987,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253987})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 253982
+                }
+            }
+        }
+    })
+    let setCalls = 0
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        if(defaults && Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue')) {
+            throw new Error('synthetic single authority projection load failure')
+        }
+        return originalGet(defaults)
+    }
+    browser.storage.local.set = async payload => {
+        setCalls += 1
+        return originalSet(payload)
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress',
+        profileHref: href,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            terminalAt: 253992,
+            actionKind: 'mute-block',
+            runId,
+            tabId
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.durable, false)
+    assert.equal(result.compatibility, false)
+    assert.equal(result.authority, false)
+    assert.equal(result.reason, 'queue-authority-load-failed')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(setCalls, 0)
+    assert.equal(sw.state().queueWakeupCounters['progress.authorityLoadFailed'] || 0, 1)
+
+    browser.storage.local.get = originalGet
+    browser.storage.local.set = originalSet
+})
+
 test('compatibility progress batch routes matching attempt row through WAL authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Batch-Matching-Attempt'
     const runId = 'run-batch-matching-attempt'
@@ -3336,6 +3463,77 @@ test('compatibility progress batch routes matching attempt row through WAL autho
     await waitFor(
         () => storage.mbProfileNukeProgress[href]?.status === 'blocked',
         'batch terminal compatibility save did not update progress',
+        {attempts: 20}
+    )
+})
+
+test('compatibility progress single routes matching attempt row through WAL authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Single-Matching-Attempt'
+    const runId = 'run-single-matching-attempt'
+    const attemptId = 'attempt-single-matching-attempt'
+    const tabId = 535
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253994,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253994})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 253984
+                }
+            }
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress',
+        profileHref: href,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            blockedAt: 254004,
+            terminalAt: 254004,
+            actionKind: 'mute-block',
+            runId,
+            tabId,
+            attemptId,
+            attemptNumber: 1
+        }
+    }, {
+        tab: {id: tabId}
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.terminal, true)
+    assert.equal(result.authority, true)
+    assert.equal(result.compatibility, false)
+    assert.equal(result.results[href].recorded, true)
+    assert.equal(result.results[href].terminal, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'succeeded')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
+
+    const walRecords = getWalRecordsForGeneration(
+        storage.mbCoordinatorQueueWal,
+        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+    )
+    assert.equal(walRecords[0].operationKind, 'terminal-progress')
+    await waitFor(
+        () => storage.mbProfileNukeProgress[href]?.status === 'blocked',
+        'single terminal compatibility save did not update progress',
         {attempts: 20}
     )
 })
