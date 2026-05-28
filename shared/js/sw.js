@@ -12450,22 +12450,14 @@ function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null) {
     }
 }
 
-async function normalizeProfileNukeProgressStorage() {
-    const stored = await metricStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}})
-    const storedProgress = stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}
-    const nextProgress = normalizeStoredProfileNukeProgress(storedProgress)
-    const changed = JSON.stringify(nextProgress) !== JSON.stringify(storedProgress)
-    profileNukeProgress = nextProgress
-
-    if(!changed) {
-        return {normalized: true, changed: false, profileNukeProgress: nextProgress}
-    }
-    return {normalized: true, changed: true, persisted: false, profileNukeProgress: nextProgress}
-}
-
 async function loadProfileNukeProgress() {
     try {
-        await normalizeProfileNukeProgressStorage()
+        const stored = await metricStorageGet({
+            [PROFILE_NUKE_PROGRESS_KEY]: {}
+        }, {
+            metricPath: 'progress.load'
+        })
+        profileNukeProgress = normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
     }
     catch {
         profileNukeProgress = {}

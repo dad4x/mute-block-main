@@ -395,7 +395,7 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     )
 })
 
-test('profile progress normalization is read-only for legacy compatibility storage', async () => {
+test('profile progress load normalizes legacy compatibility storage read-only', async () => {
     const rawHref = 'https://quora.com/profile/Synthetic-Normalize-Progress'
     const href = 'https://www.quora.com/profile/Synthetic-Normalize-Progress'
     const browser = createFakeBrowser({
@@ -419,12 +419,9 @@ test('profile progress normalization is read-only for legacy compatibility stora
         browser
     })
 
-    const result = await sw.normalizeProfileNukeProgressStorage()
+    await sw.ensureProfileNukeProgressReady()
 
-    assert.equal(result.normalized, true)
-    assert.equal(result.changed, true)
-    assert.equal(result.persisted, false)
-    assert.equal(result.profileNukeProgress[href].profileHref, href)
+    assert.equal(sw.state().profileNukeProgress[href].profileHref, href)
     assert.equal(storage.mbProfileNukeProgress[rawHref].profileHref, rawHref)
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(storageWrites.some(payload => Object.prototype.hasOwnProperty.call(payload || {}, 'mbProfileNukeProgress')), false)

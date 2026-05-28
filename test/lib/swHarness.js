@@ -412,7 +412,7 @@ module.exports.__test = {
     metricStorageGet,
     metricStorageSet,
     recoverStoredCoordinatorWork,
-    normalizeProfileNukeProgressStorage,
+    ensureProfileNukeProgressReady,
     repairCoordinatorStorageFromProgress,
     recordCoordinatorJobProgress,
     getCoordinatorQueueAccounting,
