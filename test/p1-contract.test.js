@@ -1051,7 +1051,8 @@ test('terminal progress compatibility save recomputes runs from current queue au
     assert.match(compatBody, /metricPrefix[\s\S]*terminalProgress/)
     assert.match(compatBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: `\$\{metricPrefix\}\.compatibilitySave\.load`/)
     assert.doesNotMatch(compatBody, /\[COORDINATOR_QUEUE_KEY\]: \{\}/)
-    assert.match(compatBody, /metricStorageGet\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_KEY\]: \{\}/)
+    assert.doesNotMatch(compatBody, /PROFILE_NUKE_PROGRESS_KEY|metricStorageGet\(\{[\s\S]*mbProfileNukeProgress/)
+    assert.match(compatBody, /saveProfileNukeProgressRowProjection\(progressRecords/)
     assert.match(compatBody, /recomputeCoordinatorRuns\(queue, currentRuns/)
 })
 

@@ -18799,19 +18799,9 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
     incrementQueueWakeupMetric(`${metricPrefix}.compatibilitySaveDeferred`)
     void enqueueSpaceFeedStorageUpdate(async () => {
         let currentAuthorityState = null
-        let stored = {}
         if(runsChanged) {
             currentAuthorityState = await loadCoordinatorQueueRunsProjection({
                 metricPath: `${metricPrefix}.compatibilitySave.load`
-            })
-        }
-        if(progressChanged) {
-            stored = await metricStorageGet({
-                [PROFILE_NUKE_PROGRESS_KEY]: {}
-            }, {
-                metricPath: runsChanged
-                    ? `${metricPrefix}.compatibilitySave.progress.load`
-                    : `${metricPrefix}.compatibilitySave.load`
             })
         }
 
@@ -18824,47 +18814,35 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
             nextRunsChanged = JSON.stringify(runs) !== JSON.stringify(currentRuns)
         }
 
-        const mergedProgressRecords = {}
-        let progress = {}
-        let nextProgressChanged = false
-        let progressChangedRows = 0
+        let projectionResult = null
         if(progressChanged) {
-            progress = normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
-            for(const [profileHref, record] of Object.entries(progressRecords)) {
-                const existing = mergeStoredProfileProgressRecord(
-                    progress[profileHref] || null,
-                    profileNukeProgress?.[profileHref] || null,
-                    profileHref
-                )
-                const merged = mergeStoredProfileProgressRecord(existing, record, profileHref)
-                if(JSON.stringify(progress[profileHref] || null) === JSON.stringify(merged)) continue
-                progress[profileHref] = merged
-                mergedProgressRecords[profileHref] = merged
-                nextProgressChanged = true
-                progressChangedRows += 1
-            }
+            projectionResult = await saveProfileNukeProgressRowProjection(progressRecords, {
+                metricPath: `${metricPrefix}.compatibilitySave.progressProjection`
+            })
         }
 
-        if(!nextRunsChanged && !nextProgressChanged) return true
+        if(progressChanged && projectionResult === false) return false
+        if(!nextRunsChanged && !progressChanged) return true
 
-        const saved = await saveCoordinatorState({
-            runs,
-            progress
-        }, {
-            queue: false,
-            runs: nextRunsChanged,
-            progress: nextProgressChanged,
-            progressChangedRows,
-            reason: 'ordinaryMutation',
-            metricPath: `${metricPrefix}.compatibilitySave`,
-            queueOperation,
-            queueChangedRows: 0
-        })
+        let saved = true
+        if(nextRunsChanged) {
+            saved = await saveCoordinatorState({
+                runs
+            }, {
+                queue: false,
+                runs: true,
+                progress: false,
+                reason: 'ordinaryMutation',
+                metricPath: `${metricPrefix}.compatibilitySave`,
+                queueOperation,
+                queueChangedRows: 0
+            })
+        }
 
-        if(saved !== false && nextProgressChanged) {
+        if(saved !== false && progressChanged) {
             profileNukeProgress = {
                 ...profileNukeProgress,
-                ...mergedProgressRecords
+                ...progressRecords
             }
         }
 
