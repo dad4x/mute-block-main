@@ -83,7 +83,6 @@ const MAX_COORDINATOR_EVENTS = 500
 const MAX_COORDINATOR_QUEUE_VIEW_ITEMS = 80
 const MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS = 1200
 const MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS = 1200
-const PROFILE_NUKE_PROGRESS_COMPATIBILITY_FLUSH_MS = 30000
 const COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT = 32
 const PROFILE_NUKE_PROGRESS_SHARD_COUNT = 32
 const MAX_QUEUE_WAKEUP_METRIC_JOURNAL = 240
@@ -12500,29 +12499,12 @@ async function loadProfileNukeProgress() {
 }
 
 let profileNukeProgressReady = null
-let profileNukeProgressCompatibilityFlushTimeout = null
 
 function ensureProfileNukeProgressReady() {
     if(!profileNukeProgressReady) {
         profileNukeProgressReady = loadProfileNukeProgress()
     }
     return profileNukeProgressReady
-}
-
-function scheduleProfileNukeProgressCompatibilityFlush(reason = 'row-event') {
-    if(profileNukeProgressCompatibilityFlushTimeout) {
-        incrementQueueWakeupMetric('progress.compatibilityFlushCoalesced')
-        return
-    }
-
-    incrementQueueWakeupMetric('progress.compatibilityFlushScheduled')
-    profileNukeProgressCompatibilityFlushTimeout = setTimeout(() => {
-        profileNukeProgressCompatibilityFlushTimeout = null
-        void persistProfileNukeProgress().catch(error => {
-            incrementQueueWakeupMetric('progress.compatibilityFlushFailed')
-            recordCoordinatorDiagnosticEvent('progress-compatibility-flush-failed', error?.message || `${reason || 'row-event'} compatibility flush failed`)
-        })
-    }, PROFILE_NUKE_PROGRESS_COMPATIBILITY_FLUSH_MS)
 }
 
 async function persistProfileNukeProgress() {
@@ -19240,7 +19222,6 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
                     }
                 }
             }
-            scheduleProfileNukeProgressCompatibilityFlush('row-event-progress-milestone')
             return {
                 recorded: Object.values(results).some(result => result?.recorded),
                 terminal: false,

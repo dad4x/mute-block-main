@@ -3388,6 +3388,8 @@ test('profile progress persistence is serialized with coordinator state', () => 
     assert.match(recordLockedBody, /persistProfileNukeProgressLocked\(\)/)
     assert.match(recordLockedBody, /syncCoordinatorProgressRecordsLocked/)
     assert.match(batchBody, /enqueueSpaceFeedStorageUpdate\(\(\) => recordProfileNukeProgressBatchLocked\(updates\)\)/)
+    assert.doesNotMatch(source, /scheduleProfileNukeProgressCompatibilityFlush/)
+    assert.doesNotMatch(source, /PROFILE_NUKE_PROGRESS_COMPATIBILITY_FLUSH_MS/)
     assert.match(recordRequestBody, /loadCoordinatorQueueProjection\(\{[\s\S]*metricPath: 'progress\.validate\.load'/)
     assert.match(recordRequestBody, /progress\.authorityLoadFailed/)
     assert.match(recordRequestBody, /queue-authority-load-failed/)
