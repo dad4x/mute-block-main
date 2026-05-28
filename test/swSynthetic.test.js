@@ -3388,6 +3388,75 @@ test('compatibility progress single fails closed when authority projection canno
     browser.storage.local.set = originalSet
 })
 
+test('compatibility progress single rejects legacy non-authority fallback without writing progress', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Single-Legacy-Fallback'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253987,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress',
+        profileHref: href,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            terminalAt: 253992,
+            actionKind: 'mute-block'
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.durable, false)
+    assert.equal(result.compatibility, false)
+    assert.equal(result.authority, false)
+    assert.equal(result.reason, 'legacy-progress-fallback-disabled')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(sw.state().queueWakeupCounters['progress.legacyFallbackRejected'] || 0, 1)
+})
+
+test('compatibility progress batch rejects legacy non-authority fallback without writing progress', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Batch-Legacy-Fallback'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253987,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress-batch',
+        updates: [{
+            profileHref: href,
+            patch: {
+                status: 'blocked',
+                blockSucceeded: true,
+                terminalAt: 253992,
+                actionKind: 'mute-block'
+            }
+        }]
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.compatibility, false)
+    assert.equal(result.authority, false)
+    assert.equal(result.reason, 'legacy-progress-fallback-disabled')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(sw.state().queueWakeupCounters['progressBatch.legacyFallbackRejected'] || 0, 1)
+})
+
 test('compatibility progress single rejects attempted row after coordinator authority is gone', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Single-Missing-Authority'
     const attemptId = 'attempt-single-missing-authority'

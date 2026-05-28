@@ -1058,8 +1058,6 @@ async function recordProfileNukeProgress(href, patch = {}) {
     if(!nextRecord) return null
 
     const useJobProtocol = isActiveQueuedProgressRecord(normalizedHref)
-    let result = null
-
     const mapped = mapProfileProgressToCoordinatorRepair(nextRecord)
 
     if(useJobProtocol) {
@@ -1068,7 +1066,7 @@ async function recordProfileNukeProgress(href, patch = {}) {
             [normalizedHref]: nextRecord
         })
 
-        result = await sendRecordedRuntimeMessageWithRetry({
+        const result = await sendRecordedRuntimeMessageWithRetry({
             action: mapped.terminal ? 'record-job-terminal' : 'record-job-milestone',
             profileHref: normalizedHref,
             patch: nextRecord,
@@ -1098,17 +1096,10 @@ async function recordProfileNukeProgress(href, patch = {}) {
         [normalizedHref]: nextRecord
     })
 
-    if(!result?.recorded) {
-        result = await sendRecordedRuntimeMessageWithRetry({
-            action: 'record-nuke-progress',
-            profileHref: normalizedHref,
-            patch: nextRecord
-        }, mapped)
-    }
-
     return {
         ...nextRecord,
-        runtimeRecorded: !!result?.recorded
+        runtimeRecorded: false,
+        localOnly: true
     }
 }
 
@@ -1139,11 +1130,7 @@ async function recordProfileNukeProgressBatch(updates) {
     if(!normalizedUpdates.length) return false
 
     profileNukeProgress = pruneProfileNukeProgress(nextProgress)
-    const result = await safeSendRuntimeMessageWithTimeout({
-        action: 'record-nuke-progress-batch',
-        updates: normalizedUpdates
-    }, null, 2500)
-    return true
+    return false
 }
 
 function mapProfileProgressToCoordinatorRepair(record = {}) {

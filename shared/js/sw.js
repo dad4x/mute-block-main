@@ -18196,9 +18196,14 @@ async function recordProfileNukeProgressFromRequest(request = {}, sender = {}) {
         }
     }
 
-    return recordJobProgressFromRequest(request, sender, {
-        compatibility: true
-    })
+    incrementQueueWakeupMetric('progress.legacyFallbackRejected')
+    return {
+        recorded: false,
+        durable: false,
+        compatibility: false,
+        authority: false,
+        reason: profileHref ? 'legacy-progress-fallback-disabled' : 'invalid-profile-href'
+    }
 }
 
 function addResolvedProfileToPendingSpaceRecords(pendingPosts = {}, item = {}, resolvedHref = '') {
@@ -19860,13 +19865,13 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
 
 async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = {}) {
     const rawUpdates = Array.isArray(request.updates) ? request.updates : []
-    const acceptedCompatibilityUpdates = []
     const coordinatorTerminalRecords = {}
     const coordinatorDirectRecords = {}
     const tabId = sender.tab?.id || null
     let staleAttempt = false
     let missingAttemptIdentity = false
     let missingCurrentAuthority = false
+    let legacyCompatibilityRejected = false
     let currentQueue = {}
 
     if(rawUpdates.length) {
@@ -19959,21 +19964,22 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
             continue
         }
 
-        acceptedCompatibilityUpdates.push({
-            ...update,
-            profileHref
-        })
+        legacyCompatibilityRejected = true
+        incrementQueueWakeupMetric('progressBatch.legacyFallbackRejected')
     }
 
-    if(!acceptedCompatibilityUpdates.length &&
-        !Object.keys(coordinatorTerminalRecords).length &&
+    if(!Object.keys(coordinatorTerminalRecords).length &&
         !Object.keys(coordinatorDirectRecords).length) {
         return {
             recorded: false,
+            compatibility: false,
+            authority: false,
             staleAttempt,
             reason: missingAttemptIdentity
                 ? 'missing-attempt-identity'
-                : missingCurrentAuthority ? 'missing-current-authority' : staleAttempt ? 'stale-attempt' : 'no-updates'
+                : missingCurrentAuthority ? 'missing-current-authority'
+                    : staleAttempt ? 'stale-attempt'
+                        : legacyCompatibilityRejected ? 'legacy-progress-fallback-disabled' : 'no-updates'
         }
     }
 
@@ -20000,16 +20006,13 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
         if(directResult?.terminal) scheduleQueuedWorkContinuation('terminal-job-progress-batch')
     }
 
-    const compatibilityRecorded = acceptedCompatibilityUpdates.length
-        ? await recordProfileNukeProgressBatch(acceptedCompatibilityUpdates)
-        : false
-
     return {
-        recorded: authorityRecorded || !!compatibilityRecorded,
+        recorded: authorityRecorded,
         terminal,
-        compatibility: acceptedCompatibilityUpdates.length > 0,
+        compatibility: false,
+        legacyCompatibilityRejected,
         authority: Object.keys(authorityResults).length > 0,
-        staleAttempt: staleAttempt && !authorityRecorded && !compatibilityRecorded,
+        staleAttempt: staleAttempt && !authorityRecorded,
         results: authorityResults
     }
 }
