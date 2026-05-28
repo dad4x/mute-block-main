@@ -1166,6 +1166,33 @@ pressure remains a separate performance/reliability follow-up.
   Live Windows push/reload remains blocked: rsync to `127.0.0.1:10022` refused
   connection, and both CDP checks against `127.0.0.1:9223` refused connection.
 
+- Next slice: narrowed the remaining broad runtime/read-repair surface. Replaced
+  the `loadCoordinatorCurrentAuthorityState()` alias to `loadCoordinatorState()`
+  with an explicit WAL-recovered queue/runs/progress projection plus only
+  caller-requested control defaults, so resume/reconcile/open decisions no
+  longer read coordinator events or pending/nuked post maps. Added
+  `loadCoordinatorRepairProjection()` and moved
+  `repairCoordinatorStorageFromProgressLocked()` onto that explicit repair
+  projection; repair still reads the full compatibility materialization surface
+  it needs, but the read shape is now pinned and queue authority is
+  WAL-recovered. After this slice, direct `loadCoordinatorState()` use in
+  `shared/js/sw.js` is limited to the loader itself and coordinator-authority
+  hydration. Contract coverage pins both new helpers and verifies repair no
+  longer calls `loadCoordinatorState()`. Synthetic coverage verifies repair
+  uses the explicit queue/WAL/runs/events/progress/pause/pending/nuked read
+  shape while rebuilding WAL-only enqueue derived state. Validation:
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.592`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.592.zip` and `firefox/mute_block-1.6.592.zip`.
+  Live Windows rsync push succeeded. CDP reload reported extension
+  `1.6.592`, enabled, with zero manifest/runtime errors. CDP queue accounting
+  audit was consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6
+  canceled, no active/queued/failed work, active WAL tail 0, and no
+  raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
