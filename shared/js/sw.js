@@ -12508,100 +12508,6 @@ function ensureProfileNukeProgressReady() {
     return profileNukeProgressReady
 }
 
-async function persistProfileNukeProgress() {
-    if(spaceFeedStorageUpdateDepth > 0) {
-        return persistProfileNukeProgressLocked()
-    }
-
-    return enqueueSpaceFeedStorageUpdate(persistProfileNukeProgressLocked)
-}
-
-async function persistProfileNukeProgressLocked() {
-    profileNukeProgress = pruneProfileNukeProgress(profileNukeProgress)
-
-    try {
-        await saveCoordinatorState({progress: profileNukeProgress}, {
-            progress: true,
-            reason: 'compatibilityFlush'
-        })
-        return true
-    }
-    catch {
-        return false
-    }
-}
-
-async function recordProfileNukeProgress(profileHref, patch = {}) {
-    if(spaceFeedStorageUpdateDepth > 0) {
-        return recordProfileNukeProgressLocked(profileHref, patch)
-    }
-
-    return enqueueSpaceFeedStorageUpdate(() => recordProfileNukeProgressLocked(profileHref, patch))
-}
-
-async function recordProfileNukeProgressLocked(profileHref, patch = {}) {
-    await ensureProfileNukeProgressReady()
-
-    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
-    if(!normalizedHref) return null
-
-    incrementQueueWakeupMetric('progress.recordReceived')
-    const nextRecord = normalizeProgressPatch(normalizedHref, patch)
-    if(!nextRecord) return null
-
-    profileNukeProgress = {
-        ...profileNukeProgress,
-        [normalizedHref]: nextRecord
-    }
-    await persistProfileNukeProgressLocked()
-    await syncCoordinatorProgressRecordsLocked({[normalizedHref]: nextRecord})
-    return nextRecord
-}
-
-async function recordProfileNukeProgressBatch(updates = []) {
-    if(spaceFeedStorageUpdateDepth > 0) {
-        return recordProfileNukeProgressBatchLocked(updates)
-    }
-
-    return enqueueSpaceFeedStorageUpdate(() => recordProfileNukeProgressBatchLocked(updates))
-}
-
-async function recordProfileNukeProgressBatchLocked(updates = []) {
-    await ensureProfileNukeProgressReady()
-
-    const updateCount = Array.isArray(updates) ? updates.length : 0
-    if(updateCount > 0) {
-        incrementQueueWakeupMetric('progress.batchReceived')
-        incrementQueueWakeupMetric('progress.recordReceived', updateCount)
-        incrementQueueWakeupMetric('progress.recordsPerBatch', updateCount)
-    }
-
-    let changed = false
-    const nextProgress = {
-        ...profileNukeProgress
-    }
-    const syncedRecords = {}
-
-    for(const update of updates) {
-        const normalizedHref = normalizeQuoraProfileUrl(update?.profileHref || update?.href || '')
-        if(!normalizedHref) continue
-
-        const nextRecord = normalizeProgressPatch(normalizedHref, update?.patch || {}, nextProgress[normalizedHref] || null)
-        if(!nextRecord) continue
-
-        nextProgress[normalizedHref] = nextRecord
-        syncedRecords[normalizedHref] = nextRecord
-        changed = true
-    }
-
-    if(!changed) return false
-
-    profileNukeProgress = nextProgress
-    await persistProfileNukeProgressLocked()
-    await syncCoordinatorProgressRecordsLocked(syncedRecords)
-    return true
-}
-
 function removeProfileHrefFromPendingSpaceRecords(records = {}, profileHrefs = []) {
     const hrefs = new Set(getNormalizedProfileHrefList(Array.isArray(profileHrefs) ? profileHrefs : [profileHrefs]))
     if(!hrefs.size) return {records: {...records}, changed: false}
@@ -14939,6 +14845,33 @@ function getQueuedForegroundLeaseTabId() {
     return tabId
 }
 
+function makeQueuedTabMetadataProgressPatch(metadata = {}, patch = {}) {
+    return {
+        ...patch,
+        actionKind: patch.actionKind || metadata?.actionKind || metadata?.tabAction || 'mute-block',
+        runId: patch.runId || metadata?.runId || '',
+        attemptId: getAttemptIdFromValue(patch) || getAttemptIdFromValue(metadata),
+        attemptNumber: getAttemptNumberFromValue(patch) || getAttemptNumberFromValue(metadata),
+        ownerTabId: patch.ownerTabId || metadata?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+        ownerWindowId: patch.ownerWindowId || metadata?.ownerWindowId || null
+    }
+}
+
+async function recordQueuedTabMetadataMilestone(tabId, metadata = null, patch = {}) {
+    const profileHref = normalizeQuoraProfileUrl(metadata?.profileHref || patch?.profileHref || '')
+    if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
+
+    const progressPatch = makeQueuedTabMetadataProgressPatch(metadata || {}, patch)
+    if(!getAttemptIdFromValue(progressPatch) || !getAttemptNumberFromValue(progressPatch)) {
+        incrementQueueWakeupMetric('progress.metadataMilestoneMissingAttempt')
+        return {recorded: false, staleAttempt: true, reason: 'missing-attempt-identity'}
+    }
+
+    return recordDeferredCoordinatorJobMilestone(profileHref, progressPatch, {
+        senderTabId: normalizeTabId(tabId)
+    })
+}
+
 async function noteQueuedForegroundWait(tabId, metadata = null, reason = '') {
     const now = Date.now()
     const lastEventAt = Number.isFinite(metadata?.foregroundWaitLastEventAt)
@@ -14956,7 +14889,7 @@ async function noteQueuedForegroundWait(tabId, metadata = null, reason = '') {
 
     if(now - lastEventAt < FOREGROUND_LEASE_WAIT_EVENT_MS || !metadata?.profileHref) return
 
-    void recordProfileNukeProgress(metadata.profileHref, {
+    void recordQueuedTabMetadataMilestone(tabId, metadata, {
         waitingForForegroundAt,
         foregroundWaitReason: `${reason || ''}`.trim(),
         foregroundWaitLastEventAt: now,
@@ -15921,7 +15854,7 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
         foregroundWaitLastEventAt: promotedAt
     })
     if(metadata?.profileHref) {
-        void recordProfileNukeProgress(metadata.profileHref, {
+        void recordQueuedTabMetadataMilestone(normalizedTabId, metadata, {
             foregroundPromotedAt: promotedAt,
             foregroundPromotionReason: `${reason || ''}`.trim(),
             foregroundMode: actionSurfaceMode || 'focused-window',
@@ -15969,12 +15902,14 @@ function markQueuedTabClosing(tabId, reason = '') {
             : null
         const existingProgressCloseRequestedAt = Number.isFinite(progressRecord?.closeRequestedAt) && progressRecord.closeRequestedAt > 0
 
-        void recordProfileNukeProgress(metadata.profileHref, {
-            ...(existingProgressCloseRequestedAt ? {} : {closeRequestedAt}),
-            closedByExtension: true,
-            closeReason: normalizedReason,
-            event: `Queued tab close requested${normalizedReason ? ` (${normalizedReason})` : ''}`
-        })
+        if(!isTerminalProfileNukeRecord(progressRecord)) {
+            void recordQueuedTabMetadataMilestone(tabId, metadata, {
+                ...(existingProgressCloseRequestedAt ? {} : {closeRequestedAt}),
+                closedByExtension: true,
+                closeReason: normalizedReason,
+                event: `Queued tab close requested${normalizedReason ? ` (${normalizedReason})` : ''}`
+            }).catch(() => {})
+        }
     }
 
     return closeRequestedAt
@@ -17462,7 +17397,7 @@ async function sweepStaleQueuedTabs(parentTabId = null) {
             }
         }
         if(metadata?.profileHref) {
-            await recordProfileNukeProgress(metadata.profileHref, {
+            const staleProgressPatch = {
                 status: retryAction ? 'queued' : 'interrupted',
                 retryAttempt: retryAction ? retryAction.retryAttempt : getQueuedTabRetryAttempt(metadata, progressRecord),
                 maxRetries: retryAction ? retryAction.maxRetries : getQueuedTabMaxRetries(metadata, progressRecord),
@@ -17482,7 +17417,21 @@ async function sweepStaleQueuedTabs(parentTabId = null) {
                         ? 'Queued tab stayed loading or unscriptable; throttling queue before retrying'
                         : `Queued tab timed out; retrying attempt ${retryAction.retryAttempt + 1} of ${retryAction.maxRetries + 1}`
                     : 'Queued tab closed after timing out waiting for completion'
-            })
+            }
+            if(retryAction) {
+                await recordQueuedTabMetadataMilestone(tabId, {
+                    ...metadata,
+                    attemptId: retryAction.attemptId,
+                    attemptNumber: retryAction.attemptNumber
+                }, staleProgressPatch)
+            }
+            else {
+                const terminalResult = await recordCoordinatorJobProgress(metadata.profileHref, staleProgressPatch, {
+                    expectTerminal: true,
+                    senderTabId: tabId
+                })
+                if(terminalResult?.terminal) scheduleQueuedWorkContinuation('stale-active-terminal-progress')
+            }
         }
         try {
             await releaseQueuedTabAndCleanup(tabId, {awaitFill: false})
@@ -17670,7 +17619,7 @@ async function releaseQueuedTab(tabId, options = {}) {
             const hasSlotReleasedAt = Number.isFinite(progressRecord?.slotReleasedAt) && progressRecord.slotReleasedAt > 0
 
             if(!hasSlotReleasedAt) {
-                durableWrites.push(recordProfileNukeProgress(metadata.profileHref, {
+                durableWrites.push(recordQueuedTabMetadataMilestone(tabId, metadata, {
                     slotReleasedAt: Date.now(),
                     event: 'Queued tab slot released'
                 }))
@@ -19848,18 +19797,11 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
         }
     }
 
-    const record = await recordProfileNukeProgress(targetProfileHref, patch)
-    const mapped = getCoordinatorStatusFromProgress(record)
-    const terminal = isTerminalCoordinatorStatus(mapped.status)
-    if(options.expectTerminal && !terminal) {
-        return {recorded: !!record, terminal: false, reason: 'non-terminal-progress'}
-    }
-    if(terminal) scheduleQueuedWorkContinuation('terminal-profile-progress')
-
     return {
-        recorded: !!record,
-        terminal,
-        compatibility: options.compatibility === true
+        recorded: false,
+        terminal: false,
+        compatibility: false,
+        reason: 'legacy-progress-fallback-disabled'
     }
 }
 

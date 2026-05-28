@@ -415,6 +415,7 @@ module.exports.__test = {
     ensureProfileNukeProgressReady,
     repairCoordinatorStorageFromProgress,
     recordCoordinatorJobProgress,
+    recordQueuedTabMetadataMilestone,
     getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
     refreshQueueWakeupMetricsViewForDashboard,
