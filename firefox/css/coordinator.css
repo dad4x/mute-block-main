@@ -216,7 +216,17 @@ h2 {
 .panel-actions-row {
     align-items: center;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
+    justify-content: flex-end;
+}
+
+.panel-action-buttons {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
 }
 
 .panel-action-state {
