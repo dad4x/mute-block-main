@@ -3376,7 +3376,6 @@ test('profile progress persistence is serialized with coordinator state', () => 
     const batchBody = extractFunction(source, 'async function recordProfileNukeProgressBatch(updates = [])')
     const recordRequestBody = extractFunction(source, 'async function recordProfileNukeProgressFromRequest(request = {}, sender = {})')
     const batchRequestBody = extractFunction(source, 'async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = {})')
-    const normalizeStorageBody = extractFunction(source, 'async function normalizeProfileNukeProgressStorage()')
     const loadBody = extractFunction(source, 'async function loadProfileNukeProgress()')
 
     assert.doesNotMatch(source, /browser\.storage\.local\.set\(\{\[PROFILE_NUKE_PROGRESS_KEY\]/)
@@ -3401,10 +3400,10 @@ test('profile progress persistence is serialized with coordinator state', () => 
     assert.match(batchRequestBody, /recordCoordinatorJobProgressRecords\(coordinatorTerminalRecords/)
     assert.match(batchRequestBody, /recordCoordinatorJobProgressRecords\(coordinatorDirectRecords/)
     assert.match(batchRequestBody, /recordProfileNukeProgressBatch\(acceptedCompatibilityUpdates\)/)
-    assert.doesNotMatch(normalizeStorageBody, /enqueueSpaceFeedStorageUpdate/)
-    assert.doesNotMatch(normalizeStorageBody, /saveCoordinatorState\(/)
-    assert.match(normalizeStorageBody, /persisted: false/)
-    assert.match(loadBody, /normalizeProfileNukeProgressStorage\(\)/)
+    assert.doesNotMatch(source, /async function normalizeProfileNukeProgressStorage/)
+    assert.match(loadBody, /metricStorageGet\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_KEY\]: \{\}[\s\S]*\}/)
+    assert.match(loadBody, /normalizeStoredProfileNukeProgress\(stored\?\.\[PROFILE_NUKE_PROGRESS_KEY\] \|\| \{\}\)/)
+    assert.doesNotMatch(loadBody, /saveCoordinatorState\(/)
     assert.doesNotMatch(loadBody, /enqueueStoredCoordinatorQueueProgressSync/)
 })
 
