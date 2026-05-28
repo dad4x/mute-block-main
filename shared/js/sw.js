@@ -19015,6 +19015,9 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
     const progressRecords = normalizeStoredProfileNukeProgress(snapshot.progressRecords || {})
     const progressRecordHrefs = Object.keys(progressRecords)
     const progressChanged = snapshot.progressChanged === true && progressRecordHrefs.length > 0
+    const metricPrefix = `${snapshot.metricPrefix || 'terminalProgress'}`.trim() || 'terminalProgress'
+    const reasonPrefix = `${snapshot.reasonPrefix || 'terminal-progress'}`.trim() || 'terminal-progress'
+    const queueOperation = normalizeQueueWriteOperationName(snapshot.queueOperation || 'terminal-progress')
     if(!runsChanged && !progressChanged) return false
 
     const affectedRunIds = Array.from(new Set(
@@ -19023,13 +19026,13 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
             .filter(Boolean)
     ))
 
-    incrementQueueWakeupMetric('terminalProgress.compatibilitySaveDeferred')
+    incrementQueueWakeupMetric(`${metricPrefix}.compatibilitySaveDeferred`)
     void enqueueSpaceFeedStorageUpdate(async () => {
         let currentAuthorityState = null
         let stored = {}
         if(runsChanged) {
             currentAuthorityState = await loadCoordinatorQueueRunsProjection({
-                metricPath: 'terminalProgress.compatibilitySave.load'
+                metricPath: `${metricPrefix}.compatibilitySave.load`
             })
         }
         if(progressChanged) {
@@ -19037,8 +19040,8 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
                 [PROFILE_NUKE_PROGRESS_KEY]: {}
             }, {
                 metricPath: runsChanged
-                    ? 'terminalProgress.compatibilitySave.progress.load'
-                    : 'terminalProgress.compatibilitySave.load'
+                    ? `${metricPrefix}.compatibilitySave.progress.load`
+                    : `${metricPrefix}.compatibilitySave.load`
             })
         }
 
@@ -19083,8 +19086,8 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
             progress: nextProgressChanged,
             progressChangedRows,
             reason: 'ordinaryMutation',
-            metricPath: 'terminalProgress.compatibilitySave',
-            queueOperation: 'terminal-progress',
+            metricPath: `${metricPrefix}.compatibilitySave`,
+            queueOperation,
             queueChangedRows: 0
         })
 
@@ -19097,31 +19100,40 @@ function scheduleTerminalProgressCompatibilitySave(snapshot = {}) {
 
         return saved !== false
     }, {
-        reason: 'terminal-progress-compatibility-save',
+        reason: `${reasonPrefix}-compatibility-save`,
         failureValue: false
     }).then(saved => {
         if(saved !== false) {
-            incrementQueueWakeupMetric('terminalProgress.compatibilitySaveCompleted')
+            incrementQueueWakeupMetric(`${metricPrefix}.compatibilitySaveCompleted`)
             return
         }
-        incrementQueueWakeupMetric('terminalProgress.compatibilitySaveFailed')
+        incrementQueueWakeupMetric(`${metricPrefix}.compatibilitySaveFailed`)
         scheduleStoredWorkRepair(1000, {
-            reason: 'terminal-progress-compatibility-save-failed',
+            reason: `${reasonPrefix}-compatibility-save-failed`,
             edgeTriggered: true
         })
     }).catch(error => {
-        incrementQueueWakeupMetric('terminalProgress.compatibilitySaveFailed')
+        incrementQueueWakeupMetric(`${metricPrefix}.compatibilitySaveFailed`)
         recordCoordinatorDiagnosticEvent(
-            'terminal-progress-compatibility-save-failed',
-            error?.message || 'Terminal progress compatibility save failed'
+            `${reasonPrefix}-compatibility-save-failed`,
+            error?.message || `${reasonPrefix} compatibility save failed`
         )
         scheduleStoredWorkRepair(1000, {
-            reason: 'terminal-progress-compatibility-save-failed',
+            reason: `${reasonPrefix}-compatibility-save-failed`,
             edgeTriggered: true
         })
     })
 
     return true
+}
+
+function scheduleDirectProgressCompatibilitySave(snapshot = {}) {
+    return scheduleTerminalProgressCompatibilitySave({
+        ...snapshot,
+        metricPrefix: 'directProgress',
+        reasonPrefix: 'direct-progress',
+        queueOperation: 'direct-progress'
+    })
 }
 
 function scheduleTerminalProgressSettlement(profileHrefs = []) {
@@ -19193,6 +19205,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         const affectedRunIds = new Set()
         const terminalSettlementHrefs = new Set()
         const terminalCompatibilityProgressRecords = {}
+        const deferredCompatibilityHrefs = new Set()
+        const directCompatibilityHrefs = new Set()
+        const compatibilityProgressRecords = {}
         let queueChanged = false
         let progressChanged = false
         let progressChangedRows = 0
@@ -19272,7 +19287,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                             expectedAttemptId: getAttemptIdFromValue(item),
                             expectedAttemptNumber: getAttemptNumberFromValue(item),
                             reason: 'ordinaryMutation',
-                            metricPath: 'terminalProgress.save',
+                            metricPath: mappedTerminal ? 'terminalProgress.save' : 'directProgress.save',
                             currentAuthorityState,
                             mutate(currentItem) {
                                 if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
@@ -19289,7 +19304,13 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                             currentAuthorityState = coordinatorAuthority.current()
                             queue = currentAuthorityState.queue
                             queueChanged = true
-                            if(mappedTerminal) terminalSettlementHrefs.add(normalizedHref)
+                            deferredCompatibilityHrefs.add(normalizedHref)
+                            if(mappedTerminal) {
+                                terminalSettlementHrefs.add(normalizedHref)
+                            }
+                            else {
+                                directCompatibilityHrefs.add(normalizedHref)
+                            }
                         }
                         else {
                             results[normalizedHref] = {
@@ -19339,6 +19360,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     recordQueueWakeupPhaseSamplesFromProgress(record)
                     terminalCompatibilityProgressRecords[normalizedHref] = record
                 }
+                if(deferredCompatibilityHrefs.has(normalizedHref)) {
+                    compatibilityProgressRecords[normalizedHref] = record
+                }
             }
 
             results[normalizedHref] = {recorded: accepted, terminal, record}
@@ -19350,23 +19374,24 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
         if(runsChanged) runs = nextRuns
         const terminalCompatibilityProgressRows = Object.keys(terminalCompatibilityProgressRecords).length
-        const deferCompatibilitySave = terminalSettlementHrefs.size > 0 &&
-            terminalCompatibilityProgressRows === progressChangedRows
+        const deferCompatibilitySave = queueChanged && (runsChanged || progressChanged)
 
         if(!deferCompatibilitySave) {
-            await saveCoordinatorState({
-                queue,
-                runs,
-                progress
-            }, {
-                queue: false,
-                runs: runsChanged,
-                progress: progressChanged,
-                progressChangedRows,
-                reason: 'ordinaryMutation',
-                queueOperation: terminalCompatibilityProgressRows === progressChangedRows ? 'terminal-progress' : 'direct-progress',
-                queueChangedRows: 0
-            })
+            if(runsChanged || progressChanged) {
+                await saveCoordinatorState({
+                    queue,
+                    runs,
+                    progress
+                }, {
+                    queue: false,
+                    runs: runsChanged,
+                    progress: progressChanged,
+                    progressChangedRows,
+                    reason: 'ordinaryMutation',
+                    queueOperation: terminalCompatibilityProgressRows === progressChangedRows ? 'terminal-progress' : 'direct-progress',
+                    queueChangedRows: 0
+                })
+            }
         }
         return {
             recorded: Object.values(results).some(result => result?.recorded),
@@ -19374,17 +19399,23 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
             terminalSettlementHrefs: Array.from(terminalSettlementHrefs),
             compatibilitySave: deferCompatibilitySave ? {
                 affectedRunIds: Array.from(affectedRunIds),
-                progressRecords: terminalCompatibilityProgressRecords,
+                progressRecords: compatibilityProgressRecords,
                 runsChanged,
                 progressChanged,
-                progressChangedRows: Object.keys(terminalCompatibilityProgressRecords).length
+                progressChangedRows: Object.keys(compatibilityProgressRecords).length,
+                directProgress: directCompatibilityHrefs.size > 0
             } : null,
             results
         }
     })
 
     if(updateResult?.compatibilitySave) {
-        scheduleTerminalProgressCompatibilitySave(updateResult.compatibilitySave)
+        if(updateResult.compatibilitySave.directProgress === true) {
+            scheduleDirectProgressCompatibilitySave(updateResult.compatibilitySave)
+        }
+        else {
+            scheduleTerminalProgressCompatibilitySave(updateResult.compatibilitySave)
+        }
     }
 
     if(updateResult?.terminalSettlementHrefs?.length) {
