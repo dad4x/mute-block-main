@@ -6291,7 +6291,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     const runId = 'run-non-profile-authority'
     const attemptId = 'attempt-non-profile-authority'
     const tabId = 627
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 421000,
         storage: {
             mbCoordinatorPaused: false,
@@ -6318,6 +6318,12 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
             }
         }
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
         reason: 'repair',
@@ -6332,6 +6338,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'profile-unavailable')
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,

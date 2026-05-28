@@ -1106,6 +1106,26 @@ pressure remains a separate performance/reliability follow-up.
   `chrome/mute_block-1.6.588.zip` and `firefox/mute_block-1.6.588.zip`.
   Live Windows push/reload is pending because the `127.0.0.1:10022` rsync
   tunnel and the `127.0.0.1:9223` CDP endpoint both refused connections.
+- Next slice: added `loadCoordinatorQueueRunsProgressProjection()` for repair
+  paths that need WAL-recovered queue authority, run metadata, and progress
+  evidence but not events or the full coordinator snapshot. Moved
+  `mutateCoordinatorActiveNonProfileLandingTerminalize()` and
+  `mutateCoordinatorActiveWithoutRuntimeActorReconcile()` to this narrower
+  projection. Both row mutations remain WAL-backed; only runs/progress are
+  derived compatibility saves. Contract coverage now asserts the helper does
+  not load `mbCoordinatorEvents`, non-profile landing uses
+  `repair.nonProfileLanding.load`, and active-without-actor uses
+  `repair.activeWithoutActor.load`. Synthetic coverage verifies non-profile
+  landing terminalization does not request `mbCoordinatorEvents`. Validation:
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.589`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.589.zip` and `firefox/mute_block-1.6.589.zip`.
+  Live Windows push/reload is pending because the `127.0.0.1:10022` rsync
+  tunnel and the `127.0.0.1:9223` CDP endpoint both still refused
+  connections.
 
 ## Deferred follow-up: physical WAL segmentation
 
