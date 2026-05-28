@@ -1998,7 +1998,7 @@ test('row event persists queue only for nonterminal durable status changes', asy
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].tabId, null)
     assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
     assert.equal(
         (after['storagePayload.write.queue.bytes'] || 0) -
@@ -2287,7 +2287,7 @@ test('row event queue WAL projection failure does not poison durable acknowledge
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(storage.mbCoordinatorQueueWal)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
         sw.state().hasStoredWorkRepairTimeout ||
@@ -2357,12 +2357,55 @@ test('row event derived runs failure does not poison durable queue WAL acknowled
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(storage.mbCoordinatorQueueWal)
     assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[href].status, 'active')
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.derivedRunsSaveFailed'] || 0, 1)
     assert.ok(
         sw.state().hasStoredWorkRepairTimeout ||
             (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
     )
+})
+
+test('queued tab metadata milestones use row-event projection without full progress write', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Metadata-Milestone'
+    const runId = 'run-metadata-milestone'
+    const attemptId = 'attempt-metadata-milestone'
+    const tabId = 529
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 153100,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 153100})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.recordQueuedTabMetadataMilestone(tabId, {
+        profileHref: href,
+        runId,
+        actionKind: 'mute-block',
+        ownerTabId: 13,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        waitingForForegroundAt: 153120,
+        foregroundWaitReason: 'synthetic-wait',
+        event: 'Synthetic metadata milestone'
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.deferred, true)
+    assert.equal(result.durable, true)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(sw.state().profileNukeProgress[href].waitingForForegroundAt, 153120)
+    assert.equal(getProgressShardRecord(storage, href).attemptId, attemptId)
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
+    assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.accepted'] || 0, 1)
 })
 
 test('row event rejects stale attempt before durable progress mutation', async () => {
