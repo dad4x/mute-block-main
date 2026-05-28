@@ -414,14 +414,12 @@ test('profile progress normalization is read-only for legacy compatibility stora
         storageWrites.push(payload)
         return originalSet(payload)
     }
-    const {storage} = loadServiceWorkerHarness({
+    const {storage, sw} = loadServiceWorkerHarness({
         now: 2000,
         browser
     })
 
-    const result = await browser.runtime.sendMessage({
-        action: 'normalize-profile-nuke-progress'
-    })
+    const result = await sw.normalizeProfileNukeProgressStorage()
 
     assert.equal(result.normalized, true)
     assert.equal(result.changed, true)

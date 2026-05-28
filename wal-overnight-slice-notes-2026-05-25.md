@@ -1403,6 +1403,24 @@ pressure remains a separate performance/reliability follow-up.
   no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: deleted the obsolete `normalize-profile-nuke-progress` runtime
+  action while keeping `normalizeProfileNukeProgressStorage()` as an internal
+  read-only startup/test helper. The content script already stopped sending
+  this action, and the synthetic coverage now calls the internal helper instead
+  of preserving a public compatibility message. P1 coverage rejects
+  reintroducing the runtime action. Validation before packaging: `node -c
+  shared/js/sw.js`, `node -c test/lib/swHarness.js`, `node -c
+  test/p1-contract.test.js`, `node -c test/swSynthetic.test.js`, `timeout 120
+  node test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`,
+  and `timeout 300 npm test` passed. Version bumped to `1.6.603` for release
+  packaging. `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.603.zip` and
+  `firefox/mute_block-1.6.603.zip`. Live Windows rsync push succeeded. CDP
+  reload reported extension `1.6.603`, enabled, with zero manifest/runtime
+  errors. Queue accounting audit was consistent: 413 total terminal rows, 383
+  succeeded, 24 skipped, 6 canceled, no active/queued/failed work, active WAL
+  tail 0, and no raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
