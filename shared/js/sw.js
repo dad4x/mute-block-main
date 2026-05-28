@@ -4283,6 +4283,42 @@ function getCoordinatorRunStatus(runItems = [], existingRun = {}) {
     return 'active'
 }
 
+function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, now = Date.now()) {
+    const nextRuns = {...(runs || {})}
+    const targetRunIds = new Set(Object.keys(nextRuns))
+    const affectedRunIds = []
+
+    for(const item of Object.values(queue || {})) {
+        const runId = `${item?.runId || ''}`.trim()
+        if(runId) targetRunIds.add(runId)
+    }
+
+    for(const runId of targetRunIds) {
+        const run = nextRuns[runId]
+        if(!run || typeof run !== 'object') continue
+
+        const runItems = getCoordinatorRunItems(queue, runId, run)
+        if(!runItems.some(item => isPendingCoordinatorStatus(item?.status))) continue
+
+        const status = paused ? 'paused' : 'active'
+        if(run.paused === paused && `${run.status || ''}` === status) continue
+
+        nextRuns[runId] = {
+            ...run,
+            paused,
+            status,
+            updatedAt: Math.max(Number.parseInt(run.updatedAt, 10) || 0, now)
+        }
+        affectedRunIds.push(runId)
+    }
+
+    return {
+        changed: affectedRunIds.length > 0,
+        runs: affectedRunIds.length ? nextRuns : runs,
+        affectedRunIds
+    }
+}
+
 function getCoordinatorRunTargetHrefs(run = {}) {
     return getNormalizedProfileHrefList(run?.targetProfileHrefs || [])
 }
@@ -7689,6 +7725,7 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
 
 async function repairCoordinatorStorageFromProgressLocked() {
     const state = await loadCoordinatorState({
+        [COORDINATOR_PAUSED_KEY]: false,
         [SPACE_PENDING_NUKED_POSTS_KEY]: {},
         [SPACE_NUKED_POSTS_KEY]: {}
     })
@@ -7984,6 +8021,22 @@ async function repairCoordinatorStorageFromProgressLocked() {
         changed = true
         repaired += applied.repaired || 0
         for(const runId of applied.affectedRunIds || []) {
+            if(runId) affectedRunIds.add(runId)
+        }
+    }
+
+    const runsPauseMaterialized = materializeCoordinatorRunsPausedStateFromControl(
+        queue,
+        runs,
+        state.stored?.[COORDINATOR_PAUSED_KEY] === true,
+        now
+    )
+    if(runsPauseMaterialized.changed) {
+        runs = runsPauseMaterialized.runs || runs
+        state.runs = runs
+        runsMetadataChanged = true
+        repaired += runsPauseMaterialized.affectedRunIds.length
+        for(const runId of runsPauseMaterialized.affectedRunIds || []) {
             if(runId) affectedRunIds.add(runId)
         }
     }
