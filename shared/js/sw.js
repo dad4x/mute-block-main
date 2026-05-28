@@ -8007,10 +8007,13 @@ async function repairCoordinatorStorageFromProgressLocked() {
         let mappedForAuthoritativeItem = null
         if(queueAuthoritative && !reconciledMissingActive) {
             mappedForAuthoritativeItem = getCoordinatorStatusFromProgress(record)
-            if(isTerminalCoordinatorStatus(mappedForAuthoritativeItem.status)) {
-                // Authoritative active rows still need to accept terminal repair records.
-            }
-            else {
+            const mappedTerminal = isTerminalCoordinatorStatus(mappedForAuthoritativeItem.status)
+            const persistedTabId = mappedTerminal ? getPersistedQueuedTabId(item, record) : null
+            const hasLiveAuthoritativeTab = persistedTabId
+                ? !!await getPersistedLiveTabForCoordinatorItem(item, record, itemKey)
+                : false
+
+            if(!mappedTerminal || hasLiveAuthoritativeTab) {
                 if(shouldRestoreTerminalProgressFromCoordinatorItem(item, record)) {
                     const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
                         href,

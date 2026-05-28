@@ -1382,6 +1382,27 @@ pressure remains a separate performance/reliability follow-up.
   no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: narrowed broad repair's remaining progress-derived terminal
+  authority for service-worker-owned rows. `repairCoordinatorStorageFromProgressLocked()`
+  now checks the durable tab actor before accepting terminal legacy progress
+  for an authoritative queue row: live authoritative tabs keep queue authority,
+  while missing-actor cleanup can still consume matching terminal progress to
+  clear stranded work. Added P1 contract coverage for the live-tab guard and a
+  synthetic regression proving terminal error progress does not override an
+  active service-worker row that still has its live tab. Validation before
+  packaging: `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`,
+  `node -c test/swSynthetic.test.js`, `SW_SCENARIO_FUZZ_SEED=0xc0de timeout
+  120 node test/swScenarioFuzz.test.js`, `timeout 120 node
+  test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.602`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.602.zip` and `firefox/mute_block-1.6.602.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.602`,
+  enabled, with zero manifest/runtime errors. Queue accounting audit was
+  consistent: 413 total terminal rows, 383 succeeded, 24 skipped, 6 canceled,
+  no active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
