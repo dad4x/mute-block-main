@@ -3086,11 +3086,12 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253600)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
     await waitFor(
-        () => storage.mbProfileNukeProgress[href]?.status === 'blocking',
-        'direct progress compatibility save did not materialize progress',
+        () => getProgressShardRecord(storage, href)?.status === 'blocking',
+        'direct progress compatibility save did not materialize progress projection',
         {attempts: 20}
     )
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
 
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -3185,7 +3186,9 @@ test('direct nonterminal job progress derived save failure does not poison WAL a
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbProfileNukeProgress && !payload?.mbCoordinatorQueueWal) {
+        if((payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) &&
+            !payload?.mbCoordinatorQueueWal) {
             throw new Error('synthetic direct progress derived save failure')
         }
         return originalSet(payload)
@@ -4646,16 +4649,16 @@ test('concurrent terminal compatibility saves do not regress newer terminal prog
     assert.equal(storage.mbCoordinatorQueueWal.meta.nextSeq, 3)
 
     await waitFor(
-        () => storage.mbProfileNukeProgress[hrefA]?.status === 'blocked' &&
-            storage.mbProfileNukeProgress[hrefB]?.status === 'blocked',
-        'concurrent terminal compatibility saves regressed one progress record',
+        () => getProgressShardRecord(storage, hrefA)?.status === 'blocked' &&
+            getProgressShardRecord(storage, hrefB)?.status === 'blocked',
+        'concurrent terminal compatibility saves regressed one progress projection record',
         {attempts: 40}
     )
 
-    assert.equal(storage.mbProfileNukeProgress[hrefA].status, 'blocked')
-    assert.equal(storage.mbProfileNukeProgress[hrefB].status, 'blocked')
-    assert.equal(storage.mbProfileNukeProgress[hrefA].attemptId, attemptIdA)
-    assert.equal(storage.mbProfileNukeProgress[hrefB].attemptId, attemptIdB)
+    assert.equal(getProgressShardRecord(storage, hrefA).status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, hrefB).status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, hrefA).attemptId, attemptIdA)
+    assert.equal(getProgressShardRecord(storage, hrefB).attemptId, attemptIdB)
 })
 
 test('terminal progress compatibility save recomputes runs from WAL authority over stale raw queue', async () => {
@@ -4751,7 +4754,8 @@ test('terminal job progress reports durable terminal queue despite compatibility
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbProfileNukeProgress) {
+        if(payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
             throw new Error('synthetic compatibility save failure')
         }
         return originalSet(payload)
@@ -4825,7 +4829,8 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
     const stalledSet = deferred()
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbProfileNukeProgress) {
+        if(payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
             return stalledSet.promise
         }
         return originalSet(payload)
