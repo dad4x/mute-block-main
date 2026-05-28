@@ -4762,10 +4762,6 @@ async function loadCoordinatorState(defaults = {}) {
     })
 }
 
-async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
-    return loadCoordinatorState(defaults)
-}
-
 function cloneCoordinatorAuthorityValue(value) {
     if(value === undefined) return undefined
     return JSON.parse(JSON.stringify(value))
@@ -6553,6 +6549,36 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     })
 }
 
+async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorCurrentAuthorityState', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            ...defaults
+        }, {
+            metricPath: 'currentAuthority.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            progress
+        }
+    })
+}
+
 async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsEventsProjection', async () => {
         const stored = await metricStorageGet({
@@ -6610,6 +6636,43 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
             runs,
             events,
             progress
+        }
+    })
+}
+
+async function loadCoordinatorRepairProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorRepairProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [COORDINATOR_EVENTS_KEY]: [],
+            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            [COORDINATOR_PAUSED_KEY]: false,
+            [SPACE_PENDING_NUKED_POSTS_KEY]: {},
+            [SPACE_NUKED_POSTS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'repair.projection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            events,
+            progress,
+            pendingPosts: stored[SPACE_PENDING_NUKED_POSTS_KEY] || {},
+            nukedPosts: stored[SPACE_NUKED_POSTS_KEY] || {}
         }
     })
 }
@@ -7878,18 +7941,16 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
 }
 
 async function repairCoordinatorStorageFromProgressLocked() {
-    const state = await loadCoordinatorState({
-        [COORDINATOR_PAUSED_KEY]: false,
-        [SPACE_PENDING_NUKED_POSTS_KEY]: {},
-        [SPACE_NUKED_POSTS_KEY]: {}
+    const state = await loadCoordinatorRepairProjection({
+        metricPath: 'repair.load'
     })
     const queue = state.queue
     let runs = state.runs
     const originalRuns = cloneCoordinatorAuthorityValue(runs)
     const events = state.events
     const progress = state.progress
-    let pendingPosts = state.stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-    let nukedPosts = state.stored?.[SPACE_NUKED_POSTS_KEY] || {}
+    let pendingPosts = state.pendingPosts || {}
+    let nukedPosts = state.nukedPosts || {}
     state.pendingPosts = pendingPosts
     state.nukedPosts = nukedPosts
     const now = Date.now()

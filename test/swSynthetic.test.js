@@ -11880,6 +11880,12 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
     assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
     browser.storage.local.set = originalSet
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const repair = await sw.repairCoordinatorStorageFromProgress()
 
@@ -11897,6 +11903,17 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
         event.type === 'repair' &&
         event.details?.reason === 'enqueue-derived-repair'
     ), true)
+    const repairLoadDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbCoordinatorEvents',
+        'mbProfileNukeProgress',
+        'mbCoordinatorPaused',
+        'mbSpacePendingNukedPosts',
+        'mbSpaceNukedPosts'
+    ])
+    assert.ok(repairLoadDefaults)
 })
 
 test('enqueue resetExisting derived save failure repair replaces stale progress attempt', async () => {
