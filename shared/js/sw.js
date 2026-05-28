@@ -203,9 +203,6 @@ let activeSpaceFeedStorageUpdateToken = 0
 const abandonedSpaceFeedStorageUpdates = new Set()
 let pendingCoordinatorDiagnosticEvents = []
 let coordinatorDiagnosticBatchDepth = 0
-let coordinatorProgressSyncPromise = Promise.resolve()
-let coordinatorProgressSyncActive = false
-let coordinatorProgressSyncPendingRecords = {}
 let coordinatorJobMilestoneFlushTimeout = null
 let coordinatorJobMilestoneFlushPromise = null
 let coordinatorJobMilestonePendingRecords = {}
@@ -6802,161 +6799,6 @@ async function saveCoordinatorState(state = {}, changes = {}) {
     })
 }
 
-async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
-    const hrefs = Object.keys(progressRecords || {}).map(href => normalizeQuoraProfileUrl(href)).filter(Boolean)
-    if(!hrefs.length) return false
-
-    const state = await loadCoordinatorQueueProgressProjection({
-        metricPath: 'compatibilityProgressSync.load'
-    })
-    const queue = state.queue
-    const progress = {
-        ...state.progress
-    }
-    let progressChanged = false
-    let progressChangedRows = 0
-
-    for(const href of hrefs) {
-        const item = queue[href]
-        const record = progressRecords[href] || profileNukeProgress[href] || null
-        if(!item || !record) continue
-        if(!shouldApplyProgressToCoordinatorItem(item, record)) continue
-        if(hasMismatchedCoordinatorAttempt(item, record)) {
-            await recordStaleAttemptDiagnostic({
-                profileHref: href,
-                incomingAttemptId: getAttemptIdFromValue(record),
-                expectedAttemptId: getAttemptIdFromValue(item),
-                senderTabId: record.tabId || null,
-                message: 'Ignored progress from stale coordinator attempt'
-            })
-            continue
-        }
-
-        if(!shouldRestoreTerminalProgressFromCoordinatorItem(item, record)) continue
-
-        const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
-            href,
-            item,
-            record,
-            'Restored terminal profile progress from authoritative queue row',
-            {replaceProgressRecord: true}
-        )
-        if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
-            progress[href] = restoredRecord
-            profileNukeProgress = {
-                ...profileNukeProgress,
-                [href]: restoredRecord
-            }
-            progressChanged = true
-            progressChangedRows += 1
-        }
-    }
-
-    if(progressChanged) {
-        let derivedSaved = true
-        try {
-            derivedSaved = await saveCoordinatorState({
-                progress
-            }, {
-                queue: false,
-                progress: true,
-                progressChangedRows,
-                reason: 'compatibilityFlush',
-                queueOperation: 'compatibility-progress-sync',
-                queueChangedRows: 0
-            })
-        }
-        catch(error) {
-            derivedSaved = false
-            recordCoordinatorDiagnosticEvent(
-                'compatibility-progress-sync-derived-save-failed',
-                error?.message || 'Compatibility progress sync derived save failed'
-            )
-        }
-        if(derivedSaved === false) {
-            incrementQueueWakeupMetric('compatibilityProgressSync.derivedSaveFailed')
-            scheduleStoredWorkRepair(1000, {
-                reason: 'compatibility-progress-sync-derived-save-failed',
-                edgeTriggered: true
-            })
-        }
-    }
-
-    return progressChanged
-}
-
-function syncCoordinatorProgressRecords(progressRecords = {}) {
-    return enqueueSpaceFeedStorageUpdate(() => syncCoordinatorProgressRecordsLocked(progressRecords))
-}
-
-function mergePendingCoordinatorProgressSyncRecords(progressRecords = {}) {
-    for(const [key, record] of Object.entries(progressRecords || {})) {
-        if(!record || typeof record !== 'object') continue
-
-        const href = normalizeQuoraProfileUrl(record.profileHref || key || '')
-        if(!href) continue
-
-        coordinatorProgressSyncPendingRecords[href] = {
-            ...record,
-            profileHref: href
-        }
-    }
-
-    recordQueueWakeupMetricMax('progress.pendingMax', Object.keys(coordinatorProgressSyncPendingRecords).length)
-    return Object.keys(coordinatorProgressSyncPendingRecords).length > 0
-}
-
-async function drainCoordinatorProgressSync() {
-    coordinatorProgressSyncActive = true
-    let changed = false
-
-    try {
-        while(Object.keys(coordinatorProgressSyncPendingRecords).length) {
-            const records = coordinatorProgressSyncPendingRecords
-            coordinatorProgressSyncPendingRecords = {}
-            changed = await syncCoordinatorProgressRecords(records) || changed
-        }
-
-        return changed
-    }
-    finally {
-        coordinatorProgressSyncActive = false
-        if(Object.keys(coordinatorProgressSyncPendingRecords).length) {
-            coordinatorProgressSyncPromise = drainCoordinatorProgressSync().catch(() => false)
-        }
-    }
-}
-
-function enqueueCoordinatorProgressSync(progressRecords = {}) {
-    if(!mergePendingCoordinatorProgressSyncRecords(progressRecords)) {
-        return coordinatorProgressSyncPromise
-    }
-
-    if(!coordinatorProgressSyncActive) {
-        coordinatorProgressSyncPromise = drainCoordinatorProgressSync().catch(() => false)
-    }
-
-    return coordinatorProgressSyncPromise
-}
-
-async function enqueueStoredCoordinatorQueueProgressSync(progressRecords = {}) {
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
-        metricPath: 'progressSync.storedQueue.load'
-    })
-    const queue = currentAuthorityState.queue
-    const records = {}
-
-    for(const [itemKey, item] of Object.entries(queue)) {
-        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        if(!href || !progressRecords[href]) continue
-
-        records[href] = progressRecords[href]
-    }
-
-    if(!Object.keys(records).length) return false
-    return enqueueCoordinatorProgressSync(records)
-}
-
 function getChangedProfileProgressRecords(oldRecords = {}, newRecords = {}) {
     const changedRecords = {}
 
@@ -11580,7 +11422,7 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
         senderWindowId: sender.tab?.windowId || null
     }
 
-    await coordinatorProgressSyncPromise.catch(() => false)
+    await Promise.resolve()
     coordinatorEnqueuePromise = coordinatorEnqueuePromise
         .catch(() => {})
         .then(() => enqueueCoordinatorItemsStorage(storageRequest))
@@ -12902,7 +12744,6 @@ async function confirmSpaceFeedProfilesBlocked(profileHrefs = []) {
         const result = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
 
         if(!result.changedPending && !result.changedNuked) {
-            await syncCoordinatorProgressForHrefsLocked(confirmedHrefs)
             return {confirmed: false, pendingPosts: result.nextPending, nukedPosts: result.nextNuked}
         }
 
@@ -12923,45 +12764,15 @@ async function confirmSpaceFeedProfilesBlocked(profileHrefs = []) {
         await metricStorageSet(payload, {
             snapshotWriteReason: 'userMemoryNonAuthority'
         })
-        await syncCoordinatorProgressForHrefsLocked(confirmedHrefs)
         return {confirmed: true, pendingPosts: result.nextPending, nukedPosts: prunedNuked}
     })
 }
 
-async function syncCoordinatorProgressForHrefs(profileHrefs = []) {
-    return enqueueSpaceFeedStorageUpdate(() => syncCoordinatorProgressForHrefsLocked(profileHrefs))
-}
-
-async function syncCoordinatorProgressForHrefsLocked(profileHrefs = []) {
-    const hrefs = getNormalizedProfileHrefList(Array.from(profileHrefs || []))
-    if(!hrefs.length) return false
-
-    try {
-        const stored = await metricStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}})
-        const progress = normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
-        const records = {}
-
-        for(const href of hrefs) {
-            if(progress[href]) records[href] = progress[href]
-        }
-
-        if(!Object.keys(records).length) return false
-        return syncCoordinatorProgressRecordsLocked(records)
-    }
-    catch {
-        return false
-    }
-}
-
-async function syncSuccessfulCoordinatorProgress(profileHref = '', progressRecord = null) {
+async function syncSuccessfulCoordinatorProgress(profileHref = '') {
     const normalizedHref = normalizeQuoraProfileUrl(profileHref)
     if(!normalizedHref) return false
 
     try {
-        const record = progressRecord || profileNukeProgress?.[normalizedHref] || null
-        if(record) {
-            await enqueueCoordinatorProgressSync({[normalizedHref]: record})
-        }
         await confirmSpaceFeedProfilesBlocked([normalizedHref])
         return true
     }
@@ -17625,7 +17436,6 @@ async function releaseQueuedTab(tabId, options = {}) {
                 }))
             }
             if(progressRecord && isTerminalProfileNukeRecord(progressRecord) && !metadata?.closeRequestedAt) {
-                durableWrites.push(syncCoordinatorProgressRecords({[normalizedHref]: progressRecord}))
                 markQueuedTabClosing(tabId, 'terminal-slot-release')
                 void browser.tabs.remove(tabId).catch(() => {})
             }

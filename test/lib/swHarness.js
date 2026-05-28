@@ -438,7 +438,6 @@ module.exports.__test = {
     setCoordinatorRunsPaused,
     settleTerminalCoordinatorItems,
     startQueueWakeupMetricsBackedStartupWork,
-    syncCoordinatorProgressRecords,
     sweepStaleQueuedTabs,
     switchCoordinatorAuthorityQueueWalCheckpoint,
     terminalizeCoordinatorKeyOnlyItem,
