@@ -4589,7 +4589,7 @@ function shouldPersistCoordinatorRowEventQueueItemChange(item = {}, nextItem = {
     return durableFields.some(field => JSON.stringify(item?.[field] ?? null) !== JSON.stringify(nextItem?.[field] ?? null))
 }
 
-function makeTerminalProgressRecordFromCoordinatorItem(href = '', item = {}, previous = {}, reason = '') {
+function makeTerminalProgressRecordFromCoordinatorItem(href = '', item = {}, previous = {}, reason = '', options = {}) {
     const previousRecord = previous && typeof previous === 'object' ? previous : {}
     const normalizedHref = normalizeQuoraProfileUrl(href || item?.targetProfileHref || previousRecord.profileHref || '')
     if(!normalizedHref || !isTerminalCoordinatorStatus(item?.status)) return null
@@ -4604,7 +4604,8 @@ function makeTerminalProgressRecordFromCoordinatorItem(href = '', item = {}, pre
         tabId: getPersistedQueuedTabId(item, previousRecord) || null,
         terminalAt: Number.parseInt(item.terminalAt || previousRecord.terminalAt, 10) || Date.now(),
         finalError: item.error || previousRecord.finalError || '',
-        event: reason || 'Restored terminal profile progress from coordinator row'
+        event: reason || 'Restored terminal profile progress from coordinator row',
+        replaceProgressRecord: options.replaceProgressRecord === true
     }
 
     if(item.status === 'succeeded' && actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
@@ -4675,12 +4676,13 @@ function hasTerminalProgressDriftFromCoordinatorItem(item = null, record = null)
         (expectedError && recordError !== expectedError)
 }
 
-function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null) {
+function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null, options = {}) {
     if(!item || !isTerminalCoordinatorStatus(item?.status)) return false
     if(!record) return true
 
     const mapped = getCoordinatorStatusFromProgress(record)
-    if(shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)) return false
+    const preferSuccessfulProgress = options.preferSuccessfulProgress !== false
+    if(preferSuccessfulProgress && shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)) return false
     if(!isTerminalCoordinatorStatus(mapped.status)) return true
 
     return mapped.status !== item.status || hasTerminalProgressDriftFromCoordinatorItem(item, record)
@@ -6831,14 +6833,16 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
             continue
         }
 
-        const mapped = getCoordinatorStatusFromProgress(record)
-        if(!isTerminalCoordinatorStatus(item.status) || isTerminalCoordinatorStatus(mapped.status)) continue
+        if(!shouldRestoreTerminalProgressFromCoordinatorItem(item, record, {
+            preferSuccessfulProgress: false
+        })) continue
 
         const restoredRecord = makeTerminalProgressRecordFromCoordinatorItem(
             href,
             item,
             record,
-            'Restored terminal profile progress from authoritative queue row'
+            'Restored terminal profile progress from authoritative queue row',
+            {replaceProgressRecord: true}
         )
         if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
             progress[href] = restoredRecord
