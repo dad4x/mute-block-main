@@ -97,6 +97,14 @@ function getRecoveredCoordinatorQueue(storage = {}) {
     return storage?.mbCoordinatorQueue || {}
 }
 
+function hasStorageDefault(defaults = {}, key = '') {
+    return Object.prototype.hasOwnProperty.call(defaults || {}, key)
+}
+
+function findStorageGetDefaults(getDefaults = [], keys = []) {
+    return getDefaults.find(defaults => keys.every(key => hasStorageDefault(defaults, key))) || null
+}
+
 async function activateQuoraRuntime(browser, url = 'https://www.quora.com/profile/Synthetic-Activation') {
     await browser.tabs.onUpdated.emit(101, {
         status: 'loading',
@@ -1467,7 +1475,7 @@ test('progress shadow WAL append uses bounded incremental replay', async () => {
         {length: iterations},
         (_, index) => `https://www.quora.com/profile/Synthetic-Bounded-Shadow-Wal-${index}`
     )
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 120000,
         storage: {
             mbCoordinatorPaused: false,
@@ -1549,7 +1557,7 @@ test('progress shadow WAL diagnostic append failure does not change row-event ac
     const runId = 'run-progress-shadow-wal-append-failure'
     const attemptId = 'attempt-progress-shadow-wal-append-failure'
     const tabId = 508
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 130000,
         storage: {
             mbCoordinatorPaused: false,
@@ -2915,7 +2923,7 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     const runId = 'run-nonterminal-progress-wal'
     const attemptId = 'attempt-nonterminal-progress-wal'
     const tabId = 527
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 253500,
         storage: {
             mbCoordinatorPaused: false,
@@ -2929,6 +2937,12 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
             mbProfileNukeProgress: {}
         }
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const result = await sw.recordCoordinatorJobProgress(href, {
         status: 'blocking',
@@ -2961,6 +2975,16 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'direct-progress')
+    const directLoadDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbProfileNukeProgress'
+    ])
+    assert.ok(directLoadDefaults)
+    assert.equal(hasStorageDefault(directLoadDefaults, 'mbCoordinatorEvents'), false)
+    assert.equal(hasStorageDefault(directLoadDefaults, 'mbSpacePendingNukedPosts'), false)
+    assert.equal(hasStorageDefault(directLoadDefaults, 'mbSpaceNukedPosts'), false)
 
     const restarted = loadServiceWorkerHarness({
         now: 253700,
@@ -4922,6 +4946,12 @@ test('clear profile state removes queue row through WAL authority and saves deri
             }
         }
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const result = await browser.runtime.sendMessage({
         action: 'clear-profile-nuke-state',
@@ -4946,6 +4976,16 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
     assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
     assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
+    const clearLoadDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbProfileNukeProgress',
+        'mbSpacePendingNukedPosts',
+        'mbSpaceNukedPosts'
+    ])
+    assert.ok(clearLoadDefaults)
+    assert.equal(hasStorageDefault(clearLoadDefaults, 'mbCoordinatorEvents'), false)
 
     const records = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -7122,6 +7162,12 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
         attemptId,
         attemptNumber: 1
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const result = await browser.runtime.sendMessage({
         action: 'resolve-queued-profile-target',
@@ -7146,6 +7192,16 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, false)
     assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].allUrls, [resolvedHref])
     assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].remainingUrls, [resolvedHref])
+    const resolverLoadDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbSpacePendingNukedPosts'
+    ])
+    assert.ok(resolverLoadDefaults)
+    assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbCoordinatorEvents'), false)
+    assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbProfileNukeProgress'), false)
+    assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbSpaceNukedPosts'), false)
     const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
     assert.equal(metadata.profileHref, resolvedHref)
     assert.equal(metadata.coordinatorKey, resolvedHref)

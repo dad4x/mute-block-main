@@ -6614,6 +6614,67 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
     })
 }
 
+async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsPendingProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueRunsPendingProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            pendingPosts: stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+        }
+    })
+}
+
+async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressPendingNukedProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            [SPACE_PENDING_NUKED_POSTS_KEY]: {},
+            [SPACE_NUKED_POSTS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            progress,
+            pendingPosts: stored[SPACE_PENDING_NUKED_POSTS_KEY] || {},
+            nukedPosts: stored[SPACE_NUKED_POSTS_KEY] || {}
+        }
+    })
+}
+
 async function saveCoordinatorQueueProjection(queue = {}, options = {}) {
     const queueChanged = !!options.queueChanged
     const reason = normalizeSnapshotWriteReason(options.reason || 'ordinaryMutation')
@@ -12768,9 +12829,8 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
     }
 
     return enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorState({
-            [SPACE_PENDING_NUKED_POSTS_KEY]: {},
-            [SPACE_NUKED_POSTS_KEY]: {}
+        const state = await loadCoordinatorQueueRunsProgressPendingNukedProjection({
+            metricPath: 'clearProfile.load'
         })
         const progress = normalizeStoredProfileNukeProgress(state.progress || {})
         const queue = normalizeCoordinatorMap(state.queue || {})
@@ -18262,8 +18322,8 @@ async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
     const oldKey = `${operation.oldKey || request.coordinatorKey || ''}`.trim()
     const oldProfileHref = normalizeQuoraProfileUrl(operation.oldProfileHref || request.requestedProfileHref || '')
 
-    const state = await loadCoordinatorState({
-        [SPACE_PENDING_NUKED_POSTS_KEY]: {}
+    const state = await loadCoordinatorQueueRunsPendingProjection({
+        metricPath: 'resolver.resolve.load'
     })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
@@ -19377,8 +19437,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
     }
 
     const updateResult = await enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorState({
-            [COORDINATOR_EVENTS_KEY]: undefined
+        const state = await loadCoordinatorQueueRunsProgressProjection({
+            metricPath: options.expectTerminal === true ? 'terminalProgress.load' : 'directProgress.load'
         })
         let currentAuthorityState = state
         let queue = state.queue
