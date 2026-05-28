@@ -6735,7 +6735,7 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
     const requestedUrl = 'https://www.quora.com/q/example/post-key-only-authority'
     const runId = 'run-key-only-authority'
     const attemptId = 'attempt-key-only-authority'
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw} = loadServiceWorkerHarness({
         now: 426000,
         storage: {
             mbCoordinatorPaused: false,
@@ -6766,6 +6766,12 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
             mbCoordinatorEvents: []
         }
     })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
 
     const result = await sw.terminalizeCoordinatorKeyOnlyItem(key, {
         expectedAttemptId: attemptId,
@@ -6773,8 +6779,11 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
         reason: 'synthetic-key-only-authority',
         now: 426000
     })
+    browser.storage.local.get = originalGet
 
     assert.equal(result.changed, true)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), true)
     assert.equal(result.status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView.counts.failed, 1)

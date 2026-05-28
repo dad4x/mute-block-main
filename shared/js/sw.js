@@ -6553,6 +6553,67 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     })
 }
 
+async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsEventsProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [COORDINATOR_EVENTS_KEY]: []
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueRunsEventsProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            events
+        }
+    })
+}
+
+async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsEventsProgressProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [COORDINATOR_EVENTS_KEY]: [],
+            [PROFILE_NUKE_PROGRESS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            events,
+            progress
+        }
+    })
+}
+
 async function saveCoordinatorQueueProjection(queue = {}, options = {}) {
     const queueChanged = !!options.queueChanged
     const reason = normalizeSnapshotWriteReason(options.reason || 'ordinaryMutation')
@@ -6664,9 +6725,8 @@ async function syncCoordinatorProgressRecordsLocked(progressRecords = {}) {
     const hrefs = Object.keys(progressRecords || {}).map(href => normalizeQuoraProfileUrl(href)).filter(Boolean)
     if(!hrefs.length) return false
 
-    const state = await loadCoordinatorState({
-        [COORDINATOR_EVENTS_KEY]: undefined,
-        [PROFILE_NUKE_PROGRESS_KEY]: undefined
+    const state = await loadCoordinatorQueueRunsProgressProjection({
+        metricPath: 'compatibilityProgressSync.load'
     })
     const queue = state.queue
     const nextQueue = {
@@ -10937,7 +10997,9 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     const request = operation.request && typeof operation.request === 'object' ? operation.request : {}
     const retryLimit = Math.max(1, Number.parseInt(operation.retryLimit || request.retryLimit, 10) || 2)
     const maxItems = Math.max(1, Number.parseInt(operation.maxItems || request.maxItems, 10) || 1)
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'failedRetry.load'
+    })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
@@ -11241,7 +11303,9 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     ].map(value => `${value || ''}`.trim()).filter(Boolean))
     const hasRequestedTargets = requestedHrefs.size > 0 || requestedKeys.size > 0
 
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'failedRequeue.load'
+    })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
@@ -11588,8 +11652,8 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
 
     if(!rawItems.length) return {queued: 0, merged: 0, runId}
 
-    const state = await loadCoordinatorState({
-        [PROFILE_NUKE_PROGRESS_KEY]: undefined
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'enqueue.load'
     })
     const queue = state.queue
     const nextQueue = {...queue}
@@ -13370,7 +13434,9 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: [], stalePause: true}
     }
 
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'storedWork.pause.load'
+    })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const nextQueue = {
@@ -13626,7 +13692,9 @@ async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
     }
 
     const reason = `${operation.cancelReason || 'coordinator-pause-request'}`.trim()
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'currentWork.itemCancel.load'
+    })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const target = findCoordinatorStoredWorkCancelTarget(currentAuthorityState.queue, operation)
     if(!target.entry) {
@@ -13787,7 +13855,9 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const targetCoordinatorKey = `${operation.coordinatorKey || ''}`.trim()
     const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
     const hasTarget = !!(targetStorageKey || targetCoordinatorKey || targetHref)
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+        metricPath: 'storedWork.cancel.load'
+    })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const progress = {
@@ -14272,8 +14342,8 @@ async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {}) {
     const options = operation.terminalOptions || {}
     const expectedAttemptId = normalizeAttemptId(options.expectedAttemptId || operation.expectedAttemptId || '')
     const expectedAttemptNumber = Number.parseInt(options.expectedAttemptNumber || operation.expectedAttemptNumber, 10) || 0
-    const state = await loadCoordinatorState({
-        [PROFILE_NUKE_PROGRESS_KEY]: undefined
+    const state = await loadCoordinatorQueueRunsEventsProjection({
+        metricPath: 'repair.keyOnlyTerminalize.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
