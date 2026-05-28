@@ -3392,6 +3392,76 @@ test('compatibility progress single fails closed when authority projection canno
     browser.storage.local.set = originalSet
 })
 
+test('compatibility progress single rejects attempted row after coordinator authority is gone', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Single-Missing-Authority'
+    const attemptId = 'attempt-single-missing-authority'
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 253988,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress',
+        profileHref: href,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            terminalAt: 253992,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.staleAttempt, true)
+    assert.equal(result.reason, 'missing-current-authority')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
+test('compatibility progress batch rejects attempted row after coordinator authority is gone', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Batch-Missing-Authority'
+    const attemptId = 'attempt-batch-missing-authority'
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 253989,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-nuke-progress-batch',
+        updates: [{
+            profileHref: href,
+            patch: {
+                status: 'blocked',
+                blockSucceeded: true,
+                terminalAt: 253993,
+                actionKind: 'mute-block',
+                attemptId,
+                attemptNumber: 1
+            }
+        }]
+    })
+
+    assert.equal(result.recorded, false)
+    assert.equal(result.staleAttempt, true)
+    assert.equal(result.reason, 'missing-current-authority')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+})
+
 test('compatibility progress batch routes matching attempt row through WAL authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Batch-Matching-Attempt'
     const runId = 'run-batch-matching-attempt'
