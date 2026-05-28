@@ -171,8 +171,8 @@ const SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH = 'high'
 const SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM = 'medium'
 const SPACE_FEED_CANDIDATE_CONFIDENCE_LOW = 'low'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
-const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
+const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
+const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
 const PENDING_COORDINATOR_STATUSES = new Set(['queued', 'opening', 'active', 'acting', 'settling'])
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
@@ -263,17 +263,9 @@ async function init() {
     const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
     spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
     spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-    const storedProfileNukeProgress = (await safeStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}}))[PROFILE_NUKE_PROGRESS_KEY] || {}
-    profileNukeProgress = normalizeStoredProfileNukeProgress(storedProfileNukeProgress)
-    await refreshCoordinatorQueueFromStorage()
+    await refreshCoordinatorQueueFromRuntime({force: true})
     if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
         await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
-    }
-    if(JSON.stringify(profileNukeProgress) !== JSON.stringify(storedProfileNukeProgress || {})) {
-        const progressResult = await safeSendRuntimeMessage({action: 'normalize-profile-nuke-progress'}, null)
-        if(progressResult?.profileNukeProgress && typeof progressResult.profileNukeProgress === 'object') {
-            profileNukeProgress = normalizeStoredProfileNukeProgress(progressResult.profileNukeProgress)
-        }
     }
     setStorageChangeListenerEnabled(true)
     installNavigationHooks()
@@ -333,17 +325,12 @@ function announceQuoraRuntimeReady(pageType = '') {
     }
 }
 
-async function refreshCoordinatorQueueFromStorage() {
-    const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
-    coordinatorQueue = normalizeCoordinatorQueue(stored[COORDINATOR_QUEUE_KEY] || {})
-    coordinatorQueueLoaded = true
+async function refreshCoordinatorQueueFromRuntime(options = {}) {
+    await refreshContentPageCoordinatorStateFromRuntime({
+        ...options,
+        force: true
+    })
     return coordinatorQueue
-}
-
-async function refreshProfileNukeProgressFromStorage() {
-    const stored = await safeStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}})
-    profileNukeProgress = normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
-    return profileNukeProgress
 }
 
 function getCurrentPageStateProfileHrefs(options = {}) {
@@ -438,29 +425,28 @@ function onStorageChanged(changes, areaName) {
                 scheduleSpaceFeedProgressDrivenRefresh()
             }
         }
-        else if(key === PROFILE_NUKE_PROGRESS_KEY) {
-            profileNukeProgress = normalizeStoredProfileNukeProgress(change.newValue || {})
-            if(getPageType() === 'space') {
+        else if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key === COORDINATOR_QUEUE_VIEW_KEY) {
+            scheduleContentPageStateProjectionRefresh()
+        }
+    }
+}
+
+function scheduleContentPageStateProjectionRefresh() {
+    void refreshContentPageCoordinatorStateFromRuntime({force: true})
+        .then(() => {
+            const page = getPageType()
+            if(page === 'space') {
                 void reconcileStaleSpaceFeedProgress()
                 scheduleSpaceFeedProgressDrivenRefresh()
             }
-            else if(getPageType() === 'profile-search') {
+            else if(page === 'profile-search') {
                 scheduleProfileSearchControls(0)
             }
-        }
-        else if(key === COORDINATOR_QUEUE_KEY) {
-            coordinatorQueue = normalizeCoordinatorQueue(change.newValue || {})
-            if(getPageType() === 'space') {
-                scheduleSpaceFeedProgressDrivenRefresh()
-            }
-            else if(getPageType() === 'profile-search') {
-                scheduleProfileSearchControls(0)
-            }
-            else if(getPageType() === 'profile' && hasCurrentProfilePendingCoordinatorQueueItem()) {
+            else if(page === 'profile' && hasCurrentProfilePendingCoordinatorQueueItem()) {
                 nudgeCurrentProfilePendingClaim()
             }
-        }
-    }
+        })
+        .catch(() => null)
 }
 
 function isExtensionContextInvalidatedError(error) {
@@ -1206,9 +1192,9 @@ async function maybeRecordAlreadyBlockedCoordinatorProfile() {
     const href = normalizeQuoraProfileHref(location.href)
     if(!href) return
 
-    const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
-    coordinatorQueue = normalizeCoordinatorQueue(stored[COORDINATOR_QUEUE_KEY] || {})
-    coordinatorQueueLoaded = true
+    await refreshCoordinatorQueueFromRuntime({
+        profileHrefs: [href]
+    })
     const item = coordinatorQueue[href]
     if(!item || `${item.status || ''}` === 'succeeded') return
     if(`${item.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) return
@@ -1878,7 +1864,7 @@ function onMessage(request, sender, sendResponse) {
     if(request.action === 'claim-current-profile-tab-action') {
         return (async () => {
             if(!request.queuedAction) {
-                await refreshCoordinatorQueueFromStorage().catch(() => null)
+                await refreshCoordinatorQueueFromRuntime().catch(() => null)
             }
             const nextProfileAction = request.queuedAction && typeof request.queuedAction === 'object'
                 ? request.queuedAction
