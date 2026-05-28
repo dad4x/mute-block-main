@@ -954,6 +954,8 @@ test('profile-search content uses scoped runtime state instead of full storage c
     const pendingRefreshBody = extractFunction(content, 'function scheduleProfileSearchPendingRefresh(delayMs = PROFILE_SEARCH_PENDING_REFRESH_MS)')
     const syncBody = extractFunction(content, 'function syncProfileSearchControls()')
     const nukeBody = extractFunction(content, 'async function nukeProfileSearchHrefs(button, hrefs = [], options = {})')
+    const spaceSyncBody = extractFunction(content, 'function syncSpaceFeedNukeControls()')
+    const spaceScopedRefreshBody = extractFunction(content, 'function scheduleSpaceFeedScopedStateRefresh(entries = [])')
 
     assert.notEqual(searchBranchStart, -1)
     assert.notEqual(searchBranchEnd, -1)
@@ -973,6 +975,9 @@ test('profile-search content uses scoped runtime state instead of full storage c
     assert.match(pendingRefreshBody, /syncProfileSearchControls\(\)/)
     assert.match(syncBody, /pendingSearchCount > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
     assert.match(nukeBody, /queued > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
+    assert.match(spaceSyncBody, /const entries = getLatestSpaceFeedEntries\(\)[\s\S]*scheduleSpaceFeedScopedStateRefresh\(entries\)[\s\S]*buildSpaceFeedRenderModel/)
+    assert.match(spaceScopedRefreshBody, /refreshContentPageCoordinatorStateFromRuntime\(\{[\s\S]*force: true,[\s\S]*entries: scopedEntries/)
+    assert.match(spaceScopedRefreshBody, /syncSpaceFeedNukeControls\(\)/)
     assert.match(listenerBody, /source\.addListener\(onStorageChanged\)/)
     assert.match(listenerBody, /source\.removeListener\?\.\(onStorageChanged\)/)
     assert.match(navigationBody, /setStorageChangeListenerEnabled\(page !== 'profile-search'\)/)

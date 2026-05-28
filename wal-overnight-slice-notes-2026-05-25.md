@@ -1277,6 +1277,27 @@ pressure remains a separate performance/reliability follow-up.
   skipped, 6 canceled, no active/queued/failed work, active WAL tail 0, and no
   raw/recovered/view mismatches.
 
+- Follow-up fix for the content scoped-state slice: space feed discovery now
+  forces a scoped runtime-state refresh when newly scanned candidate URLs expand
+  the page scope, then re-renders after the service worker returns the scoped
+  queue/progress projection. This closes the stale space-page display gap where
+  newly discovered feed entries could render as queueable/untracked until an
+  unrelated projection change arrived. Added `test/contentSpaceScopedState.test.js`
+  for the discovered-candidate case and extended the P1 contract to require
+  `syncSpaceFeedNukeControls()` to schedule the scoped refresh before building
+  the render model. Validation: `node -c shared/js/content.js`, `node -c
+  test/contentSpaceScopedState.test.js`, `timeout 120 node
+  test/contentSpaceScopedState.test.js`, `timeout 120 node
+  test/p1-contract.test.js`, and `timeout 300 npm test` passed. Version bumped
+  to `1.6.597`; `npm run prod`, `npm run build:chrome`, and `npm run
+  build:firefox` produced `chrome/mute_block-1.6.597.zip` and
+  `firefox/mute_block-1.6.597.zip`. Live Windows rsync push succeeded. CDP
+  reload reported extension `1.6.597`, enabled, with zero manifest/runtime
+  errors after a serial recheck. Queue accounting audit was consistent: 413
+  total terminal rows, 383 succeeded, 24 skipped, 6 canceled, no
+  active/queued/failed work, active WAL tail 0, and no raw/recovered/view
+  mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.

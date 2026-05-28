@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.6.596",
+  "version": "1.6.597",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -9,7 +9,7 @@
     "build:firefox": "web-ext build --config=firefox-config.cjs",
     "chrome": "web-ext run --config=chrome-config.cjs",
     "firefox": "web-ext run --config=firefox-config.cjs",
-    "test": "node test/subject.test.js && node test/jobState.test.js && node test/walSnapshotStore.test.js && node test/walSnapshotStoreFuzz.test.js && node test/storageInvariants.test.js && node test/rawReportPages.test.js && node test/sharedModeration.test.js && node test/sharedModerationFuzz.test.js && node test/contentActionSelectors.test.js && node test/p1-contract.test.js && node test/swSynthetic.test.js && node test/swScenarioFuzz.test.js",
+    "test": "node test/subject.test.js && node test/jobState.test.js && node test/walSnapshotStore.test.js && node test/walSnapshotStoreFuzz.test.js && node test/storageInvariants.test.js && node test/rawReportPages.test.js && node test/sharedModeration.test.js && node test/sharedModerationFuzz.test.js && node test/contentActionSelectors.test.js && node test/contentSpaceScopedState.test.js && node test/p1-contract.test.js && node test/swSynthetic.test.js && node test/swScenarioFuzz.test.js",
     "test:wal-fuzz": "node test/walSnapshotStoreFuzz.test.js",
     "test:wal-fuzz:long": "WAL_FUZZ_PROFILE=long WAL_FUZZ_SEEDS=200 WAL_FUZZ_ROUNDS=300 WAL_FUZZ_ACTORS_MAX=8 node test/walSnapshotStoreFuzz.test.js",
     "test:sw-fuzz": "node test/swScenarioFuzz.test.js"
