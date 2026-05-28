@@ -2032,10 +2032,12 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
     const itemKey = `${operation.itemKey || ''}`.trim()
     if(!itemKey) return {changed: false, reason: 'missing-item-key'}
 
-    const state = await loadCoordinatorState()
+    const state = await loadCoordinatorQueueRunsProgressProjection({
+        metricPath: 'repair.nonProfileLanding.load'
+    })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
-    const runs = state.runs
+    const runs = currentAuthorityState.runs
     const progress = state.progress
     const current = queue[itemKey] || null
     if(!current || !isActiveCoordinatorStatus(current.status)) return {changed: false, reason: 'row-changed'}
@@ -2192,7 +2194,9 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         return {changed: false, reason: 'invalid-item'}
     }
 
-    let currentAuthorityState = await loadCoordinatorCurrentAuthorityState()
+    let currentAuthorityState = await loadCoordinatorQueueRunsProgressProjection({
+        metricPath: 'repair.activeWithoutActor.load'
+    })
     const queue = currentAuthorityState.queue
     const runs = currentAuthorityState.runs
     const progress = currentAuthorityState.progress
@@ -6516,6 +6520,35 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
             stored,
             queue,
             runs
+        }
+    })
+}
+
+async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressProjection', async () => {
+        const stored = await metricStorageGet({
+            [COORDINATOR_QUEUE_KEY]: {},
+            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            [COORDINATOR_RUNS_KEY]: {},
+            [PROFILE_NUKE_PROGRESS_KEY]: {}
+        }, {
+            metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
+        })
+        const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+            queueSnapshot,
+            stored[COORDINATOR_QUEUE_WAL_KEY]
+        ))
+        const queue = queueRecovery.queue
+        const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        recordActiveStorageWorkSnapshot(queue)
+
+        return {
+            stored,
+            queue,
+            runs,
+            progress
         }
     })
 }
