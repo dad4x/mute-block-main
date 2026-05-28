@@ -3379,6 +3379,7 @@ test('profile progress persistence is serialized with coordinator state', () => 
     assert.doesNotMatch(source, /browser\.storage\.local\.set\(\{\[PROFILE_NUKE_PROGRESS_KEY\]/)
     assert.doesNotMatch(initBody, /safeStorageSet\(\{\[PROFILE_NUKE_PROGRESS_KEY\]/)
     assert.doesNotMatch(initBody, /normalize-profile-nuke-progress/)
+    assert.doesNotMatch(source, /request\.action === 'normalize-profile-nuke-progress'/)
     assert.match(persistBody, /enqueueSpaceFeedStorageUpdate\(persistProfileNukeProgressLocked\)/)
     assert.match(lockedPersistBody, /saveCoordinatorState\(\{progress: profileNukeProgress\}, \{[\s\S]*progress: true,[\s\S]*reason: 'compatibilityFlush'[\s\S]*\}\)/)
     assert.match(recordBody, /enqueueSpaceFeedStorageUpdate\(\(\) => recordProfileNukeProgressLocked\(profileHref, patch\)\)/)

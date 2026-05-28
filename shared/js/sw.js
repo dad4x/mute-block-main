@@ -21208,9 +21208,6 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     else if(request.action === 'clear-profile-nuke-state') {
         return clearProfileNukeState(request.profileHref || request.href || '', request.reason || '')
     }
-    else if(request.action === 'normalize-profile-nuke-progress') {
-        return normalizeProfileNukeProgressStorage()
-    }
     else if(request.action === 'settle-terminal-coordinator-items') {
         return settleTerminalCoordinatorItems({
             profileHrefs: request.profileHrefs || request.urls || []
