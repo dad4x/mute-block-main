@@ -18024,137 +18024,6 @@ async function validateProgressAttempt(profileHref = '', patch = {}, sender = {}
     return true
 }
 
-async function recordProfileNukeProgressFromRequest(request = {}, sender = {}) {
-    const tabId = sender.tab?.id || null
-    const metadata = tabId ? getQueuedTabMetadata(tabId) : null
-    if(metadata?.attemptId || metadata?.profileHref || metadata?.coordinatorKey) {
-        const mapped = getCoordinatorStatusFromProgress({
-            ...(request.patch || {}),
-            actionKind: metadata?.actionKind || request.patch?.actionKind || ''
-        })
-        return recordJobProgressFromRequest(request, sender, {
-            compatibility: false,
-            expectTerminal: isTerminalCoordinatorStatus(mapped.status)
-        })
-    }
-
-    const profileHref = normalizeQuoraProfileUrl(request.profileHref || request.href || '')
-    if(profileHref) {
-        const patch = request.patch && typeof request.patch === 'object' ? request.patch : {}
-        let currentQueue = {}
-        try {
-            const currentAuthorityState = await loadCoordinatorQueueProjection({
-                metricPath: 'progress.validate.load'
-            })
-            currentQueue = currentAuthorityState?.queue || {}
-        }
-        catch(error) {
-            incrementQueueWakeupMetric('progress.authorityLoadFailed')
-            recordCoordinatorDiagnosticEvent(
-                'progress-authority-load-failed',
-                error?.message || 'Progress authority load failed'
-            )
-            return {
-                recorded: false,
-                durable: false,
-                compatibility: false,
-                authority: false,
-                reason: 'queue-authority-load-failed'
-            }
-        }
-
-        const entry = currentQueue[profileHref]
-            ? {key: profileHref, item: currentQueue[profileHref]}
-            : findCoordinatorQueueEntryForHref(currentQueue, profileHref)
-        const item = entry?.item || null
-        const attemptPatch = {
-            ...patch,
-            attemptId: patch.attemptId || request.attemptId || '',
-            attemptNumber: patch.attemptNumber || request.attemptNumber || 0
-        }
-        const itemMatchesProgress = item && shouldApplyProgressToCoordinatorItem(item, attemptPatch)
-        const currentAttemptId = getAttemptIdFromValue(item)
-        const currentAttemptNumber = getAttemptNumberFromValue(item)
-        const incomingAttemptId = getAttemptIdFromValue(attemptPatch)
-        const incomingAttemptNumber = getAttemptNumberFromValue(attemptPatch)
-
-        if(!item && (incomingAttemptId || incomingAttemptNumber)) {
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: '',
-                senderTabId: tabId,
-                message: 'Ignored progress for missing coordinator authority row'
-            })
-            return {recorded: false, staleAttempt: true, reason: 'missing-current-authority'}
-        }
-
-        if(itemMatchesProgress &&
-            ((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber))) {
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: currentAttemptId,
-                senderTabId: tabId,
-                message: 'Ignored progress without required attempt identity'
-            })
-            return {recorded: false, staleAttempt: true, reason: 'missing-attempt-identity'}
-        }
-
-        if(!await validateProgressAttempt(profileHref, attemptPatch, sender)) {
-            return {recorded: false, staleAttempt: true, reason: 'stale-attempt'}
-        }
-
-        if(itemMatchesProgress && hasMismatchedCoordinatorAttempt(item, attemptPatch)) {
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: currentAttemptId,
-                senderTabId: tabId,
-                message: 'Ignored progress from stale coordinator attempt'
-            })
-            return {recorded: false, staleAttempt: true, reason: 'stale-attempt'}
-        }
-
-        if(itemMatchesProgress && isCoordinatorQueueAuthoritativeItem(item)) {
-            const authorityPatch = {
-                ...patch,
-                actionKind: patch.actionKind || item.actionKind || '',
-                runId: patch.runId || item.runId || '',
-                attemptId: incomingAttemptId,
-                attemptNumber: incomingAttemptNumber,
-                ownerTabId: patch.ownerTabId || item.ownerTabId || null,
-                ownerWindowId: patch.ownerWindowId || item.ownerWindowId || null
-            }
-            const mapped = getCoordinatorStatusFromProgress(authorityPatch)
-            const authorityResult = await recordCoordinatorJobProgressRecords({
-                [profileHref]: authorityPatch
-            }, {
-                expectTerminal: isTerminalCoordinatorStatus(mapped.status),
-                senderTabId: tabId
-            })
-            if(authorityResult?.terminal) scheduleQueuedWorkContinuation('terminal-job-progress')
-
-            return {
-                recorded: authorityResult?.recorded === true,
-                terminal: authorityResult?.terminal === true,
-                compatibility: false,
-                authority: true,
-                results: authorityResult?.results || {}
-            }
-        }
-    }
-
-    incrementQueueWakeupMetric('progress.legacyFallbackRejected')
-    return {
-        recorded: false,
-        durable: false,
-        compatibility: false,
-        authority: false,
-        reason: profileHref ? 'legacy-progress-fallback-disabled' : 'invalid-profile-href'
-    }
-}
-
 function addResolvedProfileToPendingSpaceRecords(pendingPosts = {}, item = {}, resolvedHref = '') {
     const href = normalizeQuoraProfileUrl(resolvedHref)
     if(!href) return {pendingPosts, changed: false}
@@ -19772,190 +19641,27 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
         return {recorded: false, staleAttempt: true}
     }
 
-    if(options.compatibility !== true) {
-        if(options.expectTerminal !== true) {
-            return recordDeferredCoordinatorJobMilestone(targetProfileHref, patch, {
-                senderTabId: tabId
-            })
-        }
-
-        clearPendingCoordinatorJobMilestone(targetProfileHref)
-        const result = await recordCoordinatorJobProgress(targetProfileHref, patch, {
-            expectTerminal: options.expectTerminal === true,
+    if(options.expectTerminal !== true) {
+        return recordDeferredCoordinatorJobMilestone(targetProfileHref, patch, {
             senderTabId: tabId
         })
-        if(options.expectTerminal && !result.terminal) {
-            return {recorded: !!result.recorded, terminal: false, reason: 'non-terminal-progress'}
-        }
-        if(result.terminal) scheduleQueuedWorkContinuation('terminal-job-progress')
-
-        return {
-            recorded: !!result.recorded,
-            terminal: !!result.terminal,
-            compatibility: false,
-            record: result.record || null
-        }
     }
+
+    clearPendingCoordinatorJobMilestone(targetProfileHref)
+    const result = await recordCoordinatorJobProgress(targetProfileHref, patch, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    if(!result.terminal) {
+        return {recorded: !!result.recorded, terminal: false, reason: 'non-terminal-progress'}
+    }
+    scheduleQueuedWorkContinuation('terminal-job-progress')
 
     return {
-        recorded: false,
-        terminal: false,
+        recorded: !!result.recorded,
+        terminal: true,
         compatibility: false,
-        reason: 'legacy-progress-fallback-disabled'
-    }
-}
-
-async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = {}) {
-    const rawUpdates = Array.isArray(request.updates) ? request.updates : []
-    const coordinatorTerminalRecords = {}
-    const coordinatorDirectRecords = {}
-    const tabId = sender.tab?.id || null
-    let staleAttempt = false
-    let missingAttemptIdentity = false
-    let missingCurrentAuthority = false
-    let legacyCompatibilityRejected = false
-    let currentQueue = {}
-
-    if(rawUpdates.length) {
-        try {
-            const currentAuthorityState = await loadCoordinatorQueueProjection({
-                metricPath: 'progressBatch.validate.load'
-            })
-            currentQueue = currentAuthorityState?.queue || {}
-        }
-        catch(error) {
-            incrementQueueWakeupMetric('progressBatch.authorityLoadFailed')
-            recordCoordinatorDiagnosticEvent(
-                'progress-batch-authority-load-failed',
-                error?.message || 'Progress batch authority load failed'
-            )
-            return {
-                recorded: false,
-                durable: false,
-                compatibility: false,
-                authority: false,
-                reason: 'queue-authority-load-failed'
-            }
-        }
-    }
-
-    for(const update of rawUpdates) {
-        const profileHref = normalizeQuoraProfileUrl(update?.profileHref || update?.href || '')
-        if(!profileHref) continue
-
-        const patch = update?.patch && typeof update.patch === 'object' ? update.patch : {}
-        const item = currentQueue[profileHref] || null
-        const itemMatchesProgress = item && shouldApplyProgressToCoordinatorItem(item, patch)
-        const currentAttemptId = getAttemptIdFromValue(item)
-        const currentAttemptNumber = getAttemptNumberFromValue(item)
-        const incomingAttemptId = getAttemptIdFromValue(patch)
-        const incomingAttemptNumber = getAttemptNumberFromValue(patch)
-
-        if(!item && (incomingAttemptId || incomingAttemptNumber)) {
-            staleAttempt = true
-            missingCurrentAuthority = true
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: '',
-                senderTabId: tabId,
-                message: 'Ignored batch progress for missing coordinator authority row'
-            })
-            continue
-        }
-
-        if(itemMatchesProgress &&
-            ((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber))) {
-            staleAttempt = true
-            missingAttemptIdentity = true
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: currentAttemptId,
-                senderTabId: tabId,
-                message: 'Ignored batch progress without required attempt identity'
-            })
-            continue
-        }
-
-        if(!await validateProgressAttempt(profileHref, patch, sender)) {
-            staleAttempt = true
-            continue
-        }
-
-        if(itemMatchesProgress && hasMismatchedCoordinatorAttempt(item, patch)) {
-            staleAttempt = true
-            await recordStaleAttemptDiagnostic({
-                profileHref,
-                incomingAttemptId,
-                expectedAttemptId: currentAttemptId,
-                senderTabId: tabId,
-                message: 'Ignored batch progress from stale coordinator attempt'
-            })
-            continue
-        }
-
-        if(itemMatchesProgress && isCoordinatorQueueAuthoritativeItem(item)) {
-            const mapped = getCoordinatorStatusFromProgress(patch)
-            if(isTerminalCoordinatorStatus(mapped.status)) {
-                coordinatorTerminalRecords[profileHref] = patch
-            }
-            else {
-                coordinatorDirectRecords[profileHref] = patch
-            }
-            continue
-        }
-
-        legacyCompatibilityRejected = true
-        incrementQueueWakeupMetric('progressBatch.legacyFallbackRejected')
-    }
-
-    if(!Object.keys(coordinatorTerminalRecords).length &&
-        !Object.keys(coordinatorDirectRecords).length) {
-        return {
-            recorded: false,
-            compatibility: false,
-            authority: false,
-            staleAttempt,
-            reason: missingAttemptIdentity
-                ? 'missing-attempt-identity'
-                : missingCurrentAuthority ? 'missing-current-authority'
-                    : staleAttempt ? 'stale-attempt'
-                        : legacyCompatibilityRejected ? 'legacy-progress-fallback-disabled' : 'no-updates'
-        }
-    }
-
-    const authorityResults = {}
-    let authorityRecorded = false
-    let terminal = false
-    if(Object.keys(coordinatorTerminalRecords).length) {
-        const terminalResult = await recordCoordinatorJobProgressRecords(coordinatorTerminalRecords, {
-            expectTerminal: true,
-            senderTabId: tabId
-        })
-        authorityRecorded = terminalResult?.recorded === true || authorityRecorded
-        terminal = terminalResult?.terminal === true || terminal
-        Object.assign(authorityResults, terminalResult?.results || {})
-        if(terminalResult?.terminal) scheduleQueuedWorkContinuation('terminal-job-progress-batch')
-    }
-    if(Object.keys(coordinatorDirectRecords).length) {
-        const directResult = await recordCoordinatorJobProgressRecords(coordinatorDirectRecords, {
-            senderTabId: tabId
-        })
-        authorityRecorded = directResult?.recorded === true || authorityRecorded
-        terminal = directResult?.terminal === true || terminal
-        Object.assign(authorityResults, directResult?.results || {})
-        if(directResult?.terminal) scheduleQueuedWorkContinuation('terminal-job-progress-batch')
-    }
-
-    return {
-        recorded: authorityRecorded,
-        terminal,
-        compatibility: false,
-        legacyCompatibilityRejected,
-        authority: Object.keys(authorityResults).length > 0,
-        staleAttempt: staleAttempt && !authorityRecorded,
-        results: authorityResults
+        record: result.record || null
     }
 }
 
@@ -21178,7 +20884,14 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return Promise.resolve({closed: false})
     }
     else if(request.action === 'record-nuke-progress') {
-        return recordProfileNukeProgressFromRequest(request, sender)
+        incrementQueueWakeupMetric('progress.legacyMessageDisabled')
+        return Promise.resolve({
+            recorded: false,
+            durable: false,
+            compatibility: false,
+            authority: false,
+            reason: 'legacy-progress-message-disabled'
+        })
     }
     else if(request.action === 'record-job-milestone') {
         return recordJobProgressFromRequest(request, sender, {
@@ -21191,7 +20904,14 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         })
     }
     else if(request.action === 'record-nuke-progress-batch') {
-        return recordProfileNukeProgressBatchFromRequest(request, sender)
+        incrementQueueWakeupMetric('progressBatch.legacyMessageDisabled')
+        return Promise.resolve({
+            recorded: false,
+            durable: false,
+            compatibility: false,
+            authority: false,
+            reason: 'legacy-progress-message-disabled'
+        })
     }
     else if(request.action === 'clear-profile-nuke-state') {
         return clearProfileNukeState(request.profileHref || request.href || '', request.reason || '')
