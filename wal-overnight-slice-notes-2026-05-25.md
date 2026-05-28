@@ -1298,6 +1298,28 @@ pressure remains a separate performance/reliability follow-up.
   active/queued/failed work, active WAL tail 0, and no raw/recovered/view
   mismatches.
 
+- Next slice: narrowed `record-nuke-progress-batch` compatibility handling.
+  The service-worker batch handler now reads current queue authority through a
+  WAL-recovered projection, rejects batch updates for current coordinator rows
+  when the row has attempt identity but the incoming patch does not, and routes
+  matching-attempt current rows through `recordCoordinatorJobProgressRecords()`
+  so terminal/direct progress uses queue WAL. Only non-current legacy updates
+  fall back to `recordProfileNukeProgressBatch()`. This prevents stale
+  space-page reconciliation batches from overwriting the legacy progress mirror
+  for active current work. Added synthetic coverage for missing-attempt
+  rejection with no progress overwrite/WAL append, and matching-attempt batch
+  terminalization through WAL authority. Validation before packaging: `node -c
+  shared/js/sw.js`, `node -c test/swSynthetic.test.js`, `timeout 120 node
+  test/p1-contract.test.js`, `timeout 240 node test/swSynthetic.test.js`, and
+  `timeout 300 npm test` passed. Version bumped to `1.6.598`; `npm run prod`,
+  `npm run build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.598.zip` and `firefox/mute_block-1.6.598.zip`. Live
+  Windows rsync push succeeded. CDP reload reported extension `1.6.598`,
+  enabled, with zero manifest/runtime errors after a serial recheck. Queue
+  accounting audit was consistent: 413 total terminal rows, 383 succeeded, 24
+  skipped, 6 canceled, no active/queued/failed work, active WAL tail 0, and no
+  raw/recovered/view mismatches.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
