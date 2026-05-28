@@ -19858,8 +19858,19 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
             })
             currentQueue = currentAuthorityState?.queue || {}
         }
-        catch {
-            currentQueue = {}
+        catch(error) {
+            incrementQueueWakeupMetric('progressBatch.authorityLoadFailed')
+            recordCoordinatorDiagnosticEvent(
+                'progress-batch-authority-load-failed',
+                error?.message || 'Progress batch authority load failed'
+            )
+            return {
+                recorded: false,
+                durable: false,
+                compatibility: false,
+                authority: false,
+                reason: 'queue-authority-load-failed'
+            }
         }
     }
 
