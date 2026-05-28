@@ -1127,6 +1127,25 @@ pressure remains a separate performance/reliability follow-up.
   tunnel and the `127.0.0.1:9223` CDP endpoint both still refused
   connections.
 
+- Next slice: added explicit WAL-recovered queue/runs/events and
+  queue/runs/events/progress projection loaders. Moved compatibility progress
+  sync to the existing queue/runs/progress projection so it no longer reads
+  events, moved key-only terminalization to queue/runs/events without progress,
+  and moved enqueue, failed retry/requeue, bulk pause/cancel, and targeted
+  current-work cancel to queue/runs/events/progress instead of broad
+  `loadCoordinatorState()`. Queue authority remains WAL-backed; runs/events/
+  progress remain derived compatibility saves. Contract tests pin the helper
+  boundaries and migrated call sites; synthetic coverage now verifies key-only
+  terminalization does not request `mbProfileNukeProgress`. Validation:
+  `node -c shared/js/sw.js`, `node -c test/p1-contract.test.js`, `node -c
+  test/swSynthetic.test.js`, `timeout 120 node test/p1-contract.test.js`,
+  `timeout 240 node test/swSynthetic.test.js`, and `timeout 300 npm test`
+  passed. Version bumped to `1.6.590`; `npm run prod`, `npm run
+  build:chrome`, and `npm run build:firefox` produced
+  `chrome/mute_block-1.6.590.zip` and `firefox/mute_block-1.6.590.zip`.
+  Live Windows push/reload is pending because the `127.0.0.1:10022` rsync
+  tunnel and `127.0.0.1:9223` CDP endpoint both refused connections.
+
 ## Deferred follow-up: physical WAL segmentation
 
 - Do not derail the current correctness/migration slices for this.
