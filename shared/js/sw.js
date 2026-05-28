@@ -18112,6 +18112,17 @@ async function recordProfileNukeProgressFromRequest(request = {}, sender = {}) {
         const incomingAttemptId = getAttemptIdFromValue(attemptPatch)
         const incomingAttemptNumber = getAttemptNumberFromValue(attemptPatch)
 
+        if(!item && (incomingAttemptId || incomingAttemptNumber)) {
+            await recordStaleAttemptDiagnostic({
+                profileHref,
+                incomingAttemptId,
+                expectedAttemptId: '',
+                senderTabId: tabId,
+                message: 'Ignored progress for missing coordinator authority row'
+            })
+            return {recorded: false, staleAttempt: true, reason: 'missing-current-authority'}
+        }
+
         if(itemMatchesProgress &&
             ((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber))) {
             await recordStaleAttemptDiagnostic({
@@ -19839,6 +19850,7 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
     const tabId = sender.tab?.id || null
     let staleAttempt = false
     let missingAttemptIdentity = false
+    let missingCurrentAuthority = false
     let currentQueue = {}
 
     if(rawUpdates.length) {
@@ -19875,6 +19887,19 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
         const currentAttemptNumber = getAttemptNumberFromValue(item)
         const incomingAttemptId = getAttemptIdFromValue(patch)
         const incomingAttemptNumber = getAttemptNumberFromValue(patch)
+
+        if(!item && (incomingAttemptId || incomingAttemptNumber)) {
+            staleAttempt = true
+            missingCurrentAuthority = true
+            await recordStaleAttemptDiagnostic({
+                profileHref,
+                incomingAttemptId,
+                expectedAttemptId: '',
+                senderTabId: tabId,
+                message: 'Ignored batch progress for missing coordinator authority row'
+            })
+            continue
+        }
 
         if(itemMatchesProgress &&
             ((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber))) {
@@ -19930,7 +19955,9 @@ async function recordProfileNukeProgressBatchFromRequest(request = {}, sender = 
         return {
             recorded: false,
             staleAttempt,
-            reason: missingAttemptIdentity ? 'missing-attempt-identity' : staleAttempt ? 'stale-attempt' : 'no-updates'
+            reason: missingAttemptIdentity
+                ? 'missing-attempt-identity'
+                : missingCurrentAuthority ? 'missing-current-authority' : staleAttempt ? 'stale-attempt' : 'no-updates'
         }
     }
 
