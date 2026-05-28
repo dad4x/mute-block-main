@@ -143,6 +143,11 @@ let coordinatorQueue = {}
 let coordinatorQueueLoaded = false
 let contentPageStateRefreshPromise = null
 let contentPageStateRefreshAt = 0
+let spaceFeedScopedStateRefreshPromise = null
+let spaceFeedScopedStateRefreshActiveSignature = ''
+let spaceFeedScopedStateRefreshQueuedEntries = null
+let spaceFeedScopedStateRefreshQueuedSignature = ''
+let spaceFeedScopedStateSignature = ''
 let storageChangeListenerInstalled = false
 let spaceFeedNukingPostKeys = new Set()
 let activeSpaceFeedNukeMode = ''
@@ -359,6 +364,67 @@ function getCurrentPageStateProfileHrefs(options = {}) {
     return getNormalizedProfileHrefList(hrefs).slice(0, 250)
 }
 
+function getProfileHrefScopeSignature(profileHrefs = []) {
+    return getNormalizedProfileHrefList(profileHrefs).sort().join('\n')
+}
+
+function getSpaceFeedScopedStateSignature(entries = []) {
+    return getProfileHrefScopeSignature(getCurrentPageStateProfileHrefs({entries}))
+}
+
+function scheduleSpaceFeedScopedStateRefresh(entries = []) {
+    if(getPageType() !== 'space') return false
+
+    const scopedEntries = Array.isArray(entries) ? entries : []
+    const signature = getSpaceFeedScopedStateSignature(scopedEntries)
+    if(!signature) {
+        spaceFeedScopedStateSignature = ''
+        return false
+    }
+    if(coordinatorQueueLoaded && signature === spaceFeedScopedStateSignature) return false
+
+    if(spaceFeedScopedStateRefreshPromise) {
+        if(signature !== spaceFeedScopedStateRefreshActiveSignature) {
+            spaceFeedScopedStateRefreshQueuedEntries = scopedEntries
+            spaceFeedScopedStateRefreshQueuedSignature = signature
+        }
+        return true
+    }
+
+    spaceFeedScopedStateRefreshActiveSignature = signature
+    spaceFeedScopedStateRefreshPromise = (async () => {
+        if(contentPageStateRefreshPromise) await contentPageStateRefreshPromise.catch(() => false)
+
+        const refreshed = await refreshContentPageCoordinatorStateFromRuntime({
+            force: true,
+            entries: scopedEntries
+        })
+        if(refreshed) {
+            spaceFeedScopedStateSignature = signature
+            if(getPageType() === 'space') {
+                syncSpaceFeedNukeControls()
+            }
+        }
+        return refreshed
+    })()
+        .catch(() => false)
+        .finally(() => {
+            spaceFeedScopedStateRefreshPromise = null
+            spaceFeedScopedStateRefreshActiveSignature = ''
+
+            const queuedEntries = spaceFeedScopedStateRefreshQueuedEntries
+            const queuedSignature = spaceFeedScopedStateRefreshQueuedSignature
+            spaceFeedScopedStateRefreshQueuedEntries = null
+            spaceFeedScopedStateRefreshQueuedSignature = ''
+
+            if(queuedSignature && queuedSignature !== spaceFeedScopedStateSignature) {
+                scheduleSpaceFeedScopedStateRefresh(queuedEntries)
+            }
+        })
+
+    return true
+}
+
 async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
     const page = getPageType()
     if(!['profile-search', 'profile', 'space'].includes(page)) return false
@@ -389,6 +455,9 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
                 profileNukeProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
             }
             contentPageStateRefreshAt = Date.now()
+            if(page === 'space') {
+                spaceFeedScopedStateSignature = getProfileHrefScopeSignature(profileHrefs)
+            }
             return true
         })
         .catch(() => false)
@@ -1590,6 +1659,9 @@ function resetSpaceFeedScanCache() {
     discoveredSpaceFeedEntries = new Map()
     spaceFeedEntryCache = new Map()
     spaceFeedRootCache = new WeakMap()
+    spaceFeedScopedStateSignature = ''
+    spaceFeedScopedStateRefreshQueuedEntries = null
+    spaceFeedScopedStateRefreshQueuedSignature = ''
 }
 
 function getSpaceFeedPostRootFromMutationNode(node) {
@@ -9290,6 +9362,7 @@ function syncSpaceFeedNukeControls() {
     const scannedEntries = getSpaceFeedPostEntries()
     setLatestSpaceFeedEntries(scannedEntries)
     const entries = getLatestSpaceFeedEntries()
+    scheduleSpaceFeedScopedStateRefresh(entries)
     const renderModel = buildSpaceFeedRenderModel(scannedEntries, entries)
     scheduleSpaceFeedProgressReconciliation(entries)
     clearStaleLocalSpaceFeedBusyState()
