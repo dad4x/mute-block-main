@@ -462,6 +462,24 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
         attemptNumber: 1,
         milestones: {}
     }
+    const progressA = {
+        profileHref: hrefA,
+        status: 'queued',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-cancel-a',
+        attemptNumber: 1,
+        updatedAt: 499600
+    }
+    const progressB = {
+        profileHref: hrefB,
+        status: 'queued',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-cancel-b',
+        attemptNumber: 1,
+        updatedAt: 499600
+    }
     const {browser, storage, timers, sw} = loadServiceWorkerHarness({
         now: 500000,
         storage: {
@@ -480,7 +498,10 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            mbProfileNukeProgress: {
+                [hrefA]: progressA,
+                [hrefB]: progressB
+            }
         }
     })
 
@@ -498,6 +519,8 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].outcome, 'paused')
     assert.notEqual(storage.mbCoordinatorQueue[hrefB].status, 'canceled')
+    assert.deepEqual(storage.mbProfileNukeProgress[hrefA], progressA)
+    assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -537,6 +560,24 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
         attemptNumber,
         milestones: {}
     })
+    const progressA = {
+        profileHref: hrefA,
+        status: 'queued',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-bulk-cancel-1',
+        attemptNumber: 1,
+        updatedAt: 500600
+    }
+    const progressB = {
+        profileHref: hrefB,
+        status: 'queued',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-bulk-cancel-2',
+        attemptNumber: 2,
+        updatedAt: 500600
+    }
     const {browser, storage, timers, sw} = loadServiceWorkerHarness({
         now: 501000,
         storage: {
@@ -561,7 +602,10 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            mbProfileNukeProgress: {
+                [hrefA]: progressA,
+                [hrefB]: progressB
+            }
         }
     })
 
@@ -578,6 +622,8 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefDone].status, 'succeeded')
+    assert.deepEqual(storage.mbProfileNukeProgress[hrefA], progressA)
+    assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 2)
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -1177,6 +1223,9 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     assert.equal(storage.mbCoordinatorQueueView.counts.queued, 2)
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
     assert.equal(storage.mbCoordinatorEvents[0].type, 'paused')
+    assert.equal(storage.mbProfileNukeProgress[hrefActive].status, 'tab-opened')
+    assert.equal(storage.mbProfileNukeProgress[hrefActive].tabId, tabId)
+    assert.equal(storage.mbProfileNukeProgress[hrefActive].attemptId, attemptId)
     assert.equal(browser.__removedTabs.includes(tabId), true)
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,

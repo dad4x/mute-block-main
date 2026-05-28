@@ -13072,7 +13072,7 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: [], stalePause: true}
     }
 
-    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+    const state = await loadCoordinatorQueueRunsEventsProjection({
         metricPath: 'storedWork.pause.load'
     })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -13080,16 +13080,12 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     const nextQueue = {
         ...queue
     }
-    const progress = {
-        ...state.progress
-    }
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
     const now = Date.now()
     const affectedRunIds = new Set()
     const pausedUrls = []
     const pausedWorkKeys = []
     const ownedTabIds = new Set()
-    let progressChanged = false
     const authorityResults = []
 
     for(const [itemKey, item] of Object.entries(queue || {})) {
@@ -13102,8 +13098,7 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
         if(!href && !coordinatorKey) continue
 
-        const existingProgress = href ? progress[href] || profileNukeProgress?.[href] || null : null
-        const tabId = getPersistedQueuedTabId(item, existingProgress)
+        const tabId = getPersistedQueuedTabId(item, null)
         if(tabId) ownedTabIds.add(tabId)
 
         let nextItem = item
@@ -13131,22 +13126,6 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         if(href) {
             for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
                 affectedRunIds.add(runId)
-            }
-        }
-
-        if(href) {
-            const resetRecord = normalizeProgressPatch(
-                href,
-                buildQueuedCoordinatorProgressResetPatch(nextItem, {
-                    now,
-                    runId: nextItem.runId || '',
-                    actionKind: nextItem.actionKind || ''
-                }),
-                existingProgress
-            )
-            if(resetRecord && JSON.stringify(resetRecord) !== JSON.stringify(existingProgress || null)) {
-                progress[href] = resetRecord
-                progressChanged = true
             }
         }
     }
@@ -13235,11 +13214,6 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         }
     })
 
-    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
-    if(progressChanged) {
-        profileNukeProgress = prunedProgress
-    }
-
     if(pauseGeneration && (!isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration) ||
         !await isCoordinatorPauseGenerationCurrent(pauseGeneration))) {
         await restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration)
@@ -13249,13 +13223,12 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     try {
         derivedSaved = await saveCoordinatorState({
             runs: nextRunsBase,
-            events,
-            progress: prunedProgress
+            events
         }, {
             queue: false,
             runs: true,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'stored-work-pause-derived',
             queueChangedRows: 0
@@ -13330,7 +13303,7 @@ async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
     }
 
     const reason = `${operation.cancelReason || 'coordinator-pause-request'}`.trim()
-    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+    const state = await loadCoordinatorQueueRunsEventsProjection({
         metricPath: 'currentWork.itemCancel.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -13349,8 +13322,7 @@ async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
     }
 
     const now = Date.now()
-    const existingProgress = href ? state.progress[href] || profileNukeProgress?.[href] || null : null
-    const tabId = getPersistedQueuedTabId(item, existingProgress)
+    const tabId = getPersistedQueuedTabId(item, null)
     const nextItem = buildTerminalCoordinatorQueueItem(item, {
         status: 'canceled',
         outcome: 'paused',
@@ -13423,36 +13395,16 @@ async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
         }
     })
 
-    let progressChanged = false
-    const progress = {...state.progress}
-    if(href) {
-        const nextProgress = makeTerminalProgressRecordFromCoordinatorItem(
-            href,
-            nextItem,
-            existingProgress,
-            'Paused by user'
-        )
-        if(nextProgress && JSON.stringify(nextProgress) !== JSON.stringify(existingProgress || null)) {
-            progress[href] = nextProgress
-            progressChanged = true
-        }
-    }
-    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
-    if(progressChanged) {
-        profileNukeProgress = prunedProgress
-    }
-
     let derivedSaved = false
     try {
         derivedSaved = await saveCoordinatorState({
             runs: runsChanged ? runs : undefined,
-            events,
-            progress: progressChanged ? prunedProgress : undefined
+            events
         }, {
             queue: false,
             runs: runsChanged,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'current-work-item-cancel-derived',
             queueChangedRows: 0
@@ -13493,14 +13445,11 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const targetCoordinatorKey = `${operation.coordinatorKey || ''}`.trim()
     const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
     const hasTarget = !!(targetStorageKey || targetCoordinatorKey || targetHref)
-    const state = await loadCoordinatorQueueRunsEventsProgressProjection({
+    const state = await loadCoordinatorQueueRunsEventsProjection({
         metricPath: 'storedWork.cancel.load'
     })
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
-    const progress = {
-        ...state.progress
-    }
     const now = Date.now()
     const affectedRunIds = new Set()
     const canceledUrls = []
@@ -13510,7 +13459,6 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
     const nextQueue = {
         ...queue
     }
-    let progressChanged = false
 
     for(const [itemKey, item] of Object.entries(queue || {})) {
         if(!item || typeof item !== 'object') continue
@@ -13530,8 +13478,7 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
             continue
         }
 
-        const existingProgress = href ? progress[href] || profileNukeProgress?.[href] || null : null
-        const tabId = getPersistedQueuedTabId(item, existingProgress)
+        const tabId = getPersistedQueuedTabId(item, null)
         if(tabId) ownedTabIds.add(tabId)
 
         const nextItem = buildTerminalCoordinatorQueueItem(item, {
@@ -13551,20 +13498,6 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
                 affectedRunIds.add(runId)
             }
         }
-
-        if(href) {
-            const nextProgress = makeTerminalProgressRecordFromCoordinatorItem(
-                href,
-                nextItem,
-                existingProgress,
-                'Paused by user'
-            )
-            if(nextProgress && JSON.stringify(nextProgress) !== JSON.stringify(existingProgress || null)) {
-                progress[href] = nextProgress
-                progressChanged = true
-            }
-        }
-
         authorityResults.push(makeCoordinatorAuthorityApplyResult({
             operationKind: 'stored-work-cancel',
             rowKey: itemKey,
@@ -13638,22 +13571,16 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
         }
     })
 
-    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
-    if(progressChanged) {
-        profileNukeProgress = prunedProgress
-    }
-
     let derivedSaved = true
     try {
         derivedSaved = await saveCoordinatorState({
             runs,
-            events,
-            progress: progressChanged ? prunedProgress : undefined
+            events
         }, {
             queue: false,
             runs: true,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'stored-work-cancel-derived',
             queueChangedRows: 0
