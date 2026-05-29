@@ -11626,7 +11626,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     const nextQueue = {...queue}
     const runs = normalizeCoordinatorMap(state.runs)
     const events = normalizeCoordinatorEvents(state.events)
-    const progress = {...state.progress}
+    const progress = state.progress
     let queued = 0
     let merged = 0
     let progressChanged = false
@@ -11876,16 +11876,34 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
 
     await coordinatorAuthority.hydrate()
     let derivedSaved = true
+    let progressProjectionSaved = {saved: true, rows: 0}
     try {
-        derivedSaved = await saveCoordinatorState({runs, events, progress}, {
+        progressProjectionSaved = progressChanged
+            ? await saveProfileNukeProgressRowProjection(progressResetRecords, {
+                metricPath: 'enqueue.progressProjection'
+            })
+            : {saved: true, rows: 0}
+    }
+    catch(error) {
+        progressProjectionSaved = false
+        recordCoordinatorDiagnosticEvent(
+            'enqueue-progress-projection-save-failed',
+            error?.message || 'Enqueue progress projection save failed'
+        )
+    }
+    if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+        derivedSaved = false
+    }
+    try {
+        derivedSaved = await saveCoordinatorState({runs, events}, {
             queue: false,
             runs: true,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'enqueue-derived',
             queueChangedRows: 0
-        })
+        }) && derivedSaved
     }
     catch(error) {
         derivedSaved = false

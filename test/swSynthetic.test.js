@@ -12172,6 +12172,50 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     assert.ok(repairLoadDefaults)
 })
 
+test('enqueue progress projection failure does not poison durable WAL acknowledgement', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Projection-Failure'
+    const runId = 'run-enqueue-projection-failure'
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        now: 3080,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
+            throw new Error('synthetic enqueue projection failure')
+        }
+        return originalSet(payload)
+    }
+
+    const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
+        href,
+        runId,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: 1,
+            noForegroundFallback: true
+        }
+    }), sourceSender)
+
+    assert.equal(enqueue.queued, 1)
+    assert.equal(enqueue.durable, true)
+    assert.equal(enqueue.derivedSaved, false)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
+    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView, undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
+    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+})
+
 test('enqueue resetExisting derived save failure repair replaces stale progress attempt', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Reset-Derived-Failure'
     const oldRunId = 'run-enqueue-reset-derived-old'
@@ -12297,6 +12341,10 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     assert.equal(enqueue.executionDeferred, true)
     assert.equal(storage.mbCoordinatorPaused, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
 
     await flushAsync(20)
     await timers.tick(0)
