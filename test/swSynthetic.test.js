@@ -182,6 +182,10 @@ function getRecoveredCoordinatorQueue(storage = {}) {
 }
 
 function hasStorageDefault(defaults = {}, key = '') {
+    if(key === 'mbCoordinatorQueueWal') {
+        return Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorQueueWal') ||
+            Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorQueueWal.meta')
+    }
     return Object.prototype.hasOwnProperty.call(defaults || {}, key)
 }
 
@@ -7104,6 +7108,11 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    await waitFor(
+        () => storage.mbProfileNukeProgressView?.records?.[href]?.status === 'profile-unavailable',
+        'non-profile landing progress projection was not materialized',
+        {timers, attempts: 20, tickMs: 0}
+    )
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.match(getProgressShardRecord(storage, href).unavailableReason, /did not land on a profile page/)
@@ -9158,7 +9167,11 @@ test('repair does not promote terminal error progress over active service-worker
         active: false
     })
 
-    await settleWithFakeTimers(sw.runStoredWorkRepairTick('terminal-error-test'), timers)
+    await settleWithFakeTimers(
+        sw.runStoredWorkRepairTick('terminal-error-test'),
+        timers,
+        [0, 1000, 4000, 5000, 15000, 30000, 60000, 120000]
+    )
 
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].outcome, undefined)
@@ -10285,6 +10298,100 @@ test('storage get records compact-view read payload by call path', async () => {
     assert.equal(counters['storagePayload.read.path.dashboard.initial.calls'], 1)
     assert.equal(counters['storagePayload.read.path.dashboard.initial.maxLatencyMs'] >= 0, true)
     assert.equal(storage.mbCoordinatorQueueView.total, 120)
+})
+
+test('abandoned storage update suppresses late writes but not authority reads', async () => {
+    const href = 'https://www.quora.com/profile/Abandoned-Read-Keeps-Authority'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 1000,
+        storage: {
+            mbCoordinatorQueue: {
+                [href]: {
+                    id: 'abandoned-read-row',
+                    status: 'queued',
+                    targetProfileHref: href,
+                    updatedAt: 1000
+                }
+            }
+        }
+    })
+    const gate = deferred()
+    const observed = deferred()
+
+    const updateResult = sw.enqueueSpaceFeedStorageUpdate(async () => {
+        await gate.promise
+        const stored = await sw.metricStorageGet({mbCoordinatorQueue: {}})
+        const saved = await sw.metricStorageSet({mbSyntheticLateWrite: true})
+        observed.resolve({stored, saved})
+        return {done: true}
+    }, {
+        timeoutMs: 1000,
+        failureValue: {timedOut: true}
+    })
+
+    await flushAsync(20)
+    await timers.tick(1000)
+    assert.deepEqual(await updateResult, {timedOut: true})
+
+    gate.resolve()
+    await flushAsync(50)
+    const result = await observed.promise
+
+    assert.equal(result.stored.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(result.saved, false)
+    assert.equal(storage.mbSyntheticLateWrite, undefined)
+    assert.equal(sw.state().queueWakeupCounters['storageUpdate.lateWriteSuppressed'], 1)
+    await waitFor(
+        () => sw.state().abandonedSpaceFeedStorageUpdates === 0,
+        'abandoned storage update did not finish cleanup',
+        {timers, attempts: 20, tickMs: 0}
+    )
+})
+
+test('segmented queue WAL authority read skips obsolete monolithic WAL blob', async () => {
+    const href = 'https://www.quora.com/profile/Segmented-No-Legacy-Read'
+    const segmented = makeSegmentedQueueWalStorage({
+        [href]: {
+            id: 'segmented-no-legacy-read-row',
+            status: 'queued',
+            targetProfileHref: href,
+            serviceWorkerOwned: true,
+            executorOwner: 'service-worker',
+            updatedAt: 1000
+        }
+    }, 1)
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 1000,
+        storage: {
+            mbCoordinatorQueue: {},
+            mbCoordinatorQueueWal: {
+                meta: {legacyBlobShouldNotBeRead: true},
+                checkpoints: {},
+                wal: {}
+            },
+            ...segmented
+        }
+    })
+    const getCalls = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getCalls.push(defaults)
+        return originalGet(defaults)
+    }
+
+    const accounting = await sw.getCoordinatorQueueAccounting({reason: 'synthetic'})
+
+    assert.equal(accounting.recovered.total, 1)
+    assert.equal(accounting.recovered.counts.queued, 1)
+    assert.equal(accounting.wal.recovered, true)
+    assert.equal(
+        getCalls.some(defaults => defaults &&
+            typeof defaults === 'object' &&
+            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueueWal')),
+        false
+    )
+    assert.ok(getCalls.some(defaults => defaults?.['mbCoordinatorQueueWal.meta'] === null))
+    assert.ok(getCalls.some(defaults => defaults?.['mbCoordinatorQueueWal.checkpoint.A'] === null))
 })
 
 test('legacy storage can seed compact dashboard queue view without dashboard full read', async () => {
