@@ -3259,6 +3259,76 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(after['coordinatorAuthority.postMutationQueueStorageSetRejected'] || 0, 0)
 })
 
+test('duplicate terminal progress for terminal row does not append duplicate queue WAL', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Duplicate-Noop'
+    const runId = 'run-terminal-duplicate-noop'
+    const attemptId = 'attempt-terminal-duplicate-noop'
+    const tabId = 504
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 250400,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250400})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opening',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 250300
+                }
+            }
+        }
+    })
+    const terminalPatch = {
+        status: 'interrupted',
+        finalError: 'Durable active queue row had no confirmed runtime actor',
+        terminalAt: 250500,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }
+
+    const first = await sw.recordCoordinatorJobProgress(href, terminalPatch, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    assert.equal(first.recorded, true)
+    assert.equal(first.terminal, true)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+
+    const firstRecords = getWalRecordsForGeneration(
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
+    ).filter(record => record.key === href && record.operationKind === 'terminal-progress')
+    assert.equal(firstRecords.length, 1)
+
+    const second = await sw.recordCoordinatorJobProgress(href, terminalPatch, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    assert.equal(second.recorded, true)
+    assert.equal(second.terminal, true)
+
+    const secondRecords = getWalRecordsForGeneration(
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
+    ).filter(record => record.key === href && record.operationKind === 'terminal-progress')
+    assert.equal(secondRecords.length, 1)
+    assert.equal(sw.state().queueWakeupCounters['terminalProgress.queueNoopDuplicate'] || 0, 1)
+})
+
 test('terminal authority queue WAL recovers after restart without full queue snapshot', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Wal-Restart'
     const runId = 'run-terminal-wal-restart'
@@ -15342,6 +15412,66 @@ test('queued tab active transition reuses executor authority state', async () =>
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
     assert.ok(getStoredCoordinatorQueueWal(storage))
+})
+
+test('queued tab missing after durable active transition rolls back immediately', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Missing-After-Durable'
+    const runId = 'run-active-transition-missing-after-durable'
+    const attemptId = 'attempt-active-transition-missing-after-durable'
+    const tabId = 6303
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 431960,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 431960})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const authorityState = await sw.coordinatorAuthority.hydrate()
+    const action = {
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1,
+        executorPlanAuthorityState: authorityState
+    }
+    const tab = {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    }
+    browser.__tabs.set(tabId, tab)
+    const plan = sw.buildQueuedTabOpenEffectPlan(action, tab, 431970)
+
+    sw.applyQueuedTabOpenRuntimeEffect(plan)
+    browser.__tabs.delete(tabId)
+    const result = await sw.confirmQueuedTabOpenDurableActiveEffect(action, tab, plan)
+
+    assert.equal(result.keepOpen, false)
+    assert.equal(result.rolledBack, true)
+    assert.equal(result.missingAfterDurableActive, true)
+    assert.equal(sw.state().activeQueuedTabs.includes(tabId), false)
+    assert.equal(sw.state().queuedTabMetadata.some(([id]) => id === tabId), false)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+
+    const walRecords = getWalRecordsForGeneration(
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
+    )
+    assert.equal(walRecords.some(record => record.operationKind === 'active-transition'), true)
+    assert.equal(walRecords.some(record => record.operationKind === 'rollback-active-transition'), true)
 })
 
 test('active transition rejects stale attempt before WAL append', async () => {
