@@ -2426,6 +2426,83 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
     assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(restarted.storage)).projected.state.queue[hrefB].status, 'active')
 })
 
+test('segmented queue WAL append rewrites active segments when previous physical keys are incomplete', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Incomplete-Physical'
+    const runId = 'run-segmented-wal-incomplete-physical'
+    const attemptId = 'attempt-segmented-wal-incomplete-physical'
+    const queue = {
+        [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 150250})
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 2, {
+        rowKey: href,
+        createdAt: 150250
+    })
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 150260,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const authorityState = await sw.coordinatorAuthority.hydrate()
+    const activeGeneration = authorityState.stored.mbCoordinatorQueueWal.meta.activeCheckpoint
+    const segment0 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 0)
+    const segment1 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 1)
+    const segment2 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 2)
+    assert.ok(storage[segment0])
+    assert.ok(storage[segment1])
+
+    delete storage[segment0]
+    delete authorityState.stored[segment0]
+
+    const walPayloadKeys = []
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(isCoordinatorQueueWalPayload(payload)) {
+            walPayloadKeys.push(Object.keys(payload).sort())
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.enqueueSpaceFeedStorageUpdate(() => sw.coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'row-event-progress-milestone',
+        rowKey: href,
+        reason: 'ordinaryMutation',
+        currentAuthorityState: authorityState,
+        mutate(current) {
+            return {
+                ...current,
+                status: 'active',
+                tabId: 506,
+                activeAt: 150260,
+                updatedAt: 150260,
+                milestones: {
+                    ...(current.milestones || {}),
+                    actionReadyAt: 150260
+                }
+            }
+        }
+    }))
+
+    assert.equal(result.durable, true)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentIncrementalInvalidated'] || 0, 1)
+    assert.ok(walPayloadKeys.length >= 1)
+    assert.ok(walPayloadKeys[0].includes(segment0))
+    assert.ok(walPayloadKeys[0].includes(segment1))
+    assert.ok(walPayloadKeys[0].includes(segment2))
+    assert.ok(storage[segment0])
+    assert.ok(storage[segment1])
+    assert.ok(storage[segment2])
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'active')
+})
+
 test('segmented queue WAL hydrate failure does not fall back to stale raw queue', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Missing-Segment'
     const runId = 'run-segmented-wal-missing-segment'

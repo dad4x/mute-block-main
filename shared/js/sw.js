@@ -5271,6 +5271,21 @@ function getCoordinatorQueueWalPhysicalStoredPayload(stored = {}) {
     return payload
 }
 
+function hasCoordinatorQueueWalCommittedPhysicalSegments(meta = null, generationId = '', stored = {}) {
+    if(!isSegmentedWalStorageMeta(meta)) return false
+    const id = `${generationId || ''}`.trim()
+    if(!id) return false
+
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, id)
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        const key = getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, id, segmentNo)
+        if(!Object.prototype.hasOwnProperty.call(stored || {}, key) || !stored[key]) {
+            return false
+        }
+    }
+    return true
+}
+
 function getCoordinatorQueueWalStorageDefaults() {
     return buildSegmentedWalStorageDefaults(null, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
 }
@@ -5330,21 +5345,36 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
 
 function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
     const previousMeta = options.previousMeta || null
+    const previousStored = options.previousStored && typeof options.previousStored === 'object'
+        ? options.previousStored
+        : {}
     const hasSegmentedPreviousMeta = isSegmentedWalStorageMeta(previousMeta)
-    const writeCheckpoints = options.forceWriteCheckpoints === true || !hasSegmentedPreviousMeta
     const activeGenerationId = store?.meta?.activeCheckpoint
     const activeSegments = Array.isArray(store?.wal?.[activeGenerationId]?.segments)
         ? store.wal[activeGenerationId].segments.length
         : 0
-    const previousCommitted = hasSegmentedPreviousMeta
+    const previousActiveGenerationId = hasSegmentedPreviousMeta
+        ? `${previousMeta?.activeCheckpoint || ''}`.trim()
+        : ''
+    const previousCommittedFromMeta = hasSegmentedPreviousMeta
         ? getSegmentedWalCommittedSegmentCount(previousMeta, activeGenerationId)
         : 0
+    const canAppendIncrementally = hasSegmentedPreviousMeta &&
+        previousActiveGenerationId === activeGenerationId &&
+        hasCoordinatorQueueWalCommittedPhysicalSegments(previousMeta, activeGenerationId, previousStored)
+    const previousCommitted = canAppendIncrementally ? previousCommittedFromMeta : 0
+    const writeCheckpoints = options.forceWriteCheckpoints === true ||
+        !hasSegmentedPreviousMeta ||
+        !canAppendIncrementally
+    if(hasSegmentedPreviousMeta && !canAppendIncrementally) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentIncrementalInvalidated')
+    }
     const payload = buildSegmentedWalStoragePayload(store, {
         baseKey: COORDINATOR_QUEUE_WAL_KEY,
         softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
         hardSegmentLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
         updatedAt: Date.now(),
-        segmentStartByGeneration: hasSegmentedPreviousMeta
+        segmentStartByGeneration: canAppendIncrementally
             ? {[activeGenerationId]: previousCommitted}
             : {},
         generationsToWrite: hasSegmentedPreviousMeta
@@ -5355,6 +5385,10 @@ function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
     return {
         payload,
         previousCommitted,
+        previousCommittedFromMeta,
+        hardLimitCommittedSegments: previousActiveGenerationId === activeGenerationId
+            ? previousCommittedFromMeta
+            : previousCommitted,
         committedSegments: activeSegments,
         hardLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
         softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
@@ -5367,6 +5401,7 @@ function recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal = {}) {
     const entries = Object.entries(payload)
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxActivePhysicalSegments', physicalWal.committedSegments || 0)
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxPreviousCommittedSegments', physicalWal.previousCommitted || 0)
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxPreviousManifestCommittedSegments', physicalWal.previousCommittedFromMeta || 0)
     if(!entries.length) return
 
     let manifestBytes = 0
@@ -5656,11 +5691,12 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
     }
 
     const physicalWal = getCoordinatorQueueWalPhysicalPayload(append.store, {
-        previousMeta: previousWalMeta
+        previousMeta: previousWalMeta,
+        previousStored: nextProjection?.stored || {}
     })
-    if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+    if((physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0) >= physicalWal.hardLimit) {
         recordCoordinatorQueueWalPhysicalPayloadMetrics({
-            previousCommitted: physicalWal.previousCommitted,
+            previousCommitted: physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0,
             committedSegments: physicalWal.committedSegments
         })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
@@ -5844,11 +5880,12 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     }
 
     const physicalWal = getCoordinatorQueueWalPhysicalPayload(append.store, {
-        previousMeta: previousWalMeta
+        previousMeta: previousWalMeta,
+        previousStored: nextProjection?.stored || {}
     })
-    if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+    if((physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0) >= physicalWal.hardLimit) {
         recordCoordinatorQueueWalPhysicalPayloadMetrics({
-            previousCommitted: physicalWal.previousCommitted,
+            previousCommitted: physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0,
             committedSegments: physicalWal.committedSegments
         })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
@@ -6031,6 +6068,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         try {
             checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
                 previousMeta: previousWalMeta,
+                previousStored: stored,
                 forceWriteCheckpoints: true
             })
             recordCoordinatorQueueWalPhysicalPayloadMetrics(checkpointWal)
@@ -6942,10 +6980,14 @@ function createCoordinatorAuthority() {
             )
             : null
         const freshAuthorityRows = providedAuthorityState || await loadCoordinatorQueueRunsProjection()
+        const retainedStoredProjection = Object.fromEntries(
+            Object.entries(projection.stored || {})
+                .filter(([key]) => !isCoordinatorQueueWalPhysicalStorageKey(key))
+        )
         projection = makeCoordinatorAuthorityProjection({
             ...projection,
             stored: {
-                ...(projection.stored || {}),
+                ...retainedStoredProjection,
                 [COORDINATOR_QUEUE_KEY]: freshAuthorityRows.stored?.[COORDINATOR_QUEUE_KEY] || {},
                 ...getCoordinatorQueueWalPhysicalStoredPayload(freshAuthorityRows.stored || {}),
                 [COORDINATOR_QUEUE_WAL_KEY]: freshAuthorityRows.stored?.[COORDINATOR_QUEUE_WAL_KEY] || null,
