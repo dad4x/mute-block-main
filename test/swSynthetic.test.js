@@ -2220,6 +2220,84 @@ test('row event persists queue only for nonterminal durable status changes', asy
     assert.equal(hydrated.queue[href].tabId, tabId)
 })
 
+test('segmented queue WAL appends do not rewrite checkpoint snapshots after migration', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-B'
+    const runId = 'run-segmented-wal-append'
+    const attemptA = 'attempt-segmented-wal-a'
+    const attemptB = 'attempt-segmented-wal-b'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 150200,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: {
+                    ...makeActiveCoordinatorRow({href: hrefA, runId, attemptId: attemptA, tabId: null, now: 150200}),
+                    status: 'queued',
+                    activeAt: 0,
+                    tabId: null
+                },
+                [hrefB]: {
+                    ...makeActiveCoordinatorRow({href: hrefB, runId, attemptId: attemptB, tabId: null, now: 150200}),
+                    status: 'queued',
+                    activeAt: 0,
+                    tabId: null
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: hrefA, runId, targetProfileHrefs: [hrefA, hrefB]})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const walPayloadKeys = []
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(isCoordinatorQueueWalPayload(payload)) {
+            walPayloadKeys.push(Object.keys(payload).sort())
+        }
+        return originalSet(payload)
+    }
+
+    const first = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: hrefA,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150210,
+            runId,
+            tabId: 503,
+            actionKind: 'mute-block',
+            attemptId: attemptA,
+            attemptNumber: 1
+        }
+    })
+    const second = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: hrefB,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150220,
+            runId,
+            tabId: 504,
+            actionKind: 'mute-block',
+            attemptId: attemptB,
+            attemptNumber: 1
+        }
+    })
+
+    assert.equal(first.recorded, true)
+    assert.equal(second.recorded, true)
+    assert.ok(walPayloadKeys.length >= 2)
+    assert.ok(walPayloadKeys[0].some(key => key.startsWith('mbCoordinatorQueueWal.checkpoint.')))
+    assert.equal(walPayloadKeys.slice(1).some(keys =>
+        keys.some(key => key.startsWith('mbCoordinatorQueueWal.checkpoint.'))), false)
+    assert.ok(walPayloadKeys[1].includes('mbCoordinatorQueueWal.meta'))
+    assert.ok(walPayloadKeys[1].includes('mbCoordinatorQueueWal.segment.A.0001'))
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[hrefB].status, 'active')
+})
+
 test('batched row event queue WAL mutations compose against updated projection', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-B'

@@ -5196,11 +5196,13 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
 
 function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
     const previousMeta = options.previousMeta || null
+    const hasSegmentedPreviousMeta = isSegmentedWalStorageMeta(previousMeta)
+    const writeCheckpoints = options.forceWriteCheckpoints === true || !hasSegmentedPreviousMeta
     const activeGenerationId = store?.meta?.activeCheckpoint
     const activeSegments = Array.isArray(store?.wal?.[activeGenerationId]?.segments)
         ? store.wal[activeGenerationId].segments.length
         : 0
-    const previousCommitted = isSegmentedWalStorageMeta(previousMeta)
+    const previousCommitted = hasSegmentedPreviousMeta
         ? getSegmentedWalCommittedSegmentCount(previousMeta, activeGenerationId)
         : 0
     const payload = buildSegmentedWalStoragePayload(store, {
@@ -5208,12 +5210,13 @@ function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
         softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
         hardSegmentLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
         updatedAt: Date.now(),
-        segmentStartByGeneration: isSegmentedWalStorageMeta(previousMeta)
+        segmentStartByGeneration: hasSegmentedPreviousMeta
             ? {[activeGenerationId]: previousCommitted}
             : {},
-        generationsToWrite: isSegmentedWalStorageMeta(previousMeta)
+        generationsToWrite: hasSegmentedPreviousMeta
             ? [activeGenerationId]
-            : undefined
+            : undefined,
+        writeCheckpoints
     })
     return {
         payload,
@@ -5658,7 +5661,8 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         let walSaved = false
         try {
             const checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
-                previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
+                previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null,
+                forceWriteCheckpoints: true
             })
             walSaved = await metricStorageSet(checkpointWal.payload, {
                 metricPath: options.saveMetricPath || 'queueWal.checkpointSwitch.save',
@@ -5708,7 +5712,8 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             const mirrorPayload = {
                 [COORDINATOR_QUEUE_KEY]: recoveredQueue,
                 ...getCoordinatorQueueWalPhysicalPayload(activated.store, {
-                    previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
+                    previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null,
+                    forceWriteCheckpoints: true
                 }).payload,
                 ...buildCoordinatorQueueDerivedProjectionPayload(recoveredQueue)
             }
