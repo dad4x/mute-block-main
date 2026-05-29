@@ -6874,11 +6874,18 @@ async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
 
 async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressPendingNukedProjection', async () => {
+        const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
+        const progressShardDefaults = getProfileNukeProgressShardDefaults(progressProfileHrefs)
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            ...(progressProfileHrefs.length ? {
+                [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+                ...progressShardDefaults
+            } : {
+                [PROFILE_NUKE_PROGRESS_KEY]: {}
+            }),
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
         }, {
@@ -6891,7 +6898,9 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => progressProfileHrefs.length
+            ? getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs)
+            : normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -12723,7 +12732,8 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
 
     return enqueueSpaceFeedStorageUpdate(async () => {
         const state = await loadCoordinatorQueueRunsProgressPendingNukedProjection({
-            metricPath: 'clearProfile.load'
+            metricPath: 'clearProfile.load',
+            profileHrefs: [normalizedHref]
         })
         const progress = normalizeStoredProfileNukeProgress(state.progress || {})
         const queue = normalizeCoordinatorMap(state.queue || {})
@@ -12771,9 +12781,6 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
             : removeProfileHrefFromCoordinatorRuns(runs, nextQueue, normalizedHref)
         const payload = {}
 
-        if(progressChanged) {
-            payload[PROFILE_NUKE_PROGRESS_KEY] = nextProgress
-        }
         if(runsResult.changed) {
             payload[COORDINATOR_RUNS_KEY] = runsResult.runs
         }
@@ -12842,15 +12849,38 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
         }
 
         let derivedSaved = true
-        const derivedChanged = !!Object.keys(payload).length
+        const derivedChanged = progressChanged || !!Object.keys(payload).length
+        let progressProjectionCleanup = progressChanged
+            ? {saved: false, rows: 0}
+            : {saved: true, rows: 0}
         if(derivedChanged) {
+            if(progressChanged) {
+                try {
+                    progressProjectionCleanup = await deleteProfileNukeProgressRowProjection([normalizedHref], {
+                        metricPath: 'clearProfile.progressProjectionDelete'
+                    })
+                }
+                catch(error) {
+                    progressProjectionCleanup = false
+                    recordCoordinatorDiagnosticEvent(
+                        'clear-profile-progress-projection-delete-failed',
+                        error?.message || 'Clear profile progress projection delete failed'
+                    )
+                }
+                if(progressProjectionCleanup === false || progressProjectionCleanup?.saved === false) {
+                    derivedSaved = false
+                }
+            }
             try {
-                derivedSaved = await metricStorageSet(payload, {
-                    snapshotWriteReason: 'ordinaryMutation',
-                    metricPath: queueChanged ? 'clearProfile.derived.save' : 'clearProfile.save',
-                    queueOperation: queueChanged ? 'clear-profile-derived' : 'clear-profile',
-                    queueChangedRows: 0
-                })
+                if(Object.keys(payload).length) {
+                    const payloadSaved = await metricStorageSet(payload, {
+                        snapshotWriteReason: 'ordinaryMutation',
+                        metricPath: queueChanged ? 'clearProfile.derived.save' : 'clearProfile.save',
+                        queueOperation: queueChanged ? 'clear-profile-derived' : 'clear-profile',
+                        queueChangedRows: 0
+                    })
+                    if(payloadSaved === false) derivedSaved = false
+                }
             }
             catch(error) {
                 derivedSaved = false
@@ -12882,9 +12912,8 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
             coordinatorStatePreserved: preserveCoordinatorState,
             pendingChanged: pendingResult.changed,
             nukedChanged: nukedResult.changed,
-            profileNukeProgress: derivedSaved !== false && payload[PROFILE_NUKE_PROGRESS_KEY]
-                ? payload[PROFILE_NUKE_PROGRESS_KEY]
-                : progress,
+            progressProjectionCleanup,
+            profileNukeProgress: null,
             pendingPosts: derivedSaved !== false && payload[SPACE_PENDING_NUKED_POSTS_KEY]
                 ? payload[SPACE_PENDING_NUKED_POSTS_KEY]
                 : pendingPosts,
