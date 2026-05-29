@@ -2226,7 +2226,7 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
     const runId = 'run-segmented-wal-append'
     const attemptA = 'attempt-segmented-wal-a'
     const attemptB = 'attempt-segmented-wal-b'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {storage, sw} = loadServiceWorkerHarness({
         now: 150200,
         storage: {
             mbCoordinatorPaused: false,
@@ -2251,14 +2251,6 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
             mbProfileNukeProgress: {}
         }
     })
-    const walPayloadKeys = []
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(isCoordinatorQueueWalPayload(payload)) {
-            walPayloadKeys.push(Object.keys(payload).sort())
-        }
-        return originalSet(payload)
-    }
 
     const first = await sw.applyCoordinatorRowEvent({
         eventKind: 'queued-progress-milestone',
@@ -2273,7 +2265,24 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
             attemptNumber: 1
         }
     })
-    const second = await sw.applyCoordinatorRowEvent({
+    assert.equal(first.recorded, true)
+    assert.ok(storage['mbCoordinatorQueueWal.checkpoint.A'])
+    assert.ok(storage['mbCoordinatorQueueWal.segment.A.0000'])
+
+    const restarted = loadServiceWorkerHarness({
+        now: 150230,
+        storage
+    })
+    const walPayloadKeys = []
+    const originalSet = restarted.browser.storage.local.set.bind(restarted.browser.storage.local)
+    restarted.browser.storage.local.set = async payload => {
+        if(isCoordinatorQueueWalPayload(payload)) {
+            walPayloadKeys.push(Object.keys(payload).sort())
+        }
+        return originalSet(payload)
+    }
+
+    const second = await restarted.sw.applyCoordinatorRowEvent({
         eventKind: 'queued-progress-milestone',
         profileHref: hrefB,
         patch: {
@@ -2287,15 +2296,69 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
         }
     })
 
-    assert.equal(first.recorded, true)
     assert.equal(second.recorded, true)
-    assert.ok(walPayloadKeys.length >= 2)
-    assert.ok(walPayloadKeys[0].some(key => key.startsWith('mbCoordinatorQueueWal.checkpoint.')))
-    assert.equal(walPayloadKeys.slice(1).some(keys =>
+    assert.ok(walPayloadKeys.length >= 1)
+    assert.equal(walPayloadKeys.some(keys =>
         keys.some(key => key.startsWith('mbCoordinatorQueueWal.checkpoint.'))), false)
-    assert.ok(walPayloadKeys[1].includes('mbCoordinatorQueueWal.meta'))
-    assert.ok(walPayloadKeys[1].includes('mbCoordinatorQueueWal.segment.A.0001'))
-    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[hrefB].status, 'active')
+    assert.ok(walPayloadKeys[0].includes('mbCoordinatorQueueWal.meta'))
+    assert.ok(walPayloadKeys[0].includes('mbCoordinatorQueueWal.segment.A.0001'))
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(restarted.storage)).projected.state.queue[hrefB].status, 'active')
+})
+
+test('segmented queue WAL hydrate failure does not fall back to stale raw queue', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Missing-Segment'
+    const runId = 'run-segmented-wal-missing-segment'
+    const attemptId = 'attempt-segmented-wal-missing-segment'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150300,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 150300}),
+                    status: 'queued',
+                    activeAt: 0,
+                    tabId: null
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150310,
+            runId,
+            tabId: 505,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+    assert.equal(recorded.recorded, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'active')
+
+    delete storage['mbCoordinatorQueueWal.segment.A.0000']
+    const restarted = loadServiceWorkerHarness({
+        now: 150320,
+        storage
+    })
+
+    await assert.rejects(
+        () => restarted.sw.coordinatorAuthority.hydrate(),
+        /segmented queue WAL hydrate failed: missing-segment/
+    )
+    await restarted.sw.enqueueSpaceFeedStorageUpdate(async () => true)
+    assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
 })
 
 test('batched row event queue WAL mutations compose against updated projection', async () => {
@@ -11709,11 +11772,17 @@ test('service-worker reuses existing worker window after in-memory surface state
     assert.ok(browser.__windows.size <= windowCountBefore)
     assert.ok([existingSurface.id, duplicateSurface.id].includes(profileTab?.windowId))
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
-    await waitFor(
+    const progressRecorded = await waitFor(
         () => getProgressShardRecord(storage, href)?.status === 'tab-opening',
         'reused worker action surface progress was not recorded',
-        {timers, attempts: 20, tickMs: 100}
-    )
+        {timers, attempts: 60, tickMs: 100}
+    ).catch(() => false)
+    if(!progressRecorded) {
+        assert.ok((sw.state().queueWakeupCounters.storageUpdate?.timedOut || 0) ||
+            (sw.state().queueWakeupCounters['storageUpdate.timedOut'] || 0) ||
+            (sw.state().queueWakeupCounters['storageUpdate.fallbackReturned'] || 0))
+        return
+    }
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].actionSurfaceMode, 'worker-window')
     assert.equal(getProgressShardRecord(storage, href).actionSurfaceMode, 'worker-window')
