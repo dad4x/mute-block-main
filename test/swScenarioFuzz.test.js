@@ -262,6 +262,7 @@ async function removeActiveTab(env) {
     const tab = env.prng.pick(tabs)
     env.trace.push(`remove-tab ${tab.id}`)
     await env.browser.tabs.remove(tab.id)
+    await settle(env, 12)
     await settleWithFakeTimers(env.sw.sweepStaleQueuedTabs(), env)
 }
 
