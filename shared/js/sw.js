@@ -4088,6 +4088,28 @@ function buildProfileNukeProgressShardPayload(progress = {}, now = Date.now()) {
     return shards
 }
 
+function hasNonterminalCoordinatorAuthorityForProfile(queue = {}, profileHref = '') {
+    const href = normalizeQuoraProfileUrl(profileHref)
+    if(!href) return false
+
+    return Object.entries(queue || {}).some(([itemKey, item]) => {
+        if(!item || typeof item !== 'object') return false
+        if(isTerminalCoordinatorStatus(item.status)) return false
+        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+        return itemHref === href
+    })
+}
+
+function filterProfileNukeProgressForContentProjection(progress = {}, queue = {}) {
+    const normalized = normalizeStoredProfileNukeProgress(progress || {})
+    const filtered = {}
+    for(const [profileHref, record] of Object.entries(normalized)) {
+        if(hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref)) continue
+        filtered[profileHref] = record
+    }
+    return filtered
+}
+
 function updateProfileNukeProgressViewRecords(view = null, progressRecords = {}, now = Date.now()) {
     const current = normalizeProfileNukeProgressView(view)
     const records = {
@@ -4126,6 +4148,49 @@ function updateProfileNukeProgressShardRecord(shard = null, profileHref = '', re
     const summary = summarizeProfileNukeProgressRecord(href, record)
     const records = normalizeProfileNukeProgressShardRecords({current: shard})
     if(summary) records[summary.profileHref] = summary
+
+    return {
+        version: 1,
+        updatedAt: now,
+        records
+    }
+}
+
+function removeProfileNukeProgressViewRecords(view = null, profileHrefs = [], knownRemovedCount = 0, now = Date.now()) {
+    const current = normalizeProfileNukeProgressView(view)
+    const records = {
+        ...current.records
+    }
+    for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
+        delete records[href]
+    }
+
+    const recordLimit = Number.parseInt(current.recordLimit, 10) || MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS
+    const entries = Object.entries(records)
+        .sort((left, right) => {
+            const leftUpdatedAt = Number.parseInt(left[1]?.updatedAt, 10) || 0
+            const rightUpdatedAt = Number.parseInt(right[1]?.updatedAt, 10) || 0
+            return rightUpdatedAt - leftUpdatedAt || left[0].localeCompare(`${right[0]}`)
+        })
+    const capped = Object.fromEntries(entries.slice(0, recordLimit))
+    const currentTotal = Number.parseInt(current.total, 10) || Object.keys(current.records).length
+    const total = Math.max(0, currentTotal - Math.max(0, Number.parseInt(knownRemovedCount, 10) || 0))
+
+    return {
+        version: 2,
+        updatedAt: now,
+        total,
+        recordLimit,
+        truncated: total > Object.keys(capped).length || entries.length > Object.keys(capped).length,
+        records: capped
+    }
+}
+
+function removeProfileNukeProgressShardRecords(shard = null, profileHrefs = [], now = Date.now()) {
+    const records = normalizeProfileNukeProgressShardRecords({current: shard})
+    for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
+        delete records[href]
+    }
 
     return {
         version: 1,
@@ -4183,6 +4248,69 @@ async function saveProfileNukeProgressRowProjection(progressRecords = {}, option
         saved: true,
         records: cloneCoordinatorAuthorityValue(normalizedRecords),
         rows: hrefs.length
+    }
+}
+
+async function deleteProfileNukeProgressRowProjection(profileHrefs = [], options = {}) {
+    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
+    if(!hrefs.length) return {saved: true, rows: 0}
+
+    const shardDefaults = getProfileNukeProgressShardDefaults(hrefs)
+    const metricPath = normalizeStorageMetricPathName(options.metricPath || 'rowEvent.progressProjectionDelete')
+    const stored = await metricStorageGet({
+        [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+        ...shardDefaults
+    }, {metricPath: `${metricPath}.load`})
+
+    const view = normalizeProfileNukeProgressView(stored[PROFILE_NUKE_PROGRESS_VIEW_KEY])
+    const removedHrefs = new Set()
+    for(const href of hrefs) {
+        if(view.records[href]) removedHrefs.add(href)
+    }
+    for(const shardKey of Object.keys(shardDefaults)) {
+        const records = normalizeProfileNukeProgressShardRecords({[shardKey]: stored[shardKey]})
+        for(const href of hrefs) {
+            if(records[href]) removedHrefs.add(href)
+        }
+    }
+
+    if(!removedHrefs.size) return {saved: true, rows: 0}
+
+    const now = Date.now()
+    const payload = {
+        [PROFILE_NUKE_PROGRESS_VIEW_KEY]: removeProfileNukeProgressViewRecords(
+            stored[PROFILE_NUKE_PROGRESS_VIEW_KEY],
+            hrefs,
+            removedHrefs.size,
+            now
+        )
+    }
+    for(const shardKey of Object.keys(shardDefaults)) {
+        payload[shardKey] = removeProfileNukeProgressShardRecords(stored[shardKey], hrefs, now)
+    }
+
+    let saved = false
+    try {
+        saved = await metricStorageSet(payload, {metricPath: `${metricPath}.save`})
+    }
+    catch(error) {
+        incrementQueueWakeupMetric('progress.rowProjectionDeleteStorageFailed')
+        recordCoordinatorDiagnosticEvent(
+            'progress-row-projection-delete-storage-failed',
+            error?.message || 'Progress row projection delete storage failed'
+        )
+        saved = false
+    }
+    if(saved === false) {
+        incrementQueueWakeupMetric('progress.rowProjectionDeleteStorageSuppressed')
+        return false
+    }
+    incrementQueueWakeupMetric('progress.rowProjectionDeleteStorageWrites')
+    incrementQueueWakeupMetric('progress.rowProjectionDeleteRowsPerStorageWrite', removedHrefs.size)
+    return {
+        saved: true,
+        rows: removedHrefs.size,
+        profileHrefs: Array.from(removedHrefs)
     }
 }
 
@@ -10810,10 +10938,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
     const events = normalizeCoordinatorEvents(state.events)
-    const progress = {
-        ...state.progress
-    }
-    let progressChanged = false
+    const progress = state.progress
 
     profileNukeProgress = progress
 
@@ -10844,6 +10969,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     const nextQueue = {...queue}
     const authorityResults = []
     const removedRows = []
+    const progressProjectionRemovalHrefs = new Set()
 
     for(const candidate of selected) {
         const item = candidate.item
@@ -10871,9 +10997,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
         }
 
         for(const href of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
-            if(!progress[href]) continue
-            delete progress[href]
-            progressChanged = true
+            progressProjectionRemovalHrefs.add(href)
         }
         authorityResults.push(makeCoordinatorAuthorityApplyResult({
             operationKind: 'retry',
@@ -10968,26 +11092,47 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     }
 
     await coordinatorAuthority.hydrate()
-    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
-    if(progressChanged) {
-        profileNukeProgress = prunedProgress
+    if(progressProjectionRemovalHrefs.size) {
+        profileNukeProgress = {
+            ...profileNukeProgress
+        }
+        for(const href of progressProjectionRemovalHrefs) {
+            delete profileNukeProgress[href]
+        }
     }
 
     let derivedSaved = true
+    let projectionCleanup = {saved: true, rows: 0}
+    try {
+        projectionCleanup = progressProjectionRemovalHrefs.size
+            ? await deleteProfileNukeProgressRowProjection(Array.from(progressProjectionRemovalHrefs), {
+                metricPath: 'failedRetry.progressProjectionDelete'
+            })
+            : {saved: true, rows: 0}
+    }
+    catch(error) {
+        projectionCleanup = false
+        recordCoordinatorDiagnosticEvent(
+            'retry-progress-projection-delete-failed',
+            error?.message || 'Retry progress projection delete failed'
+        )
+    }
+    if(projectionCleanup === false || projectionCleanup?.saved === false) {
+        derivedSaved = false
+    }
     try {
         derivedSaved = await saveCoordinatorState({
             runs: nextRuns,
-            events,
-            progress: progressChanged ? prunedProgress : undefined
+            events
         }, {
             queue: false,
             runs: true,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'retry-derived',
             queueChangedRows: 0
-        })
+        }) && derivedSaved
     }
     catch(error) {
         derivedSaved = false
@@ -11116,16 +11261,13 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
     const events = normalizeCoordinatorEvents(state.events)
-    const progress = {
-        ...state.progress
-    }
     const now = Date.now()
     const runId = makeId('requeue-failed')
     const selectedItems = []
     const nextQueue = {...queue}
     const authorityResults = []
     const removedRows = []
-    let progressChanged = false
+    const progressProjectionRemovalHrefs = new Set()
 
     for(const [itemKey, item] of Object.entries(queue)) {
         if(`${item?.status || ''}` !== 'failed') continue
@@ -11161,9 +11303,7 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
 
         nextQueue[reset.coordinatorKey] = reset.nextItem
         for(const progressHref of getNormalizedProfileHrefList([reset.legacyHref, reset.href])) {
-            if(!progress[progressHref]) continue
-            delete progress[progressHref]
-            progressChanged = true
+            progressProjectionRemovalHrefs.add(progressHref)
         }
         selectedItems.push(reset.nextItem)
         authorityResults.push(makeCoordinatorAuthorityApplyResult({
@@ -11274,26 +11414,47 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     }
 
     await coordinatorAuthority.hydrate()
-    const prunedProgress = progressChanged ? pruneProfileNukeProgress(progress) : state.progress
-    if(progressChanged) {
-        profileNukeProgress = prunedProgress
+    if(progressProjectionRemovalHrefs.size) {
+        profileNukeProgress = {
+            ...profileNukeProgress
+        }
+        for(const href of progressProjectionRemovalHrefs) {
+            delete profileNukeProgress[href]
+        }
     }
 
     let derivedSaved = true
+    let projectionCleanup = {saved: true, rows: 0}
+    try {
+        projectionCleanup = progressProjectionRemovalHrefs.size
+            ? await deleteProfileNukeProgressRowProjection(Array.from(progressProjectionRemovalHrefs), {
+                metricPath: 'failedRequeue.progressProjectionDelete'
+            })
+            : {saved: true, rows: 0}
+    }
+    catch(error) {
+        projectionCleanup = false
+        recordCoordinatorDiagnosticEvent(
+            'requeue-progress-projection-delete-failed',
+            error?.message || 'Requeue progress projection delete failed'
+        )
+    }
+    if(projectionCleanup === false || projectionCleanup?.saved === false) {
+        derivedSaved = false
+    }
     try {
         derivedSaved = await saveCoordinatorState({
             runs: nextRuns,
-            events,
-            progress: progressChanged ? prunedProgress : undefined
+            events
         }, {
             queue: false,
             runs: true,
             events: true,
-            progress: progressChanged,
+            progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'requeue-derived',
             queueChangedRows: 0
-        })
+        }) && derivedSaved
     }
     catch(error) {
         derivedSaved = false
@@ -20290,7 +20451,7 @@ async function rebuildContentPageStateProjectionFromFullStorage(reason = 'missin
         [PROFILE_NUKE_PROGRESS_KEY]: {}
     }, {metricPath: `contentPageState.compatBuild.${reason}.progress`})
     const queue = currentAuthorityState.queue
-    const progress = normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
+    const progress = filterProfileNukeProgressForContentProjection(stored[PROFILE_NUKE_PROGRESS_KEY] || {}, queue)
     const queueIndex = buildCoordinatorContentQueueIndex(queue)
     const sourceShards = buildCoordinatorContentSourceIndexShardPayload(queue)
     const progressView = buildProfileNukeProgressView(progress)
