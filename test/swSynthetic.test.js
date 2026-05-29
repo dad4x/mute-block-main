@@ -2672,11 +2672,13 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
     await waitFor(
-        () => storage.mbProfileNukeProgress[href]?.status === 'blocked',
-        'terminal progress compatibility save did not update the progress snapshot',
+        () => getProgressShardRecord(storage, href)?.status === 'blocked',
+        'terminal progress compatibility save did not update the compact progress projection',
         {attempts: 20}
     )
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
     assert.equal(
         (after['storagePayload.read.queue.calls'] || 0) -
             (before['storagePayload.read.queue.calls'] || 0),
@@ -3547,6 +3549,12 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].sourceSettlementOutcome, 'confirmed')
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 2)
     assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement'], undefined)
+    assert.equal(storage.mbProfileNukeProgress[hrefA], undefined)
+    assert.equal(storage.mbProfileNukeProgress[hrefB], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[hrefA].status, 'blocked')
+    assert.equal(storage.mbProfileNukeProgressView.records[hrefB].status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, hrefA).status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, hrefB).status, 'blocked')
     assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.terminalSettlement.save.queueWal.bytes'] > 0, true)
     assert.equal((sw.state().queueWakeupCounters['storagePayload.write.queue.bytes'] || 0), 0)
 
@@ -3817,6 +3825,59 @@ test('terminal settlement derived save failure does not poison authority settlem
     assert.equal(storage.mbCoordinatorQueue[href].sourceSettlementOutcome, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
     assert.ok(storage.mbSpacePendingNukedPosts['post-terminal-settlement-derived-failure'])
+    assert.equal(sw.state().queueWakeupCounters['terminalSettlement.derivedSaveFailed'] || 0, 1)
+    assert.ok(
+        sw.state().hasStoredWorkRepairTimeout ||
+            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+    )
+})
+
+test('terminal settlement progress projection failure does not poison authority settlement', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Progress-Projection-Failure'
+    const runId = 'run-terminal-settlement-progress-projection-failure'
+    const attemptId = 'attempt-terminal-settlement-progress-projection-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 254720,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 254720}),
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    terminalAt: 254730,
+                    updatedAt: 254730
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {},
+            mbSpacePendingNukedPosts: {},
+            mbSpaceNukedPosts: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
+            throw new Error('synthetic terminal settlement progress projection failure')
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
+
+    assert.equal(result.settled, 1)
+    assert.equal(result.confirmed, 1)
+    assert.equal(result.progressRestored, 1)
+    assert.equal(storage.mbCoordinatorQueue[href].sourceSettlementOutcome, undefined)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView, undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
+    assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.derivedSaveFailed'] || 0, 1)
     assert.ok(
         sw.state().hasStoredWorkRepairTimeout ||
