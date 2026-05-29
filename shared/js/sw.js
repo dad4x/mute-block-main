@@ -2138,26 +2138,46 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
     const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
 
     if(runsChanged || progressChanged) {
-        let derivedSaved = false
+        let derivedSaved = true
+        let progressProjectionSaved = {saved: true, rows: 0}
         try {
-            derivedSaved = await saveCoordinatorState({
-                runs: runsChanged ? nextRuns : undefined,
-                progress: progressChanged ? pruneProfileNukeProgress(progress) : undefined
-            }, {
-                queue: false,
-                runs: runsChanged,
-                progress: progressChanged,
-                reason: 'repair',
-                queueOperation: 'repair-non-profile-landing-derived',
-                queueChangedRows: 0
-            })
+            progressProjectionSaved = progressChanged
+                ? await saveProfileNukeProgressRowProjection({[href]: progress[href]}, {
+                    metricPath: 'repair.nonProfileLanding.progressProjection'
+                })
+                : {saved: true, rows: 0}
         }
         catch(error) {
-            derivedSaved = false
+            progressProjectionSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-non-profile-landing-derived-save-failed',
-                error?.message || 'Non-profile landing derived save failed'
+                'repair-non-profile-landing-progress-projection-save-failed',
+                error?.message || 'Non-profile landing progress projection save failed'
             )
+        }
+        if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+            derivedSaved = false
+        }
+        if(runsChanged) {
+            try {
+                derivedSaved = await saveCoordinatorState({
+                    runs: nextRuns,
+                    progress: undefined
+                }, {
+                    queue: false,
+                    runs: true,
+                    progress: false,
+                    reason: 'repair',
+                    queueOperation: 'repair-non-profile-landing-derived',
+                    queueChangedRows: 0
+                }) && derivedSaved
+            }
+            catch(error) {
+                derivedSaved = false
+                recordCoordinatorDiagnosticEvent(
+                    'repair-non-profile-landing-derived-save-failed',
+                    error?.message || 'Non-profile landing derived save failed'
+                )
+            }
         }
         if(derivedSaved === false) {
             incrementQueueWakeupMetric('repair.nonProfileLanding.derivedSaveFailed')
@@ -2301,25 +2321,45 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         : runs
     const runsChanged = affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)
     let derivedSaved = true
+    let progressProjectionSaved = {saved: true, rows: 0}
     try {
-        derivedSaved = await saveCoordinatorState({
-            runs: runsChanged ? nextRuns : undefined,
-            progress: progressChanged ? pruneProfileNukeProgress(progress) : undefined
-        }, {
-            queue: false,
-            runs: runsChanged,
-            progress: progressChanged,
-            reason: 'repair',
-            queueOperation: 'repair-active-without-actor-derived',
-            queueChangedRows: 0
-        })
+        progressProjectionSaved = progressChanged
+            ? await saveProfileNukeProgressRowProjection({[href]: progress[href]}, {
+                metricPath: 'repair.activeWithoutActor.progressProjection'
+            })
+            : {saved: true, rows: 0}
     }
     catch(error) {
-        derivedSaved = false
+        progressProjectionSaved = false
         recordCoordinatorDiagnosticEvent(
-            'repair-active-without-actor-derived-save-failed',
-            error?.message || 'Active-without-actor derived save failed'
+            'repair-active-without-actor-progress-projection-save-failed',
+            error?.message || 'Active-without-actor progress projection save failed'
         )
+    }
+    if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+        derivedSaved = false
+    }
+    if(runsChanged) {
+        try {
+            derivedSaved = await saveCoordinatorState({
+                runs: nextRuns,
+                progress: undefined
+            }, {
+                queue: false,
+                runs: true,
+                progress: false,
+                reason: 'repair',
+                queueOperation: 'repair-active-without-actor-derived',
+                queueChangedRows: 0
+            }) && derivedSaved
+        }
+        catch(error) {
+            derivedSaved = false
+            recordCoordinatorDiagnosticEvent(
+                'repair-active-without-actor-derived-save-failed',
+                error?.message || 'Active-without-actor derived save failed'
+            )
+        }
     }
     if(derivedSaved === false) {
         incrementQueueWakeupMetric('repair.activeWithoutActor.derivedSaveFailed')

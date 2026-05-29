@@ -1418,7 +1418,8 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(nonProfileLandingMutationBody, /expectedAttemptNumber/)
     assert.match(nonProfileLandingMutationBody, /currentAuthorityState/)
     assert.match(nonProfileLandingMutationBody, /context\.reject\('row-changed-before-authority-apply'\)/)
-    assert.match(nonProfileLandingMutationBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined,[\s\S]*progress: progressChanged \? pruneProfileNukeProgress\(progress\) : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'repair'/)
+    assert.match(nonProfileLandingMutationBody, /saveProfileNukeProgressRowProjection\(\{\[href\]: progress\[href\]\}/)
+    assert.match(nonProfileLandingMutationBody, /if\(runsChanged\) \{[\s\S]*saveCoordinatorState\(\{[\s\S]*runs: nextRuns,[\s\S]*progress: undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*runs: true,[\s\S]*progress: false,[\s\S]*reason: 'repair'/)
     assert.match(activeWithoutActorBody, /mutateCoordinatorProjection\(\{[\s\S]*kind: 'reconcileActiveWithoutRuntimeActor'[\s\S]*reason: 'repair'[\s\S]*itemKey,[\s\S]*expectedItem,[\s\S]*expectedRecord/)
     assert.match(activeWithoutActorMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'repair'\)/)
     assert.match(activeWithoutActorMutationBody, /snapshotReason !== 'repair'/)
@@ -1432,7 +1433,8 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(activeWithoutActorMutationBody, /expectedAttemptNumber/)
     assert.match(activeWithoutActorMutationBody, /reason: 'ordinaryMutation'/)
     assert.match(activeWithoutActorMutationBody, /metricPath: 'repair\.activeWithoutActor\.save'/)
-    assert.match(activeWithoutActorMutationBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined,[\s\S]*progress: progressChanged \? pruneProfileNukeProgress\(progress\) : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'repair',[\s\S]*queueOperation: 'repair-active-without-actor-derived'/)
+    assert.match(activeWithoutActorMutationBody, /saveProfileNukeProgressRowProjection\(\{\[href\]: progress\[href\]\}/)
+    assert.match(activeWithoutActorMutationBody, /if\(runsChanged\) \{[\s\S]*saveCoordinatorState\(\{[\s\S]*runs: nextRuns,[\s\S]*progress: undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*runs: true,[\s\S]*progress: false,[\s\S]*reason: 'repair',[\s\S]*queueOperation: 'repair-active-without-actor-derived'/)
 })
 
 test('stale-attempt diagnostics are serialized with coordinator updates', () => {

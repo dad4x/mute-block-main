@@ -5824,8 +5824,10 @@ test('authority reconcile reclaims durable active row without confirmed runtime 
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
     assert.equal(sw.state().activeQueuedTabs.length, 0)
 })
 
@@ -6470,8 +6472,10 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'profile-unavailable')
-    assert.match(storage.mbProfileNukeProgress[href].unavailableReason, /did not land on a profile page/)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
+    assert.match(getProgressShardRecord(storage, href).unavailableReason, /did not land on a profile page/)
     await timers.tick(1000)
     await flushAsync(20)
     assert.equal(browser.__tabs.has(tabId), false)
@@ -6548,7 +6552,9 @@ test('authority reconcile skips durable active profile row that landed on a non-
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'profile-unavailable')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(browser.__tabs.has(tabId), false)
     assert.equal(browser.__removedTabs.includes(tabId), true)
 })
@@ -6605,7 +6611,9 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     assert.equal(result.outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'profile-unavailable')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     const walRecords = getWalRecordsForGeneration(
@@ -6922,7 +6930,9 @@ test('non-profile landing projection failure does not poison WAL terminalization
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.ok(storage.mbCoordinatorQueueWal)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'profile-unavailable')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
 
@@ -6990,6 +7000,8 @@ test('non-profile landing derived failure does not poison authority terminalizat
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.ok(storage.mbCoordinatorQueueWal)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.state().queueWakeupCounters['repair.nonProfileLanding.derivedSaveFailed'] || 0, 1)
     assert.ok(
@@ -13412,8 +13424,10 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, 'attempt-active-no-actor')
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -13601,7 +13615,9 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
     assert.equal(result.failed, 1)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'interrupted')
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'interrupted')
+    assert.equal(getProgressShardRecord(storage, href).status, 'interrupted')
 
     const walRecords = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
