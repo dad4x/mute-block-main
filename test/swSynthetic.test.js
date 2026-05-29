@@ -5,6 +5,7 @@ const {
 } = require('./lib/swHarness')
 const {
     getWalRecordsForGeneration,
+    getSegmentedWalSegmentKey,
     hydrateSegmentedWalStore,
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
@@ -3078,6 +3079,11 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(walRecords[2].operationKind, 'terminal-progress')
     assert.equal(walRecords[3].operationKind, 'terminal-settlement')
     assert.equal(getStoredCoordinatorQueueWal(storage).meta.nextSeq, 5)
+    const oldActiveGeneration = getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
+    const oldSegmentKeys = [0, 1, 2, 3].map(segmentNo =>
+        getSegmentedWalSegmentKey('mbCoordinatorQueueWal', oldActiveGeneration, segmentNo))
+    assert.equal(oldSegmentKeys.every(key => Object.prototype.hasOwnProperty.call(storage, key)), true)
+    storage.mbCoordinatorQueueWal = getStoredCoordinatorQueueWal(storage)
 
     const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
 
@@ -3087,6 +3093,10 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(checkpointSwitch.checkpointedRecords, 4)
     assert.equal(checkpointSwitch.tailLength, 0)
     assert.equal(checkpointSwitch.mirrorSaved, true)
+    assert.equal(checkpointSwitch.physicalCleanup?.removed, true)
+    assert.ok(checkpointSwitch.physicalCleanup.keyCount >= oldSegmentKeys.length + 1)
+    assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueWal'), false)
+    assert.equal(oldSegmentKeys.some(key => Object.prototype.hasOwnProperty.call(storage, key)), false)
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueue[hrefC].status, 'active')
@@ -3139,6 +3149,68 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(postAppendRecords[0].seq, 5)
     assert.equal(postAppendRecords[1].seq, 6)
     assert.equal(getStoredCoordinatorQueueWal(restarted.storage).meta.nextSeq, 7)
+})
+
+test('terminal authority queue WAL physical cleanup failure does not poison checkpoint switch', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Wal-Cleanup-Failure'
+    const runId = 'run-terminal-wal-cleanup-failure'
+    const attemptId = 'attempt-terminal-wal-cleanup-failure'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 252850,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId: 529, now: 252850})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const terminal = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        terminalAt: 252860,
+        actionKind: 'mute-block',
+        runId,
+        tabId: 529,
+        attemptId,
+        attemptNumber: 1
+    }, {expectTerminal: true, senderTabId: 529})
+    assert.equal(terminal.recorded, true)
+
+    const oldActiveGeneration = getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
+    const oldSegmentKey = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', oldActiveGeneration, 0)
+    assert.ok(storage[oldSegmentKey])
+    storage.mbCoordinatorQueueWal = getStoredCoordinatorQueueWal(storage)
+
+    const originalRemove = browser.storage.local.remove.bind(browser.storage.local)
+    browser.storage.local.remove = async keys => {
+        const list = Array.isArray(keys) ? keys : [keys]
+        if(list.includes('mbCoordinatorQueueWal') || list.includes(oldSegmentKey)) {
+            throw new Error('synthetic physical cleanup failure')
+        }
+        return originalRemove(keys)
+    }
+
+    const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+
+    assert.equal(checkpointSwitch.checkpointSwitched, true)
+    assert.equal(checkpointSwitch.durable, true)
+    assert.equal(checkpointSwitch.physicalCleanup?.removed, false)
+    assert.equal(checkpointSwitch.physicalCleanup?.reason, 'storage-remove-failed')
+    assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueWal'), true)
+    assert.equal(Object.prototype.hasOwnProperty.call(storage, oldSegmentKey), true)
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'succeeded')
+    const restarted = loadServiceWorkerHarness({
+        now: 252870,
+        storage
+    })
+    assert.equal((await restarted.sw.coordinatorAuthority.hydrate()).queue[href].status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupFailed'] || 0, 1)
 })
 
 test('terminal authority queue WAL checkpoint survives compatibility mirror failure', async () => {

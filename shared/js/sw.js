@@ -37,6 +37,7 @@ const {
     buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
     getWalRecordsForGeneration,
+    getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     getSegmentedWalMetaKey,
     hydrateSegmentedWalStore,
@@ -1566,6 +1567,31 @@ async function metricStorageSet(payload = {}, options = {}) {
     notifyCoordinatorAuthorityPersistedSnapshot(payload)
     notifyCoordinatorDashboardStateChanged(keys, pathName)
     return result
+}
+
+async function metricStorageRemove(keys = [], options = {}) {
+    const normalizedKeys = Array.from(new Set((Array.isArray(keys) ? keys : [keys])
+        .map(key => `${key || ''}`.trim())
+        .filter(Boolean)))
+    if(!normalizedKeys.length) return true
+    if(suppressAbandonedStorageOperation('storageRemove')) return false
+
+    const pathName = getStorageMetricPathName(options)
+    incrementQueueWakeupMetric('storageRemoveCalls')
+    incrementQueueWakeupMetric(`storageRemove.${normalizeStorageMetricPathName(pathName)}.keys`, normalizedKeys.length)
+    recordQueueWakeupMetricMax(`storageRemove.${normalizeStorageMetricPathName(pathName)}.maxKeys`, normalizedKeys.length)
+    incrementActiveStorageMetricDetail('storageRemoveCalls')
+    setActiveStorageMetricDetail('removeKeys', normalizedKeys.slice(0, 12).join(','))
+    setActiveStorageMetricDetail('removePath', normalizeStorageMetricPathName(pathName))
+
+    const startedAt = Date.now()
+    try {
+        await runQueueWakeupMetricPhase(options.phase || 'storageRemove', () => coordinatorStorageAdapter.remove(normalizedKeys))
+        return true
+    }
+    finally {
+        recordStoragePathLatencyMetrics('write', pathName, Date.now() - startedAt)
+    }
 }
 
 function notifyCoordinatorDashboardStateChanged(keys = [], reason = '') {
@@ -5243,6 +5269,81 @@ function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
     }
 }
 
+function getRetiredCoordinatorQueueWalPhysicalKeys(previousMeta = null, nextMeta = null) {
+    if(!isSegmentedWalStorageMeta(nextMeta)) return []
+
+    const keys = new Set([COORDINATOR_QUEUE_WAL_KEY])
+    const nextActiveGenerationId = nextMeta?.activeCheckpoint || ''
+    if(isSegmentedWalStorageMeta(previousMeta)) {
+        const previousCommittedSegments = previousMeta?.segmentedStorage?.committedSegments || {}
+        const previousGenerations = {
+            ...(previousMeta?.generations || {}),
+            ...Object.fromEntries(Object.entries(previousCommittedSegments)
+                .map(([generationId, committedSegments]) => [
+                    generationId,
+                    {segments: committedSegments}
+                ]))
+        }
+        for(const generationId of Object.keys(previousGenerations)) {
+            if(!generationId || generationId === nextActiveGenerationId) continue
+            const committedSegments = getSegmentedWalCommittedSegmentCount(previousMeta, generationId)
+            for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+                keys.add(getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, generationId, segmentNo))
+            }
+        }
+    }
+
+    return Array.from(keys)
+}
+
+async function cleanupRetiredCoordinatorQueueWalPhysicalKeys(previousMeta = null, nextMeta = null, options = {}) {
+    const retiredKeys = getRetiredCoordinatorQueueWalPhysicalKeys(previousMeta, nextMeta)
+    if(!retiredKeys.length) {
+        return {
+            removed: false,
+            keyCount: 0,
+            keys: []
+        }
+    }
+
+    try {
+        const removed = await metricStorageRemove(retiredKeys, {
+            metricPath: options.metricPath || 'queueWal.physicalCleanup.remove'
+        })
+        if(removed === false) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalCleanupSuppressed')
+            return {
+                removed: false,
+                keyCount: retiredKeys.length,
+                keys: retiredKeys,
+                reason: 'storage-remove-suppressed'
+            }
+        }
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalCleanupRemoved')
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalCleanupRemovedKeys', retiredKeys.length)
+        recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxPhysicalCleanupKeys', retiredKeys.length)
+        return {
+            removed: true,
+            keyCount: retiredKeys.length,
+            keys: retiredKeys
+        }
+    }
+    catch(error) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalCleanupFailed')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-physical-cleanup-failed',
+            error?.message || 'Coordinator authority queue WAL physical cleanup failed'
+        )
+        return {
+            removed: false,
+            keyCount: retiredKeys.length,
+            keys: retiredKeys,
+            reason: 'storage-remove-failed',
+            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+        }
+    }
+}
+
 function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {
     const normalizedSnapshot = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(snapshotQueue || {}))
     if(!walStore || typeof walStore !== 'object') {
@@ -5673,10 +5774,12 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             }
         }
 
+        const previousWalMeta = stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
         let walSaved = false
+        let checkpointWal = null
         try {
-            const checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
-                previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null,
+            checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
+                previousMeta: previousWalMeta,
                 forceWriteCheckpoints: true
             })
             walSaved = await metricStorageSet(checkpointWal.payload, {
@@ -5726,10 +5829,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         try {
             const mirrorPayload = {
                 [COORDINATOR_QUEUE_KEY]: recoveredQueue,
-                ...getCoordinatorQueueWalPhysicalPayload(activated.store, {
-                    previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null,
-                    forceWriteCheckpoints: true
-                }).payload,
+                ...(checkpointWal?.payload || {}),
                 ...buildCoordinatorQueueDerivedProjectionPayload(recoveredQueue)
             }
             mirrorSaved = await metricStorageSet(mirrorPayload, {
@@ -5758,6 +5858,12 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.compatMirrorSaved')
         }
 
+        const physicalCleanup = await cleanupRetiredCoordinatorQueueWalPhysicalKeys(
+            previousWalMeta,
+            checkpointWal?.payload?.[COORDINATOR_QUEUE_WAL_META_KEY] || null,
+            {metricPath: options.cleanupMetricPath || 'queueWal.checkpointSwitch.physicalCleanup.remove'}
+        )
+
         return {
             checkpointSwitched: true,
             saved: true,
@@ -5768,6 +5874,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             tailLength: getWalRecordsForGeneration(activated.store, activated.store?.meta?.activeCheckpoint).length,
             walStore: activated.store,
             mirrorSaved: mirrorSaved !== false,
+            physicalCleanup,
             queue: recoveredQueue
         }
     }, {

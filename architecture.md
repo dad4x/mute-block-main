@@ -32,6 +32,22 @@ processing mechanism. Treat that deliberately: the normal queue processor should
 be a reconciler/scheduler tick, not several separate direct paths plus a broad
 exception handler.
 
+Terminology target: when the queue WAL is the authority, stale or missing
+derived state is not normally "repair". It is reconciliation or materialization
+from authority. Use:
+
+- `apply` for reducer/authority operations and WAL record application;
+- `resolve` for ambiguity decisions such as profile target resolution;
+- `reconcile` for comparing authority, runtime actors, and derived state;
+- `materialize` for writing derived runs/events/progress/views from authority;
+- `recover` for startup/crash rebuild from checkpoint plus WAL tail;
+- `audit` or `validate` for mismatch detection without mutation;
+- `legacy cleanup` for one-time snapshot-era or invariant cleanup.
+
+Long term, ordinary scheduler and derived-state paths should not use `repair`
+names. Reserve `repair` only for true authority corruption or unavoidable legacy
+compatibility cleanup while the transition is in progress.
+
 Each tick should be two-phase:
 
 1. Observe: load the bounded durable state needed for the tick, inspect owned
@@ -77,7 +93,7 @@ Ordinary queue/progress/runs changes should not be scattered full-map
 load/edit/save operations. The storage authority layer should make mutation
 reasons explicit and keep compatibility paths from creating truth.
 
-Near-term requirements:
+Current cleanup requirements:
 
 - reason-tag all snapshot writes;
 - inventory full-state load/save call sites;
@@ -85,6 +101,28 @@ Near-term requirements:
 - prevent content scripts from writing coordinator authority maps directly;
 - keep executor startup behind durable authority;
 - add tests that make new direct authority writes visible.
+
+Cleanup end state:
+
+- queue WAL records are the durable row authority;
+- raw `mbCoordinatorQueue` is a checkpoint/compatibility mirror, not the
+  per-row authority path;
+- `mbProfileNukeProgress` is not a queue-authority input and does not receive
+  ordinary milestone or terminal mirror writes;
+- progress views, progress shards, queue views, runs, events, source-post
+  pending records, and remembered post state are derived materializations;
+- derived materialization failure never poisons an already-durable queue WAL
+  acknowledgement;
+- startup, dashboard, content, executor, and reconcile reads use projected
+  current authority instead of raw queue/progress snapshots;
+- legacy progress request handlers either reroute valid current-attempt rows to
+  job progress/WAL authority or reject; they do not fall back to full progress
+  snapshot writes;
+- broad progress-derived queue mutation is split into explicit, tested
+  materializers or deleted;
+- ordinary code uses `reconcile`, `materialize`, `recover`, `resolve`, and
+  `apply` names; `repair` remains only for true authority corruption or
+  explicitly bounded legacy cleanup.
 
 The target storage design is WAL plus A/B checkpoints:
 
@@ -95,6 +133,16 @@ The target storage design is WAL plus A/B checkpoints:
 - gzip is the first production compression target for checkpoint snapshots, with
   raw JSON fallback;
 - WAL is durability/replay format, not an alternate state machine.
+
+The logical WAL and checkpoint model is separate from the physical storage
+adapter. Correctness and authority isolation came first; segmented physical
+queue WAL storage has now begun for `mbCoordinatorQueueWal`, using
+generation-local record segments plus a small manifest cursor. Segment numbers
+reset on each checkpoint generation, while WAL record sequence numbers remain
+monotonic within the active logical WAL generation. Remaining work is hardening
+segmented recovery, reducing compatibility mirrors, and cleaning old physical
+generations. See
+[queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md).
 
 Terminology: older code, metrics, and notes may still say `compaction`. In the
 architecture, read that as checkpoint generation switching plus later
@@ -118,6 +166,12 @@ milestones, terminal results, and page observations back to the service worker.
 Content-side timeout or message failure must not trigger a direct durable write
 to coordinator authority maps. It may record local observation only where that
 cannot move queue truth.
+
+After cleanup, content scripts should not send legacy `record-nuke-progress`
+fallback messages. Active queued work reports through job milestone/terminal
+messages that carry attempt identity and are accepted or rejected by the service
+worker authority boundary. Non-queued local observations may update content-local
+UI state, but they do not persist service-worker queue/progress authority.
 
 ## Shared Moderation Boundary
 
@@ -147,7 +201,11 @@ Architecture health should be measurable:
 - pump/nudge/repair yield;
 - storage timeout, deadline miss, fallback, abandoned, late-write suppression;
 - snapshot write reason, bytes, rows, and call path;
-- queued/active/terminal movement per tick window.
+- queued/active/terminal movement per tick window;
+- legacy progress fallback rejection count;
+- derived materialization failure and recovery count by materializer;
+- WAL append bytes, record bytes, checkpoint generation switch count, active
+  tail length, and physical segment count for segmented queue WAL storage.
 
 Tests should exercise state snapshots directly:
 
@@ -159,7 +217,11 @@ Tests should exercise state snapshots directly:
 - durable active rows without actors;
 - runtime actors without durable rows;
 - compatibility progress trying to move terminal truth backward;
-- repeated ticks reaching a fixed point or bounded progress.
+- repeated ticks reaching a fixed point or bounded progress;
+- legacy progress requests with and without current authority;
+- derived materialization failure after durable WAL acknowledgement;
+- restart recovery from checkpoint plus WAL tail;
+- segmented WAL orphan, missing-segment, and manifest edge cases.
 
 ## Supporting Architecture Notes
 
@@ -171,6 +233,8 @@ Tests should exercise state snapshots directly:
   storage authority cleanup plan.
 - [storage-wal-overlay-design-2026-05-20.md](storage-wal-overlay-design-2026-05-20.md):
   WAL/checkpoint design.
+- [queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md):
+  physical WAL segmentation follow-up.
 - [shared-moderation-publication-design-2026-05-18.md](shared-moderation-publication-design-2026-05-18.md):
   shared moderation design.
 - [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable
