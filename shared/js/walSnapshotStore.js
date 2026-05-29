@@ -19,6 +19,7 @@ const TERMINAL_STATUSES = new Set([
 const RAW_SNAPSHOT_CODEC = 'raw-json'
 const GZIP_SNAPSHOT_CODEC = 'gzip'
 const BASE64_ENCODING = 'base64'
+const SEGMENTED_WAL_STORAGE_VERSION = 1
 
 function cloneJson(value) {
     if(value === undefined) return undefined
@@ -360,6 +361,187 @@ function getWalRecordsForGeneration(store = {}, generationId = CHECKPOINT_A) {
         .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
 }
 
+function getSegmentedWalMetaKey(baseKey = 'wal') {
+    return `${baseKey}.meta`
+}
+
+function getSegmentedWalCheckpointKey(baseKey = 'wal', checkpointId = CHECKPOINT_A) {
+    return `${baseKey}.checkpoint.${normalizeCheckpointId(checkpointId)}`
+}
+
+function getSegmentedWalSegmentKey(baseKey = 'wal', generationId = CHECKPOINT_A, segmentNo = 0) {
+    const normalizedSegmentNo = normalizeSeq(segmentNo)
+    return `${baseKey}.segment.${normalizeCheckpointId(generationId)}.${`${normalizedSegmentNo}`.padStart(4, '0')}`
+}
+
+function makeSegmentedWalStorageMeta(store = {}, options = {}) {
+    const committedSegments = {}
+    const generations = {}
+    const sourceGenerations = store?.wal || {}
+    for(const generationId of [CHECKPOINT_A, CHECKPOINT_B]) {
+        const generation = getWalGeneration(store, generationId)
+        committedSegments[generationId] = Array.isArray(generation?.segments) ? generation.segments.length : 0
+        generations[generationId] = {
+            snapshotSeq: normalizeSeq(generation?.snapshotSeq),
+            segments: committedSegments[generationId]
+        }
+    }
+    for(const generationId of Object.keys(sourceGenerations || {})) {
+        if(generationId === CHECKPOINT_A || generationId === CHECKPOINT_B) continue
+        const generation = sourceGenerations[generationId]
+        committedSegments[generationId] = Array.isArray(generation?.segments) ? generation.segments.length : 0
+        generations[generationId] = {
+            snapshotSeq: normalizeSeq(generation?.snapshotSeq),
+            segments: committedSegments[generationId]
+        }
+    }
+
+    return {
+        ...(cloneJson(store?.meta || makeWalMeta()) || {}),
+        generations: {
+            ...(cloneJson(store?.meta?.generations || {}) || {}),
+            ...generations
+        },
+        segmentedStorage: {
+            version: SEGMENTED_WAL_STORAGE_VERSION,
+            committedSegments,
+            softSwitchAt: normalizeSeq(options.softSwitchAt),
+            hardSegmentLimit: normalizeSeq(options.hardSegmentLimit),
+            updatedAt: normalizeSeq(options.updatedAt)
+        }
+    }
+}
+
+function isSegmentedWalStorageMeta(value = null) {
+    return value &&
+        typeof value === 'object' &&
+        value.segmentedStorage &&
+        Number.parseInt(value.segmentedStorage.version, 10) === SEGMENTED_WAL_STORAGE_VERSION
+}
+
+function getSegmentedWalCommittedSegmentCount(meta = {}, generationId = CHECKPOINT_A) {
+    const id = normalizeCheckpointId(generationId)
+    const fromSegmented = Number.parseInt(meta?.segmentedStorage?.committedSegments?.[id], 10)
+    if(Number.isFinite(fromSegmented) && fromSegmented >= 0) return fromSegmented
+    return normalizeSeq(meta?.generations?.[id]?.segments)
+}
+
+function buildSegmentedWalStorageDefaults(meta = null, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const defaults = {
+        [getSegmentedWalMetaKey(baseKey)]: null
+    }
+    if(!isSegmentedWalStorageMeta(meta)) return defaults
+
+    const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
+    defaults[getSegmentedWalCheckpointKey(baseKey, activeCheckpoint)] = null
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        defaults[getSegmentedWalSegmentKey(baseKey, activeCheckpoint, segmentNo)] = null
+    }
+    return defaults
+}
+
+function normalizeSegmentedWalSegment(value = null, generationId = CHECKPOINT_A, segmentNo = 0) {
+    if(!value || typeof value !== 'object') return null
+    const segment = value.segment && typeof value.segment === 'object' ? value.segment : value
+    const normalized = makeWalSegment(segment.records || [], {
+        ...segment,
+        id: segment.id || value.id || `segment-${normalizeCheckpointId(generationId)}-${segmentNo}`
+    })
+    return {
+        version: value.version || SEGMENTED_WAL_STORAGE_VERSION,
+        generation: normalizeCheckpointId(value.generation || generationId),
+        segmentNo: normalizeSeq(value.segmentNo, segmentNo),
+        segment: normalized
+    }
+}
+
+function buildSegmentedWalStoragePayload(store = {}, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const meta = makeSegmentedWalStorageMeta(store, options)
+    const payload = {
+        [getSegmentedWalMetaKey(baseKey)]: meta
+    }
+    const generationsToWrite = options.generationsToWrite || [CHECKPOINT_A, CHECKPOINT_B]
+    const segmentStartByGeneration = options.segmentStartByGeneration || {}
+    const writeCheckpoints = options.writeCheckpoints !== false
+
+    for(const generationId of generationsToWrite) {
+        const id = normalizeCheckpointId(generationId)
+        if(writeCheckpoints && store?.checkpoints && Object.prototype.hasOwnProperty.call(store.checkpoints, id)) {
+            payload[getSegmentedWalCheckpointKey(baseKey, id)] = cloneJson(store.checkpoints[id] || null)
+        }
+        const generation = getWalGeneration(store, id)
+        const segments = Array.isArray(generation?.segments) ? generation.segments : []
+        const start = Math.min(Math.max(0, normalizeSeq(segmentStartByGeneration[id])), segments.length)
+        for(let index = start; index < segments.length; index += 1) {
+            payload[getSegmentedWalSegmentKey(baseKey, id, index)] = {
+                version: SEGMENTED_WAL_STORAGE_VERSION,
+                generation: id,
+                segmentNo: index,
+                segment: cloneJson(segments[index])
+            }
+        }
+    }
+
+    return payload
+}
+
+function hydrateSegmentedWalStore(stored = {}, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const meta = cloneJson(stored?.[getSegmentedWalMetaKey(baseKey)] || null)
+    if(!isSegmentedWalStorageMeta(meta)) {
+        return {
+            ok: false,
+            reason: 'missing-segmented-meta',
+            store: cloneJson(options.fallbackStore || null)
+        }
+    }
+
+    const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
+    const checkpoint = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, activeCheckpoint)] || null)
+    if(!checkpoint) {
+        return {ok: false, reason: 'missing-checkpoint', store: null, meta}
+    }
+
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
+    const segments = []
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        const key = getSegmentedWalSegmentKey(baseKey, activeCheckpoint, segmentNo)
+        const wrapped = normalizeSegmentedWalSegment(stored?.[key], activeCheckpoint, segmentNo)
+        if(!wrapped) {
+            return {ok: false, reason: 'missing-segment', missingKey: key, store: null, meta}
+        }
+        if(wrapped.generation !== activeCheckpoint || wrapped.segmentNo !== segmentNo) {
+            return {ok: false, reason: 'segment-identity-mismatch', missingKey: key, store: null, meta}
+        }
+        segments.push(wrapped.segment)
+    }
+
+    const inactiveCheckpoint = getInactiveCheckpointId(activeCheckpoint)
+    const inactiveStored = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, inactiveCheckpoint)] || null)
+    const store = {
+        meta,
+        checkpoints: {
+            [activeCheckpoint]: checkpoint,
+            [inactiveCheckpoint]: inactiveStored || null
+        },
+        wal: {
+            [activeCheckpoint]: makeWalGeneration({
+                snapshotSeq: meta?.generations?.[activeCheckpoint]?.snapshotSeq || checkpoint.snapshotSeq,
+                segments
+            }),
+            [inactiveCheckpoint]: makeWalGeneration({
+                snapshotSeq: meta?.generations?.[inactiveCheckpoint]?.snapshotSeq || inactiveStored?.snapshotSeq || 0,
+                segments: []
+            })
+        }
+    }
+
+    return {ok: true, reason: '', store, meta}
+}
+
 function appendWalRecordsToGeneration(store = {}, records = [], options = {}) {
     const nextStore = cloneJson(store)
     const generationId = normalizeCheckpointId(options.generationId, nextStore?.meta?.activeCheckpoint || CHECKPOINT_A)
@@ -694,6 +876,7 @@ module.exports = {
     DEFAULT_RECOVERY_CRITICAL_AREAS,
     GZIP_SNAPSHOT_CODEC,
     RAW_SNAPSHOT_CODEC,
+    SEGMENTED_WAL_STORAGE_VERSION,
     WAL_SCHEMA_VERSION,
     activateCheckpoint,
     appendWalRecordsToGeneration,
@@ -703,14 +886,22 @@ module.exports = {
     bytesToBase64,
     bytesToText,
     cloneJson,
+    buildSegmentedWalStorageDefaults,
+    buildSegmentedWalStoragePayload,
     decodeCheckpointSnapshot,
     encodeCheckpointSnapshot,
     estimateStateBytes,
     getActiveCheckpoint,
     getInactiveCheckpointId,
+    getSegmentedWalCheckpointKey,
+    getSegmentedWalCommittedSegmentCount,
+    getSegmentedWalMetaKey,
+    getSegmentedWalSegmentKey,
     getWalGeneration,
     getWalRecordsForGeneration,
     hashState,
+    hydrateSegmentedWalStore,
+    isSegmentedWalStorageMeta,
     makeCheckpoint,
     makePairedCheckpointStore,
     makeWalGeneration,

@@ -34,7 +34,13 @@ const {
     activateCheckpoint,
     appendWalRecordsToGeneration,
     applyWalRecord,
+    buildSegmentedWalStorageDefaults,
+    buildSegmentedWalStoragePayload,
     getWalRecordsForGeneration,
+    getSegmentedWalCommittedSegmentCount,
+    getSegmentedWalMetaKey,
+    hydrateSegmentedWalStore,
+    isSegmentedWalStorageMeta,
     makePairedCheckpointStore,
     recoverProjectedState,
     writeInactiveCheckpoint
@@ -52,6 +58,9 @@ const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
+const COORDINATOR_QUEUE_WAL_META_KEY = getSegmentedWalMetaKey(COORDINATOR_QUEUE_WAL_KEY)
+const COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT = 896
+const COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT = 1024
 const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
 const COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'
 const COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex.'
@@ -1217,6 +1226,7 @@ function runQueueWakeupMetricPhase(name = '', callback = () => undefined) {
 function getStorageMetricKeyName(key = '') {
     if(key === COORDINATOR_QUEUE_KEY) return 'queue'
     if(key === COORDINATOR_QUEUE_WAL_KEY) return 'queueWal'
+    if(`${key || ''}`.startsWith(`${COORDINATOR_QUEUE_WAL_KEY}.`)) return 'queueWal'
     if(key === COORDINATOR_QUEUE_VIEW_KEY) return 'queueView'
     if(key === COORDINATOR_CONTENT_QUEUE_INDEX_KEY) return 'contentQueueIndex'
     if(`${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX)) return 'contentSourceIndex'
@@ -3837,11 +3847,13 @@ function makeCoordinatorCurrentWorkAccounting(queue = {}) {
 async function getCoordinatorQueueAccounting(request = {}) {
     const stored = await metricStorageGet({
         [COORDINATOR_QUEUE_KEY]: {},
-        [COORDINATOR_QUEUE_WAL_KEY]: null,
+        ...getCoordinatorQueueWalStorageDefaults(),
         [COORDINATOR_QUEUE_VIEW_KEY]: null
     }, {metricPath: 'queueAccounting.read'})
     const rawQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY] || {})
-    const walStore = stored[COORDINATOR_QUEUE_WAL_KEY] || null
+    const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, rawQueue, {
+        metricPath: 'queueAccounting.read.segments'
+    })
     const recovery = recoverCoordinatorQueueFromWal(rawQueue, walStore)
     const recoveredQueue = normalizeCoordinatorMap(recovery.queue || rawQueue)
     const raw = makeCoordinatorQueueAccountingCounts(rawQueue)
@@ -5142,6 +5154,77 @@ function normalizeCoordinatorQueueWalStore(value = null, snapshotQueue = {}) {
     return makeCoordinatorQueueWalCheckpoint(snapshotQueue)
 }
 
+function getCoordinatorQueueWalStorageDefaults() {
+    return {
+        [COORDINATOR_QUEUE_WAL_KEY]: null,
+        ...buildSegmentedWalStorageDefaults(null, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
+    }
+}
+
+async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueue = {}, options = {}) {
+    const meta = stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
+    if(isSegmentedWalStorageMeta(meta)) {
+        const defaults = buildSegmentedWalStorageDefaults(meta, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
+        const missingKeys = Object.keys(defaults).filter(key => !Object.prototype.hasOwnProperty.call(stored, key))
+        let segmentStored = {}
+        if(missingKeys.length) {
+            segmentStored = await metricStorageGet(Object.fromEntries(missingKeys.map(key => [key, defaults[key]])), {
+                metricPath: options.metricPath || 'coordinatorQueueWal.segmented.load'
+            })
+            Object.assign(stored, segmentStored)
+        }
+        const hydrated = hydrateSegmentedWalStore(stored, {
+            baseKey: COORDINATOR_QUEUE_WAL_KEY,
+            fallbackStore: stored[COORDINATOR_QUEUE_WAL_KEY] || null
+        })
+        if(hydrated?.ok === true && hydrated.store) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrated')
+            stored[COORDINATOR_QUEUE_WAL_KEY] = hydrated.store
+            return hydrated.store
+        }
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateFailed')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-segmented-hydrate-failed',
+            hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
+        )
+    }
+
+    const fallback = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
+    stored[COORDINATOR_QUEUE_WAL_KEY] = fallback
+    return fallback
+}
+
+function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
+    const previousMeta = options.previousMeta || null
+    const activeGenerationId = store?.meta?.activeCheckpoint
+    const activeSegments = Array.isArray(store?.wal?.[activeGenerationId]?.segments)
+        ? store.wal[activeGenerationId].segments.length
+        : 0
+    const previousCommitted = isSegmentedWalStorageMeta(previousMeta)
+        ? getSegmentedWalCommittedSegmentCount(previousMeta, activeGenerationId)
+        : 0
+    const payload = buildSegmentedWalStoragePayload(store, {
+        baseKey: COORDINATOR_QUEUE_WAL_KEY,
+        softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+        hardSegmentLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
+        updatedAt: Date.now(),
+        segmentStartByGeneration: isSegmentedWalStorageMeta(previousMeta)
+            ? {[activeGenerationId]: previousCommitted}
+            : {},
+        generationsToWrite: isSegmentedWalStorageMeta(previousMeta)
+            ? [activeGenerationId]
+            : undefined
+    })
+    return {
+        payload,
+        previousCommitted,
+        committedSegments: activeSegments,
+        hardLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
+        softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+        segmented: true
+    }
+}
+
 function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {
     const normalizedSnapshot = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(snapshotQueue || {}))
     if(!walStore || typeof walStore !== 'object') {
@@ -5230,6 +5313,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY],
         result.previousProjectionQueue || {}
     )
+    const previousWalMeta = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
     const appendRecord = cloneCoordinatorAuthorityValue(record)
     delete appendRecord.id
     delete appendRecord.seq
@@ -5249,9 +5333,24 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         }
     }
 
-    const walSaved = await metricStorageSet({
-        [COORDINATOR_QUEUE_WAL_KEY]: append.store
-    }, {
+    const physicalWal = getCoordinatorQueueWalPhysicalPayload(append.store, {
+        previousMeta: previousWalMeta
+    })
+    if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'queue-wal-segment-hard-limit',
+            edgeTriggered: true
+        })
+        return {
+            saved: false,
+            backend: 'queue-wal',
+            reason: 'queue-wal-segment-hard-limit',
+            append
+        }
+    }
+
+    const walSaved = await metricStorageSet(physicalWal.payload, {
         metricPath: options.metricPath || `authority.${result.operationKind || 'row-mutation'}.queueWal.save`,
         queueOperation: result.operationKind || 'authority-row-mutation',
         queueChangedRows: 1,
@@ -5269,7 +5368,17 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended')
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
+    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentWrites', Object.keys(physicalWal.payload || {}).length)
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxAppendBytes', getJsonByteSize(append.records || []))
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
+    if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
+        void switchCoordinatorAuthorityQueueWalCheckpoint({
+            metricPath: 'queueWal.segmentSoftSwitch.load',
+            saveMetricPath: 'queueWal.segmentSoftSwitch.save',
+            mirrorMetricPath: 'queueWal.segmentSoftSwitch.compatMirror.save'
+        })
+    }
 
     let projectionSaved = true
     try {
@@ -5304,6 +5413,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         saved: true,
         backend: 'queue-wal',
         append,
+        physicalWal,
         projectionSaved,
         snapshotSaved: false,
         walSaved: true
@@ -5344,6 +5454,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY],
         options.previousProjectionQueue || {}
     )
+    const previousWalMeta = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
     const appendRecords = records.map(record => {
         const next = cloneCoordinatorAuthorityValue(record)
         delete next.id
@@ -5366,9 +5477,24 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         }
     }
 
-    const walSaved = await metricStorageSet({
-        [COORDINATOR_QUEUE_WAL_KEY]: append.store
-    }, {
+    const physicalWal = getCoordinatorQueueWalPhysicalPayload(append.store, {
+        previousMeta: previousWalMeta
+    })
+    if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
+        scheduleStoredWorkRepair(1000, {
+            reason: 'queue-wal-segment-hard-limit',
+            edgeTriggered: true
+        })
+        return {
+            saved: false,
+            backend: 'queue-wal',
+            reason: 'queue-wal-segment-hard-limit',
+            append
+        }
+    }
+
+    const walSaved = await metricStorageSet(physicalWal.payload, {
         metricPath: options.metricPath || `authority.${operationKind}.queueWal.save`,
         queueOperation: operationKind,
         queueChangedRows: records.length,
@@ -5386,7 +5512,17 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended', records.length)
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
+    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentWrites', Object.keys(physicalWal.payload || {}).length)
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxAppendBytes', getJsonByteSize(append.records || []))
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
+    if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
+        void switchCoordinatorAuthorityQueueWalCheckpoint({
+            metricPath: 'queueWal.segmentSoftSwitch.load',
+            saveMetricPath: 'queueWal.segmentSoftSwitch.save',
+            mirrorMetricPath: 'queueWal.segmentSoftSwitch.compatMirror.save'
+        })
+    }
     if(activeQueueWakeupStorageContext) {
         activeQueueWakeupStorageContext.coordinatorAuthorityQueueMutationApplied = true
         activeQueueWakeupStorageContext.coordinatorAuthorityQueueOperation = operationKind
@@ -5432,6 +5568,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         saved: true,
         backend: 'queue-wal',
         append,
+        physicalWal,
         projectionSaved,
         snapshotSaved: false,
         walSaved: true,
@@ -5450,12 +5587,14 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
     return enqueueSpaceFeedStorageUpdate(async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null
+            ...getCoordinatorQueueWalStorageDefaults()
         }, {
             metricPath: options.metricPath || 'queueWal.checkpointSwitch.load'
         })
         const snapshotQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY] || {})
-        const storedWal = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
+        const storedWal = await loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, {
+            metricPath: `${options.metricPath || 'queueWal.checkpointSwitch.load'}.segments`
+        })
         const recovered = recoverProjectedState(storedWal)
         if(recovered?.recovered !== true) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointFailed')
@@ -5518,9 +5657,10 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
 
         let walSaved = false
         try {
-            walSaved = await metricStorageSet({
-                [COORDINATOR_QUEUE_WAL_KEY]: activated.store
-            }, {
+            const checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
+                previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
+            })
+            walSaved = await metricStorageSet(checkpointWal.payload, {
                 metricPath: options.saveMetricPath || 'queueWal.checkpointSwitch.save',
                 queueOperation: 'queue-wal-checkpoint-switch',
                 queueChangedRows: Object.keys(recoveredQueue).length,
@@ -5567,7 +5707,9 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         try {
             const mirrorPayload = {
                 [COORDINATOR_QUEUE_KEY]: recoveredQueue,
-                [COORDINATOR_QUEUE_WAL_KEY]: activated.store,
+                ...getCoordinatorQueueWalPhysicalPayload(activated.store, {
+                    previousMeta: stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
+                }).payload,
                 ...buildCoordinatorQueueDerivedProjectionPayload(recoveredQueue)
             }
             mirrorSaved = await metricStorageSet(mirrorPayload, {
@@ -6544,7 +6686,8 @@ function createCoordinatorAuthority() {
                 if(persistenceResult?.append?.store) {
                     nextProjection.stored = {
                         ...(nextProjection.stored || {}),
-                        [COORDINATOR_QUEUE_WAL_KEY]: persistenceResult.append.store
+                        [COORDINATOR_QUEUE_WAL_KEY]: persistenceResult.append.store,
+                        ...(persistenceResult.physicalWal?.payload || {})
                     }
                 }
                 projection = nextProjection
@@ -6669,14 +6812,17 @@ async function loadCoordinatorQueueProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueProjection', async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null
+            ...getCoordinatorQueueWalStorageDefaults()
         }, {
             metricPath: options.metricPath || 'coordinatorQueueProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         recordActiveStorageWorkSnapshot(queue)
@@ -6692,15 +6838,18 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProjection', async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {}
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6719,7 +6868,7 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_KEY]: {},
             ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
@@ -6727,9 +6876,12 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6749,7 +6901,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorCurrentAuthorityState', async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
@@ -6759,9 +6911,12 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
             metricPath: 'currentAuthority.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: 'currentAuthority.load.segments'
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6781,16 +6936,19 @@ async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsEventsProjection', async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: []
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6811,7 +6969,7 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
             [PROFILE_NUKE_PROGRESS_KEY]: {},
@@ -6820,9 +6978,12 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6845,7 +7006,7 @@ async function loadCoordinatorRepairProjection(options = {}) {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
             [PROFILE_NUKE_PROGRESS_KEY]: {},
@@ -6857,9 +7018,12 @@ async function loadCoordinatorRepairProjection(options = {}) {
             metricPath: options.metricPath || 'repair.projection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'repair.projection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6883,16 +7047,19 @@ async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsPendingProjection', async () => {
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [SPACE_PENDING_NUKED_POSTS_KEY]: {}
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsPendingProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsPendingProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -6912,7 +7079,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
-            [COORDINATOR_QUEUE_WAL_KEY]: null,
+            ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             ...(progressProfileHrefs.length ? {
                 ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
@@ -6926,9 +7093,12 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
+        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+            metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'}.segments`
+        })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
-            stored[COORDINATOR_QUEUE_WAL_KEY]
+            walStore
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
@@ -8431,7 +8601,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
 
     const stored = await metricStorageGet({
         [COORDINATOR_QUEUE_KEY]: {},
-        [COORDINATOR_QUEUE_WAL_KEY]: null,
+        ...getCoordinatorQueueWalStorageDefaults(),
         [COORDINATOR_RUNS_KEY]: {},
         [PROFILE_NUKE_PROGRESS_KEY]: {},
         ...getProfileNukeProgressProjectionDefaults(requestedHrefs),
@@ -8441,9 +8611,12 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         metricPath: 'terminalSettlement.load'
     })
     const snapshotQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY])
+    const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, {
+        metricPath: 'terminalSettlement.load.segments'
+    })
     const queueRecovery = recoverCoordinatorQueueFromWal(
         snapshotQueue,
-        stored[COORDINATOR_QUEUE_WAL_KEY]
+        walStore
     )
     let queue = queueRecovery.queue
     let currentAuthorityState = {
@@ -17448,6 +17621,7 @@ async function sweepStaleQueuedTabs(parentTabId = null) {
             ? COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS
             : COORDINATOR_ACTIVE_JOB_MAX_MS
         const activeAgeExpired = activeStartedAt > 0 && now - activeStartedAt >= activeJobMaxMs
+        const staleAnchor = activeStartedAt || lastUpdatedAt
 
         if(progressRecord && isTerminalProfileNukeRecord(progressRecord) && !metadata?.closeRequestedAt) {
             markQueuedTabClosing(tabId, 'terminal-progress-record')
@@ -17469,7 +17643,7 @@ async function sweepStaleQueuedTabs(parentTabId = null) {
             continue
         }
 
-        if(metadata?.closeRequestedAt || !lastUpdatedAt || (!activeAgeExpired && now - lastUpdatedAt < staleTimeoutMs)) {
+        if(metadata?.closeRequestedAt || !staleAnchor || (!activeAgeExpired && now - staleAnchor < staleTimeoutMs)) {
             continue
         }
 

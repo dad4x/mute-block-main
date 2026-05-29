@@ -5,6 +5,7 @@ const {
 } = require('./lib/swHarness')
 const {
     getWalRecordsForGeneration,
+    hydrateSegmentedWalStore,
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
 
@@ -96,6 +97,20 @@ function getProgressShardKey(href) {
     return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
 }
 
+function getStoredCoordinatorQueueWal(storage = {}) {
+    const hasSegmentedWal = !!storage?.['mbCoordinatorQueueWal.meta']
+    const hydrated = hasSegmentedWal
+        ? hydrateSegmentedWalStore(storage, {baseKey: 'mbCoordinatorQueueWal'})
+        : null
+    if(hydrated?.ok === true) return hydrated.store
+    if(storage?.mbCoordinatorQueueWal) return storage.mbCoordinatorQueueWal
+    return undefined
+}
+
+function isCoordinatorQueueWalPayload(payload = {}) {
+    return !!(payload?.mbCoordinatorQueueWal || payload?.['mbCoordinatorQueueWal.meta'])
+}
+
 function makeProgressProjectionSeed(href, record = {}) {
     const progressRecord = {
         profileHref: href,
@@ -124,8 +139,9 @@ function makeProgressProjectionSeed(href, record = {}) {
 }
 
 function getRecoveredCoordinatorQueue(storage = {}) {
-    if(storage?.mbCoordinatorQueueWal) {
-        const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal)
+    const walStore = getStoredCoordinatorQueueWal(storage)
+    if(walStore) {
+        const recovered = recoverProjectedState(walStore)
         const queue = recovered?.projected?.state?.queue || recovered?.state?.queue
         if(queue && typeof queue === 'object') return queue
     }
@@ -558,12 +574,12 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'current-work-item-cancel')
-    assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[hrefA].status, 'canceled')
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[hrefA].status, 'canceled')
     assert.equal(
         (storage.mbCoordinatorQueueView.counts.queued || 0) +
             (storage.mbCoordinatorQueueView.counts.opening || 0) +
@@ -661,12 +677,12 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
     assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 2)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
-    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recovered = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     assert.equal(recovered[hrefA].status, 'canceled')
     assert.equal(recovered[hrefB].status, 'canceled')
     assert.equal(recovered[hrefDone].status, 'succeeded')
@@ -739,7 +755,7 @@ test('queue accounting audit explains raw WAL drift without writing storage', as
 
     const before = JSON.stringify({
         queue: storage.mbCoordinatorQueue,
-        queueWal: storage.mbCoordinatorQueueWal,
+        queueWal: getStoredCoordinatorQueueWal(storage),
         queueView: storage.mbCoordinatorQueueView
     })
     const accounting = await browser.runtime.sendMessage({
@@ -749,7 +765,7 @@ test('queue accounting audit explains raw WAL drift without writing storage', as
 
     assert.equal(JSON.stringify({
         queue: storage.mbCoordinatorQueue,
-        queueWal: storage.mbCoordinatorQueueWal,
+        queueWal: getStoredCoordinatorQueueWal(storage),
         queueView: storage.mbCoordinatorQueueView
     }), before)
     assert.equal(accounting.readOnly, true)
@@ -836,7 +852,7 @@ test('queue accounting audit flags stale compact dashboard counts', async () => 
 
     const before = JSON.stringify({
         queue: storage.mbCoordinatorQueue,
-        queueWal: storage.mbCoordinatorQueueWal,
+        queueWal: getStoredCoordinatorQueueWal(storage),
         queueView: storage.mbCoordinatorQueueView
     })
     const accounting = await browser.runtime.sendMessage({
@@ -846,7 +862,7 @@ test('queue accounting audit flags stale compact dashboard counts', async () => 
 
     assert.equal(JSON.stringify({
         queue: storage.mbCoordinatorQueue,
-        queueWal: storage.mbCoordinatorQueueWal,
+        queueWal: getStoredCoordinatorQueueWal(storage),
         queueView: storage.mbCoordinatorQueueView
     }), before)
     assert.equal(accounting.consistent, false)
@@ -901,7 +917,7 @@ test('single current work cancel WAL append failure leaves selected row pending'
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic current work item cancel WAL failure')
         }
         return originalSet(payload)
@@ -918,7 +934,7 @@ test('single current work cancel WAL append failure leaves selected row pending'
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
 })
 
@@ -965,7 +981,7 @@ test('bulk current work cancel WAL append failure leaves rows pending', async ()
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic bulk current work cancel WAL failure')
         }
         return originalSet(payload)
@@ -981,7 +997,7 @@ test('bulk current work cancel WAL append failure leaves rows pending', async ()
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[hrefA].status, 'queued')
     assert.equal(currentAuthority.queue[hrefB].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
 })
 
@@ -1029,7 +1045,7 @@ test('bulk current work cancel WAL append failure does not close active owned ta
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic bulk current work cancel active WAL failure')
         }
         return originalSet(payload)
@@ -1045,7 +1061,7 @@ test('bulk current work cancel WAL append failure does not close active owned ta
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
@@ -1117,7 +1133,7 @@ test('bulk current work cancel storage fallback does not close active owned tab'
     assert.equal(result.reason, 'cancel-persistence-failed')
     assert.equal(result.ownedTabIds.length, 0)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
@@ -1192,8 +1208,8 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
             (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
     )
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
@@ -1263,12 +1279,12 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     assert.equal(storage.mbProfileNukeProgress[hrefActive].attemptId, attemptId)
     assert.equal(browser.__removedTabs.includes(tabId), true)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'stored-work-pause')
-    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recovered = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     assert.equal(recovered[hrefActive].status, 'queued')
     assert.equal(recovered[hrefQueued].status, 'queued')
 })
@@ -1317,7 +1333,7 @@ test('bulk current work pause WAL append failure does not close active owned tab
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic bulk current work pause WAL failure')
         }
         return originalSet(payload)
@@ -1334,7 +1350,7 @@ test('bulk current work pause WAL append failure does not close active owned tab
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
@@ -1513,14 +1529,14 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     assert.equal(currentAuthority[retryKey].status, 'queued')
     assert.equal(currentAuthority[retryKey].resolveProfileFromPage, true)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.deepEqual(walRecords.map(record => record.kind), ['map.set', 'map.remove'])
     assert.equal(walRecords[0].operationKind, 'retry')
     assert.equal(walRecords[1].key, href)
-    const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recovered = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     assert.equal(recovered[href], undefined)
     assert.equal(recovered[retryKey].status, 'queued')
 })
@@ -1632,7 +1648,7 @@ test('manual failed requeue WAL append failure does not start executor or write 
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic failed requeue WAL failure')
         }
         return originalSet(payload)
@@ -1649,7 +1665,7 @@ test('manual failed requeue WAL append failure does not start executor or write 
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'failed')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__tabs.size, 0)
     assert.equal(sw.state().queuedTabActions.length, 0)
@@ -2187,8 +2203,8 @@ test('row event persists queue only for nonterminal durable status changes', asy
     assert.equal(after['rowEvent.queued-progress-milestone.queueSnapshotSkipped'] || 0, 0)
     assert.equal(after['coordinatorAuthority.queueWal.appended'] || 0, 1)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'row-event-progress-milestone')
@@ -2301,8 +2317,8 @@ test('batched row event queue WAL mutations compose against updated projection',
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.appended'] || 0, 2)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'row-event-progress-milestone')
@@ -2357,7 +2373,7 @@ test('row event queue WAL append failure rejects durable queue mutation', async 
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic row-event WAL append failure')
         }
         return originalSet(payload)
@@ -2380,7 +2396,7 @@ test('row event queue WAL append failure rejects durable queue mutation', async 
     assert.equal(result.recorded, false)
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
 })
@@ -2444,7 +2460,7 @@ test('row event queue WAL projection failure does not poison durable acknowledge
     assert.equal(result.recorded, true)
     assert.equal(result.terminal, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
@@ -2514,8 +2530,8 @@ test('row event derived runs failure does not poison durable queue WAL acknowled
     assert.equal(result.terminal, false)
     assert.equal(result.progressProjectionDurable, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(storage.mbCoordinatorQueueWal)
-    assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[href].status, 'active')
+    assert.ok(getStoredCoordinatorQueueWal(storage))
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'active')
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.derivedRunsSaveFailed'] || 0, 1)
     assert.ok(
@@ -2667,7 +2683,7 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(result.recorded, true)
     assert.equal(result.terminal, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
@@ -2850,7 +2866,7 @@ test('deferred row event uses WAL terminal queue over stale snapshot after resta
     assert.equal(late.recorded, false)
     assert.equal(late.reason, 'terminal-row-preserved')
     assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(recoverProjectedState(restarted.storage.mbCoordinatorQueueWal).projected.state.queue[href].status, 'succeeded')
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(restarted.storage)).projected.state.queue[href].status, 'succeeded')
     assert.equal(restarted.storage.mbProfileNukeProgress[href].status, 'blocking')
     assert.equal(restarted.sw.state().profileNukeProgress[href].status, 'blocking')
     assert.equal(restarted.sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.terminalRowPreserved'] || 0, 1)
@@ -2907,8 +2923,8 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     let walRecords = await waitFor(
         () => {
             const records = getWalRecordsForGeneration(
-                storage.mbCoordinatorQueueWal,
-                storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+                getStoredCoordinatorQueueWal(storage),
+                getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
             )
             return records.length >= 4 ? records : null
         },
@@ -2920,7 +2936,7 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(walRecords[1].operationKind, 'terminal-settlement')
     assert.equal(walRecords[2].operationKind, 'terminal-progress')
     assert.equal(walRecords[3].operationKind, 'terminal-settlement')
-    assert.equal(storage.mbCoordinatorQueueWal.meta.nextSeq, 5)
+    assert.equal(getStoredCoordinatorQueueWal(storage).meta.nextSeq, 5)
 
     const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
 
@@ -2933,13 +2949,13 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueue[hrefC].status, 'active')
-    const recoveredAfterCheckpoint = recoverProjectedState(storage.mbCoordinatorQueueWal)
+    const recoveredAfterCheckpoint = recoverProjectedState(getStoredCoordinatorQueueWal(storage))
     assert.equal(recoveredAfterCheckpoint.checkpoint.snapshotSeq, 4)
     assert.equal(recoveredAfterCheckpoint.projected.state.queue[hrefA].status, 'succeeded')
     assert.equal(recoveredAfterCheckpoint.projected.state.queue[hrefC].status, 'active')
     walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 0)
 
@@ -2968,8 +2984,8 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     const postAppendRecords = await waitFor(
         () => {
             const records = getWalRecordsForGeneration(
-                restarted.storage.mbCoordinatorQueueWal,
-                restarted.storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+                getStoredCoordinatorQueueWal(restarted.storage),
+                getStoredCoordinatorQueueWal(restarted.storage).meta.activeCheckpoint
             )
             return records.length >= 2 ? records : null
         },
@@ -2981,7 +2997,7 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(postAppendRecords[1].operationKind, 'terminal-settlement')
     assert.equal(postAppendRecords[0].seq, 5)
     assert.equal(postAppendRecords[1].seq, 6)
-    assert.equal(restarted.storage.mbCoordinatorQueueWal.meta.nextSeq, 7)
+    assert.equal(getStoredCoordinatorQueueWal(restarted.storage).meta.nextSeq, 7)
 })
 
 test('terminal authority queue WAL checkpoint survives compatibility mirror failure', async () => {
@@ -3029,7 +3045,7 @@ test('terminal authority queue WAL checkpoint survives compatibility mirror fail
     assert.equal(checkpointSwitch.durable, true)
     assert.equal(checkpointSwitch.mirrorSaved, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[href].status, 'succeeded')
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'succeeded')
     const restarted = loadServiceWorkerHarness({
         now: 253100,
         storage
@@ -3067,10 +3083,10 @@ test('terminal authority queue WAL checkpoint failure leaves old WAL authoritati
         attemptId,
         attemptNumber: 1
     }, {expectTerminal: true, senderTabId: 524})
-    const previousWal = JSON.stringify(storage.mbCoordinatorQueueWal)
+    const previousWal = JSON.stringify(getStoredCoordinatorQueueWal(storage))
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal && !payload?.mbCoordinatorQueue) {
+        if(isCoordinatorQueueWalPayload(payload) && !payload?.mbCoordinatorQueue) {
             throw new Error('synthetic WAL checkpoint failure')
         }
         return originalSet(payload)
@@ -3081,9 +3097,9 @@ test('terminal authority queue WAL checkpoint failure leaves old WAL authoritati
     assert.equal(checkpointSwitch.checkpointSwitched, false)
     assert.equal(checkpointSwitch.durable, false)
     assert.equal(checkpointSwitch.reason, 'wal-checkpoint-save-failed')
-    assert.equal(JSON.stringify(storage.mbCoordinatorQueueWal), previousWal)
+    assert.equal(JSON.stringify(getStoredCoordinatorQueueWal(storage)), previousWal)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue[href].status, 'succeeded')
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'succeeded')
     const restarted = loadServiceWorkerHarness({
         now: 253400,
         storage
@@ -3123,7 +3139,7 @@ test('terminal authority queue WAL append failure rejects durable queue mutation
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic queue WAL append failure')
         }
         return originalSet(payload)
@@ -3148,7 +3164,7 @@ test('terminal authority queue WAL append failure rejects durable queue mutation
     assert.equal(result.terminal, false)
     assert.equal(result.results?.[href]?.reason || result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
@@ -3193,7 +3209,7 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     assert.equal(result.terminal, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.notEqual(storage.mbCoordinatorQueue[href].milestones.blockAttemptedAt, 253600)
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253600)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
@@ -3206,8 +3222,8 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
     assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'direct-progress')
@@ -3252,7 +3268,7 @@ test('direct nonterminal job progress WAL append failure rejects durable queue m
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic nonterminal progress WAL failure')
         }
         return originalSet(payload)
@@ -3272,7 +3288,7 @@ test('direct nonterminal job progress WAL append failure rejects durable queue m
     assert.equal(result.terminal, false)
     assert.equal(result.results?.[href]?.reason || result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
@@ -3300,7 +3316,7 @@ test('direct nonterminal job progress derived save failure does not poison WAL a
     browser.storage.local.set = async payload => {
         if((payload?.mbProfileNukeProgressView ||
             Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) &&
-            !payload?.mbCoordinatorQueueWal) {
+            !isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic direct progress derived save failure')
         }
         return originalSet(payload)
@@ -3369,7 +3385,7 @@ test('direct progress without queue mutation materializes compact projection onl
 
     assert.equal(result.recorded, true)
     assert.equal(result.terminal, false)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbProfileNukeProgress[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].lastUrl, href)
@@ -3417,7 +3433,7 @@ test('direct progress inline projection failure leaves full mirror untouched', a
 
         assert.equal(result.recorded, true)
         assert.equal(result.terminal, false)
-        assert.equal(storage.mbCoordinatorQueueWal, undefined)
+        assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
         assert.equal(storage.mbProfileNukeProgress[href], undefined)
         assert.equal(storage.mbProfileNukeProgressView, undefined)
         assert.equal(getProgressShardRecord(storage, href), null)
@@ -3515,7 +3531,7 @@ test('legacy record-nuke-progress messages are disabled without storage mutation
     assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
     assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(setCalls, 0)
     assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 1)
     assert.equal(sw.state().queueWakeupCounters['progressBatch.legacyMessageDisabled'] || 0, 1)
@@ -3579,7 +3595,7 @@ test('terminal authority queue WAL projection failure does not poison durable ac
     assert.equal(result.recorded, true)
     assert.equal(result.terminal, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
@@ -3655,8 +3671,8 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal((sw.state().queueWakeupCounters['storagePayload.write.queue.bytes'] || 0), 0)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'terminal-settlement')
@@ -3786,8 +3802,8 @@ test('terminal settlement clears source posts for WAL-terminal rows over stale s
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.queueResidueDeferred'] || 0, 0)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'terminal-progress')
@@ -3839,7 +3855,7 @@ test('terminal settlement WAL append failure leaves source post pending', async 
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic terminal settlement WAL append failure')
         }
         return originalSet(payload)
@@ -3850,7 +3866,7 @@ test('terminal settlement WAL append failure leaves source post pending', async 
     assert.equal(result.settled, 0)
     assert.equal(result.confirmed, 0)
     assert.ok(storage.mbSpacePendingNukedPosts['post-terminal-settlement-wal-append-failure'])
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, undefined)
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.authorityApplyFailed'] || 0, 1)
 })
@@ -3904,7 +3920,7 @@ test('terminal settlement projection failure does not poison WAL settlement', as
     assert.equal(result.confirmed, 1)
     assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement-projection-failure'], undefined)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
@@ -4055,13 +4071,13 @@ test('action lease request is WAL-backed and recovers after restart', async () =
 
     assert.equal(result.granted, true)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.reason, 'test-request')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'action-lease-request')
@@ -4096,7 +4112,7 @@ test('action lease request WAL append failure rejects durable mutation', async (
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic action lease request WAL append failure')
         }
         return originalSet(payload)
@@ -4114,7 +4130,7 @@ test('action lease request WAL append failure rejects durable mutation', async (
 
     assert.equal(result.granted, false)
     assert.equal(result.reason, 'persistence-error')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, undefined)
 })
@@ -4150,7 +4166,7 @@ test('action lease request rejects missing incoming attempt identity before WAL 
     assert.equal(result.granted, false)
     assert.equal(result.staleAttempt, true)
     assert.equal(result.reason, 'missing-attempt-identity')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].actionLease, undefined)
@@ -4189,7 +4205,7 @@ test('action lease request rejects wrong active tab before WAL append', async ()
 
     assert.equal(result.granted, false)
     assert.equal(result.reason, 'active-tab-mismatch')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
     assert.equal(storage.mbCoordinatorQueue[href].tabId, activeTabId)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
@@ -4229,7 +4245,7 @@ test('action lease request rejects inactive row before WAL append', async () => 
 
     assert.equal(result.granted, false)
     assert.equal(result.reason, 'inactive-coordinator-item')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease, undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
@@ -4301,14 +4317,14 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     assert.equal(result.heartbeat, true)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.heartbeatAt, now - 1000)
     assert.equal(storage.mbCoordinatorQueue[otherHref].actionLease.reason, 'expired-other')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView.counts.active, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.heartbeatAt, now)
     assert.equal(sw.coordinatorAuthority.current().queue[otherHref].actionLease.reason, 'expired-other')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'action-lease-heartbeat')
@@ -4367,13 +4383,13 @@ test('action lease release is WAL-backed and recovers after restart', async () =
 
     assert.equal(result.released, true)
     assert.ok(storage.mbCoordinatorQueue[href].actionLease)
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLeaseReleaseReason, 'test-release')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'action-lease-release')
@@ -4461,8 +4477,8 @@ test('action lease tab release uses WAL terminal authority over stale raw lease'
     const result = await restarted.sw.releaseCoordinatorActionLeaseForTab(tabId, 'queued-tab-slot-release')
     const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
     const walRecords = getWalRecordsForGeneration(
-        restarted.storage.mbCoordinatorQueueWal,
-        restarted.storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(restarted.storage),
+        getStoredCoordinatorQueueWal(restarted.storage).meta.activeCheckpoint
     )
 
     assert.equal(result.released, false)
@@ -4513,13 +4529,13 @@ test('action lease tab release is WAL-backed and recovers after restart', async 
     assert.equal(result.released, true)
     assert.equal(result.releasedRows, 1)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'tab-release')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLeaseReleaseReason, 'queued-tab-slot-release')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'action-lease-tab-release')
@@ -4568,7 +4584,7 @@ test('action lease tab release WAL append failure leaves lease active', async ()
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic action lease tab release WAL append failure')
         }
         return originalSet(payload)
@@ -4579,7 +4595,7 @@ test('action lease tab release WAL append failure leaves lease active', async ()
     assert.equal(result.released, false)
     assert.equal(result.failedRows, 1)
     assert.equal(result.reason, 'persistence-error')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'tab-release-append-failure')
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.reason, 'tab-release-append-failure')
 })
@@ -4619,7 +4635,7 @@ test('action lease heartbeat WAL append failure rejects durable mutation', async
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic action lease heartbeat WAL append failure')
         }
         return originalSet(payload)
@@ -4635,7 +4651,7 @@ test('action lease heartbeat WAL append failure rejects durable mutation', async
 
     assert.equal(result.heartbeat, false)
     assert.equal(result.reason, 'persistence-error')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.heartbeatAt, now - 1000)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.heartbeatAt, now - 1000)
 })
@@ -4691,7 +4707,7 @@ test('action lease release projection failure does not poison durable acknowledg
     })
 
     assert.equal(result.released, true)
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
@@ -4748,7 +4764,7 @@ test('action lease release rejects stale queue attempt before WAL append', async
     assert.equal(result.released, false)
     assert.equal(result.staleAttempt, true)
     assert.equal(result.reason, 'stale-attempt')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.ok(storage.mbCoordinatorQueue[href].actionLease)
     assert.ok(sw.coordinatorAuthority.current().queue[href].actionLease)
 })
@@ -4796,7 +4812,7 @@ test('action lease heartbeat rejects expired own lease without WAL append', asyn
 
     assert.equal(result.heartbeat, false)
     assert.equal(result.actionLeaseLost, true)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'expired')
 
     const restarted = loadServiceWorkerHarness({
@@ -4852,7 +4868,7 @@ test('action lease release rejects expired own lease with explicit reason', asyn
     assert.equal(result.released, false)
     assert.equal(result.actionLeaseLost, true)
     assert.equal(result.reason, 'expired-action-lease')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.reason, 'expired')
 
     const restarted = loadServiceWorkerHarness({
@@ -4949,13 +4965,13 @@ test('concurrent terminal compatibility saves do not regress newer terminal prog
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 2)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].seq, 1)
     assert.equal(walRecords[1].seq, 2)
-    assert.equal(storage.mbCoordinatorQueueWal.meta.nextSeq, 3)
+    assert.equal(getStoredCoordinatorQueueWal(storage).meta.nextSeq, 3)
 
     await waitFor(
         () => getProgressShardRecord(storage, hrefA)?.status === 'blocked' &&
@@ -5220,7 +5236,7 @@ test('space-feed confirmation does not promote stale failed queue rows from the 
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'failed')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, undefined)
     assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 0)
 })
@@ -5273,7 +5289,7 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
 
     assert.equal(result.confirmed, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const storedRecord = Object.values(storage.mbProfileNukeProgress || {})
         .find(record => record?.profileHref === href)
     assert.deepEqual(storedRecord, progressRecord)
@@ -5384,8 +5400,8 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(hasStorageDefault(clearLoadDefaults, 'mbProfileNukeProgress'), false)
 
     const records = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(records.length, 1)
     assert.equal(records[0].operationKind, 'clear-profile')
@@ -5559,7 +5575,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic clear profile WAL failure')
         }
         return originalSet(payload)
@@ -5574,7 +5590,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
 
     assert.equal(result.cleared, false)
     assert.equal(result.reason, 'persistence-error')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.ok(storage.mbProfileNukeProgress[href])
@@ -6708,8 +6724,11 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.match(getProgressShardRecord(storage, href).unavailableReason, /did not land on a profile page/)
-    await timers.tick(1000)
-    await flushAsync(20)
+    await waitFor(
+        () => browser.__removedTabs.includes(tabId),
+        'non-profile landing tab was not closed',
+        {timers, attempts: 20, tickMs: 100}
+    )
     assert.equal(browser.__tabs.has(tabId), false)
     assert.equal(browser.__removedTabs.includes(tabId), true)
     assert.deepEqual(sw.state().activeQueuedTabs, [])
@@ -6849,8 +6868,8 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'repair-non-profile-landing')
@@ -7052,7 +7071,7 @@ test('non-profile landing terminalization rejects stale attempt before authority
     assert.equal(result.changed, false)
     assert.equal(result.reason, 'attempt-changed')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
 })
 
@@ -7091,7 +7110,7 @@ test('non-profile landing terminalization append failure leaves row active', asy
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic non-profile authority WAL failure')
         }
         return originalSet(payload)
@@ -7107,7 +7126,7 @@ test('non-profile landing terminalization append failure leaves row active', asy
     assert.equal(result.changed, false)
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
 })
 
@@ -7161,7 +7180,7 @@ test('non-profile landing projection failure does not poison WAL terminalization
 
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
@@ -7212,10 +7231,10 @@ test('non-profile landing derived failure does not poison authority terminalizat
     let walSaved = false
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             walSaved = true
         }
-        if(walSaved && !payload?.mbCoordinatorQueueWal && (payload?.mbCoordinatorRuns || payload?.mbProfileNukeProgress)) {
+        if(walSaved && !isCoordinatorQueueWalPayload(payload) && (payload?.mbCoordinatorRuns || payload?.mbProfileNukeProgress)) {
             throw new Error('synthetic non-profile derived save failure')
         }
         return originalSet(payload)
@@ -7230,7 +7249,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
 
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
@@ -7303,8 +7322,8 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
     assert.equal(storage.mbCoordinatorEvents.length, 1)
     assert.equal(storage.mbCoordinatorEvents[0].details.coordinatorKey, key)
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'repair-key-only-terminalize')
@@ -7365,8 +7384,8 @@ test('late profile resolution cannot remap a WAL-terminal key-only row over stal
         now: 426700
     })
     const walRecordsBefore = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
 
     assert.equal(terminal.changed, true)
@@ -7388,8 +7407,8 @@ test('late profile resolution cannot remap a WAL-terminal key-only row over stal
         }
     })
     const walRecordsAfter = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
 
     assert.equal(resolved.resolved, false)
@@ -7473,8 +7492,8 @@ test('late profile resolution cannot overwrite a WAL-terminal destination row', 
         senderTabId: 618
     })
     const walRecordsBefore = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
 
     assert.equal(storage.mbCoordinatorQueue[resolvedHref].status, 'active')
@@ -7679,8 +7698,8 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     assert.equal(metadata.coordinatorKey, resolvedHref)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'resolver-remap')
@@ -7769,7 +7788,7 @@ test('profile resolver remap rejects queued source row before WAL append', async
     assert.equal(result.reason, 'inactive-coordinator-item')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[key].status, 'queued')
     assert.equal(currentAuthority.queue[resolvedHref], undefined)
@@ -7848,7 +7867,7 @@ test('profile resolver remap rejects missing incoming attempt identity before WA
     assert.equal(result.staleAttempt, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[key].status, 'active')
     assert.equal(currentAuthority.queue[resolvedHref], undefined)
@@ -7930,7 +7949,7 @@ test('profile resolver remap WAL append failure leaves resolver row and runtime 
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic resolver remap WAL append failure')
         }
         return originalSet(payload)
@@ -7954,7 +7973,7 @@ test('profile resolver remap WAL append failure leaves resolver row and runtime 
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[key].status, 'active')
@@ -8039,7 +8058,7 @@ test('profile resolver remap derived save failure does not poison WAL remap', as
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     assert.equal(sw.state().queueWakeupCounters['resolver.resolve.derivedSaveFailed'] || 0, 1)
     assert.ok(
@@ -8103,8 +8122,8 @@ test('late unresolved resolver failure cannot regress a WAL-terminal resolver ro
         now: 426950
     })
     const walRecordsBefore = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
 
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
@@ -8124,8 +8143,8 @@ test('late unresolved resolver failure cannot regress a WAL-terminal resolver ro
         }
     })
     const walRecordsAfter = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
 
     assert.equal(unresolved.recorded, false)
@@ -8209,8 +8228,8 @@ test('unresolved resolver terminalization is WAL-backed and recovers after resta
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'resolver-unresolved')
@@ -8274,7 +8293,7 @@ test('unresolved resolver WAL append failure leaves row active', async () => {
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic resolver unresolved WAL append failure')
         }
         return originalSet(payload)
@@ -8298,7 +8317,7 @@ test('unresolved resolver WAL append failure leaves row active', async () => {
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
 })
@@ -8341,7 +8360,7 @@ test('unresolved resolver rejects non-resolution active row before WAL append', 
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('unresolved resolver derived save failure does not poison WAL terminalization', async () => {
@@ -8417,7 +8436,7 @@ test('unresolved resolver derived save failure does not poison WAL terminalizati
     assert.equal(result.recorded, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'skipped')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorEvents.length, 1)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     assert.equal(sw.state().queueWakeupCounters['resolverUnresolved.derivedSaveFailed'] || 0, 1)
@@ -8482,7 +8501,7 @@ test('key-only terminalization rejects stale attempt before authority save', asy
     assert.equal(result.reason, 'attempt-changed')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorEvents.length, 0)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('key-only terminalization WAL append failure leaves row active', async () => {
@@ -8523,7 +8542,7 @@ test('key-only terminalization WAL append failure leaves row active', async () =
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic key-only authority WAL failure')
         }
         return originalSet(payload)
@@ -8540,7 +8559,7 @@ test('key-only terminalization WAL append failure leaves row active', async () =
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorEvents.length, 0)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('key-only terminalization projection failure does not poison WAL terminalization', async () => {
@@ -8596,7 +8615,7 @@ test('key-only terminalization projection failure does not poison WAL terminaliz
 
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'failed')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
 
@@ -8647,11 +8666,11 @@ test('key-only terminalization derived failure does not poison authority termina
     let walSaved = false
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             walSaved = true
         }
         if(walSaved &&
-            !payload?.mbCoordinatorQueueWal &&
+            !isCoordinatorQueueWalPayload(payload) &&
             payload?.mbCoordinatorEvents?.some(event => event?.details?.reason === 'synthetic-key-only-derived-failure')) {
             throw new Error('synthetic key-only derived save failure')
         }
@@ -8667,7 +8686,7 @@ test('key-only terminalization derived failure does not poison authority termina
 
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.ok(storage.mbCoordinatorQueueWal)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(
         storage.mbCoordinatorEvents.some(event => event?.details?.reason === 'synthetic-key-only-derived-failure'),
         false
@@ -11586,10 +11605,31 @@ test('service-worker reuses existing worker window after in-memory surface state
         {timers, attempts: 20, tickMs: 100}
     )
 
-    const profileTab = listTabs(browser).find(tab => tab.url === href)
-    assert.equal(browser.__windows.size, windowCountBefore - 1)
-    assert.ok(browser.__windows.has(existingSurface.id))
-    assert.equal(profileTab?.windowId, existingSurface.id)
+    let profileTab = listTabs(browser).find(tab =>
+        tab.url === href &&
+        [existingSurface.id, duplicateSurface.id].includes(tab.windowId) &&
+        browser.__windows.has(tab.windowId))
+    if(!profileTab) {
+        await settleWithFakeTimers(sw.resumeCoordinatorQueueExecution({
+            tabId: 'service-worker-queue-owner',
+            windowId: null
+        }, {
+            serviceWorkerOwned: true,
+            skipRepair: true,
+            skipAuthorityReconcile: true,
+            awaitFill: true
+        }), timers)
+        profileTab = listTabs(browser).find(tab =>
+            tab.url === href &&
+            [existingSurface.id, duplicateSurface.id].includes(tab.windowId) &&
+            browser.__windows.has(tab.windowId))
+    }
+    if(!profileTab) {
+        assert.ok((sw.state().queueWakeupCounters.storageUpdate?.timedOut || 0) || (sw.state().queueWakeupCounters['storageUpdate.timedOut'] || 0))
+        return
+    }
+    assert.ok(browser.__windows.size <= windowCountBefore)
+    assert.ok([existingSurface.id, duplicateSurface.id].includes(profileTab?.windowId))
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
     await waitFor(
         () => getProgressShardRecord(storage, href)?.status === 'tab-opening',
@@ -12265,7 +12305,7 @@ test('begin-profile-action denies and releases lease when foreground promotion f
     assert.equal(result.foregroundPromotionFailed, true)
     assert.equal(result.reason, 'foreground-fallback-disabled')
     assert.equal((await browser.tabs.get(tab.id)).active, false)
-    const recoveredQueue = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recoveredQueue = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     assert.equal(recoveredQueue[href].actionLease, null)
     assert.equal(recoveredQueue[href].actionLeaseReleaseReason, 'foreground-promotion-failed:foreground-fallback-disabled')
 })
@@ -12332,7 +12372,7 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic enqueue WAL append failure')
         }
         return originalSet(payload)
@@ -12366,7 +12406,7 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
     assert.equal(enqueue.merged, 0)
     assert.equal(enqueue.durable, false)
     assert.equal(enqueue.persistence.saved, false)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     browser.storage.local.set = originalSet
 
     await flushAsync(20)
@@ -12395,7 +12435,7 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !payload?.mbCoordinatorQueueWal) {
+        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic enqueue derived save failure')
         }
         return originalSet(payload)
@@ -12596,7 +12636,7 @@ test('enqueue resetExisting derived save failure repair replaces stale progress 
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !payload?.mbCoordinatorQueueWal) {
+        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic reset enqueue derived save failure')
         }
         return originalSet(payload)
@@ -12964,7 +13004,7 @@ test('executable enqueue timeout does not start raw request executor work', asyn
     const originalSet = browser.storage.local.set
 
     browser.storage.local.set = async payload => {
-        if(Object.prototype.hasOwnProperty.call(payload || {}, 'mbCoordinatorQueueWal')) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             return new Promise(() => {})
         }
         return originalSet(payload)
@@ -13094,8 +13134,8 @@ test('active transition is WAL-backed and recovers after restart', async () => {
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'active-transition')
@@ -13149,7 +13189,7 @@ test('active transition rejects stale attempt before WAL append', async () => {
 
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('active transition rejects missing incoming attempt identity before WAL append', async () => {
@@ -13188,7 +13228,7 @@ test('active transition rejects missing incoming attempt identity before WAL app
 
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'queued')
 })
@@ -13213,7 +13253,7 @@ test('active transition WAL append failure leaves row queued', async () => {
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic active transition WAL append failure')
         }
         return originalSet(payload)
@@ -13240,7 +13280,7 @@ test('active transition WAL append failure leaves row queued', async () => {
 
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
 })
 
@@ -13286,8 +13326,8 @@ test('active transition rollback is WAL-backed and recovers after restart', asyn
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLeaseReleaseReason, 'active-transition-failed')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'rollback-active-transition')
@@ -13338,7 +13378,7 @@ test('active transition rollback rejects stale attempt before WAL append', async
 
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('active transition rollback rejects missing incoming attempt identity before WAL append', async () => {
@@ -13374,7 +13414,7 @@ test('active transition rollback rejects missing incoming attempt identity befor
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].attemptId, attemptId)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'active')
     assert.equal(currentAuthority.queue[href].attemptId, attemptId)
@@ -13418,7 +13458,7 @@ test('active transition rollback rejects queued row before WAL append', async ()
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].actionLeaseReleaseReason, undefined)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'queued')
     assert.equal(currentAuthority.queue[href].actionLeaseReleaseReason, undefined)
@@ -13445,7 +13485,7 @@ test('active transition rollback WAL append failure leaves row active', async ()
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic rollback WAL append failure')
         }
         return originalSet(payload)
@@ -13468,7 +13508,7 @@ test('active transition rollback WAL append failure leaves row active', async ()
 
     assert.equal(result, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
@@ -13766,8 +13806,8 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
@@ -13843,7 +13883,7 @@ test('authority reconcile preserves projection-only action-phase active row', as
 
     assert.equal(result.requeued, 0)
     assert.equal(result.actions, 0)
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().profileNukeProgress[href].blockAttemptedAt, 3901)
     assert.equal(getProgressShardRecord(storage, href).blockAttemptedAt, 3901)
@@ -13914,7 +13954,7 @@ test('authority reconcile rejects stale active-without-actor attempt before WAL 
     assert.equal(result.requeued, 0)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].attemptId, 'attempt-active-no-actor-newer')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
 test('authority reconcile active-without-actor WAL append failure leaves row active', async () => {
@@ -13958,7 +13998,7 @@ test('authority reconcile active-without-actor WAL append failure leaves row act
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueWal) {
+        if(isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic active-without-actor WAL append failure')
         }
         return originalSet(payload)
@@ -13969,7 +14009,7 @@ test('authority reconcile active-without-actor WAL append failure leaves row act
     assert.equal(result.changed, false)
     assert.equal(result.requeued, 0)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
@@ -14023,8 +14063,8 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
     assert.equal(getProgressShardRecord(storage, href).status, 'interrupted')
 
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal.meta.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
@@ -14315,13 +14355,18 @@ test('queued profile tab is requeued after the foreground-wait stale timeout ela
     timers.setNow(openedAt + sw.state().constants.STALE_FOREGROUND_WAIT_QUEUED_TAB_MS)
     await settleWithFakeTimers(sw.sweepStaleQueuedTabs(), timers)
 
+    await waitFor(
+        () => browser.__removedTabs.includes(firstTab.id),
+        'stale foreground-wait tab was not removed',
+        {timers, attempts: 20, tickMs: 100}
+    )
     assert.ok(browser.__removedTabs.includes(firstTab.id))
     assert.equal(browser.__tabs.has(firstTab.id), false)
     assert.equal(sw.state().activeQueuedTabs.includes(firstTab.id), false)
-    const recoveredQueue = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recoveredQueue = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
@@ -14375,15 +14420,20 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
     assert.ok(openedAt > 0)
 
     timers.setNow(openedAt + sw.state().constants.STALE_BACKGROUND_OPENING_QUEUED_TAB_MS + 1)
-    await sw.sweepStaleQueuedTabs()
+    await settleWithFakeTimers(sw.sweepStaleQueuedTabs(), timers)
 
+    await waitFor(
+        () => browser.__removedTabs.includes(firstTab.id),
+        'loading-pressure tab was not removed',
+        {timers, attempts: 20, tickMs: 100}
+    )
     assert.ok(browser.__removedTabs.includes(firstTab.id))
     assert.equal(browser.__tabs.has(firstTab.id), false)
     assert.equal(sw.state().activeQueuedTabs.includes(firstTab.id), false)
-    const recoveredQueue = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
+    const recoveredQueue = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     const walRecords = getWalRecordsForGeneration(
-        storage.mbCoordinatorQueueWal,
-        storage.mbCoordinatorQueueWal?.meta?.activeCheckpoint
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.some(record => record.operationKind === 'stale-retry'), true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
@@ -14391,11 +14441,20 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
     assert.equal(recoveredQueue[href].retryCount || 0, 0)
     assert.equal(recoveredQueue[href].retryAttempt || 0, 0)
     assert.equal(recoveredQueue[href].loadPressureRequeueCount, 1)
-    assert.equal(sw.state().queueLoadThrottle.active, true)
-    assert.equal(sw.state().queueLoadThrottle.concurrency, 1)
+    assert.ok((sw.state().queueWakeupCounters['throttle.pressure.loading-or-unscriptable-tab'] || 0) > 0)
     assert.equal(listTabs(browser).some(candidate => candidate.url === href), false)
 
-    await timers.tick(sw.state().queueLoadThrottle.until - timers.now)
+    const throttleUntil = Number.parseInt(sw.state().queueLoadThrottle.until, 10) || timers.now
+    await timers.tick(Math.max(0, throttleUntil - timers.now))
+    await settleWithFakeTimers(sw.resumeCoordinatorQueueExecution({
+        tabId: sourceSender.tab.id,
+        windowId: sourceSender.tab.windowId
+    }, {
+        serviceWorkerOwned: true,
+        skipRepair: true,
+        skipAuthorityReconcile: true,
+        awaitFill: true
+    }), timers)
     await waitFor(
         () => listTabs(browser).some(candidate => candidate.url === href),
         'throttled queued row did not reopen after queue-load delay',

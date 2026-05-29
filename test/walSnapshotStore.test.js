@@ -4,11 +4,16 @@ const {
     CHECKPOINT_B,
     activateCheckpoint,
     appendWalRecordsToGeneration,
+    buildSegmentedWalStorageDefaults,
+    buildSegmentedWalStoragePayload,
     decodeCheckpointSnapshot,
     encodeCheckpointSnapshot,
     estimateStateBytes,
     getActiveCheckpoint,
+    getSegmentedWalMetaKey,
+    getSegmentedWalSegmentKey,
     getWalRecordsForGeneration,
+    hydrateSegmentedWalStore,
     makeCheckpoint,
     makePairedCheckpointStore,
     makeWalRecord,
@@ -374,6 +379,95 @@ test('recovers by replaying only the active generation WAL', () => {
     assert.equal(recovered.projected.state.queue['https://www.quora.com/profile/A'].status, 'succeeded')
     assert.equal(recovered.projected.state.queue['https://www.quora.com/profile/A'].outcome, 'blocked')
     assert.equal(getWalRecordsForGeneration(inactiveAppend.store, CHECKPOINT_B).length, 0)
+})
+
+test('segmented WAL storage hydrates logical store from committed segment keys', () => {
+    let store = makePairedCheckpointStore(baseState(), {
+        activeCheckpoint: CHECKPOINT_A,
+        snapshotSeq: 10,
+        nextSeq: 11
+    })
+    store = appendWalRecordsToGeneration(store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        patch: {status: 'active'}
+    }]).store
+    store = appendWalRecordsToGeneration(store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        patch: {status: 'succeeded', outcome: 'blocked'}
+    }]).store
+
+    const payload = buildSegmentedWalStoragePayload(store, {baseKey: 'mbCoordinatorQueueWal'})
+
+    assert.equal(payload.mbCoordinatorQueueWal, undefined)
+    assert.ok(payload[getSegmentedWalMetaKey('mbCoordinatorQueueWal')])
+    assert.ok(payload[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 0)])
+    assert.ok(payload[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 1)])
+
+    const hydrated = hydrateSegmentedWalStore(payload, {baseKey: 'mbCoordinatorQueueWal'})
+    assert.equal(hydrated.ok, true)
+    assert.equal(getWalRecordsForGeneration(hydrated.store, CHECKPOINT_A).length, 2)
+    assert.equal(recoverProjectedState(hydrated.store).projected.state.queue['https://www.quora.com/profile/A'].status, 'succeeded')
+})
+
+test('segmented WAL storage ignores orphan segments not committed by meta', () => {
+    let store = makePairedCheckpointStore(baseState(), {
+        activeCheckpoint: CHECKPOINT_A,
+        snapshotSeq: 10,
+        nextSeq: 11
+    })
+    store = appendWalRecordsToGeneration(store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        patch: {status: 'active'}
+    }]).store
+    const firstPayload = buildSegmentedWalStoragePayload(store, {baseKey: 'mbCoordinatorQueueWal'})
+    const orphaned = appendWalRecordsToGeneration(store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        patch: {status: 'failed'}
+    }]).store
+    const orphanPayload = buildSegmentedWalStoragePayload(orphaned, {baseKey: 'mbCoordinatorQueueWal'})
+    const storage = {
+        ...firstPayload,
+        [getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 1)]:
+            orphanPayload[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 1)]
+    }
+
+    const hydrated = hydrateSegmentedWalStore(storage, {baseKey: 'mbCoordinatorQueueWal'})
+    assert.equal(hydrated.ok, true)
+    assert.equal(getWalRecordsForGeneration(hydrated.store, CHECKPOINT_A).length, 1)
+    assert.equal(recoverProjectedState(hydrated.store).projected.state.queue['https://www.quora.com/profile/A'].status, 'active')
+})
+
+test('segmented WAL storage detects manifest advanced past missing segment', () => {
+    let store = makePairedCheckpointStore(baseState(), {
+        activeCheckpoint: CHECKPOINT_A,
+        snapshotSeq: 10,
+        nextSeq: 11
+    })
+    store = appendWalRecordsToGeneration(store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        patch: {status: 'active'}
+    }]).store
+    const payload = buildSegmentedWalStoragePayload(store, {baseKey: 'mbCoordinatorQueueWal'})
+    delete payload[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 0)]
+
+    const defaults = buildSegmentedWalStorageDefaults(payload[getSegmentedWalMetaKey('mbCoordinatorQueueWal')], {
+        baseKey: 'mbCoordinatorQueueWal'
+    })
+    assert.ok(Object.prototype.hasOwnProperty.call(defaults, getSegmentedWalSegmentKey('mbCoordinatorQueueWal', CHECKPOINT_A, 0)))
+
+    const hydrated = hydrateSegmentedWalStore(payload, {baseKey: 'mbCoordinatorQueueWal'})
+    assert.equal(hydrated.ok, false)
+    assert.equal(hydrated.reason, 'missing-segment')
 })
 
 test('activating checkpoint switches recovery to that generation WAL', () => {
