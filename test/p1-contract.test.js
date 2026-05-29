@@ -3423,7 +3423,9 @@ test('terminal settlement separates authority stamping from derived materializat
     assert.doesNotMatch(authorityBody, /SPACE_PENDING_NUKED_POSTS_KEY|SPACE_NUKED_POSTS_KEY|PROFILE_NUKE_PROGRESS_KEY|metricStorageSet/)
     assert.match(derivedBody, /SPACE_PENDING_NUKED_POSTS_KEY/)
     assert.match(derivedBody, /SPACE_NUKED_POSTS_KEY/)
-    assert.match(derivedBody, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.match(derivedBody, /progressRecords/)
+    assert.doesNotMatch(derivedBody, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.match(settlementBody, /saveProfileNukeProgressRowProjection\([\s\S]*derivedSettlement\.progressRecords/)
     assert.doesNotMatch(derivedBody, /coordinatorAuthority|applyWithinStorageUpdate|metricStorageSet/)
 })
 

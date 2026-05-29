@@ -8266,6 +8266,9 @@ function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress 
     const confirmedHrefs = options.confirmedHrefs || new Set()
     const clearedHrefs = options.clearedHrefs || new Set()
     const progressChanged = options.progressChanged === true
+    const progressRecords = progressChanged
+        ? normalizeStoredProfileNukeProgress(options.progressRecords || {})
+        : {}
     const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
     const currentNuked = stored?.[SPACE_NUKED_POSTS_KEY] || {}
     const confirmedResult = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
@@ -8278,7 +8281,6 @@ function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress 
         : confirmedResult.nextNuked
     const payload = {}
 
-    if(progressChanged) payload[PROFILE_NUKE_PROGRESS_KEY] = pruneProfileNukeProgress(progress)
     if(confirmedResult.changedPending || clearedResult.changed) {
         payload[SPACE_PENDING_NUKED_POSTS_KEY] = clearedResult.records
     }
@@ -8288,6 +8290,7 @@ function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress 
 
     return {
         payload,
+        progressRecords,
         pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || null,
         nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || null
     }
@@ -8334,6 +8337,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
     let queueChangedRows = 0
     let progressRestored = 0
     let progressChanged = false
+    const progressProjectionRecords = {}
 
     for(const {itemKey, href, item} of terminalEntries) {
         const currentRecord = progress[href] || profileNukeProgress?.[href] || null
@@ -8350,6 +8354,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
                     ...profileNukeProgress,
                     [href]: restoredRecord
                 }
+                progressProjectionRecords[href] = restoredRecord
                 progressChanged = true
                 progressRestored += 1
             }
@@ -8419,26 +8424,52 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
     const derivedSettlement = buildTerminalCoordinatorSettlementDerivedPayload(stored, progress, {
         confirmedHrefs,
         clearedHrefs,
-        progressChanged
+        progressChanged,
+        progressRecords: progressProjectionRecords
     })
     const payload = derivedSettlement.payload
 
-    if(Object.keys(payload).length) {
-        let derivedSaved = false
-        try {
-            derivedSaved = await metricStorageSet(payload, {
-                snapshotWriteReason: 'ordinaryMutation',
-                metricPath: 'terminalSettlement.derived.save',
-                queueOperation: 'terminal-settlement-derived',
-                queueChangedRows: 0
-            })
+    if(progressChanged || Object.keys(payload).length) {
+        let derivedSaved = true
+        if(progressChanged) {
+            let progressProjectionSaved = false
+            try {
+                progressProjectionSaved = await saveProfileNukeProgressRowProjection(
+                    derivedSettlement.progressRecords,
+                    {metricPath: 'terminalSettlement.derived.progressProjection'}
+                )
+            }
+            catch(error) {
+                progressProjectionSaved = false
+                recordCoordinatorDiagnosticEvent(
+                    'terminal-settlement-progress-projection-save-failed',
+                    error?.message || 'Terminal settlement progress projection save failed'
+                )
+            }
+            if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+                derivedSaved = false
+            }
         }
-        catch(error) {
-            derivedSaved = false
-            recordCoordinatorDiagnosticEvent(
-                'terminal-settlement-derived-save-failed',
-                error?.message || 'Terminal settlement derived save failed'
-            )
+        if(Object.keys(payload).length) {
+            let materializedSaved = false
+            try {
+                materializedSaved = await metricStorageSet(payload, {
+                    snapshotWriteReason: 'ordinaryMutation',
+                    metricPath: 'terminalSettlement.derived.save',
+                    queueOperation: 'terminal-settlement-derived',
+                    queueChangedRows: 0
+                })
+            }
+            catch(error) {
+                materializedSaved = false
+                recordCoordinatorDiagnosticEvent(
+                    'terminal-settlement-derived-save-failed',
+                    error?.message || 'Terminal settlement derived save failed'
+                )
+            }
+            if(materializedSaved === false) {
+                derivedSaved = false
+            }
         }
         if(derivedSaved === false) {
             incrementQueueWakeupMetric('terminalSettlement.derivedSaveFailed')
