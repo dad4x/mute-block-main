@@ -2355,6 +2355,8 @@ test('queued progress keeps sender tab id in persisted records', () => {
     assert.match(batchBody, /addSenderTabIdToProgressPatch\(patch, options\.senderTabId\)/)
     assert.match(batchBody, /loadCoordinatorQueueRunsProgressProjection\(\{[\s\S]*metricPath: options\.expectTerminal === true \? 'terminalProgress\.load' : 'directProgress\.load'/)
     assert.doesNotMatch(batchBody, /loadCoordinatorState\(/)
+    assert.match(batchBody, /saveProfileNukeProgressRowProjection\([\s\S]*inlineProgressProjectionRecords/)
+    assert.doesNotMatch(batchBody, /progress: progressChanged/)
     assert.match(deferredBody, /addSenderTabIdToProgressPatch\(patch, options\.senderTabId\)/)
     assert.match(requestBody, /recordDeferredCoordinatorJobMilestone\(targetProfileHref, patch,[\s\S]*senderTabId: tabId/)
     assert.match(requestBody, /recordCoordinatorJobProgress\(targetProfileHref, patch,[\s\S]*senderTabId: tabId/)
