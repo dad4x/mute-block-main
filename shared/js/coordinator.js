@@ -74,7 +74,7 @@ async function init() {
         void cancelCurrentWork()
     })
     document.getElementById('startCoordinatorButton')?.addEventListener('click', () => {
-        void startQuoraRuntime()
+        void startCoordinatorQueue()
     })
     document.getElementById('openPreferencesButton')?.addEventListener('click', () => {
         void openPreferences()
@@ -224,17 +224,29 @@ async function openPreferences() {
     })
 }
 
-async function startQuoraRuntime() {
+async function startCoordinatorQueue() {
     const button = document.getElementById('startCoordinatorButton')
     flashButton(button)
-    retryFailedLastResult = {reason: 'opening-quora'}
+    retryFailedLastResult = {reason: 'starting-current-work'}
     render()
-    await browser.tabs.create({
-        url: 'https://www.quora.com/',
-        active: true
-    }).catch(() => {
-        window.open('https://www.quora.com/', '_blank', 'noopener')
-    })
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'resume-coordinator-queue',
+        allowBeforeQuora: true,
+        userInitiated: true
+    }, null, 10000).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+
+    retryFailedLastResult = {
+        reason: result?.error
+            ? 'start-current-work-failed'
+            : result?.reason || 'start-current-work-scheduled'
+    }
+    if(result && !result.requiresQuoraVisit) {
+        setQuoraVisitRequirement(false)
+    }
+    await loadState()
+    render()
 }
 
 async function announceCoordinatorPageReady() {
@@ -671,7 +683,7 @@ function syncStartCoordinatorControls() {
     button.hidden = !state.requiresQuoraVisit
     button.disabled = state.loading
     button.title = state.requiresQuoraVisit
-        ? 'Open Quora to start Current Work'
+        ? 'Start Current Work without waiting for a Quora page'
         : 'Quora runtime is available'
 }
 

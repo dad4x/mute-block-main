@@ -54,6 +54,7 @@ async function init() {
     const fopDelay = document.getElementById('fopDelay')
     const flipToAnswers = document.getElementById('flipToAnswers')
     const fopFlipDelay = document.getElementById('fopFlipDelay')
+    const coordinatorAutoStartOnBrowserStart = document.getElementById('coordinatorAutoStartOnBrowserStart')
     const profilesPerBatch = document.getElementById('profilesPerBatch')
     const nukedPostRetentionDays = document.getElementById('nukedPostRetentionDays')
     const maxRememberedNukedPosts = document.getElementById('maxRememberedNukedPosts')
@@ -61,6 +62,7 @@ async function init() {
     fopDelay.value = settings.fopDelay
     flipToAnswers.checked = settings.flipToAnswers
     fopFlipDelay.value = settings.fopFlipDelay
+    coordinatorAutoStartOnBrowserStart.checked = settings.coordinatorAutoStartOnBrowserStart === true
     profilesPerBatch.value = settings.profilesPerBatch
     popupState.nukedPostRetentionDays = normalizeRetentionDays(settings[NUKED_POST_RETENTION_DAYS_KEY], defaults[NUKED_POST_RETENTION_DAYS_KEY])
     popupState.maxRememberedNukedPosts = normalizeMaxRememberedNukedPosts(settings[MAX_REMEMBERED_NUKED_POSTS_KEY], defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
@@ -86,6 +88,7 @@ async function init() {
             fopDelay: fopDelay.valueAsNumber,
             flipToAnswers: flipToAnswers.checked,
             fopFlipDelay: fopFlipDelay.valueAsNumber,
+            coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart.checked,
             profilesPerBatch: profilesPerBatch.valueAsNumber,
             [NUKED_POST_RETENTION_DAYS_KEY]: normalizeRetentionDays(nukedPostRetentionDays.valueAsNumber, defaults[NUKED_POST_RETENTION_DAYS_KEY]),
             [MAX_REMEMBERED_NUKED_POSTS_KEY]: normalizeMaxRememberedNukedPosts(maxRememberedNukedPosts.valueAsNumber, defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
@@ -114,6 +117,7 @@ async function init() {
         fopDelay.value = defaults.fopDelay
         flipToAnswers.checked = defaults.flipToAnswers
         fopFlipDelay.value = defaults.fopFlipDelay
+        coordinatorAutoStartOnBrowserStart.checked = defaults.coordinatorAutoStartOnBrowserStart === true
         profilesPerBatch.value = defaults.profilesPerBatch
         popupState.nukedPostRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY]
         popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]

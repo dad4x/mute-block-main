@@ -11440,6 +11440,61 @@ test('dashboard resume waits for first Quora visit before scheduling work', asyn
     )
 })
 
+test('dashboard explicit start bypasses first Quora visit and opens queued work', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Explicit-Start'
+    const runId = 'run-explicit-start'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3325,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    status: 'queued',
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1,
+                    runId,
+                    createdAt: 3000,
+                    updatedAt: 3000,
+                    attemptId: 'attempt-explicit-start',
+                    attemptNumber: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'resume-coordinator-queue',
+        allowBeforeQuora: true,
+        userInitiated: true
+    })
+
+    assert.equal(result.requiresQuoraVisit, undefined)
+    assert.equal(result.reason, 'dashboard-resume-scheduled')
+    assert.equal(result.fallbackScheduled, true)
+    assert.equal(result.scheduledOnly, true)
+
+    await waitFor(
+        () => listTabs(browser).some(tab => tab.url === href),
+        'dashboard explicit start did not open queued work before Quora activation',
+        {timers, attempts: 40, tickMs: 1000}
+    )
+    await waitFor(
+        () => ['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status),
+        'dashboard explicit start did not persist active queue authority state',
+        {timers}
+    )
+    assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
+})
+
 test('dashboard ready stays display-only even when a Quora tab is already open', async () => {
     const {browser} = loadServiceWorkerHarness({now: 0})
 
@@ -11477,6 +11532,94 @@ test('dashboard resume observes an already-open Quora tab after restart', async 
     assert.equal(result.fallbackScheduled, true)
     assert.equal(result.scheduledOnly, true)
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+})
+
+test('browser startup leaves queued work idle when auto-start is disabled', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Auto-Start-Off'
+    const {browser} = loadServiceWorkerHarness({
+        now: 3325,
+        storage: {
+            coordinatorAutoStartOnBrowserStart: false,
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    status: 'queued',
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1,
+                    createdAt: 3000,
+                    updatedAt: 3000,
+                    attemptId: 'attempt-auto-start-off',
+                    attemptNumber: 1
+                }
+            }
+        }
+    })
+
+    const results = await browser.runtime.onStartup.emit()
+
+    assert.equal(results[0]?.autoStart, false)
+    assert.equal(results[0]?.reason, 'browser-startup-auto-start-disabled')
+    assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+    assert.equal(
+        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-stored-work-repair'),
+        false
+    )
+})
+
+test('browser startup auto-start preference bypasses first Quora visit', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Auto-Start-On'
+    const runId = 'run-auto-start-on'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3325,
+        storage: {
+            coordinatorAutoStartOnBrowserStart: true,
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    status: 'queued',
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1,
+                    runId,
+                    createdAt: 3000,
+                    updatedAt: 3000,
+                    attemptId: 'attempt-auto-start-on',
+                    attemptNumber: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const results = await browser.runtime.onStartup.emit()
+
+    assert.equal(results[0]?.requiresQuoraVisit, undefined)
+    assert.equal(results[0]?.reason, 'browser-startup-auto-start-scheduled')
+    assert.equal(results[0]?.fallbackScheduled, true)
+    assert.equal(results[0]?.scheduledOnly, true)
+
+    await waitFor(
+        () => listTabs(browser).some(tab => tab.url === href),
+        'browser startup auto-start did not open queued work before Quora activation',
+        {timers, attempts: 40, tickMs: 1000}
+    )
+    await waitFor(
+        () => ['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status),
+        'browser startup auto-start did not persist active queue authority state',
+        {timers}
+    )
+    assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
 })
 
 test('dashboard resume starts service-worker queued work before alarm delivery', async () => {
