@@ -1506,18 +1506,9 @@ function suppressAbandonedStorageOperation(operation = 'storage') {
     return true
 }
 
-function makeAbandonedStorageGetResult(defaults = {}) {
-    if(typeof defaults === 'string') return {[defaults]: undefined}
-    if(Array.isArray(defaults)) return Object.fromEntries(defaults.map(key => [key, undefined]))
-    return JSON.parse(JSON.stringify(defaults || {}))
-}
-
 async function metricStorageGet(defaults = {}, options = {}) {
     incrementQueueWakeupMetric('storageGetCalls')
     incrementActiveStorageMetricDetail('storageGetCalls')
-    if(suppressAbandonedStorageOperation('storageGet-before')) {
-        return makeAbandonedStorageGetResult(defaults)
-    }
     const pathName = getStorageMetricPathName(options)
     const startedAt = Date.now()
     let result = null
@@ -1528,9 +1519,6 @@ async function metricStorageGet(defaults = {}, options = {}) {
         recordStoragePathLatencyMetrics('read', pathName, Date.now() - startedAt)
     }
     recordStorageReadPayloadMetrics(result, pathName)
-    if(suppressAbandonedStorageOperation('storageGet-after')) {
-        return makeAbandonedStorageGetResult(defaults)
-    }
     return result
 }
 
@@ -5195,10 +5183,7 @@ function getCoordinatorQueueWalPhysicalStoredPayload(stored = {}) {
 }
 
 function getCoordinatorQueueWalStorageDefaults() {
-    return {
-        [COORDINATOR_QUEUE_WAL_KEY]: null,
-        ...buildSegmentedWalStorageDefaults(null, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
-    }
+    return buildSegmentedWalStorageDefaults(null, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
 }
 
 async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueue = {}, options = {}) {
@@ -5228,6 +5213,15 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
         )
         throw new Error(`segmented queue WAL hydrate failed: ${hydrated?.reason || 'hydrate-failed'}`)
+    }
+
+    if(!Object.prototype.hasOwnProperty.call(stored || {}, COORDINATOR_QUEUE_WAL_KEY)) {
+        const legacyStored = await metricStorageGet({[COORDINATOR_QUEUE_WAL_KEY]: null}, {
+            metricPath: options.metricPath
+                ? `${options.metricPath}.legacy`
+                : 'coordinatorQueueWal.legacy.load'
+        })
+        stored[COORDINATOR_QUEUE_WAL_KEY] = legacyStored?.[COORDINATOR_QUEUE_WAL_KEY] || null
     }
 
     const fallback = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
@@ -10344,15 +10338,28 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
         }
     }
 
-    const recovery = await runCoordinatorReconcileTick(reason, {
-        direct: true,
-        skipStoredWorkCheck: true,
-        repairBeforeResume: options.repairBeforeResume
-    }).catch(error => ({
-        recovered: false,
-        reason: 'resume-reconcile-error',
-        error: error?.message || `${error || ''}`
-    }))
+    const recovery = await promiseWithTimeout(
+        runCoordinatorReconcileTick(reason, {
+            direct: true,
+            skipStoredWorkCheck: true,
+            repairBeforeResume: options.repairBeforeResume
+        }),
+        COORDINATOR_RESUME_GATE_TIMEOUT_MS,
+        'coordinator queue direct resume'
+    ).catch(error => {
+        scheduleStoredWorkRepair(STORED_WORK_REPAIR_INTERVAL_MS, {
+            reason: 'direct-resume-reconcile-timeout',
+            edgeTriggered: true
+        })
+        return {
+            recovered: false,
+            reason: /timed out/i.test(error?.message || '')
+                ? 'resume-reconcile-timeout'
+                : 'resume-reconcile-error',
+            timedOut: /timed out/i.test(error?.message || ''),
+            error: error?.message || `${error || ''}`
+        }
+    })
     await pruneMissingQueuedTabRuntimeState('direct-resume-runtime-prune')
 
     finishQueueWakeupMetricCycle(cycle, recovery?.recovered ? 'state-changed' : 'no-op', recovery?.reason || reason || 'resume-request', {
