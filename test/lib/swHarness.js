@@ -408,6 +408,9 @@ module.exports.__test = {
     coordinatorAuthority,
     enqueueSpaceFeedStorageUpdate,
     enqueueExistingExecutorForCoordinator,
+    buildQueuedTabOpenEffectPlan,
+    applyQueuedTabOpenRuntimeEffect,
+    confirmQueuedTabOpenDurableActiveEffect,
     kickCoordinatorQueueResume,
     metricStorageGet,
     metricStorageSet,
@@ -419,6 +422,8 @@ module.exports.__test = {
     getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
     refreshQueueWakeupMetricsViewForDashboard,
+    rememberQueueLoadPressure,
+    runCoordinatorQueueExecutorFastPath,
     recordDeferredCoordinatorJobMilestone,
     resetQueueWakeupMetricsEpochAfterLoad,
     rollbackFailedQueuedTabOpen,
@@ -432,6 +437,7 @@ module.exports.__test = {
     resumeCoordinatorQueueExecution,
     resumeCoordinatorQueueExecutionOnce,
     restoreCoordinatorPageForStoredWork,
+    runCoordinatorQueueExecutorFastPath,
     runStoredWorkRepairTick,
     saveCoordinatorState,
     scheduleStoredWorkRepair,
@@ -507,7 +513,10 @@ module.exports.__test = {
                 COORDINATOR_ACTIVE_JOB_MAX_MS,
                 COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS,
                 STALE_CLOSE_REQUESTED_QUEUED_TAB_MS,
-                SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS
+                SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS,
+                COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+                COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
+                COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS
             }
         }
     }

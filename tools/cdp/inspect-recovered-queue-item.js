@@ -17,6 +17,9 @@ const {
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
+const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
+const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
+const PROFILE_NUKE_PROGRESS_SHARD_PREFIX = 'mbProfileNukeProgressShard.'
 
 function normalize(value) {
     try {
@@ -68,9 +71,23 @@ function recoverQueue(stored = {}) {
     }
 }
 
+function getProgressRecords(stored = {}) {
+    const progress = {
+        ...(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
+    }
+    const viewRecords = stored[PROFILE_NUKE_PROGRESS_VIEW_KEY]?.records || {}
+    Object.assign(progress, viewRecords)
+    for(const [key, value] of Object.entries(stored || {})) {
+        if(!key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) continue
+        Object.assign(progress, value?.records || {})
+    }
+    return progress
+}
+
 runMain(async () => {
     const config = getCdpConfig()
     const needle = `${getOption('needle', process.env.MB_QUEUE_NEEDLE || '')}`.toLowerCase()
+    const statusFilter = `${getOption('status', '')}`.trim()
     const limit = Number.parseInt(getOption('limit', '10'), 10) || 10
     const targets = await getTargets(config)
     const extensionPrefix = `chrome-extension://${config.extensionId}/`
@@ -87,10 +104,21 @@ runMain(async () => {
         return chrome.storage.local.get(null)
     }})()`, 60000)
     const {queue, recovered, reason, wal} = recoverQueue(stored || {})
+    const progress = getProgressRecords(stored || {})
     const tabs = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readTabs() {
         return chrome.tabs.query({})
     }})()`, 30000)
+    const counts = {}
+    const authoritativeCounts = {}
+    for(const item of Object.values(queue || {})) {
+        const status = `${item?.status || ''}`.trim()
+        counts[status] = (counts[status] || 0) + 1
+        if(item?.serviceWorkerOwned === true || `${item?.executorOwner || ''}` === 'service-worker') {
+            authoritativeCounts[status] = (authoritativeCounts[status] || 0) + 1
+        }
+    }
     const matches = Object.entries(queue || {}).filter(([key, item]) => {
+        if(statusFilter && `${item?.status || ''}`.trim() !== statusFilter) return false
         if(!needle) return true
         return [
             key,
@@ -108,6 +136,7 @@ runMain(async () => {
         return {
             key,
             queue: item,
+            progress: progress[normalizedHref] || null,
             liveTabs: (tabs || [])
                 .filter(tab => normalize(tab.url || '') === normalizedHref)
                 .map(tab => ({
@@ -122,9 +151,12 @@ runMain(async () => {
 
     console.log(JSON.stringify({
         needle,
+        statusFilter,
         recovered,
         reason,
         rowCount: Object.keys(queue || {}).length,
+        counts,
+        authoritativeCounts,
         matchedCount: matches.length,
         wal,
         items: matches

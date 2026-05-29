@@ -463,7 +463,7 @@ test('active queued action phase uses its own wall clock cap', () => {
     )
     const sweep = extractFunction(
         source,
-        'async function sweepStaleQueuedTabs(parentTabId = null)'
+        'async function sweepStaleQueuedTabs(parentTabId = null, options = {})'
     )
     const staleTimeout = extractFunction(
         source,
@@ -1196,7 +1196,7 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     const keyOnlyTerminalMutationBody = extractFunction(source, 'async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {})')
     const nonProfileLandingBody = extractFunction(source, 'async function terminalizeActiveCoordinatorNonProfileLanding(itemKey = \'\', landingUrl = \'\', options = {})')
     const nonProfileLandingMutationBody = extractFunction(source, 'async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {})')
-    const activeWithoutActorBody = extractFunction(source, 'async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = \'\', expectedItem = null, expectedRecord = null, reason = \'reconcile-active-without-actor\')')
+    const activeWithoutActorBody = extractFunction(source, 'async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = \'\', expectedItem = null, expectedRecord = null, reason = \'reconcile-active-without-actor\', options = {})')
     const activeWithoutActorMutationBody = extractFunction(source, 'async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {})')
 
     assert.match(projectionBody, /const kind = `\$\{operation\.kind \|\| ''\}`\.trim\(\)/)
@@ -1588,7 +1588,7 @@ test('storage change progress trigger uses compact progress view instead of full
 test('active queued jobs have a wall-clock cap', () => {
     const source = readRepoFile('shared/js/sw.js')
     const contentSource = readRepoFile('shared/js/content.js')
-    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null)')
+    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
     const repairBody = extractFunction(
         source,
         'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
@@ -1644,19 +1644,22 @@ test('queued tab action claim recovers after service worker restart', () => {
     assert.match(matchBody, /tabId !== itemTabId/)
     assert.match(matchBody, /getAttemptIdFromValue\(item\)/)
     assert.match(matchBody, /getAttemptNumberFromValue\(item\)/)
+    assert.match(recoverBody, /getHydratedCoordinatorAuthorityState\('pendingTabAction\.recover\.residentAuthority'\)/)
     assert.match(recoverBody, /loadCoordinatorQueueProjection\(\{[\s\S]*metricPath: 'pendingTabAction\.recover\.load'/)
     assert.match(recoverBody, /activeQueuedTabs\.add\(tabId\)/)
     assert.match(recoverBody, /pendingTabActions\.set\(tabId, action\)/)
     assert.match(recoverBody, /registerOwnedTab\(ownerTabId, tabId\)/)
     assert.match(recoverBody, /scheduleOwnedBlockedProfileSweep\(ownerTabId, 4000\)/)
+    assert.match(recoverBody, /durablyActive: true/)
     assert.match(claimBody, /recoverPendingTabActionFromCoordinatorQueue\(sender\)/)
     assert.match(claimBody, /recovered\?\.action/)
+    assert.match(claimBody, /recovered\?\.durablyActive === true/)
 })
 
 test('live queued tab adoption immediately injects and nudges content script', () => {
     const body = extractFunction(
         readRepoFile('shared/js/sw.js'),
-        'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)'
+        'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})'
     )
     const registerIndex = body.indexOf('registerOwnedTab(ownerTabId, tabId)')
     const ensureIndex = body.indexOf('ensureQueuedTabContentScript(tabId, \'resume-live-active-tab\')')
@@ -1706,7 +1709,7 @@ test('queued tab release kicks durable stored work even after service worker sle
     const metadataOnlyBody = extractFunction(source, 'function cleanupQueuedTabMetadataOnly(tabId)')
     const followUpBody = extractFunction(source, 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
-    const staleSweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null)')
+    const staleSweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
     const blockedSweepBody = extractFunction(source, 'async function sweepOwnedBlockedProfileTabs(parentTabId)')
     const terminalCloseBody = extractFunction(source, 'async function closeTerminalOwnedProfileTabs(profileHrefs = [])')
 
@@ -2206,7 +2209,7 @@ test('queued executor actions preserve stored foreground policy', () => {
     const activateOnOpenBody = extractFunction(source, 'function shouldActivateOwnedQueuedTabOnOpen(action = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
     const recoverBody = extractFunction(source, 'async function recoverPendingTabActionFromCoordinatorQueue(sender = {})')
-    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)')
+    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
 
     assert.match(helperBody, /item\?\.executorNoForegroundFallback === true/)
     assert.match(helperBody, /item\?\.executorNoForegroundFallback === false/)
@@ -2217,7 +2220,7 @@ test('queued executor actions preserve stored foreground policy', () => {
     assert.match(enqueueBody, /const noForegroundFallback = getQueuedActionNoForegroundFallback\(item, options\)/)
     assert.match(recoverBody, /const noForegroundFallback = getQueuedActionNoForegroundFallback\(item\)/)
     assert.match(adoptBody, /const noForegroundFallback = getQueuedActionNoForegroundFallback\(item\)/)
-    assert.match(adoptBody, /transitionCoordinatorItemForQueuedTab\(pendingAction, tab/)
+    assert.match(adoptBody, /transitionCoordinatorItemForQueuedTab\(pendingAction, liveTab/)
     assert.doesNotMatch(enqueueBody, /noForegroundFallback: true/)
     assert.doesNotMatch(recoverBody, /noForegroundFallback: true/)
     assert.doesNotMatch(adoptBody, /noForegroundFallback: true/)
@@ -2259,7 +2262,8 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.match(transitionBody, /expectedAttemptId/)
     assert.match(transitionBody, /expectedAttemptNumber/)
     assert.match(transitionBody, /metricPath: 'activeTransition\.save'/)
-    assert.match(transitionBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'ordinaryMutation',[\s\S]*queueOperation: 'active-transition-derived'/)
+    assert.match(transitionBody, /deferProjectionSave: true/)
+    assert.match(transitionBody, /if\(runsChanged\) \{[\s\S]*saveCoordinatorState\(\{[\s\S]*runs: nextRuns[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*runs: true,[\s\S]*reason: 'ordinaryMutation',[\s\S]*queueOperation: 'active-transition-derived'/)
     assert.doesNotMatch(transitionBody, /saveCoordinatorQueueRunsProjection\(/)
     assert.match(transitionBody, /return true/)
     assert.match(confirmBody, /loadCoordinatorQueueProjection\(\)\.catch\(\(\) => null\)/)
@@ -2306,7 +2310,7 @@ test('stale queued tab retry gets a fresh attempt identity', () => {
         source,
         'async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {})'
     )
-    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null)')
+    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
     const advanceIndex = sweepBody.indexOf('await advanceCoordinatorQueueForStaleRetryAction(retryAction, closedAt)')
     const enqueueIndex = sweepBody.indexOf('queuedTabActions.unshift(markQueuedTabExecutorActionPlanned(')
 
@@ -2391,6 +2395,9 @@ test('dashboard resume is a prompt kick with alarm-backed execution', () => {
     assert.match(kickBody, /browser\.alarms\.create\(COORDINATOR_RESUME_ALARM_NAME/)
     assert.match(kickBody, /alarmCreated/)
     assert.match(kickBody, /runCoordinatorReconcileTick\(reason/)
+    assert.match(kickBody, /options\.backgroundFastPath === true/)
+    assert.match(kickBody, /void runCoordinatorQueueExecutorFastPath\(reason \|\| 'resume-request'/)
+    assert.match(kickBody, /runCoordinatorQueueExecutorFastPath\(reason \|\| 'resume-request'/)
     assert.match(kickBody, /scheduleCoordinatorQueueResume\(600, reason \|\| 'resume-request'\)/)
     assert.match(kickBody, /ensureQuoraRuntimeActivatedForScheduler\('resume-existing-quora-tab'\)/)
     assert.match(kickBody, /resumeScheduled/)
@@ -2399,8 +2406,11 @@ test('dashboard resume is a prompt kick with alarm-backed execution', () => {
     assert.match(source, /ensureQuoraRuntimeActivatedForScheduler\('resume-alarm-existing-quora-session'\)/)
     assert.match(source, /return runScheduledCoordinatorQueueResume\('resume-alarm'\)/)
     assert.match(source, /async function runScheduledCoordinatorQueueResume\(reason = ''\)/)
+    assert.match(source, /runCoordinatorQueueExecutorFastPath\(resumeReason/)
     assert.match(source, /clearTimeout\(coordinatorQueueResumeTimeout\)/)
-    assert.match(resumeBranch, /return kickCoordinatorQueueResume\('dashboard-resume'\)/)
+    assert.match(resumeBranch, /return kickCoordinatorQueueResume\('dashboard-resume', \{[\s\S]*backgroundFastPath: true[\s\S]*\}\)/)
+    assert.doesNotMatch(resumeBranch, /executorFastPath: true/)
+    assert.doesNotMatch(resumeBranch, /awaitFill: true/)
     assert.match(resumeBranch, /scheduleStoredWorkRepair\(1000, \{[\s\S]*reason: 'dashboard-resume'[\s\S]*edgeTriggered: true/)
     assert.doesNotMatch(resumeBranch, /return resumeCoordinatorQueueExecution/)
     assert.doesNotMatch(resumeBranch, /\{direct: true\}/)
@@ -2443,6 +2453,7 @@ test('queued background tabs have a content-script injection fallback', () => {
 test('queued tab fill bounds stale open-decision reads', () => {
     const source = readRepoFile('shared/js/sw.js')
     const planBody = extractFunction(source, 'async function planQueuedTabExecutorAction(action = {}, options = {})')
+    const planLimitBody = extractFunction(source, 'function getCoordinatorExecutorPlanBatchLimit(ownerTabId = null, options = {})')
     const finalCheckBody = extractFunction(source, 'async function validateQueuedTabOpenAgainstCurrentAuthority(action = {})')
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
@@ -2454,7 +2465,13 @@ test('queued tab fill bounds stale open-decision reads', () => {
     assert.match(finalCheckBody, /reason: 'final-open-decision-timeout'/)
     assert.match(planBody, /reason: 'open-decision-timeout'/)
     assert.match(planBody, /open: true/)
-    assert.match(planBody, /markQueuedTabExecutorActionPlanned\(action, openDecision, 'executor-apply-phase'\)/)
+    assert.match(planBody, /authorityValidated: !!\(options\.currentAuthorityState \|\| options\.authorityState\)/)
+    assert.match(planBody, /markQueuedTabExecutorActionPlanned\(action, \{[\s\S]*\.\.\.openDecision[\s\S]*authorityValidated:/)
+    assert.match(planLimitBody, /getEffectiveQueuedTabConcurrency\(\)/)
+    assert.match(planLimitBody, /countQueuedExecutorSlotsForOwner\(ownerTabId\)/)
+    assert.match(enqueueBody, /const planBatchLimit = getCoordinatorExecutorPlanBatchLimit\(ownerTabId, options\)/)
+    assert.match(enqueueBody, /if\(queued >= planBatchLimit\) \{[\s\S]*batchLimited = true[\s\S]*break/)
+    assert.match(fillBody, /next\.executorPlanAuthorityValidated === true[\s\S]*reason: 'prevalidated-current-authority'[\s\S]*validateQueuedTabOpenAgainstCurrentAuthority\(next\)/)
     assert.match(enqueueBody, /const plannedAction = await planQueuedTabExecutorAction/)
     assert.match(enqueueBody, /queuedTabActions\.push\(plannedAction\)/)
     assert.match(fillBody, /next\.executorPlanKind !== 'open-tab'/)
@@ -2483,6 +2500,26 @@ test('resume rebuilds from durable queue after stale volatile queued actions do 
     assert.match(resumeBody, /runCoordinatorExecutorApplyPhase\(options\.reason \|\| 'resume'/)
     assert.match(resumeBody, /dropVolatileReason: options\.reason \|\| 'resume-rebuild-from-durable-queue'/)
     assert.match(source, /name: 'volatile-queued-actions-dropped'/)
+})
+
+test('resume adopts only owned or expected live queued tabs before planning opens', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const body = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
+    const liveTabBody = extractFunction(source, 'function getLiveTabForCoordinatorItem(item = null, itemKey = \'\', liveProfileTabsByHref = new Map(), record = null)')
+    const queuedAdoptIndex = body.indexOf("`${item?.status || ''}`.trim() === 'queued'")
+    const liveTabIndex = body.indexOf('getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, record)')
+    const pendingPushIndex = body.indexOf('pendingItems.push({')
+
+    assert.notEqual(queuedAdoptIndex, -1)
+    assert.notEqual(liveTabIndex, -1)
+    assert.notEqual(pendingPushIndex, -1)
+    assert.ok(queuedAdoptIndex < pendingPushIndex)
+    assert.ok(liveTabIndex < pendingPushIndex)
+    assert.match(body.slice(queuedAdoptIndex, pendingPushIndex), /adoptLiveCoordinatorQueuedTab\(item, itemKey, liveTab, ownerTabId, \{currentAuthorityState\}\)/)
+    assert.match(body.slice(queuedAdoptIndex, pendingPushIndex), /incrementMetric\('noop\.liveQueuedTabAdoptionFailed'\)/)
+    assert.match(body.slice(queuedAdoptIndex, pendingPushIndex), /continue/)
+    assert.match(liveTabBody, /getOwnedOrExpectedLiveTabsForProfileHref\(item, record, href, liveProfileTabsByHref\)/)
+    assert.doesNotMatch(liveTabBody, /liveProfileTabsByHref\.get\(href\)/)
 })
 
 test('stored work recovery reports durable work without deciding executor movement', () => {
@@ -2524,7 +2561,7 @@ test('queued tab content ensure nudges the profile page to claim its action', ()
     const nudgeBody = extractFunction(swSource, 'async function nudgeQueuedTabActionClaim(tabId, reason = \'\')')
     const retryBody = extractFunction(swSource, 'async function nudgeQueuedTabActionClaimWithRetries(tabId, reason = \'\', delays = [0, 250, 750, 1500])')
     const fillBody = extractFunction(swSource, 'async function fillQueuedTabsOnce(options = {})')
-    const adoptBody = extractFunction(swSource, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)')
+    const adoptBody = extractFunction(swSource, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
     const messageBody = extractFunction(contentSource, 'function onMessage(request, sender, sendResponse)')
 
     assert.match(swSource, /QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS/)
@@ -2609,7 +2646,7 @@ test('resume reattaches live active tabs after service worker restart', () => {
     const source = readRepoFile('shared/js/sw.js')
     const resumeBody = extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
     const applyBody = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
-    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)')
+    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
     const legacyBody = extractFunction(source, 'function buildLegacyCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})')
 
     assert.match(resumeBody, /runCoordinatorExecutorApplyPhase\(options\.reason \|\| 'resume'/)
@@ -2618,7 +2655,7 @@ test('resume reattaches live active tabs after service worker restart', () => {
     assert.match(applyBody, /isActiveCoordinatorStatus\(item\?\.status\)/)
     assert.match(applyBody, /getTokenMatchedLiveOrPersistedTabForCoordinatorItem\(item, record, itemKey, liveProfileTabsByHref\)/)
     assert.match(applyBody, /hasActiveQueuedTabActionPhaseProgress\(record, item\)\) continue/)
-    assert.match(applyBody, /adoptLiveCoordinatorQueuedTab\(item, itemKey, liveTab, ownerTabId\)/)
+    assert.match(applyBody, /adoptLiveCoordinatorQueuedTab\(item, itemKey, liveTab, ownerTabId, \{currentAuthorityState\}\)/)
     assert.match(applyBody, /reattached-live-active-tabs/)
     assert.match(adoptBody, /pendingTabActions\.set/)
     assert.match(adoptBody, /activeQueuedTabs\.add/)
@@ -2641,9 +2678,10 @@ test('storage repair immediately reconciles active rows whose persisted tab is g
 
     assert.match(helperBody, /getPersistedQueuedTabId\(item, record\)/)
     assert.match(helperBody, /hasOwnedQueuedTabState\(tabId\)/)
-    assert.match(helperBody, /await browser\.tabs\.get\(tabId\)/)
+    assert.match(helperBody, /getQueuedExecutorTabWithTimeout\(tabId, 'missing-active-persisted-tab'\)/)
     assert.match(helperBody, /detachQueuedTabRuntimeState\(tabId, 'missing-persisted-active-tab'\)/)
-    assert.match(helperBody, /catch\s*\{[\s\S]*return true/)
+    assert.doesNotMatch(helperBody, /browser\.tabs\.get/)
+    assert.match(helperBody, /return true/)
     assert.match(helperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
     assert.match(timeoutHelperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
     assert.match(decisionBody, /shouldReconcileMissingActiveCoordinatorTab\(item, record, href, liveProfileTabsByHref, now\)/)
@@ -2681,7 +2719,9 @@ test('dashboard resume returns scheduled recovery with repair follow-up schedule
     assert.notEqual(messageStart, -1)
     const body = source.slice(messageStart, messageStart + 450)
 
-    assert.match(body, /return kickCoordinatorQueueResume\('dashboard-resume'\)/)
+    assert.match(body, /return kickCoordinatorQueueResume\('dashboard-resume', \{[\s\S]*backgroundFastPath: true[\s\S]*\}\)/)
+    assert.doesNotMatch(body, /executorFastPath: true/)
+    assert.doesNotMatch(body, /awaitFill: true/)
     assert.match(body, /scheduleStoredWorkRepair\(1000, \{[\s\S]*reason: 'dashboard-resume'[\s\S]*edgeTriggered: true/)
     assert.doesNotMatch(body, /\{direct: true\}/)
 })
@@ -3108,25 +3148,28 @@ test('active queued already-blocked repair releases and closes the tab', () => {
 
 test('live queued tab adoption requires durable active transition before cleanup', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)')
+    const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
     const terminalizeBody = extractFunction(source, 'async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = \'already-blocked-queued-tab\')')
     const activeSetIndex = adoptBody.indexOf('activeQueuedTabs.add(tabId)')
     const transitionIndex = adoptBody.indexOf('const activeTransitioned = await transitionCoordinatorItemForQueuedTab')
-    const failedIndex = adoptBody.indexOf("detachQueuedTabRuntimeState(tabId, 'resume-live-active-tab-transition-failed')")
+    const failedIndex = adoptBody.indexOf("activeTransitionPendingReason: 'resume-live-active-tab-transition-failed'")
     const terminalizeIndex = adoptBody.indexOf("terminalizeAlreadyBlockedQueuedTab(tabId, 'resume-live-active-tab-already-blocked')")
     const nudgeIndex = adoptBody.indexOf("nudgeQueuedTabActionClaimWithRetries(tabId, 'resume-live-active-tab')")
+    const pendingNudgeIndex = adoptBody.indexOf("nudgeQueuedTabActionClaimWithRetries(tabId, 'resume-live-active-tab-transition-pending')")
 
     assert.notEqual(activeSetIndex, -1)
     assert.notEqual(transitionIndex, -1)
     assert.notEqual(failedIndex, -1)
     assert.notEqual(terminalizeIndex, -1)
     assert.notEqual(nudgeIndex, -1)
+    assert.notEqual(pendingNudgeIndex, -1)
     assert.ok(activeSetIndex < transitionIndex)
     assert.ok(transitionIndex < failedIndex)
     assert.ok(failedIndex < terminalizeIndex)
     assert.ok(terminalizeIndex < nudgeIndex)
     assert.match(adoptBody, /if\(!activeTransitioned\)/)
-    assert.match(adoptBody, /return false/)
+    assert.match(adoptBody, /ensureQueuedTabContentScript\(tabId, 'resume-live-active-tab-transition-pending'\)/)
+    assert.match(adoptBody, /return true/)
     assert.match(terminalizeBody, /action: 'close-if-blocked'/)
     assert.match(terminalizeBody, /recordOwnedBlockedSweepTerminal/)
     assert.match(terminalizeBody, /if\(!recorded\?\.terminal\) return false/)
@@ -3156,7 +3199,7 @@ test('fresh queued tab progress clears stale close fields', () => {
     const actionBody = extractFunction(contentSource, 'async function maybeRunAutoProfileAction()')
     const initialOpenIndex = actionBody.indexOf("status: 'tab-opened'")
     const resolvedOpenIndex = actionBody.indexOf('Resolved queued page target to')
-    const swBody = extractFunction(readRepoFile('shared/js/sw.js'), 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID)')
+    const swBody = extractFunction(readRepoFile('shared/js/sw.js'), 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
     const reattachIndex = swBody.indexOf("status: 'tab-opening'")
 
     assert.notEqual(initialOpenIndex, -1)
@@ -3389,7 +3432,7 @@ test('legacy profile progress writes are deleted from service-worker progress pa
     const promoteBody = extractFunction(source, 'async function promoteQueuedTab(tabId, reason = \'\', options = {})')
     const closingBody = extractFunction(source, 'function markQueuedTabClosing(tabId, reason = \'\')')
     const releaseBody = extractFunction(source, 'async function releaseQueuedTab(tabId, options = {})')
-    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null)')
+    const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
     const singleBranchStart = source.indexOf("request.action === 'record-nuke-progress'")
     const milestoneBranchStart = source.indexOf("request.action === 'record-job-milestone'")
     const batchBranchStart = source.indexOf("request.action === 'record-nuke-progress-batch'")

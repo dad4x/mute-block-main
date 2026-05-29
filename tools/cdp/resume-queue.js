@@ -13,7 +13,7 @@ runMain(async () => {
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     const serviceWorker = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))
     const dashboard = targets.find(target => target.type === 'page' && target.url === dashboardUrl)
-    const target = dashboard || serviceWorker
+    const target = serviceWorker || dashboard
     if(!target) {
         console.log(JSON.stringify({dashboard: false, serviceWorker: false}, null, 2))
         process.exitCode = 1
@@ -90,6 +90,7 @@ runMain(async () => {
             const action = paused
                 ? 'resume-paused-coordinator-nukes'
                 : 'resume-coordinator-queue'
+            const fallbackMs = allowDirectServiceWorkerCall ? 65000 : 5000
             setTimeout(() => {
                 if(scheduleAlarmFallback('resume message did not receive a callback', {clearPause: paused})) return
                 finish({
@@ -98,7 +99,7 @@ runMain(async () => {
                     timedOut: true,
                     lastError: ''
                 })
-            }, 5000)
+            }, fallbackMs)
             if(allowDirectServiceWorkerCall && paused && typeof resumePausedCoordinatorNukes === 'function') {
                 resumePausedCoordinatorNukes().then(response => finish({
                     action: 'service-worker-resume-paused',
@@ -111,12 +112,27 @@ runMain(async () => {
                 }))
                 return
             }
+            if(allowDirectServiceWorkerCall && !paused && typeof runCoordinatorQueueExecutorFastPath === 'function') {
+                runCoordinatorQueueExecutorFastPath('cdp-resume-queue', {
+                    awaitFill: true
+                }).then(response => finish({
+                    action: 'service-worker-fast-resume',
+                    response: response || null,
+                    lastError: ''
+                })).catch(error => finish({
+                    action: 'service-worker-fast-resume',
+                    response: null,
+                    lastError: error?.message || String(error || '')
+                }))
+                return
+            }
             if(allowDirectServiceWorkerCall && !paused && typeof resumeCoordinatorQueueExecution === 'function') {
                 resumeCoordinatorQueueExecution({
                     tabId: 'service-worker-queue-owner',
                     windowId: null
                 }, {
                     skipRepair: true,
+                    skipAuthorityReconcile: true,
                     serviceWorkerOwned: true
                 }).then(response => finish({
                     action: 'service-worker-direct-resume',
