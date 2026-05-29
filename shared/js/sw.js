@@ -80,13 +80,15 @@ const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#worker-window'
 const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
 const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
 const COORDINATOR_PAUSE_GENERATION_KEY = 'mbCoordinatorPauseGeneration'
+const COORDINATOR_AUTO_START_ON_BROWSER_START_KEY = 'coordinatorAutoStartOnBrowserStart'
 const COORDINATOR_DASHBOARD_STATE_KEYS = new Set([
     COORDINATOR_QUEUE_VIEW_KEY,
     COORDINATOR_RUNS_KEY,
     COORDINATOR_EVENTS_KEY,
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
     COORDINATOR_RETRY_FAILED_ENABLED_KEY,
-    COORDINATOR_PAUSED_KEY
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_AUTO_START_ON_BROWSER_START_KEY
 ])
 const SERVICE_WORKER_QUEUE_OWNER_ID = 'service-worker-queue-owner'
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
@@ -1051,6 +1053,41 @@ function makeQuoraRuntimeNotActivatedResult(reason = 'quora-runtime-not-activate
         repairScheduled: false,
         scheduledOnly: true
     }
+}
+
+async function isCoordinatorAutoStartOnBrowserStartEnabled() {
+    const stored = await metricStorageGet({
+        [COORDINATOR_AUTO_START_ON_BROWSER_START_KEY]:
+            defaults[COORDINATOR_AUTO_START_ON_BROWSER_START_KEY] === true
+    }, {
+        phase: 'startupPreferenceGet'
+    }).catch(() => null)
+
+    return stored?.[COORDINATOR_AUTO_START_ON_BROWSER_START_KEY] === true
+}
+
+async function handleCoordinatorBrowserStartup() {
+    await Promise.all([
+        forgetQuoraRuntimeActivation('browser-startup'),
+        resetQueueWakeupMetricsEpochAfterLoad('browser-startup', {deferUntilQuora: true})
+    ]).catch(() => null)
+
+    if(!await isCoordinatorAutoStartOnBrowserStartEnabled()) {
+        return {
+            autoStart: false,
+            reason: 'browser-startup-auto-start-disabled'
+        }
+    }
+
+    scheduleStoredWorkRepair(1000, {
+        reason: 'browser-startup-auto-start',
+        edgeTriggered: true,
+        allowBeforeQuora: true
+    })
+    return kickCoordinatorQueueResume('browser-startup-auto-start', {
+        allowBeforeQuora: true,
+        backgroundFastPath: true
+    })
 }
 
 function normalizeObjectNumberMap(value = null) {
@@ -21538,14 +21575,12 @@ browser.runtime.onInstalled.addListener(details => {
 
 if(!hasBrowserSessionStorage()) {
     browser.runtime.onStartup.addListener(() => {
-        void forgetQuoraRuntimeActivation('browser-startup')
-        void resetQueueWakeupMetricsEpochAfterLoad('browser-startup', {deferUntilQuora: true})
+        return handleCoordinatorBrowserStartup()
     })
 }
 else {
     browser.runtime.onStartup.addListener(() => {
-        void forgetQuoraRuntimeActivation('browser-startup')
-        void resetQueueWakeupMetricsEpochAfterLoad('browser-startup', {deferUntilQuora: true})
+        return handleCoordinatorBrowserStartup()
     })
 }
 
@@ -22223,9 +22258,11 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     else if(request.action === 'resume-coordinator-queue') {
         scheduleStoredWorkRepair(1000, {
             reason: 'dashboard-resume',
-            edgeTriggered: true
+            edgeTriggered: true,
+            allowBeforeQuora: request.allowBeforeQuora === true
         })
         return kickCoordinatorQueueResume('dashboard-resume', {
+            allowBeforeQuora: request.allowBeforeQuora === true,
             backgroundFastPath: true
         })
     }
