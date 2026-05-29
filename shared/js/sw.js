@@ -5154,6 +5154,20 @@ function normalizeCoordinatorQueueWalStore(value = null, snapshotQueue = {}) {
     return makeCoordinatorQueueWalCheckpoint(snapshotQueue)
 }
 
+function isCoordinatorQueueWalPhysicalStorageKey(key = '') {
+    return key === COORDINATOR_QUEUE_WAL_KEY || `${key || ''}`.startsWith(`${COORDINATOR_QUEUE_WAL_KEY}.`)
+}
+
+function getCoordinatorQueueWalPhysicalStoredPayload(stored = {}) {
+    const payload = {}
+    for(const [key, value] of Object.entries(stored || {})) {
+        if(isCoordinatorQueueWalPhysicalStorageKey(key)) {
+            payload[key] = cloneCoordinatorAuthorityValue(value)
+        }
+    }
+    return payload
+}
+
 function getCoordinatorQueueWalStorageDefaults() {
     return {
         [COORDINATOR_QUEUE_WAL_KEY]: null,
@@ -5187,6 +5201,7 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             'coordinator-authority-queue-wal-segmented-hydrate-failed',
             hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
         )
+        throw new Error(`segmented queue WAL hydrate failed: ${hydrated?.reason || 'hydrate-failed'}`)
     }
 
     const fallback = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
@@ -6426,6 +6441,7 @@ function normalizeCoordinatorAuthorityStateInput(value = null) {
     return {
         stored: {
             [COORDINATOR_QUEUE_KEY]: cloneCoordinatorAuthorityValue(queue),
+            ...getCoordinatorQueueWalPhysicalStoredPayload(stored),
             [COORDINATOR_QUEUE_WAL_KEY]: cloneCoordinatorAuthorityValue(stored[COORDINATOR_QUEUE_WAL_KEY] || null),
             [COORDINATOR_RUNS_KEY]: cloneCoordinatorAuthorityValue(runs)
         },
@@ -6459,8 +6475,33 @@ function createCoordinatorAuthority() {
             next.stored[COORDINATOR_QUEUE_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_KEY] || {})
             changed = true
         }
-        if(Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_WAL_KEY)) {
+        const physicalWalKeys = Object.keys(payload || {}).filter(isCoordinatorQueueWalPhysicalStorageKey)
+        const hasLegacyWalPayload = Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_WAL_KEY)
+        if(physicalWalKeys.length) {
+            for(const key of physicalWalKeys) {
+                next.stored[key] = cloneCoordinatorAuthorityValue(payload[key])
+            }
+            const hydrated = hydrateSegmentedWalStore(next.stored, {
+                baseKey: COORDINATOR_QUEUE_WAL_KEY,
+                fallbackStore: next.stored[COORDINATOR_QUEUE_WAL_KEY] || null
+            })
+            if(hydrated?.ok === true && hydrated.store) {
+                next.stored[COORDINATOR_QUEUE_WAL_KEY] = hydrated.store
+            }
+            else if(!hasLegacyWalPayload && physicalWalKeys.some(key => key !== COORDINATOR_QUEUE_WAL_KEY)) {
+                incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateFailed')
+                recordCoordinatorDiagnosticEvent(
+                    'coordinator-authority-queue-wal-segmented-hydrate-failed',
+                    hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
+                )
+                return false
+            }
+            changed = true
+        }
+        if(hasLegacyWalPayload) {
             next.stored[COORDINATOR_QUEUE_WAL_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_WAL_KEY] || null)
+        }
+        if(hasLegacyWalPayload || physicalWalKeys.length) {
             const recovered = recoverCoordinatorQueueFromWal(
                 next.stored[COORDINATOR_QUEUE_KEY] || next.queue || {},
                 next.stored[COORDINATOR_QUEUE_WAL_KEY]
@@ -6545,6 +6586,7 @@ function createCoordinatorAuthority() {
             stored: {
                 ...(projection.stored || {}),
                 [COORDINATOR_QUEUE_KEY]: freshAuthorityRows.stored?.[COORDINATOR_QUEUE_KEY] || {},
+                ...getCoordinatorQueueWalPhysicalStoredPayload(freshAuthorityRows.stored || {}),
                 [COORDINATOR_QUEUE_WAL_KEY]: freshAuthorityRows.stored?.[COORDINATOR_QUEUE_WAL_KEY] || null,
                 [COORDINATOR_RUNS_KEY]: freshAuthorityRows.stored?.[COORDINATOR_RUNS_KEY] || {}
             },
@@ -12610,6 +12652,27 @@ function preserveAdvancedProfileProgress(previous = {}, next = {}) {
         const nextValue = Number.isFinite(next?.[key]) ? next[key] : 0
         if(previousValue > nextValue && profileProgressAttemptsMatch(previous, next)) {
             next[key] = previousValue
+        }
+    }
+
+    if(profileProgressAttemptsMatch(previous, next)) {
+        if(previous?.actionSurfaceMode && !next.actionSurfaceMode) {
+            next.actionSurfaceMode = previous.actionSurfaceMode
+        }
+        if(previous?.actionSurfaceWindowId && !next.actionSurfaceWindowId) {
+            next.actionSurfaceWindowId = previous.actionSurfaceWindowId
+        }
+        if(previous?.actionSurfaceAnchorTabId && !next.actionSurfaceAnchorTabId) {
+            next.actionSurfaceAnchorTabId = previous.actionSurfaceAnchorTabId
+        }
+        const previousActivatedAt = Number.isFinite(previous?.actionSurfaceActivatedAt)
+            ? previous.actionSurfaceActivatedAt
+            : 0
+        const nextActivatedAt = Number.isFinite(next?.actionSurfaceActivatedAt)
+            ? next.actionSurfaceActivatedAt
+            : 0
+        if(previousActivatedAt > nextActivatedAt) {
+            next.actionSurfaceActivatedAt = previousActivatedAt
         }
     }
 
