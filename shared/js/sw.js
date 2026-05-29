@@ -5250,6 +5250,26 @@ function shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item = null, 
     return true
 }
 
+function isRedundantTerminalProgressForCoordinatorItem(item = null, record = null, mapped = null) {
+    const itemStatus = `${item?.status || ''}`.trim()
+    if(!item || !record || !isTerminalCoordinatorStatus(itemStatus)) return false
+
+    const effectiveMapped = mapped || getCoordinatorStatusFromProgress(record)
+    if(!isTerminalCoordinatorStatus(effectiveMapped.status)) return false
+    if(effectiveMapped.status !== itemStatus) return false
+    if(shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, effectiveMapped)) return false
+    if(hasMismatchedCoordinatorAttempt(item, record)) return false
+
+    const mappedOutcome = `${effectiveMapped.outcome || ''}`.trim()
+    const mappedError = `${effectiveMapped.error || ''}`.trim()
+    const itemOutcome = `${item.outcome || ''}`.trim()
+    const itemError = `${item.error || ''}`.trim()
+    if(mappedOutcome !== itemOutcome) return false
+    if(mappedError !== itemError) return false
+
+    return true
+}
+
 function promoteTerminalCoordinatorItemFromSuccessfulProgress(item = {}, record = {}, mapped = {}, options = {}) {
     const now = Number.parseInt(options.now, 10) || Date.now()
     const terminalAt = getCoordinatorTransitionTerminalAt(item, record, now, options)
@@ -21050,6 +21070,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                         terminal = true
                     }
                 }
+                else if(isRedundantTerminalProgressForCoordinatorItem(item, record, mapped)) {
+                    incrementQueueWakeupMetric('terminalProgress.queueNoopDuplicate')
+                }
                 else if((patchCanTransitionStatus || preferSuccessfulTerminal) &&
                     mapped.status &&
                     !(item.status !== 'queued' && mapped.status === 'queued')) {
@@ -21734,6 +21757,38 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
         }
     }
     else {
+        const liveTab = await getQueuedExecutorTabWithTimeout(tab?.id, 'active-transition-post-confirm')
+        if(!liveTab) {
+            const rolledBack = await rollbackFailedQueuedTabOpen(action, tab, {
+                ...(plan.activeTransitionDetails || {}),
+                activeTransitionError: 'queued tab missing after durable active transition'
+            }).catch(() => false)
+            if(rolledBack) {
+                const detached = detachQueuedTabRuntimeState(tab.id, 'active-transition-tab-missing')
+                void releaseQueuedTab(tab.id, {
+                    runtimeDetached: true,
+                    metadata: detached.metadata,
+                    wasActive: detached.wasActive,
+                    foregroundLeaseReleased: detached.foregroundLeaseReleased
+                })
+                return {
+                    activeTransitionAccepted,
+                    activeTransitionError,
+                    activeTransitionContinued,
+                    keepOpen: false,
+                    rolledBack: true,
+                    missingAfterDurableActive: true
+                }
+            }
+            setQueuedTabMetadata(tab.id, {
+                activeTransitionConfirmTabMissingAt: Date.now(),
+                activeTransitionConfirmTabMissingReason: 'active-transition-post-confirm'
+            })
+            scheduleStoredWorkRepair(1000, {
+                reason: 'active-transition-post-confirm-tab-missing',
+                edgeTriggered: true
+            })
+        }
         markQueuedTabDurablyActive(tab.id, 'active-transition')
     }
 
