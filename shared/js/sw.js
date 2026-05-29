@@ -4131,6 +4131,16 @@ function getAllProfileNukeProgressShardDefaults() {
     return defaults
 }
 
+function getProfileNukeProgressProjectionDefaults(profileHrefs = []) {
+    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
+    return {
+        [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+        ...(hrefs.length
+            ? getProfileNukeProgressShardDefaults(hrefs)
+            : getAllProfileNukeProgressShardDefaults())
+    }
+}
+
 function buildProfileNukeProgressShardPayload(progress = {}, now = Date.now()) {
     const normalized = normalizeStoredProfileNukeProgress(progress || {})
     const shards = {}
@@ -4407,6 +4417,13 @@ function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs =
         if(!requested || requested.has(profileHref)) progress[profileHref] = record
     }
     return progress
+}
+
+function getProfileNukeProgressRecordsFromStorage(stored = {}, profileHrefs = []) {
+    return {
+        ...normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}),
+        ...getProfileNukeProgressRecordsFromProjection(stored, profileHrefs)
+    }
 }
 
 function addContentPageStateProjectionPayload(payload = {}) {
@@ -6700,16 +6717,12 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
 async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressProjection', async () => {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
-        const progressShardDefaults = getProfileNukeProgressShardDefaults(progressProfileHrefs)
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_KEY]: {},
-            ...(progressProfileHrefs.length ? {
-                [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
-                ...progressShardDefaults
-            } : {})
+            ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
         })
@@ -6720,10 +6733,7 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => ({
-            ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
-            ...getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs)
-        }))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -6755,10 +6765,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => ({
-            ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
-            ...getProfileNukeProgressRecordsFromProjection(stored)
-        }))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -6801,12 +6808,14 @@ async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
 
 async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsEventsProgressProjection', async () => {
+        const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
-            [PROFILE_NUKE_PROGRESS_KEY]: {}
+            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'
         })
@@ -6818,7 +6827,7 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -6833,12 +6842,14 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
 
 async function loadCoordinatorRepairProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorRepairProjection', async () => {
+        const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
             [PROFILE_NUKE_PROGRESS_KEY]: {},
+            ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs),
             [COORDINATOR_PAUSED_KEY]: false,
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
@@ -6853,7 +6864,7 @@ async function loadCoordinatorRepairProjection(options = {}) {
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -6899,16 +6910,15 @@ async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
 async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressPendingNukedProjection', async () => {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
-        const progressShardDefaults = getProfileNukeProgressShardDefaults(progressProfileHrefs)
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
             ...(progressProfileHrefs.length ? {
-                [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
-                ...progressShardDefaults
+                ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
             } : {
-                [PROFILE_NUKE_PROGRESS_KEY]: {}
+                [PROFILE_NUKE_PROGRESS_KEY]: {},
+                ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
             }),
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
@@ -6924,7 +6934,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => progressProfileHrefs.length
             ? getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs)
-            : normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+            : getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -7830,6 +7840,8 @@ async function repairCoordinatorStorageFromProgressLocked() {
     const originalRuns = cloneCoordinatorAuthorityValue(runs)
     const events = state.events
     const progress = state.progress
+    const originalProgress = cloneCoordinatorAuthorityValue(progress || {})
+    const originalLegacyProgress = normalizeStoredProfileNukeProgress(state.stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
     let pendingPosts = state.pendingPosts || {}
     let nukedPosts = state.nukedPosts || {}
     state.pendingPosts = pendingPosts
@@ -8146,10 +8158,53 @@ async function repairCoordinatorStorageFromProgressLocked() {
     const runsChanged = (runsMetadataChanged || nextRuns !== runs) && JSON.stringify(nextRuns) !== JSON.stringify(originalRuns)
     const storagePatch = {}
 
+    let fullProgressMirrorChanged = false
+    let progressProjectionSaved = {saved: true, rows: 0}
+    let progressProjectionDeleted = {saved: true, rows: 0}
     if(progressChanged) {
         const prunedProgress = pruneProfileNukeProgress(progress)
+        const changedProgressRecords = getChangedProfileProgressRecords(originalProgress, prunedProgress)
+        const deletedProgressHrefs = Object.keys(originalProgress || {})
+            .filter(href => !Object.prototype.hasOwnProperty.call(prunedProgress, href))
         profileNukeProgress = prunedProgress
-        storagePatch[PROFILE_NUKE_PROGRESS_KEY] = prunedProgress
+
+        if(Object.keys(changedProgressRecords).length) {
+            try {
+                progressProjectionSaved = await saveProfileNukeProgressRowProjection(changedProgressRecords, {
+                    metricPath: 'repair.progressProjection'
+                })
+            }
+            catch(error) {
+                progressProjectionSaved = false
+                recordCoordinatorDiagnosticEvent(
+                    'repair-progress-projection-save-failed',
+                    error?.message || 'Repair progress projection save failed'
+                )
+            }
+        }
+
+        if(deletedProgressHrefs.length) {
+            try {
+                progressProjectionDeleted = await deleteProfileNukeProgressRowProjection(deletedProgressHrefs, {
+                    metricPath: 'repair.progressProjectionDelete'
+                })
+            }
+            catch(error) {
+                progressProjectionDeleted = false
+                recordCoordinatorDiagnosticEvent(
+                    'repair-progress-projection-delete-failed',
+                    error?.message || 'Repair progress projection delete failed'
+                )
+            }
+
+            fullProgressMirrorChanged = deletedProgressHrefs.some(href =>
+                Object.prototype.hasOwnProperty.call(originalLegacyProgress, href)
+            )
+        }
+
+        if(fullProgressMirrorChanged) {
+            storagePatch[PROFILE_NUKE_PROGRESS_KEY] = prunedProgress
+        }
     }
     if(changed) storagePatch[COORDINATOR_QUEUE_KEY] = queue
     if(runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
@@ -8157,24 +8212,32 @@ async function repairCoordinatorStorageFromProgressLocked() {
     if(pendingPostsChanged) storagePatch[SPACE_PENDING_NUKED_POSTS_KEY] = pendingPosts
     if(nukedPostsChanged) storagePatch[SPACE_NUKED_POSTS_KEY] = nukedPosts
 
-    const saved = await saveCoordinatorState({
-        queue: storagePatch[COORDINATOR_QUEUE_KEY],
-        runs: storagePatch[COORDINATOR_RUNS_KEY],
-        events: storagePatch[COORDINATOR_EVENTS_KEY],
-        progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY],
-        pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY],
-        nukedPosts: storagePatch[SPACE_NUKED_POSTS_KEY]
-    }, {
-        queue: changed,
-        runs: runsChanged,
-        events: eventsChanged,
-        progress: progressChanged,
-        pendingPosts: pendingPostsChanged,
-        nukedPosts: nukedPostsChanged,
-        reason: 'repair',
-        queueOperation: 'repair-progress',
-        queueChangedRows: repaired
-    })
+    let saved = true
+    if(progressProjectionSaved === false || progressProjectionSaved?.saved === false ||
+        progressProjectionDeleted === false || progressProjectionDeleted?.saved === false) {
+        saved = false
+    }
+    if(Object.keys(storagePatch).length) {
+        const stateSaved = await saveCoordinatorState({
+            queue: storagePatch[COORDINATOR_QUEUE_KEY],
+            runs: storagePatch[COORDINATOR_RUNS_KEY],
+            events: storagePatch[COORDINATOR_EVENTS_KEY],
+            progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY],
+            pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY],
+            nukedPosts: storagePatch[SPACE_NUKED_POSTS_KEY]
+        }, {
+            queue: changed,
+            runs: runsChanged,
+            events: eventsChanged,
+            progress: fullProgressMirrorChanged,
+            pendingPosts: pendingPostsChanged,
+            nukedPosts: nukedPostsChanged,
+            reason: 'repair',
+            queueOperation: 'repair-progress',
+            queueChangedRows: repaired
+        })
+        if(stateSaved === false) saved = false
+    }
 
     if(terminalSettlementHrefs.size) {
         await settleTerminalCoordinatorItemsLocked({
@@ -8371,6 +8434,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         [COORDINATOR_QUEUE_WAL_KEY]: null,
         [COORDINATOR_RUNS_KEY]: {},
         [PROFILE_NUKE_PROGRESS_KEY]: {},
+        ...getProfileNukeProgressProjectionDefaults(requestedHrefs),
         [SPACE_PENDING_NUKED_POSTS_KEY]: {},
         [SPACE_NUKED_POSTS_KEY]: {}
     }, {
@@ -8387,7 +8451,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         queue,
         runs: normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY])
     }
-    const progress = normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
+    const progress = getProfileNukeProgressRecordsFromStorage(stored, requestedHrefs)
     const terminalEntries = getCoordinatorTerminalItemEntries(queue, requestedHrefs)
     const missingQueueHrefs = requestedHrefs.filter(href => !findCoordinatorQueueEntryForHref(queue, href))
     const missingConfirmedHrefs = new Set(missingQueueHrefs.filter(href => isSuccessfulProfileNukeRecord(progress[href])))

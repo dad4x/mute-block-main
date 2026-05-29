@@ -3673,6 +3673,48 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal(hydrated.queue[hrefB].sourceSettlementOutcome, 'confirmed')
 })
 
+test('terminal settlement confirms missing queue row from projection-only progress', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Projection-Only-Missing'
+    const postKey = 'post-terminal-projection-only-missing'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 254575,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {},
+            ...makeProgressProjectionSeed(href, {
+                status: 'blocked',
+                blockSucceeded: true,
+                terminalAt: 254570,
+                updatedAt: 254570
+            }),
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-terminal-projection-only-missing',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [href],
+                    remainingUrls: [href],
+                    updatedAt: 254000
+                }
+            },
+            mbSpaceNukedPosts: {}
+        }
+    })
+
+    const result = await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
+
+    assert.equal(result.settled, 1)
+    assert.equal(result.confirmed, 1)
+    assert.equal(result.cleared, 0)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
+})
+
 test('terminal settlement clears source posts for WAL-terminal rows over stale snapshot', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Wal-Handoff'
     const runId = 'run-terminal-settlement-wal-handoff'
@@ -12390,13 +12432,14 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
 
     assert.ok(repair.repaired > 0)
     assert.equal(repair.runsChanged, true)
-    assert.equal(repair.progressChanged, true)
+    assert.equal(repair.progressChanged, false)
     assert.equal(repair.eventsChanged, true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].runId, runId)
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
+    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].runId, runId)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
     assert.equal(storage.mbCoordinatorEvents.some(event =>
         event.runId === runId &&
         event.type === 'repair' &&
@@ -12408,6 +12451,65 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
         'mbCoordinatorRuns',
         'mbCoordinatorEvents',
         'mbProfileNukeProgress',
+        'mbCoordinatorPaused',
+        'mbSpacePendingNukedPosts',
+        'mbSpaceNukedPosts'
+    ])
+    assert.ok(repairLoadDefaults)
+})
+
+test('stored-work repair restores projection-only queued progress', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Projection-Only-Queued-Repair'
+    const runId = 'run-projection-only-queued-repair'
+    const attemptId = 'attempt-projection-only-queued-repair'
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        now: 3120,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href, runId}),
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {},
+            ...makeProgressProjectionSeed(href, {
+                status: 'queued',
+                actionKind: 'mute-block',
+                runId,
+                attemptId,
+                attemptNumber: 1,
+                queuedAt: 3100,
+                updatedAt: 3100
+            })
+        }
+    })
+    const getDefaults = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getDefaults.push(defaults)
+        return originalGet(defaults)
+    }
+
+    const repair = await sw.repairCoordinatorStorageFromProgress()
+
+    assert.equal(repair.queueChanged, true)
+    assert.equal(repair.progressChanged, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[href].runId, runId)
+    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(getProgressShardRecord(storage, href).status, 'queued')
+    const repairLoadDefaults = findStorageGetDefaults(getDefaults, [
+        'mbCoordinatorQueue',
+        'mbCoordinatorQueueWal',
+        'mbCoordinatorRuns',
+        'mbCoordinatorEvents',
+        'mbProfileNukeProgress',
+        'mbProfileNukeProgressView',
         'mbCoordinatorPaused',
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
@@ -12540,13 +12642,16 @@ test('enqueue resetExisting derived save failure repair replaces stale progress 
     const repair = await sw.repairCoordinatorStorageFromProgress()
 
     assert.ok(repair.repaired > 0)
-    assert.equal(repair.progressChanged, true)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href].runId, nextRunId)
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, walRow.attemptId)
-    assert.equal(storage.mbProfileNukeProgress[href].attemptNumber, walRow.attemptNumber)
-    assert.equal(storage.mbProfileNukeProgress[href].tabId, null)
-    assert.equal(storage.mbProfileNukeProgress[href].blockAttempted, false)
+    assert.equal(repair.progressChanged, false)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
+    assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
+    assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
+    assert.equal(storage.mbProfileNukeProgressView.records[href].runId, nextRunId)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, walRow.attemptId)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptNumber, walRow.attemptNumber)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].tabId, null)
+    assert.notEqual(storage.mbProfileNukeProgressView.records[href].blockAttempted, true)
     assert.equal(storage.mbCoordinatorRuns[nextRunId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorEvents.some(event =>
         event.runId === nextRunId &&
