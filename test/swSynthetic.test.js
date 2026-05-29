@@ -88,6 +88,41 @@ function getProgressShardRecord(storage, href) {
     return null
 }
 
+function getProgressShardKey(href) {
+    let hash = 0
+    for(let index = 0; index < href.length; index += 1) {
+        hash = ((hash * 31) + href.charCodeAt(index)) >>> 0
+    }
+    return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
+}
+
+function makeProgressProjectionSeed(href, record = {}) {
+    const progressRecord = {
+        profileHref: href,
+        ...record
+    }
+    const shardKey = getProgressShardKey(href)
+    return {
+        mbProfileNukeProgressView: {
+            version: 2,
+            updatedAt: progressRecord.updatedAt || 1,
+            total: 1,
+            recordLimit: 1200,
+            truncated: false,
+            records: {
+                [href]: progressRecord
+            }
+        },
+        [shardKey]: {
+            version: 1,
+            updatedAt: progressRecord.updatedAt || 1,
+            records: {
+                [href]: progressRecord
+            }
+        }
+    }
+}
+
 function getRecoveredCoordinatorQueue(storage = {}) {
     if(storage?.mbCoordinatorQueueWal) {
         const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal)
@@ -1412,6 +1447,16 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     const questionUrl = 'https://www.quora.com/unanswered/Synthetic-failed-retry-move-question'
     const retryKey = `resolve-profile:${questionUrl}`
     const runId = 'run-failed-retry-move'
+    const progressRecord = {
+        profileHref: href,
+        status: 'failed',
+        outcome: 'timeout',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-failed-retry-move',
+        attemptNumber: 1,
+        updatedAt: 505500
+    }
     const {browser, storage, timers, sw} = loadServiceWorkerHarness({
         now: 506000,
         storage: {
@@ -1441,17 +1486,9 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
             },
             mbCoordinatorEvents: [],
             mbProfileNukeProgress: {
-                [href]: {
-                    profileHref: href,
-                    status: 'failed',
-                    outcome: 'timeout',
-                    runId,
-                    actionKind: 'mute-block',
-                    attemptId: 'attempt-failed-retry-move',
-                    attemptNumber: 1,
-                    updatedAt: 505500
-                }
-            }
+                [href]: progressRecord
+            },
+            ...makeProgressProjectionSeed(href, progressRecord)
         }
     })
 
@@ -1468,7 +1505,9 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
     assert.equal(storage.mbCoordinatorQueueView.counts.failed || 0, 0)
     assert.equal(storage.mbCoordinatorEvents.at(-1).type, 'retry')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'failed')
+    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
     const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
     assert.equal(currentAuthority[href], undefined)
     assert.equal(currentAuthority[retryKey].status, 'queued')
@@ -1484,6 +1523,77 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     const recovered = recoverProjectedState(storage.mbCoordinatorQueueWal).projected.state.queue
     assert.equal(recovered[href], undefined)
     assert.equal(recovered[retryKey].status, 'queued')
+})
+
+test('manual failed requeue deletes compact progress projection without rewriting full mirror', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Failed-Requeue-Projection-Cleanup'
+    const runId = 'run-failed-requeue-projection-cleanup'
+    const progressRecord = {
+        profileHref: href,
+        status: 'failed',
+        outcome: 'timeout',
+        runId,
+        actionKind: 'mute-block',
+        attemptId: 'attempt-failed-requeue-projection-cleanup',
+        attemptNumber: 1,
+        updatedAt: 506500
+    }
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 506800,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeFailedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: 'attempt-failed-requeue-projection-cleanup',
+                    requestedUrl: href,
+                    now: 506800
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: progressRecord
+            },
+            ...makeProgressProjectionSeed(href, progressRecord)
+        }
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'requeue-coordinator-failed',
+        maxItems: 1
+    }), timers)
+
+    assert.equal(result.selected, 1)
+    assert.equal(result.queued, 1)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'failed')
+    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
+    const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
+    assert.ok(['queued', 'opening', 'active'].includes(currentAuthority[href].status))
+    assert.equal(currentAuthority[href].runId, result.runId)
+
+    delete storage.mbProfileNukeProgressView
+    for(const key of Object.keys(storage)) {
+        if(key.startsWith('mbProfileNukeProgressShard.')) delete storage[key]
+    }
+    const scoped = await browser.runtime.sendMessage({
+        action: 'get-content-page-coordinator-state',
+        pageType: 'profile-search',
+        profileHrefs: [href]
+    })
+    assert.equal(scoped.queueRows, 1)
+    assert.equal(scoped.progressRows, 0)
+    assert.ok(['queued', 'opening', 'active'].includes(scoped.coordinatorQueue[href].status))
 })
 
 test('manual failed requeue WAL append failure does not start executor or write derived state', async () => {
