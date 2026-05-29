@@ -5269,6 +5269,61 @@ function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
     }
 }
 
+function recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal = {}) {
+    const payload = physicalWal?.payload || {}
+    const entries = Object.entries(payload)
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxActivePhysicalSegments', physicalWal.committedSegments || 0)
+    recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxPreviousCommittedSegments', physicalWal.previousCommitted || 0)
+    if(!entries.length) return
+
+    let manifestBytes = 0
+    let checkpointBytes = 0
+    let segmentBytes = 0
+    let manifestWrites = 0
+    let checkpointWrites = 0
+    let segmentWrites = 0
+    for(const [key, value] of entries) {
+        const bytes = getJsonByteSize(value)
+        if(key === COORDINATOR_QUEUE_WAL_META_KEY) {
+            manifestBytes += bytes
+            manifestWrites += 1
+        }
+        else if(key.startsWith(`${COORDINATOR_QUEUE_WAL_KEY}.checkpoint.`)) {
+            checkpointBytes += bytes
+            checkpointWrites += 1
+        }
+        else if(key.startsWith(`${COORDINATOR_QUEUE_WAL_KEY}.segment.`)) {
+            segmentBytes += bytes
+            segmentWrites += 1
+        }
+    }
+
+    if(manifestWrites) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.manifestWrites', manifestWrites)
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.manifestBytes', manifestBytes)
+        recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxManifestBytes', manifestBytes)
+    }
+    if(checkpointWrites) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWrites', checkpointWrites)
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointBytes', checkpointBytes)
+        recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCheckpointBytes', checkpointBytes)
+    }
+    if(segmentWrites) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalSegmentWrites', segmentWrites)
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.physicalSegmentBytes', segmentBytes)
+        recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxPhysicalSegmentBytes', segmentBytes)
+    }
+}
+
+function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {
+    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled')
+    void switchCoordinatorAuthorityQueueWalCheckpoint({
+        metricPath: `queueWal.${reason}.load`,
+        saveMetricPath: `queueWal.${reason}.save`,
+        mirrorMetricPath: `queueWal.${reason}.compatMirror.save`
+    })
+}
+
 function getRetiredCoordinatorQueueWalPhysicalKeys(previousMeta = null, nextMeta = null) {
     if(!isSegmentedWalStorageMeta(nextMeta)) return []
 
@@ -5456,7 +5511,12 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         previousMeta: previousWalMeta
     })
     if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+        recordCoordinatorQueueWalPhysicalPayloadMetrics({
+            previousCommitted: physicalWal.previousCommitted,
+            committedSegments: physicalWal.committedSegments
+        })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentHardLimit')
         scheduleStoredWorkRepair(1000, {
             reason: 'queue-wal-segment-hard-limit',
             edgeTriggered: true
@@ -5469,6 +5529,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         }
     }
 
+    recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal)
     const walSaved = await metricStorageSet(physicalWal.payload, {
         metricPath: options.metricPath || `authority.${result.operationKind || 'row-mutation'}.queueWal.save`,
         queueOperation: result.operationKind || 'authority-row-mutation',
@@ -5492,11 +5553,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
     if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
-        void switchCoordinatorAuthorityQueueWalCheckpoint({
-            metricPath: 'queueWal.segmentSoftSwitch.load',
-            saveMetricPath: 'queueWal.segmentSoftSwitch.save',
-            mirrorMetricPath: 'queueWal.segmentSoftSwitch.compatMirror.save'
-        })
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch')
     }
 
     let projectionSaved = true
@@ -5600,7 +5657,12 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         previousMeta: previousWalMeta
     })
     if(physicalWal.previousCommitted >= physicalWal.hardLimit) {
+        recordCoordinatorQueueWalPhysicalPayloadMetrics({
+            previousCommitted: physicalWal.previousCommitted,
+            committedSegments: physicalWal.committedSegments
+        })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentHardLimit')
         scheduleStoredWorkRepair(1000, {
             reason: 'queue-wal-segment-hard-limit',
             edgeTriggered: true
@@ -5613,6 +5675,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         }
     }
 
+    recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal)
     const walSaved = await metricStorageSet(physicalWal.payload, {
         metricPath: options.metricPath || `authority.${operationKind}.queueWal.save`,
         queueOperation: operationKind,
@@ -5636,11 +5699,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
     if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
-        void switchCoordinatorAuthorityQueueWalCheckpoint({
-            metricPath: 'queueWal.segmentSoftSwitch.load',
-            saveMetricPath: 'queueWal.segmentSoftSwitch.save',
-            mirrorMetricPath: 'queueWal.segmentSoftSwitch.compatMirror.save'
-        })
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch')
     }
     if(activeQueueWakeupStorageContext) {
         activeQueueWakeupStorageContext.coordinatorAuthorityQueueMutationApplied = true
@@ -5782,6 +5841,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 previousMeta: previousWalMeta,
                 forceWriteCheckpoints: true
             })
+            recordCoordinatorQueueWalPhysicalPayloadMetrics(checkpointWal)
             walSaved = await metricStorageSet(checkpointWal.payload, {
                 metricPath: options.saveMetricPath || 'queueWal.checkpointSwitch.save',
                 queueOperation: 'queue-wal-checkpoint-switch',
@@ -6854,13 +6914,14 @@ function createCoordinatorAuthority() {
                 accepted: true,
                 changed: true,
                 durable: saved === true,
-                reason: saved ? 'persisted' : 'persistence-failed',
+                reason: saved ? 'persisted' : persistenceResult?.reason || 'persistence-failed',
                 previousRow,
                 nextRow,
                 terminal: isTerminalCoordinatorStatus(nextRow?.status),
                 persistence: {
                     backend: persistenceResult?.backend || 'snapshot',
                     saved: saved === true,
+                    reason: persistenceResult?.reason || (saved ? 'persisted' : 'persistence-failed'),
                     walSaved: persistenceResult?.walSaved === true,
                     snapshotSaved: persistenceResult?.snapshotSaved === true,
                     projectionSaved: persistenceResult?.projectionSaved,

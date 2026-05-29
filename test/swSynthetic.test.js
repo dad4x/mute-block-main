@@ -4,9 +4,12 @@ const {
     loadServiceWorkerHarness
 } = require('./lib/swHarness')
 const {
+    appendWalRecordsToGeneration,
+    buildSegmentedWalStoragePayload,
     getWalRecordsForGeneration,
     getSegmentedWalSegmentKey,
     hydrateSegmentedWalStore,
+    makePairedCheckpointStore,
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
 
@@ -110,6 +113,35 @@ function getStoredCoordinatorQueueWal(storage = {}) {
 
 function isCoordinatorQueueWalPayload(payload = {}) {
     return !!(payload?.mbCoordinatorQueueWal || payload?.['mbCoordinatorQueueWal.meta'])
+}
+
+function makeSegmentedQueueWalStorage(queue = {}, segmentCount = 0, options = {}) {
+    let store = makePairedCheckpointStore({queue}, {
+        createdAt: options.createdAt || 1000,
+        nextSeq: 1
+    })
+    const keys = Object.keys(queue || {})
+    const rowKey = options.rowKey || keys[0] || 'synthetic-row'
+    for(let index = 0; index < segmentCount; index += 1) {
+        store = appendWalRecordsToGeneration(store, [{
+            kind: 'map.patch',
+            area: 'queue',
+            key: rowKey,
+            patch: {
+                syntheticWalSegmentNo: index
+            },
+            operationKind: 'synthetic-segment-seed',
+            at: (options.createdAt || 1000) + index
+        }], {
+            segmentId: `synthetic-segment-${index}`
+        }).store
+    }
+    return buildSegmentedWalStoragePayload(store, {
+        baseKey: 'mbCoordinatorQueueWal',
+        softSwitchAt: 896,
+        hardSegmentLimit: 1024,
+        updatedAt: options.updatedAt || options.createdAt || 1000
+    })
 }
 
 function makeProgressProjectionSeed(href, record = {}) {
@@ -2362,6 +2394,138 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
 })
 
+test('segmented queue WAL soft threshold records lifecycle metrics and schedules checkpoint switch', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Soft-Threshold'
+    const runId = 'run-segmented-wal-soft-threshold'
+    const attemptId = 'attempt-segmented-wal-soft-threshold'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'queued',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150400,
+            updatedAt: 150400,
+            attemptId,
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 895, {
+        rowKey: href,
+        createdAt: 150400
+    })
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150410,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150420,
+            runId,
+            tabId: 540,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+
+    assert.equal(recorded.recorded, true)
+    assert.ok(storage[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', 'A', 895)])
+    const counters = sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentSoftSwitchScheduled'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
+    assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= 896)
+    assert.ok((counters['coordinatorAuthority.queueWal.manifestBytes'] || 0) > 0)
+    assert.ok((counters['coordinatorAuthority.queueWal.physicalSegmentBytes'] || 0) > 0)
+})
+
+test('segmented queue WAL hard limit blocks durable append before physical write', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Hard-Limit'
+    const runId = 'run-segmented-wal-hard-limit'
+    const attemptId = 'attempt-segmented-wal-hard-limit'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'queued',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150500,
+            updatedAt: 150500,
+            attemptId,
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 1024, {
+        rowKey: href,
+        createdAt: 150500
+    })
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150510,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const beforeMeta = JSON.stringify(storage['mbCoordinatorQueueWal.meta'])
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150520,
+            runId,
+            tabId: 541,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+
+    assert.equal(recorded.recorded, false)
+    assert.equal(recorded.reason, 'queue-wal-segment-hard-limit')
+    assert.equal(JSON.stringify(storage['mbCoordinatorQueueWal.meta']), beforeMeta)
+    assert.equal(storage[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', 'A', 1024)], undefined)
+    const counters = sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentHardBlocked'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
+    assert.ok((counters['coordinatorAuthority.queueWal.maxPreviousCommittedSegments'] || 0) >= 1024)
+    assert.equal(counters['coordinatorAuthority.queueWal.physicalSegmentWrites'] || 0, 0)
+})
+
 test('batched row event queue WAL mutations compose against updated projection', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-B'
@@ -3095,6 +3259,10 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(checkpointSwitch.mirrorSaved, true)
     assert.equal(checkpointSwitch.physicalCleanup?.removed, true)
     assert.ok(checkpointSwitch.physicalCleanup.keyCount >= oldSegmentKeys.length + 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.checkpointed'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.checkpointedRecords'] || 0, 4)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemoved'] || 0, 1)
+    assert.ok((sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemovedKeys'] || 0) >= oldSegmentKeys.length + 1)
     assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueWal'), false)
     assert.equal(oldSegmentKeys.some(key => Object.prototype.hasOwnProperty.call(storage, key)), false)
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'succeeded')
@@ -3211,6 +3379,7 @@ test('terminal authority queue WAL physical cleanup failure does not poison chec
     })
     assert.equal((await restarted.sw.coordinatorAuthority.hydrate()).queue[href].status, 'succeeded')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupFailed'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemoved'] || 0, 0)
 })
 
 test('terminal authority queue WAL checkpoint survives compatibility mirror failure', async () => {
@@ -3313,6 +3482,7 @@ test('terminal authority queue WAL checkpoint failure leaves old WAL authoritati
     assert.equal(JSON.stringify(getStoredCoordinatorQueueWal(storage)), previousWal)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.checkpointFailed'] || 0, 1)
     const restarted = loadServiceWorkerHarness({
         now: 253400,
         storage

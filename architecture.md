@@ -136,12 +136,18 @@ The target storage design is WAL plus A/B checkpoints:
 
 The logical WAL and checkpoint model is separate from the physical storage
 adapter. Correctness and authority isolation came first; segmented physical
-queue WAL storage has now begun for `mbCoordinatorQueueWal`, using
-generation-local record segments plus a small manifest cursor. Segment numbers
-reset on each checkpoint generation, while WAL record sequence numbers remain
-monotonic within the active logical WAL generation. Remaining work is hardening
-segmented recovery, reducing compatibility mirrors, and cleaning old physical
-generations. See
+queue WAL storage has landed for `mbCoordinatorQueueWal`, using generation-local
+record segments plus a small manifest cursor. Segment numbers reset on each
+checkpoint generation, while WAL record sequence numbers remain monotonic within
+the active logical WAL generation. The active generation has a soft threshold
+that schedules a checkpoint generation switch, and a hard segment limit that
+blocks new durable queue WAL appends until the switch can make room. Hydration
+fails closed when the manifest references a missing or identity-mismatched
+committed segment. Extra orphan segment keys that are not committed by the
+manifest are ignored. Covered old-generation segment keys are retired only
+after the new checkpoint generation switch is durable. Remaining work is
+reducing compatibility mirrors and shrinking old progress/runs materialization.
+See
 [queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md).
 
 Terminology: older code, metrics, and notes may still say `compaction`. In the
