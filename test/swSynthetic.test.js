@@ -10947,6 +10947,45 @@ test('content-page state rebuilds missing progress shards for old requested prof
     assert.ok(shardKeys.some(key => storage[key]?.records?.[oldHref]))
 })
 
+test('content-page projection rebuild preserves projection-only progress rows', async () => {
+    const href = 'https://www.quora.com/profile/Projection-Only-Completed-Profile'
+    const {browser, storage} = loadServiceWorkerHarness({
+        storage: {
+            mbCoordinatorContentQueueIndex: {
+                version: 1,
+                updatedAt: 10,
+                total: 0,
+                indexed: 0,
+                itemLimit: 1200,
+                truncated: false,
+                items: []
+            },
+            mbProfileNukeProgress: {},
+            ...makeProgressProjectionSeed(href, {
+                status: 'blocked',
+                blockSucceeded: true,
+                blockAttemptedAt: 20,
+                updatedAt: 21
+            })
+        }
+    })
+
+    const result = await browser.runtime.sendMessage({
+        action: 'get-content-page-coordinator-state',
+        pageType: 'profile-search',
+        profileHrefs: [href]
+    })
+
+    assert.equal(result.progressRows, 1)
+    assert.equal(result.profileNukeProgress[href].status, 'blocked')
+    assert.equal(result.profileNukeProgress[href].blockSucceeded, true)
+    assert.equal(result.profileNukeProgress[href].blockAttemptedAt, 20)
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, href).blockAttemptedAt, 20)
+})
+
 test('content-page state falls back for source-matched rows outside truncated queue index', async () => {
     const searchUrl = 'https://www.quora.com/search?q=SEO&type=profile'
     const targetHref = 'https://www.quora.com/profile/Seo-Outside-Index'
@@ -13636,6 +13675,73 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.equal(hydrated.queue[href].attemptNumber, 2)
     assert.equal(hydrated.queue[href].tabId, null)
+})
+
+test('authority reconcile preserves projection-only action-phase active row', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Projection-Action-Phase'
+    const runId = 'run-active-projection-action-phase'
+    const attemptId = 'attempt-active-projection-action-phase'
+    const {sw, storage} = loadServiceWorkerHarness({
+        now: 3905,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    runId,
+                    status: 'active',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'nuke',
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    dedupeKey: href,
+                    coordinatorKey: href,
+                    queuedAt: 3000,
+                    activeAt: 3500,
+                    updatedAt: 3500,
+                    tabId: 702,
+                    attemptId,
+                    attemptNumber: 1,
+                    retryAttempt: 0,
+                    maxRetries: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {},
+            ...makeProgressProjectionSeed(href, {
+                status: 'page-ready',
+                runId,
+                tabId: 702,
+                actionKind: 'mute-block',
+                attemptId,
+                attemptNumber: 1,
+                retryAttempt: 0,
+                maxRetries: 1,
+                blockAttemptedAt: 3901,
+                updatedAt: 3901
+            })
+        }
+    })
+
+    const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-projection-action-phase')
+
+    assert.equal(result.requeued, 0)
+    assert.equal(result.actions, 0)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
+    assert.equal(sw.state().profileNukeProgress[href].blockAttemptedAt, 3901)
+    assert.equal(getProgressShardRecord(storage, href).blockAttemptedAt, 3901)
 })
 
 test('authority reconcile rejects stale active-without-actor attempt before WAL append', async () => {
