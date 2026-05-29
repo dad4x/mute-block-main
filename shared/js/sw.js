@@ -4034,9 +4034,14 @@ function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
         attemptNumber: getAttemptNumberFromValue(source),
         runId: source.runId || '',
         tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
+        lastUrl: source.lastUrl || '',
         queuedAt: Number.parseInt(source.queuedAt, 10) || 0,
         terminalAt: Number.parseInt(source.terminalAt, 10) || 0,
         updatedAt: Number.parseInt(source.updatedAt, 10) || 0,
+        actionSurfaceMode: source.actionSurfaceMode || '',
+        actionSurfaceWindowId: source.actionSurfaceWindowId || null,
+        actionSurfaceAnchorTabId: source.actionSurfaceAnchorTabId || null,
+        actionSurfaceActivatedAt: Number.parseInt(source.actionSurfaceActivatedAt, 10) || 0,
         muteSucceeded: source.muteSucceeded === true,
         blockSucceeded: source.blockSucceeded === true,
         unblockSucceeded: source.unblockSucceeded === true,
@@ -4363,6 +4368,26 @@ function normalizeProfileNukeProgressShardRecords(shards = {}) {
         Object.assign(records, normalizeStoredProfileNukeProgress(shardRecords))
     }
     return records
+}
+
+function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs = []) {
+    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
+    if(!hrefs.length) return {}
+
+    const requested = new Set(hrefs)
+    const viewRecords = normalizeProfileNukeProgressView(stored?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]).records
+    const shardDefaults = getProfileNukeProgressShardDefaults(hrefs)
+    const shardRecords = normalizeProfileNukeProgressShardRecords(
+        Object.fromEntries(Object.keys(shardDefaults).map(key => [key, stored?.[key]]))
+    )
+    const progress = {}
+    for(const [profileHref, record] of Object.entries({
+        ...viewRecords,
+        ...shardRecords
+    })) {
+        if(requested.has(profileHref)) progress[profileHref] = record
+    }
+    return progress
 }
 
 function addContentPageStateProjectionPayload(payload = {}) {
@@ -6655,11 +6680,17 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
 
 async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
     return runQueueWakeupMetricPhase('loadCoordinatorQueueRunsProgressProjection', async () => {
+        const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
+        const progressShardDefaults = getProfileNukeProgressShardDefaults(progressProfileHrefs)
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
-            [PROFILE_NUKE_PROGRESS_KEY]: {}
+            [PROFILE_NUKE_PROGRESS_KEY]: {},
+            ...(progressProfileHrefs.length ? {
+                [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+                ...progressShardDefaults
+            } : {})
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
         })
@@ -6670,7 +6701,10 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => ({
+            ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
+            ...getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs)
+        }))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -19193,7 +19227,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
 
     const updateResult = await enqueueSpaceFeedStorageUpdate(async () => {
         const state = await loadCoordinatorQueueRunsProgressProjection({
-            metricPath: options.expectTerminal === true ? 'terminalProgress.load' : 'directProgress.load'
+            metricPath: options.expectTerminal === true ? 'terminalProgress.load' : 'directProgress.load',
+            profileHrefs: Object.keys(normalizedRecords)
         })
         let currentAuthorityState = state
         let queue = state.queue
@@ -19206,6 +19241,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         const deferredCompatibilityHrefs = new Set()
         const directCompatibilityHrefs = new Set()
         const compatibilityProgressRecords = {}
+        const inlineProgressProjectionRecords = {}
         let queueChanged = false
         let progressChanged = false
         let progressChangedRows = 0
@@ -19343,6 +19379,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
 
             if(accepted) {
                 progress[normalizedHref] = record
+                inlineProgressProjectionRecords[normalizedHref] = record
                 profileNukeProgress = {
                     ...profileNukeProgress,
                     [normalizedHref]: record
@@ -19376,19 +19413,64 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
 
         if(!deferCompatibilitySave) {
             if(runsChanged || progressChanged) {
-                await saveCoordinatorState({
-                    queue,
-                    runs,
-                    progress
-                }, {
-                    queue: false,
-                    runs: runsChanged,
-                    progress: progressChanged,
-                    progressChangedRows,
-                    reason: 'ordinaryMutation',
-                    queueOperation: terminalCompatibilityProgressRows === progressChangedRows ? 'terminal-progress' : 'direct-progress',
-                    queueChangedRows: 0
-                })
+                const inlineQueueOperation = terminalCompatibilityProgressRows === progressChangedRows
+                    ? 'terminal-progress'
+                    : 'direct-progress'
+                const inlineMetricPrefix = inlineQueueOperation === 'terminal-progress'
+                    ? 'terminalProgress'
+                    : 'directProgress'
+                let inlineDerivedSaved = true
+                if(progressChanged) {
+                    let progressProjectionSaved = false
+                    try {
+                        progressProjectionSaved = await saveProfileNukeProgressRowProjection(
+                            inlineProgressProjectionRecords,
+                            {metricPath: `${inlineMetricPrefix}.inline.progressProjection`}
+                        )
+                    }
+                    catch(error) {
+                        progressProjectionSaved = false
+                        recordCoordinatorDiagnosticEvent(
+                            `${inlineQueueOperation}-inline-progress-projection-save-failed`,
+                            error?.message || `${inlineQueueOperation} inline progress projection save failed`
+                        )
+                    }
+                    if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+                        inlineDerivedSaved = false
+                    }
+                }
+                if(runsChanged) {
+                    let runsSaved = false
+                    try {
+                        runsSaved = await saveCoordinatorState({
+                            runs
+                        }, {
+                            queue: false,
+                            runs: true,
+                            progress: false,
+                            reason: 'ordinaryMutation',
+                            queueOperation: inlineQueueOperation,
+                            queueChangedRows: 0
+                        })
+                    }
+                    catch(error) {
+                        runsSaved = false
+                        recordCoordinatorDiagnosticEvent(
+                            `${inlineQueueOperation}-inline-runs-save-failed`,
+                            error?.message || `${inlineQueueOperation} inline runs save failed`
+                        )
+                    }
+                    if(runsSaved === false) {
+                        inlineDerivedSaved = false
+                    }
+                }
+                if(inlineDerivedSaved === false) {
+                    incrementQueueWakeupMetric(`${inlineMetricPrefix}.compatibilitySaveFailed`)
+                    scheduleStoredWorkRepair(1000, {
+                        reason: `${inlineQueueOperation}-inline-compatibility-save-failed`,
+                        edgeTriggered: true
+                    })
+                }
             }
         }
         return {

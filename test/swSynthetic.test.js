@@ -3337,6 +3337,102 @@ test('direct nonterminal job progress derived save failure does not poison WAL a
     browser.storage.local.set = originalSet
 })
 
+test('direct progress without queue mutation materializes compact projection only', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Direct-Progress-Projection-Only'
+    const runId = 'run-direct-progress-projection-only'
+    const attemptId = 'attempt-direct-progress-projection-only'
+    const tabId = 531
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 253965,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253965})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        lastUrl: href,
+        runId,
+        tabId,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1,
+        event: 'Synthetic direct progress projection-only breadcrumb'
+    }, {senderTabId: tabId})
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.terminal, false)
+    assert.equal(storage.mbCoordinatorQueueWal, undefined)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].lastUrl, href)
+    assert.equal(getProgressShardRecord(storage, href).lastUrl, href)
+    assert.equal(sw.state().profileNukeProgress[href].lastUrl, href)
+})
+
+test('direct progress inline projection failure leaves full mirror untouched', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Direct-Progress-Inline-Projection-Failure'
+    const runId = 'run-direct-progress-inline-projection-failure'
+    const attemptId = 'attempt-direct-progress-inline-projection-failure'
+    const tabId = 532
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 253966,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 253966})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(payload?.mbProfileNukeProgressView ||
+            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
+            throw new Error('synthetic direct progress inline projection failure')
+        }
+        return originalSet(payload)
+    }
+
+    try {
+        const result = await sw.recordCoordinatorJobProgress(href, {
+            lastUrl: href,
+            runId,
+            tabId,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }, {senderTabId: tabId})
+
+        assert.equal(result.recorded, true)
+        assert.equal(result.terminal, false)
+        assert.equal(storage.mbCoordinatorQueueWal, undefined)
+        assert.equal(storage.mbProfileNukeProgress[href], undefined)
+        assert.equal(storage.mbProfileNukeProgressView, undefined)
+        assert.equal(getProgressShardRecord(storage, href), null)
+        assert.equal(sw.state().profileNukeProgress[href].lastUrl, href)
+        assert.equal(sw.state().queueWakeupCounters['directProgress.compatibilitySaveFailed'] || 0, 1)
+        assert.ok(
+            sw.state().hasStoredWorkRepairTimeout ||
+                (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        )
+    }
+    finally {
+        browser.storage.local.set = originalSet
+    }
+})
+
 test('legacy record-nuke-progress messages are disabled without storage mutation', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Legacy-Progress-Disabled'
     const runId = 'run-legacy-progress-disabled'
@@ -11382,11 +11478,13 @@ test('service-worker reuses existing worker window after in-memory surface state
     assert.equal(profileTab?.windowId, existingSurface.id)
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
     await waitFor(
-        () => storage.mbProfileNukeProgress[href]?.actionSurfaceMode === 'worker-window',
+        () => getProgressShardRecord(storage, href)?.status === 'tab-opening',
         'reused worker action surface progress was not recorded',
         {timers, attempts: 20, tickMs: 100}
     )
-    assert.equal(storage.mbProfileNukeProgress[href].actionSurfaceMode, 'worker-window')
+    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].actionSurfaceMode, 'worker-window')
+    assert.equal(getProgressShardRecord(storage, href).actionSurfaceMode, 'worker-window')
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.created'] || 0, 0)
     assert.ok(browser.__removedTabs.includes(duplicateSurface.tabs[0].id))
 })
@@ -13922,7 +14020,7 @@ test('queued profile tab is retained until the foreground-wait stale timeout ela
         {timers}
     )
     await waitFor(
-        () => storage.mbProfileNukeProgress?.[href]?.status === 'tab-opening' &&
+        () => getProgressShardRecord(storage, href)?.status === 'tab-opening' &&
             sw.state().spaceFeedStorageUpdateDepth === 0,
         'initial tab-opening progress was not durable before timeout test',
         {timers}
@@ -13962,7 +14060,7 @@ test('queued profile tab is requeued after the foreground-wait stale timeout ela
         {timers}
     )
     await waitFor(
-        () => storage.mbProfileNukeProgress?.[href]?.status === 'tab-opening' &&
+        () => getProgressShardRecord(storage, href)?.status === 'tab-opening' &&
             sw.state().spaceFeedStorageUpdateDepth === 0,
         'initial tab-opening progress was not durable before retry timeout test',
         {timers}
@@ -14023,7 +14121,7 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
         {timers}
     )
     await waitFor(
-        () => storage.mbProfileNukeProgress?.[href]?.status === 'tab-opening' &&
+        () => getProgressShardRecord(storage, href)?.status === 'tab-opening' &&
             sw.state().spaceFeedStorageUpdateDepth === 0,
         'initial tab-opening progress was not durable before loading-pressure test',
         {timers}
