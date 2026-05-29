@@ -13,6 +13,7 @@ const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
 const RETRY_FAILED_LIMIT = 2
 const SECONDS_PER_BLOCK_SAMPLE_LIMIT = 100
+const CURRENT_WORK_MUTATION_TIMEOUT_MS = 70000
 
 const state = {
     queue: {},
@@ -732,7 +733,7 @@ async function cancelCurrentWorkItem(item = {}) {
         storageKey,
         coordinatorKey: storageKey,
         profileHref
-    }, null, 10000).catch(error => ({
+    }, {error: 'cancel-one-current-work-timeout'}, CURRENT_WORK_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
 
@@ -867,7 +868,7 @@ async function cancelCurrentWork() {
 
     const result = await sendRuntimeMessageWithTimeout({
         action: 'cancel-coordinator-current-work'
-    }, null, 10000).catch(error => ({
+    }, {error: 'cancel-current-work-timeout'}, CURRENT_WORK_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
 
