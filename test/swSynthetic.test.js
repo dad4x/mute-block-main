@@ -5266,6 +5266,15 @@ test('clear profile state removes queue row through WAL authority and saves deri
                     updatedAt: 278000
                 }
             },
+            ...makeProgressProjectionSeed(href, {
+                status: 'queued',
+                runId,
+                tabId: null,
+                actionKind: 'mute-block',
+                attemptId,
+                attemptNumber: 1,
+                updatedAt: 278000
+            }),
             mbSpacePendingNukedPosts: {
                 [postKey]: {
                     postKey,
@@ -5309,7 +5318,9 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href], undefined)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(sw.state().profileNukeProgress[href], undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
@@ -5321,12 +5332,14 @@ test('clear profile state removes queue row through WAL authority and saves deri
         'mbCoordinatorQueue',
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
-        'mbProfileNukeProgress',
+        'mbProfileNukeProgressView',
+        getProgressShardKey(href),
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
     ])
     assert.ok(clearLoadDefaults)
     assert.equal(hasStorageDefault(clearLoadDefaults, 'mbCoordinatorEvents'), false)
+    assert.equal(hasStorageDefault(clearLoadDefaults, 'mbProfileNukeProgress'), false)
 
     const records = getWalRecordsForGeneration(
         storage.mbCoordinatorQueueWal,
@@ -5365,6 +5378,15 @@ test('clear profile state derived failure materializes cleanup without resurrect
                     updatedAt: 278250
                 }
             },
+            ...makeProgressProjectionSeed(href, {
+                status: 'queued',
+                runId,
+                tabId: null,
+                actionKind: 'mute-block',
+                attemptId,
+                attemptNumber: 1,
+                updatedAt: 278250
+            }),
             mbSpacePendingNukedPosts: {
                 [postKey]: {
                     postKey,
@@ -5390,7 +5412,6 @@ test('clear profile state derived failure materializes cleanup without resurrect
     let failedDerivedSave = false
     browser.storage.local.set = async payload => {
         if(!failedDerivedSave &&
-            payload?.mbProfileNukeProgress &&
             payload?.mbCoordinatorRuns &&
             payload?.mbSpacePendingNukedPosts &&
             payload?.mbSpaceNukedPosts) {
@@ -5414,6 +5435,8 @@ test('clear profile state derived failure materializes cleanup without resurrect
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(storage.mbProfileNukeProgress[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
+    assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
     assert.ok(storage.mbSpacePendingNukedPosts[postKey])
@@ -5462,6 +5485,15 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
                     updatedAt: 278500
                 }
             },
+            ...makeProgressProjectionSeed(href, {
+                status: 'queued',
+                runId,
+                tabId: null,
+                actionKind: 'mute-block',
+                attemptId,
+                attemptNumber: 1,
+                updatedAt: 278500
+            }),
             mbSpacePendingNukedPosts: {
                 [postKey]: {
                     postKey,
@@ -5504,6 +5536,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.ok(storage.mbProfileNukeProgress[href])
+    assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.ok(sw.state().profileNukeProgress[href])
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.ok(storage.mbSpacePendingNukedPosts[postKey])
