@@ -4036,6 +4036,17 @@ function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
         tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
         lastUrl: source.lastUrl || '',
         queuedAt: Number.parseInt(source.queuedAt, 10) || 0,
+        tabCreatedAt: Number.parseInt(source.tabCreatedAt, 10) || 0,
+        tabOpenedAt: Number.parseInt(source.tabOpenedAt, 10) || 0,
+        contentOpenedAt: Number.parseInt(source.contentOpenedAt, 10) || 0,
+        actionReadyAt: Number.parseInt(source.actionReadyAt, 10) || 0,
+        waitingForForegroundAt: Number.parseInt(source.waitingForForegroundAt, 10) || 0,
+        foregroundLeaseAcquiredAt: Number.parseInt(source.foregroundLeaseAcquiredAt, 10) || 0,
+        foregroundPromotedAt: Number.parseInt(source.foregroundPromotedAt, 10) || 0,
+        muteAttemptedAt: Number.parseInt(source.muteAttemptedAt, 10) || 0,
+        blockAttemptedAt: Number.parseInt(source.blockAttemptedAt, 10) || 0,
+        unmuteAttemptedAt: Number.parseInt(source.unmuteAttemptedAt, 10) || 0,
+        unblockAttemptedAt: Number.parseInt(source.unblockAttemptedAt, 10) || 0,
         terminalAt: Number.parseInt(source.terminalAt, 10) || 0,
         updatedAt: Number.parseInt(source.updatedAt, 10) || 0,
         actionSurfaceMode: source.actionSurfaceMode || '',
@@ -4108,6 +4119,14 @@ function getProfileNukeProgressShardDefaults(profileHrefs = []) {
     for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
         const key = getProfileNukeProgressShardKey(href)
         if(key) defaults[key] = {}
+    }
+    return defaults
+}
+
+function getAllProfileNukeProgressShardDefaults() {
+    const defaults = {}
+    for(let index = 0; index < PROFILE_NUKE_PROGRESS_SHARD_COUNT; index += 1) {
+        defaults[getProfileNukeProgressShardKeyByIndex(index)] = {}
     }
     return defaults
 }
@@ -4372,11 +4391,11 @@ function normalizeProfileNukeProgressShardRecords(shards = {}) {
 
 function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs = []) {
     const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
-    if(!hrefs.length) return {}
-
-    const requested = new Set(hrefs)
+    const requested = hrefs.length ? new Set(hrefs) : null
     const viewRecords = normalizeProfileNukeProgressView(stored?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]).records
-    const shardDefaults = getProfileNukeProgressShardDefaults(hrefs)
+    const shardDefaults = requested
+        ? getProfileNukeProgressShardDefaults(hrefs)
+        : getAllProfileNukeProgressShardDefaults()
     const shardRecords = normalizeProfileNukeProgressShardRecords(
         Object.fromEntries(Object.keys(shardDefaults).map(key => [key, stored?.[key]]))
     )
@@ -4385,7 +4404,7 @@ function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs =
         ...viewRecords,
         ...shardRecords
     })) {
-        if(requested.has(profileHref)) progress[profileHref] = record
+        if(!requested || requested.has(profileHref)) progress[profileHref] = record
     }
     return progress
 }
@@ -6723,6 +6742,8 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
             [COORDINATOR_QUEUE_WAL_KEY]: null,
             [COORDINATOR_RUNS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_KEY]: {},
+            [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+            ...getAllProfileNukeProgressShardDefaults(),
             ...defaults
         }, {
             metricPath: 'currentAuthority.load'
@@ -6734,7 +6755,10 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => ({
+            ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
+            ...getProfileNukeProgressRecordsFromProjection(stored)
+        }))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -20648,10 +20672,15 @@ async function rebuildContentPageStateProjectionFromFullStorage(reason = 'missin
         metricPath: `contentPageState.compatBuild.${reason}`
     })
     const stored = await metricStorageGet({
-        [PROFILE_NUKE_PROGRESS_KEY]: {}
+        [PROFILE_NUKE_PROGRESS_KEY]: {},
+        [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+        ...getAllProfileNukeProgressShardDefaults()
     }, {metricPath: `contentPageState.compatBuild.${reason}.progress`})
     const queue = currentAuthorityState.queue
-    const progress = filterProfileNukeProgressForContentProjection(stored[PROFILE_NUKE_PROGRESS_KEY] || {}, queue)
+    const progress = filterProfileNukeProgressForContentProjection({
+        ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
+        ...getProfileNukeProgressRecordsFromProjection(stored)
+    }, queue)
     const queueIndex = buildCoordinatorContentQueueIndex(queue)
     const sourceShards = buildCoordinatorContentSourceIndexShardPayload(queue)
     const progressView = buildProfileNukeProgressView(progress)
