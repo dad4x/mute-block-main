@@ -183,6 +183,7 @@ let persistOwnedTabIdsTimeout = null
 let coordinatorQueueResumeTimeout = null
 let coordinatorQueueResumeDueAt = 0
 let coordinatorQueueResumeReason = ''
+let coordinatorQueueResumeAllowBeforeQuora = false
 let coordinatorQueueResumeAlarmSuppressUntil = 0
 let coordinatorQueueResumeClearedAlarmDueAt = 0
 let storedWorkRepairTimeout = null
@@ -10872,6 +10873,9 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
     const resumeScheduled = options.direct === true
         ? false
         : scheduleCoordinatorQueueResume(600, reason || 'resume-request')
+    if(options.direct !== true && options.allowBeforeQuora === true) {
+        coordinatorQueueResumeAllowBeforeQuora = true
+    }
     let alarmCreated = false
     if(resumeScheduled && browser.alarms?.create) {
         try {
@@ -10887,7 +10891,10 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
         }
     }
 
-    scheduleStoredWorkRepair(1000, {reason})
+    scheduleStoredWorkRepair(1000, {
+        reason,
+        allowBeforeQuora: options.allowBeforeQuora === true
+    })
     if(options.backgroundFastPath === true && options.direct !== true) {
         void runCoordinatorQueueExecutorFastPath(reason || 'resume-request', {
             awaitFill: options.awaitFill !== false
@@ -10944,7 +10951,8 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
         runCoordinatorReconcileTick(reason, {
             direct: true,
             skipStoredWorkCheck: true,
-            repairBeforeResume: options.repairBeforeResume
+            repairBeforeResume: options.repairBeforeResume,
+            allowBeforeQuora: options.allowBeforeQuora === true
         }),
         COORDINATOR_RESUME_GATE_TIMEOUT_MS,
         'coordinator queue direct resume'
@@ -11660,6 +11668,7 @@ function scheduleStoredWorkRepair(delayMs = STORED_WORK_REPAIR_INTERVAL_MS, opti
 }
 
 function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resume') {
+    const options = arguments[2] && typeof arguments[2] === 'object' ? arguments[2] : {}
     const now = Date.now()
     const normalizedDelayMs = Math.max(100, Number.parseInt(delayMs, 10) || 500)
     const dueAt = now + normalizedDelayMs
@@ -11673,6 +11682,7 @@ function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resum
         incrementQueueWakeupMetric('pump.staleTimeoutCleared')
     }
     if(coordinatorQueueResumeTimeout && coordinatorQueueResumeDueAt && coordinatorQueueResumeDueAt <= dueAt) {
+        if(options.allowBeforeQuora === true) coordinatorQueueResumeAllowBeforeQuora = true
         incrementQueueWakeupMetric('pump.coalesced')
         return false
     }
@@ -11684,6 +11694,7 @@ function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resum
 
     coordinatorQueueResumeDueAt = dueAt
     coordinatorQueueResumeReason = normalizedReason
+    coordinatorQueueResumeAllowBeforeQuora = options.allowBeforeQuora === true
     incrementQueueWakeupMetric('reconcile.deadlineUpdated')
     recordQueueWakeupMetricMax('scheduler.pendingDeadlineMs', Math.max(0, dueAt - now))
     const scheduledDueAt = dueAt
@@ -11703,7 +11714,9 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
     const throttle = getQueueLoadThrottle()
     if(throttle?.active === true && (activeQueuedTabs.size > 0 || queuedTabActions.length > 0)) {
         const delayMs = Math.max(1000, throttle.until - Date.now())
-        scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle')
+        scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle', {
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
         scheduleStoredWorkRepair(delayMs, {
             reason: 'queue-load-throttle',
             allowBeforeQuora: true
@@ -11728,7 +11741,9 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         })
         if(authorityPreflight?.changed === true || (authorityPreflight?.actions || 0) > 0) {
             incrementQueueWakeupMetric('pump.fastExecutor.authorityPreflightChanged')
-            scheduleCoordinatorQueueResume(1000, `${reason || 'resume'}-post-authority-preflight`)
+            scheduleCoordinatorQueueResume(1000, `${reason || 'resume'}-post-authority-preflight`, {
+                allowBeforeQuora: options.allowBeforeQuora === true
+            })
             scheduleStoredWorkRepair(STORED_WORK_REPAIR_INTERVAL_MS, {
                 reason: `${reason || 'resume'}-post-authority-preflight`,
                 edgeTriggered: true,
@@ -11798,15 +11813,18 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
 
 async function runScheduledCoordinatorQueueResume(reason = '') {
     const resumeReason = `${reason || coordinatorQueueResumeReason || 'scheduled-resume'}`.trim()
+    const allowBeforeQuora = coordinatorQueueResumeAllowBeforeQuora === true
     if(coordinatorQueueResumeTimeout) {
         clearTimeout(coordinatorQueueResumeTimeout)
     }
     coordinatorQueueResumeTimeout = null
     coordinatorQueueResumeDueAt = 0
     coordinatorQueueResumeReason = ''
+    coordinatorQueueResumeAllowBeforeQuora = false
 
     const fastResult = await runCoordinatorQueueExecutorFastPath(resumeReason, {
-        awaitFill: true
+        awaitFill: true,
+        allowBeforeQuora
     })
     if(fastResult?.changed === true || (fastResult?.queued || 0) > 0 || (fastResult?.active || 0) > 0) {
         return {
@@ -11816,7 +11834,9 @@ async function runScheduledCoordinatorQueueResume(reason = '') {
         }
     }
 
-    return runCoordinatorReconcileTick(resumeReason).catch(error => {
+    return runCoordinatorReconcileTick(resumeReason, {
+        allowBeforeQuora
+    }).catch(error => {
         scheduleStoredWorkRepair(1000, {
             reason: 'scheduled-reconcile-error',
             edgeTriggered: true
@@ -21300,6 +21320,7 @@ function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {}) {
     const retryAttempt = Number.parseInt(plan.retryAttempt, 10) || 0
     return {
         ...(plan.progressPatch || {}),
+        replaceProgressRecord: transition.activeTransitionContinued !== true,
         activeTransitionAccepted: transition.activeTransitionAccepted === true,
         activeTransitionError: transition.activeTransitionError || '',
         activeTransitionContinued: transition.activeTransitionContinued === true,
@@ -21633,7 +21654,8 @@ if(browser.alarms?.onAlarm) {
                 incrementQueueWakeupMetric('pump.alarmStale')
                 return null
             }
-            if(!await ensureQuoraRuntimeActivatedForScheduler('resume-alarm-existing-quora-session')) {
+            if(coordinatorQueueResumeAllowBeforeQuora !== true &&
+                !await ensureQuoraRuntimeActivatedForScheduler('resume-alarm-existing-quora-session')) {
                 void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
                 return null
             }

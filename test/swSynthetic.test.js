@@ -14090,6 +14090,47 @@ test('scheduled resume alarm starts durable queued work through executor fast pa
     assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
 })
 
+test('scheduled explicit dashboard resume preserves before-Quora bypass through alarm', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Scheduled-Bypass-Resume'
+    const runId = 'run-scheduled-bypass-resume'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3360,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: 'attempt-scheduled-bypass-resume',
+                    now: 3360
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {}
+        }
+    })
+
+    const scheduled = await sw.kickCoordinatorQueueResume('synthetic-scheduled-bypass-resume', {
+        allowBeforeQuora: true
+    })
+    assert.equal(scheduled.scheduledOnly, true)
+    assert.equal(scheduled.reason, 'synthetic-scheduled-bypass-resume-scheduled')
+
+    await browser.alarms.onAlarm.emit({name: 'mb-coordinator-resume'})
+    await waitFor(
+        () => listTabs(browser).some(tab => tab.url === href),
+        'scheduled before-Quora resume did not open a profile tab',
+        {timers, attempts: 40, tickMs: 1000}
+    )
+
+    assert.ok(['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status))
+    assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
+    assert.equal(sw.state().queueWakeupCounters['pump.deferredBeforeQuora'] || 0, 0)
+})
+
 test('fast executor throttle still opens one durable queued row when idle', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Throttled-Idle-Resume'
     const runId = 'run-throttled-idle-resume'
@@ -14559,6 +14600,72 @@ test('service-worker executor does not adopt unrelated same-profile tab for queu
     assert.equal(sw.state().activeQueuedTabs.includes(newExecutorTab.id), true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].tabId, newExecutorTab.id)
+})
+
+test('service-worker executor open resets stale terminal progress for the current tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Open-Resets-Stale-Terminal'
+    const runId = 'run-open-resets-stale-terminal'
+    const attemptId = 'attempt-open-resets-stale-terminal'
+    const staleTabId = 889
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3880,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3880}),
+                    executorMaxConcurrent: 1,
+                    executorNoForegroundFallback: true,
+                    maxAttempts: 2
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbProfileNukeProgress: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'interrupted',
+                    finalError: 'Queued tab timed out after disappearing before completion',
+                    closeReason: 'stale-active-tab',
+                    terminalAt: 3870,
+                    tabId: staleTabId,
+                    tabOpenedAt: 3860,
+                    contentOpenedAt: 3865,
+                    attemptId,
+                    attemptNumber: 1,
+                    runId,
+                    updatedAt: 3870
+                }
+            }
+        }
+    })
+
+    const result = await settleWithFakeTimers(sw.resumeCoordinatorQueueExecutionOnce({
+        tabId: 'service-worker-queue-owner',
+        windowId: null
+    }, {
+        serviceWorkerOwned: true,
+        skipRepair: true,
+        skipAuthorityReconcile: true,
+        awaitFill: true,
+        reason: 'synthetic-open-resets-stale-terminal'
+    }), timers)
+
+    const openedTab = listTabs(browser).find(tab => tab.url === href && tab.id !== staleTabId)
+    const progressRecord = getProgressShardRecord(storage, href) || storage.mbProfileNukeProgress[href]
+    const recoveredQueue = getRecoveredCoordinatorQueue(storage)
+
+    assert.equal(result.queued, 1)
+    assert.ok(openedTab)
+    assert.equal(progressRecord.status, 'tab-opening')
+    assert.equal(progressRecord.tabId, openedTab.id)
+    assert.equal(progressRecord.finalError, '')
+    assert.equal(progressRecord.closeReason, '')
+    assert.equal(recoveredQueue[href].status, 'active')
+    assert.equal(recoveredQueue[href].tabId, openedTab.id)
 })
 
 test('service-worker executor releases live queued tab when active transition never becomes durable', async () => {
