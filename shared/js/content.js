@@ -1278,15 +1278,20 @@ async function maybeRecordAlreadyBlockedCoordinatorProfile() {
         event: 'Visible profile was already blocked; repairing coordinator row'
     }
     const progress = await recordAlreadyBlockedCoordinatorProgress(href, item, progressPatch)
+    if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+        alreadyBlockedCoordinatorRepairKey = ''
+        console.info('Already-blocked repair was not recorded; leaving queued tab open for retry')
+        setTimeout(() => void sweepServiceWorkerBlockedProfileTabs(), 1000)
+        setTimeout(() => void maybeRecordAlreadyBlockedCoordinatorProfile(), 2000)
+        return
+    }
 
     if(isActiveQueuedProgressRecord(href)) {
-        if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
-            alreadyBlockedCoordinatorRepairKey = ''
-            console.info('Already-blocked repair was not recorded; leaving queued tab open for retry')
-            return
-        }
         await notifyQueuedTabComplete()
         await requestCloseTab()
+    }
+    else if(item?.serviceWorkerOwned === true || `${item?.executorOwner || ''}` === 'service-worker') {
+        setTimeout(() => void sweepServiceWorkerBlockedProfileTabs(), 1000)
     }
 }
 
@@ -1353,6 +1358,14 @@ async function notifyQueuedTabComplete() {
 
 async function sweepBlockedProfileTabs() {
     const result = await safeSendRuntimeMessage({action: 'sweep-owned-blocked-profile-tabs'}, null)
+    return {
+        owned: Number.parseInt(result?.owned, 10) || 0,
+        signaled: Number.parseInt(result?.signaled, 10) || 0
+    }
+}
+
+async function sweepServiceWorkerBlockedProfileTabs() {
+    const result = await safeSendRuntimeMessage({action: 'sweep-service-worker-blocked-profile-tabs'}, null)
     return {
         owned: Number.parseInt(result?.owned, 10) || 0,
         signaled: Number.parseInt(result?.signaled, 10) || 0
@@ -1938,6 +1951,29 @@ function onMessage(request, sender, sendResponse) {
             scheduleCurrentProfilePendingClaimRescue(500)
             return {accepted: true, reason: request.reason || ''}
         })()
+    }
+
+    if(request.action === 'get-profile-action-surface-state') {
+        const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
+        const resolvedProfileHref = getProfileKey(location.href) || ''
+        const confirmationKind = getBlockConfirmAction()
+            ? 'block'
+            : getMuteConfirmAction()
+            ? 'mute'
+            : getUnblockConfirmAction()
+            ? 'unblock'
+            : getUnmuteConfirmAction()
+            ? 'unmute'
+            : ''
+        return Promise.resolve({
+            pageType: getPageType() || '',
+            resolvedProfileHref,
+            requestedProfileHref,
+            profileMatches: !!requestedProfileHref && !!resolvedProfileHref && requestedProfileHref === resolvedProfileHref,
+            pendingProfileConfirmation: !!confirmationKind,
+            confirmationKind,
+            profileActionInProgress
+        })
     }
 
     switch(request.status) {
@@ -10496,6 +10532,11 @@ async function maybeRunAutoProfileAction() {
             return queuedTabReleased
         }
         const closeQueuedBlockedTab = async (patch = {}) => {
+            const swept = await sweepServiceWorkerBlockedProfileTabs().catch(() => ({signaled: 0}))
+            if(swept.signaled) {
+                return true
+            }
+
             const foundBlockedBeforeQueue = !!patch.foundBlockedBeforeQueue
             const progress = await recordQueuedProfileProgress({
                 status: foundBlockedBeforeQueue ? 'already-blocked' : 'blocked',
@@ -10507,6 +10548,9 @@ async function maybeRunAutoProfileAction() {
             })
             if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
                 console.info('Queued terminal success was not recorded; leaving tab open for retry')
+                setTimeout(() => {
+                    void sweepServiceWorkerBlockedProfileTabs()
+                }, 1000)
                 return false
             }
             await releaseQueuedTabSlot()
@@ -11639,6 +11683,36 @@ async function ensureForegroundForConfirmation(confirmationKind = '') {
         begun: false,
         reason: 'confirmation-foreground-timeout'
     }, FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS)
+
+    if(activeQueuedNoForegroundFallback && activeQueuedActionSurfaceMode === 'worker-window') {
+        const responseReason = response?.reason || ''
+        const timedOut = !response?.begun && /timeout/i.test(responseReason)
+        if(!response?.begun && !timedOut) {
+            return {ok: false, required: true, reason: responseReason || 'confirmation-foreground-denied'}
+        }
+        let promoted = response?.foregroundPromoted === true
+        if(timedOut) {
+            const retry = await promoteCurrentQueuedTab(reason, true)
+            promoted = promoted || retry?.promoted === true
+        }
+        noteCurrentProfileNukeProgress({
+            event: timedOut
+                ? `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface after foreground timeout`
+                : `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface`,
+            confirmationForegroundRequired: true,
+            confirmationForegroundPromoted: promoted,
+            confirmationWorkerWindowActionSurface: true,
+            confirmationWorkerWindowTimeoutRecovered: timedOut,
+            foregroundWaitReason: reason
+        })
+        return {
+            ok: true,
+            required: true,
+            promoted,
+            workerWindowActionSurface: true,
+            reason: 'worker-window-action-surface'
+        }
+    }
 
     if(!response?.begun) {
         return {ok: false, required: true, reason: response?.reason || 'confirmation-foreground-denied'}

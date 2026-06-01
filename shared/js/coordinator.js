@@ -8,6 +8,8 @@ const SPACE_REGISTRY_KEY = 'mbSpaceRegistry'
 const HIDDEN_RUNS_KEY = 'mbCoordinatorHiddenRunIds'
 const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
 const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
+const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
+const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#worker-window'
 const COORDINATOR_RESUME_INTERVAL_MS = 5000
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
@@ -36,8 +38,6 @@ const state = {
 }
 let resumeCoordinatorQueueTimer = null
 let resumeCoordinatorQueuePromise = null
-let coordinatorRepairTimer = null
-let coordinatorRepairPromise = null
 let dashboardCompactRefreshTimer = null
 let dashboardCompactRefreshScheduledTimer = null
 let dashboardCompactRefreshPromise = null
@@ -52,6 +52,7 @@ addEventListener('load', () => {
 async function init() {
     const manifest = browser.runtime.getManifest()
     document.getElementById('appVersion').textContent = `v${manifest.version}`
+    await registerQueuedWorkerActionSurfacePage()
     document.getElementById('clearEventsButton')?.addEventListener('click', () => {
         void clearEvents()
     })
@@ -101,10 +102,39 @@ async function init() {
         retryFailedLastResult = {reason: 'resumed'}
     }
     render()
+}
 
-    if(!state.requiresQuoraVisit && hasRawPendingCoordinatorQueueWork()) {
-        void repairCoordinatorStorageAfterInitialRender()
+function isQueuedWorkerActionSurfacePage() {
+    return `${globalThis.location?.hash || ''}` === QUEUED_ACTION_SURFACE_COORDINATOR_HASH
+}
+
+async function registerQueuedWorkerActionSurfacePage() {
+    if(!isQueuedWorkerActionSurfacePage()) return false
+    if(browser.storage?.session?.set !== undefined) {
+        document.title = 'Mute Block Worker'
     }
+
+    const currentTab = await browser.tabs?.getCurrent?.().catch(() => null)
+    const currentWindow = !currentTab?.windowId && browser.windows?.getCurrent
+        ? await browser.windows.getCurrent({populate: true}).catch(() => null)
+        : null
+    const windowId = Number.parseInt(currentTab?.windowId || currentWindow?.id, 10) || 0
+    const anchorTabId = Number.parseInt(currentTab?.id, 10) ||
+        (Array.isArray(currentWindow?.tabs)
+            ? Number.parseInt(currentWindow.tabs.find(tab => tab?.active)?.id || currentWindow.tabs.find(tab => tab?.id)?.id, 10) || 0
+            : 0)
+    if(!windowId || !browser.storage?.session?.set) return false
+
+    await browser.storage.session.set({
+        [QUEUED_ACTION_SURFACE_STATE_KEY]: {
+            windowId,
+            anchorTabId: anchorTabId || null,
+            url: browser.runtime.getURL(`coordinator.html${QUEUED_ACTION_SURFACE_COORDINATOR_HASH}`),
+            reason: 'coordinator-worker-window-load',
+            updatedAt: Date.now()
+        }
+    }).catch(() => null)
+    return true
 }
 
 function installCompactStorageRefreshPolling() {
@@ -255,48 +285,6 @@ async function announceCoordinatorPageReady() {
     }
     catch {}
     return null
-}
-
-async function repairCoordinatorStorage() {
-    try {
-        const result = await sendRuntimeMessageWithTimeout({action: 'repair-coordinator-storage'}, null, 5000)
-        if(result?.queueChanged || result?.runsChanged) {
-            await loadState()
-            return true
-        }
-    }
-    catch {}
-
-    return false
-}
-
-async function repairCoordinatorStorageAfterInitialRender() {
-    if(await repairCoordinatorStorage()) {
-        render()
-    }
-}
-
-function scheduleCoordinatorStorageRepair(delay = 1000) {
-    clearTimeout(coordinatorRepairTimer)
-    coordinatorRepairTimer = setTimeout(() => {
-        coordinatorRepairTimer = null
-        void repairCoordinatorStorageQueued()
-    }, delay)
-}
-
-async function repairCoordinatorStorageQueued() {
-    if(coordinatorRepairPromise) return coordinatorRepairPromise
-
-    coordinatorRepairPromise = repairCoordinatorStorage()
-        .then(repaired => {
-            if(repaired) render()
-            return repaired
-        })
-        .finally(() => {
-            coordinatorRepairPromise = null
-        })
-
-    return coordinatorRepairPromise
 }
 
 async function resetMetrics() {

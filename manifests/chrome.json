@@ -1,34 +1,51 @@
 {
-    "name": "Mute Block",
-    "description": "Silence unwanted noise on Quora profiles instantly with this Chrome extension.",
-  "version": "1.6.671",
-    "manifest_version": 3,
-    "author": "https://mohsinali.dev",
-    "background": {
-        "service_worker": "js/sw.js"
-    },
-    "action": {
-        "default_popup": "popup.html"
-    },
-    "icons": {
-        "32": "icons/32.png",
-        "64": "icons/64.png",
-        "116": "icons/116.png"
-    },
-    "content_scripts": [
-        {
-            "matches": ["https://*.quora.com/*"],
-            "css": ["css/content.css"],
-            "js": ["js/content.js"],
-            "run_at": "document_start"
-        }
-    ],
-    "host_permissions": ["https://*.quora.com/"],
-    "permissions": ["webRequest", "storage", "alarms", "scripting"],
-    "web_accessible_resources": [
-        {
-            "matches": ["https://*.quora.com/*"],
-            "resources": ["img/*"]
-        }
-    ]
+  "name": "Mute Block",
+  "description": "Silence unwanted noise on Quora profiles instantly with this Chrome extension.",
+  "version": "1.6.840",
+  "manifest_version": 3,
+  "author": "https://mohsinali.dev",
+  "background": {
+    "service_worker": "js/sw.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "32": "icons/32.png",
+    "64": "icons/64.png",
+    "116": "icons/116.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.quora.com/*"
+      ],
+      "css": [
+        "css/content.css"
+      ],
+      "js": [
+        "js/content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "host_permissions": [
+    "https://*.quora.com/"
+  ],
+  "permissions": [
+    "webRequest",
+    "storage",
+    "alarms",
+    "scripting"
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "https://*.quora.com/*"
+      ],
+      "resources": [
+        "img/*"
+      ]
+    }
+  ]
 }
