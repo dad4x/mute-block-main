@@ -501,7 +501,7 @@ test('queued tab nudge retry failure leaves alarm-backed continuation', async ()
     const result = await sw.nudgeQueuedTabActionClaimWithRetries(tab.id, 'synthetic-nudge-followup', [0])
 
     assert.equal(result.nudged, false)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
@@ -579,7 +579,7 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
     assert.equal(getProgressShardRecord(storage, href), null)
 })
@@ -1619,8 +1619,8 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
     assert.equal(storage.mbCoordinatorEvents[0].type, 'stored-work-cancel-derived-save-failed')
     assert.equal(sw.state().queueWakeupCounters['storedWork.cancel.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -1861,8 +1861,8 @@ test('runs paused update failure schedules repair without throwing', async () =>
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
     assert.equal(sw.state().queueWakeupCounters['runsPaused.derivedSaveFailed'], 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 
     browser.storage.local.set = originalSet
@@ -3293,8 +3293,8 @@ test('row event queue WAL projection failure does not poison durable acknowledge
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -3363,8 +3363,8 @@ test('row event derived runs failure does not poison durable queue WAL acknowled
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.derivedRunsSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -3562,7 +3562,7 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(after['coordinatorAuthority.queueWal.appended'] || 0, 1)
     assert.equal(after['coordinatorAuthority.postMutationQueueStorageSetRejected'] || 0, 0)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
 })
 
 test('duplicate terminal progress for terminal row does not append duplicate queue WAL', async () => {
@@ -4670,8 +4670,8 @@ test('terminal authority queue WAL projection failure does not poison durable ac
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -4994,8 +4994,8 @@ test('terminal settlement projection failure does not poison WAL settlement', as
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -5051,8 +5051,8 @@ test('terminal settlement derived save failure does not poison authority settlem
     assert.ok(storage.mbSpacePendingNukedPosts['post-terminal-settlement-derived-failure'])
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -5104,8 +5104,8 @@ test('terminal settlement progress projection failure does not poison authority 
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -5836,8 +5836,8 @@ test('action lease release projection failure does not poison durable acknowledg
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -6305,8 +6305,8 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
     assert.equal(sw.state().queueWakeupCounters['terminalProgress.compatibilitySaveFailed'] || 0, 1)
     assert.ok((sw.state().queueWakeupCounters['storageUpdate.timedOut'] || 0) >= 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -6718,8 +6718,8 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     const hydrated = await sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -8482,8 +8482,8 @@ test('non-profile landing derived failure does not poison authority terminalizat
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.state().queueWakeupCounters['repair.nonProfileLanding.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -9288,8 +9288,8 @@ test('profile resolver remap derived save failure does not poison WAL remap', as
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     assert.equal(sw.state().queueWakeupCounters['resolver.resolve.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 
     browser.storage.local.set = originalSet
@@ -9667,8 +9667,8 @@ test('unresolved resolver derived save failure does not poison WAL terminalizati
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     assert.equal(sw.state().queueWakeupCounters['resolverUnresolved.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 
     browser.storage.local.set = originalSet
@@ -9920,8 +9920,8 @@ test('key-only terminalization derived failure does not poison authority termina
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'failed')
     assert.equal(sw.state().queueWakeupCounters['repair.keyOnlyTerminalize.derivedSaveFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 
     browser.storage.local.set = originalSet
@@ -10014,50 +10014,50 @@ test('coordinator reconcile scheduler keeps the earliest requested deadline', as
     const {browser, sw, timers} = loadServiceWorkerHarness({now: 1000})
 
     sw.scheduleCoordinatorReconcile(5000, {allowBeforeQuora: true})
-    assert.equal(sw.state().storedWorkRepairDueAt, 6000)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 6000)
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [6000])
 
     sw.scheduleCoordinatorReconcile(1000, {allowBeforeQuora: true})
-    assert.equal(sw.state().storedWorkRepairDueAt, 2000)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 2000)
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [2000])
     assert.equal(browser.__alarmCreates.at(-1).name, 'mb-stored-work-repair')
     assert.equal(browser.__alarmCreates.at(-1).info.when, 2000)
 
     sw.scheduleCoordinatorReconcile(5000)
-    assert.equal(sw.state().storedWorkRepairDueAt, 2000)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 2000)
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [2000])
 })
 
-test('coordinator reconcile scheduler coalesces and backs off no-op repair', async () => {
+test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', async () => {
     const {sw, timers} = loadServiceWorkerHarness({now: 0})
 
     await settleWithFakeTimers(sw.runScheduledCoordinatorReconcileTick('noop-repair-backoff'), timers)
     const backoffState = sw.state()
-    assert.ok(backoffState.storedWorkRepairBackoffLevel > 0)
-    assert.ok(backoffState.storedWorkRepairBackoffUntil > timers.now)
+    assert.ok(backoffState.coordinatorReconcileBackoffLevel > 0)
+    assert.ok(backoffState.coordinatorReconcileBackoffUntil > timers.now)
 
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {
         allowBeforeQuora: true,
         reason: 'periodic-reconcile'
     }), true)
-    assert.equal(sw.state().storedWorkRepairDueAt, backoffState.storedWorkRepairBackoffUntil)
-    assert.deepEqual(timers.pending().map(timer => timer.dueAt), [backoffState.storedWorkRepairBackoffUntil])
+    assert.equal(sw.state().coordinatorReconcileDueAt, backoffState.coordinatorReconcileBackoffUntil)
+    assert.deepEqual(timers.pending().map(timer => timer.dueAt), [backoffState.coordinatorReconcileBackoffUntil])
 
     assert.equal(sw.scheduleCoordinatorReconcile(3000, {
         allowBeforeQuora: true,
         reason: 'periodic-reconcile'
     }), false)
-    assert.equal(sw.state().storedWorkRepairDueAt, backoffState.storedWorkRepairBackoffUntil)
-    assert.deepEqual(timers.pending().map(timer => timer.dueAt), [backoffState.storedWorkRepairBackoffUntil])
+    assert.equal(sw.state().coordinatorReconcileDueAt, backoffState.coordinatorReconcileBackoffUntil)
+    assert.deepEqual(timers.pending().map(timer => timer.dueAt), [backoffState.coordinatorReconcileBackoffUntil])
 
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {
         allowBeforeQuora: true,
         reason: 'legacy-import-request'
     }), true)
-    assert.equal(sw.state().storedWorkRepairBackoffLevel, 0)
-    assert.equal(sw.state().storedWorkRepairBackoffUntil, 0)
+    assert.equal(sw.state().coordinatorReconcileBackoffLevel, 0)
+    assert.equal(sw.state().coordinatorReconcileBackoffUntil, 0)
     const edgeTriggeredDueAt = timers.now + 1000
-    assert.equal(sw.state().storedWorkRepairDueAt, edgeTriggeredDueAt)
+    assert.equal(sw.state().coordinatorReconcileDueAt, edgeTriggeredDueAt)
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [edgeTriggeredDueAt])
 })
 
@@ -10101,7 +10101,7 @@ test('stored-work repair hands queued-only durable work to fast executor', async
     const counters = sw.state().queueWakeupCounters
     assert.equal(counters['reconcile.queuedOnlyFastResumeScheduled'] || 0, 1)
     assert.equal((counters['pump.fastExecutor.changed'] || 0) > 0, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status))
 })
@@ -11030,7 +11030,7 @@ test('storage timeout recovery clears stale scheduler latches and rearms resume'
     assert.equal(state.queuedTabFillPromise, false)
     assert.equal(state.coordinatorReconcilePromise, false)
     assert.equal(state.hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(state.hasStoredWorkRepairTimeout, true)
+    assert.equal(state.hasCoordinatorReconcileTimeout, true)
     assert.equal(state.queueWakeupCounters['storageUpdate.timeoutRecoveryRequested'], 1)
     assert.equal(state.queueWakeupCounters['storageUpdate.clearedTimedOutFillPromise'], 1)
     assert.equal(state.queueWakeupCounters['storageUpdate.clearedTimedOutReconcilePromise'], 1)
@@ -11506,15 +11506,15 @@ test('queue wakeup metric reset rolls current epoch into history and starts fres
             'storagePayload.write.total.bytes': 1000,
             'storagePayload.write.total.calls': 4,
             'storagePayload.write.total.maxBytes': 400,
-            'repair.requested': 3,
-            'repair.changed.queue': 2,
+            'reconcile.requested': 3,
+            'reconcile.changed.queue': 2,
             'pump.requested': 5,
             'pump.changed.openedTab': 2,
             'nudge.sent': 4,
             'nudge.accepted': 1,
             'job.enqueued': 7,
             'job.terminal': 6,
-            'job.completedOnlyAfterRepair': 2
+            'job.completedOnlyAfterReconcile': 2
         },
         phases: {},
         journal: [{
@@ -11555,15 +11555,15 @@ test('queue wakeup metric reset rolls current epoch into history and starts fres
     assert.equal(previous.storage.timeoutRate, 0.2)
     assert.equal(previous.storagePayload.writeBytes, 1000)
     assert.equal(previous.storagePayload.writeCalls, 4)
-    assert.equal(previous.repair.requested, 3)
-    assert.equal(previous.repair.changed, 2)
+    assert.equal(previous.reconcile.requested, 3)
+    assert.equal(previous.reconcile.changed, 2)
     assert.equal(previous.pump.requested, 5)
     assert.equal(previous.pump.changed, 2)
     assert.equal(previous.nudge.sent, 4)
     assert.equal(previous.nudge.accepted, 1)
     assert.equal(previous.jobs.enqueued, 7)
     assert.equal(previous.jobs.terminal, 6)
-    assert.equal(previous.jobs.completedAfterRepair, 2)
+    assert.equal(previous.jobs.completedAfterReconcile, 2)
     assert.equal(previous.maxPayloadSize, 400)
 
     assert.equal(current.resetReason, 'browser-startup')
@@ -11602,7 +11602,7 @@ test('queue wakeup metrics view keeps dashboard reads bounded', async () => {
             counters: {
                 'storagePayload.write.total.bytes': 123456,
                 'storagePayload.read.total.bytes': 654321,
-                'repair.requested': 9
+                'reconcile.requested': 9
             },
             phases: {
                 storageGet: {count: 2, totalMs: 50, maxMs: 40}
@@ -11669,10 +11669,10 @@ test('metrics loading does not flush default epoch before persisted metrics reso
                 endedAt: 999,
                 storage: {started: 1, timedOut: 0, timeoutRate: 0},
                 storagePayload: {writeBytes: 0, writeCalls: 0, maxBytes: 0},
-                repair: {requested: 0, changed: 0},
+                reconcile: {requested: 0, changed: 0},
                 pump: {requested: 0, changed: 0, yield: 0},
                 nudge: {sent: 0, accepted: 0, yield: 0},
-                jobs: {enqueued: 0, terminal: 0, completedAfterRepair: 0, completedAfterRepairRate: 0},
+                jobs: {enqueued: 0, terminal: 0, completedAfterReconcile: 0, completedAfterReconcileRate: 0},
                 maxPayloadSize: 0,
                 journalCount: 0
             }],
@@ -11709,7 +11709,7 @@ test('metrics loading does not flush default epoch before persisted metrics reso
     assert.equal(metricsGetStarted, true)
     assert.equal(storage.mbQueueWakeupMetrics.currentEpoch.epochId, 'epoch-persisted')
     assert.equal(storage.mbQueueWakeupMetrics.currentEpoch.resetReason, 'extension-updated')
-    assert.equal(storage.mbQueueWakeupMetrics.currentEpoch.counters['repair.requested'], undefined)
+    assert.equal(storage.mbQueueWakeupMetrics.currentEpoch.counters['reconcile.requested'], undefined)
 
     gate.resolve()
     await flushAsync(30)
@@ -11859,7 +11859,7 @@ test('service worker reload rearms stored work in an existing browser session', 
     await flushAsync(1500)
 
     assert.equal(browser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair' && !alarm.cleared), true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
@@ -12633,13 +12633,13 @@ test('stored-work repair alarm clears the pending timeout and runs repair', asyn
 
     await activateQuoraRuntime(browser)
     sw.scheduleCoordinatorReconcile(1000)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.ok(timers.pending().some(timer => timer.dueAt === 1000))
 
     await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
-    assert.equal(sw.state().storedWorkRepairDueAt, 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
     assert.equal(timers.pending().some(timer => timer.dueAt === 1000), false)
 })
 
@@ -12652,16 +12652,16 @@ test('coordinator reconcile timeout clears and suppresses stale alarm delivery',
     await timers.tick(1000)
     await flushAsync(20)
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
-    assert.equal(sw.state().storedWorkRepairDueAt, 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
     assert.ok(browser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair' && alarm.cleared))
 
     const beforeCounters = sw.state().queueWakeupCounters
     await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
     const afterCounters = sw.state().queueWakeupCounters
 
-    assert.equal((afterCounters['repair.alarmStale'] || 0), (beforeCounters['repair.alarmStale'] || 0) + 1)
-    assert.equal((afterCounters['repair.alarmFired'] || 0), beforeCounters['repair.alarmFired'] || 0)
+    assert.equal((afterCounters['reconcile.alarmStale'] || 0), (beforeCounters['reconcile.alarmStale'] || 0) + 1)
+    assert.equal((afterCounters['reconcile.alarmFired'] || 0), beforeCounters['reconcile.alarmFired'] || 0)
 })
 
 test('coordinator reconcile suppresses identifiable stale alarm after suppression window', async () => {
@@ -12681,8 +12681,8 @@ test('coordinator reconcile suppresses identifiable stale alarm after suppressio
     })
     const afterCounters = sw.state().queueWakeupCounters
 
-    assert.equal((afterCounters['repair.alarmStale'] || 0), (beforeCounters['repair.alarmStale'] || 0) + 1)
-    assert.equal((afterCounters['repair.alarmFired'] || 0), beforeCounters['repair.alarmFired'] || 0)
+    assert.equal((afterCounters['reconcile.alarmStale'] || 0), (beforeCounters['reconcile.alarmStale'] || 0) + 1)
+    assert.equal((afterCounters['reconcile.alarmFired'] || 0), beforeCounters['reconcile.alarmFired'] || 0)
 })
 
 test('coordinator reconcile accepts Chrome-delayed scheduled alarm delivery', async () => {
@@ -12695,7 +12695,7 @@ test('coordinator reconcile accepts Chrome-delayed scheduled alarm delivery', as
     })
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {
         allowBeforeQuora: true,
-        reason: 'synthetic-delayed-live-repair-alarm'
+        reason: 'synthetic-delayed-live-reconcile-alarm'
     }), true)
 
     await browser.alarms.onAlarm.emit({
@@ -12704,10 +12704,10 @@ test('coordinator reconcile accepts Chrome-delayed scheduled alarm delivery', as
     })
     const afterCounters = sw.state().queueWakeupCounters
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
-    assert.equal(sw.state().storedWorkRepairDueAt, 0)
-    assert.equal(afterCounters['repair.alarmStale'] || 0, 0)
-    assert.equal(afterCounters['repair.noop'] || 0, 1)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
+    assert.equal(afterCounters['reconcile.alarmStale'] || 0, 0)
+    assert.equal(afterCounters['reconcile.noop'] || 0, 1)
 })
 
 test('coordinator reconcile stale alarm cannot steal a newer timeout', async () => {
@@ -12722,7 +12722,7 @@ test('coordinator reconcile stale alarm cannot steal a newer timeout', async () 
         allowBeforeQuora: true,
         reason: 'periodic-reconcile'
     })
-    const newerDueAt = sw.state().storedWorkRepairDueAt
+    const newerDueAt = sw.state().coordinatorReconcileDueAt
     assert.equal(newerDueAt, timers.now + 5000)
 
     const beforeCounters = sw.state().queueWakeupCounters
@@ -12732,10 +12732,10 @@ test('coordinator reconcile stale alarm cannot steal a newer timeout', async () 
     })
     const afterCounters = sw.state().queueWakeupCounters
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
-    assert.equal(sw.state().storedWorkRepairDueAt, newerDueAt)
-    assert.equal((afterCounters['repair.alarmStale'] || 0), (beforeCounters['repair.alarmStale'] || 0) + 1)
-    assert.equal((afterCounters['repair.alarmFired'] || 0), beforeCounters['repair.alarmFired'] || 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+    assert.equal(sw.state().coordinatorReconcileDueAt, newerDueAt)
+    assert.equal((afterCounters['reconcile.alarmStale'] || 0), (beforeCounters['reconcile.alarmStale'] || 0) + 1)
+    assert.equal((afterCounters['reconcile.alarmFired'] || 0), beforeCounters['reconcile.alarmFired'] || 0)
 })
 
 test('coordinator resume timeout clears and suppresses stale alarm delivery', async () => {
@@ -12893,16 +12893,16 @@ test('coordinator reconcile reschedules stale in-memory repair timeout that neve
 
     await activateQuoraRuntime(browser)
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {reason: 'synthetic-first-repair'}), true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
-    assert.equal(sw.state().storedWorkRepairDueAt, 1000)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 1000)
 
     timers.setNow(10_000)
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {reason: 'synthetic-second-repair'}), true)
     const counters = sw.state().queueWakeupCounters
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
-    assert.equal(sw.state().storedWorkRepairDueAt, 11_000)
-    assert.equal(counters['repair.staleTimeoutCleared'], 1)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 11_000)
+    assert.equal(counters['reconcile.staleTimeoutCleared'], 1)
 })
 
 test('nonterminal progress storage changes do not edge-trigger repair backoff reset', async () => {
@@ -12922,8 +12922,8 @@ test('nonterminal progress storage changes do not edge-trigger repair backoff re
     await flushAsync(20)
 
     const nonterminalCounters = sw.state().queueWakeupCounters
-    assert.equal(nonterminalCounters['repair.edgeTriggered'] || 0, 0)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(nonterminalCounters['reconcile.edgeTriggered'] || 0, 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
 
     await browser.storage.local.set({
         mbProfileNukeProgressView: {
@@ -12944,8 +12944,8 @@ test('nonterminal progress storage changes do not edge-trigger repair backoff re
     await flushAsync(20)
 
     const terminalCounters = sw.state().queueWakeupCounters
-    assert.equal(terminalCounters['repair.edgeTriggered'] || 0, 1)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(terminalCounters['reconcile.edgeTriggered'] || 0, 1)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('content-page state rebuilds missing progress shards for old requested profiles', async () => {
@@ -13256,8 +13256,8 @@ test('first Quora activation without stored work only opens the runtime gate', a
 
     await activateQuoraRuntime(browser)
 
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
-    assert.equal(sw.state().storedWorkRepairDueAt, 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
     assert.equal(
         browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-stored-work-repair'),
         false
@@ -13423,7 +13423,7 @@ test('source-page run status polling is read-only for terminal owned tabs', asyn
     assert.equal(typeof status.owned, 'number')
     assert.equal(browser.__removedTabs.length, 0)
     assert.equal(browser.__tabs.has(tabId), true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.deepEqual(timers.pending(), pendingTimersBefore)
     assert.equal(browser.__alarmCreates.length, alarmCreatesBefore)
 })
@@ -14663,7 +14663,7 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
     assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     browser.storage.local.set = originalSet
     const getDefaults = []
     const originalGet = browser.storage.local.get.bind(browser.storage.local)
@@ -14833,7 +14833,7 @@ test('stored-work repair terminal raw row updates WAL authority', async () => {
     const records = getWalRecordsForGeneration(walStore, walStore.meta.activeCheckpoint)
     assert.equal(records.some(record =>
         record.key === href &&
-        record.operationKind === 'repair-progress' &&
+        record.operationKind === 'reconcile-progress' &&
         record.status === 'failed'
     ), true)
 })
@@ -14879,7 +14879,7 @@ test('enqueue progress projection failure does not poison durable WAL acknowledg
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView, undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('enqueue resetExisting derived save failure repair replaces stale progress attempt', async () => {
@@ -17269,8 +17269,8 @@ test('active transition is WAL-backed and recovers after restart', async () => {
     )
     assert.equal(walRecords.length, 1)
     assert.equal(walRecords[0].operationKind, 'active-transition')
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
-    assert.equal(sw.state().queueWakeupCounters['repair.edgeTriggered'] || 0, 0)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().queueWakeupCounters['reconcile.edgeTriggered'] || 0, 0)
 
     const restarted = loadServiceWorkerHarness({
         now: 431500,
@@ -17355,8 +17355,8 @@ test('active transition projection failure does not poison durable acknowledgeme
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
-        sw.state().hasStoredWorkRepairTimeout ||
-            (sw.state().queueWakeupCounters['repair.deferredBeforeQuora'] || 0) >= 1
+        sw.state().hasCoordinatorReconcileTimeout ||
+            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
     )
 })
 
@@ -17866,7 +17866,7 @@ test('runtime prune defers detach when queued tab lookup times out', async () =>
     assert.equal(sw.state().activeQueuedTabs.includes(tabId), true)
     assert.equal(sw.state().queuedTabMetadata.some(([id]) => id === tabId), true)
     assert.equal(sw.state().queueWakeupCounters['job.tabGetTimedOut'] > 0, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('active transition rejects stale attempt before WAL append', async () => {
@@ -18618,7 +18618,7 @@ test('stale queued tab sweep defers hung tab lookup without releasing executor s
     assert.equal(sw.state().activeQueuedTabs.includes(tabId), true)
     assert.equal(sw.state().queuedTabMetadata.some(([id]) => id === tabId), true)
     assert.equal(sw.state().queueWakeupCounters['job.tabGetTimedOut'] > 0, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('authority reconcile requeues durable active row without runtime actor through WAL', async () => {
@@ -18680,7 +18680,7 @@ test('authority reconcile requeues durable active row without runtime actor thro
     const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor')
 
     assert.equal(result.requeued, 1)
-    assert.ok((sw.state().queueWakeupCounters['repair.activeWithoutActor.usedResidentAuthority'] || 0) > 0)
+    assert.ok((sw.state().queueWakeupCounters['reconcile.activeWithoutActor.usedResidentAuthority'] || 0) > 0)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
@@ -18700,7 +18700,7 @@ test('authority reconcile requeues durable active row without runtime actor thro
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[0].operationKind, 'reconcile-active-without-actor')
 
     const restarted = loadServiceWorkerHarness({
         now: 3950,
@@ -18830,7 +18830,7 @@ test('authority reconcile defers fresh worker-window startup progress before no-
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     const hydrated = await sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'active')
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshWorkerWindowStartupProgress'], 1)
 })
 
@@ -18878,7 +18878,7 @@ test('authority preflight preserves fresh durably active startup actor before cl
     assert.equal(browser.__tabs.has(tab.id), true)
     assert.equal(sw.state().activeQueuedTabs.includes(tab.id), true)
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshRuntimeStartup'], 1)
 })
 
@@ -18925,7 +18925,7 @@ test('executor queue-only repair defers fresh startup actor before no-actor fail
     assert.equal(sw.state().activeQueuedTabs.includes(tab.id), true)
     assert.equal(browser.__removedTabs.includes(tab.id), false)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshRuntimeStartupQueueOnly'], 1)
 })
 
@@ -18988,7 +18988,7 @@ test('executor queue-only repair reports stale active requeue as continuation wo
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
     assert.ok(sw.coordinatorAuthority.current().queue[href].tabId)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().queueWakeupCounters['reconcile.executor.changed.requeuedMissingActiveTab'], 1)
     assert.equal(sw.state().queueWakeupCounters['reconcile.executor.changed.requeuedMissingActiveTabQueuedForFill'], 1)
 })
@@ -19135,7 +19135,7 @@ test('user-initiated dashboard resume repairs active-transition-failed row befor
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
-test('authority reconcile defers fresh no-actor repair when persisted tab lookup times out', async () => {
+test('authority reconcile terminalizes retry-exhausted no-actor row when persisted tab lookup times out', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Timeout'
     const runId = 'run-active-no-actor-timeout'
     const attemptId = 'attempt-active-no-actor-timeout'
@@ -19210,18 +19210,18 @@ test('authority reconcile defers fresh no-actor repair when persisted tab lookup
     )
     browser.tabs.get = originalGet
 
-    assert.equal(result.actions, 0)
+    assert.equal(result.actions, 1)
     assert.equal(result.requeued, 0)
-    assert.equal(result.failed, 0)
+    assert.equal(result.failed, 1)
     assert.ok(hungGetCalls > 0)
     assert.equal(sw.state().queueWakeupCounters['job.tabGetTimedOut'] > 0, true)
     const hydrated = await sw.coordinatorAuthority.hydrate()
-    assert.equal(hydrated.queue[href].status, 'active')
-    assert.equal(hydrated.queue[href].tabId, tabId)
-    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
+    assert.equal(hydrated.queue[href].status, 'failed')
+    assert.equal(hydrated.queue[href].outcome, 'timeout')
+    assert.equal(getProgressShardRecord(storage, href).status, 'interrupted')
 })
 
-test('authority reconcile requeues stale no-actor repair when persisted tab lookup times out', async () => {
+test('authority reconcile requeues stale no-actor row when persisted tab lookup times out', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Stale-Timeout'
     const runId = 'run-active-no-actor-stale-timeout'
     const attemptId = 'attempt-active-no-actor-stale-timeout'
@@ -19301,7 +19301,6 @@ test('authority reconcile requeues stale no-actor repair when persisted tab look
     assert.equal(result.failed, 0)
     assert.ok(hungGetCalls > 0)
     assert.equal(sw.state().queueWakeupCounters['job.tabGetTimedOut'] > 0, true)
-    assert.equal(sw.state().queueWakeupCounters['repair.persistedTabLookupTimeoutTreatedMissing'] > 0, true)
     const hydrated = await sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.equal(hydrated.queue[href].tabId, null)
@@ -19314,7 +19313,7 @@ test('authority reconcile requeues stale no-actor repair when persisted tab look
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[0].operationKind, 'reconcile-active-without-actor')
 })
 
 test('authority reconcile adopts same-profile live tab before no-actor terminal failure', async () => {
@@ -19691,7 +19690,7 @@ test('authority reconcile requeues missing active tab after releasing stale acti
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'action-lease-tab-release')
-    assert.equal(walRecords[1].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[1].operationKind, 'reconcile-active-without-actor')
 })
 
 test('authority reconcile releases stale action lease and requeues when lease tab lookup times out', async () => {
@@ -19774,7 +19773,7 @@ test('authority reconcile releases stale action lease and requeues when lease ta
     assert.equal(result.requeued, 1)
     assert.ok(hungGetCalls >= 2)
     assert.equal(sw.state().queueWakeupCounters['job.tabGetTimedOut'] > 0, true)
-    assert.equal(sw.state().queueWakeupCounters['repair.persistedTabLookupTimeoutTreatedMissing'] >= 2, true)
+    assert.equal(sw.state().queueWakeupCounters['reconcile.persistedTabLookupTimeoutTreatedMissing'] >= 2, true)
     const hydrated = await sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.equal(hydrated.queue[href].tabId, null)
@@ -19790,7 +19789,7 @@ test('authority reconcile releases stale action lease and requeues when lease ta
     )
     assert.equal(walRecords.length, 2)
     assert.equal(walRecords[0].operationKind, 'action-lease-tab-release')
-    assert.equal(walRecords[1].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[1].operationKind, 'reconcile-active-without-actor')
 })
 
 test('authority reconcile adopts same-profile live tab after releasing stale action lease', async () => {
@@ -19953,7 +19952,7 @@ test('authority reconcile defers profile reclaim while action lease tab is still
     assert.equal(recovered[href].tabId, leaseTabId)
     assert.equal(recovered[href].actionLease.tabId, leaseTabId)
     assert.equal(sw.state().activeQueuedTabs.includes(unrelatedProfileTab.id), false)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('active action lease rejects progress from stale sender tab', async () => {
@@ -20417,7 +20416,7 @@ test('authority reconcile ignores stale mismatched progress for active-without-a
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[0].operationKind, 'reconcile-active-without-actor')
 })
 
 test('authority reconcile requeues projection-only action-phase active row when action tab is gone', async () => {
@@ -20495,7 +20494,7 @@ test('authority reconcile requeues projection-only action-phase active row when 
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[0].operationKind, 'reconcile-active-without-actor')
 })
 
 test('authority reconcile rejects stale active-without-actor attempt before WAL append', async () => {
@@ -20676,7 +20675,7 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-active-without-actor')
+    assert.equal(walRecords[0].operationKind, 'reconcile-active-without-actor')
 
     const restarted = loadServiceWorkerHarness({
         now: 3960,
@@ -21439,7 +21438,7 @@ test('queued tab release defers active rollback while content-script recovery is
     assert.equal(recoveredQueue[href].attemptId, attemptId)
     assert.equal(sw.state().activeQueuedTabs.includes(tabId), true)
     assert.equal(Object.fromEntries(sw.state().queuedTabMetadata)[tabId].releaseRollbackDeferredReason, 'fresh-content-script-recovery')
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
@@ -21846,7 +21845,7 @@ test('stale coordinator reconcile promise is cleared before new reconcile tick',
     assert.equal(sw.state().coordinatorReconcilePromise, false)
     assert.equal(sw.state().queueWakeupCounters['reconcile.stalePromiseCleared'] || 0, 1)
     assert.equal(sw.state().queueWakeupCounters['reconcile.idleStalePromiseCleared'] || 0, 1)
-    assert.equal(sw.state().hasStoredWorkRepairTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     await timers.tick(1000)
     await flushAsync(200)
 })

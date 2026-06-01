@@ -119,9 +119,9 @@ const ACTION_LEASE_MS = 90000
 const STALE_CLOSE_REQUESTED_QUEUED_TAB_MS = 8000
 const STALE_QUEUED_TAB_MAX_RETRIES = 1
 const FOREGROUND_LEASE_WAIT_EVENT_MS = 5000
-const STORED_WORK_REPAIR_INTERVAL_MS = 5000
-const STORED_WORK_REPAIR_BACKOFF_BASE_MS = 5000
-const STORED_WORK_REPAIR_BACKOFF_MAX_MS = 60000
+const COORDINATOR_RECONCILE_INTERVAL_MS = 5000
+const COORDINATOR_RECONCILE_BACKOFF_BASE_MS = 5000
+const COORDINATOR_RECONCILE_BACKOFF_MAX_MS = 60000
 const STALE_SCHEDULER_ALARM_SUPPRESSION_MS = 5000
 const SCHEDULER_ALARM_TIME_TOLERANCE_MS = 100
 const SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS = 15000
@@ -145,7 +145,7 @@ const PERSISTENT_FAILED_RETRY_INTERVAL_MS = 5000
 const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
 const PERSISTENT_FAILED_RETRY_ALARM_PERIOD_MINUTES = 0.5
 const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
-const COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME = 'mb-stored-work-repair'
+const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-stored-work-repair'
 const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const CONTENT_SCRIPT_READY_ATTR = 'data-mb-content-script-ready'
 const QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS = 750
@@ -178,7 +178,7 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'stale-retry',
     'terminalize-exhausted-rolled-back-queued',
     'rollback-active-transition',
-    'repair-active-without-actor',
+    'reconcile-active-without-actor',
     'repair-profile-redirect-mismatch',
     'active-transition',
     'action-lease-request',
@@ -202,12 +202,12 @@ let coordinatorQueueResumeClearedAlarmDueAt = 0
 let coordinatorQueueResumeAlarmCreatedForDueAt = 0
 let coordinatorQueueResumeAlarmPromise = null
 let postStorageQueuedWorkContinuationReason = ''
-let storedWorkRepairTimeout = null
-let storedWorkRepairDueAt = 0
-let storedWorkRepairBackoffLevel = 0
-let storedWorkRepairBackoffUntil = 0
-let storedWorkRepairAlarmSuppressUntil = 0
-let storedWorkRepairClearedAlarmDueAt = 0
+let coordinatorReconcileTimeout = null
+let coordinatorReconcileDueAt = 0
+let coordinatorReconcileBackoffLevel = 0
+let coordinatorReconcileBackoffUntil = 0
+let coordinatorReconcileAlarmSuppressUntil = 0
+let coordinatorReconcileClearedAlarmDueAt = 0
 let persistentRetryFailedTimeout = null
 let persistentRetryFailedPromise = null
 let queuedTabReleaseFollowUpTimeout = null
@@ -550,15 +550,20 @@ function summarizeQueueWakeupMetricEpoch(epoch = {}, rolloverReason = '') {
     const storageFallbackReturned = counters['storageUpdate.fallbackReturned'] || 0
     const writeBytes = counters['storagePayload.write.total.bytes'] || 0
     const writeCalls = counters['storagePayload.write.total.calls'] || 0
-    const repairRequested = counters['repair.requested'] || 0
-    const repairChanged = sumQueueWakeupCounters(counters, 'repair.changed.')
+    const reconcileRequested = (counters['reconcile.requested'] || 0) + (counters['repair.requested'] || 0)
+    const reconcileChanged =
+        sumQueueWakeupCounters(counters, 'reconcile.changed.') +
+        sumQueueWakeupCounters(counters, 'repair.changed.')
     const pumpRequested = counters['pump.requested'] || 0
     const pumpChanged = sumQueueWakeupCounters(counters, 'pump.changed.')
     const nudgeSent = counters['nudge.sent'] || 0
     const nudgeAccepted = counters['nudge.accepted'] || 0
     const jobsEnqueued = counters['job.enqueued'] || 0
     const jobsTerminal = counters['job.terminal'] || 0
-    const completedAfterRepair = counters['job.completedOnlyAfterRepair'] || 0
+    const completedAfterReconcile =
+        counters['job.completedOnlyAfterReconcile'] ||
+        counters['job.completedOnlyAfterRepair'] ||
+        0
 
     return {
         epochId: epoch.epochId || '',
@@ -582,9 +587,9 @@ function summarizeQueueWakeupMetricEpoch(epoch = {}, rolloverReason = '') {
             writeCalls,
             maxBytes: counters['storagePayload.write.total.maxBytes'] || 0
         },
-        repair: {
-            requested: repairRequested,
-            changed: repairChanged
+        reconcile: {
+            requested: reconcileRequested,
+            changed: reconcileChanged
         },
         pump: {
             requested: pumpRequested,
@@ -599,8 +604,8 @@ function summarizeQueueWakeupMetricEpoch(epoch = {}, rolloverReason = '') {
         jobs: {
             enqueued: jobsEnqueued,
             terminal: jobsTerminal,
-            completedAfterRepair,
-            completedAfterRepairRate: getQueueWakeupCounterRatio(completedAfterRepair, jobsTerminal)
+            completedAfterReconcile,
+            completedAfterReconcileRate: getQueueWakeupCounterRatio(completedAfterReconcile, jobsTerminal)
         },
         maxPayloadSize: counters['storagePayload.write.total.maxBytes'] || 0,
         journalCount: Array.isArray(epoch.journal) ? epoch.journal.length : 0
@@ -815,7 +820,7 @@ function clearSchedulerAlarms(reason = 'clear-scheduler-alarms') {
 
     return Promise.all([
         browser.alarms.clear(COORDINATOR_RESUME_ALARM_NAME).catch(() => false),
-        browser.alarms.clear(COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME).catch(() => false),
+        browser.alarms.clear(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false),
         browser.alarms.clear(PERSISTENT_FAILED_RETRY_ALARM_NAME).catch(() => false)
     ])
         .then(results => {
@@ -1417,6 +1422,7 @@ function recordStoragePathLatencyMetrics(direction = '', pathName = '', duration
 const SNAPSHOT_WRITE_REASONS = new Set([
     'ordinaryMutation',
     'repair',
+    'reconcile',
     'displayRead',
     'compatibilityFlush',
     'checkpointSwitch',
@@ -2405,9 +2411,9 @@ function shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(item = nul
         isDurableActiveCoordinatorReclaimStale(item, record, now)
 }
 
-function shouldDeferActiveWithoutActorRepairForPersistedTabStatus(status = null, item = null, record = null, now = Date.now()) {
+function shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(status = null, item = null, record = null, now = Date.now()) {
     if(shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(item, record, status, now)) {
-        incrementQueueWakeupMetric('repair.persistedTabLookupTimeoutTreatedMissing')
+        incrementQueueWakeupMetric('reconcile.persistedTabLookupTimeoutTreatedMissing')
         return false
     }
 
@@ -2434,7 +2440,7 @@ async function getActionPhaseLiveTabProtectionForCoordinatorItem(item = null, re
             tabStatus: persistedTabStatus
         }
     }
-    if(shouldDeferActiveWithoutActorRepairForPersistedTabStatus(persistedTabStatus)) {
+    if(shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(persistedTabStatus)) {
         scheduleCoordinatorQueueResume(1000, 'action-phase-progress-persisted-tab-lookup-deferred', {
             allowBeforeQuora: true
         })
@@ -2612,7 +2618,7 @@ async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = '', exp
     const liveProfileTabsByHref = href ? await getLiveProfileTabsByHref() : new Map()
     const hasExpectedLiveProfileTabs = !!href &&
         getOwnedOrExpectedLiveTabsForProfileHref(expectedItem, expectedRecord, href, liveProfileTabsByHref).length > 0
-    if(shouldDeferActiveWithoutActorRepairForPersistedTabStatus(expectedPersistedTabStatus, expectedItem, expectedRecord) &&
+    if(shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(expectedPersistedTabStatus, expectedItem, expectedRecord) &&
         hasExpectedLiveProfileTabs) {
         scheduleCoordinatorReconcile(1000, {
             reason: 'active-without-actor-persisted-tab-lookup-deferred',
@@ -2663,7 +2669,7 @@ async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = '', exp
     const result = await enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'reconcileActiveWithoutRuntimeActor',
-            reason: 'repair',
+            reason: 'reconcile',
             itemKey,
             expectedItem,
             expectedRecord,
@@ -2672,7 +2678,7 @@ async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = '', exp
         })
     }, {
         timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
-        reason: 'repair-active-without-actor'
+        reason: 'reconcile-active-without-actor'
     })
 
     if(result?.changed === true) {
@@ -2712,7 +2718,7 @@ async function releaseMissingActionLeaseForActiveCoordinatorItem(itemKey = '', e
 
         return {changed: false, reason: 'action-lease-tab-still-live'}
     }
-    if(shouldDeferActiveWithoutActorRepairForPersistedTabStatus(leaseTabStatus, expectedItem, expectedRecord)) {
+    if(shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(leaseTabStatus, expectedItem, expectedRecord)) {
         scheduleCoordinatorReconcile(1000, {
             reason: 'action-lease-tab-lookup-deferred',
             edgeTriggered: true
@@ -3192,8 +3198,8 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
 }
 
 async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair') return {changed: false, reason: 'invalid-reconcile-reason'}
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'reconcile')
+    if(snapshotReason !== 'reconcile') return {changed: false, reason: 'invalid-reconcile-reason'}
 
     const itemKey = `${operation.itemKey || ''}`.trim()
     const expectedItem = operation.expectedItem || null
@@ -3210,11 +3216,11 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
             runs: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(operation.currentAuthorityState.runs || {})),
             progress: cloneCoordinatorAuthorityValue(operation.currentAuthorityState.progress || {})
         }
-        incrementQueueWakeupMetric('repair.activeWithoutActor.usedResidentAuthority')
+        incrementQueueWakeupMetric('reconcile.activeWithoutActor.usedResidentAuthority')
     }
     if(!currentAuthorityState) {
         currentAuthorityState = await loadCoordinatorQueueRunsProjection({
-            metricPath: 'repair.activeWithoutActor.load'
+            metricPath: 'reconcile.activeWithoutActor.load'
         })
     }
     const queue = currentAuthorityState.queue
@@ -3262,7 +3268,7 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
     const liveProfileTabsByHref = href ? await getLiveProfileTabsByHref() : new Map()
     const hasExpectedLiveProfileTabs = !!href &&
         getOwnedOrExpectedLiveTabsForProfileHref(current, currentRecord, href, liveProfileTabsByHref).length > 0
-    if(shouldDeferActiveWithoutActorRepairForPersistedTabStatus(persistedTabStatus, current, currentRecord) &&
+    if(shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(persistedTabStatus, current, currentRecord) &&
         hasExpectedLiveProfileTabs) {
         scheduleCoordinatorReconcile(1000, {
             reason: 'active-without-actor-persisted-tab-lookup-deferred',
@@ -3282,12 +3288,12 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
     const currentHref = getCoordinatorItemHref(current) || normalizeQuoraProfileUrl(itemKey)
     const currentCoordinatorKey = getCoordinatorItemQueueKey(current, itemKey)
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'repair-active-without-actor',
+        operationKind: 'reconcile-active-without-actor',
         rowKey: itemKey,
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.activeWithoutActor.save',
+        metricPath: 'reconcile.activeWithoutActor.save',
         projectionPayload: 'queueViewOnly',
         currentAuthorityState,
         mutate(currentItem, context) {
@@ -3355,23 +3361,23 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
     }
 
     let progressProjectionSaved = {saved: true, rows: 0}
-    if(progressChanged && href && isTerminalCoordinatorStatus(nextItem.status)) {
+    if(progressChanged && href) {
         try {
             progressProjectionSaved = await saveProfileNukeProgressRowProjection({[href]: progress[href]}, {
-                metricPath: 'repair.activeWithoutActor.progressProjection'
+                metricPath: 'reconcile.activeWithoutActor.progressProjection'
             })
         }
         catch(error) {
             progressProjectionSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-active-without-actor-progress-projection-save-failed',
+                'reconcile-active-without-actor-progress-projection-save-failed',
                 error?.message || 'Active-without-actor terminal progress projection save failed'
             )
         }
         if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
-            incrementQueueWakeupMetric('repair.activeWithoutActor.progressProjectionFailed')
+            incrementQueueWakeupMetric('reconcile.activeWithoutActor.progressProjectionFailed')
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-active-without-actor-progress-projection-failed',
+                reason: 'reconcile-active-without-actor-progress-projection-failed',
                 edgeTriggered: true
             })
         }
@@ -9273,8 +9279,8 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
     })
 }
 
-async function loadCoordinatorRepairProjection(options = {}) {
-    return runQueueWakeupMetricPhase('loadCoordinatorRepairProjection', async () => {
+async function loadCoordinatorReconcileProjection(options = {}) {
+    return runQueueWakeupMetricPhase('loadCoordinatorReconcileProjection', async () => {
         const progressProfileHrefs = getNormalizedProfileHrefList(options.profileHrefs || options.progressProfileHrefs || [])
         const stored = await metricStorageGet({
             [COORDINATOR_QUEUE_KEY]: {},
@@ -9287,11 +9293,11 @@ async function loadCoordinatorRepairProjection(options = {}) {
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
         }, {
-            metricPath: options.metricPath || 'repair.projection.load'
+            metricPath: options.metricPath || 'reconcile.projection.load'
         })
         const queueSnapshot = runQueueWakeupMetricPhase('normalizeQueue', () => normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY]))
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
-            metricPath: `${options.metricPath || 'repair.projection.load'}.segments`
+            metricPath: `${options.metricPath || 'reconcile.projection.load'}.segments`
         })
         const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
@@ -9883,7 +9889,7 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
     }))
 }
 
-function getCoordinatorRepairOperationTabIdsToClose(operation = {}, item = null, record = null) {
+function getCoordinatorReconcileOperationTabIdsToClose(operation = {}, item = null, record = null) {
     const tabIds = new Set()
     const persistedTabId = normalizeTabId(operation.persistedTabId || getPersistedQueuedTabId(item, record))
     if(operation.closePersistedTab === true && persistedTabId) {
@@ -9896,7 +9902,7 @@ function getCoordinatorRepairOperationTabIdsToClose(operation = {}, item = null,
     return Array.from(tabIds)
 }
 
-function matchesCoordinatorRepairOperationAttempt(item = null, operation = {}) {
+function matchesCoordinatorReconcileOperationAttempt(item = null, operation = {}) {
     const expectedAttemptId = normalizeAttemptId(operation.expectedAttemptId || '')
     const expectedAttemptNumber = Number.parseInt(operation.expectedAttemptNumber, 10) || 0
     if(expectedAttemptId && getAttemptIdFromValue(item) !== expectedAttemptId) return false
@@ -9904,8 +9910,8 @@ function matchesCoordinatorRepairOperationAttempt(item = null, operation = {}) {
     return true
 }
 
-function applyInvalidProfileResolutionRepairActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'repairInvalidProfileResolution') {
+function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operation = {}) {
+    if(`${operation.kind || ''}`.trim() !== 'reconcileInvalidProfileResolution') {
         return {changed: false, reason: 'wrong-kind'}
     }
 
@@ -9915,7 +9921,7 @@ function applyInvalidProfileResolutionRepairActionLocked(state = {}, operation =
 
     const item = queue[itemKey] || null
     if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorRepairOperationAttempt(item, operation)) {
+    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
         return {changed: false, reason: 'attempt-changed'}
     }
 
@@ -9968,13 +9974,13 @@ function applyInvalidProfileResolutionRepairActionLocked(state = {}, operation =
         pendingPosts,
         repaired: 1,
         affectedRunIds: item.runId ? [item.runId] : [],
-        tabIdsToClose: getCoordinatorRepairOperationTabIdsToClose(operation, item, operation.record || null),
+        tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
         item: nextItem
     }
 }
 
-function applyStaleProfileResolutionTabRepairActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'repairStaleProfileResolutionTab') {
+function applyStaleProfileResolutionTabReconcileActionLocked(state = {}, operation = {}) {
+    if(`${operation.kind || ''}`.trim() !== 'reconcileStaleProfileResolutionTab') {
         return {changed: false, reason: 'wrong-kind'}
     }
 
@@ -9984,7 +9990,7 @@ function applyStaleProfileResolutionTabRepairActionLocked(state = {}, operation 
 
     const item = queue[itemKey] || null
     if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorRepairOperationAttempt(item, operation)) {
+    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
         return {changed: false, reason: 'attempt-changed'}
     }
 
@@ -10005,13 +10011,13 @@ function applyStaleProfileResolutionTabRepairActionLocked(state = {}, operation 
         queueChanged: true,
         repaired: 1,
         affectedRunIds: item.runId ? [item.runId] : [],
-        tabIdsToClose: getCoordinatorRepairOperationTabIdsToClose(operation, item, operation.record || null),
+        tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
         item: nextItem
     }
 }
 
-function applyProgressRecordCoordinatorRepairActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'repairFromProgressRecord') {
+function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {}) {
+    if(`${operation.kind || ''}`.trim() !== 'reconcileFromProgressRecord') {
         return {changed: false, reason: 'wrong-kind'}
     }
 
@@ -10021,7 +10027,7 @@ function applyProgressRecordCoordinatorRepairActionLocked(state = {}, operation 
 
     const item = queue[itemKey] || null
     if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorRepairOperationAttempt(item, operation)) {
+    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
         return {changed: false, reason: 'attempt-changed'}
     }
 
@@ -10056,7 +10062,7 @@ function applyProgressRecordCoordinatorRepairActionLocked(state = {}, operation 
     }
 }
 
-function buildCoordinatorRepairQueueAuthorityDiff(originalQueue = {}, nextQueue = {}, operationKind = 'repair-progress') {
+function buildCoordinatorReconcileQueueAuthorityDiff(originalQueue = {}, nextQueue = {}, operationKind = 'reconcile-progress') {
     const results = []
     const removedRows = []
     const keys = new Set([
@@ -10073,12 +10079,12 @@ function buildCoordinatorRepairQueueAuthorityDiff(originalQueue = {}, nextQueue 
             results.push(makeCoordinatorAuthorityApplyResult({
                 operationKind,
                 rowKey: key,
-                reason: 'repair'
+                reason: 'reconcile'
             }, {
                 accepted: true,
                 changed: true,
                 durable: true,
-                reason: 'repair',
+                reason: 'reconcile',
                 previousRow,
                 nextRow,
                 terminal: isTerminalCoordinatorStatus(nextRow.status)
@@ -10089,7 +10095,7 @@ function buildCoordinatorRepairQueueAuthorityDiff(originalQueue = {}, nextQueue 
                 rowKey: key,
                 previousRow,
                 operationKind,
-                reason: 'repair'
+                reason: 'reconcile'
             })
         }
     }
@@ -10097,9 +10103,9 @@ function buildCoordinatorRepairQueueAuthorityDiff(originalQueue = {}, nextQueue 
     return {results, removedRows}
 }
 
-async function persistCoordinatorRepairQueueAuthorityMutation(originalQueue = {}, nextState = {}, options = {}) {
-    const operationKind = normalizeQueueWriteOperationName(options.operationKind || 'repair-progress')
-    const diff = buildCoordinatorRepairQueueAuthorityDiff(
+async function persistCoordinatorReconcileQueueAuthorityMutation(originalQueue = {}, nextState = {}, options = {}) {
+    const operationKind = normalizeQueueWriteOperationName(options.operationKind || 'reconcile-progress')
+    const diff = buildCoordinatorReconcileQueueAuthorityDiff(
         originalQueue,
         nextState?.queue || {},
         operationKind
@@ -10118,11 +10124,11 @@ async function persistCoordinatorRepairQueueAuthorityMutation(originalQueue = {}
         nextState,
         {
             operationKind,
-            reason: 'repair',
+            reason: 'reconcile',
             previousProjectionQueue: originalQueue,
             removedRows: diff.removedRows,
-            metricPath: 'repair.queueWal.save',
-            projectionMetricPath: 'repair.queueWal.projection'
+            metricPath: 'reconcile.queueWal.save',
+            projectionMetricPath: 'reconcile.queueWal.projection'
         }
     )
     if(persistence?.saved === true) {
@@ -10393,83 +10399,111 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
     }
 }
 
-async function reconcileCoordinatorStorageLocked(options = {}) {
-    const state = await loadCoordinatorRepairProjection({
-        metricPath: 'repair.load'
+function addCoordinatorReconcileAffectedRunIds(ctx = {}, runIds = []) {
+    for(const runId of runIds || []) {
+        if(runId) ctx.affectedRunIds.add(runId)
+    }
+}
+
+function markCoordinatorReconcileRunAffected(ctx = {}, item = null) {
+    const runId = `${item?.runId || ''}`.trim()
+    if(runId) ctx.affectedRunIds.add(runId)
+}
+
+async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
+    const state = await loadCoordinatorReconcileProjection({
+        metricPath: 'reconcile.load'
     })
     const queue = state.queue
-    const originalQueue = cloneCoordinatorAuthorityValue(queue || {})
     let runs = state.runs
-    const originalRuns = cloneCoordinatorAuthorityValue(runs)
-    const events = state.events
-    const progress = state.progress
-    const originalProgress = cloneCoordinatorAuthorityValue(progress || {})
-    const originalLegacyProgress = normalizeStoredProfileNukeProgress(state.stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
     let pendingPosts = state.pendingPosts || {}
     let nukedPosts = state.nukedPosts || {}
     state.pendingPosts = pendingPosts
     state.nukedPosts = nukedPosts
-    const now = Date.now()
-    const liveProfileTabsByHref = await getLiveProfileTabsByHref()
-    let changed = false
-    let eventsChanged = false
-    let pendingPostsChanged = false
-    let nukedPostsChanged = false
-    let progressChanged = false
-    let runsMetadataChanged = false
-    let repaired = 0
-    let recomputeAllRuns = false
-    const affectedRunIds = new Set()
-    const terminalSettlementHrefs = new Set()
-    const tabsToCloseAfterRepair = new Set()
-    coordinatorDiagnosticBatchDepth += 1
-    try {
-    const markRunAffected = item => {
-        const runId = `${item?.runId || ''}`.trim()
-        if(runId) affectedRunIds.add(runId)
+
+    return {
+        options,
+        state,
+        queue,
+        originalQueue: cloneCoordinatorAuthorityValue(queue || {}),
+        runs,
+        originalRuns: cloneCoordinatorAuthorityValue(runs),
+        events: state.events,
+        progress: state.progress,
+        originalProgress: cloneCoordinatorAuthorityValue(state.progress || {}),
+        originalLegacyProgress: normalizeStoredProfileNukeProgress(state.stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}),
+        pendingPosts,
+        nukedPosts,
+        now: Date.now(),
+        liveProfileTabsByHref: new Map(),
+        changed: false,
+        eventsChanged: false,
+        pendingPostsChanged: false,
+        nukedPostsChanged: false,
+        progressChanged: false,
+        runsMetadataChanged: false,
+        repaired: 0,
+        recomputeAllRuns: false,
+        affectedRunIds: new Set(),
+        terminalSettlementHrefs: new Set(),
+        tabsToCloseAfterReconcile: new Set()
     }
+}
+
+function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {}) {
+    const clearProfileMaterialized = materializeRemovedProfileDerivedStateFromAuthority(ctx.state)
+    if(clearProfileMaterialized.changed) {
+        ctx.runs = clearProfileMaterialized.runs || ctx.runs
+        ctx.pendingPosts = clearProfileMaterialized.pendingPosts || ctx.pendingPosts
+        ctx.nukedPosts = clearProfileMaterialized.nukedPosts || ctx.nukedPosts
+        ctx.state.runs = ctx.runs
+        ctx.state.pendingPosts = ctx.pendingPosts
+        ctx.state.nukedPosts = ctx.nukedPosts
+        ctx.progressChanged = ctx.progressChanged || clearProfileMaterialized.progressChanged
+        ctx.runsMetadataChanged = ctx.runsMetadataChanged || clearProfileMaterialized.runsChanged
+        ctx.pendingPostsChanged = ctx.pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
+        ctx.nukedPostsChanged = ctx.nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
+        ctx.repaired += clearProfileMaterialized.repaired || 0
+        addCoordinatorReconcileAffectedRunIds(ctx, clearProfileMaterialized.affectedRunIds)
+    }
+}
+
+function importLegacyQueuedProgressRecordsReconcilePhase(ctx = {}, options = {}) {
+    if(options.legacyImport === true || options.importLegacy === true) {
+        const restoredQueued = importLegacyQueuedProgressRecordsToCoordinatorQueue(ctx.state, {now: ctx.now})
+        if(restoredQueued.restored > 0) {
+            ctx.changed = true
+            ctx.eventsChanged = ctx.eventsChanged || restoredQueued.eventsChanged
+            ctx.progressChanged = ctx.progressChanged || restoredQueued.progressChanged
+            ctx.runsMetadataChanged = true
+            ctx.repaired += restoredQueued.restored
+            addCoordinatorReconcileAffectedRunIds(ctx, restoredQueued.affectedRunIds)
+        }
+    }
+}
+
+async function reconcileCoordinatorRuntimeActorsPhase(ctx = {}) {
+    ctx.liveProfileTabsByHref = await getLiveProfileTabsByHref()
+}
+
+async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) {
+    const {
+        state,
+        queue,
+        events,
+        progress,
+        now
+    } = ctx
 
     if(pruneCoordinatorCurrentWork(queue, now)) {
-        changed = true
-        recomputeAllRuns = true
-    }
-
-    const clearProfileMaterialized = materializeRemovedProfileDerivedStateFromAuthority(state)
-    if(clearProfileMaterialized.changed) {
-        runs = clearProfileMaterialized.runs || runs
-        pendingPosts = clearProfileMaterialized.pendingPosts || pendingPosts
-        nukedPosts = clearProfileMaterialized.nukedPosts || nukedPosts
-        state.runs = runs
-        state.pendingPosts = pendingPosts
-        state.nukedPosts = nukedPosts
-        progressChanged = progressChanged || clearProfileMaterialized.progressChanged
-        runsMetadataChanged = runsMetadataChanged || clearProfileMaterialized.runsChanged
-        pendingPostsChanged = pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
-        nukedPostsChanged = nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
-        repaired += clearProfileMaterialized.repaired || 0
-        for(const runId of clearProfileMaterialized.affectedRunIds || []) {
-            if(runId) affectedRunIds.add(runId)
-        }
-    }
-
-    if(options.legacyImport === true || options.importLegacy === true) {
-        const restoredQueued = importLegacyQueuedProgressRecordsToCoordinatorQueue(state, {now})
-        if(restoredQueued.restored > 0) {
-            changed = true
-            eventsChanged = eventsChanged || restoredQueued.eventsChanged
-            progressChanged = progressChanged || restoredQueued.progressChanged
-            runsMetadataChanged = true
-            repaired += restoredQueued.restored
-            for(const runId of restoredQueued.affectedRunIds || []) {
-                if(runId) affectedRunIds.add(runId)
-            }
-        }
+        ctx.changed = true
+        ctx.recomputeAllRuns = true
     }
 
     for(const [itemKey, rawItem] of Object.entries(queue)) {
         let item = rawItem
         if(!item || typeof item !== 'object') continue
-        const rawSnapshotItem = state.stored?.[COORDINATOR_QUEUE_KEY]?.[itemKey] || null
+        const rawSnapshotItem = ctx.state.stored?.[COORDINATOR_QUEUE_KEY]?.[itemKey] || null
         if(shouldAdoptTerminalRawCoordinatorSnapshot(item, rawSnapshotItem)) {
             item = {
                 ...item,
@@ -10479,58 +10513,54 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
                 requestedUrl: rawSnapshotItem.requestedUrl || item.requestedUrl || ''
             }
             queue[itemKey] = item
-            changed = true
-            repaired += 1
-            markRunAffected(item)
+            ctx.changed = true
+            ctx.repaired += 1
+            markCoordinatorReconcileRunAffected(ctx, item)
             const terminalHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-            if(terminalHref) terminalSettlementHrefs.add(terminalHref)
+            if(terminalHref) ctx.terminalSettlementHrefs.add(terminalHref)
         }
 
         if(item.runId) {
-            const inferredSource = makeCoordinatorSourceFromRunMetadata(item.runId || '', runs[item.runId] || {}, events)
+            const inferredSource = makeCoordinatorSourceFromRunMetadata(item.runId || '', ctx.runs[item.runId] || {}, events)
             const sourceRepairedItem = applyCoordinatorSourceMetadataRepair(item, inferredSource)
             if(sourceRepairedItem !== item) {
                 item = sourceRepairedItem
                 queue[itemKey] = item
-                changed = true
-                repaired += 1
-                markRunAffected(item)
+                ctx.changed = true
+                ctx.repaired += 1
+                markCoordinatorReconcileRunAffected(ctx, item)
             }
         }
 
         const terminalKeyOnlyDerivedRepair = repairTerminalKeyOnlyDerivedStateLocked(state, itemKey, item, now)
         if(terminalKeyOnlyDerivedRepair.changed) {
-            eventsChanged = eventsChanged || terminalKeyOnlyDerivedRepair.eventsChanged
-            repaired += terminalKeyOnlyDerivedRepair.repaired || 0
+            ctx.eventsChanged = ctx.eventsChanged || terminalKeyOnlyDerivedRepair.eventsChanged
+            ctx.repaired += terminalKeyOnlyDerivedRepair.repaired || 0
         }
-        for(const runId of terminalKeyOnlyDerivedRepair.affectedRunIds || []) {
-            if(runId) affectedRunIds.add(runId)
-        }
+        addCoordinatorReconcileAffectedRunIds(ctx, terminalKeyOnlyDerivedRepair.affectedRunIds)
 
         const terminalResolverPendingRepair = repairTerminalResolverPendingSourceRecordsLocked(state, itemKey, item)
         if(terminalResolverPendingRepair.changed) {
-            pendingPosts = terminalResolverPendingRepair.pendingPosts || pendingPosts
-            pendingPostsChanged = pendingPostsChanged || terminalResolverPendingRepair.pendingPostsChanged
-            repaired += terminalResolverPendingRepair.repaired || 0
+            ctx.pendingPosts = terminalResolverPendingRepair.pendingPosts || ctx.pendingPosts
+            ctx.pendingPostsChanged = ctx.pendingPostsChanged || terminalResolverPendingRepair.pendingPostsChanged
+            ctx.repaired += terminalResolverPendingRepair.repaired || 0
         }
 
         const resolvedResolverPendingRepair = repairResolvedResolverPendingSourceRecordsLocked(state, itemKey, item)
         if(resolvedResolverPendingRepair.changed) {
-            pendingPosts = resolvedResolverPendingRepair.pendingPosts || pendingPosts
-            pendingPostsChanged = pendingPostsChanged || resolvedResolverPendingRepair.pendingPostsChanged
-            repaired += resolvedResolverPendingRepair.repaired || 0
+            ctx.pendingPosts = resolvedResolverPendingRepair.pendingPosts || ctx.pendingPosts
+            ctx.pendingPostsChanged = ctx.pendingPostsChanged || resolvedResolverPendingRepair.pendingPostsChanged
+            ctx.repaired += resolvedResolverPendingRepair.repaired || 0
         }
 
         const queuedDerivedRepair = repairQueuedCoordinatorDerivedStateLocked(state, itemKey, item, now)
         if(queuedDerivedRepair.changed) {
-            runsMetadataChanged = runsMetadataChanged || queuedDerivedRepair.runsChanged
-            progressChanged = progressChanged || queuedDerivedRepair.progressChanged
-            eventsChanged = eventsChanged || queuedDerivedRepair.eventsChanged
-            repaired += queuedDerivedRepair.repaired || 0
+            ctx.runsMetadataChanged = ctx.runsMetadataChanged || queuedDerivedRepair.runsChanged
+            ctx.progressChanged = ctx.progressChanged || queuedDerivedRepair.progressChanged
+            ctx.eventsChanged = ctx.eventsChanged || queuedDerivedRepair.eventsChanged
+            ctx.repaired += queuedDerivedRepair.repaired || 0
         }
-        for(const runId of queuedDerivedRepair.affectedRunIds || []) {
-            if(runId) affectedRunIds.add(runId)
-        }
+        addCoordinatorReconcileAffectedRunIds(ctx, queuedDerivedRepair.affectedRunIds)
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         let record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
@@ -10556,11 +10586,11 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
             const closePersistedTab = tabId
                 ? !!await getPersistedLiveTabForCoordinatorItem(item, record, itemKey)
                 : false
-            const applied = applyInvalidProfileResolutionRepairActionLocked({
+            const applied = applyInvalidProfileResolutionReconcileActionLocked({
                 queue,
-                pendingPosts
+                pendingPosts: ctx.pendingPosts
             }, {
-                kind: 'repairInvalidProfileResolution',
+                kind: 'reconcileInvalidProfileResolution',
                 itemKey,
                 failure: invalidProfileResolutionFailure,
                 expectedAttemptId: getAttemptIdFromValue(item),
@@ -10572,15 +10602,13 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
                 now
             })
             if(applied.changed) {
-                pendingPosts = applied.pendingPosts || pendingPosts
-                pendingPostsChanged = pendingPostsChanged || applied.pendingPostsChanged
-                changed = true
-                repaired += applied.repaired || 0
-                for(const runId of applied.affectedRunIds || []) {
-                    if(runId) affectedRunIds.add(runId)
-                }
+                ctx.pendingPosts = applied.pendingPosts || ctx.pendingPosts
+                ctx.pendingPostsChanged = ctx.pendingPostsChanged || applied.pendingPostsChanged
+                ctx.changed = true
+                ctx.repaired += applied.repaired || 0
+                addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
-                    if(closeTabId) tabsToCloseAfterRepair.add(closeTabId)
+                    if(closeTabId) ctx.tabsToCloseAfterReconcile.add(closeTabId)
                 }
             }
             continue
@@ -10591,10 +10619,10 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
             const closePersistedTab = tabId && !persistedActiveTabMissing
                 ? !!await getPersistedLiveTabForCoordinatorItem(item, record, itemKey)
                 : false
-            const applied = applyStaleProfileResolutionTabRepairActionLocked({
+            const applied = applyStaleProfileResolutionTabReconcileActionLocked({
                 queue
             }, {
-                kind: 'repairStaleProfileResolutionTab',
+                kind: 'reconcileStaleProfileResolutionTab',
                 itemKey,
                 expectedAttemptId: getAttemptIdFromValue(item),
                 expectedAttemptNumber: getAttemptNumberFromValue(item),
@@ -10604,31 +10632,29 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
                 now
             })
             if(applied.changed) {
-                changed = true
-                repaired += applied.repaired || 0
-                for(const runId of applied.affectedRunIds || []) {
-                    if(runId) affectedRunIds.add(runId)
-                }
+                ctx.changed = true
+                ctx.repaired += applied.repaired || 0
+                addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
-                    if(closeTabId) tabsToCloseAfterRepair.add(closeTabId)
+                    if(closeTabId) ctx.tabsToCloseAfterReconcile.add(closeTabId)
                 }
             }
             continue
         }
         const queueAuthoritative = isCoordinatorQueueAuthoritativeItem(item)
         let reconciledMissingActive = false
-        const missingActiveDecision = await getMissingActiveCoordinatorRepairDecision(
+        const missingActiveDecision = await getMissingActiveCoordinatorReconcileDecision(
             item,
             record,
             itemKey,
             href,
-            liveProfileTabsByHref,
+            ctx.liveProfileTabsByHref,
             now,
             persistedActiveTabMissing
         )
         if(missingActiveDecision.reconcile) {
             const tabId = getPersistedQueuedTabId(item, record)
-            const expectedLiveTabIds = getOwnedOrExpectedLiveTabsForProfileHref(item, record, href, liveProfileTabsByHref)
+            const expectedLiveTabIds = getOwnedOrExpectedLiveTabsForProfileHref(item, record, href, ctx.liveProfileTabsByHref)
                 .map(tab => normalizeTabId(tab?.id))
                 .filter(liveTabId => liveTabId && liveTabId !== tabId)
             const applied = applyMissingActiveCoordinatorEvidenceReconcileActionLocked(state, {
@@ -10643,14 +10669,12 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
             })
             if(applied.changed) {
                 record = progress[applied.href] || record
-                progressChanged = progressChanged || applied.progressChanged
-                repaired += applied.repaired || 0
+                ctx.progressChanged = ctx.progressChanged || applied.progressChanged
+                ctx.repaired += applied.repaired || 0
                 reconciledMissingActive = true
-                for(const runId of applied.affectedRunIds || []) {
-                    if(runId) affectedRunIds.add(runId)
-                }
+                addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
-                    if(closeTabId) tabsToCloseAfterRepair.add(closeTabId)
+                    if(closeTabId) ctx.tabsToCloseAfterReconcile.add(closeTabId)
                 }
             }
         }
@@ -10679,9 +10703,9 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
                             ...profileNukeProgress,
                             [recordHref]: restoredRecord
                         }
-                        progressChanged = true
-                        repaired += 1
-                        markRunAffected(item)
+                        ctx.progressChanged = true
+                        ctx.repaired += 1
+                        markCoordinatorReconcileRunAffected(ctx, item)
                     }
                 }
                 continue
@@ -10697,8 +10721,8 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
             continue
         }
 
-        const applied = applyProgressRecordCoordinatorRepairActionLocked(state, {
-            kind: 'repairFromProgressRecord',
+        const applied = applyProgressRecordCoordinatorReconcileActionLocked(state, {
+            kind: 'reconcileFromProgressRecord',
             itemKey,
             expectedAttemptId: getAttemptIdFromValue(item),
             expectedAttemptNumber: getAttemptNumberFromValue(item),
@@ -10709,57 +10733,55 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
             terminalAtFallback: 'record'
         })
         if(!applied.changed) continue
-        if(applied.mappedTerminal) terminalSettlementHrefs.add(href)
-        changed = true
-        repaired += applied.repaired || 0
-        for(const runId of applied.affectedRunIds || []) {
-            if(runId) affectedRunIds.add(runId)
-        }
+        if(applied.mappedTerminal) ctx.terminalSettlementHrefs.add(href)
+        ctx.changed = true
+        ctx.repaired += applied.repaired || 0
+        addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
     }
 
     const runsPauseMaterialized = materializeCoordinatorRunsPausedStateFromControl(
         queue,
-        runs,
+        ctx.runs,
         state.stored?.[COORDINATOR_PAUSED_KEY] === true,
         now
     )
     if(runsPauseMaterialized.changed) {
-        runs = runsPauseMaterialized.runs || runs
-        state.runs = runs
-        runsMetadataChanged = true
-        repaired += runsPauseMaterialized.affectedRunIds.length
-        for(const runId of runsPauseMaterialized.affectedRunIds || []) {
-            if(runId) affectedRunIds.add(runId)
-        }
+        ctx.runs = runsPauseMaterialized.runs || ctx.runs
+        state.runs = ctx.runs
+        ctx.runsMetadataChanged = true
+        ctx.repaired += runsPauseMaterialized.affectedRunIds.length
+        addCoordinatorReconcileAffectedRunIds(ctx, runsPauseMaterialized.affectedRunIds)
     }
+}
 
-    const nextRuns = (recomputeAllRuns || affectedRunIds.size)
-        ? recomputeCoordinatorRuns(queue, runs, recomputeAllRuns ? null : affectedRunIds)
-        : runs
-    const runsChanged = (runsMetadataChanged || nextRuns !== runs) && JSON.stringify(nextRuns) !== JSON.stringify(originalRuns)
+async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
+    const nextRuns = (ctx.recomputeAllRuns || ctx.affectedRunIds.size)
+        ? recomputeCoordinatorRuns(ctx.queue, ctx.runs, ctx.recomputeAllRuns ? null : ctx.affectedRunIds)
+        : ctx.runs
+    const runsChanged = (ctx.runsMetadataChanged || nextRuns !== ctx.runs) && JSON.stringify(nextRuns) !== JSON.stringify(ctx.originalRuns)
     const storagePatch = {}
 
     let fullProgressMirrorChanged = false
     let progressProjectionSaved = {saved: true, rows: 0}
     let progressProjectionDeleted = {saved: true, rows: 0}
-    if(progressChanged) {
-        const prunedProgress = pruneProfileNukeProgress(progress)
-        const changedProgressRecords = getChangedProfileProgressRecords(originalProgress, prunedProgress)
-        const deletedProgressHrefs = Object.keys(originalProgress || {})
+    if(ctx.progressChanged) {
+        const prunedProgress = pruneProfileNukeProgress(ctx.progress)
+        const changedProgressRecords = getChangedProfileProgressRecords(ctx.originalProgress, prunedProgress)
+        const deletedProgressHrefs = Object.keys(ctx.originalProgress || {})
             .filter(href => !Object.prototype.hasOwnProperty.call(prunedProgress, href))
         profileNukeProgress = prunedProgress
 
         if(Object.keys(changedProgressRecords).length) {
             try {
                 progressProjectionSaved = await saveProfileNukeProgressRowProjection(changedProgressRecords, {
-                    metricPath: 'repair.progressProjection'
+                    metricPath: 'reconcile.progressProjection'
                 })
             }
             catch(error) {
                 progressProjectionSaved = false
                 recordCoordinatorDiagnosticEvent(
-                    'repair-progress-projection-save-failed',
-                    error?.message || 'Repair progress projection save failed'
+                    'reconcile-progress-projection-save-failed',
+                    error?.message || 'Reconcile progress projection save failed'
                 )
             }
         }
@@ -10767,19 +10789,19 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
         if(deletedProgressHrefs.length) {
             try {
                 progressProjectionDeleted = await deleteProfileNukeProgressRowProjection(deletedProgressHrefs, {
-                    metricPath: 'repair.progressProjectionDelete'
+                    metricPath: 'reconcile.progressProjectionDelete'
                 })
             }
             catch(error) {
                 progressProjectionDeleted = false
                 recordCoordinatorDiagnosticEvent(
-                    'repair-progress-projection-delete-failed',
-                    error?.message || 'Repair progress projection delete failed'
+                    'reconcile-progress-projection-delete-failed',
+                    error?.message || 'Reconcile progress projection delete failed'
                 )
             }
 
             fullProgressMirrorChanged = deletedProgressHrefs.some(href =>
-                Object.prototype.hasOwnProperty.call(originalLegacyProgress, href)
+                Object.prototype.hasOwnProperty.call(ctx.originalLegacyProgress, href)
             )
         }
 
@@ -10794,36 +10816,36 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
     }
     let queueAuthorityPersistence = null
     let queueAuthorityChangedRows = 0
-    if(changed) {
-        queueAuthorityPersistence = await persistCoordinatorRepairQueueAuthorityMutation(originalQueue, {
-            ...state,
-            queue,
+    if(ctx.changed) {
+        queueAuthorityPersistence = await persistCoordinatorReconcileQueueAuthorityMutation(ctx.originalQueue, {
+            ...ctx.state,
+            queue: ctx.queue,
             runs: nextRuns
         }, {
-            operationKind: 'repair-progress'
+            operationKind: 'reconcile-progress'
         })
-        queueAuthorityChangedRows = Number.parseInt(queueAuthorityPersistence?.changedRows, 10) || repaired
+        queueAuthorityChangedRows = Number.parseInt(queueAuthorityPersistence?.changedRows, 10) || ctx.repaired
         if(queueAuthorityPersistence?.saved !== true) {
             saved = false
-            incrementQueueWakeupMetric('repair.queueWalSaveFailed')
+            incrementQueueWakeupMetric('reconcile.queueWalSaveFailed')
             recordCoordinatorDiagnosticEvent(
-                'repair-queue-wal-save-failed',
-                queueAuthorityPersistence?.reason || 'Repair queue authority WAL save failed'
+                'reconcile-queue-wal-save-failed',
+                queueAuthorityPersistence?.reason || 'Reconcile queue authority WAL save failed'
             )
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-queue-wal-save-failed',
+                reason: 'reconcile-queue-wal-save-failed',
                 edgeTriggered: true
             })
         }
         else {
-            storagePatch[COORDINATOR_QUEUE_KEY] = queue
+            storagePatch[COORDINATOR_QUEUE_KEY] = ctx.queue
         }
     }
-    const queueAuthoritySaved = !changed || queueAuthorityPersistence?.saved === true
+    const queueAuthoritySaved = !ctx.changed || queueAuthorityPersistence?.saved === true
     if(queueAuthoritySaved && runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
-    if(queueAuthoritySaved && eventsChanged) storagePatch[COORDINATOR_EVENTS_KEY] = events
-    if(queueAuthoritySaved && pendingPostsChanged) storagePatch[SPACE_PENDING_NUKED_POSTS_KEY] = pendingPosts
-    if(queueAuthoritySaved && nukedPostsChanged) storagePatch[SPACE_NUKED_POSTS_KEY] = nukedPosts
+    if(queueAuthoritySaved && ctx.eventsChanged) storagePatch[COORDINATOR_EVENTS_KEY] = ctx.events
+    if(queueAuthoritySaved && ctx.pendingPostsChanged) storagePatch[SPACE_PENDING_NUKED_POSTS_KEY] = ctx.pendingPosts
+    if(queueAuthoritySaved && ctx.nukedPostsChanged) storagePatch[SPACE_NUKED_POSTS_KEY] = ctx.nukedPosts
 
     if(Object.keys(storagePatch).length) {
         const queueMirrorChanged = Object.prototype.hasOwnProperty.call(storagePatch, COORDINATOR_QUEUE_KEY)
@@ -10837,25 +10859,25 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
         }, {
             queue: queueMirrorChanged,
             runs: runsChanged,
-            events: eventsChanged,
+            events: ctx.eventsChanged,
             progress: fullProgressMirrorChanged,
-            pendingPosts: pendingPostsChanged,
-            nukedPosts: nukedPostsChanged,
-            reason: 'repair',
-            queueOperation: 'repair-progress',
-            queueChangedRows: queueAuthorityChangedRows || repaired,
-            coordinatorAuthorityWrite: changed && queueAuthorityPersistence?.saved === true
+            pendingPosts: ctx.pendingPostsChanged,
+            nukedPosts: ctx.nukedPostsChanged,
+            reason: 'reconcile',
+            queueOperation: 'reconcile-progress',
+            queueChangedRows: queueAuthorityChangedRows || ctx.repaired,
+            coordinatorAuthorityWrite: ctx.changed && queueAuthorityPersistence?.saved === true
         })
         if(stateSaved === false) saved = false
     }
 
-    if(terminalSettlementHrefs.size) {
+    if(ctx.terminalSettlementHrefs.size) {
         await settleTerminalCoordinatorItemsLocked({
-            profileHrefs: Array.from(terminalSettlementHrefs)
+            profileHrefs: Array.from(ctx.terminalSettlementHrefs)
         })
     }
-    for(const tabId of saved !== false ? tabsToCloseAfterRepair : []) {
-        detachQueuedTabRuntimeState(tabId, 'storage-repair-tab-close')
+    for(const tabId of saved !== false ? ctx.tabsToCloseAfterReconcile : []) {
+        detachQueuedTabRuntimeState(tabId, 'storage-reconcile-tab-close')
         try {
             await browser.tabs.remove(tabId)
         }
@@ -10864,16 +10886,27 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
     await flushPendingCoordinatorDiagnosticEvents()
 
     return {
-        repaired,
-        queueChanged: changed,
-        pendingPostsChanged,
-        nukedPostsChanged,
+        repaired: ctx.repaired,
+        queueChanged: ctx.changed,
+        pendingPostsChanged: ctx.pendingPostsChanged,
+        nukedPostsChanged: ctx.nukedPostsChanged,
         runsChanged,
-        eventsChanged,
-        progressChanged,
-        queueCount: Object.keys(queue).length,
+        eventsChanged: ctx.eventsChanged,
+        progressChanged: ctx.progressChanged,
+        queueCount: Object.keys(ctx.queue).length,
         runCount: Object.keys(nextRuns).length
     }
+}
+
+async function reconcileCoordinatorStorageLocked(options = {}) {
+    const ctx = await loadCoordinatorReconcileAuthorityPhase(options)
+    coordinatorDiagnosticBatchDepth += 1
+    try {
+        importLegacyQueuedProgressRecordsReconcilePhase(ctx, options)
+        materializeCoordinatorReconcileDerivedProjectionPhase(ctx)
+        await reconcileCoordinatorRuntimeActorsPhase(ctx)
+        await applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx)
+        return persistCoordinatorReconcileAuthorityTransitionPhase(ctx)
     }
     finally {
         coordinatorDiagnosticBatchDepth = Math.max(0, coordinatorDiagnosticBatchDepth - 1)
@@ -13768,10 +13801,10 @@ async function getCoordinatorWhyNotRunning(request = {}) {
             coordinatorQueueResumeReason,
             coordinatorQueueResumeTimeout: !!coordinatorQueueResumeTimeout,
             coordinatorQueueResumeAllowBeforeQuora,
-            storedWorkRepairDueAt,
-            storedWorkRepairTimeout: !!storedWorkRepairTimeout,
-            storedWorkRepairBackoffUntil,
-            storedWorkRepairBackoffLevel
+            coordinatorReconcileDueAt,
+            coordinatorReconcileTimeout: !!coordinatorReconcileTimeout,
+            coordinatorReconcileBackoffUntil,
+            coordinatorReconcileBackoffLevel
         },
         promises: {
             queuedTabFillPromise: !!queuedTabFillPromise,
@@ -14337,7 +14370,7 @@ async function shouldAllowStoredWorkBeforeQuora(reason = 'stored-work-scheduler'
     return hasUnpausedStoredCoordinatorWorkInQueueView(reason)
 }
 
-function isCoordinatorRepairEdgeTriggerReason(reason = '') {
+function isCoordinatorReconcileEdgeTriggerReason(reason = '') {
     const normalized = `${reason || ''}`.trim()
     return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|repair-request.*|legacy-import.*|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
 }
@@ -14371,10 +14404,10 @@ function suppressStaleCoordinatorResumeAlarm(dueAt = 0) {
     clearNamedSchedulerAlarm(COORDINATOR_RESUME_ALARM_NAME)
 }
 
-function suppressStaleStoredWorkRepairAlarm(dueAt = 0) {
-    storedWorkRepairClearedAlarmDueAt = Number.parseInt(dueAt, 10) || storedWorkRepairClearedAlarmDueAt || 0
-    storedWorkRepairAlarmSuppressUntil = Date.now() + STALE_SCHEDULER_ALARM_SUPPRESSION_MS
-    clearNamedSchedulerAlarm(COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME)
+function suppressStaleCoordinatorReconcileAlarm(dueAt = 0) {
+    coordinatorReconcileClearedAlarmDueAt = Number.parseInt(dueAt, 10) || coordinatorReconcileClearedAlarmDueAt || 0
+    coordinatorReconcileAlarmSuppressUntil = Date.now() + STALE_SCHEDULER_ALARM_SUPPRESSION_MS
+    clearNamedSchedulerAlarm(COORDINATOR_RECONCILE_ALARM_NAME)
 }
 
 function scheduleCoordinatorResumeAlarm(dueAt = 0) {
@@ -14415,100 +14448,100 @@ function isSuppressedStaleCoordinatorResumeAlarm(alarm = null) {
     return coordinatorQueueResumeAlarmSuppressUntil > Date.now()
 }
 
-function isSuppressedStaleStoredWorkRepairAlarm(alarm = null) {
+function isSuppressedStaleCoordinatorReconcileAlarm(alarm = null) {
     const scheduledTime = getSchedulerAlarmScheduledTime(alarm)
-    if(storedWorkRepairDueAt && scheduledTime) {
-        return !isSchedulerAlarmScheduledForDueAt(scheduledTime, storedWorkRepairDueAt)
+    if(coordinatorReconcileDueAt && scheduledTime) {
+        return !isSchedulerAlarmScheduledForDueAt(scheduledTime, coordinatorReconcileDueAt)
     }
-    if(storedWorkRepairDueAt) return false
-    if(scheduledTime && storedWorkRepairClearedAlarmDueAt) {
-        return isSchedulerAlarmScheduledForDueAt(scheduledTime, storedWorkRepairClearedAlarmDueAt)
+    if(coordinatorReconcileDueAt) return false
+    if(scheduledTime && coordinatorReconcileClearedAlarmDueAt) {
+        return isSchedulerAlarmScheduledForDueAt(scheduledTime, coordinatorReconcileClearedAlarmDueAt)
     }
 
-    return storedWorkRepairAlarmSuppressUntil > Date.now()
+    return coordinatorReconcileAlarmSuppressUntil > Date.now()
 }
 
-function resetStoredWorkRepairBackoff(reason = 'repair-edge-trigger') {
-    if(!storedWorkRepairBackoffLevel && !storedWorkRepairBackoffUntil) return
-    storedWorkRepairBackoffLevel = 0
-    storedWorkRepairBackoffUntil = 0
-    incrementQueueWakeupMetric('repair.backoffReset')
+function resetCoordinatorReconcileBackoff(reason = 'reconcile-edge-trigger') {
+    if(!coordinatorReconcileBackoffLevel && !coordinatorReconcileBackoffUntil) return
+    coordinatorReconcileBackoffLevel = 0
+    coordinatorReconcileBackoffUntil = 0
+    incrementQueueWakeupMetric('reconcile.backoffReset')
 }
 
-function recordStoredWorkRepairNoopBackoff() {
-    storedWorkRepairBackoffLevel = Math.min(6, storedWorkRepairBackoffLevel + 1)
+function recordCoordinatorReconcileNoopBackoff() {
+    coordinatorReconcileBackoffLevel = Math.min(6, coordinatorReconcileBackoffLevel + 1)
     const delayMs = Math.min(
-        STORED_WORK_REPAIR_BACKOFF_MAX_MS,
-        STORED_WORK_REPAIR_BACKOFF_BASE_MS * (2 ** Math.max(0, storedWorkRepairBackoffLevel - 1))
+        COORDINATOR_RECONCILE_BACKOFF_MAX_MS,
+        COORDINATOR_RECONCILE_BACKOFF_BASE_MS * (2 ** Math.max(0, coordinatorReconcileBackoffLevel - 1))
     )
-    storedWorkRepairBackoffUntil = Date.now() + delayMs
-    recordQueueWakeupMetricMax('repair.backoffLevel.max', storedWorkRepairBackoffLevel)
-    recordQueueWakeupMetricMax('repair.backoffDelay.maxMs', delayMs)
+    coordinatorReconcileBackoffUntil = Date.now() + delayMs
+    recordQueueWakeupMetricMax('reconcile.backoffLevel.max', coordinatorReconcileBackoffLevel)
+    recordQueueWakeupMetricMax('reconcile.backoffDelay.maxMs', delayMs)
 }
 
-function hasStoredWorkRepairBackoff(now = Date.now()) {
-    return storedWorkRepairBackoffUntil > now
+function hasCoordinatorReconcileBackoff(now = Date.now()) {
+    return coordinatorReconcileBackoffUntil > now
 }
 
-function scheduleCoordinatorReconcile(delayMs = STORED_WORK_REPAIR_INTERVAL_MS, options = {}) {
+function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_MS, options = {}) {
     if(!quoraRuntimeActivated && options.allowBeforeQuora !== true) {
-        incrementQueueWakeupMetric('repair.deferredBeforeQuora')
+        incrementQueueWakeupMetric('reconcile.deferredBeforeQuora')
         return false
     }
 
-    const reason = `${options.reason || 'stored-work-repair'}`.trim()
-    const edgeTriggered = options.edgeTriggered === true || isCoordinatorRepairEdgeTriggerReason(reason)
+    const reason = `${options.reason || 'coordinator-reconcile'}`.trim()
+    const edgeTriggered = options.edgeTriggered === true || isCoordinatorReconcileEdgeTriggerReason(reason)
     if(edgeTriggered) {
-        incrementQueueWakeupMetric('repair.edgeTriggered')
-        resetStoredWorkRepairBackoff(reason)
+        incrementQueueWakeupMetric('reconcile.edgeTriggered')
+        resetCoordinatorReconcileBackoff(reason)
     }
 
     const now = Date.now()
-    const requestedDelayMs = Math.max(1000, Number.parseInt(delayMs, 10) || STORED_WORK_REPAIR_INTERVAL_MS)
+    const requestedDelayMs = Math.max(1000, Number.parseInt(delayMs, 10) || COORDINATOR_RECONCILE_INTERVAL_MS)
     let dueAt = now + requestedDelayMs
-    if(storedWorkRepairTimeout &&
-        storedWorkRepairDueAt &&
-        storedWorkRepairDueAt + SCHEDULER_ALARM_TIME_TOLERANCE_MS < now) {
-        clearTimeout(storedWorkRepairTimeout)
-        storedWorkRepairTimeout = null
-        storedWorkRepairDueAt = 0
-        incrementQueueWakeupMetric('repair.staleTimeoutCleared')
+    if(coordinatorReconcileTimeout &&
+        coordinatorReconcileDueAt &&
+        coordinatorReconcileDueAt + SCHEDULER_ALARM_TIME_TOLERANCE_MS < now) {
+        clearTimeout(coordinatorReconcileTimeout)
+        coordinatorReconcileTimeout = null
+        coordinatorReconcileDueAt = 0
+        incrementQueueWakeupMetric('reconcile.staleTimeoutCleared')
     }
-    if(!edgeTriggered && hasStoredWorkRepairBackoff(now) && dueAt < storedWorkRepairBackoffUntil) {
-        incrementQueueWakeupMetric('repair.suppressedBackoff')
-        dueAt = storedWorkRepairBackoffUntil
+    if(!edgeTriggered && hasCoordinatorReconcileBackoff(now) && dueAt < coordinatorReconcileBackoffUntil) {
+        incrementQueueWakeupMetric('reconcile.suppressedBackoff')
+        dueAt = coordinatorReconcileBackoffUntil
     }
 
-    if(storedWorkRepairTimeout && storedWorkRepairDueAt && storedWorkRepairDueAt <= dueAt) {
-        incrementQueueWakeupMetric('repair.coalesced')
+    if(coordinatorReconcileTimeout && coordinatorReconcileDueAt && coordinatorReconcileDueAt <= dueAt) {
+        incrementQueueWakeupMetric('reconcile.coalesced')
         return false
     }
 
-    if(storedWorkRepairTimeout) {
-        clearTimeout(storedWorkRepairTimeout)
-        storedWorkRepairTimeout = null
+    if(coordinatorReconcileTimeout) {
+        clearTimeout(coordinatorReconcileTimeout)
+        coordinatorReconcileTimeout = null
     }
-    storedWorkRepairDueAt = dueAt
-    incrementQueueWakeupMetric('repair.requested')
+    coordinatorReconcileDueAt = dueAt
+    incrementQueueWakeupMetric('reconcile.requested')
     incrementQueueWakeupMetric('reconcile.deadlineUpdated')
     recordQueueWakeupMetricMax('scheduler.pendingDeadlineMs', Math.max(0, dueAt - now))
 
     const scheduledDueAt = dueAt
-    storedWorkRepairTimeout = setTimeout(() => {
-        if(storedWorkRepairDueAt !== scheduledDueAt) {
-            incrementQueueWakeupMetric('repair.timeoutStale')
+    coordinatorReconcileTimeout = setTimeout(() => {
+        if(coordinatorReconcileDueAt !== scheduledDueAt) {
+            incrementQueueWakeupMetric('reconcile.timeoutStale')
             return
         }
-        storedWorkRepairTimeout = null
-        storedWorkRepairDueAt = 0
-        suppressStaleStoredWorkRepairAlarm(scheduledDueAt)
+        coordinatorReconcileTimeout = null
+        coordinatorReconcileDueAt = 0
+        suppressStaleCoordinatorReconcileAlarm(scheduledDueAt)
         void runScheduledCoordinatorReconcileTick('scheduled-coordinator-reconcile')
     }, Math.max(0, dueAt - Date.now()))
 
     if(browser.alarms?.create) {
         try {
-            const alarmResult = browser.alarms.create(COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME, {when: dueAt})
-            incrementQueueWakeupMetric('repair.alarmScheduled')
+            const alarmResult = browser.alarms.create(COORDINATOR_RECONCILE_ALARM_NAME, {when: dueAt})
+            incrementQueueWakeupMetric('reconcile.alarmScheduled')
             if(alarmResult?.catch) alarmResult.catch(() => null)
         }
         catch {}
@@ -14753,6 +14786,34 @@ async function runCoordinatorReconcileTick(reason = 'coordinator-reconcile', opt
     return coordinatorReconcilePromise
 }
 
+function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {}) {
+    if(!((after?.hasStoredWork && !after?.paused) || authority?.budgetExhausted === true)) {
+        return false
+    }
+
+    if(authority?.budgetExhausted === true) {
+        incrementQueueWakeupMetric('reconcile.rescheduled')
+        scheduleCoordinatorQueueResume(1000, 'reconcile-authority-budget-exhausted', {
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
+        return true
+    }
+
+    if(shouldContinueQueuedOnlyWorkWithFastExecutor(after)) {
+        scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'reconcile'}-queued-only-fast-resume`, {
+            awaitFill: options.awaitFill !== false,
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
+        return true
+    }
+
+    incrementQueueWakeupMetric('reconcile.rescheduled')
+    scheduleCoordinatorQueueResume(1000, 'reconcile-has-stored-work', {
+        allowBeforeQuora: options.allowBeforeQuora === true
+    })
+    return true
+}
+
 async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile', options = {}) {
     const cycle = startQueueWakeupMetricCycle('reconcile', 'runCoordinatorReconcileTick', reason, {
         direct: options.direct === true
@@ -14869,26 +14930,7 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
 
         if(changed) incrementQueueWakeupMetric('reconcile.changed')
         else incrementQueueWakeupMetric('reconcile.noop')
-        if((after?.hasStoredWork && !after?.paused) || authority?.budgetExhausted === true) {
-            if(authority?.budgetExhausted === true) {
-                incrementQueueWakeupMetric('reconcile.rescheduled')
-                scheduleCoordinatorQueueResume(1000, 'reconcile-authority-budget-exhausted', {
-                    allowBeforeQuora: options.allowBeforeQuora === true
-                })
-            }
-            else if(shouldContinueQueuedOnlyWorkWithFastExecutor(after)) {
-                scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'reconcile'}-queued-only-fast-resume`, {
-                    awaitFill: options.awaitFill !== false,
-                    allowBeforeQuora: options.allowBeforeQuora === true
-                })
-            }
-            else {
-                incrementQueueWakeupMetric('reconcile.rescheduled')
-                scheduleCoordinatorQueueResume(1000, 'reconcile-has-stored-work', {
-                    allowBeforeQuora: options.allowBeforeQuora === true
-                })
-            }
-        }
+        scheduleCoordinatorReconcileExecutorContinuation(after, authority, reason, options)
 
         finishQueueWakeupMetricCycle(cycle, changed ? 'state-changed' : 'no-op', result?.reason || reason, {
             prunedRuntime,
@@ -15018,27 +15060,27 @@ async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconc
         const result = await runCoordinatorReconcileTick(reason, {
             allowBeforeQuora: true
         })
-        const repair = result?.repair || {}
-        if(repair.queueChanged || repair.repaired) incrementQueueWakeupMetric('repair.changed.queue')
-        if(repair.runsChanged) incrementQueueWakeupMetric('repair.changed.runs')
-        if(repair.progressChanged) incrementQueueWakeupMetric('repair.changed.progress')
-        if(repair.pendingPostsChanged) incrementQueueWakeupMetric('repair.changed.pendingPosts')
-        const repairChanged = repair.queueChanged || repair.repaired || repair.runsChanged || repair.progressChanged || repair.pendingPostsChanged
-        if(repairChanged) {
-            resetStoredWorkRepairBackoff('repair-changed')
+        const reconciliation = result?.repair || {}
+        if(reconciliation.queueChanged || reconciliation.repaired) incrementQueueWakeupMetric('reconcile.changed.queue')
+        if(reconciliation.runsChanged) incrementQueueWakeupMetric('reconcile.changed.runs')
+        if(reconciliation.progressChanged) incrementQueueWakeupMetric('reconcile.changed.progress')
+        if(reconciliation.pendingPostsChanged) incrementQueueWakeupMetric('reconcile.changed.pendingPosts')
+        const reconcileChanged = reconciliation.queueChanged || reconciliation.repaired || reconciliation.runsChanged || reconciliation.progressChanged || reconciliation.pendingPostsChanged
+        if(reconcileChanged) {
+            resetCoordinatorReconcileBackoff('reconcile-changed')
         }
         else {
-            incrementQueueWakeupMetric('repair.noop')
-            recordStoredWorkRepairNoopBackoff()
+            incrementQueueWakeupMetric('reconcile.noop')
+            recordCoordinatorReconcileNoopBackoff()
         }
 
         if(!result?.paused && shouldContinueQueuedOnlyWorkWithFastExecutor(result?.reconcile?.after)) {
-            scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'repair'}-queued-only-fast-resume`, {
+            scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'reconcile'}-queued-only-fast-resume`, {
                 allowBeforeQuora: true
             })
         }
         else if(!result?.paused && result?.reconcile?.after?.hasStoredWork) {
-            scheduleCoordinatorQueueResume(1000, 'repair-tick-has-stored-work', {
+            scheduleCoordinatorQueueResume(1000, 'reconcile-tick-has-stored-work', {
                 allowBeforeQuora: true
             })
         }
@@ -15048,10 +15090,10 @@ async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconc
         })
     }
     catch(error) {
-        incrementQueueWakeupMetric(/timed out/i.test(error?.message || '') ? 'repair.timeout' : 'repair.noop')
-        finishQueueWakeupMetricCycle(cycle, 'timed-out', error?.message || 'repair-failed')
-        scheduleCoordinatorReconcile(STORED_WORK_REPAIR_INTERVAL_MS, {
-            reason: 'repair-tick-error',
+        incrementQueueWakeupMetric(/timed out/i.test(error?.message || '') ? 'reconcile.timeout' : 'reconcile.noop')
+        finishQueueWakeupMetricCycle(cycle, 'timed-out', error?.message || 'reconcile-failed')
+        scheduleCoordinatorReconcile(COORDINATOR_RECONCILE_INTERVAL_MS, {
+            reason: 'reconcile-tick-error',
             edgeTriggered: true
         })
     }
@@ -19896,11 +19938,17 @@ async function createOwnedTab(action = {}) {
 
 async function createQueuedExecutorBrowserTab(options = {}, label = 'queued executor tab create') {
     let timedOut = false
+    let settled = false
     let timeoutId = null
     const timeoutMs = QUEUED_TAB_CREATE_TIMEOUT_MS
     const createPromise = Promise.resolve()
         .then(() => browser.tabs.create(options))
         .then(tab => {
+            settled = true
+            if(timeoutId && !timedOut) {
+                clearTimeout(timeoutId)
+                timeoutId = null
+            }
             if(timedOut && tab?.id) {
                 incrementQueueWakeupMetric('pump.changed.closedLateCreatedTab')
                 void browser.tabs.remove(tab.id).catch(() => null)
@@ -19915,6 +19963,7 @@ async function createQueuedExecutorBrowserTab(options = {}, label = 'queued exec
         })
     const timeoutPromise = new Promise((resolve, reject) => {
         timeoutId = setTimeout(() => {
+            if(settled) return
             timedOut = true
             incrementQueueWakeupMetric('pump.noop.tabCreateTimedOut')
             reject(new Error(`${label} timed out after ${timeoutMs}ms`))
@@ -19927,6 +19976,7 @@ async function createQueuedExecutorBrowserTab(options = {}, label = 'queued exec
             timeoutPromise
         ])
         if(!tab?.id) throw new Error(`${label} did not create a tab`)
+        await browser.tabs.get(tab.id)
         return tab
     }
     finally {
@@ -21810,7 +21860,7 @@ async function shouldImmediatelyReconcileMissingPersistedActiveTab(item = null, 
     return true
 }
 
-async function getMissingActiveCoordinatorRepairDecision(
+async function getMissingActiveCoordinatorReconcileDecision(
     item = null,
     record = null,
     itemKey = '',
@@ -25612,8 +25662,8 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
                 ...(plan.activeTransitionDetails || {}),
                 activeTransitionError: 'queued tab missing after durable active transition'
             }).catch(() => false)
+            const detached = detachQueuedTabRuntimeState(tab.id, 'active-transition-tab-missing')
             if(rolledBack) {
-                const detached = detachQueuedTabRuntimeState(tab.id, 'active-transition-tab-missing')
                 void releaseQueuedTab(tab.id, {
                     runtimeDetached: true,
                     metadata: detached.metadata,
@@ -25629,13 +25679,29 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
                     missingAfterDurableActive: true
                 }
             }
-            setQueuedTabMetadata(tab.id, {
-                activeTransitionConfirmTabMissingAt: Date.now(),
-                activeTransitionConfirmTabMissingReason: 'active-transition-post-confirm'
+            void releaseQueuedTab(tab.id, {
+                runtimeDetached: true,
+                metadata: detached.metadata,
+                wasActive: detached.wasActive,
+                foregroundLeaseReleased: detached.foregroundLeaseReleased
             })
+            incrementQueueWakeupMetric('reconcile.changed.runtimeDetached')
             scheduleCoordinatorQueueResume(1000, 'active-transition-post-confirm-tab-missing', {
                 allowBeforeQuora: true
             })
+            scheduleCoordinatorReconcile(1000, {
+                reason: 'active-transition-post-confirm-tab-missing',
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            return {
+                activeTransitionAccepted,
+                activeTransitionError,
+                activeTransitionContinued,
+                keepOpen: false,
+                rolledBack: false,
+                missingAfterDurableActive: true
+            }
         }
         else if(!liveTabStatus.tab) {
             setQueuedTabMetadata(tab.id, {
@@ -25831,6 +25897,37 @@ async function fillQueuedTabsOnce(options = {}) {
                 activeTransitionContinued: activeTransition.activeTransitionContinued
             }) : null
             if(options.returnAfterDurableActive === true) {
+                const fastOpenTabStatus = await getQueuedExecutorTabStatusWithTimeout(tab.id, 'queued-tab-open-fast-post-transition-confirm')
+                if(!fastOpenTabStatus.tab && fastOpenTabStatus.missing) {
+                    const detached = detachQueuedTabRuntimeState(tab.id, 'queued-tab-open-fast-tab-missing')
+                    void releaseQueuedTab(tab.id, {
+                        runtimeDetached: true,
+                        metadata: detached.metadata,
+                        wasActive: detached.wasActive,
+                        foregroundLeaseReleased: detached.foregroundLeaseReleased
+                    })
+                    scheduleCoordinatorQueueResume(1000, 'queued-tab-open-fast-tab-missing', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: 'queued-tab-open-fast-tab-missing',
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    continue
+                }
+                if(!fastOpenTabStatus.tab) {
+                    setQueuedTabMetadata(tab.id, {
+                        queuedTabOpenFastPostTransitionLookupFailedAt: Date.now(),
+                        queuedTabOpenFastPostTransitionLookupReason: fastOpenTabStatus.timedOut
+                            ? 'queued-tab-open-fast-post-transition-timeout'
+                            : 'queued-tab-open-fast-post-transition-unknown',
+                        queuedTabOpenFastPostTransitionLookupError: fastOpenTabStatus.error || ''
+                    })
+                    scheduleCoordinatorQueueResume(1000, 'queued-tab-open-fast-lookup-deferred', {
+                        allowBeforeQuora: true
+                    })
+                }
                 if(openPlan.profileHref && openedProgressPatch) {
                     void recordCoordinatorJobProgress(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})
                         .catch(error => {
@@ -25992,22 +26089,22 @@ if(browser.alarms?.onAlarm) {
             return runScheduledCoordinatorQueueResume('resume-alarm', {allowBeforeQuora}).catch(() => null)
         }
 
-        if(alarm?.name === COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME) {
-            if(isSuppressedStaleStoredWorkRepairAlarm(alarm)) {
-                incrementQueueWakeupMetric('repair.alarmStale')
+        if(alarm?.name === COORDINATOR_RECONCILE_ALARM_NAME) {
+            if(isSuppressedStaleCoordinatorReconcileAlarm(alarm)) {
+                incrementQueueWakeupMetric('reconcile.alarmStale')
                 return null
             }
-            const allowBeforeQuora = await shouldAllowStoredWorkBeforeQuora('repair-alarm-stored-work')
+            const allowBeforeQuora = await shouldAllowStoredWorkBeforeQuora('reconcile-alarm-stored-work')
             if(!allowBeforeQuora &&
-                !await ensureQuoraRuntimeActivatedForScheduler('repair-alarm-existing-quora-session')) {
-                void browser.alarms?.clear?.(COORDINATOR_STORED_WORK_REPAIR_ALARM_NAME).catch(() => false)
+                !await ensureQuoraRuntimeActivatedForScheduler('reconcile-alarm-existing-quora-session')) {
+                void browser.alarms?.clear?.(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false)
                 return null
             }
-            incrementQueueWakeupMetric('repair.alarmFired')
-            if(storedWorkRepairTimeout) {
-                clearTimeout(storedWorkRepairTimeout)
-                storedWorkRepairTimeout = null
-                storedWorkRepairDueAt = 0
+            incrementQueueWakeupMetric('reconcile.alarmFired')
+            if(coordinatorReconcileTimeout) {
+                clearTimeout(coordinatorReconcileTimeout)
+                coordinatorReconcileTimeout = null
+                coordinatorReconcileDueAt = 0
             }
             return runScheduledCoordinatorReconcileTick('coordinator-reconcile-alarm').catch(() => null)
         }
