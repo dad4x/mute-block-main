@@ -14855,7 +14855,6 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
             result = {
                 recovered: true,
                 reason: 'authority-reconcile-changed',
-                repair: {},
                 hasWork: true,
                 paused: false
             }
@@ -14894,7 +14893,7 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
             (Number.parseInt(after?.activeQueuedTabs, 10) || 0) <= 0 &&
             (Number.parseInt(after?.queuedTabActions, 10) || 0) <= 0 &&
             (Number.parseInt(after?.pendingTabActions, 10) || 0) <= 0) {
-            const continuation = await runCoordinatorQueueExecutorFastPath(`${reason || 'reconcile'}-post-active-repair`, {
+            const continuation = await runCoordinatorQueueExecutorFastPath(`${reason || 'reconcile'}-post-active-reconcile`, {
                 awaitFill: options.awaitFill !== false,
                 returnAfterDurableActive: true,
                 allowBeforeQuora: options.allowBeforeQuora === true,
@@ -14903,7 +14902,7 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
             if(continuation?.changed === true || (continuation?.queued || 0) > 0 || (continuation?.adopted || 0) > 0) {
                 executor = {
                     ...(continuation || {}),
-                    reason: continuation?.reason || 'post-active-repair-fast-executor'
+                    reason: continuation?.reason || 'post-active-reconcile-fast-executor'
                 }
                 after = await observeCoordinatorReconcileSnapshot(reason, {
                     rowBudget: options.rowBudget
@@ -14911,16 +14910,10 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
             }
         }
 
-        const repair = result?.repair || {}
         const changed = result?.recovered === true ||
             prunedRuntime > 0 ||
             authority?.changed === true ||
             executor?.changed === true ||
-            repair.queueChanged ||
-            repair.repaired ||
-            repair.runsChanged ||
-            repair.progressChanged ||
-            repair.pendingPostsChanged ||
             before?.durableActiveRows !== after?.durableActiveRows ||
             before?.durableQueuedRows !== after?.durableQueuedRows ||
             before?.durableTerminalRows !== after?.durableTerminalRows ||
@@ -14993,11 +14986,10 @@ async function recoverStoredCoordinatorWork(reason = 'stored-work-recovery', opt
     return runCoordinatorReconcileTick(reason, options)
 }
 
-function makeStoredWorkRecoveryResumeOwnedResult(reason = 'stored-work-recovery', repair = {}, hasWork = false, paused = false) {
+function makeStoredWorkRecoveryResumeOwnedResult(reason = 'stored-work-recovery', hasWork = false, paused = false) {
     return {
         recovered: false,
         reason,
-        repair,
         resume: {skipped: true, reason: 'resume-owned-by-reconcile'},
         hasWork,
         paused
@@ -15012,10 +15004,9 @@ async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery',
     let queue = currentAuthorityState.queue
     let hasWork = hasStoredCoordinatorWork(queue)
     let paused = !!currentAuthorityState.stored?.[COORDINATOR_PAUSED_KEY]
-    const repair = {skipped: true, reason: 'queue-authority-only'}
 
     if(hasWork && !paused) {
-        return makeStoredWorkRecoveryResumeOwnedResult(reason, repair, hasWork, paused)
+        return makeStoredWorkRecoveryResumeOwnedResult(reason, hasWork, paused)
     }
 
     if(!options.skipStoredWorkCheck && !hasWork) {
@@ -15028,7 +15019,7 @@ async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery',
         paused = !!currentAuthorityState.stored?.[COORDINATOR_PAUSED_KEY]
 
         if(!hasWork) {
-            return {recovered: false, reason: 'no-stored-work', repair}
+            return {recovered: false, reason: 'no-stored-work'}
         }
     }
 
@@ -15043,14 +15034,13 @@ async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery',
     if(!hasWork || paused) {
         return {
             recovered: false,
-            reason: paused ? 'coordinator-paused' : 'no-stored-work-after-repair',
-            repair,
+            reason: paused ? 'coordinator-paused' : 'no-stored-work-after-reconcile',
             hasWork,
             paused
         }
     }
 
-    return makeStoredWorkRecoveryResumeOwnedResult(reason, repair, hasWork, paused)
+    return makeStoredWorkRecoveryResumeOwnedResult(reason, hasWork, paused)
 }
 
 async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconcile-tick') {
@@ -15059,12 +15049,30 @@ async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconc
         const result = await runCoordinatorReconcileTick(reason, {
             allowBeforeQuora: true
         })
-        const reconciliation = result?.repair || {}
-        if(reconciliation.queueChanged || reconciliation.repaired) incrementQueueWakeupMetric('reconcile.changed.queue')
-        if(reconciliation.runsChanged) incrementQueueWakeupMetric('reconcile.changed.runs')
-        if(reconciliation.progressChanged) incrementQueueWakeupMetric('reconcile.changed.progress')
-        if(reconciliation.pendingPostsChanged) incrementQueueWakeupMetric('reconcile.changed.pendingPosts')
-        const reconcileChanged = reconciliation.queueChanged || reconciliation.repaired || reconciliation.runsChanged || reconciliation.progressChanged || reconciliation.pendingPostsChanged
+        const reconcile = result?.reconcile || {}
+        const authority = reconcile.authority || {}
+        const executor = reconcile.executor || {}
+        const before = reconcile.before || {}
+        const after = reconcile.after || {}
+        const queueChanged = authority?.changed === true ||
+            (authority?.actions || 0) > 0 ||
+            before?.durableActiveRows !== after?.durableActiveRows ||
+            before?.durableQueuedRows !== after?.durableQueuedRows ||
+            before?.durableTerminalRows !== after?.durableTerminalRows ||
+            before?.activeQueuedTabs !== after?.activeQueuedTabs ||
+            before?.queuedTabActions !== after?.queuedTabActions
+        const executorChanged = executor?.changed === true ||
+            (executor?.queued || 0) > 0 ||
+            (executor?.pending || 0) > 0 ||
+            (executor?.adopted || 0) > 0
+        const runtimePruned = (reconcile?.prunedRuntime || 0) > 0
+        const reconcileChanged = result?.recovered === true ||
+            reconcile?.changed === true ||
+            queueChanged ||
+            executorChanged ||
+            runtimePruned
+        if(queueChanged) incrementQueueWakeupMetric('reconcile.changed.queue')
+        if(executorChanged) incrementQueueWakeupMetric('reconcile.changed.executor')
         if(reconcileChanged) {
             resetCoordinatorReconcileBackoff('reconcile-changed')
         }
@@ -15083,9 +15091,13 @@ async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconc
                 allowBeforeQuora: true
             })
         }
-        finishQueueWakeupMetricCycle(cycle, result?.recovered ? 'state-changed' : 'no-op', result?.reason || '', {
+        finishQueueWakeupMetricCycle(cycle, reconcileChanged ? 'state-changed' : 'no-op', result?.reason || '', {
             hasWork: result?.hasWork === true,
-            paused: result?.paused === true
+            paused: result?.paused === true,
+            reconcileChanged,
+            authorityActions: authority?.actions || 0,
+            executorQueued: executor?.queued || 0,
+            runtimePruned: reconcile?.prunedRuntime || 0
         })
     }
     catch(error) {
