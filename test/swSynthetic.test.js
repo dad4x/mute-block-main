@@ -8077,7 +8077,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     }
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-authority'
@@ -8098,7 +8098,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-non-profile-landing')
+    assert.equal(walRecords[0].operationKind, 'terminalize-non-profile-landing')
 
     const restarted = loadServiceWorkerHarness({
         now: 421500,
@@ -8144,7 +8144,7 @@ test('reconcile does not resume WAL-terminal row from stale raw queue snapshot',
     })
 
     const terminalized = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-reconcile'
@@ -8207,7 +8207,7 @@ test('preplanned queued action revalidates WAL-terminal authority before opening
     })
 
     const terminalized = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-preplanned-wal-terminal'
@@ -8288,7 +8288,7 @@ test('non-profile landing terminalization rejects stale attempt before authority
     })
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: 'stale-attempt',
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-stale'
@@ -8343,7 +8343,7 @@ test('non-profile landing terminalization append failure leaves row active', asy
     }
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-append-failure'
@@ -8398,7 +8398,7 @@ test('non-profile landing projection failure does not poison WAL terminalization
     }
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-projection-failure'
@@ -8467,7 +8467,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
     }
 
     const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'repair',
+        reason: 'reconcile',
         expectedAttemptId: attemptId,
         expectedAttemptNumber: 1,
         reconcileReason: 'synthetic-non-profile-derived-failure'
@@ -8480,7 +8480,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
-    assert.equal(sw.state().queueWakeupCounters['repair.nonProfileLanding.derivedSaveFailed'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['reconcile.nonProfileLanding.derivedSaveFailed'] || 0, 1)
     assert.ok(
         sw.state().hasCoordinatorReconcileTimeout ||
             (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
@@ -8552,7 +8552,7 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
         getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-key-only-terminalize')
+    assert.equal(walRecords[0].operationKind, 'terminalize-key-only')
 
     const restarted = loadServiceWorkerHarness({
         now: 426500,
@@ -9918,7 +9918,7 @@ test('key-only terminalization derived failure does not poison authority termina
         false
     )
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'failed')
-    assert.equal(sw.state().queueWakeupCounters['repair.keyOnlyTerminalize.derivedSaveFailed'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['reconcile.keyOnlyTerminalize.derivedSaveFailed'] || 0, 1)
     assert.ok(
         sw.state().hasCoordinatorReconcileTimeout ||
             (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
@@ -20742,7 +20742,7 @@ test('authority reconcile terminalizes active row from same-attempt terminal pro
         walStore.meta.activeCheckpoint
     )
     assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'repair-terminal-progress-active')
+    assert.equal(walRecords[0].operationKind, 'terminal-progress-active')
 
     const restarted = loadServiceWorkerHarness({
         now: 3965,

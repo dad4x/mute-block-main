@@ -169,17 +169,17 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'direct-progress',
     'row-event-progress-milestone',
     'terminal-settlement',
-    'repair-terminal-progress-active',
+    'terminal-progress-active',
     'action-lease-heartbeat',
     'action-lease-release',
-    'repair-non-profile-landing',
-    'repair-key-only-terminalize',
+    'terminalize-non-profile-landing',
+    'terminalize-key-only',
     'current-work-item-cancel',
     'stale-retry',
     'terminalize-exhausted-rolled-back-queued',
     'rollback-active-transition',
     'reconcile-active-without-actor',
-    'repair-profile-redirect-mismatch',
+    'terminalize-profile-redirect-mismatch',
     'active-transition',
     'action-lease-request',
     'action-lease-tab-release',
@@ -2764,7 +2764,7 @@ async function terminalizeDurableActiveCoordinatorItemFromTerminalProgress(itemK
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'terminalizeActiveFromTerminalProgress',
-            reason: 'repair',
+            reason: 'reconcile',
             itemKey,
             expectedItem,
             record,
@@ -2774,7 +2774,7 @@ async function terminalizeDurableActiveCoordinatorItemFromTerminalProgress(itemK
         })
     }, {
         timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
-        reason: 'repair-terminal-progress-active'
+        reason: 'terminal-progress-active'
     })
 }
 
@@ -2785,7 +2785,7 @@ async function terminalizeActiveCoordinatorNonProfileLanding(itemKey = '', landi
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'terminalizeActiveNonProfileLanding',
-            reason: options.reason || 'repair',
+            reason: options.reason || 'reconcile',
             itemKey: key,
             landingUrl,
             expectedAttemptId: options.expectedAttemptId || '',
@@ -2806,7 +2806,7 @@ async function terminalizeActiveCoordinatorProfileRedirectMismatch(itemKey = '',
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'terminalizeActiveProfileRedirectMismatch',
-            reason: options.reason || 'repair',
+            reason: options.reason || 'reconcile',
             itemKey: key,
             requestedProfileHref,
             resolvedProfileHref,
@@ -2816,13 +2816,13 @@ async function terminalizeActiveCoordinatorProfileRedirectMismatch(itemKey = '',
         })
     }, {
         timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
-        reason: 'repair-profile-redirect-mismatch'
+        reason: 'terminalize-profile-redirect-mismatch'
     })
 }
 
 async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair' && snapshotReason !== 'ordinaryMutation') {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'reconcile')
+    if(snapshotReason !== 'reconcile' && snapshotReason !== 'ordinaryMutation') {
         return {changed: false, reason: 'invalid-terminalize-reason'}
     }
 
@@ -2830,7 +2830,7 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
     if(!itemKey) return {changed: false, reason: 'missing-item-key'}
 
     const state = await loadCoordinatorQueueRunsProgressProjection({
-        metricPath: 'repair.nonProfileLanding.load'
+        metricPath: 'reconcile.nonProfileLanding.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
@@ -2865,12 +2865,12 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
     })
 
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'repair-non-profile-landing',
+        operationKind: 'terminalize-non-profile-landing',
         rowKey: itemKey,
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.nonProfileLanding.save',
+        metricPath: 'reconcile.nonProfileLanding.save',
         currentAuthorityState,
         mutate(currentItem, context) {
             if(!isActiveCoordinatorStatus(currentItem?.status)) {
@@ -2945,14 +2945,14 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
         try {
             progressProjectionSaved = progressChanged
                 ? await saveProfileNukeProgressRowProjection({[href]: progress[href]}, {
-                    metricPath: 'repair.nonProfileLanding.progressProjection'
+                    metricPath: 'reconcile.nonProfileLanding.progressProjection'
                 })
                 : {saved: true, rows: 0}
         }
         catch(error) {
             progressProjectionSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-non-profile-landing-progress-projection-save-failed',
+                'terminalize-non-profile-landing-progress-projection-save-failed',
                 error?.message || 'Non-profile landing progress projection save failed'
             )
         }
@@ -2968,23 +2968,23 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
                     queue: false,
                     runs: true,
                     progress: false,
-                    reason: 'repair',
-                    queueOperation: 'repair-non-profile-landing-derived',
+                    reason: 'reconcile',
+                    queueOperation: 'terminalize-non-profile-landing-derived',
                     queueChangedRows: 0
                 }) && derivedSaved
             }
             catch(error) {
                 derivedSaved = false
                 recordCoordinatorDiagnosticEvent(
-                    'repair-non-profile-landing-derived-save-failed',
+                    'terminalize-non-profile-landing-derived-save-failed',
                     error?.message || 'Non-profile landing derived save failed'
                 )
             }
         }
         if(derivedSaved === false) {
-            incrementQueueWakeupMetric('repair.nonProfileLanding.derivedSaveFailed')
+            incrementQueueWakeupMetric('reconcile.nonProfileLanding.derivedSaveFailed')
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-non-profile-landing-derived-save-failed',
+                reason: 'terminalize-non-profile-landing-derived-save-failed',
                 edgeTriggered: true
             })
         }
@@ -3002,8 +3002,8 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
 }
 
 async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair' && snapshotReason !== 'ordinaryMutation') {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'reconcile')
+    if(snapshotReason !== 'reconcile' && snapshotReason !== 'ordinaryMutation') {
         return {changed: false, reason: 'invalid-profile-redirect-reason'}
     }
 
@@ -3017,7 +3017,7 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
     }
 
     const state = await loadCoordinatorQueueRunsProgressProjection({
-        metricPath: 'repair.profileRedirectMismatch.load'
+        metricPath: 'reconcile.profileRedirectMismatch.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
@@ -3051,12 +3051,12 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
     const currentCoordinatorKey = getCoordinatorItemQueueKey(current, itemKey)
 
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'repair-profile-redirect-mismatch',
+        operationKind: 'terminalize-profile-redirect-mismatch',
         rowKey: itemKey,
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.profileRedirectMismatch.save',
+        metricPath: 'reconcile.profileRedirectMismatch.save',
         projectionPayload: 'queueViewOnly',
         currentAuthorityState: null,
         mutate(currentItem, context) {
@@ -3124,20 +3124,20 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
         }
         try {
             progressProjectionSaved = await saveProfileNukeProgressRowProjection({[href]: terminalRecord}, {
-                metricPath: 'repair.profileRedirectMismatch.progressProjection'
+                metricPath: 'reconcile.profileRedirectMismatch.progressProjection'
             })
         }
         catch(error) {
             progressProjectionSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-profile-redirect-mismatch-progress-projection-save-failed',
+                'terminalize-profile-redirect-mismatch-progress-projection-save-failed',
                 error?.message || 'Profile redirect mismatch progress projection save failed'
             )
         }
         if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
-            incrementQueueWakeupMetric('repair.profileRedirectMismatch.progressProjectionFailed')
+            incrementQueueWakeupMetric('reconcile.profileRedirectMismatch.progressProjectionFailed')
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-profile-redirect-mismatch-progress-projection-failed',
+                reason: 'terminalize-profile-redirect-mismatch-progress-projection-failed',
                 edgeTriggered: true
             })
         }
@@ -3163,22 +3163,22 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
                 queue: false,
                 runs: true,
                 progress: false,
-                reason: 'repair',
-                queueOperation: 'repair-profile-redirect-mismatch-derived',
+                reason: 'reconcile',
+                queueOperation: 'terminalize-profile-redirect-mismatch-derived',
                 queueChangedRows: 0
             })
         }
         catch(error) {
             derivedSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-profile-redirect-mismatch-derived-save-failed',
+                'terminalize-profile-redirect-mismatch-derived-save-failed',
                 error?.message || 'Profile redirect mismatch derived save failed'
             )
         }
         if(derivedSaved === false) {
-            incrementQueueWakeupMetric('repair.profileRedirectMismatch.derivedSaveFailed')
+            incrementQueueWakeupMetric('reconcile.profileRedirectMismatch.derivedSaveFailed')
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-profile-redirect-mismatch-derived-save-failed',
+                reason: 'terminalize-profile-redirect-mismatch-derived-save-failed',
                 edgeTriggered: true
             })
         }
@@ -3396,8 +3396,8 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
 }
 
 async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair') return {changed: false, reason: 'invalid-terminal-progress-repair-reason'}
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'reconcile')
+    if(snapshotReason !== 'reconcile') return {changed: false, reason: 'invalid-terminal-progress-reconcile-reason'}
 
     const itemKey = `${operation.itemKey || ''}`.trim()
     const expectedItem = operation.expectedItem || null
@@ -3419,11 +3419,11 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
             runs: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(operation.currentAuthorityState.runs || {})),
             progress: cloneCoordinatorAuthorityValue(operation.currentAuthorityState.progress || {})
         }
-        incrementQueueWakeupMetric('repair.terminalProgressActive.usedResidentAuthority')
+        incrementQueueWakeupMetric('reconcile.terminalProgressActive.usedResidentAuthority')
     }
     if(!currentAuthorityState) {
         currentAuthorityState = await loadCoordinatorQueueRunsProgressProjection({
-            metricPath: 'repair.terminalProgressActive.load'
+            metricPath: 'reconcile.terminalProgressActive.load'
         })
     }
 
@@ -3454,12 +3454,12 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
     if(!isTerminalCoordinatorStatus(nextItem.status)) return {changed: false, reason: 'terminal-transition-rejected'}
 
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'repair-terminal-progress-active',
+        operationKind: 'terminal-progress-active',
         rowKey: itemKey,
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.terminalProgressActive.save',
+        metricPath: 'reconcile.terminalProgressActive.save',
         deferProjectionSave: true,
         projectionRepairDelayMs: 30000,
         currentAuthorityState: null,
@@ -3517,22 +3517,22 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
                 queue: false,
                 runs: true,
                 progress: false,
-                reason: 'repair',
-                queueOperation: 'repair-terminal-progress-active-derived',
+                reason: 'reconcile',
+                queueOperation: 'terminal-progress-active-derived',
                 queueChangedRows: 0
             })
         }
         catch(error) {
             derivedSaved = false
             recordCoordinatorDiagnosticEvent(
-                'repair-terminal-progress-active-derived-save-failed',
-                error?.message || 'Active terminal progress repair derived save failed'
+                'terminal-progress-active-derived-save-failed',
+                error?.message || 'Active terminal progress reconcile derived save failed'
             )
         }
         if(derivedSaved === false) {
-            incrementQueueWakeupMetric('repair.terminalProgressActive.derivedSaveFailed')
+            incrementQueueWakeupMetric('reconcile.terminalProgressActive.derivedSaveFailed')
             scheduleCoordinatorReconcile(1000, {
-                reason: 'repair-terminal-progress-active-derived-save-failed',
+                reason: 'terminal-progress-active-derived-save-failed',
                 edgeTriggered: true
             })
         }
@@ -3812,7 +3812,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
         const nonProfileLandingUrl = record?.lastUrl || record?.errorPageUrl || ''
         if(shouldTerminalizeCoordinatorNonProfileLanding(item, record, itemKey, nonProfileLandingUrl)) {
             const result = await terminalizeActiveCoordinatorNonProfileLanding(itemKey, nonProfileLandingUrl, {
-                reason: 'repair',
+                reason: 'reconcile',
                 expectedAttemptId: getAttemptIdFromValue(item),
                 expectedAttemptNumber: getAttemptNumberFromValue(item),
                 reconcileReason: reason
@@ -14332,7 +14332,7 @@ async function terminalizeCoordinatorKeyOnlyItem(coordinatorKey = '', options = 
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'terminalizeKeyOnlyCoordinatorItem',
-            reason: 'repair',
+            reason: 'reconcile',
             coordinatorKey: key,
             terminalOptions: options
         })
@@ -18568,8 +18568,8 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
 }
 
 async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair') return {changed: false, reason: 'invalid-terminalize-reason'}
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'reconcile')
+    if(snapshotReason !== 'reconcile') return {changed: false, reason: 'invalid-terminalize-reason'}
 
     const key = `${operation.coordinatorKey || ''}`.trim()
     if(!key) return {changed: false, reason: 'missing-coordinator-key'}
@@ -18578,7 +18578,7 @@ async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {}) {
     const expectedAttemptId = normalizeAttemptId(options.expectedAttemptId || operation.expectedAttemptId || '')
     const expectedAttemptNumber = Number.parseInt(options.expectedAttemptNumber || operation.expectedAttemptNumber, 10) || 0
     const state = await loadCoordinatorQueueRunsEventsProjection({
-        metricPath: 'repair.keyOnlyTerminalize.load'
+        metricPath: 'reconcile.keyOnlyTerminalize.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
@@ -18609,12 +18609,12 @@ async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {}) {
     })
 
     const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'repair-key-only-terminalize',
+        operationKind: 'terminalize-key-only',
         rowKey: itemKey,
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.keyOnlyTerminalize.save',
+        metricPath: 'reconcile.keyOnlyTerminalize.save',
         currentAuthorityState,
         mutate(currentItem, context) {
             if(!currentItem || getCoordinatorItemHref(currentItem) || isTerminalCoordinatorStatus(currentItem.status)) {
@@ -18667,22 +18667,22 @@ async function mutateCoordinatorKeyOnlyItemTerminalize(operation = {}) {
             queue: false,
             runs: runsChanged,
             events: true,
-            reason: 'repair',
-            queueOperation: 'repair-key-only-terminalize-derived',
+            reason: 'reconcile',
+            queueOperation: 'terminalize-key-only-derived',
             queueChangedRows: 0
         })
     }
     catch(error) {
         derivedSaved = false
         recordCoordinatorDiagnosticEvent(
-            'repair-key-only-terminalize-derived-save-failed',
-            error?.message || 'Key-only terminal repair derived save failed'
+            'terminalize-key-only-derived-save-failed',
+            error?.message || 'Key-only terminal reconcile derived save failed'
         )
     }
     if(derivedSaved === false) {
-        incrementQueueWakeupMetric('repair.keyOnlyTerminalize.derivedSaveFailed')
+        incrementQueueWakeupMetric('reconcile.keyOnlyTerminalize.derivedSaveFailed')
         scheduleCoordinatorReconcile(1000, {
-            reason: 'repair-key-only-terminalize-derived-save-failed',
+            reason: 'terminalize-key-only-derived-save-failed',
             edgeTriggered: true
         })
     }
@@ -26223,7 +26223,7 @@ async function terminalizeQueuedTabNonProfileLandingFromMetadata(tabId, expected
         metadata.coordinatorKey || metadata.profileHref,
         currentLandingUrl,
         {
-            reason: 'repair',
+            reason: 'reconcile',
             expectedAttemptId: getAttemptIdFromValue(metadata),
             expectedAttemptNumber: getAttemptNumberFromValue(metadata),
             reconcileReason: 'tab-non-profile-landing'
@@ -26264,7 +26264,7 @@ async function terminalizeQueuedTabProfileRedirectMismatchFromMetadata(tabId, ex
         requestedHref,
         resolvedProfileHref,
         {
-            reason: 'repair',
+            reason: 'reconcile',
             expectedAttemptId: getAttemptIdFromValue(metadata),
             expectedAttemptNumber: getAttemptNumberFromValue(metadata),
             reconcileReason: 'tab-profile-redirect-mismatch'
