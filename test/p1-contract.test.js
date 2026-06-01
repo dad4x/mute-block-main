@@ -485,7 +485,7 @@ test('stale tab close cannot fail a requeued Current Work row', () => {
     assert.match(guardBody, /isActiveCoordinatorStatus\(item\?\.status \|\| ''\) && itemTabId === senderTabId/)
 })
 
-test('repair preserves expected live tabs for resume adoption', () => {
+test('reconcile preserves expected live tabs for resume adoption', () => {
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(
         source,
@@ -576,7 +576,7 @@ test('legacy progress mirror sync bridge is deleted', () => {
     assert.doesNotMatch(confirmBody, /PROFILE_NUKE_PROGRESS_KEY/)
 })
 
-test('stale active repair ignores queued mirror records as liveness', () => {
+test('stale active reconcile ignores queued mirror records as liveness', () => {
     const body = extractFunction(
         readRepoFile('shared/js/sw.js'),
         'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
@@ -586,7 +586,7 @@ test('stale active repair ignores queued mirror records as liveness', () => {
     assert.match(body, /const staleRecord = recordIsActiveEvidence \? record : null/)
 })
 
-test('stale active repair does not let timed out tab lookup wedge actorless rows', () => {
+test('stale active reconcile does not let timed out tab lookup wedge actorless rows', () => {
     const source = readRepoFile('shared/js/sw.js')
     const timeoutHelperBody = extractFunction(
         source,
@@ -655,7 +655,7 @@ test('action lease tab release reloads authority before mutating rows', () => {
     assert.match(releaseForTabMutationBody, /expectedAttemptNumber: getAttemptNumberFromValue\(item\) \|\| lease\.attemptNumber \|\| 0/)
 })
 
-test('repair returns after saving stale-active cleanup', () => {
+test('reconcile returns after saving stale-active cleanup', () => {
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
     const lockedBody = extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})')
@@ -1320,7 +1320,7 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     const currentAuthorityProjectionBody = extractFunction(source, 'async function loadCoordinatorCurrentAuthorityState(defaults = {})')
     const queueRunsEventsProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueRunsEventsProjection(options = {})')
     const queueRunsEventsProgressProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueRunsEventsProgressProjection(options = {})')
-    const repairProjectionBody = extractFunction(source, 'async function loadCoordinatorReconcileProjection(options = {})')
+    const reconcileProjectionBody = extractFunction(source, 'async function loadCoordinatorReconcileProjection(options = {})')
     const queueRunsPendingProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueRunsPendingProjection(options = {})')
     const queueRunsProgressPendingNukedProjectionBody = extractFunction(source, 'async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = {})')
     const clearProfileBody = extractFunction(source, 'async function clearProfileNukeState(profileHref = \'\', reason = \'\')')
@@ -1405,13 +1405,13 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(currentAuthorityProjectionBody, /getProfileNukeProgressRecordsFromStorage\(stored\)/)
     assert.match(currentAuthorityProjectionBody, /metricPath: 'currentAuthority\.load'/)
     assert.doesNotMatch(currentAuthorityProjectionBody, /COORDINATOR_EVENTS_KEY|SPACE_PENDING_NUKED_POSTS_KEY|SPACE_NUKED_POSTS_KEY|loadCoordinatorState\(/)
-    assert.match(repairProjectionBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_QUEUE_KEY\]: \{\},[\s\S]*getCoordinatorQueueWalStorageDefaults\(\),[\s\S]*\[COORDINATOR_RUNS_KEY\]: \{\},[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[PROFILE_NUKE_PROGRESS_KEY\]: \{\},[\s\S]*\[COORDINATOR_PAUSED_KEY\]: false,[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\},[\s\S]*\[SPACE_NUKED_POSTS_KEY\]: \{\}[\s\S]*\}/)
-    assert.match(repairProjectionBody, /recoverCoordinatorQueueFromWal\(/)
-    assert.match(repairProjectionBody, /getProfileNukeProgressProjectionDefaults\(progressProfileHrefs\)/)
-    assert.match(repairProjectionBody, /getProfileNukeProgressRecordsFromStorage\(stored, progressProfileHrefs\)/)
-    assert.match(repairProjectionBody, /pendingPosts: stored\[SPACE_PENDING_NUKED_POSTS_KEY\] \|\| \{\}/)
-    assert.match(repairProjectionBody, /nukedPosts: stored\[SPACE_NUKED_POSTS_KEY\] \|\| \{\}/)
-    assert.doesNotMatch(repairProjectionBody, /loadCoordinatorState\(/)
+    assert.match(reconcileProjectionBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_QUEUE_KEY\]: \{\},[\s\S]*getCoordinatorQueueWalStorageDefaults\(\),[\s\S]*\[COORDINATOR_RUNS_KEY\]: \{\},[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[PROFILE_NUKE_PROGRESS_KEY\]: \{\},[\s\S]*\[COORDINATOR_PAUSED_KEY\]: false,[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\},[\s\S]*\[SPACE_NUKED_POSTS_KEY\]: \{\}[\s\S]*\}/)
+    assert.match(reconcileProjectionBody, /recoverCoordinatorQueueFromWal\(/)
+    assert.match(reconcileProjectionBody, /getProfileNukeProgressProjectionDefaults\(progressProfileHrefs\)/)
+    assert.match(reconcileProjectionBody, /getProfileNukeProgressRecordsFromStorage\(stored, progressProfileHrefs\)/)
+    assert.match(reconcileProjectionBody, /pendingPosts: stored\[SPACE_PENDING_NUKED_POSTS_KEY\] \|\| \{\}/)
+    assert.match(reconcileProjectionBody, /nukedPosts: stored\[SPACE_NUKED_POSTS_KEY\] \|\| \{\}/)
+    assert.doesNotMatch(reconcileProjectionBody, /loadCoordinatorState\(/)
     assert.match(queueRunsPendingProjectionBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_QUEUE_KEY\]: \{\},[\s\S]*getCoordinatorQueueWalStorageDefaults\(\),[\s\S]*\[COORDINATOR_RUNS_KEY\]: \{\},[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}[\s\S]*\}/)
     assert.match(queueRunsPendingProjectionBody, /recoverCoordinatorQueueFromWal\(/)
     assert.match(queueRunsPendingProjectionBody, /pendingPosts: stored\[SPACE_PENDING_NUKED_POSTS_KEY\] \|\| \{\}/)
@@ -1498,7 +1498,7 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(pauseControlBody, /mutateCoordinatorProjection\(\{[\s\S]*kind: 'setPauseState'[\s\S]*reason,[\s\S]*paused: !!paused,[\s\S]*pauseGeneration/)
     assert.doesNotMatch(source, /async function mutateCoordinatorControlProjection/)
     assert.match(pauseControlMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'ordinaryMutation'\)/)
-    assert.match(pauseControlMutationBody, /snapshotReason !== 'ordinaryMutation' && snapshotReason !== 'repair'/)
+    assert.match(pauseControlMutationBody, /snapshotReason !== 'ordinaryMutation' && snapshotReason !== 'reconcile'/)
     assert.match(pauseControlMutationBody, /\[COORDINATOR_PAUSED_KEY\]: operation\.paused === true/)
     assert.match(pauseControlMutationBody, /payload\[COORDINATOR_PAUSE_GENERATION_KEY\] = pauseGeneration/)
     assert.match(pauseControlMutationBody, /metricStorageSet\(payload, \{[\s\S]*snapshotWriteReason: snapshotReason/)
@@ -1816,7 +1816,7 @@ test('active queued jobs have a wall-clock cap', () => {
     const source = readRepoFile('shared/js/sw.js')
     const contentSource = readRepoFile('shared/js/content.js')
     const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
-    const repairBody = extractFunction(
+    const reconcileDecisionBody = extractFunction(
         source,
         'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
     )
@@ -1831,8 +1831,8 @@ test('active queued jobs have a wall-clock cap', () => {
     assert.match(sweepBody, /activeAgeExpired/)
     assert.match(sweepBody, /getActiveQueuedTabAgeAnchor/)
     assert.match(sweepBody, /Queued tab exceeded the active job time limit/)
-    assert.match(repairBody, /activeAgeExpired/)
-    assert.match(repairBody, /COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS/)
+    assert.match(reconcileDecisionBody, /activeAgeExpired/)
+    assert.match(reconcileDecisionBody, /COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS/)
 })
 
 test('queued tab metadata accepts the current attempt before old profile progress', () => {
@@ -2219,8 +2219,8 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
     const unresolvedBody = extractFunction(source, 'async function markQueuedProfileResolutionUnresolved(request = {}, sender = {})')
-    const repairHelperBody = extractFunction(source, 'function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
-    const repairBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
+    const settlementHelperBody = extractFunction(source, 'function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
+    const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
 
     assert.match(helperBody, /resolverPending !== true/)
     assert.match(helperBody, /record\?\.resolverUrl/)
@@ -2245,10 +2245,10 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.doesNotMatch(unresolvedBody, /loadCoordinatorState\(/)
     assert.doesNotMatch(unresolvedBody, /queue: true/)
     assert.doesNotMatch(unresolvedBody, /browser\.storage\.local\.set\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]: pendingResult\.pendingPosts\}\)/)
-    assert.match(repairHelperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
-    assert.match(repairHelperBody, /isProfileResolutionItem\(item\)/)
-    assert.match(repairHelperBody, /clearResolverPendingSpaceRecords\(pendingPosts, item/)
-    assert.match(repairBody, /repairTerminalResolverPendingSourceRecordsLocked\(state, itemKey, item\)/)
+    assert.match(settlementHelperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
+    assert.match(settlementHelperBody, /isProfileResolutionItem\(item\)/)
+    assert.match(settlementHelperBody, /clearResolverPendingSpaceRecords\(pendingPosts, item/)
+    assert.match(transitionBody, /settleTerminalResolverPendingSourceRecordsLocked\(state, itemKey, item\)/)
 })
 
 test('failed resolver requeue preserves source-post resolution mode', () => {
@@ -2324,17 +2324,17 @@ test('manual failed requeue requests reconcile after durable storage', () => {
     assert.match(requeueBody, /requeue-scheduled/)
 })
 
-test('invalid resolver repair rows are non-retryable and source-settled', () => {
+test('invalid resolver reconcile rows are non-retryable and source-settled', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const repairBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
+    const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
     const operationBody = extractFunction(source, 'function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operation = {})')
 
-    assert.match(repairBody, /getInvalidProfileResolutionFailure\(item, itemKey\)/)
-    assert.match(repairBody, /invalidTerminalResolutionNeedsRepair/)
-    assert.match(repairBody, /applyInvalidProfileResolutionReconcileActionLocked\(\{[\s\S]*queue,[\s\S]*pendingPosts/)
-    assert.match(repairBody, /kind: 'reconcileInvalidProfileResolution'/)
-    assert.match(repairBody, /getPersistedLiveTabForCoordinatorItem\(item, record, itemKey\)/)
+    assert.match(transitionBody, /getInvalidProfileResolutionFailure\(item, itemKey\)/)
+    assert.match(transitionBody, /invalidTerminalResolutionNeedsRepair/)
+    assert.match(transitionBody, /applyInvalidProfileResolutionReconcileActionLocked\(\{[\s\S]*queue,[\s\S]*pendingPosts/)
+    assert.match(transitionBody, /kind: 'reconcileInvalidProfileResolution'/)
+    assert.match(transitionBody, /getPersistedLiveTabForCoordinatorItem\(item, record, itemKey\)/)
     assert.match(operationBody, /status: 'skipped'/)
     assert.match(operationBody, /outcome: 'unresolved-target'/)
     assert.match(operationBody, /sourceSettlementOutcome: 'cleared'/)
@@ -2503,7 +2503,7 @@ test('service-worker-owned status is visible to source-page run waits', () => {
 
 test('legacy import is the only progress-to-queue materialization path', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const repairBody = extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})')
+    const reconcileBody = extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})')
     const legacyImportPhaseBody = extractFunction(source, 'function importLegacyQueuedProgressRecordsReconcilePhase(ctx = {}, options = {})')
     const authorityTransitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
@@ -2513,7 +2513,7 @@ test('legacy import is the only progress-to-queue materialization path', () => {
 
     assert.match(legacyImportPhaseBody, /options\.legacyImport === true \|\| options\.importLegacy === true/)
     assert.match(legacyImportPhaseBody, /importLegacyQueuedProgressRecordsToCoordinatorQueue/)
-    assert.match(authorityTransitionBody, /applyCoordinatorSourceMetadataRepair/)
+    assert.match(authorityTransitionBody, /applyCoordinatorSourceMetadataMaterialization/)
     assert.match(persistBody, /eventsChanged: ctx\.eventsChanged/)
     assert.match(restoreBody, /makeCoordinatorSourceFromRunMetadata/)
     assert.match(restoreEligibilityBody, /getCoordinatorRunTargetHrefs\(run\)/)
@@ -2896,7 +2896,7 @@ test('terminal/direct progress can mutate from resident authority without storag
     assert.doesNotMatch(batchBody, /await loadCoordinatorQueueRunsScopedProgressProjection\(/)
 })
 
-test('dashboard resume polls are alarm-backed but user starts run direct authority repair', () => {
+test('dashboard resume polls are alarm-backed but user starts run direct authority reconcile', () => {
     const source = readRepoFile('shared/js/sw.js')
     const kickBody = extractFunction(source, 'async function kickCoordinatorQueueResume(reason = \'resume-request\', options = {})')
     const userStartBody = extractFunction(source, 'async function startUserInitiatedCoordinatorQueueResume(reason = \'dashboard-resume\', options = {})')
@@ -3061,7 +3061,7 @@ test('resume rebuilds from durable queue after stale volatile queued actions do 
     assert.match(source, /pump\.changed\.clearedStaleFillPromise/)
 })
 
-test('idle storage updates repair durable active work before queue fill', () => {
+test('idle storage updates reconcile durable active work before queue fill', () => {
     const source = readRepoFile('shared/js/sw.js')
     const idleBody = extractFunction(source, 'function recordStorageIdleChurnCounters(context = {})')
     const scheduleBody = extractFunction(source, 'function scheduleDurableQueueResumeFromIdleStorage(context = {})')
@@ -3385,15 +3385,15 @@ test('resume reattaches live active tabs after service worker restart', () => {
     assert.match(legacyBody, /record\.tabOpenedAt \|\| record\.contentOpenedAt/)
 })
 
-test('storage repair immediately reconciles active rows whose persisted tab is gone', () => {
+test('storage reconcile immediately reconciles active rows whose persisted tab is gone', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'async function shouldImmediatelyReconcileMissingPersistedActiveTab(item = null, record = null)')
     const timeoutHelperBody = extractFunction(source, 'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())')
     const decisionBody = extractFunction(source, 'async function getMissingActiveCoordinatorReconcileDecision(')
-    const repairBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
+    const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
-    const immediateIndex = repairBody.indexOf('await shouldImmediatelyReconcileMissingPersistedActiveTab(item, record)')
-    const decisionIndex = repairBody.indexOf('await getMissingActiveCoordinatorReconcileDecision(', immediateIndex)
+    const immediateIndex = transitionBody.indexOf('await shouldImmediatelyReconcileMissingPersistedActiveTab(item, record)')
+    const decisionIndex = transitionBody.indexOf('await getMissingActiveCoordinatorReconcileDecision(', immediateIndex)
 
     assert.match(helperBody, /getPersistedQueuedTabId\(item, record\)/)
     assert.match(helperBody, /hasOwnedQueuedTabState\(tabId\)/)
@@ -3411,8 +3411,8 @@ test('storage repair immediately reconciles active rows whose persisted tab is g
     assert.notEqual(immediateIndex, -1)
     assert.notEqual(decisionIndex, -1)
     assert.ok(immediateIndex < decisionIndex)
-    assert.match(repairBody, /applyMissingActiveCoordinatorEvidenceReconcileActionLocked\(state, \{[\s\S]*closePersistedTab: missingActiveDecision\.closePersistedTab === true/)
-    assert.match(repairBody, /tabsToCloseAfterReconcile\.add\(closeTabId\)/)
+    assert.match(transitionBody, /applyMissingActiveCoordinatorEvidenceReconcileActionLocked\(state, \{[\s\S]*closePersistedTab: missingActiveDecision\.closePersistedTab === true/)
+    assert.match(transitionBody, /tabsToCloseAfterReconcile\.add\(closeTabId\)/)
     assert.match(persistBody, /detachQueuedTabRuntimeState\(tabId, 'storage-reconcile-tab-close'\)[\s\S]*browser\.tabs\.remove\(tabId\)/)
     assert.doesNotMatch(source.replace(persistBody, ''), /storage-reconcile-tab-close/)
 })
@@ -3791,10 +3791,10 @@ test('modal contributor nuking uses small tab batches', () => {
     assert.match(body, /if\(urlsToQueue\.length >= queueLimit\) break/)
 })
 
-test('same-attempt terminal success repairs stale failed coordinator rows', () => {
+test('same-attempt terminal success reconciles stale failed coordinator rows', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const repairBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
-    const progressRepairBody = extractFunction(source, 'function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {})')
+    const authorityTransitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
+    const progressReconcileBody = extractFunction(source, 'function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {})')
     const preferBody = extractFunction(
         source,
         'function shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item = null, record = null, mapped = null)'
@@ -3803,7 +3803,7 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
         source,
         'function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null)'
     )
-    const transitionBody = extractFunction(
+    const progressTransitionBody = extractFunction(
         source,
         'function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})'
     )
@@ -3825,13 +3825,13 @@ test('same-attempt terminal success repairs stale failed coordinator rows', () =
     assert.match(preferBody, /isSuccessfulProfileNukeRecord\(record\)/)
     assert.match(preferBody, /hasMismatchedCoordinatorAttempt\(item, record\)/)
     assert.match(restoreBody, /shouldPreferSuccessfulProgressOverTerminalCoordinatorItem\(item, record, mapped\)/)
-    assert.match(transitionBody, /promoteTerminalCoordinatorItemFromSuccessfulProgress\(item, record, mapped/)
+    assert.match(progressTransitionBody, /promoteTerminalCoordinatorItemFromSuccessfulProgress\(item, record, mapped/)
     assert.match(legacyBody, /record\.actionSurfaceMode \|\| item\.actionSurfaceMode/)
     assert.match(mergeBody, /legacyItem\.actionSurfaceMode \|\| reducedItem\.actionSurfaceMode/)
-    assert.match(repairBody, /applyProgressRecordCoordinatorReconcileActionLocked\(state, \{[\s\S]*kind: 'reconcileFromProgressRecord'[\s\S]*record,[\s\S]*mapped,[\s\S]*resetRetry/)
-    assert.match(progressRepairBody, /matchesCoordinatorReconcileOperationAttempt\(item, operation\)/)
-    assert.match(progressRepairBody, /transitionCoordinatorItemFromProgress\(item, record, mapped/)
-    assert.match(progressRepairBody, /queue\[itemKey\] = nextItem/)
+    assert.match(authorityTransitionBody, /applyProgressRecordCoordinatorReconcileActionLocked\(state, \{[\s\S]*kind: 'reconcileFromProgressRecord'[\s\S]*record,[\s\S]*mapped,[\s\S]*resetRetry/)
+    assert.match(progressReconcileBody, /matchesCoordinatorReconcileOperationAttempt\(item, operation\)/)
+    assert.match(progressReconcileBody, /transitionCoordinatorItemFromProgress\(item, record, mapped/)
+    assert.match(progressReconcileBody, /queue\[itemKey\] = nextItem/)
     assert.doesNotMatch(source, /syncCoordinatorProgressRecordsLocked/)
     assert.doesNotMatch(source, /syncCoordinatorProgressRecords\(progressRecords/)
     assert.match(directBody, /preferSuccessfulTerminal = shouldPreferSuccessfulProgressOverTerminalCoordinatorItem\(item, record, mapped\)/)
@@ -3922,7 +3922,7 @@ test('queued tab release and close messages are bounded', () => {
     assert.match(releaseAndCloseBranches, /releaseQueuedTab\(tabId, \{awaitFill: true\}\)/)
 })
 
-test('active queued already-blocked repair releases and closes the tab', () => {
+test('active queued already-blocked reconcile releases and closes the tab', () => {
     const body = extractFunction(
         readRepoFile('shared/js/content.js'),
         'async function maybeRecordAlreadyBlockedCoordinatorProfile()'

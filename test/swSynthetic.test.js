@@ -1821,7 +1821,7 @@ test('runs paused update uses queue-runs projection without loading progress', a
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
 })
 
-test('runs paused update failure schedules repair without throwing', async () => {
+test('runs paused update failure schedules reconcile without throwing', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Runs-Paused-Failure'
     const runId = 'run-runs-paused-failure'
     const attemptId = 'attempt-runs-paused-failure'
@@ -7548,7 +7548,7 @@ test('authority reconcile treats missing active anchors as reclaimable despite p
     assert.equal(browser.__removedTabs.includes(tabId), false)
 })
 
-test('storage repair preserves fresh plausible persisted tab on transient URL', async () => {
+test('storage reconcile preserves fresh plausible persisted tab on transient URL', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Transient'
     const runId = 'run-repair-transient'
     const attemptId = 'attempt-repair-transient'
@@ -7625,7 +7625,7 @@ test('storage repair preserves fresh plausible persisted tab on transient URL', 
     assert.equal(browser.__removedTabs.includes(tabId), false)
 })
 
-test('storage repair does not close unrelated persisted tab id', async () => {
+test('storage reconcile does not close unrelated persisted tab id', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Reused-Tab'
     const runId = 'run-repair-reused-tab'
     const attemptId = 'attempt-repair-reused-tab'
@@ -9958,7 +9958,7 @@ test('key-only terminalization derived failure does not poison authority termina
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
 })
 
-test('repair does not promote terminal error progress over active service-worker authority', async () => {
+test('reconcile does not promote terminal error progress over active service-worker authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Error'
     const runId = 'run-terminal-error'
     const attemptId = 'attempt-terminal-error'
@@ -10083,7 +10083,7 @@ test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', 
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [edgeTriggeredDueAt])
 })
 
-test('stored-work repair hands queued-only durable work to fast executor', async () => {
+test('stored-work reconcile hands queued-only durable work to fast executor', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Queued-Only-Fast-Resume'
     const runId = 'run-repair-queued-only-fast-resume'
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
@@ -12925,7 +12925,7 @@ test('dashboard resume reschedules stale in-memory resume timeout that never fir
     ))
 })
 
-test('coordinator reconcile reschedules stale in-memory repair timeout that never fired', async () => {
+test('coordinator reconcile reschedules stale in-memory reconcile timeout that never fired', async () => {
     const {browser, sw, timers} = loadServiceWorkerHarness({now: 0})
 
     await activateQuoraRuntime(browser)
@@ -12942,7 +12942,7 @@ test('coordinator reconcile reschedules stale in-memory repair timeout that neve
     assert.equal(counters['reconcile.staleTimeoutCleared'], 1)
 })
 
-test('nonterminal progress storage changes do not edge-trigger repair backoff reset', async () => {
+test('nonterminal progress storage changes do not edge-trigger reconcile backoff reset', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Progress'
     const {browser, sw} = loadServiceWorkerHarness({now: 0})
 
@@ -14660,7 +14660,7 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
     assert.equal(storage.mbCoordinatorRuns[nextRunId], undefined)
 })
 
-test('enqueue derived save failure keeps WAL row durable and repair rebuilds derived state', async () => {
+test('enqueue derived save failure keeps WAL row durable and reconcile materializes derived state', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Derived-Failure'
     const runId = 'run-enqueue-derived-failure'
     const sourceSender = {tab: {id: 12, windowId: 1}}
@@ -14709,12 +14709,12 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
         return originalGet(defaults)
     }
 
-    const repair = await sw.reconcileCoordinatorStorage()
+    const reconcile = await sw.reconcileCoordinatorStorage()
 
-    assert.ok(repair.repaired > 0)
-    assert.equal(repair.runsChanged, true)
-    assert.equal(repair.progressChanged, false)
-    assert.equal(repair.eventsChanged, true)
+    assert.ok(reconcile.repaired > 0)
+    assert.equal(reconcile.runsChanged, true)
+    assert.equal(reconcile.progressChanged, false)
+    assert.equal(reconcile.eventsChanged, true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
@@ -14723,10 +14723,10 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
     assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
     assert.equal(storage.mbCoordinatorEvents.some(event =>
         event.runId === runId &&
-        event.type === 'repair' &&
-        event.details?.reason === 'enqueue-derived-repair'
+        event.type === 'materialize' &&
+        event.details?.reason === 'enqueue-derived-materialization'
     ), true)
-    const repairLoadDefaults = findStorageGetDefaults(getDefaults, [
+    const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueue',
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
@@ -14736,13 +14736,13 @@ test('enqueue derived save failure keeps WAL row durable and repair rebuilds der
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
     ])
-    assert.ok(repairLoadDefaults)
+    assert.ok(reconcileLoadDefaults)
 })
 
 test('explicit legacy import materializes projection-only queued progress', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Projection-Only-Queued-Repair'
-    const runId = 'run-projection-only-queued-repair'
-    const attemptId = 'attempt-projection-only-queued-repair'
+    const href = 'https://www.quora.com/profile/Synthetic-Projection-Only-Queued-Materialize'
+    const runId = 'run-projection-only-queued-materialize'
+    const attemptId = 'attempt-projection-only-queued-materialize'
     const {browser, sw, storage} = loadServiceWorkerHarness({
         now: 3120,
         storage: {
@@ -14780,16 +14780,16 @@ test('explicit legacy import materializes projection-only queued progress', asyn
     assert.equal(ordinaryReconcile.queueChanged, false)
     assert.equal(storage.mbCoordinatorQueue[href], undefined)
 
-    const repair = await sw.reconcileCoordinatorStorage({legacyImport: true})
+    const legacyImport = await sw.reconcileCoordinatorStorage({legacyImport: true})
 
-    assert.equal(repair.queueChanged, true)
-    assert.equal(repair.progressChanged, true)
+    assert.equal(legacyImport.queueChanged, true)
+    assert.equal(legacyImport.progressChanged, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].runId, runId)
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
-    const repairLoadDefaults = findStorageGetDefaults(getDefaults, [
+    const legacyImportLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueue',
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
@@ -14800,13 +14800,13 @@ test('explicit legacy import materializes projection-only queued progress', asyn
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
     ])
-    assert.ok(repairLoadDefaults)
+    assert.ok(legacyImportLoadDefaults)
 })
 
-test('stored-work repair terminal raw row updates WAL authority', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Repair-Terminal-Wal'
-    const runId = 'run-repair-terminal-wal'
-    const attemptId = 'attempt-repair-terminal-wal'
+test('stored-work reconcile terminal raw row updates WAL authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Reconcile-Terminal-Wal'
+    const runId = 'run-reconcile-terminal-wal'
+    const attemptId = 'attempt-reconcile-terminal-wal'
     const activeRow = makeActiveCoordinatorRow({
         href,
         runId,
@@ -14860,9 +14860,9 @@ test('stored-work repair terminal raw row updates WAL authority', async () => {
 
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
 
-    const repair = await sw.reconcileCoordinatorStorage()
+    const reconcile = await sw.reconcileCoordinatorStorage()
 
-    assert.equal(repair.queueChanged, true)
+    assert.equal(reconcile.queueChanged, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'interrupted')
@@ -14919,7 +14919,7 @@ test('enqueue progress projection failure does not poison durable WAL acknowledg
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
-test('enqueue resetExisting derived save failure repair replaces stale progress attempt', async () => {
+test('enqueue resetExisting derived save failure reconcile replaces stale progress attempt', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Reset-Derived-Failure'
     const oldRunId = 'run-enqueue-reset-derived-old'
     const nextRunId = 'run-enqueue-reset-derived-next'
@@ -14997,10 +14997,10 @@ test('enqueue resetExisting derived save failure repair replaces stale progress 
     assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
     browser.storage.local.set = originalSet
 
-    const repair = await sw.reconcileCoordinatorStorage()
+    const reconcile = await sw.reconcileCoordinatorStorage()
 
-    assert.ok(repair.repaired > 0)
-    assert.equal(repair.progressChanged, false)
+    assert.ok(reconcile.repaired > 0)
+    assert.equal(reconcile.progressChanged, false)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
     assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
     assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
@@ -15013,8 +15013,8 @@ test('enqueue resetExisting derived save failure repair replaces stale progress 
     assert.equal(storage.mbCoordinatorRuns[nextRunId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorEvents.some(event =>
         event.runId === nextRunId &&
-        event.type === 'repair' &&
-        event.details?.reason === 'enqueue-derived-repair'
+        event.type === 'materialize' &&
+        event.details?.reason === 'enqueue-derived-materialization'
     ), true)
 })
 
@@ -16108,7 +16108,7 @@ test('resume rebuilds durable work after stale volatile queued action skips with
     assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
 })
 
-test('stored work repair drops stale volatile queued actions before durable resume', async () => {
+test('stored work reconcile drops stale volatile queued actions before durable resume', async () => {
     const href = 'https://www.quora.com/profile/Repair-Rebuild-After-Stale-Volatile'
     const staleHref = 'https://www.quora.com/profile/Repair-Stale-Volatile-Missing'
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
@@ -16147,7 +16147,7 @@ test('stored work repair drops stale volatile queued actions before durable resu
     await waitFor(
         () => sw.state().queuedTabActions.length === 0 &&
             listTabs(browser).some(tab => tab.url === href),
-        'stored work repair did not drop stale volatile action and resume durable row',
+        'stored work reconcile did not drop stale volatile action and resume durable row',
         {timers, attempts: 40, tickMs: 1000}
     )
 
@@ -18749,7 +18749,7 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.equal(hydrated.queue[href].tabId, null)
 })
 
-test('active-without-actor terminal repair schedules next queued fill', async () => {
+test('active-without-actor terminal reconcile schedules next queued fill', async () => {
     const failedHref = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Terminal'
     const queuedHref = 'https://www.quora.com/profile/Synthetic-Next-After-No-Actor-Terminal'
     const runId = 'run-active-no-actor-terminal-continuation'
@@ -18807,7 +18807,7 @@ test('active-without-actor terminal repair schedules next queued fill', async ()
 
     await waitFor(
         () => listTabs(browser).some(tab => tab.url === queuedHref),
-        'queued row did not fill after active-without-actor terminal repair',
+        'queued row did not fill after active-without-actor terminal reconcile',
         {timers, attempts: 40, tickMs: 1000}
     )
     assert.ok(['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[queuedHref].status))
@@ -18919,7 +18919,7 @@ test('authority preflight preserves fresh durably active startup actor before cl
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshRuntimeStartup'], 1)
 })
 
-test('executor queue-only repair defers fresh startup actor before no-actor failure', async () => {
+test('executor queue-only reconcile defers fresh startup actor before no-actor failure', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Executor-Fresh-Startup-Actor'
     const runId = 'run-executor-fresh-startup-actor'
     const attemptId = 'attempt-executor-fresh-startup-actor'
@@ -18966,7 +18966,7 @@ test('executor queue-only repair defers fresh startup actor before no-actor fail
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshRuntimeStartupQueueOnly'], 1)
 })
 
-test('executor queue-only repair reports stale active requeue as continuation work', async () => {
+test('executor queue-only reconcile reports stale active requeue as continuation work', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Executor-Requeue-Continuation'
     const runId = 'run-executor-requeue-continuation'
     const attemptId = 'attempt-executor-requeue-continuation'
@@ -19099,7 +19099,7 @@ test('authority reconcile requeues active-transition-failed active row with miss
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
-test('user-initiated dashboard resume repairs active-transition-failed row before returning', async () => {
+test('user-initiated dashboard resume reconciles active-transition-failed row before returning', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Direct-Resume-Repairs-Missing-Tab'
     const runId = 'run-direct-resume-missing-tab'
     const attemptId = 'attempt-direct-resume-missing-tab'
@@ -20396,7 +20396,7 @@ test('authority reconcile reloads confirmed live actor with stale content script
     assert.equal((sw.state().queueWakeupCounters['reconcile.changed.runtimeRecovered'] || 0), 1)
 })
 
-test('authority reconcile ignores stale mismatched progress for active-without-actor repair', async () => {
+test('authority reconcile ignores stale mismatched progress for active-without-actor reconcile', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-Mismatched-Progress'
     const runId = 'run-active-mismatched-progress'
     const {storage, sw} = loadServiceWorkerHarness({
@@ -20843,7 +20843,7 @@ test('authority reconcile terminal-progress WAL append failure leaves active row
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
-test('fast executor stops after authority preflight repairs stale active row', async () => {
+test('fast executor stops after authority preflight reconciles stale active row', async () => {
     const staleHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Stale'
     const queuedHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Queued'
     const runId = 'run-fast-preflight-active'
@@ -20906,7 +20906,7 @@ test('fast executor stops after authority preflight repairs stale active row', a
     assert.equal(sw.state().queueWakeupCounters['pump.fastExecutor.authorityPreflightChanged'], 1)
 })
 
-test('scheduled fast executor continues into queued work after active preflight repair', async () => {
+test('scheduled fast executor continues into queued work after active preflight reconcile', async () => {
     const staleHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Continue-Stale'
     const queuedHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Continue-Queued'
     const runId = 'run-fast-preflight-continue-active'
@@ -20971,7 +20971,7 @@ test('scheduled fast executor continues into queued work after active preflight 
     assert.equal(sw.coordinatorAuthority.current().queue[staleHref].status, 'failed')
     await waitFor(
         () => listTabs(browser).some(tab => tab.url === queuedHref),
-        'queued row did not start after active preflight repair continuation',
+        'queued row did not start after active preflight reconcile continuation',
         {timers, attempts: 40, tickMs: 1000}
     )
     assert.ok(['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[queuedHref].status))
@@ -21037,7 +21037,7 @@ test('authority preflight defers fresh provisional active-transition runtime act
     assert.equal(sw.state().queueWakeupCounters['reconcile.deferred.freshRuntimeStartup'], 1)
 })
 
-test('fast executor authority preflight repairs a stale active batch before opening queued work', async () => {
+test('fast executor authority preflight reconciles a stale active batch before opening queued work', async () => {
     const staleOneHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Stale-One'
     const staleTwoHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Stale-Two'
     const queuedHref = 'https://www.quora.com/profile/Synthetic-Fast-Preflight-Batch-Queued'
@@ -21131,7 +21131,7 @@ test('fast executor authority preflight repairs a stale active batch before open
     assert.equal(sw.state().queueWakeupCounters['reconcile.changed.activeRequeued'], 2)
 })
 
-test('reconcile tick skips executor after authority repairs stale active row', async () => {
+test('reconcile tick skips executor after authority reconciles stale active row', async () => {
     const staleHref = 'https://www.quora.com/profile/Synthetic-Reconcile-Preflight-Stale'
     const queuedHref = 'https://www.quora.com/profile/Synthetic-Reconcile-Preflight-Queued'
     const runId = 'run-reconcile-preflight-active'
