@@ -199,6 +199,78 @@ test('rejects non-terminal regression after terminal state', () => {
     assert.equal(projected.ignored[0].reason, 'terminal-regression')
 })
 
+test('rejects late active transition after rollback of same attempt', () => {
+    const state = baseState()
+    state.queue['https://www.quora.com/profile/A'] = {
+        ...state.queue['https://www.quora.com/profile/A'],
+        status: 'queued',
+        actionLeaseReleaseReason: 'active-transition-failed',
+        actionLeaseReleasedAt: 1200,
+        activeAt: 0,
+        tabId: null
+    }
+    const checkpoint = makeCheckpoint(state, {snapshotSeq: 0})
+    const projected = projectSnapshot(checkpoint, [{
+        seq: 1,
+        id: 'late-active-after-rollback',
+        kind: 'map.set',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        operationKind: 'active-transition',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        value: {
+            status: 'active',
+            attemptId: 'attempt-1',
+            attemptNumber: 1,
+            runId: 'run-1',
+            activeAt: 1300,
+            tabId: 42
+        }
+    }])
+
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].status, 'queued')
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].tabId, null)
+    assert.equal(projected.ignored.length, 1)
+    assert.equal(projected.ignored[0].reason, 'active-transition-after-rollback')
+})
+
+test('allows explicit live reclaim active transition after rollback', () => {
+    const state = baseState()
+    state.queue['https://www.quora.com/profile/A'] = {
+        ...state.queue['https://www.quora.com/profile/A'],
+        status: 'queued',
+        actionLeaseReleaseReason: 'active-transition-failed',
+        actionLeaseReleasedAt: 1200,
+        activeAt: 0,
+        tabId: null
+    }
+    const checkpoint = makeCheckpoint(state, {snapshotSeq: 0})
+    const projected = projectSnapshot(checkpoint, [{
+        seq: 1,
+        id: 'live-reclaim-active-after-rollback',
+        kind: 'map.set',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        operationKind: 'active-transition',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        allowActiveTransitionAfterRollback: true,
+        value: {
+            status: 'active',
+            attemptId: 'attempt-1',
+            attemptNumber: 1,
+            runId: 'run-1',
+            activeAt: 1300,
+            tabId: 42
+        }
+    }])
+
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].status, 'active')
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].tabId, 42)
+    assert.equal(projected.ignored.length, 0)
+})
+
 test('rejects stale attempt progress records', () => {
     const state = baseState()
     state.progress['https://www.quora.com/profile/A'] = {

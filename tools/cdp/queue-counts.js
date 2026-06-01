@@ -13,19 +13,20 @@ runMain(async () => {
     const needle = getOption('needle', process.env.MB_QUEUE_NEEDLE || '').toLowerCase()
     const targets = await getTargets(config)
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
-    const extensionPage = targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
-        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`))
+    const extensionTarget = targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
+        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`)) ||
+        targets.find(target => target.type === 'service_worker' && (target.url || '').includes(config.extensionId))
     const profilePages = targets.filter(target =>
         target.type === 'page' && /^https:\/\/www\.quora\.com\/profile\//i.test(target.url || '')
     )
 
-    if(!extensionPage) {
-        console.log(JSON.stringify({extensionPage: false}, null, 2))
+    if(!extensionTarget) {
+        console.log(JSON.stringify({extensionTarget: false}, null, 2))
         process.exitCode = 1
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function getQueueCounts(needle) {
+    const result = await evaluate(extensionTarget.webSocketDebuggerUrl, `(${async function getQueueCounts(needle) {
         const storage = await chrome.storage.local.get({mbCoordinatorQueueView: {}})
         const view = storage.mbCoordinatorQueueView && typeof storage.mbCoordinatorQueueView === 'object'
             ? storage.mbCoordinatorQueueView

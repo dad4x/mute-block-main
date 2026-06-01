@@ -279,6 +279,17 @@ function createFakeBrowser(initialStorage = {}) {
                 tabs.delete(normalizedTabId)
                 await browser.tabs.onRemoved.emit(normalizedTabId, {isWindowClosing: false})
             },
+            async reload(tabId) {
+                const normalizedTabId = Number.parseInt(tabId, 10)
+                const tab = tabs.get(normalizedTabId)
+                if(!tab) throw new Error(`no fake tab ${tabId}`)
+                tabs.set(normalizedTabId, {
+                    ...tab,
+                    status: 'loading'
+                })
+                await browser.tabs.onUpdated.emit(normalizedTabId, {status: 'loading'}, clone(tabs.get(normalizedTabId)))
+                return undefined
+            },
             async sendMessage() {
                 return {}
             }
@@ -393,10 +404,46 @@ function loadServiceWorkerHarness(options = {}) {
     const timers = options.timers || createFakeTimers(options.now || 0)
     const browser = options.browser || createFakeBrowser(options.storage || {})
     const baseRequire = createRequire(swPath)
-    let source = fs.readFileSync(swPath, 'utf8')
+    let source = `let __testHarnessDeactivated = false;\n${fs.readFileSync(swPath, 'utf8')}`
 
     if(!options.runStartupWork) {
-        source = source.replace(/\nvoid startQueueWakeupMetricsBackedStartupWork\(\)\s*$/, '\n')
+        source = source
+            .replace(/\nvoid startQueueWakeupMetricsBackedStartupWork\(\)/, '\n')
+            .replace(/\nscheduleStoredWorkRearmAfterServiceWorkerReload\(\)/, '\n')
+    }
+    if(options.disableQueueWakeupMetricsFlush === true) {
+        source = source.replace(
+            'function scheduleQueueWakeupMetricsFlush() {\n    queueWakeupMetricsDirty = true',
+            'function scheduleQueueWakeupMetricsFlush() {\n    queueWakeupMetricsDirty = false\n    return'
+        )
+    }
+    if(options.disableQueueWalCheckpointSwitch === true) {
+        source = source.replace(
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    if(coordinatorQueueWalCheckpointSwitchPromise) {",
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    return null\n    if(coordinatorQueueWalCheckpointSwitchPromise) {"
+        )
+    }
+    if(options.suppressBackgroundWorkAfterDeactivate === true) {
+        source = source.replace(
+            'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
+            'async function metricStorageGet(defaults = {}, options = {}) {\n    if(__testHarnessDeactivated) return cloneCoordinatorAuthorityValue(defaults || {})\n    incrementQueueWakeupMetric'
+        )
+        source = source.replace(
+            'async function metricStorageSet(payload = {}, options = {}) {\n    if(payload &&',
+            'async function metricStorageSet(payload = {}, options = {}) {\n    if(__testHarnessDeactivated) return false\n    if(payload &&'
+        )
+        source = source.replace(
+            'async function metricStorageRemove(keys = [], options = {}) {\n    const normalizedKeys',
+            'async function metricStorageRemove(keys = [], options = {}) {\n    if(__testHarnessDeactivated) return false\n    const normalizedKeys'
+        )
+        source = source.replace(
+            'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot',
+            'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot'
+        )
+        source = source.replace(
+            '    if(!walStore || typeof walStore !== \'object\') {\n        return {',
+            '    if(__testHarnessDeactivated) {\n        return {\n            queue: normalizedSnapshot,\n            recovered: false,\n            reason: \'test-harness-deactivated\'\n        }\n    }\n\n    if(!walStore || typeof walStore !== \'object\') {\n        return {'
+        )
     }
     source += `
 
@@ -415,14 +462,18 @@ module.exports.__test = {
     metricStorageGet,
     metricStorageSet,
     recoverStoredCoordinatorWork,
+    ensureQueuedTabContentScript,
+    nudgeQueuedTabActionClaim,
+    nudgeQueuedTabActionClaimWithRetries,
     ensureProfileNukeProgressReady,
-    repairCoordinatorStorageFromProgress,
+    reconcileCoordinatorStorage,
     recordCoordinatorJobProgress,
     recordQueuedTabMetadataMilestone,
     getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
     refreshQueueWakeupMetricsViewForDashboard,
     rememberQueueLoadPressure,
+    runCoordinatorExecutorApplyPhase,
     runCoordinatorQueueExecutorFastPath,
     recordDeferredCoordinatorJobMilestone,
     resetQueueWakeupMetricsEpochAfterLoad,
@@ -432,15 +483,19 @@ module.exports.__test = {
     heartbeatCoordinatorActionLease,
     releaseCoordinatorActionLease,
     releaseCoordinatorActionLeaseForTab,
+    releaseQueuedTabAndCleanup,
     runCoordinatorAuthorityReconcileActions,
     runCoordinatorReconcileTick,
+    pruneMissingQueuedTabRuntimeState,
     resumeCoordinatorQueueExecution,
     resumeCoordinatorQueueExecutionOnce,
     restoreCoordinatorPageForStoredWork,
     runCoordinatorQueueExecutorFastPath,
-    runStoredWorkRepairTick,
+    runScheduledCoordinatorReconcileTick,
     saveCoordinatorState,
-    scheduleStoredWorkRepair,
+    scheduleCoordinatorQueueResume,
+    scheduleCoordinatorReconcile,
+    sendTabMessage,
     setCoordinatorRunsPaused,
     settleTerminalCoordinatorItems,
     startQueueWakeupMetricsBackedStartupWork,
@@ -448,6 +503,15 @@ module.exports.__test = {
     switchCoordinatorAuthorityQueueWalCheckpoint,
     terminalizeCoordinatorKeyOnlyItem,
     terminalizeActiveCoordinatorNonProfileLanding,
+    __testDeactivateHarness() {
+        __testHarnessDeactivated = true
+        if(activeSpaceFeedStorageUpdateToken) {
+            abandonedSpaceFeedStorageUpdates.add(activeSpaceFeedStorageUpdateToken)
+        }
+        queueWakeupMetricsLoaded = false
+        queueWakeupMetricsDirty = false
+        queueWakeupMetricsFlushPromise = null
+    },
     __testAddProvisionalQueuedTab(tabId, metadata = {}, action = null) {
         activeQueuedTabs.add(tabId)
         setQueuedTabMetadata(tabId, metadata)
@@ -487,6 +551,20 @@ module.exports.__test = {
     __testSetProgressShadowWalStore(value) {
         progressShadowWalStore = value
     },
+    __testPauseQueuedOwner(ownerTabId) {
+        pausedQueuedOwners.add(ownerTabId)
+    },
+    __testSetQueuedTabFillPromise(promise, startedAt = Date.now()) {
+        queuedTabFillPromise = promise
+        queuedTabFillPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
+    },
+    __testSetCoordinatorReconcilePromise(promise, startedAt = Date.now()) {
+        coordinatorReconcilePromise = promise
+        coordinatorReconcilePromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
+    },
+    __testClearStaleCoordinatorReconcilePromise(reason = 'test') {
+        return clearStaleCoordinatorReconcilePromise(reason)
+    },
     state() {
         return {
             storedWorkRepairDueAt,
@@ -502,18 +580,31 @@ module.exports.__test = {
             coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.current().stored?.mbCoordinatorQueueWal || null)),
             spaceFeedStorageUpdateDepth,
             abandonedSpaceFeedStorageUpdates: abandonedSpaceFeedStorageUpdates.size,
+            queuedTabFillPromise: !!queuedTabFillPromise,
+            queuedTabFillPromiseAgeMs: queuedTabFillPromise ? getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) : 0,
+            coordinatorReconcilePromise: !!coordinatorReconcilePromise,
+            coordinatorReconcilePromiseAgeMs: coordinatorReconcilePromise ? getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) : 0,
             activeQueuedTabs: Array.from(activeQueuedTabs),
+            pausedQueuedOwners: Array.from(pausedQueuedOwners),
             queuedTabActions: queuedTabActions.map(action => ({...action})),
             queuedTabMetadata: Array.from(queuedTabMetadata.entries()).map(([tabId, metadata]) => [tabId, {...metadata}]),
+            queuedActionSurfaceWindowId,
+            queuedActionSurfaceAnchorTabId,
             queueLoadThrottle: {...queueLoadThrottle},
             constants: {
                 STALE_BACKGROUND_OPENING_QUEUED_TAB_MS,
                 STALE_ACTIVE_ACTION_QUEUED_TAB_MS,
                 STALE_FOREGROUND_WAIT_QUEUED_TAB_MS,
+                QUEUED_TAB_CREATE_TIMEOUT_MS,
                 COORDINATOR_ACTIVE_JOB_MAX_MS,
                 COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS,
                 STALE_CLOSE_REQUESTED_QUEUED_TAB_MS,
+                COORDINATOR_JOB_MILESTONE_FLUSH_MS,
                 SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS,
+                QUEUED_TAB_FILL_PROMISE_STALE_MS,
+                QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS,
+                COORDINATOR_RECONCILE_PROMISE_STALE_MS,
+                COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS,
                 COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
                 COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
                 COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS

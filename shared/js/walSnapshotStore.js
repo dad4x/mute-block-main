@@ -737,6 +737,14 @@ function shouldApplyPatch(existing = null, patch = {}, record = {}) {
 
     const existingStatus = `${existing?.status || ''}`
     const patchStatus = `${patch?.status || ''}`
+    if(existing &&
+        record.operationKind === 'active-transition' &&
+        existingStatus === 'queued' &&
+        patchStatus === 'active' &&
+        existing.actionLeaseReleaseReason === 'active-transition-failed' &&
+        record.allowActiveTransitionAfterRollback !== true) {
+        return {ok: false, reason: 'active-transition-after-rollback'}
+    }
     if(existing && isTerminalStatus(existingStatus) && patchStatus && !isTerminalStatus(patchStatus) && record.allowTerminalOverwrite !== true) {
         return {ok: false, reason: 'terminal-regression'}
     }

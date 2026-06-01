@@ -11,16 +11,17 @@ runMain(async () => {
     const config = getCdpConfig()
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     const targets = await getTargets(config)
-    const extensionPage = targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
-        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`))
+    const extensionTarget = targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
+        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`)) ||
+        targets.find(target => target.type === 'service_worker' && (target.url || '').includes(config.extensionId))
 
-    if(!extensionPage) {
-        console.log(JSON.stringify({extensionPage: false}, null, 2))
+    if(!extensionTarget) {
+        console.log(JSON.stringify({extensionTarget: false}, null, 2))
         process.exitCode = 1
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function summarizeWindows(extensionId) {
+    const result = await evaluate(extensionTarget.webSocketDebuggerUrl, `(${async function summarizeWindows(extensionId) {
         const callChrome = (fn, fallback) => new Promise(resolve => {
             let settled = false
             const finish = value => {

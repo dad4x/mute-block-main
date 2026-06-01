@@ -284,7 +284,7 @@ async function pauseResumeOrCancel(env) {
         'pause-coordinator-nukes',
         'resume-paused-coordinator-nukes',
         'cancel-coordinator-current-work',
-        'repair-coordinator-storage',
+        'reconcile-coordinator-storage',
         'resume-coordinator-queue'
     ])
     env.trace.push(action)
@@ -308,9 +308,14 @@ async function restartServiceWorker(env) {
     env.trace.push('restart-service-worker')
     const snapshot = clone(env.storage)
     const tabs = listTabs(env).map(tab => clone(tab))
+    env.sw.__testDeactivateHarness?.()
+    env.timers.clearAll()
     const next = loadServiceWorkerHarness({
         now: env.timers.now,
-        storage: snapshot
+        storage: snapshot,
+        disableQueueWakeupMetricsFlush: true,
+        disableQueueWalCheckpointSwitch: true,
+        suppressBackgroundWorkAfterDeactivate: true
     })
     let maxTabId = 99
     for(const tab of tabs) {
@@ -323,7 +328,7 @@ async function restartServiceWorker(env) {
     env.timers = next.timers
     env.storage = next.storage
     env.sourceSender = {tab: {id: 9000 + env.seed, windowId: 1}}
-    await sendMessage(env, {action: 'repair-coordinator-storage'})
+    await sendMessage(env, {action: 'reconcile-coordinator-storage'})
     await settle(env, 8)
 }
 
@@ -344,7 +349,12 @@ const ACTIONS = [
 ]
 
 async function runScenario(seed, steps) {
-    const harness = loadServiceWorkerHarness({now: 100000 + seed})
+    const harness = loadServiceWorkerHarness({
+        now: 100000 + seed,
+        disableQueueWakeupMetricsFlush: true,
+        disableQueueWalCheckpointSwitch: true,
+        suppressBackgroundWorkAfterDeactivate: true
+    })
     const env = {
         ...harness,
         seed,
@@ -368,6 +378,10 @@ async function runScenario(seed, steps) {
         const wrapped = new Error(`${error.message}\nseed=0x${seed.toString(16)} step=${env.stepIndex}\ntrace:\n${env.trace.join('\n')}`)
         wrapped.cause = error
         throw wrapped
+    }
+    finally {
+        env.sw.__testDeactivateHarness?.()
+        env.timers.clearAll()
     }
 }
 

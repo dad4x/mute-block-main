@@ -11,23 +11,6 @@ const {
     sleep
 } = require('./lib/cdp')
 
-async function openDashboard(config, targets) {
-    const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
-    let dashboard = targets.find(target => target.url === dashboardUrl)
-    if(dashboard) return dashboard
-
-    const versionInfo = await getJson('/json/version', config)
-    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
-        url: dashboardUrl,
-        background: true
-    })
-    await sleep(1500)
-    targets = await getTargets(config)
-    dashboard = targets.find(target => target.url === dashboardUrl)
-    if(!dashboard) throw new Error('Dashboard target not found')
-    return dashboard
-}
-
 async function clearExtensionErrors(config, extensionsPage) {
     return evaluate(extensionsPage.webSocketDebuggerUrl, `new Promise(resolve => {
         chrome.developerPrivate.getExtensionInfo(${jsString(config.extensionId)}, info => {
@@ -51,10 +34,32 @@ async function clearExtensionErrors(config, extensionsPage) {
     })`)
 }
 
+async function openExtensionsPage(config, targets) {
+    let extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
+    if(extensionsPage) return extensionsPage
+
+    const versionInfo = await getJson('/json/version', config)
+    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url: 'chrome://extensions/',
+        background: true
+    })
+    await sleep(1500)
+    targets = await getTargets(config)
+    extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
+    if(extensionsPage) return extensionsPage
+
+    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url: 'chrome://extensions/'
+    })
+    await sleep(1500)
+    targets = await getTargets(config)
+    return targets.find(target => target.url === 'chrome://extensions/') || null
+}
+
 runMain(async () => {
     const config = getCdpConfig()
     let targets = await getTargets(config)
-    const extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
+    const extensionsPage = await openExtensionsPage(config, targets)
     if(!extensionsPage) throw new Error('chrome://extensions/ target not found')
 
     const clearedErrors = await clearExtensionErrors(config, extensionsPage)
@@ -65,9 +70,6 @@ runMain(async () => {
         }))
     })`)
     await sleep(2500)
-    targets = await getTargets(config)
-    const dashboard = await openDashboard(config, targets)
-    const version = await evaluate(dashboard.webSocketDebuggerUrl, 'chrome.runtime.getManifest().version')
     const extensionInfoTarget = (await getTargets(config)).find(target => target.url === 'chrome://extensions/')
     const info = extensionInfoTarget
         ? await evaluate(extensionInfoTarget.webSocketDebuggerUrl, `new Promise(resolve => chrome.developerPrivate.getExtensionInfo(${jsString(config.extensionId)}, info => resolve({
@@ -80,6 +82,7 @@ runMain(async () => {
             installWarnings: (info.installWarnings || []).length
         })))`)
         : null
+    const version = info?.version || ''
 
     console.log(JSON.stringify({clearedErrors, reload, version, info}, null, 2))
 })

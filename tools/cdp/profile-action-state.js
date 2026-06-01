@@ -28,8 +28,9 @@ runMain(async () => {
     const result = await evaluate(tab.webSocketDebuggerUrl, `(${function inspectProfileActionState() {
         const visibleText = text => `${text || ''}`.replace(/\\s+/g, ' ').trim()
         const all = selector => Array.from(document.querySelectorAll(selector))
-        const buttons = all('button, [role="button"], a')
-            .map((node, index) => ({
+        const describeNode = (node, index) => {
+            const rect = node.getBoundingClientRect()
+            return {
                 index,
                 tag: node.tagName,
                 role: node.getAttribute('role') || '',
@@ -37,14 +38,37 @@ runMain(async () => {
                 aria: visibleText(node.getAttribute('aria-label') || ''),
                 title: visibleText(node.getAttribute('title') || ''),
                 disabled: !!node.disabled || node.getAttribute('aria-disabled') === 'true',
-                hidden: node.offsetParent === null
-            }))
+                hidden: node.offsetParent === null,
+                rect: {
+                    top: Math.round(rect.top),
+                    left: Math.round(rect.left),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                }
+            }
+        }
+        const buttons = all('button, [role="button"], [role="menuitem"], a')
+            .map(describeNode)
             .filter(item => /mute|unmute|block|unblock|more|follow|following|\\.\\.\\.|⋯/i.test([
                 item.text,
                 item.aria,
-                item.title
+                item.title,
+                item.role
             ].join(' ')))
             .slice(0, 80)
+        const menus = all('[role="menu"], [data-popper-placement]')
+            .map((node, index) => ({
+                index,
+                role: node.getAttribute('role') || '',
+                placement: node.getAttribute('data-popper-placement') || '',
+                text: visibleText(node.innerText || node.textContent || '').slice(0, 1000),
+                hidden: node.offsetParent === null,
+                items: Array.from(node.querySelectorAll('button, [role="button"], [role="menuitem"], a'))
+                    .map(describeNode)
+                    .slice(0, 40)
+            }))
+            .filter(item => !item.hidden || /mute|unmute|block|unblock/i.test(item.text))
+            .slice(0, 20)
         const dialogs = all('[role="dialog"], [aria-modal="true"]')
             .map((node, index) => ({
                 index,
@@ -59,6 +83,7 @@ runMain(async () => {
             contentReady: document.documentElement.getAttribute('data-mb-content-script-ready') || '',
             bodyText: visibleText(document.body?.innerText || '').slice(0, 1500),
             buttons,
+            menus,
             dialogs
         }
     }} )()`, 20000)
