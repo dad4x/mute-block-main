@@ -33,7 +33,7 @@ runMain(async () => {
                 timedOut: true,
                 lastError: ''
             }), 10000)
-            chrome.runtime.sendMessage({action: 'repair-coordinator-storage'}, response => finish({
+            chrome.runtime.sendMessage({action: 'reconcile-coordinator-storage', userInitiated: true}, response => finish({
                 response: response || null,
                 lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
             }))
