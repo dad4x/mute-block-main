@@ -145,7 +145,8 @@ const PERSISTENT_FAILED_RETRY_INTERVAL_MS = 5000
 const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
 const PERSISTENT_FAILED_RETRY_ALARM_PERIOD_MINUTES = 0.5
 const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
-const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-stored-work-repair'
+const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-coordinator-reconcile'
+const COORDINATOR_LEGACY_RECONCILE_ALARM_NAME = 'mb-stored-work-repair'
 const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const CONTENT_SCRIPT_READY_ATTR = 'data-mb-content-script-ready'
 const QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS = 750
@@ -821,6 +822,7 @@ function clearSchedulerAlarms(reason = 'clear-scheduler-alarms') {
     return Promise.all([
         browser.alarms.clear(COORDINATOR_RESUME_ALARM_NAME).catch(() => false),
         browser.alarms.clear(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false),
+        browser.alarms.clear(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME).catch(() => false),
         browser.alarms.clear(PERSISTENT_FAILED_RETRY_ALARM_NAME).catch(() => false)
     ])
         .then(results => {
@@ -14384,6 +14386,16 @@ function clearNamedSchedulerAlarm(name = '') {
     catch {}
 }
 
+function clearCoordinatorReconcileAlarms() {
+    clearNamedSchedulerAlarm(COORDINATOR_RECONCILE_ALARM_NAME)
+    clearNamedSchedulerAlarm(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME)
+}
+
+function isCoordinatorReconcileAlarmName(name = '') {
+    return name === COORDINATOR_RECONCILE_ALARM_NAME ||
+        name === COORDINATOR_LEGACY_RECONCILE_ALARM_NAME
+}
+
 function getSchedulerAlarmScheduledTime(alarm = null) {
     return Number.parseInt(alarm?.scheduledTime, 10) || 0
 }
@@ -14406,7 +14418,7 @@ function suppressStaleCoordinatorResumeAlarm(dueAt = 0) {
 function suppressStaleCoordinatorReconcileAlarm(dueAt = 0) {
     coordinatorReconcileClearedAlarmDueAt = Number.parseInt(dueAt, 10) || coordinatorReconcileClearedAlarmDueAt || 0
     coordinatorReconcileAlarmSuppressUntil = Date.now() + STALE_SCHEDULER_ALARM_SUPPRESSION_MS
-    clearNamedSchedulerAlarm(COORDINATOR_RECONCILE_ALARM_NAME)
+    clearCoordinatorReconcileAlarms()
 }
 
 function scheduleCoordinatorResumeAlarm(dueAt = 0) {
@@ -14539,6 +14551,7 @@ function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_M
 
     if(browser.alarms?.create) {
         try {
+            clearNamedSchedulerAlarm(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME)
             const alarmResult = browser.alarms.create(COORDINATOR_RECONCILE_ALARM_NAME, {when: dueAt})
             incrementQueueWakeupMetric('reconcile.alarmScheduled')
             if(alarmResult?.catch) alarmResult.catch(() => null)
@@ -26100,7 +26113,7 @@ if(browser.alarms?.onAlarm) {
             return runScheduledCoordinatorQueueResume('resume-alarm', {allowBeforeQuora}).catch(() => null)
         }
 
-        if(alarm?.name === COORDINATOR_RECONCILE_ALARM_NAME) {
+        if(isCoordinatorReconcileAlarmName(alarm?.name)) {
             if(isSuppressedStaleCoordinatorReconcileAlarm(alarm)) {
                 incrementQueueWakeupMetric('reconcile.alarmStale')
                 return null
@@ -26108,7 +26121,7 @@ if(browser.alarms?.onAlarm) {
             const allowBeforeQuora = await shouldAllowStoredWorkBeforeQuora('reconcile-alarm-stored-work')
             if(!allowBeforeQuora &&
                 !await ensureQuoraRuntimeActivatedForScheduler('reconcile-alarm-existing-quora-session')) {
-                void browser.alarms?.clear?.(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false)
+                clearCoordinatorReconcileAlarms()
                 return null
             }
             incrementQueueWakeupMetric('reconcile.alarmFired')

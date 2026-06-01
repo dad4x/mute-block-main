@@ -10042,7 +10042,7 @@ test('coordinator reconcile scheduler keeps the earliest requested deadline', as
     sw.scheduleCoordinatorReconcile(1000, {allowBeforeQuora: true})
     assert.equal(sw.state().coordinatorReconcileDueAt, 2000)
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [2000])
-    assert.equal(browser.__alarmCreates.at(-1).name, 'mb-stored-work-repair')
+    assert.equal(browser.__alarmCreates.at(-1).name, 'mb-coordinator-reconcile')
     assert.equal(browser.__alarmCreates.at(-1).info.when, 2000)
 
     sw.scheduleCoordinatorReconcile(5000)
@@ -11795,12 +11795,12 @@ test('extension lifecycle reset persists a fresh metrics epoch before Quora acti
     assert.equal(metrics.previousEpochs[0].rolloverReason, 'extension-updated')
     assert.equal(metrics.lifetime.counters['storageUpdate.started'], 4)
     assert.equal(
-        browser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair' && !alarm.cleared),
+        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-reconcile' && !alarm.cleared),
         false
     )
 })
 
-test('startup does not schedule queue repair before Quora is observed', async () => {
+test('startup does not schedule queue reconcile before Quora is observed', async () => {
     const gate = deferred()
     let metricsGetStarted = false
     const browser = createFakeBrowser({
@@ -11829,7 +11829,7 @@ test('startup does not schedule queue repair before Quora is observed', async ()
 
     await flushAsync(5)
     assert.equal(
-        harnessBrowser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair'),
+        harnessBrowser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-reconcile'),
         false
     )
     assert.equal(metricsGetStarted, false)
@@ -11880,7 +11880,7 @@ test('service worker reload rearms stored work in an existing browser session', 
     await timers.tick(1000)
     await flushAsync(1500)
 
-    assert.equal(browser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair' && !alarm.cleared), true)
+    assert.equal(browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-reconcile' && !alarm.cleared), true)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
@@ -12049,7 +12049,7 @@ test('first Quora tab observation preserves explicit pause across extension relo
     await timers.tick(0)
     await timers.tick(1000)
     await harnessBrowser.alarms.onAlarm.emit({name: 'mb-coordinator-resume'})
-    await harnessBrowser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
+    await harnessBrowser.alarms.onAlarm.emit({name: 'mb-coordinator-reconcile'})
     await flushAsync(20)
 
     assert.equal(storage.mbCoordinatorPaused, true)
@@ -12244,7 +12244,7 @@ test('dashboard resume waits for first Quora visit before scheduling work', asyn
     assert.equal(result.fallbackScheduled, false)
     assert.equal(result.resumeScheduled, false)
     assert.equal(
-        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-stored-work-repair'),
+        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-coordinator-reconcile'),
         false
     )
 })
@@ -12377,7 +12377,7 @@ test('browser startup leaves queued work idle when auto-start is disabled', asyn
     assert.equal(results[0]?.reason, 'browser-startup-auto-start-disabled')
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
     assert.equal(
-        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-stored-work-repair'),
+        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-coordinator-reconcile'),
         false
     )
 })
@@ -12650,7 +12650,7 @@ test('active transition retargets a replacement actor tab for the same attempt',
     assert.equal(storage.mbCoordinatorQueueView.items.find(item => item.storageKey === href).tabId, newTabId)
 })
 
-test('stored-work repair alarm clears the pending timeout and runs repair', async () => {
+test('coordinator reconcile alarm clears the pending timeout and runs reconcile', async () => {
     const {browser, sw, timers} = loadServiceWorkerHarness({now: 0})
 
     await activateQuoraRuntime(browser)
@@ -12658,7 +12658,22 @@ test('stored-work repair alarm clears the pending timeout and runs repair', asyn
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.ok(timers.pending().some(timer => timer.dueAt === 1000))
 
-    await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
+    await browser.alarms.onAlarm.emit({name: 'mb-coordinator-reconcile'})
+
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
+    assert.equal(timers.pending().some(timer => timer.dueAt === 1000), false)
+})
+
+test('legacy stored-work alarm name is accepted only as a reconcile transition alias', async () => {
+    const {browser, sw, timers} = loadServiceWorkerHarness({now: 0})
+    const legacyReconcileAlarmName = ['mb', 'stored', 'work', 'repair'].join('-')
+
+    await activateQuoraRuntime(browser)
+    sw.scheduleCoordinatorReconcile(1000)
+    assert.equal(browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-reconcile'), true)
+
+    await browser.alarms.onAlarm.emit({name: legacyReconcileAlarmName})
 
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(sw.state().coordinatorReconcileDueAt, 0)
@@ -12676,10 +12691,10 @@ test('coordinator reconcile timeout clears and suppresses stale alarm delivery',
 
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(sw.state().coordinatorReconcileDueAt, 0)
-    assert.ok(browser.__alarmCreates.some(alarm => alarm.name === 'mb-stored-work-repair' && alarm.cleared))
+    assert.ok(browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-reconcile' && alarm.cleared))
 
     const beforeCounters = sw.state().queueWakeupCounters
-    await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
+    await browser.alarms.onAlarm.emit({name: 'mb-coordinator-reconcile'})
     const afterCounters = sw.state().queueWakeupCounters
 
     assert.equal((afterCounters['reconcile.alarmStale'] || 0), (beforeCounters['reconcile.alarmStale'] || 0) + 1)
@@ -12698,7 +12713,7 @@ test('coordinator reconcile suppresses identifiable stale alarm after suppressio
 
     const beforeCounters = sw.state().queueWakeupCounters
     await browser.alarms.onAlarm.emit({
-        name: 'mb-stored-work-repair',
+        name: 'mb-coordinator-reconcile',
         scheduledTime: 1000
     })
     const afterCounters = sw.state().queueWakeupCounters
@@ -12721,7 +12736,7 @@ test('coordinator reconcile accepts Chrome-delayed scheduled alarm delivery', as
     }), true)
 
     await browser.alarms.onAlarm.emit({
-        name: 'mb-stored-work-repair',
+        name: 'mb-coordinator-reconcile',
         scheduledTime: 31000
     })
     const afterCounters = sw.state().queueWakeupCounters
@@ -12749,7 +12764,7 @@ test('coordinator reconcile stale alarm cannot steal a newer timeout', async () 
 
     const beforeCounters = sw.state().queueWakeupCounters
     await browser.alarms.onAlarm.emit({
-        name: 'mb-stored-work-repair',
+        name: 'mb-coordinator-reconcile',
         scheduledTime: 1000
     })
     const afterCounters = sw.state().queueWakeupCounters
@@ -13281,7 +13296,7 @@ test('first Quora activation without stored work only opens the runtime gate', a
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
     assert.equal(sw.state().coordinatorReconcileDueAt, 0)
     assert.equal(
-        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-stored-work-repair'),
+        browser.__alarmCreates.some(alarm => alarm.name === 'mb-coordinator-resume' || alarm.name === 'mb-coordinator-reconcile'),
         false
     )
     assert.equal(timers.pending().some(timer => timer.dueAt === 1000), false)
@@ -15041,7 +15056,7 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     await timers.tick(0)
     await timers.tick(1000)
     await browser.alarms.onAlarm.emit({name: 'mb-coordinator-resume'})
-    await browser.alarms.onAlarm.emit({name: 'mb-stored-work-repair'})
+    await browser.alarms.onAlarm.emit({name: 'mb-coordinator-reconcile'})
     await flushAsync(20)
 
     assert.equal(storage.mbCoordinatorPaused, true)

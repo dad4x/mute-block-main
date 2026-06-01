@@ -12,9 +12,19 @@ runMain(async () => {
     const config = getCdpConfig()
     const alarm = getOption('alarm', 'resume')
     const delayMs = Math.max(0, Number.parseInt(getOption('delay-ms', '500'), 10) || 0)
-    const name = alarm === 'repair'
-        ? 'mb-stored-work-repair'
-        : 'mb-coordinator-resume'
+    const alarmNames = {
+        reconcile: 'mb-coordinator-reconcile',
+        resume: 'mb-coordinator-resume'
+    }
+    const name = alarmNames[alarm]
+    if(!name) {
+        console.log(JSON.stringify({
+            scheduled: false,
+            error: `Unknown alarm ${alarm}; expected resume or reconcile`
+        }, null, 2))
+        process.exitCode = 1
+        return
+    }
     const targets = await getTargets(config)
     const serviceWorker = targets.find(target =>
         target.type === 'service_worker' && (target.url || '').includes(config.extensionId)
