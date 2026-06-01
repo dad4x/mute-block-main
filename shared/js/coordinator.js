@@ -1341,8 +1341,8 @@ function renderWakeupMetrics(queueItems = []) {
     const nudgeAccepted = getMetricCounter(counters, 'nudge.accepted')
     const pumpRequested = getMetricCounter(counters, 'pump.requested')
     const pumpChanged = sumMetricCounters(counters, 'pump.changed.')
-    const repairRequested = getMetricCounter(counters, 'repair.requested')
-    const repairChanged = sumMetricCounters(counters, 'repair.changed.')
+    const reconcileRequested = getMetricCounter(counters, 'reconcile.requested')
+    const reconcileChanged = sumMetricCounters(counters, 'reconcile.changed.')
     const storageStarted = getMetricCounter(counters, 'storageUpdate.started')
     const storageTimedOut = getMetricCounter(counters, 'storageUpdate.timedOut')
     const storageDeadlineMissed = getMetricCounter(counters, 'storageUpdate.deadlineMissed')
@@ -1377,7 +1377,7 @@ function renderWakeupMetrics(queueItems = []) {
     const duplicatePumps = getMetricCounter(counters, 'pump.noop.noPendingItems') +
         getMetricCounter(counters, 'pump.noop.executorAlreadyRunning') +
         getMetricCounter(counters, 'pump.noop.paused')
-    const wakeups = nudgeSent + pumpRequested + repairRequested
+    const wakeups = nudgeSent + pumpRequested + reconcileRequested
     const stalledQueued = queueItems.filter(item => `${item?.status || ''}` === 'queued').length
 
     const epochReason = metrics.resetReason ? `, ${metrics.resetReason}` : ''
@@ -1395,7 +1395,7 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Nudge accept', nudgeSent ? formatPercent(nudgeAccepted / nudgeSent) : '--', `${nudgeAccepted} / ${nudgeSent}`),
             buildMetricCard('Pump yield', pumpRequested ? formatPercent(pumpChanged / pumpRequested) : '--', `${pumpChanged} changed / ${pumpRequested}`),
             buildMetricCard('Duplicate pumps', pumpRequested ? formatPercent(duplicatePumps / pumpRequested) : '--', `${duplicatePumps} no-op`),
-            buildMetricCard('Repairs/job', jobs ? formatRatio(repairRequested / jobs) : '--', `${repairChanged} repair changes`),
+            buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', `${reconcileChanged} reconcile changes`),
             buildMetricCard('Terminal jobs', `${terminalJobs}`, `${stalledQueued} currently queued`),
             buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen)),
             buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted)),

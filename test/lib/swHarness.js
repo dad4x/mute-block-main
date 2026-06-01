@@ -567,10 +567,10 @@ module.exports.__test = {
     },
     state() {
         return {
-            storedWorkRepairDueAt,
-            hasStoredWorkRepairTimeout: !!storedWorkRepairTimeout,
-            storedWorkRepairBackoffLevel,
-            storedWorkRepairBackoffUntil,
+            coordinatorReconcileDueAt,
+            hasCoordinatorReconcileTimeout: !!coordinatorReconcileTimeout,
+            coordinatorReconcileBackoffLevel,
+            coordinatorReconcileBackoffUntil,
             coordinatorQueueResumeDueAt,
             hasCoordinatorQueueResumeTimeout: !!coordinatorQueueResumeTimeout,
             queueWakeupCounters: {...getQueueWakeupMetricEpoch().counters},
