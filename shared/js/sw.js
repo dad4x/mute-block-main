@@ -1077,7 +1077,6 @@ function makeQuoraRuntimeNotActivatedResult(reason = 'quora-runtime-not-activate
         fallbackScheduled: false,
         resumeScheduled: false,
         reconcileScheduled: false,
-        repairScheduled: false,
         scheduledOnly: true
     }
 }
@@ -26742,15 +26741,13 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     else if(request.action === 'cancel-coordinator-current-work-item') {
         return cancelCoordinatorCurrentWorkItem(request)
     }
-    else if(request.action === 'reconcile-coordinator-storage' ||
-        request.action === 'repair-coordinator-storage') {
+    else if(request.action === 'reconcile-coordinator-storage') {
         if(request.userInitiated !== true && request.legacyImport !== true) {
             return Promise.resolve({
                 recovered: false,
                 displayOnly: true,
                 reason: 'display-only-reconcile-disabled',
                 reconcileScheduled: false,
-                repairScheduled: false,
                 scheduledOnly: false
             })
         }
@@ -26775,9 +26772,7 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return {
                 ...(result || {}),
                 reconcile,
-                repair: reconcile,
                 reconcileScheduled: true,
-                repairScheduled: true,
                 direct: true
             }
         }
@@ -26801,7 +26796,6 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         reason: scheduledReason,
                         fallbackScheduled: true,
                         reconcileScheduled: true,
-                        repairScheduled: true,
                         scheduledOnly: true
                     }
                 })
@@ -26819,7 +26813,6 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
             reason: scheduledReason,
             fallbackScheduled: true,
             reconcileScheduled: true,
-            repairScheduled: true,
             scheduledOnly: true
         })
     }

@@ -7036,7 +7036,7 @@ test('deferred milestone acknowledgement is row-specific for mixed flush results
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.terminalRowPreserved'] || 0, 1)
 })
 
-test('dashboard repair request is display-only and does not schedule progress import', async () => {
+test('dashboard reconcile request is display-only and does not schedule progress import', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-User'
     const runId = 'run-synthetic-1'
     const {browser, storage} = loadServiceWorkerHarness({
@@ -7074,9 +7074,30 @@ test('dashboard repair request is display-only and does not schedule progress im
     assert.equal(result.reason, 'display-only-reconcile-disabled')
     assert.equal(result.displayOnly, true)
     assert.equal(result.reconcileScheduled, false)
-    assert.equal(result.repairScheduled, false)
     assert.equal(result.scheduledOnly, false)
     assert.equal(storage.mbCoordinatorQueue[href], undefined)
+})
+
+test('legacy repair coordinator request action is not accepted', async () => {
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 100250,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {}
+        }
+    })
+
+    await activateQuoraRuntime(browser, 'https://www.quora.com/space/example')
+
+    const legacyAction = ['repair', 'coordinator', 'storage'].join('-')
+    const result = await browser.runtime.sendMessage({
+        action: legacyAction,
+        userInitiated: true,
+        legacyImport: true
+    })
+
+    assert.equal(result, undefined)
+    assert.deepEqual(storage.mbCoordinatorQueue, {})
 })
 
 test('explicit legacy import keeps progress restore quarantined from dashboard display path', async () => {
@@ -7118,9 +7139,10 @@ test('explicit legacy import keeps progress restore quarantined from dashboard d
     })
 
     assert.equal(result.reconcileScheduled, true)
-    assert.equal(result.repairScheduled, true)
     assert.equal(result.direct, true)
     assert.equal(result.reconcile.queueChanged, true)
+    assert.equal(Object.prototype.hasOwnProperty.call(result, 'repair'), false)
+    assert.equal(Object.prototype.hasOwnProperty.call(result, 'repairScheduled'), false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
 })
 
