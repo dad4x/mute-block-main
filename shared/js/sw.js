@@ -9553,7 +9553,7 @@ function mergeCoordinatorSourceMetadata(existing = {}, inferred = {}) {
     return next
 }
 
-function applyCoordinatorSourceMetadataRepair(item = {}, inferred = {}) {
+function applyCoordinatorSourceMetadataMaterialization(item = {}, inferred = {}) {
     if(!item || typeof item !== 'object' || !inferred?.type) return item
 
     let changed = false
@@ -9566,7 +9566,7 @@ function applyCoordinatorSourceMetadataRepair(item = {}, inferred = {}) {
 
     const sources = Array.isArray(next.sources) ? next.sources : []
     let matchedSource = false
-    const repairedSources = sources.map(source => {
+    const materializedSources = sources.map(source => {
         if(!source || typeof source !== 'object') return source
         if(source.type && source.type !== inferred.type) return source
         matchedSource = true
@@ -9576,10 +9576,10 @@ function applyCoordinatorSourceMetadataRepair(item = {}, inferred = {}) {
     })
 
     if(!matchedSource && (inferred.pageUrl || inferred.searchQuery)) {
-        repairedSources.push({...inferred})
+        materializedSources.push({...inferred})
         changed = true
     }
-    if(changed) next.sources = repairedSources
+    if(changed) next.sources = materializedSources
 
     if(inferred.pageUrl && next.scope && typeof next.scope === 'object' && !next.scope.sourcePageUrl) {
         next.scope = {
@@ -10186,7 +10186,7 @@ function hasTerminalKeyOnlyCoordinatorEvent(events = [], itemKey = '', item = {}
     })
 }
 
-function repairTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
+function materializeTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
     if(!item || typeof item !== 'object') return {changed: false}
     if(getCoordinatorItemHref(item) || !isTerminalCoordinatorStatus(item.status)) return {changed: false}
 
@@ -10212,7 +10212,7 @@ function repairTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item 
         at: eventAt,
         details: {
             coordinatorKey: getCoordinatorItemQueueKey(item, itemKey),
-            reason: item.actionLeaseReleaseReason || item.outcome || 'terminal-key-only-derived-repair'
+            reason: item.actionLeaseReleaseReason || item.outcome || 'terminal-key-only-derived-materialization'
         }
     })
 
@@ -10224,7 +10224,7 @@ function repairTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item 
     }
 }
 
-function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
+function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
     if(!item || typeof item !== 'object') return {changed: false}
     if(!isTerminalCoordinatorStatus(item.status) || !isProfileResolutionItem(item)) return {changed: false}
     if(item.status !== 'skipped' || `${item.outcome || ''}`.trim() !== 'unresolved-target') return {changed: false}
@@ -10245,7 +10245,7 @@ function repairTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = 
     }
 }
 
-function repairResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
+function settleResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
     if(!item || typeof item !== 'object') return {changed: false}
     const resolvedHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
     if(!resolvedHref || isProfileResolutionItem(item)) return {changed: false}
@@ -10283,7 +10283,7 @@ function repairResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = 
     }
 }
 
-function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
+function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
     if(!item || typeof item !== 'object') return {changed: false}
     if(`${item.status || ''}` !== 'queued') return {changed: false}
 
@@ -10370,18 +10370,18 @@ function repairQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', ite
 
     if((runsChanged || progressChanged) && !events.some(event =>
         `${event?.runId || ''}` === runId &&
-        `${event?.type || ''}` === 'repair' &&
-        `${event?.details?.reason || ''}` === 'enqueue-derived-repair'
+        `${event?.type || ''}` === 'materialize' &&
+        `${event?.details?.reason || ''}` === 'enqueue-derived-materialization'
     )) {
         events.push({
             id: makeId('event'),
             runId,
             itemId: coordinatorKey || itemKey,
-            type: 'repair',
-            message: 'Repaired derived enqueue state',
+            type: 'materialize',
+            message: 'Materialized derived enqueue state',
             at: now,
             details: {
-                reason: 'enqueue-derived-repair',
+                reason: 'enqueue-derived-materialization',
                 coordinatorKey,
                 targetProfileHref: href,
                 sourcePageUrl
@@ -10523,9 +10523,9 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
 
         if(item.runId) {
             const inferredSource = makeCoordinatorSourceFromRunMetadata(item.runId || '', ctx.runs[item.runId] || {}, events)
-            const sourceRepairedItem = applyCoordinatorSourceMetadataRepair(item, inferredSource)
-            if(sourceRepairedItem !== item) {
-                item = sourceRepairedItem
+            const sourceMaterializedItem = applyCoordinatorSourceMetadataMaterialization(item, inferredSource)
+            if(sourceMaterializedItem !== item) {
+                item = sourceMaterializedItem
                 queue[itemKey] = item
                 ctx.changed = true
                 ctx.repaired += 1
@@ -10533,35 +10533,35 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             }
         }
 
-        const terminalKeyOnlyDerivedRepair = repairTerminalKeyOnlyDerivedStateLocked(state, itemKey, item, now)
-        if(terminalKeyOnlyDerivedRepair.changed) {
-            ctx.eventsChanged = ctx.eventsChanged || terminalKeyOnlyDerivedRepair.eventsChanged
-            ctx.repaired += terminalKeyOnlyDerivedRepair.repaired || 0
+        const terminalKeyOnlyDerivedMaterialization = materializeTerminalKeyOnlyDerivedStateLocked(state, itemKey, item, now)
+        if(terminalKeyOnlyDerivedMaterialization.changed) {
+            ctx.eventsChanged = ctx.eventsChanged || terminalKeyOnlyDerivedMaterialization.eventsChanged
+            ctx.repaired += terminalKeyOnlyDerivedMaterialization.repaired || 0
         }
-        addCoordinatorReconcileAffectedRunIds(ctx, terminalKeyOnlyDerivedRepair.affectedRunIds)
+        addCoordinatorReconcileAffectedRunIds(ctx, terminalKeyOnlyDerivedMaterialization.affectedRunIds)
 
-        const terminalResolverPendingRepair = repairTerminalResolverPendingSourceRecordsLocked(state, itemKey, item)
-        if(terminalResolverPendingRepair.changed) {
-            ctx.pendingPosts = terminalResolverPendingRepair.pendingPosts || ctx.pendingPosts
-            ctx.pendingPostsChanged = ctx.pendingPostsChanged || terminalResolverPendingRepair.pendingPostsChanged
-            ctx.repaired += terminalResolverPendingRepair.repaired || 0
-        }
-
-        const resolvedResolverPendingRepair = repairResolvedResolverPendingSourceRecordsLocked(state, itemKey, item)
-        if(resolvedResolverPendingRepair.changed) {
-            ctx.pendingPosts = resolvedResolverPendingRepair.pendingPosts || ctx.pendingPosts
-            ctx.pendingPostsChanged = ctx.pendingPostsChanged || resolvedResolverPendingRepair.pendingPostsChanged
-            ctx.repaired += resolvedResolverPendingRepair.repaired || 0
+        const terminalResolverPendingSettlement = settleTerminalResolverPendingSourceRecordsLocked(state, itemKey, item)
+        if(terminalResolverPendingSettlement.changed) {
+            ctx.pendingPosts = terminalResolverPendingSettlement.pendingPosts || ctx.pendingPosts
+            ctx.pendingPostsChanged = ctx.pendingPostsChanged || terminalResolverPendingSettlement.pendingPostsChanged
+            ctx.repaired += terminalResolverPendingSettlement.repaired || 0
         }
 
-        const queuedDerivedRepair = repairQueuedCoordinatorDerivedStateLocked(state, itemKey, item, now)
-        if(queuedDerivedRepair.changed) {
-            ctx.runsMetadataChanged = ctx.runsMetadataChanged || queuedDerivedRepair.runsChanged
-            ctx.progressChanged = ctx.progressChanged || queuedDerivedRepair.progressChanged
-            ctx.eventsChanged = ctx.eventsChanged || queuedDerivedRepair.eventsChanged
-            ctx.repaired += queuedDerivedRepair.repaired || 0
+        const resolvedResolverPendingSettlement = settleResolvedResolverPendingSourceRecordsLocked(state, itemKey, item)
+        if(resolvedResolverPendingSettlement.changed) {
+            ctx.pendingPosts = resolvedResolverPendingSettlement.pendingPosts || ctx.pendingPosts
+            ctx.pendingPostsChanged = ctx.pendingPostsChanged || resolvedResolverPendingSettlement.pendingPostsChanged
+            ctx.repaired += resolvedResolverPendingSettlement.repaired || 0
         }
-        addCoordinatorReconcileAffectedRunIds(ctx, queuedDerivedRepair.affectedRunIds)
+
+        const queuedDerivedMaterialization = materializeQueuedCoordinatorDerivedStateLocked(state, itemKey, item, now)
+        if(queuedDerivedMaterialization.changed) {
+            ctx.runsMetadataChanged = ctx.runsMetadataChanged || queuedDerivedMaterialization.runsChanged
+            ctx.progressChanged = ctx.progressChanged || queuedDerivedMaterialization.progressChanged
+            ctx.eventsChanged = ctx.eventsChanged || queuedDerivedMaterialization.eventsChanged
+            ctx.repaired += queuedDerivedMaterialization.repaired || 0
+        }
+        addCoordinatorReconcileAffectedRunIds(ctx, queuedDerivedMaterialization.affectedRunIds)
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         let record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
@@ -10695,7 +10695,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
                         href,
                         item,
                         record,
-                        'Restored terminal profile progress during authoritative queue repair'
+                        'Restored terminal profile progress during authoritative queue reconcile'
                     )
                     if(restoredRecord && JSON.stringify(restoredRecord) !== JSON.stringify(record)) {
                         const recordHref = normalizeQuoraProfileUrl(href || restoredRecord.profileHref || '')
@@ -13987,12 +13987,12 @@ async function restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration = 
     return true
 }
 
-function scheduleCoordinatorPauseStateRepair(reason = 'pause-generation-repair') {
+function scheduleCoordinatorPauseStateReconcile(reason = 'pause-generation-reconcile') {
     setTimeout(() => {
         void setCoordinatorPauseControlState(
             coordinatorPauseRequested === true,
             coordinatorPauseGeneration,
-            'repair'
+            'reconcile'
         ).catch(() => null)
 
         if(coordinatorPauseRequested !== true) {
@@ -14184,7 +14184,7 @@ async function setCoordinatorPauseControlState(paused = false, pauseGeneration =
 
 async function mutateCoordinatorPauseStateSet(operation = {}) {
     const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
-    if(snapshotReason !== 'ordinaryMutation' && snapshotReason !== 'repair') {
+    if(snapshotReason !== 'ordinaryMutation' && snapshotReason !== 'reconcile') {
         return {changed: false, reason: 'invalid-reason'}
     }
 
@@ -17825,7 +17825,7 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     })
     if(pauseGeneration && !isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)) {
         await restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration)
-        scheduleCoordinatorPauseStateRepair('stale-pause-flag-repair')
+        scheduleCoordinatorPauseStateReconcile('stale-pause-flag-reconcile')
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: Array.from(ownedTabIds), stalePause: true}
     }
 
@@ -17934,7 +17934,7 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     }
     if(pauseGeneration && !isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)) {
         await restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration)
-        scheduleCoordinatorPauseStateRepair('stale-pause-save-repair')
+        scheduleCoordinatorPauseStateReconcile('stale-pause-save-reconcile')
         return {pausedUrls: [], pausedWorkKeys: [], ownedTabIds: Array.from(ownedTabIds), stalePause: true}
     }
 
