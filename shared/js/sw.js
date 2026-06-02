@@ -9672,7 +9672,7 @@ function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
             pendingPostsChanged: false,
             nukedPostsChanged: false,
             affectedRunIds: [],
-            repaired: 0,
+            materialized: 0,
             runs: state.runs || {},
             pendingPosts: state.pendingPosts || {},
             nukedPosts: state.nukedPosts || {}
@@ -9689,7 +9689,7 @@ function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
     let runsChanged = false
     let pendingPostsChanged = false
     let nukedPostsChanged = false
-    let repaired = 0
+    let materialized = 0
 
     for(const href of removedHrefs) {
         if(liveHrefs.has(href)) continue
@@ -9728,7 +9728,7 @@ function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
             hrefChanged = true
         }
 
-        if(hrefChanged) repaired += 1
+        if(hrefChanged) materialized += 1
     }
 
     return {
@@ -9738,7 +9738,7 @@ function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
         pendingPostsChanged,
         nukedPostsChanged,
         affectedRunIds: Array.from(affectedRunIds),
-        repaired,
+        materialized,
         runs,
         pendingPosts,
         nukedPosts
@@ -9882,7 +9882,7 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
         timeoutMs,
         'coordinator storage reconcile'
     ).catch(error => ({
-        repaired: 0,
+        materialized: 0,
         queueChanged: false,
         runsChanged: false,
         timedOut: /timed out/i.test(error?.message || ''),
@@ -9973,7 +9973,7 @@ function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operatio
         queueChanged: true,
         pendingPostsChanged,
         pendingPosts,
-        repaired: 1,
+        materialized: 1,
         affectedRunIds: item.runId ? [item.runId] : [],
         tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
         item: nextItem
@@ -10010,7 +10010,7 @@ function applyStaleProfileResolutionTabReconcileActionLocked(state = {}, operati
     return {
         changed: true,
         queueChanged: true,
-        repaired: 1,
+        materialized: 1,
         affectedRunIds: item.runId ? [item.runId] : [],
         tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
         item: nextItem
@@ -10055,7 +10055,7 @@ function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operati
     return {
         changed: true,
         queueChanged: true,
-        repaired: 1,
+        materialized: 1,
         previousItem: item,
         item: nextItem,
         mappedTerminal: isTerminalCoordinatorStatus(mapped.status),
@@ -10220,7 +10220,7 @@ function materializeTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', 
         changed: true,
         eventsChanged: true,
         affectedRunIds,
-        repaired: 1
+        materialized: 1
     }
 }
 
@@ -10241,7 +10241,7 @@ function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = 
         changed: true,
         pendingPostsChanged: true,
         pendingPosts: pendingResult.pendingPosts,
-        repaired: 1
+        materialized: 1
     }
 }
 
@@ -10279,7 +10279,7 @@ function settleResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = 
         changed: true,
         pendingPostsChanged: true,
         pendingPosts: pendingResult.pendingPosts,
-        repaired: 1
+        materialized: 1
     }
 }
 
@@ -10301,7 +10301,7 @@ function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = ''
     let runsChanged = false
     let progressChanged = false
     let eventsChanged = false
-    let repaired = 0
+    let materialized = 0
 
     const targetProfileHrefs = new Set(getCoordinatorRunTargetHrefs(run))
     const targetWorkKeys = new Set(Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [])
@@ -10333,7 +10333,7 @@ function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = ''
             targetProfileHrefs: Array.from(targetProfileHrefs),
             targetWorkKeys: Array.from(targetWorkKeys)
         }
-        repaired += 1
+        materialized += 1
     }
 
     const existingProgressRecord = href ? getCoordinatorProgressRecordForItem(itemKey, item, progress) : null
@@ -10364,7 +10364,7 @@ function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = ''
                 [href]: resetRecord
             }
             progressChanged = true
-            repaired += 1
+            materialized += 1
         }
     }
 
@@ -10396,7 +10396,7 @@ function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = ''
         progressChanged,
         eventsChanged,
         affectedRunIds: runsChanged || progressChanged || eventsChanged ? [runId] : [],
-        repaired
+        materialized
     }
 }
 
@@ -10443,7 +10443,7 @@ async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
         nukedPostsChanged: false,
         progressChanged: false,
         runsMetadataChanged: false,
-        repaired: 0,
+        materialized: 0,
         recomputeAllRuns: false,
         affectedRunIds: new Set(),
         terminalSettlementHrefs: new Set(),
@@ -10464,7 +10464,7 @@ function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {}) {
         ctx.runsMetadataChanged = ctx.runsMetadataChanged || clearProfileMaterialized.runsChanged
         ctx.pendingPostsChanged = ctx.pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
         ctx.nukedPostsChanged = ctx.nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
-        ctx.repaired += clearProfileMaterialized.repaired || 0
+        ctx.materialized += clearProfileMaterialized.materialized || 0
         addCoordinatorReconcileAffectedRunIds(ctx, clearProfileMaterialized.affectedRunIds)
     }
 }
@@ -10477,7 +10477,7 @@ function importLegacyQueuedProgressRecordsReconcilePhase(ctx = {}, options = {})
             ctx.eventsChanged = ctx.eventsChanged || restoredQueued.eventsChanged
             ctx.progressChanged = ctx.progressChanged || restoredQueued.progressChanged
             ctx.runsMetadataChanged = true
-            ctx.repaired += restoredQueued.restored
+            ctx.materialized += restoredQueued.restored
             addCoordinatorReconcileAffectedRunIds(ctx, restoredQueued.affectedRunIds)
         }
     }
@@ -10515,7 +10515,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             }
             queue[itemKey] = item
             ctx.changed = true
-            ctx.repaired += 1
+            ctx.materialized += 1
             markCoordinatorReconcileRunAffected(ctx, item)
             const terminalHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
             if(terminalHref) ctx.terminalSettlementHrefs.add(terminalHref)
@@ -10528,7 +10528,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
                 item = sourceMaterializedItem
                 queue[itemKey] = item
                 ctx.changed = true
-                ctx.repaired += 1
+                ctx.materialized += 1
                 markCoordinatorReconcileRunAffected(ctx, item)
             }
         }
@@ -10536,7 +10536,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
         const terminalKeyOnlyDerivedMaterialization = materializeTerminalKeyOnlyDerivedStateLocked(state, itemKey, item, now)
         if(terminalKeyOnlyDerivedMaterialization.changed) {
             ctx.eventsChanged = ctx.eventsChanged || terminalKeyOnlyDerivedMaterialization.eventsChanged
-            ctx.repaired += terminalKeyOnlyDerivedMaterialization.repaired || 0
+            ctx.materialized += terminalKeyOnlyDerivedMaterialization.materialized || 0
         }
         addCoordinatorReconcileAffectedRunIds(ctx, terminalKeyOnlyDerivedMaterialization.affectedRunIds)
 
@@ -10544,14 +10544,14 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
         if(terminalResolverPendingSettlement.changed) {
             ctx.pendingPosts = terminalResolverPendingSettlement.pendingPosts || ctx.pendingPosts
             ctx.pendingPostsChanged = ctx.pendingPostsChanged || terminalResolverPendingSettlement.pendingPostsChanged
-            ctx.repaired += terminalResolverPendingSettlement.repaired || 0
+            ctx.materialized += terminalResolverPendingSettlement.materialized || 0
         }
 
         const resolvedResolverPendingSettlement = settleResolvedResolverPendingSourceRecordsLocked(state, itemKey, item)
         if(resolvedResolverPendingSettlement.changed) {
             ctx.pendingPosts = resolvedResolverPendingSettlement.pendingPosts || ctx.pendingPosts
             ctx.pendingPostsChanged = ctx.pendingPostsChanged || resolvedResolverPendingSettlement.pendingPostsChanged
-            ctx.repaired += resolvedResolverPendingSettlement.repaired || 0
+            ctx.materialized += resolvedResolverPendingSettlement.materialized || 0
         }
 
         const queuedDerivedMaterialization = materializeQueuedCoordinatorDerivedStateLocked(state, itemKey, item, now)
@@ -10559,7 +10559,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             ctx.runsMetadataChanged = ctx.runsMetadataChanged || queuedDerivedMaterialization.runsChanged
             ctx.progressChanged = ctx.progressChanged || queuedDerivedMaterialization.progressChanged
             ctx.eventsChanged = ctx.eventsChanged || queuedDerivedMaterialization.eventsChanged
-            ctx.repaired += queuedDerivedMaterialization.repaired || 0
+            ctx.materialized += queuedDerivedMaterialization.materialized || 0
         }
         addCoordinatorReconcileAffectedRunIds(ctx, queuedDerivedMaterialization.affectedRunIds)
 
@@ -10606,7 +10606,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
                 ctx.pendingPosts = applied.pendingPosts || ctx.pendingPosts
                 ctx.pendingPostsChanged = ctx.pendingPostsChanged || applied.pendingPostsChanged
                 ctx.changed = true
-                ctx.repaired += applied.repaired || 0
+                ctx.materialized += applied.materialized || 0
                 addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
                     if(closeTabId) ctx.tabsToCloseAfterReconcile.add(closeTabId)
@@ -10634,7 +10634,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             })
             if(applied.changed) {
                 ctx.changed = true
-                ctx.repaired += applied.repaired || 0
+                ctx.materialized += applied.materialized || 0
                 addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
                     if(closeTabId) ctx.tabsToCloseAfterReconcile.add(closeTabId)
@@ -10671,7 +10671,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             if(applied.changed) {
                 record = progress[applied.href] || record
                 ctx.progressChanged = ctx.progressChanged || applied.progressChanged
-                ctx.repaired += applied.repaired || 0
+                ctx.materialized += applied.materialized || 0
                 reconciledMissingActive = true
                 addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
                 for(const closeTabId of applied.tabIdsToClose || []) {
@@ -10705,7 +10705,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
                             [recordHref]: restoredRecord
                         }
                         ctx.progressChanged = true
-                        ctx.repaired += 1
+                        ctx.materialized += 1
                         markCoordinatorReconcileRunAffected(ctx, item)
                     }
                 }
@@ -10736,7 +10736,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
         if(!applied.changed) continue
         if(applied.mappedTerminal) ctx.terminalSettlementHrefs.add(href)
         ctx.changed = true
-        ctx.repaired += applied.repaired || 0
+        ctx.materialized += applied.materialized || 0
         addCoordinatorReconcileAffectedRunIds(ctx, applied.affectedRunIds)
     }
 
@@ -10750,7 +10750,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
         ctx.runs = runsPauseMaterialized.runs || ctx.runs
         state.runs = ctx.runs
         ctx.runsMetadataChanged = true
-        ctx.repaired += runsPauseMaterialized.affectedRunIds.length
+        ctx.materialized += runsPauseMaterialized.affectedRunIds.length
         addCoordinatorReconcileAffectedRunIds(ctx, runsPauseMaterialized.affectedRunIds)
     }
 }
@@ -10825,7 +10825,7 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
         }, {
             operationKind: 'reconcile-progress'
         })
-        queueAuthorityChangedRows = Number.parseInt(queueAuthorityPersistence?.changedRows, 10) || ctx.repaired
+        queueAuthorityChangedRows = Number.parseInt(queueAuthorityPersistence?.changedRows, 10) || ctx.materialized
         if(queueAuthorityPersistence?.saved !== true) {
             saved = false
             incrementQueueWakeupMetric('reconcile.queueWalSaveFailed')
@@ -10866,7 +10866,7 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
             nukedPosts: ctx.nukedPostsChanged,
             reason: 'reconcile',
             queueOperation: 'reconcile-progress',
-            queueChangedRows: queueAuthorityChangedRows || ctx.repaired,
+            queueChangedRows: queueAuthorityChangedRows || ctx.materialized,
             coordinatorAuthorityWrite: ctx.changed && queueAuthorityPersistence?.saved === true
         })
         if(stateSaved === false) saved = false
@@ -10887,7 +10887,7 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
     await flushPendingCoordinatorDiagnosticEvents()
 
     return {
-        repaired: ctx.repaired,
+        materialized: ctx.materialized,
         queueChanged: ctx.changed,
         pendingPostsChanged: ctx.pendingPostsChanged,
         nukedPostsChanged: ctx.nukedPostsChanged,
@@ -11788,7 +11788,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItem(itemKey = '',
         expectedAttemptId,
         expectedAttemptNumber,
         reason: 'ordinaryMutation',
-        metricPath: 'repair.exhaustedRolledBackQueued.save',
+        metricPath: 'reconcile.exhaustedRolledBackQueued.save',
         currentAuthorityState: options.currentAuthorityState || null,
         mutate(currentItem, context) {
             if(!isExhaustedRolledBackQueuedTabRetry(currentItem)) {
@@ -11825,7 +11825,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItem(itemKey = '',
             }, {
                 queue: false,
                 runs: true,
-                reason: 'repair',
+                reason: 'reconcile',
                 queueOperation: 'terminalize-exhausted-rolled-back-queued-derived',
                 queueChangedRows: 0
             })
@@ -11888,7 +11888,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
 
     return enqueueSpaceFeedStorageUpdate(async () => {
         const state = await loadCoordinatorQueueRunsProjection({
-            metricPath: 'repair.exhaustedRolledBackQueued.batch.load'
+            metricPath: 'reconcile.exhaustedRolledBackQueued.batch.load'
         })
         const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
         const originalQueue = currentAuthorityState.queue
@@ -11926,7 +11926,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
                 accepted: true,
                 changed: true,
                 durable: true,
-                reason: 'repair',
+                reason: 'reconcile',
                 previousRow: currentItem,
                 nextRow,
                 terminal: true
@@ -11953,8 +11953,8 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
                 operationKind: 'terminalize-exhausted-rolled-back-queued',
                 reason: 'ordinaryMutation',
                 previousProjectionQueue: originalQueue,
-                metricPath: 'repair.exhaustedRolledBackQueued.batch.queueWal',
-                projectionMetricPath: 'repair.exhaustedRolledBackQueued.batch.projection',
+                metricPath: 'reconcile.exhaustedRolledBackQueued.batch.queueWal',
+                projectionMetricPath: 'reconcile.exhaustedRolledBackQueued.batch.projection',
                 projectionPayload: 'queueViewOnly'
             }
         )
@@ -11969,7 +11969,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
 
         await coordinatorAuthority.hydrate().catch(() => null)
         scheduleCoordinatorReconcile(1000, {
-            reason: 'terminalize-exhausted-rolled-back-queued-derived-repair',
+            reason: 'terminalize-exhausted-rolled-back-queued-derived-reconcile',
             edgeTriggered: true
         })
         return {
@@ -13090,7 +13090,7 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         resolvedProfileHref: href,
         remappedFromRequested: false,
         finalError: '',
-        event: 'Profile confirmed blocked by active actorless repair'
+        event: 'Profile confirmed blocked during active actorless reconcile'
     }, {
         senderTabId: tabId,
         expectTerminal: true,
@@ -13120,7 +13120,7 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         await browser.tabs.remove(closeTabId).catch(() => {})
         closedTabIds.add(closeTabId)
     }
-    incrementQueueWakeupMetric('repair.activeBlockedLiveTabTerminalized')
+    incrementQueueWakeupMetric('reconcile.activeBlockedLiveTabTerminalized')
 
     return {
         changed: true,
@@ -22016,7 +22016,7 @@ function applyMissingActiveCoordinatorEvidenceReconcileActionLocked(state = {}, 
     return {
         changed: true,
         progressChanged: true,
-        repaired: 1,
+        materialized: 1,
         affectedRunIds: Array.from(affectedRunIds),
         tabIdsToClose: Array.from(tabIdsToClose),
         href: recordHref
