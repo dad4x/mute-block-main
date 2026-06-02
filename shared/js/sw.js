@@ -1422,7 +1422,6 @@ function recordStoragePathLatencyMetrics(direction = '', pathName = '', duration
 
 const SNAPSHOT_WRITE_REASONS = new Set([
     'ordinaryMutation',
-    'repair',
     'reconcile',
     'displayRead',
     'compatibilityFlush',
@@ -2745,7 +2744,7 @@ async function releaseMissingActionLeaseForActiveCoordinatorItem(itemKey = '', e
         })
     }, {
         timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
-        reason: 'repair-action-lease-missing-tab'
+        reason: 'reconcile-action-lease-missing-tab'
     })
     return {
         ...(result || {}),
@@ -3672,7 +3671,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
             })
                 .catch(error => ({
                     changed: false,
-                    reason: 'active-terminal-progress-repair-error',
+                    reason: 'active-terminal-progress-reconcile-error',
                     error: error?.message || `${error || ''}`
                 }))
             if(!result.changed) continue
@@ -5006,7 +5005,7 @@ async function flushPendingCoordinatorDiagnosticEvents() {
         await metricStorageSet({
             [COORDINATOR_EVENTS_KEY]: events.concat(pending).slice(-MAX_COORDINATOR_EVENTS)
         }, {
-            snapshotWriteReason: 'repair'
+            snapshotWriteReason: 'reconcile'
         })
         incrementQueueWakeupMetric('diagnosticEvent.storageWrites')
         return true
@@ -6698,7 +6697,7 @@ function promoteTerminalCoordinatorItemFromSuccessfulProgress(item = {}, record 
         tabId: null,
         actionLease: null,
         actionLeaseReleasedAt: now,
-        actionLeaseReleaseReason: 'terminal-success-repair',
+        actionLeaseReleaseReason: 'terminal-success-reconcile',
         milestones: {
             ...makeEmptyCoordinatorMilestones(),
             ...(item.milestones || {}),
@@ -8638,12 +8637,6 @@ function createCoordinatorAuthority() {
 
     async function persist(nextProjection = projection, changes = {}) {
         const requestedReason = normalizeSnapshotWriteReason(changes.reason || 'ordinaryMutation')
-        if(requestedReason === 'repair') {
-            return saveCoordinatorState(nextProjection, {
-                ...changes,
-                reason: 'repair'
-            })
-        }
         if(requestedReason === 'displayRead') {
             return saveCoordinatorState(nextProjection, {
                 ...changes,
@@ -10574,7 +10567,7 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
                 incomingAttemptId: getAttemptIdFromValue(record),
                 expectedAttemptId: getAttemptIdFromValue(item),
                 senderTabId: record.tabId || null,
-                message: 'Ignored repair from stale coordinator attempt'
+                message: 'Ignored reconcile from stale coordinator attempt'
             })
             record = null
         }
@@ -12554,7 +12547,7 @@ async function rollbackFailedQueuedTabOpen(action = {}, tab = {}, details = {}) 
     return enqueueSpaceFeedStorageUpdate(() => {
         return mutateCoordinatorProjection({
             kind: 'rollbackFailedQueuedTabOpen',
-            reason: 'repair',
+            reason: 'ordinaryMutation',
             action,
             tab,
             details,
@@ -14373,7 +14366,7 @@ async function shouldAllowStoredWorkBeforeQuora(reason = 'stored-work-scheduler'
 
 function isCoordinatorReconcileEdgeTriggerReason(reason = '') {
     const normalized = `${reason || ''}`.trim()
-    return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|repair-request.*|legacy-import.*|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
+    return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|legacy-import.*|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
 }
 
 function clearNamedSchedulerAlarm(name = '') {
@@ -15190,10 +15183,10 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
     const runId = options.runId || makeId('failed-reset')
     const request = options.request || {}
     const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-    const repairAsResolution = !!resolutionRetryUrl
+    const retryViaResolution = !!resolutionRetryUrl
     const legacyHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    const href = repairAsResolution ? '' : legacyHref
-    const coordinatorKey = repairAsResolution
+    const href = retryViaResolution ? '' : legacyHref
+    const coordinatorKey = retryViaResolution
         ? makeProfileResolutionQueueKey(resolutionRetryUrl)
         : href || getCoordinatorItemQueueKey(item, itemKey)
     const attemptId = makeAttemptId()
@@ -15226,9 +15219,9 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
         targetProfileHref: href,
         dedupeKey: href || coordinatorKey,
         coordinatorKey,
-        resolutionMode: repairAsResolution ? QUEUED_PROFILE_RESOLUTION_MODE : '',
-        resolveProfileFromPage: repairAsResolution,
-        resolutionReason: repairAsResolution ? item.resolutionReason || 'failed-target-source-post-revisit' : item.resolutionReason || '',
+        resolutionMode: retryViaResolution ? QUEUED_PROFILE_RESOLUTION_MODE : '',
+        resolveProfileFromPage: retryViaResolution,
+        resolutionReason: retryViaResolution ? item.resolutionReason || 'failed-target-source-post-revisit' : item.resolutionReason || '',
         requestedUrl: requestedUrl || href,
         actionKind,
         executorTabAction: getCoordinatorExecutorTabActionForActionKind(actionKind),
@@ -15272,7 +15265,7 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
         coordinatorKey,
         href,
         legacyHref,
-        repairAsResolution
+        retryViaResolution
     }
 }
 
@@ -15628,9 +15621,9 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
 
         const legacyHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-        const repairAsResolution = !!resolutionRetryUrl
-        const href = repairAsResolution ? '' : legacyHref
-        const coordinatorKey = repairAsResolution
+        const retryViaResolution = !!resolutionRetryUrl
+        const href = retryViaResolution ? '' : legacyHref
+        const coordinatorKey = retryViaResolution
             ? makeProfileResolutionQueueKey(resolutionRetryUrl)
             : href || getCoordinatorItemQueueKey(item, itemKey)
         if(!href && !coordinatorKey) continue
@@ -18295,8 +18288,8 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
 }
 
 async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'repair')
-    if(snapshotReason !== 'repair') return false
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') return false
 
     const action = operation.action || {}
     const tab = operation.tab || {}
@@ -18413,7 +18406,7 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
         }, {
             queue: false,
             runs: runsChanged,
-            reason: 'repair',
+            reason: 'ordinaryMutation',
             queueOperation: 'rollback-active-transition-derived',
             queueChangedRows: 0
         })

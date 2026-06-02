@@ -165,7 +165,7 @@ let activeProfileModal = null
 let handledModalProfileUrls = new Set()
 let queuedModalNukeProfileUrls = new Set()
 let initialized = false
-let alreadyBlockedCoordinatorRepairKey = ''
+let alreadyBlockedCoordinatorReconcileKey = ''
 let manualUnblockedReconcileKey = ''
 const PROFILE_ACTION_BUTTON_ORDER = ['unblock-unmute', 'mute-block-close', 'mute-block', 'close-tab']
 const UNBLOCK_UNMUTE_ACTION_KIND = 'unblock-unmute'
@@ -1262,8 +1262,8 @@ async function maybeRecordAlreadyBlockedCoordinatorProfile() {
         item.updatedAt || 0,
         item.terminalAt || 0
     ].join('|')
-    if(repairKey === alreadyBlockedCoordinatorRepairKey) return
-    alreadyBlockedCoordinatorRepairKey = repairKey
+    if(repairKey === alreadyBlockedCoordinatorReconcileKey) return
+    alreadyBlockedCoordinatorReconcileKey = repairKey
 
     const progressPatch = {
         status: 'already-blocked',
@@ -1275,12 +1275,12 @@ async function maybeRecordAlreadyBlockedCoordinatorProfile() {
         resolvedProfileHref: href,
         remappedFromRequested: false,
         finalError: '',
-        event: 'Visible profile was already blocked; repairing coordinator row'
+        event: 'Visible profile was already blocked; reconciling coordinator row'
     }
     const progress = await recordAlreadyBlockedCoordinatorProgress(href, item, progressPatch)
     if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
-        alreadyBlockedCoordinatorRepairKey = ''
-        console.info('Already-blocked repair was not recorded; leaving queued tab open for retry')
+        alreadyBlockedCoordinatorReconcileKey = ''
+        console.info('Already-blocked reconcile was not recorded; leaving queued tab open for retry')
         setTimeout(() => void sweepServiceWorkerBlockedProfileTabs(), 1000)
         setTimeout(() => void maybeRecordAlreadyBlockedCoordinatorProfile(), 2000)
         return

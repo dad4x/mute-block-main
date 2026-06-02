@@ -1262,7 +1262,6 @@ test('snapshot state writes carry inventoried authority reasons', () => {
     const inventory = readRepoFile('storage-authority-callsite-inventory-2026-05-20.md')
     const allowedReasons = new Set([
         'ordinaryMutation',
-        'repair',
         'reconcile',
         'displayRead',
         'compatibilityFlush',
@@ -1547,9 +1546,9 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(activeTransitionMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'ordinaryMutation'\)/)
     assert.match(activeTransitionMutationBody, /snapshotReason !== 'ordinaryMutation'/)
     assert.match(activeTransitionMutationBody, /transitionCoordinatorItemForQueuedTabLocked\([\s\S]*operation\.action \|\| \{\},[\s\S]*operation\.tab \|\| \{\},[\s\S]*operation\.details \|\| \{\},[\s\S]*operation\.href \|\| '',[\s\S]*operation\.coordinatorKey \|\| ''/)
-    assert.match(rollbackOpenBody, /mutateCoordinatorProjection\(\{[\s\S]*kind: 'rollbackFailedQueuedTabOpen'[\s\S]*reason: 'repair'[\s\S]*action,[\s\S]*tab,[\s\S]*details,[\s\S]*href,[\s\S]*coordinatorKey/)
-    assert.match(rollbackOpenMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'repair'\)/)
-    assert.match(rollbackOpenMutationBody, /snapshotReason !== 'repair'/)
+    assert.match(rollbackOpenBody, /mutateCoordinatorProjection\(\{[\s\S]*kind: 'rollbackFailedQueuedTabOpen'[\s\S]*reason: 'ordinaryMutation'[\s\S]*action,[\s\S]*tab,[\s\S]*details,[\s\S]*href,[\s\S]*coordinatorKey/)
+    assert.match(rollbackOpenMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'ordinaryMutation'\)/)
+    assert.match(rollbackOpenMutationBody, /snapshotReason !== 'ordinaryMutation'/)
     assert.match(rollbackOpenMutationBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: 'rollbackActiveTransition\.load'/)
     assert.match(rollbackOpenMutationBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'rollback-active-transition'/)
     assert.match(rollbackOpenMutationBody, /currentAttemptId/)
@@ -1562,7 +1561,7 @@ test('coordinator projection mutation uses explicit operation shapes', () => {
     assert.match(rollbackOpenMutationBody, /reason: 'ordinaryMutation'/)
     assert.match(rollbackOpenMutationBody, /metricPath: 'rollbackActiveTransition\.save'/)
     assert.match(rollbackOpenMutationBody, /projectionPayload: 'queueViewOnly'/)
-    assert.match(rollbackOpenMutationBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'repair',[\s\S]*queueOperation: 'rollback-active-transition-derived'/)
+    assert.match(rollbackOpenMutationBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'ordinaryMutation',[\s\S]*queueOperation: 'rollback-active-transition-derived'/)
     assert.doesNotMatch(rollbackOpenMutationBody, /saveCoordinatorQueueRunsProjection\(/)
     assert.match(staleRetryBody, /mutateCoordinatorProjection\(\{[\s\S]*kind: 'advanceStaleRetryQueuedTab'[\s\S]*reason: 'ordinaryMutation'[\s\S]*action,[\s\S]*at,[\s\S]*href,[\s\S]*coordinatorKey/)
     assert.match(staleRetryMutationBody, /normalizeSnapshotWriteReason\(operation\.reason \|\| 'ordinaryMutation'\)/)
@@ -1706,7 +1705,7 @@ test('progress repair is explicit, not a hot runtime path', () => {
     assert.doesNotMatch(source, /request\.action === 'repair-coordinator-storage'/)
     assert.match(source, /request\.action === 'reconcile-coordinator-storage'[\s\S]*display-only-reconcile-disabled/)
     assert.match(source, /request\.userInitiated !== true && request\.legacyImport !== true/)
-    assert.doesNotMatch(source, /request\.action === 'reconcile-coordinator-storage'[\s\S]{0,450}return recoverStoredCoordinatorWork\('dashboard-repair-request'\)/)
+    assert.doesNotMatch(source, /request\.action === 'reconcile-coordinator-storage'[\s\S]{0,450}return recoverStoredCoordinatorWork\('dashboard-reconcile-request'\)/)
     assert.match(source, /request\.action === 'reconcile-coordinator-storage'[\s\S]*reconcileCoordinatorStorageBestEffort/)
     assert.doesNotMatch(source, /repairScheduled/)
     assert.doesNotMatch(source, /repair: reconcile/)
@@ -2264,8 +2263,8 @@ test('failed resolver requeue preserves source-post resolution mode', () => {
     assert.match(candidateBody, /resolutionRetryUrl/)
     assert.match(candidateBody, /!href && !candidate\.resolutionRetryUrl/)
     assert.match(resetBody, /getFailedItemProfileResolutionRetryUrl\(item, itemKey\)/)
-    assert.match(resetBody, /resolutionMode: repairAsResolution \? QUEUED_PROFILE_RESOLUTION_MODE : ''/)
-    assert.match(resetBody, /resolveProfileFromPage: repairAsResolution/)
+    assert.match(resetBody, /resolutionMode: retryViaResolution \? QUEUED_PROFILE_RESOLUTION_MODE : ''/)
+    assert.match(resetBody, /resolveProfileFromPage: retryViaResolution/)
     assert.match(retryBody, /kind: 'retryFailedItems'/)
     assert.match(requeueBody, /kind: 'requeueFailedItems'/)
     assert.match(retryMutationBody, /buildFailedCoordinatorResetItem\(candidate\.itemKey, item/)
@@ -2743,7 +2742,7 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.doesNotMatch(rollbackBody, /metricStorageGet\(/)
     assert.match(rollbackBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'rollback-active-transition'/)
     assert.match(rollbackBody, /projectionPayload: 'queueViewOnly'/)
-    assert.match(rollbackBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'repair'/)
+    assert.match(rollbackBody, /saveCoordinatorState\(\{[\s\S]*runs: runsChanged \? nextRuns : undefined[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*reason: 'ordinaryMutation'/)
     assert.doesNotMatch(rollbackBody, /saveCoordinatorQueueRunsProjection\(/)
     assert.match(rollbackBody, /status: 'queued'/)
     assert.match(rollbackBody, /actionLeaseReleaseReason: 'active-transition-failed'/)
@@ -3931,9 +3930,9 @@ test('active queued already-blocked reconcile releases and closes the tab', () =
         readRepoFile('shared/js/content.js'),
         'function nudgeCurrentProfilePendingClaim()'
     )
-    const repairIndex = body.indexOf("event: 'Visible profile was already blocked; repairing coordinator row'")
+    const repairIndex = body.indexOf("event: 'Visible profile was already blocked; reconciling coordinator row'")
     const activeIndex = body.indexOf('isActiveQueuedProgressRecord(href)')
-    const guardIndex = body.indexOf('Already-blocked repair was not recorded; leaving queued tab open for retry')
+    const guardIndex = body.indexOf('Already-blocked reconcile was not recorded; leaving queued tab open for retry')
     const retryIndex = body.indexOf('setTimeout(() => void maybeRecordAlreadyBlockedCoordinatorProfile(), 2000)', guardIndex)
     const releaseIndex = body.indexOf('await notifyQueuedTabComplete()', activeIndex)
     const closeIndex = body.indexOf('await requestCloseTab()', activeIndex)
@@ -3951,7 +3950,7 @@ test('active queued already-blocked reconcile releases and closes the tab', () =
     assert.match(body, /const progress = await recordAlreadyBlockedCoordinatorProgress\(href, item, progressPatch\)/)
     assert.match(readRepoFile('shared/js/content.js'), /action: 'record-job-terminal'/)
     assert.match(body, /if\(progress\?\.serviceWorkerOnly && !progress\.runtimeRecorded\)/)
-    assert.match(body, /alreadyBlockedCoordinatorRepairKey = ''/)
+    assert.match(body, /alreadyBlockedCoordinatorReconcileKey = ''/)
     assert.match(nudgeBody, /maybeRecordAlreadyBlockedCoordinatorProfile\(\)/)
 })
 
@@ -4364,7 +4363,7 @@ test('queued terminal close and stale close denial keep authority in the service
     const windowCloseIndex = closeRequestBody.indexOf('window.close()')
     const terminalDeniedIndex = actionBody.indexOf('Queued terminal success was not recorded; leaving tab open for retry')
     const releaseIndex = actionBody.indexOf('await releaseQueuedTabSlot()', terminalDeniedIndex)
-    const repairDeniedIndex = alreadyBlockedBody.indexOf('Already-blocked repair was not recorded; leaving queued tab open for retry')
+    const repairDeniedIndex = alreadyBlockedBody.indexOf('Already-blocked reconcile was not recorded; leaving queued tab open for retry')
     const repairReleaseIndex = alreadyBlockedBody.indexOf('await notifyQueuedTabComplete()', repairDeniedIndex)
 
     assert.notEqual(staleIndex, -1)
