@@ -131,7 +131,6 @@ runMain(async () => {
                     tabId: 'service-worker-queue-owner',
                     windowId: null
                 }, {
-                    skipRepair: true,
                     skipAuthorityReconcile: true,
                     serviceWorkerOwned: true
                 }).then(response => finish({

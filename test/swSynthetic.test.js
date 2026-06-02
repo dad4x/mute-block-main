@@ -4519,12 +4519,12 @@ test('direct progress inline projection failure leaves full mirror untouched', a
     }
 })
 
-test('legacy record-nuke-progress messages are disabled without storage mutation', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Legacy-Progress-Disabled'
-    const runId = 'run-legacy-progress-disabled'
-    const attemptId = 'attempt-legacy-progress-disabled'
+test('legacy record-nuke-progress messages are absent runtime actions', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Legacy-Progress-Absent'
+    const runId = 'run-legacy-progress-absent'
+    const attemptId = 'attempt-legacy-progress-absent'
     const tabId = 530
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage} = loadServiceWorkerHarness({
         now: 253970,
         storage: {
             mbCoordinatorPaused: false,
@@ -4591,20 +4591,13 @@ test('legacy record-nuke-progress messages are disabled without storage mutation
         tab: {id: tabId}
     })
 
-    for(const result of [singleResult, batchResult]) {
-        assert.equal(result.recorded, false)
-        assert.equal(result.durable, false)
-        assert.equal(result.compatibility, false)
-        assert.equal(result.authority, false)
-        assert.equal(result.reason, 'legacy-progress-message-disabled')
-    }
+    assert.equal(singleResult, undefined)
+    assert.equal(batchResult, undefined)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
     assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(setCalls, 0)
-    assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 1)
-    assert.equal(sw.state().queueWakeupCounters['progressBatch.legacyMessageDisabled'] || 0, 1)
 
     browser.storage.local.set = originalSet
 })
@@ -6354,7 +6347,6 @@ test('space-feed confirmation does not promote stale failed queue rows from the 
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'failed')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, undefined)
-    assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 0)
 })
 
 test('space-feed confirmation does not rewrite legacy progress mirror from queue authority', async () => {
@@ -6379,7 +6371,7 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
         attemptNumber: 1,
         updatedAt: 276100
     }
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage} = loadServiceWorkerHarness({
         now: 276500,
         storage: {
             mbCoordinatorPaused: false,
@@ -6409,7 +6401,6 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
     const storedRecord = Object.values(storage.mbProfileNukeProgress || {})
         .find(record => record?.profileHref === href)
     assert.deepEqual(storedRecord, progressRecord)
-    assert.equal(sw.state().queueWakeupCounters['progress.legacyMessageDisabled'] || 0, 0)
 })
 
 test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {
@@ -8260,9 +8251,7 @@ test('preplanned queued action revalidates WAL-terminal authority before opening
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-preplanned-wal-terminal'
     })
@@ -12665,7 +12654,7 @@ test('coordinator reconcile alarm clears the pending timeout and runs reconcile'
     assert.equal(timers.pending().some(timer => timer.dueAt === 1000), false)
 })
 
-test('legacy stored-work alarm name is accepted only as a reconcile transition alias', async () => {
+test('legacy stored-work repair alarm name is not accepted as reconcile', async () => {
     const {browser, sw, timers} = loadServiceWorkerHarness({now: 0})
     const legacyReconcileAlarmName = ['mb', 'stored', 'work', 'repair'].join('-')
 
@@ -12675,9 +12664,9 @@ test('legacy stored-work alarm name is accepted only as a reconcile transition a
 
     await browser.alarms.onAlarm.emit({name: legacyReconcileAlarmName})
 
-    assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
-    assert.equal(sw.state().coordinatorReconcileDueAt, 0)
-    assert.equal(timers.pending().some(timer => timer.dueAt === 1000), false)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+    assert.equal(sw.state().coordinatorReconcileDueAt, 1000)
+    assert.equal(timers.pending().some(timer => timer.dueAt === 1000), true)
 })
 
 test('coordinator reconcile timeout clears and suppresses stale alarm delivery', async () => {
@@ -13544,9 +13533,7 @@ test('service-worker no-foreground destructive work uses worker window without f
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     })
 
@@ -13631,9 +13618,7 @@ test('service-worker reuses existing worker window after in-memory surface state
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
     await waitFor(
@@ -13651,9 +13636,7 @@ test('service-worker reuses existing worker window after in-memory surface state
             tabId: 'service-worker-queue-owner',
             windowId: null
         }, {
-            serviceWorkerOwned: true,
-            skipRepair: true,
-            skipAuthorityReconcile: true,
+            serviceWorkerOwned: true,            skipAuthorityReconcile: true,
             awaitFill: true
         }), timers)
         profileTab = listTabs(browser).find(tab =>
@@ -13752,9 +13735,7 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
 
@@ -13840,9 +13821,7 @@ test('service-worker worker window closes after queued worker surface becomes id
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
 
@@ -13932,9 +13911,7 @@ test('confirmation promotion in no-foreground worker window briefly focuses and 
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
 
@@ -14119,9 +14096,7 @@ test('service-worker durable queue clears stale owner pause before opening next 
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-stale-service-worker-pause'
     }), timers)
@@ -16093,9 +16068,7 @@ test('resume rebuilds durable work after stale volatile queued action skips with
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     })
     resumePromise.catch(() => null)
@@ -16272,9 +16245,7 @@ test('volatile action pruning uses WAL terminal authority over stale raw active 
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-prune-wal-terminal'
     })
@@ -16325,9 +16296,7 @@ test('service-worker executor resume plans only the current slot batch', async (
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-plan-slot-batch'
     })
@@ -16391,9 +16360,7 @@ test('service-worker executor resume adopts expected live queued profile tab bef
             tabId: 'service-worker-queue-owner',
             windowId: null
         }, {
-            serviceWorkerOwned: true,
-            skipRepair: true,
-            skipAuthorityReconcile: true,
+            serviceWorkerOwned: true,            skipAuthorityReconcile: true,
             awaitFill: true,
             reason: 'synthetic-adopt-live-queued'
         }),
@@ -16441,9 +16408,7 @@ test('service-worker executor does not adopt unrelated same-profile tab for queu
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-unowned-same-profile'
     })
@@ -16509,9 +16474,7 @@ test('service-worker executor adopts orphaned worker-window queued profile tab',
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-orphaned-worker-window'
     })
@@ -16577,9 +16540,7 @@ test('service-worker executor adopts orphaned pending-confirmation worker-window
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-orphaned-pending-confirmation'
     })
@@ -16641,9 +16602,7 @@ test('service-worker executor reclaims rolled-back queued profile tab before ope
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-reclaim-rolled-back-queued'
     })
@@ -16719,9 +16678,7 @@ test('service-worker executor reclaims rolled-back queued profile tab when retry
             tabId: 'service-worker-queue-owner',
             windowId: null
         }, {
-            serviceWorkerOwned: true,
-            skipRepair: true,
-            skipAuthorityReconcile: true,
+            serviceWorkerOwned: true,            skipAuthorityReconcile: true,
             awaitFill: true,
             reason: 'synthetic-reclaim-retry-budget-exhausted'
         }),
@@ -16852,9 +16809,7 @@ test('service-worker executor terminalizes exhausted rolled-back queue rows and 
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-terminalize-exhausted-rollback-continue'
     }), timers)
@@ -16919,9 +16874,7 @@ test('service-worker executor open resets stale terminal progress for the curren
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true,
         reason: 'synthetic-open-resets-stale-terminal'
     }), timers)
@@ -17118,9 +17071,7 @@ test('worker window cleanup does not close a live profile tab after runtime rele
         tabId: 'service-worker-queue-owner',
         windowId: null
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
 
@@ -21726,9 +21677,7 @@ test('loading queued tab becomes queue-load pressure without consuming row retry
         tabId: sourceSender.tab.id,
         windowId: sourceSender.tab.windowId
     }, {
-        serviceWorkerOwned: true,
-        skipRepair: true,
-        skipAuthorityReconcile: true,
+        serviceWorkerOwned: true,        skipAuthorityReconcile: true,
         awaitFill: true
     }), timers)
     await waitFor(

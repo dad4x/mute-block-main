@@ -146,7 +146,6 @@ const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
 const PERSISTENT_FAILED_RETRY_ALARM_PERIOD_MINUTES = 0.5
 const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
 const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-coordinator-reconcile'
-const COORDINATOR_LEGACY_RECONCILE_ALARM_NAME = 'mb-stored-work-repair'
 const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const CONTENT_SCRIPT_READY_ATTR = 'data-mb-content-script-ready'
 const QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS = 750
@@ -551,20 +550,15 @@ function summarizeQueueWakeupMetricEpoch(epoch = {}, rolloverReason = '') {
     const storageFallbackReturned = counters['storageUpdate.fallbackReturned'] || 0
     const writeBytes = counters['storagePayload.write.total.bytes'] || 0
     const writeCalls = counters['storagePayload.write.total.calls'] || 0
-    const reconcileRequested = (counters['reconcile.requested'] || 0) + (counters['repair.requested'] || 0)
-    const reconcileChanged =
-        sumQueueWakeupCounters(counters, 'reconcile.changed.') +
-        sumQueueWakeupCounters(counters, 'repair.changed.')
+    const reconcileRequested = counters['reconcile.requested'] || 0
+    const reconcileChanged = sumQueueWakeupCounters(counters, 'reconcile.changed.')
     const pumpRequested = counters['pump.requested'] || 0
     const pumpChanged = sumQueueWakeupCounters(counters, 'pump.changed.')
     const nudgeSent = counters['nudge.sent'] || 0
     const nudgeAccepted = counters['nudge.accepted'] || 0
     const jobsEnqueued = counters['job.enqueued'] || 0
     const jobsTerminal = counters['job.terminal'] || 0
-    const completedAfterReconcile =
-        counters['job.completedOnlyAfterReconcile'] ||
-        counters['job.completedOnlyAfterRepair'] ||
-        0
+    const completedAfterReconcile = counters['job.completedOnlyAfterReconcile'] || 0
 
     return {
         epochId: epoch.epochId || '',
@@ -822,7 +816,6 @@ function clearSchedulerAlarms(reason = 'clear-scheduler-alarms') {
     return Promise.all([
         browser.alarms.clear(COORDINATOR_RESUME_ALARM_NAME).catch(() => false),
         browser.alarms.clear(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false),
-        browser.alarms.clear(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME).catch(() => false),
         browser.alarms.clear(PERSISTENT_FAILED_RETRY_ALARM_NAME).catch(() => false)
     ])
         .then(results => {
@@ -9427,8 +9420,6 @@ async function saveCoordinatorState(state = {}, changes = {}) {
                 .concat(diagnosticEvents)
                 .slice(-MAX_COORDINATOR_EVENTS)
         }
-        if(changes.progress) payload[PROFILE_NUKE_PROGRESS_KEY] = pruneProfileNukeProgress(state.progress || {})
-
         if(Object.keys(payload).length) {
             if(isStorageUpdateAbandoned(updateToken)) {
                 incrementQueueWakeupMetric('storageUpdate.lateWriteSuppressed')
@@ -9443,17 +9434,6 @@ async function saveCoordinatorState(state = {}, changes = {}) {
                 queueChangedRows: changes.queueChangedRows,
                 coordinatorAuthorityWrite: changes.coordinatorAuthorityWrite === true
             })
-            if(changes.progress && payload[PROFILE_NUKE_PROGRESS_KEY]) {
-                incrementQueueWakeupMetric('progress.storageWrites')
-                incrementQueueWakeupMetric('progress.flushPerformed')
-                const payloadRows = getStoragePayloadRowCount(payload[PROFILE_NUKE_PROGRESS_KEY])
-                const changedRows = Math.max(0, Number.parseInt(changes.progressChangedRows, 10) || 0)
-                if(changedRows > 0) {
-                    incrementQueueWakeupMetric('progress.changedRecordsPerStorageWrite', changedRows)
-                }
-                incrementQueueWakeupMetric('progress.payloadRowsPerStorageWrite', payloadRows)
-                incrementQueueWakeupMetric('progress.recordsPerStorageWrite', payloadRows)
-            }
         }
 
         return !!Object.keys(payload).length
@@ -9920,10 +9900,10 @@ function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operatio
     }
 
     const failure = `${operation.failure || getInvalidProfileResolutionFailure(item, itemKey) || ''}`.trim()
-    const invalidTerminalResolutionNeedsRepair = isTerminalCoordinatorStatus(item.status) &&
+    const invalidTerminalResolutionNeedsReconcile = isTerminalCoordinatorStatus(item.status) &&
         item.status === 'failed' &&
         item.outcome === 'action-error'
-    if(!failure || (isTerminalCoordinatorStatus(item.status) && !invalidTerminalResolutionNeedsRepair)) {
+    if(!failure || (isTerminalCoordinatorStatus(item.status) && !invalidTerminalResolutionNeedsReconcile)) {
         return {changed: false, reason: 'not-invalid-profile-resolution'}
     }
 
@@ -10425,7 +10405,6 @@ async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
         events: state.events,
         progress: state.progress,
         originalProgress: cloneCoordinatorAuthorityValue(state.progress || {}),
-        originalLegacyProgress: normalizeStoredProfileNukeProgress(state.stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}),
         pendingPosts,
         nukedPosts,
         now: Date.now(),
@@ -10572,10 +10551,10 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             record = null
         }
         const invalidProfileResolutionFailure = getInvalidProfileResolutionFailure(item, itemKey)
-        const invalidTerminalResolutionNeedsRepair = isTerminalCoordinatorStatus(item.status) &&
+        const invalidTerminalResolutionNeedsReconcile = isTerminalCoordinatorStatus(item.status) &&
             item.status === 'failed' &&
             item.outcome === 'action-error'
-        if(invalidProfileResolutionFailure && (!isTerminalCoordinatorStatus(item.status) || invalidTerminalResolutionNeedsRepair)) {
+        if(invalidProfileResolutionFailure && (!isTerminalCoordinatorStatus(item.status) || invalidTerminalResolutionNeedsReconcile)) {
             const tabId = getPersistedQueuedTabId(item, record)
             const closePersistedTab = tabId
                 ? !!await getPersistedLiveTabForCoordinatorItem(item, record, itemKey)
@@ -10755,7 +10734,6 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
     const runsChanged = (ctx.runsMetadataChanged || nextRuns !== ctx.runs) && JSON.stringify(nextRuns) !== JSON.stringify(ctx.originalRuns)
     const storagePatch = {}
 
-    let fullProgressMirrorChanged = false
     let progressProjectionSaved = {saved: true, rows: 0}
     let progressProjectionDeleted = {saved: true, rows: 0}
     if(ctx.progressChanged) {
@@ -10794,13 +10772,6 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
                 )
             }
 
-            fullProgressMirrorChanged = deletedProgressHrefs.some(href =>
-                Object.prototype.hasOwnProperty.call(ctx.originalLegacyProgress, href)
-            )
-        }
-
-        if(fullProgressMirrorChanged) {
-            storagePatch[PROFILE_NUKE_PROGRESS_KEY] = prunedProgress
         }
     }
     let saved = true
@@ -10847,14 +10818,13 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
             queue: storagePatch[COORDINATOR_QUEUE_KEY],
             runs: storagePatch[COORDINATOR_RUNS_KEY],
             events: storagePatch[COORDINATOR_EVENTS_KEY],
-            progress: storagePatch[PROFILE_NUKE_PROGRESS_KEY],
             pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY],
             nukedPosts: storagePatch[SPACE_NUKED_POSTS_KEY]
         }, {
             queue: queueMirrorChanged,
             runs: runsChanged,
             events: ctx.eventsChanged,
-            progress: fullProgressMirrorChanged,
+            progress: false,
             pendingPosts: ctx.pendingPostsChanged,
             nukedPosts: ctx.nukedPostsChanged,
             reason: 'reconcile',
@@ -14381,12 +14351,10 @@ function clearNamedSchedulerAlarm(name = '') {
 
 function clearCoordinatorReconcileAlarms() {
     clearNamedSchedulerAlarm(COORDINATOR_RECONCILE_ALARM_NAME)
-    clearNamedSchedulerAlarm(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME)
 }
 
 function isCoordinatorReconcileAlarmName(name = '') {
-    return name === COORDINATOR_RECONCILE_ALARM_NAME ||
-        name === COORDINATOR_LEGACY_RECONCILE_ALARM_NAME
+    return name === COORDINATOR_RECONCILE_ALARM_NAME
 }
 
 function getSchedulerAlarmScheduledTime(alarm = null) {
@@ -14544,7 +14512,6 @@ function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_M
 
     if(browser.alarms?.create) {
         try {
-            clearNamedSchedulerAlarm(COORDINATOR_LEGACY_RECONCILE_ALARM_NAME)
             const alarmResult = browser.alarms.create(COORDINATOR_RECONCILE_ALARM_NAME, {when: dueAt})
             incrementQueueWakeupMetric('reconcile.alarmScheduled')
             if(alarmResult?.catch) alarmResult.catch(() => null)
@@ -14663,7 +14630,6 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         }, {
             serviceWorkerOwned: true,
             skipAuthorityReconcile: true,
-            skipRepair: true,
             queueOnlyAuthority: true,
             queuedOnly: true,
             requeueMissingActiveTabs: true,
@@ -26958,16 +26924,6 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         return Promise.resolve({closed: false})
     }
-    else if(request.action === 'record-nuke-progress') {
-        incrementQueueWakeupMetric('progress.legacyMessageDisabled')
-        return Promise.resolve({
-            recorded: false,
-            durable: false,
-            compatibility: false,
-            authority: false,
-            reason: 'legacy-progress-message-disabled'
-        })
-    }
     else if(request.action === 'record-job-milestone') {
         return recordJobProgressFromRequest(request, sender, {
             expectTerminal: false
@@ -26976,16 +26932,6 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     else if(request.action === 'record-job-terminal') {
         return recordJobProgressFromRequest(request, sender, {
             expectTerminal: true
-        })
-    }
-    else if(request.action === 'record-nuke-progress-batch') {
-        incrementQueueWakeupMetric('progressBatch.legacyMessageDisabled')
-        return Promise.resolve({
-            recorded: false,
-            durable: false,
-            compatibility: false,
-            authority: false,
-            reason: 'legacy-progress-message-disabled'
         })
     }
     else if(request.action === 'clear-profile-nuke-state') {
