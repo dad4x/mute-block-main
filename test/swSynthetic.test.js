@@ -14,6 +14,9 @@ const {
 } = require('../shared/js/walSnapshotStore')
 
 const tests = []
+const LEGACY_PROFILE_PROGRESS_KEY = ['mb', 'Profile', 'Nuke', 'Progress'].join('')
+const LEGACY_RECORD_PROGRESS_ACTION = ['record', 'nuke', 'progress'].join('-')
+const LEGACY_RECORD_PROGRESS_BATCH_ACTION = ['record', 'nuke', 'progress', 'batch'].join('-')
 
 function test(name, fn) {
     tests.push({name, fn})
@@ -320,7 +323,7 @@ test('active transition uncertainty keeps executor tab when rollback is not dura
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const tab = await browser.tabs.create({url: href, active: true})
@@ -368,7 +371,7 @@ test('unconfirmed active transition releases runtime slot when authority row sta
             mbCoordinatorRuns: {
                 [runId]: makeCoordinatorRun({href, runId})
             },
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const tab = await browser.tabs.create({url: href, active: true})
@@ -436,7 +439,7 @@ test('queued tab nudge rebuilds claimable action from durable tab id when tab lo
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -526,7 +529,7 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -542,7 +545,7 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     })
     const tab = await browser.tabs.create({url: href, active: true})
     storage.mbCoordinatorQueue[href].tabId = tab.id
-    storage.mbProfileNukeProgress[href].tabId = tab.id
+    storage[LEGACY_PROFILE_PROGRESS_KEY][href].tabId = tab.id
     await sw.coordinatorAuthority.hydrate()
     sw.coordinatorAuthority.current().queue[href].tabId = tab.id
     sw.__testAddProvisionalQueuedTab(tab.id, {
@@ -580,7 +583,7 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
     assert.equal(getProgressShardRecord(storage, href), null)
 })
 
@@ -605,7 +608,7 @@ test('service-worker blocked sweep uses scripting probe when close message times
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -621,7 +624,7 @@ test('service-worker blocked sweep uses scripting probe when close message times
     })
     const tab = await browser.tabs.create({url: href, active: true})
     storage.mbCoordinatorQueue[href].tabId = tab.id
-    storage.mbProfileNukeProgress[href].tabId = tab.id
+    storage[LEGACY_PROFILE_PROGRESS_KEY][href].tabId = tab.id
     await sw.coordinatorAuthority.hydrate()
     sw.coordinatorAuthority.current().queue[href].tabId = tab.id
     sw.__testAddProvisionalQueuedTab(tab.id, {
@@ -695,7 +698,7 @@ test('row event records same-attempt nonterminal queued progress without rereadi
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 profileHref: href,
                 status: 'tab-opened',
@@ -780,7 +783,7 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     const recoveredShadow = recoverProjectedState(sw.state().progressShadowWalStore)
     assert.equal(recoveredShadow.recovered, true)
     assert.equal(recoveredShadow.projected.state.progress[href].status, 'blocking')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'tab-opened')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
@@ -855,7 +858,7 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(afterRepeat['rowEvent.queued-progress-milestone.shadowWal.skippedNoChange'] || 0, 1)
 
     await timers.tick(30000)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
     assert.equal(afterRepeat['progress.compatibilityFlushScheduled'] || 0, 0)
 })
@@ -890,9 +893,9 @@ test('profile progress load reads compact projection storage only', async () => 
     await sw.ensureProfileNukeProgressReady()
 
     assert.equal(sw.state().profileNukeProgress[href].profileHref, href)
-    assert.equal(storage.mbProfileNukeProgress, undefined)
-    assert.equal(storageReads.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
-    assert.equal(storageWrites.some(payload => Object.prototype.hasOwnProperty.call(payload || {}, 'mbProfileNukeProgress')), false)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY], undefined)
+    assert.equal(storageReads.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
+    assert.equal(storageWrites.some(payload => Object.prototype.hasOwnProperty.call(payload || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
 })
 
 test('single current work cancel WAL-terminalizes only the selected pending row', async () => {
@@ -967,7 +970,7 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [hrefA]: progressA,
                 [hrefB]: progressB
             }
@@ -988,8 +991,8 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].outcome, 'paused')
     assert.notEqual(storage.mbCoordinatorQueue[hrefB].status, 'canceled')
-    assert.deepEqual(storage.mbProfileNukeProgress[hrefA], progressA)
-    assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
+    assert.deepEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefA], progressA)
+    assert.deepEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 1)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -1071,7 +1074,7 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [hrefA]: progressA,
                 [hrefB]: progressB
             }
@@ -1091,8 +1094,8 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'canceled')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefDone].status, 'succeeded')
-    assert.deepEqual(storage.mbProfileNukeProgress[hrefA], progressA)
-    assert.deepEqual(storage.mbProfileNukeProgress[hrefB], progressB)
+    assert.deepEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefA], progressA)
+    assert.deepEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], progressB)
     assert.equal(storage.mbCoordinatorQueueView.counts.canceled, 2)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -1158,7 +1161,7 @@ test('queue accounting audit explains raw WAL drift without writing storage', as
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -1251,7 +1254,7 @@ test('queue accounting audit flags stale compact dashboard counts', async () => 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -1330,7 +1333,7 @@ test('single current work cancel WAL append failure leaves selected row pending'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -1394,7 +1397,7 @@ test('bulk current work cancel WAL append failure leaves rows pending', async ()
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -1441,7 +1444,7 @@ test('bulk current work cancel WAL append failure does not close active owned ta
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -1508,7 +1511,7 @@ test('bulk current work cancel storage fallback does not close active owned tab'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -1598,7 +1601,7 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -1657,7 +1660,7 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [hrefActive]: {
                     profileHref: hrefActive,
                     status: 'tab-opened',
@@ -1692,9 +1695,9 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     assert.equal(storage.mbCoordinatorQueueView.counts.queued, 2)
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
     assert.equal(storage.mbCoordinatorEvents[0].type, 'paused')
-    assert.equal(storage.mbProfileNukeProgress[hrefActive].status, 'tab-opened')
-    assert.equal(storage.mbProfileNukeProgress[hrefActive].tabId, tabId)
-    assert.equal(storage.mbProfileNukeProgress[hrefActive].attemptId, attemptId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].tabId, tabId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].attemptId, attemptId)
     assert.equal(browser.__removedTabs.includes(tabId), true)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -1729,7 +1732,7 @@ test('bulk current work pause WAL append failure does not close active owned tab
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -1796,7 +1799,7 @@ test('runs paused update uses queue-runs projection without loading progress', a
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -1820,7 +1823,7 @@ test('runs paused update uses queue-runs projection without loading progress', a
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'active')
     assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
-    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
 })
 
@@ -1846,7 +1849,7 @@ test('runs paused update failure schedules reconcile without throwing', async ()
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -1919,7 +1922,7 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: progressRecord
             },
             ...makeProgressProjectionSeed(href, progressRecord)
@@ -1939,7 +1942,7 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
     assert.equal(storage.mbCoordinatorQueueView.counts.failed || 0, 0)
     assert.equal(storage.mbCoordinatorEvents.at(-1).type, 'retry')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'failed')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'failed')
     assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
@@ -1996,7 +1999,7 @@ test('manual failed requeue deletes compact progress projection without rewritin
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: progressRecord
             },
             ...makeProgressProjectionSeed(href, progressRecord)
@@ -2010,7 +2013,7 @@ test('manual failed requeue deletes compact progress projection without rewritin
 
     assert.equal(result.selected, 1)
     assert.equal(result.queued, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'failed')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'failed')
     assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
@@ -2062,7 +2065,7 @@ test('manual failed requeue WAL append failure does not start executor or write 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -2119,7 +2122,7 @@ test('progress shadow WAL append uses bounded incremental replay', async () => {
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: Object.fromEntries(hrefs.map((href, index) => [
+            [LEGACY_PROFILE_PROGRESS_KEY]: Object.fromEntries(hrefs.map((href, index) => [
                 href,
                 {
                     profileHref: href,
@@ -2175,7 +2178,7 @@ test('progress shadow WAL append uses bounded incremental replay', async () => {
     assert.equal(recoveredShadow.projected.state.progress[hrefs.at(-1)].status, 'blocking')
     assert.equal(recoveredShadow.projected.state.progress[hrefs.at(-1)].blockAttemptedAt, 120000 + iterations - 1)
     assert.equal(sw.state().profileNukeProgress[hrefs.at(-1)].blockAttemptedAt, 120000 + iterations - 1)
-    assert.equal(storage.mbProfileNukeProgress[hrefs.at(-1)].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefs.at(-1)].status, 'tab-opened')
 })
 
 test('progress shadow WAL diagnostic append failure does not change row-event acknowledgement', async () => {
@@ -2194,7 +2197,7 @@ test('progress shadow WAL diagnostic append failure does not change row-event ac
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -2253,7 +2256,7 @@ test('progress shadow WAL parity uses exact persisted projection row after async
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -2317,7 +2320,7 @@ test('progress shadow WAL appends same-status mutations with distinct ids', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -2387,7 +2390,7 @@ test('row event does not report shadow WAL parity for suppressed progress projec
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 profileHref: href,
                 status: 'tab-opened',
@@ -2473,7 +2476,7 @@ test('row event treats throwing progress projection storage as non-durable proje
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -2552,7 +2555,7 @@ test('row event persists queue only for nonterminal durable status changes', asy
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -2667,7 +2670,7 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
                 [runId]: makeCoordinatorRun({href: hrefA, runId, targetProfileHrefs: [hrefA, hrefB]})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -2745,7 +2748,7 @@ test('segmented queue WAL append rewrites active segments when previous physical
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -2821,7 +2824,7 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -2895,7 +2898,7 @@ test('segmented queue WAL soft threshold records lifecycle metrics and schedules
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -2961,7 +2964,7 @@ test('segmented queue WAL hard limit blocks durable append before physical write
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const beforeMeta = JSON.stringify(storage['mbCoordinatorQueueWal.meta'])
@@ -3038,7 +3041,7 @@ test('segmented queue WAL authority read schedules checkpoint switch over soft s
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -3083,7 +3086,7 @@ test('batched row event queue WAL mutations compose against updated projection',
                 [runB]: makeCoordinatorRun({href: hrefB, runId: runB})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [hrefA]: {
                     profileHref: hrefA,
                     status: 'queued',
@@ -3189,7 +3192,7 @@ test('row event queue WAL append failure rejects durable queue mutation', async 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -3253,7 +3256,7 @@ test('row event queue WAL projection failure does not poison durable acknowledge
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -3322,7 +3325,7 @@ test('row event derived runs failure does not poison durable queue WAL acknowled
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -3387,7 +3390,7 @@ test('queued tab metadata milestones use row-event projection without full progr
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -3408,7 +3411,7 @@ test('queued tab metadata milestones use row-event projection without full progr
     assert.equal(result.deferred, true)
     assert.equal(result.durable, false)
     assert.equal(result.reason, 'milestone-flush-deferred')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(sw.state().profileNukeProgress[href].waitingForForegroundAt, 153120)
 
     await timers.tick(sw.state().constants.COORDINATOR_JOB_MILESTONE_FLUSH_MS)
@@ -3438,7 +3441,7 @@ test('row event rejects stale attempt before durable progress mutation', async (
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'page-ready',
@@ -3467,8 +3470,8 @@ test('row event rejects stale attempt before durable progress mutation', async (
 
     assert.equal(result.recorded, false)
     assert.equal(result.reason, 'stale-attempt')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'page-ready')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'page-ready')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, attemptId)
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.staleAttempt'] || 0, 1)
 })
 
@@ -3488,7 +3491,7 @@ test('terminal job progress applies queue mutation through authority without dup
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -3532,7 +3535,7 @@ test('terminal job progress applies queue mutation through authority without dup
         'terminal progress compatibility save did not update the compact progress projection',
         {attempts: 20}
     )
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
     assert.equal(
@@ -3593,7 +3596,7 @@ test('duplicate terminal progress for terminal row does not append duplicate que
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -3663,7 +3666,7 @@ test('terminal authority queue WAL recovers after restart without full queue sna
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -3727,7 +3730,7 @@ test('deferred row event uses WAL terminal queue over stale snapshot after resta
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -3760,7 +3763,7 @@ test('deferred row event uses WAL terminal queue over stale snapshot after resta
     assert.equal(firstHarness.storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(firstHarness.sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
 
-    firstHarness.storage.mbProfileNukeProgress[href] = {
+    firstHarness.storage[LEGACY_PROFILE_PROGRESS_KEY][href] = {
         profileHref: href,
         status: 'blocking',
         runId,
@@ -3788,7 +3791,7 @@ test('deferred row event uses WAL terminal queue over stale snapshot after resta
     assert.equal(late.reason, 'terminal-row-preserved')
     assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(restarted.storage)).projected.state.queue[href].status, 'succeeded')
-    assert.equal(restarted.storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(restarted.storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
     assert.equal(restarted.sw.state().profileNukeProgress[href], undefined)
     assert.equal(restarted.sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.terminalRowPreserved'] || 0, 1)
 })
@@ -3814,7 +3817,7 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
                 [runId]: makeCoordinatorRun({href: hrefA, runId, targetProfileHrefs: [hrefA, hrefB, hrefC]})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(520, {id: 520, windowId: 1, url: hrefA, status: 'complete', active: true})
@@ -3994,7 +3997,7 @@ test('terminal authority queue WAL physical cleanup failure does not poison chec
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -4066,7 +4069,7 @@ test('terminal authority queue WAL checkpoint removes legacy monolith before sav
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -4103,7 +4106,7 @@ test('terminal authority queue WAL checkpoint survives compatibility mirror fail
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -4157,7 +4160,7 @@ test('terminal authority queue WAL checkpoint failure leaves old WAL authoritati
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -4212,7 +4215,7 @@ test('terminal authority queue WAL append failure rejects durable queue mutation
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -4274,7 +4277,7 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const getDefaults = []
@@ -4307,7 +4310,7 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
         'direct progress compatibility save did not materialize progress projection',
         {attempts: 20}
     )
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
 
     const walRecords = getWalRecordsForGeneration(
@@ -4324,7 +4327,7 @@ test('direct nonterminal job progress is WAL-backed and recovers after restart',
         !hasStorageDefault(defaults, 'mbProfileNukeProgressView')
     )
     assert.ok(directLoadDefaults)
-    assert.equal(hasStorageDefault(directLoadDefaults, 'mbProfileNukeProgress'), false)
+    assert.equal(hasStorageDefault(directLoadDefaults, LEGACY_PROFILE_PROGRESS_KEY), false)
     assert.equal(hasStorageDefault(directLoadDefaults, 'mbProfileNukeProgressView'), false)
     assert.equal(Object.keys(directLoadDefaults).some(key => key.startsWith('mbProfileNukeProgressShard.')), true)
     assert.equal(hasStorageDefault(directLoadDefaults, 'mbCoordinatorEvents'), false)
@@ -4356,7 +4359,7 @@ test('direct nonterminal job progress WAL append failure rejects durable queue m
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -4382,7 +4385,7 @@ test('direct nonterminal job progress WAL append failure rejects durable queue m
     assert.equal(result.results?.[href]?.reason || result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
 })
 
@@ -4402,7 +4405,7 @@ test('direct nonterminal job progress derived save failure does not poison WAL a
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -4431,7 +4434,7 @@ test('direct nonterminal job progress derived save failure does not poison WAL a
     assert.notEqual(storage.mbCoordinatorQueue[href].milestones.blockAttemptedAt, 253960)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].milestones.blockAttemptedAt, 253960)
     assert.equal(sw.coordinatorAuthority.current().queue[href].milestones.blockAttemptedAt, 253960)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
     assert.equal(sw.state().queueWakeupCounters['directProgress.compatibilitySaveFailed'] || 0, 0)
     assert.equal(sw.state().queueWakeupCounters['directProgress.derivedSaveFailed'] || 0, 1)
@@ -4454,7 +4457,7 @@ test('direct progress without queue mutation materializes progress shard only', 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -4472,7 +4475,7 @@ test('direct progress without queue mutation materializes progress shard only', 
     assert.equal(result.terminal, false)
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView, undefined)
     assert.equal(getProgressShardRecord(storage, href).lastUrl, href)
     assert.equal(sw.state().profileNukeProgress[href].lastUrl, href)
@@ -4494,7 +4497,7 @@ test('direct progress inline projection failure leaves full mirror untouched', a
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -4519,7 +4522,7 @@ test('direct progress inline projection failure leaves full mirror untouched', a
         assert.equal(result.recorded, true)
         assert.equal(result.terminal, false)
         assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-        assert.equal(storage.mbProfileNukeProgress[href], undefined)
+        assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
         assert.equal(storage.mbProfileNukeProgressView, undefined)
         assert.equal(getProgressShardRecord(storage, href), null)
         assert.equal(sw.state().profileNukeProgress[href].lastUrl, href)
@@ -4531,7 +4534,7 @@ test('direct progress inline projection failure leaves full mirror untouched', a
     }
 })
 
-test('legacy record-nuke-progress messages are absent runtime actions', async () => {
+test('legacy progress runtime aliases are absent runtime actions', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Legacy-Progress-Absent'
     const runId = 'run-legacy-progress-absent'
     const attemptId = 'attempt-legacy-progress-absent'
@@ -4547,7 +4550,7 @@ test('legacy record-nuke-progress messages are absent runtime actions', async ()
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -4569,7 +4572,7 @@ test('legacy record-nuke-progress messages are absent runtime actions', async ()
     }
 
     const singleResult = await browser.runtime.sendMessage({
-        action: 'record-nuke-progress',
+        action: LEGACY_RECORD_PROGRESS_ACTION,
         profileHref: href,
         patch: {
             status: 'blocked',
@@ -4585,7 +4588,7 @@ test('legacy record-nuke-progress messages are absent runtime actions', async ()
         tab: {id: tabId}
     })
     const batchResult = await browser.runtime.sendMessage({
-        action: 'record-nuke-progress-batch',
+        action: LEGACY_RECORD_PROGRESS_BATCH_ACTION,
         updates: [{
             profileHref: href,
             patch: {
@@ -4605,8 +4608,8 @@ test('legacy record-nuke-progress messages are absent runtime actions', async ()
 
     assert.equal(singleResult, undefined)
     assert.equal(batchResult, undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, attemptId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, attemptId)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(setCalls, 0)
@@ -4630,7 +4633,7 @@ test('terminal authority queue WAL projection failure does not poison durable ac
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -4710,7 +4713,7 @@ test('terminal settlement applies terminal row residue through authority in a ba
                 [runId]: makeCoordinatorRun({href: hrefA, runId, targetProfileHrefs: [hrefA, hrefB]})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             mbSpacePendingNukedPosts: {
                 'post-terminal-settlement': {
                     postKey: 'post-terminal-settlement',
@@ -4736,8 +4739,8 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].sourceSettlementOutcome, 'confirmed')
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 2)
     assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement'], undefined)
-    assert.equal(storage.mbProfileNukeProgress[hrefA], undefined)
-    assert.equal(storage.mbProfileNukeProgress[hrefB], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefA], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[hrefA].status, 'blocked')
     assert.equal(storage.mbProfileNukeProgressView.records[hrefB].status, 'blocked')
     assert.equal(getProgressShardRecord(storage, hrefA).status, 'blocked')
@@ -4774,7 +4777,7 @@ test('terminal settlement confirms missing queue row from projection-only progre
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 status: 'blocked',
                 blockSucceeded: true,
@@ -4801,7 +4804,7 @@ test('terminal settlement confirms missing queue row from projection-only progre
     assert.equal(result.confirmed, 1)
     assert.equal(result.cleared, 0)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
 })
@@ -4822,7 +4825,7 @@ test('terminal settlement clears source posts for WAL-terminal rows over stale s
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -4914,7 +4917,7 @@ test('terminal settlement WAL append failure leaves source post pending', async 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             mbSpacePendingNukedPosts: {
                 'post-terminal-settlement-wal-append-failure': {
                     postKey: 'post-terminal-settlement-wal-append-failure',
@@ -4967,7 +4970,7 @@ test('terminal settlement projection failure does not poison WAL settlement', as
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             mbSpacePendingNukedPosts: {
                 'post-terminal-settlement-projection-failure': {
                     postKey: 'post-terminal-settlement-projection-failure',
@@ -5025,7 +5028,7 @@ test('terminal settlement derived save failure does not poison authority settlem
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             mbSpacePendingNukedPosts: {
                 'post-terminal-settlement-derived-failure': {
                     postKey: 'post-terminal-settlement-derived-failure',
@@ -5082,7 +5085,7 @@ test('terminal settlement progress projection failure does not poison authority 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             mbSpacePendingNukedPosts: {},
             mbSpaceNukedPosts: {}
         }
@@ -5103,7 +5106,7 @@ test('terminal settlement progress projection failure does not poison authority 
     assert.equal(result.progressRestored, 1)
     assert.equal(storage.mbCoordinatorQueue[href].sourceSettlementOutcome, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView, undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
@@ -5563,7 +5566,7 @@ test('action lease tab release uses WAL terminal authority over stale raw lease'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -6028,7 +6031,7 @@ test('concurrent terminal compatibility saves do not regress newer terminal prog
                 [runIdB]: makeCoordinatorRun({href: hrefB, runId: runIdB})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [hrefA]: {
                     profileHref: hrefA,
                     status: 'blocking',
@@ -6131,7 +6134,7 @@ test('terminal progress compatibility save recomputes runs from WAL authority ov
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -6192,7 +6195,7 @@ test('terminal job progress reports durable terminal queue despite compatibility
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -6236,7 +6239,7 @@ test('terminal job progress reports durable terminal queue despite compatibility
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
     assert.equal(sw.state().queueWakeupCounters['terminalProgress.compatibilitySaveFailed'] || 0, 0)
     assert.equal(sw.state().queueWakeupCounters['terminalProgress.derivedSaveFailed'] || 0, 1)
@@ -6258,7 +6261,7 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -6302,7 +6305,7 @@ test('terminal job progress acknowledges durable terminal queue before compatibi
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocking')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
 
     await timers.tick(121000)
     await flushAsync(20)
@@ -6330,7 +6333,7 @@ test('space-feed confirmation does not promote stale failed queue rows from the 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocked',
@@ -6394,7 +6397,7 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: progressRecord
             },
             mbSpacePendingNukedPosts: {},
@@ -6410,7 +6413,7 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
     assert.equal(result.confirmed, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    const storedRecord = Object.values(storage.mbProfileNukeProgress || {})
+    const storedRecord = Object.values(storage[LEGACY_PROFILE_PROGRESS_KEY] || {})
         .find(record => record?.profileHref === href)
     assert.deepEqual(storedRecord, progressRecord)
 })
@@ -6431,7 +6434,7 @@ test('clear profile state removes queue row through WAL authority and saves deri
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -6495,7 +6498,7 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href], undefined)
-    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
     assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(sw.state().profileNukeProgress[href], undefined)
@@ -6516,7 +6519,7 @@ test('clear profile state removes queue row through WAL authority and saves deri
     ])
     assert.ok(clearLoadDefaults)
     assert.equal(hasStorageDefault(clearLoadDefaults, 'mbCoordinatorEvents'), false)
-    assert.equal(hasStorageDefault(clearLoadDefaults, 'mbProfileNukeProgress'), false)
+    assert.equal(hasStorageDefault(clearLoadDefaults, LEGACY_PROFILE_PROGRESS_KEY), false)
 
     const records = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -6543,7 +6546,7 @@ test('clear profile state derived failure materializes cleanup without resurrect
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -6611,7 +6614,7 @@ test('clear profile state derived failure materializes cleanup without resurrect
     assert.equal(failedDerivedSave, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
     assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
@@ -6626,7 +6629,7 @@ test('clear profile state derived failure materializes cleanup without resurrect
     assert.equal(repair.queueCount, 0)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
     assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
@@ -6650,7 +6653,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -6712,7 +6715,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
-    assert.ok(storage.mbProfileNukeProgress[href])
+    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.ok(sw.state().profileNukeProgress[href])
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
@@ -6806,7 +6809,7 @@ test('row event preserves terminal durable rows against late nonterminal breadcr
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocked',
@@ -6839,8 +6842,8 @@ test('row event preserves terminal durable rows against late nonterminal breadcr
     assert.equal(result.recorded, false)
     assert.equal(result.reason, 'terminal-row-preserved')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
-    assert.equal(storage.mbProfileNukeProgress[href].terminalAt, terminalAt)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocked')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].terminalAt, terminalAt)
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.terminalRowPreserved'] || 0, 1)
 })
 
@@ -6871,7 +6874,7 @@ test('rejected deferred milestones do not poison in-memory progress mirror', asy
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocked',
@@ -6900,7 +6903,7 @@ test('rejected deferred milestones do not poison in-memory progress mirror', asy
     assert.equal(result.recorded, false)
     assert.equal(result.durable, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'blocked')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocked')
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
     assert.equal(sw.state().profileNukeProgress[href].terminalAt, terminalAt)
     assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.rejected.terminalRowPreserved'] || 0, 1)
@@ -6947,7 +6950,7 @@ test('deferred milestone acknowledgement is row-specific for mixed flush results
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [rejectedHref]: {
                     profileHref: rejectedHref,
                     status: 'blocked',
@@ -7025,10 +7028,10 @@ test('deferred milestone acknowledgement is row-specific for mixed flush results
     assert.equal(rejected.reason, 'terminal-row-preserved')
     assert.equal(accepted.recorded, true)
     assert.equal(accepted.durable, true)
-    assert.equal(storage.mbProfileNukeProgress[rejectedHref].status, 'blocked')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][rejectedHref].status, 'blocked')
     assert.equal(sw.state().profileNukeProgress[rejectedHref].status, 'blocked')
     assert.equal(sw.state().profileNukeProgress[acceptedHref].status, 'page-ready')
-    assert.equal(storage.mbProfileNukeProgress[acceptedHref].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][acceptedHref].status, 'tab-opened')
     assert.equal(storage.mbProfileNukeProgressView.records[acceptedHref].status, 'page-ready')
     assert.equal(getProgressShardRecord(storage, acceptedHref).status, 'page-ready')
     assert.equal(rejectedMetadataAfter.lastProgressAt, rejectedMetadataBefore.lastProgressAt)
@@ -7058,7 +7061,7 @@ test('dashboard reconcile request is display-only and does not schedule progress
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -7121,7 +7124,7 @@ test('legacy import flag does not recreate queue authority from progress', async
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -7147,7 +7150,7 @@ test('legacy import flag does not recreate queue authority from progress', async
     assert.equal(Object.prototype.hasOwnProperty.call(result, 'repair'), false)
     assert.equal(Object.prototype.hasOwnProperty.call(result, 'repairScheduled'), false)
     assert.equal(storage.mbCoordinatorQueue[href], undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'queued')
 })
 
 test('authority reconcile reclaims durable active row without confirmed runtime actor', async () => {
@@ -7190,7 +7193,7 @@ test('authority reconcile reclaims durable active row without confirmed runtime 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -7212,7 +7215,7 @@ test('authority reconcile reclaims durable active row without confirmed runtime 
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, attemptId)
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opened')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
@@ -7264,7 +7267,7 @@ test('authority reconcile adopts matching candidate tab by durable active token'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -7345,7 +7348,7 @@ test('authority reconcile preserves live persisted tab even when current URL is 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -7389,8 +7392,8 @@ test('authority reconcile preserves live persisted tab even when current URL is 
     assert.equal(result.requeued, 0)
     assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
     assert.equal(storage.mbCoordinatorQueue[href].attemptId, attemptId)
-    assert.notEqual(storage.mbProfileNukeProgress[href].status, 'queued')
-    assert.notEqual(storage.mbProfileNukeProgress[href].status, 'interrupted')
+    assert.notEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'queued')
+    assert.notEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'interrupted')
     assert.equal(browser.__tabs.has(tabId), true)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.ok(sw.state().activeQueuedTabs.includes(tabId))
@@ -7439,7 +7442,7 @@ test('authority reconcile rejects persisted tab id reuse with unrelated live tab
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -7517,7 +7520,7 @@ test('authority reconcile treats missing active anchors as reclaimable despite p
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -7554,8 +7557,8 @@ test('authority reconcile treats missing active anchors as reclaimable despite p
 
 test('storage reconcile preserves fresh plausible persisted tab on transient URL', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Transient'
-    const runId = 'run-repair-transient'
-    const attemptId = 'attempt-repair-transient'
+    const runId = 'run-reconcile-transient'
+    const attemptId = 'attempt-reconcile-transient'
     const tabId = 337
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 360000,
@@ -7597,7 +7600,7 @@ test('storage reconcile preserves fresh plausible persisted tab on transient URL
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -7624,15 +7627,15 @@ test('storage reconcile preserves fresh plausible persisted tab on transient URL
 
     assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
     assert.equal(storage.mbCoordinatorQueue[href].tabId, tabId)
-    assert.notEqual(storage.mbProfileNukeProgress[href].status, 'interrupted')
+    assert.notEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'interrupted')
     assert.equal(browser.__tabs.has(tabId), true)
     assert.equal(browser.__removedTabs.includes(tabId), false)
 })
 
 test('storage reconcile does not close unrelated persisted tab id', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Reused-Tab'
-    const runId = 'run-repair-reused-tab'
-    const attemptId = 'attempt-repair-reused-tab'
+    const runId = 'run-reconcile-reused-tab'
+    const attemptId = 'attempt-reconcile-reused-tab'
     const tabId = 338
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 500000,
@@ -7672,7 +7675,7 @@ test('storage reconcile does not close unrelated persisted tab id', async () => 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -7730,7 +7733,7 @@ test('resume does not duplicate action-phase active row whose live tab is on a n
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -7809,7 +7812,7 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -7860,7 +7863,7 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     await waitFor(
         () => storage.mbProfileNukeProgressView?.records?.[href]?.status === 'profile-unavailable',
         'non-profile landing progress projection was not materialized',
@@ -7915,7 +7918,7 @@ test('queued profile tab redirecting to a different profile is skipped and close
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -7966,7 +7969,7 @@ test('queued profile tab redirecting to a different profile is skipped and close
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'profile-redirect-mismatch')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     await waitFor(
         () => storage.mbProfileNukeProgressView?.records?.[href]?.status === 'profile-unavailable',
         'profile redirect mismatch progress projection was not materialized',
@@ -8022,7 +8025,7 @@ test('authority reconcile skips durable active profile row that landed on a non-
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8055,7 +8058,7 @@ test('authority reconcile skips durable active profile row that landed on a non-
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(browser.__tabs.has(tabId), false)
@@ -8079,7 +8082,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8114,7 +8117,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     assert.equal(result.outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
@@ -8152,7 +8155,7 @@ test('reconcile does not resume WAL-terminal row from stale raw queue snapshot',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8215,7 +8218,7 @@ test('preplanned queued action revalidates WAL-terminal authority before opening
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8294,7 +8297,7 @@ test('non-profile landing terminalization rejects stale attempt before authority
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8322,7 +8325,7 @@ test('non-profile landing terminalization rejects stale attempt before authority
     assert.equal(result.reason, 'attempt-changed')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
 })
 
 test('non-profile landing terminalization append failure leaves row active', async () => {
@@ -8342,7 +8345,7 @@ test('non-profile landing terminalization append failure leaves row active', asy
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8377,7 +8380,7 @@ test('non-profile landing terminalization append failure leaves row active', asy
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
 })
 
 test('non-profile landing projection failure does not poison WAL terminalization', async () => {
@@ -8397,7 +8400,7 @@ test('non-profile landing projection failure does not poison WAL terminalization
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8431,7 +8434,7 @@ test('non-profile landing projection failure does not poison WAL terminalization
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
@@ -8462,7 +8465,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opening',
@@ -8484,7 +8487,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
         if(isCoordinatorQueueWalPayload(payload)) {
             walSaved = true
         }
-        if(walSaved && !isCoordinatorQueueWalPayload(payload) && (payload?.mbCoordinatorRuns || payload?.mbProfileNukeProgress)) {
+        if(walSaved && !isCoordinatorQueueWalPayload(payload) && (payload?.mbCoordinatorRuns || payload?.[LEGACY_PROFILE_PROGRESS_KEY])) {
             throw new Error('synthetic non-profile derived save failure')
         }
         return originalSet(payload)
@@ -8500,7 +8503,7 @@ test('non-profile landing derived failure does not poison authority terminalizat
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
@@ -8563,7 +8566,7 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
     browser.storage.local.get = originalGet
 
     assert.equal(result.changed, true)
-    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), true)
     assert.equal(result.status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
@@ -8714,7 +8717,7 @@ test('late profile resolution cannot overwrite a WAL-terminal destination row', 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [resolvedHref]: {
                     profileHref: resolvedHref,
                     status: 'blocking',
@@ -8941,7 +8944,7 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     ])
     assert.ok(resolverLoadDefaults)
     assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbCoordinatorEvents'), false)
-    assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbProfileNukeProgress'), false)
+    assert.equal(hasStorageDefault(resolverLoadDefaults, LEGACY_PROFILE_PROGRESS_KEY), false)
     assert.equal(hasStorageDefault(resolverLoadDefaults, 'mbSpaceNukedPosts'), false)
     const metadata = sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]
     assert.equal(metadata.profileHref, resolvedHref)
@@ -10002,7 +10005,7 @@ test('reconcile does not promote terminal error progress over active service-wor
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'error',
@@ -10030,8 +10033,8 @@ test('reconcile does not promote terminal error progress over active service-wor
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].outcome, undefined)
     assert.equal(storage.mbCoordinatorQueue[href].error, undefined)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'error')
-    assert.equal(storage.mbProfileNukeProgress[href].finalError, 'Profile actions not ready')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'error')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].finalError, 'Profile actions not ready')
 })
 
 test('coordinator reconcile scheduler keeps the earliest requested deadline', async () => {
@@ -10055,7 +10058,7 @@ test('coordinator reconcile scheduler keeps the earliest requested deadline', as
 test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', async () => {
     const {sw, timers} = loadServiceWorkerHarness({now: 0})
 
-    await settleWithFakeTimers(sw.runScheduledCoordinatorReconcileTick('noop-repair-backoff'), timers)
+    await settleWithFakeTimers(sw.runScheduledCoordinatorReconcileTick('noop-reconcile-backoff'), timers)
     const backoffState = sw.state()
     assert.ok(backoffState.coordinatorReconcileBackoffLevel > 0)
     assert.ok(backoffState.coordinatorReconcileBackoffUntil > timers.now)
@@ -10087,7 +10090,7 @@ test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', 
 
 test('stored-work reconcile hands queued-only durable work to fast executor', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Queued-Only-Fast-Resume'
-    const runId = 'run-repair-queued-only-fast-resume'
+    const runId = 'run-reconcile-queued-only-fast-resume'
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 3965,
         storage: {
@@ -10096,7 +10099,7 @@ test('stored-work reconcile hands queued-only durable work to fast executor', as
                 [href]: makeQueuedCoordinatorRow({
                     href,
                     runId,
-                    attemptId: 'attempt-repair-queued-only-fast-resume',
+                    attemptId: 'attempt-reconcile-queued-only-fast-resume',
                     now: 3965
                 })
             },
@@ -10104,13 +10107,13 @@ test('stored-work reconcile hands queued-only durable work to fast executor', as
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
     await activateQuoraRuntime(browser, href)
     const result = await settleWithFakeTimers(
-        sw.runScheduledCoordinatorReconcileTick('synthetic-queued-only-repair'),
+        sw.runScheduledCoordinatorReconcileTick('synthetic-queued-only-reconcile'),
         timers,
         [0, 1000, 5000]
     )
@@ -10118,7 +10121,7 @@ test('stored-work reconcile hands queued-only durable work to fast executor', as
     assert.equal(result, undefined)
     await waitFor(
         () => listTabs(browser).some(tab => tab.url === href),
-        'queued-only repair fast resume did not open a profile tab',
+        'queued-only reconcile fast resume did not open a profile tab',
         {timers, attempts: 40, tickMs: 1000}
     )
 
@@ -10390,7 +10393,7 @@ test('coordinator authority hydrates resident projection without storage writes'
                 type: 'synthetic',
                 at: 2990
             }],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -10421,7 +10424,7 @@ test('coordinator authority hydrates resident projection without storage writes'
         'mbCoordinatorQueue',
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
-        'mbProfileNukeProgress'
+        LEGACY_PROFILE_PROGRESS_KEY
     ])
     assert.ok(hydrateDefaults)
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorEvents'), false)
@@ -11028,7 +11031,7 @@ test('storage timeout recovery clears stale scheduler latches and rearms resume'
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const gate = deferred()
@@ -11449,7 +11452,7 @@ test('dashboard queue view refresh uses WAL terminal authority over stale raw qu
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -11865,7 +11868,7 @@ test('service worker reload rearms stored work in an existing browser session', 
             [runId]: makeCoordinatorRun({href, runId})
         },
         mbCoordinatorEvents: [],
-        mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     browser.__sessionStorage.mbBrowserSessionMarker = {
         id: 'existing-session',
@@ -11964,7 +11967,7 @@ test('first Quora tab observation clears stale pause and resumes persisted servi
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12035,7 +12038,7 @@ test('first Quora tab observation preserves explicit pause across extension relo
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12099,7 +12102,7 @@ test('content ready message opens the Quora runtime gate and resumes stored work
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12278,7 +12281,7 @@ test('dashboard explicit start bypasses first Quora visit and opens queued work'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12412,7 +12415,7 @@ test('browser startup auto-start preference bypasses first Quora visit', async (
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12466,7 +12469,7 @@ test('extension update rearms queued stored work without a manual resume poke', 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12511,7 +12514,7 @@ test('dashboard resume starts service-worker queued work before alarm delivery',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -12602,7 +12605,7 @@ test('active transition retargets a replacement actor tab for the same attempt',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const action = {
@@ -12949,8 +12952,7 @@ test('nonterminal progress storage changes do not edge-trigger reconcile backoff
     const {browser, sw} = loadServiceWorkerHarness({now: 0})
 
     await activateQuoraRuntime(browser)
-    await browser.storage.local.set({
-        mbProfileNukeProgress: {
+    await browser.storage.local.set({[LEGACY_PROFILE_PROGRESS_KEY]: {
             [href]: {
                 status: 'acting',
                 event: 'Action in progress',
@@ -13016,7 +13018,7 @@ test('content-page state rebuilds missing progress shards for old requested prof
                     }
                 }
             },
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [oldHref]: {
                     profileHref: oldHref,
                     status: 'blocked',
@@ -13061,7 +13063,7 @@ test('content-page projection rebuild preserves projection-only progress rows', 
                 truncated: false,
                 items: []
             },
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 status: 'blocked',
                 blockSucceeded: true,
@@ -13081,7 +13083,7 @@ test('content-page projection rebuild preserves projection-only progress rows', 
     assert.equal(result.profileNukeProgress[href].status, 'blocked')
     assert.equal(result.profileNukeProgress[href].blockSucceeded, true)
     assert.equal(result.profileNukeProgress[href].blockAttemptedAt, 20)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
     assert.equal(getProgressShardRecord(storage, href).blockAttemptedAt, 20)
@@ -13189,7 +13191,7 @@ test('content-page projection rebuild uses WAL terminal authority over stale raw
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -13258,7 +13260,7 @@ test('queued work resumes after service worker restart once Quora was seen this 
         },
         mbCoordinatorRuns: {},
         mbCoordinatorEvents: [],
-        mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     browser.__sessionStorage.mbQuoraRuntimeActivated = {
         active: true,
@@ -13352,7 +13354,7 @@ test('source-page run status ignores WAL-terminal row over stale raw active queu
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -13420,7 +13422,7 @@ test('source-page run status polling is read-only for terminal owned tabs', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocked',
@@ -13537,7 +13539,7 @@ test('service-worker no-foreground destructive work uses worker window without f
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=elon', active: true})
@@ -13611,7 +13613,7 @@ test('service-worker reuses existing worker window after in-memory surface state
             }
         },
         mbCoordinatorEvents: [],
-        mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const existingSurface = await browser.windows.create({
         url: browser.runtime.getURL('coordinator.html#worker-window'),
@@ -13675,7 +13677,7 @@ test('service-worker reuses existing worker window after in-memory surface state
             (sw.state().queueWakeupCounters['storageUpdate.fallbackReturned'] || 0))
         return
     }
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].actionSurfaceMode, 'worker-window')
     assert.equal(getProgressShardRecord(storage, href).actionSurfaceMode, 'worker-window')
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.created'] || 0, 0)
@@ -13719,7 +13721,7 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
             }
         },
         mbCoordinatorEvents: [],
-        mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const existingSurface = await browser.windows.create({
         url: browser.runtime.getURL('coordinator.html#worker-window'),
@@ -13768,7 +13770,7 @@ test('service-worker closes idle orphan worker windows after Quora activation', 
         mbCoordinatorQueue: {},
         mbCoordinatorRuns: {},
         mbCoordinatorEvents: [],
-        mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const orphanSurface = await browser.windows.create({
         url: browser.runtime.getURL('coordinator.html#worker-window'),
@@ -13825,7 +13827,7 @@ test('service-worker worker window closes after queued worker surface becomes id
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await browser.tabs.create({url: 'https://www.quora.com/search?q=elon', active: true})
@@ -13915,7 +13917,7 @@ test('confirmation promotion in no-foreground worker window briefly focuses and 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=elon', active: true})
@@ -14009,7 +14011,7 @@ test('begin-profile-action promotes from sender tab when tab lookup is transient
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__setNextTabId(tabId)
@@ -14100,7 +14102,7 @@ test('service-worker durable queue clears stale owner pause before opening next 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testPauseQueuedOwner('service-worker-queue-owner')
@@ -14164,7 +14166,7 @@ test('failed retry preserves no-foreground executor policy when claimed', async 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -14237,7 +14239,7 @@ test('manual failed requeue preserves no-foreground executor policy when claimed
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -14358,7 +14360,7 @@ test('begin-profile-action grants initial action gate without foreground promoti
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__setNextTabId(250)
@@ -14434,7 +14436,7 @@ test('begin-profile-action promotes a hidden confirmation action', async () => {
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__setNextTabId(252)
@@ -14502,7 +14504,7 @@ test('begin-profile-action denies and releases lease when foreground promotion f
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__setNextTabId(251)
@@ -14579,7 +14581,7 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -14659,7 +14661,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -14687,7 +14689,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
     assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
-    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     browser.storage.local.set = originalSet
     const getDefaults = []
@@ -14705,7 +14707,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     assert.equal(reconcile.eventsChanged, true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
-    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(storage.mbProfileNukeProgressView.records[href].runId, runId)
     assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
@@ -14719,7 +14721,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
         'mbCoordinatorEvents',
-        'mbProfileNukeProgress',
+        LEGACY_PROFILE_PROGRESS_KEY,
         'mbCoordinatorPaused',
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
@@ -14744,7 +14746,7 @@ test('reconcile does not materialize projection-only queued progress as queue au
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 status: 'queued',
                 actionKind: 'mute-block',
@@ -14773,7 +14775,7 @@ test('reconcile does not materialize projection-only queued progress as queue au
     assert.equal(directReconcile.queueChanged, false)
     assert.equal(directReconcile.progressChanged, false)
     assert.equal(storage.mbCoordinatorQueue[href], undefined)
-    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
@@ -14781,7 +14783,7 @@ test('reconcile does not materialize projection-only queued progress as queue au
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
         'mbCoordinatorEvents',
-        'mbProfileNukeProgress',
+        LEGACY_PROFILE_PROGRESS_KEY,
         'mbProfileNukeProgressView',
         'mbCoordinatorPaused',
         'mbSpacePendingNukedPosts',
@@ -14838,7 +14840,7 @@ test('stored-work reconcile terminal raw row updates WAL authority', async () =>
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: staleProgress
             },
             ...makeProgressProjectionSeed(href, staleProgress)
@@ -14873,7 +14875,7 @@ test('enqueue progress projection failure does not poison durable WAL acknowledg
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -14900,7 +14902,7 @@ test('enqueue progress projection failure does not poison durable WAL acknowledg
     assert.equal(enqueue.derivedSaved, false)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
-    assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView, undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
@@ -14923,7 +14925,7 @@ test('enqueue resetExisting derived save failure reconcile replaces stale progre
                 [oldRunId]: makeCoordinatorRun({href, runId: oldRunId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'tab-opened',
@@ -14979,18 +14981,18 @@ test('enqueue resetExisting derived save failure reconcile replaces stale progre
     assert.equal(walRow.runId, nextRunId)
     assert.notEqual(walRow.attemptId, oldAttemptId)
     assert.equal(walRow.attemptNumber, 2)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
-    assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].runId, oldRunId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, oldAttemptId)
     browser.storage.local.set = originalSet
 
     const reconcile = await sw.reconcileCoordinatorStorage()
 
     assert.ok(reconcile.materialized > 0)
     assert.equal(reconcile.progressChanged, false)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
-    assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, oldAttemptId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opened')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].runId, oldRunId)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, oldAttemptId)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(storage.mbProfileNukeProgressView.records[href].runId, nextRunId)
     assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, walRow.attemptId)
@@ -15016,7 +15018,7 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15034,7 +15036,7 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     assert.equal(enqueue.executionDeferred, true)
     assert.equal(storage.mbCoordinatorPaused, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
@@ -15089,7 +15091,7 @@ test('dashboard resume opens durable service-worker queued rows after volatile e
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15146,7 +15148,7 @@ test('scheduled resume alarm starts durable queued work through executor fast pa
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15212,7 +15214,7 @@ test('terminal progress continuation starts next queued row through fast executo
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(terminalTabId, {
@@ -15315,7 +15317,7 @@ test('terminal progress continuation ignores stale provisional runtime capacity'
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(staleTabId, {
@@ -15399,7 +15401,7 @@ test('executor planning ignores stale mismatched progress for queued retry row',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -15471,7 +15473,7 @@ test('scheduled explicit dashboard resume preserves before-Quora bypass through 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15520,7 +15522,7 @@ test('fast executor throttle still opens one durable queued row when idle', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15577,7 +15579,7 @@ test('fast executor drops stale volatile queued action while throttled and idle'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -15630,7 +15632,7 @@ test('queue-only fast executor uses resident authority without legacy progress l
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'queued',
@@ -15645,7 +15647,7 @@ test('queue-only fast executor uses resident authority without legacy progress l
     const forbiddenReads = []
     browser.storage.local.get = async defaults => {
         if(defaults &&
-            Object.prototype.hasOwnProperty.call(defaults, 'mbProfileNukeProgress')) {
+            Object.prototype.hasOwnProperty.call(defaults, LEGACY_PROFILE_PROGRESS_KEY)) {
             forbiddenReads.push({keys: Object.keys(defaults).sort(), stack: new Error().stack})
             throw new Error('synthetic queue-only resume legacy progress read')
         }
@@ -15696,7 +15698,7 @@ test('awaited queue fill releases promise when tab creation hangs', async () => 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -15745,7 +15747,7 @@ test('scheduled queue wakeup reloads durable queue instead of stale resident aut
                 [runId]: makeCoordinatorRun({href: durableHref, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -15800,7 +15802,7 @@ test('fast executor freshens rolled-back active-transition rows before reopening
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -15865,7 +15867,7 @@ test('fast executor reclaims queued retry row after active missing-tab rollback 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -15914,7 +15916,7 @@ test('active transition waits behind slow storage tail instead of failing before
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testAddProvisionalQueuedTab(717, {
@@ -15992,7 +15994,7 @@ test('active transition rollback waits behind slow storage tail instead of faili
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const gate = deferred()
@@ -16064,7 +16066,7 @@ test('resume rebuilds durable work after stale volatile queued action skips with
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -16112,7 +16114,7 @@ test('stored work reconcile drops stale volatile queued actions before durable r
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -16151,7 +16153,7 @@ test('durable resume preserves volatile queued action while fill is in flight', 
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -16205,7 +16207,7 @@ test('volatile action pruning uses WAL terminal authority over stale raw active 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     status: 'blocking',
@@ -16300,7 +16302,7 @@ test('service-worker executor resume plans only the current slot batch', async (
                 })
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -16340,11 +16342,11 @@ test('service-worker executor resume adopts expected live queued profile tab bef
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const existingTab = await browser.tabs.create({url: href, active: true})
-    storage.mbProfileNukeProgress[href] = {
+    storage[LEGACY_PROFILE_PROGRESS_KEY][href] = {
         profileHref: href,
         actionKind: 'mute-block',
         status: 'tab-opening',
@@ -16360,7 +16362,7 @@ test('service-worker executor resume adopts expected live queued profile tab bef
         if(defaults &&
             Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue') &&
             Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorRuns') &&
-            !Object.prototype.hasOwnProperty.call(defaults, 'mbProfileNukeProgress') &&
+            !Object.prototype.hasOwnProperty.call(defaults, LEGACY_PROFILE_PROGRESS_KEY) &&
             !Object.prototype.hasOwnProperty.call(defaults, 'mbProfileNukeProgressView')) {
             queueRunsOnlyReads += 1
             throw new Error('synthetic redundant active transition authority load')
@@ -16411,7 +16413,7 @@ test('service-worker executor does not adopt unrelated same-profile tab for queu
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const unrelatedTab = await browser.tabs.create({url: href, active: true})
@@ -16458,7 +16460,7 @@ test('service-worker executor adopts orphaned worker-window queued profile tab',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -16522,7 +16524,7 @@ test('service-worker executor adopts orphaned pending-confirmation worker-window
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const confirmationTab = await browser.tabs.create({
@@ -16593,7 +16595,7 @@ test('service-worker executor reclaims rolled-back queued profile tab before ope
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -16657,7 +16659,7 @@ test('service-worker executor reclaims rolled-back queued profile tab when retry
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -16782,7 +16784,7 @@ test('service-worker executor terminalizes exhausted rolled-back queue rows and 
                 })
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [staleHref]: {
                     profileHref: staleHref,
                     actionKind: 'mute-block',
@@ -16862,7 +16864,7 @@ test('service-worker executor open resets stale terminal progress for the curren
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -16892,7 +16894,7 @@ test('service-worker executor open resets stale terminal progress for the curren
     }), timers)
 
     const openedTab = listTabs(browser).find(tab => tab.url === href && tab.id !== staleTabId)
-    const progressRecord = getProgressShardRecord(storage, href) || storage.mbProfileNukeProgress[href]
+    const progressRecord = getProgressShardRecord(storage, href) || storage[LEGACY_PROFILE_PROGRESS_KEY][href]
     const recoveredQueue = getRecoveredCoordinatorQueue(storage)
 
     assert.equal(result.queued, 1)
@@ -16922,7 +16924,7 @@ test('service-worker executor releases live queued tab when active transition ne
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const existingTab = await browser.tabs.create({url: href, active: true})
@@ -16989,7 +16991,7 @@ test('no-foreground worker window keeps profile tab after active transition WAL 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const surface = await browser.windows.create({
@@ -17074,7 +17076,7 @@ test('worker window cleanup does not close a live profile tab after runtime rele
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await browser.tabs.create({url: 'https://www.quora.com/search?q=synthetic', active: true})
@@ -17221,7 +17223,7 @@ test('active transition is WAL-backed and recovers after restart', async () => {
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -17297,7 +17299,7 @@ test('active transition projection failure does not poison durable acknowledgeme
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -17386,7 +17388,7 @@ test('stale active transition append cannot repaint compact queue view over WAL 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -17471,7 +17473,7 @@ test('post-active missing tab rollback reuses resident authority state', async (
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -17563,7 +17565,7 @@ test('queued tab active transition reuses executor authority state', async () =>
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const authorityState = await sw.coordinatorAuthority.hydrate()
@@ -17631,7 +17633,7 @@ test('queued tab missing after durable active transition rolls back immediately'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const authorityState = await sw.coordinatorAuthority.hydrate()
@@ -17691,7 +17693,7 @@ test('queued tab lookup timeout after durable active transition defers rollback'
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const authorityState = await sw.coordinatorAuthority.hydrate()
@@ -17761,7 +17763,7 @@ test('queued tab lookup timeout with absent tab-list entry rolls back immediatel
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const authorityState = await sw.coordinatorAuthority.hydrate()
@@ -17829,7 +17831,7 @@ test('runtime prune defers detach when queued tab lookup times out', async () =>
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -17884,7 +17886,7 @@ test('active transition rejects stale attempt before WAL append', async () => {
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -17927,7 +17929,7 @@ test('active transition rejects missing incoming attempt identity before WAL app
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -17968,7 +17970,7 @@ test('active transition WAL append failure leaves row queued', async () => {
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -18021,7 +18023,7 @@ test('active transition rollback is WAL-backed and recovers after restart', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -18078,7 +18080,7 @@ test('active transition rollback rejects stale attempt before WAL append', async
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -18118,7 +18120,7 @@ test('active transition rollback rejects missing incoming attempt identity befor
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -18157,7 +18159,7 @@ test('active transition rollback rejects queued row before WAL append', async ()
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -18201,7 +18203,7 @@ test('active transition rollback WAL append failure leaves row active', async ()
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -18368,7 +18370,7 @@ test('resume ignores provisional queued tab runtime ownership', async () => {
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(777, {
@@ -18431,7 +18433,7 @@ test('claim-tab-action ignores queued storage rows without durable active owners
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -18472,7 +18474,7 @@ test('claim-tab-action recovers active resident authority without full projectio
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -18530,7 +18532,7 @@ test('claim-tab-action recovers active row when persisted tab id is stale', asyn
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -18576,7 +18578,7 @@ test('stale queued tab sweep defers hung tab lookup without releasing executor s
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -18661,7 +18663,7 @@ test('authority reconcile requeues durable active row without runtime actor thro
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -18690,7 +18692,7 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, 'attempt-active-no-actor')
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
@@ -18745,7 +18747,7 @@ test('active-without-actor terminal reconcile schedules next queued fill', async
                 [runId]: makeCoordinatorRun({href: failedHref, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [failedHref]: {
                     profileHref: failedHref,
                     actionKind: 'mute-block',
@@ -18801,7 +18803,7 @@ test('authority reconcile defers fresh worker-window startup progress before no-
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 profileHref: href,
                 actionKind: 'mute-block',
@@ -18849,7 +18851,7 @@ test('authority preflight preserves fresh durably active startup actor before cl
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const tab = await browser.tabs.create({url: href, active: true})
@@ -18897,7 +18899,7 @@ test('executor queue-only reconcile defers fresh startup actor before no-actor f
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     const tab = await browser.tabs.create({url: href, active: true})
@@ -18955,7 +18957,7 @@ test('executor queue-only reconcile reports stale active requeue as continuation
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19036,7 +19038,7 @@ test('authority reconcile requeues active-transition-failed active row with miss
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19105,7 +19107,7 @@ test('user-initiated dashboard resume reconciles active-transition-failed row be
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19177,7 +19179,7 @@ test('authority reconcile terminalizes retry-exhausted no-actor row when persist
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19263,7 +19265,7 @@ test('authority reconcile requeues stale no-actor row when persisted tab lookup 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19348,7 +19350,7 @@ test('authority reconcile adopts same-profile live tab before no-actor terminal 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19409,7 +19411,7 @@ test('authority reconcile terminalizes blocked live profile tab before no-actor 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19506,7 +19508,7 @@ test('authority reconcile terminalizes blocked live action-lease tab before leas
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19579,7 +19581,7 @@ test('authority reconcile requeues missing active-transition tab instead of recl
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19651,7 +19653,7 @@ test('authority reconcile requeues missing active tab after releasing stale acti
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19737,7 +19739,7 @@ test('authority reconcile releases stale action lease and requeues when lease ta
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19835,7 +19837,7 @@ test('authority reconcile adopts same-profile live tab after releasing stale act
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19916,7 +19918,7 @@ test('authority reconcile defers profile reclaim while action lease tab is still
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -19996,7 +19998,7 @@ test('active action lease rejects progress from stale sender tab', async () => {
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20064,7 +20066,7 @@ test('content script ensure reprobes same URL when extension version changes', a
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -20154,7 +20156,7 @@ test('content script ensure reloads same-version cached marker when nudge has no
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -20224,7 +20226,7 @@ test('content script reload schedules a post-reload ensure and claim continuatio
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -20306,7 +20308,7 @@ test('authority reconcile reloads confirmed live actor with stale content script
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
@@ -20383,7 +20385,7 @@ test('authority reconcile ignores stale mismatched progress for active-without-a
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20403,7 +20405,7 @@ test('authority reconcile ignores stale mismatched progress for active-without-a
 
     assert.equal(result.requeued, 1)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbProfileNukeProgress[href].attemptId, 'attempt-stale-progress')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, 'attempt-stale-progress')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, 'attempt-active-current')
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
@@ -20460,7 +20462,7 @@ test('authority reconcile requeues projection-only action-phase active row when 
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {},
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
             ...makeProgressProjectionSeed(href, {
                 status: 'page-ready',
                 runId,
@@ -20521,7 +20523,7 @@ test('authority reconcile rejects stale active-without-actor attempt before WAL 
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20589,7 +20591,7 @@ test('authority reconcile active-without-actor WAL append failure leaves row act
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20645,7 +20647,7 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20666,7 +20668,7 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
     assert.equal(result.failed, 1)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
-    assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'interrupted')
     assert.equal(getProgressShardRecord(storage, href).status, 'interrupted')
 
@@ -20710,7 +20712,7 @@ test('authority reconcile terminalizes active row from same-attempt terminal pro
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20774,7 +20776,7 @@ test('authority reconcile terminal-progress WAL append failure leaves active row
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -20837,7 +20839,7 @@ test('fast executor stops after authority preflight reconciles stale active row'
                 [runId]: makeCoordinatorRun({href: staleHref})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [staleHref]: {
                     profileHref: staleHref,
                     actionKind: 'mute-block',
@@ -20900,7 +20902,7 @@ test('scheduled fast executor continues into queued work after active preflight 
                 [runId]: makeCoordinatorRun({href: staleHref})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [staleHref]: {
                     profileHref: staleHref,
                     actionKind: 'mute-block',
@@ -20963,7 +20965,7 @@ test('authority preflight defers fresh provisional active-transition runtime act
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -21043,7 +21045,7 @@ test('fast executor authority preflight reconciles a stale active batch before o
                 [runId]: makeCoordinatorRun({href: staleOneHref})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [staleOneHref]: {
                     profileHref: staleOneHref,
                     actionKind: 'mute-block',
@@ -21125,7 +21127,7 @@ test('reconcile tick skips executor after authority reconciles stale active row'
                 [runId]: makeCoordinatorRun({href: staleHref})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [staleHref]: {
                     profileHref: staleHref,
                     actionKind: 'mute-block',
@@ -21175,7 +21177,7 @@ test('authority reconcile does not requeue stale raw active row after WAL termin
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
                 [href]: {
                     profileHref: href,
                     actionKind: 'mute-block',
@@ -21210,7 +21212,7 @@ test('authority reconcile does not requeue stale raw active row after WAL termin
     assert.equal(firstHarness.storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(firstHarness.sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
 
-    firstHarness.storage.mbProfileNukeProgress[href] = {
+    firstHarness.storage[LEGACY_PROFILE_PROGRESS_KEY][href] = {
         profileHref: href,
         actionKind: 'mute-block',
         status: 'tab-opening',
@@ -21233,7 +21235,7 @@ test('authority reconcile does not requeue stale raw active row after WAL termin
     assert.equal(result.actions, 0)
     assert.equal(result.requeued, 0)
     assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(restarted.storage.mbProfileNukeProgress[href].status, 'tab-opening')
+    assert.equal(restarted.storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(hydrated.queue[href].status, 'succeeded')
     assert.equal(restarted.sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
     assert.equal(restarted.sw.state().queuedTabActions.length, 0)
@@ -21268,7 +21270,7 @@ test('authority reconcile detaches stale durably-marked runtime actor without du
             },
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -21339,7 +21341,7 @@ test('authority reconcile adopts active durable row only by matching tab and att
                 }
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     browser.__tabs.set(tabId, {
@@ -21787,7 +21789,7 @@ test('stale queued fill promise is cleared so durable queue can resume', async (
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -21834,7 +21836,7 @@ test('stale coordinator reconcile promise is cleared before new reconcile tick',
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {}
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 

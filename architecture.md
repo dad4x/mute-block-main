@@ -93,6 +93,19 @@ Ordinary queue/progress/runs changes should not be scattered full-map
 load/edit/save operations. The storage authority layer should make mutation
 reasons explicit and keep compatibility paths from creating truth.
 
+### Deleted Legacy Surfaces
+
+Legacy full progress storage and repair-style compatibility are deleted
+architecture, not deprecated architecture. The full profile progress blob key,
+legacy progress runtime actions, dashboard repair request aliases, legacy repair
+alarms, progress-to-queue legacy import switches, repair operation kinds, and
+repair metric namespaces must not be reintroduced as live product surfaces.
+
+Current progress storage is compact projection state only. Queue authority is
+the queue WAL and its checkpoints; reconciliation may materialize projections
+from authority, but compatibility progress state must not write, retry,
+schedule, throttle, import queued work, or influence queue drain.
+
 Current cleanup requirements:
 
 - reason-tag all snapshot writes;
