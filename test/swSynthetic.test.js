@@ -14711,7 +14711,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
 
     const reconcile = await sw.reconcileCoordinatorStorage()
 
-    assert.ok(reconcile.repaired > 0)
+    assert.ok(reconcile.materialized > 0)
     assert.equal(reconcile.runsChanged, true)
     assert.equal(reconcile.progressChanged, false)
     assert.equal(reconcile.eventsChanged, true)
@@ -14999,7 +14999,7 @@ test('enqueue resetExisting derived save failure reconcile replaces stale progre
 
     const reconcile = await sw.reconcileCoordinatorStorage()
 
-    assert.ok(reconcile.repaired > 0)
+    assert.ok(reconcile.materialized > 0)
     assert.equal(reconcile.progressChanged, false)
     assert.equal(storage.mbProfileNukeProgress[href].status, 'tab-opened')
     assert.equal(storage.mbProfileNukeProgress[href].runId, oldRunId)
@@ -17438,8 +17438,8 @@ test('stale active transition append cannot repaint compact queue view over WAL 
             },
         }
     })
-    const repaired = await sw.runCoordinatorAuthorityReconcileActions('synthetic-stale-projection')
-    assert.equal(repaired.changed, true)
+    const reconciled = await sw.runCoordinatorAuthorityReconcileActions('synthetic-stale-projection')
+    assert.equal(reconciled.changed, true)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     const freshAttemptId = sw.coordinatorAuthority.current().queue[href].attemptId
     assert.notEqual(freshAttemptId, staleAttemptId)
