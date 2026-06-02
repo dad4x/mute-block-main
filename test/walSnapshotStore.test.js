@@ -334,7 +334,7 @@ test('rejects non-terminal progress regression after terminal progress state', (
     assert.equal(projected.ignored[0].reason, 'terminal-regression')
 })
 
-test('allows explicit terminal overwrite for repair records', () => {
+test('allows explicit terminal overwrite for manual requeue records', () => {
     const state = baseState()
     state.queue['https://www.quora.com/profile/A'].status = 'failed'
     state.queue['https://www.quora.com/profile/A'].outcome = 'timeout'

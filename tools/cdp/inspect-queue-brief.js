@@ -9,7 +9,7 @@ const {
 } = require('./lib/cdp')
 
 const QUEUE_KEY = 'mbCoordinatorQueue'
-const PROGRESS_KEY = 'mbProfileNukeProgress'
+const PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
 
 function normalizeHref(value = '') {
     try {
@@ -75,7 +75,7 @@ runMain(async () => {
         return withTimeout(readStorage()).then(result => {
             if(result.timedOut || result.error) return result
             const queue = result.value?.[queueKey] || {}
-            const progress = result.value?.[progressKey] || {}
+            const progress = result.value?.[progressKey]?.records || {}
             const entries = Object.entries(queue)
             const match = key
                 ? entries.find(([itemKey]) => itemKey === key)
@@ -111,7 +111,7 @@ runMain(async () => {
                 progress: progressEntries
             }
         })
-    }})( ${JSON.stringify(QUEUE_KEY)}, ${JSON.stringify(PROGRESS_KEY)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
+    }})( ${JSON.stringify(QUEUE_KEY)}, ${JSON.stringify(PROGRESS_VIEW_KEY)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
 
     const output = {
         target: {

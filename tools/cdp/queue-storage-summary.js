@@ -30,22 +30,24 @@ runMain(async () => {
     const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function inspectStorageQueue(needle, includeFullRead) {
         const defaults = {
             mbCoordinatorQueueView: {},
+            mbProfileNukeProgressView: {},
             mbCoordinatorRuns: {},
             mbCoordinatorPaused: false,
             mbCoordinatorIdleRetryEnabled: false
         }
         if(includeFullRead) {
             defaults.mbCoordinatorQueue = {}
-            defaults.mbProfileNukeProgress = {}
         }
         const storage = await chrome.storage.local.get(defaults)
         const view = storage.mbCoordinatorQueueView && typeof storage.mbCoordinatorQueueView === 'object'
             ? storage.mbCoordinatorQueueView
             : {}
         const items = Array.isArray(view.items) ? view.items : []
+        const progressView = storage.mbProfileNukeProgressView && typeof storage.mbProfileNukeProgressView === 'object'
+            ? storage.mbProfileNukeProgressView
+            : {}
         const queue = includeFullRead ? storage.mbCoordinatorQueue || {} : null
         const runs = storage.mbCoordinatorRuns || {}
-        const progress = includeFullRead ? storage.mbProfileNukeProgress || {} : null
         const matchesNeedle = item => {
             if(!needle) return true
             return [
@@ -131,7 +133,7 @@ runMain(async () => {
             runs: runRows.slice(0, 40),
             totalQueue: includeFullRead ? Object.keys(queue).length : Number.parseInt(view.total, 10) || items.length,
             totalRuns: Object.keys(runs).length,
-            totalProgress: includeFullRead ? Object.keys(progress).length : null,
+            totalProgress: Number.parseInt(progressView.total, 10) || Object.keys(progressView.records || {}).length,
             truncated: view.truncated === true,
             fullStorageRead: includeFullRead,
             paused: storage.mbCoordinatorPaused === true,

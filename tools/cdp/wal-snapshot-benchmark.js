@@ -141,7 +141,7 @@ function buildDatasets(storage = {}) {
     const recoveryCritical = {
         queue: storage.mbCoordinatorQueue || {},
         runs: storage.mbCoordinatorRuns || {},
-        progress: storage.mbProfileNukeProgress || {},
+        progressView: storage.mbProfileNukeProgressView || {},
         events: storage.mbCoordinatorEvents || []
     }
     const userMemory = {

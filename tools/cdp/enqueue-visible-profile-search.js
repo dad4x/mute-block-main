@@ -99,9 +99,9 @@ runMain(async () => {
             sourceLabel: visible?.title || ''
         }
 
-        return chrome.storage.local.get({mbCoordinatorQueue: {}, mbProfileNukeProgress: {}}).then(async stored => {
+        return chrome.storage.local.get({mbCoordinatorQueue: {}, mbProfileNukeProgressView: {}}).then(async stored => {
             const queue = stored.mbCoordinatorQueue || {}
-            const progress = stored.mbProfileNukeProgress || {}
+            const progress = stored.mbProfileNukeProgressView?.records || {}
             const selected = unique.filter(href => {
                 const row = queue[href]
                 const record = progress[href]

@@ -121,6 +121,35 @@ function makePatch(ctx, overrides = {}) {
     }
 }
 
+function makeProgressProjection(records = {}) {
+    return {
+        version: 2,
+        updatedAt: Date.now(),
+        records,
+        total: Object.keys(records).length,
+        recordLimit: 500,
+        truncated: false
+    }
+}
+
+function getProgressShardKey(profileHref = '') {
+    let hash = 0
+    for(let index = 0; index < profileHref.length; index += 1) {
+        hash = ((hash * 31) + profileHref.charCodeAt(index)) >>> 0
+    }
+    return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
+}
+
+function makeProgressShardPayload(records = {}, now = Date.now()) {
+    const payload = {}
+    for(const [href, record] of Object.entries(records)) {
+        const key = getProgressShardKey(href)
+        if(!payload[key]) payload[key] = {version: 1, updatedAt: now, records: {}}
+        payload[key].records[href] = record
+    }
+    return payload
+}
+
 function makeHarness(ctx, options = {}) {
     const queueRow = options.queueRow === undefined
         ? makeActiveCoordinatorRow(ctx)
@@ -144,7 +173,8 @@ function makeHarness(ctx, options = {}) {
                 [ctx.runId]: makeCoordinatorRun(ctx)
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: progress
+            mbProfileNukeProgressView: makeProgressProjection(progress),
+            ...makeProgressShardPayload(progress, ctx.now)
         }
     })
 }
@@ -256,7 +286,7 @@ const CASES = [
                 `draft no-op setup mutation should be accepted: ${summarizeResult(env.__draftFirstResult)}`
             )
         },
-        patch: (ctx, env) => clone(env.storage.mbProfileNukeProgress[ctx.href]),
+        patch: (ctx, env) => clone(env.storage.mbProfileNukeProgressView.records[ctx.href]),
         assert({result, beforeCounters, afterCounters, label}) {
             assert.equal(result.recorded, true, `${label}: no-op row should still be accepted`)
             assert.equal(result.progressProjectionDurable, true, `${label}: no-op projection should be durable`)
@@ -384,7 +414,7 @@ const CASES = [
             assert.equal(result.progressShadowWal.matched, false, `${label}: non-durable row should not match shadow WAL`)
             assert.equal(result.progressShadowWal.reason, 'non-durable', `${label}: shadow WAL reason mismatch`)
             assert.equal(result.progressShadowWal.skippedNonDurable, true, `${label}: non-durable skip flag missing`)
-            assert.equal(env.storage.mbProfileNukeProgressView, undefined, `${label}: compact view should not be saved`)
+            assert.equal(env.storage.mbProfileNukeProgressView.records[ctx.href].status, 'tab-opened', `${label}: compact view should not save changed row`)
             assert.equal(afterCounters['progress.shadowWal.checked'] || 0, 0, `${label}: non-durable row inflated checked`)
             assert.equal(afterCounters['progress.shadowWal.matched'] || 0, 0, `${label}: non-durable row inflated matched`)
             assert.equal(afterCounters['progress.shadowWal.skippedNonDurable'] || 0, 1, `${label}: non-durable counter mismatch`)

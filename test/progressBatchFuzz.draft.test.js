@@ -84,6 +84,35 @@ function makePatch(ctx, label, overrides = {}) {
     }
 }
 
+function makeProgressProjection(records = {}) {
+    return {
+        version: 2,
+        updatedAt: Date.now(),
+        records,
+        total: Object.keys(records).length,
+        recordLimit: 500,
+        truncated: false
+    }
+}
+
+function getProgressShardKey(profileHref = '') {
+    let hash = 0
+    for(let index = 0; index < profileHref.length; index += 1) {
+        hash = ((hash * 31) + profileHref.charCodeAt(index)) >>> 0
+    }
+    return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
+}
+
+function makeProgressShardPayload(records = {}, now = Date.now()) {
+    const payload = {}
+    for(const [href, record] of Object.entries(records)) {
+        const key = getProgressShardKey(href)
+        if(!payload[key]) payload[key] = {version: 1, updatedAt: now, records: {}}
+        payload[key].records[href] = record
+    }
+    return payload
+}
+
 function makeContext(seed) {
     const labels = ['accepted', 'noop', 'stale', 'terminal', 'durableOnly', 'missing']
     const hrefs = Object.fromEntries(labels.map((label, index) => [label, makeHref(seed, index, label)]))
@@ -179,7 +208,8 @@ function makeHarness(ctx, options = {}) {
                 [ctx.runId]: makeRun(ctx.runId, Object.values(ctx.hrefs))
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: progress
+            mbProfileNukeProgressView: makeProgressProjection(progress),
+            ...makeProgressShardPayload(progress, ctx.now)
         }
     })
 
@@ -291,23 +321,38 @@ function assertRejected(label, result, expectedReason, context) {
 
 function assertMixedBatch({ctx, env, results, beforeCounters, afterCounters}, options = {}) {
     const context = `${options.name || 'mixed'} seed=0x${ctx.seed.toString(16)}`
-    const durableExpected = options.suppressProgressProjection !== true
+    const durableExpected = false
+    const projectionDurable = result => result.progressProjectionDurable ?? result.progressOperation?.durable ?? result.durable
 
     assert.equal(results.accepted.recorded, true, `${context}: accepted row should record: ${summarize(results.accepted)}`)
-    assert.equal(results.accepted.progressProjectionDurable, durableExpected, `${context}: accepted projection durability mismatch`)
-    assert.equal(results.accepted.progressOperation.durable, durableExpected, `${context}: accepted operation durability mismatch`)
+    assert.equal(projectionDurable(results.accepted), durableExpected, `${context}: accepted projection durability mismatch`)
+    assert.equal(results.accepted.progressOperation?.durable ?? results.accepted.durable, durableExpected, `${context}: accepted operation durability mismatch`)
     assert.equal(results.noop.recorded, true, `${context}: no-op row should record: ${summarize(results.noop)}`)
-    assert.equal(results.noop.progressProjectionDurable, durableExpected, `${context}: no-op projection durability mismatch`)
-    assert.equal(results.noop.progressOperation.durable, durableExpected, `${context}: no-op operation durability mismatch`)
-    assert.equal(results.noop.progressOperation.changed, false, `${context}: no-op should not be changed`)
+    assert.equal(projectionDurable(results.noop), durableExpected, `${context}: no-op projection durability mismatch`)
+    assert.equal(results.noop.progressOperation?.durable ?? results.noop.durable, durableExpected, `${context}: no-op operation durability mismatch`)
+    assert.equal(results.noop.progressOperation?.changed ?? results.noop.changed ?? false, false, `${context}: no-op should not be changed`)
+
+    if(results.stale.reason === 'milestone-flush-deferred') {
+        for(const label of ['accepted', 'noop', 'stale', 'durableOnly']) {
+            const result = results[label]
+            assert.equal(result.recorded, true, `${context}: ${label} should be accepted into deferred flush: ${summarize(result)}`)
+            assert.equal(result.durable, false, `${context}: ${label} deferred envelope should not be durable`)
+            assert.equal(result.reason, 'milestone-flush-deferred', `${context}: ${label} deferred reason mismatch`)
+        }
+        assertRejected('terminal', results.terminal, 'terminal-row-preserved', context)
+        assertRejected('missing', results.missing, 'missing-coordinator-item', context)
+        assert.equal(env.storage.mbProfileNukeProgressView.records[ctx.hrefs.stale].status, 'tab-opened', `${context}: stale row mutated storage before deferred flush`)
+        assert.equal(env.storage.mbProfileNukeProgressView.records[ctx.hrefs.terminal].status, 'blocked', `${context}: terminal row regressed storage before deferred flush`)
+        return
+    }
 
     assertRejected('stale', results.stale, 'stale-attempt', context)
     assertRejected('terminal', results.terminal, 'terminal-row-preserved', context)
     assertRejected('durableOnly', results.durableOnly, 'durable-only-coordinator-item', context)
     assertRejected('missing', results.missing, 'missing-coordinator-item', context)
 
-    assert.equal(env.storage.mbProfileNukeProgress[ctx.hrefs.stale].status, 'tab-opened', `${context}: stale row mutated storage`)
-    assert.equal(env.storage.mbProfileNukeProgress[ctx.hrefs.terminal].status, 'blocked', `${context}: terminal row regressed storage`)
+    assert.equal(env.storage.mbProfileNukeProgressView.records[ctx.hrefs.stale].status, 'tab-opened', `${context}: stale row mutated storage`)
+    assert.equal(env.storage.mbProfileNukeProgressView.records[ctx.hrefs.terminal].status, 'blocked', `${context}: terminal row regressed storage`)
     assert.equal(env.sw.state().profileNukeProgress[ctx.hrefs.missing]?.status, 'tab-opened', `${context}: missing row should not be accepted`)
 
     const acceptedDelta = (afterCounters['rowEvent.queued-progress-milestone.accepted'] || 0) -
@@ -330,7 +375,7 @@ function assertMixedBatch({ctx, env, results, beforeCounters, afterCounters}, op
     assert.equal(durableOnlyDelta, 1, `${context}: durable-only rejection counter mismatch`)
     assert.equal(missingDelta, 1, `${context}: missing rejection counter mismatch`)
 
-    if(options.suppressProgressProjection === true) {
+    if(!durableExpected) {
         assert.equal(results.accepted.progressShadowWal.reason, 'non-durable', `${context}: accepted non-durable reason mismatch`)
         assert.equal(results.noop.progressShadowWal.reason, 'non-durable', `${context}: no-op non-durable reason mismatch`)
         assert.equal(afterCounters['progress.shadowWal.checked'] || 0, beforeCounters['progress.shadowWal.checked'] || 0, `${context}: non-durable batch checked shadow WAL`)

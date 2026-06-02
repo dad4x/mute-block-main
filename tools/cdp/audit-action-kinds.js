@@ -23,11 +23,11 @@ runMain(async () => {
     const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function auditActionKinds() {
         const storage = await chrome.storage.local.get({
             mbCoordinatorQueue: {},
-            mbProfileNukeProgress: {},
+            mbProfileNukeProgressView: {},
             mbCoordinatorRuns: {}
         })
         const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgress || {}
+        const progress = storage.mbProfileNukeProgressView?.records || {}
         const runs = storage.mbCoordinatorRuns || {}
         const countBy = (values, selector) => values.reduce((counts, value) => {
             const key = selector(value) || '(empty)'

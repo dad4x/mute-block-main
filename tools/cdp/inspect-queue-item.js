@@ -30,10 +30,10 @@ runMain(async () => {
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {},
             mbCoordinatorRetryFailedEnabled: false,
-            mbProfileNukeProgress: {}
+            mbProfileNukeProgressView: {}
         })
         const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgress || {}
+        const progress = storage.mbProfileNukeProgressView?.records || {}
         const tabs = await chrome.tabs.query({})
         const normalize = value => {
             try {

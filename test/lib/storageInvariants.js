@@ -5,7 +5,6 @@ const {
 
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns'
-const PROFILE_PROGRESS_KEY = 'mbProfileNukeProgress'
 const SPACE_PENDING_POSTS_KEY = 'mbSpacePendingNukedPosts'
 
 const TERMINAL_QUEUE_STATUSES = new Set(['succeeded', 'failed', 'skipped', 'canceled'])
@@ -346,7 +345,6 @@ function checkStorageInvariants(snapshot = {}) {
 module.exports = {
     COORDINATOR_QUEUE_KEY,
     COORDINATOR_RUNS_KEY,
-    PROFILE_PROGRESS_KEY,
     SPACE_PENDING_POSTS_KEY,
     checkStorageInvariants
 }

@@ -11,7 +11,7 @@ const {
 const DEFAULT_KEYS = [
     'mbCoordinatorQueueView',
     'mbCoordinatorQueue',
-    'mbProfileNukeProgress',
+    'mbProfileNukeProgressView',
     'mbCoordinatorRuns',
     'mbCoordinatorEvents',
     'mbQueueWakeupMetrics',

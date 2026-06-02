@@ -25,13 +25,13 @@ runMain(async () => {
     const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function readQueueSummary(needle) {
         const storage = await chrome.storage.local.get({
             mbCoordinatorQueue: {},
-            mbProfileNukeProgress: {},
+            mbProfileNukeProgressView: {},
             mbCoordinatorPaused: false,
             mbCoordinatorRetryFailedEnabled: false
         })
         const tabs = await chrome.tabs.query({})
         const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgress || {}
+        const progress = storage.mbProfileNukeProgressView?.records || {}
         const normalize = value => {
             try {
                 const url = new URL(`${value || ''}`)
