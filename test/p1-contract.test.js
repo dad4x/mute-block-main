@@ -18,6 +18,45 @@ function readRepoFile(relativePath) {
     return fs.readFileSync(path.join(__dirname, '..', relativePath), 'utf8')
 }
 
+function listRepoTextFiles(relativeRoots = [], options = {}) {
+    const repoRoot = path.join(__dirname, '..')
+    const excluded = new Set(options.exclude || [])
+    const textExtensions = new Set([
+        '.cjs',
+        '.css',
+        '.html',
+        '.js',
+        '.json',
+        '.md',
+        '.txt'
+    ])
+    const files = []
+
+    function walk(relativePath) {
+        if(excluded.has(relativePath)) return
+        const absolutePath = path.join(repoRoot, relativePath)
+        const stat = fs.statSync(absolutePath)
+        if(stat.isDirectory()) {
+            for(const entry of fs.readdirSync(absolutePath).sort()) {
+                walk(path.join(relativePath, entry))
+            }
+            return
+        }
+        if(!stat.isFile()) return
+        if(!textExtensions.has(path.extname(relativePath))) return
+        files.push(relativePath)
+    }
+
+    for(const root of relativeRoots) walk(root)
+    return files
+}
+
+function getRuntimeRequestActionNames(source) {
+    return Array.from(source.matchAll(/request\.action === '([^']+)'/g))
+        .map(match => match[1])
+        .sort()
+}
+
 function extractFunction(source, signature) {
     const start = source.indexOf(signature)
     assert.notEqual(start, -1, `missing ${signature}`)
@@ -191,6 +230,137 @@ test('legacy record-nuke-progress messages are absent from the service worker', 
     assert.doesNotMatch(source, /async function recordProfileNukeProgressBatchFromRequest/)
     assert.doesNotMatch(source, /legacy-progress-message-disabled/)
     assert.doesNotMatch(source, /legacyMessageDisabled/)
+})
+
+test('forbidden legacy progress and repair surfaces stay out of live source', () => {
+    const forbidden = [
+        {name: 'full legacy progress blob key', pattern: /mbProfileNukeProgress(?!View|Shard)/},
+        {name: 'legacy progress key constant', pattern: /PROFILE_NUKE_PROGRESS_KEY/},
+        {name: 'single legacy progress action', pattern: /record-nuke-progress/},
+        {name: 'batch legacy progress action', pattern: /record-nuke-progress-batch/},
+        {name: 'legacy import option', pattern: /legacyImport|importLegacy/},
+        {name: 'legacy repair request action', pattern: /repair-coordinator-storage/},
+        {name: 'legacy repair alarm', pattern: /mb-stored-work-repair/},
+        {name: 'repair queue operation kind', pattern: /operationKind: 'repair-/},
+        {name: 'repair metric path', pattern: /metricPath: 'repair\./},
+        {name: 'repair projection metric path', pattern: /projectionMetricPath: 'repair\./},
+        {name: 'skip repair option', pattern: /skipRepair/},
+        {name: 'projection repair delay option', pattern: /projectionRepairDelayMs/}
+    ]
+    const files = listRepoTextFiles([
+        'shared/js',
+        'tools/cdp',
+        'test',
+        'chrome',
+        'firefox'
+    ], {
+        exclude: ['test/p1-contract.test.js']
+    })
+    const failures = []
+
+    for(const file of files) {
+        const source = readRepoFile(file)
+        for(const entry of forbidden) {
+            const match = source.match(entry.pattern)
+            if(match) failures.push(`${file}: ${entry.name}: ${match[0]}`)
+        }
+    }
+
+    assert.deepEqual(failures, [])
+})
+
+test('forbidden legacy storage keys are absent from source text and runtime action names', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const content = readRepoFile('shared/js/content.js')
+    const coordinator = readRepoFile('shared/js/coordinator.js')
+    const runtimeActions = getRuntimeRequestActionNames(source)
+
+    assert.doesNotMatch(source, /mbProfileNukeProgress(?!View|Shard)/)
+    assert.doesNotMatch(source, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.doesNotMatch(content, /mbProfileNukeProgress(?!View|Shard)|PROFILE_NUKE_PROGRESS_KEY/)
+    assert.doesNotMatch(coordinator, /mbProfileNukeProgress(?!View|Shard)|PROFILE_NUKE_PROGRESS_KEY/)
+    assert.equal(runtimeActions.includes('record-nuke-progress'), false)
+    assert.equal(runtimeActions.includes('record-nuke-progress-batch'), false)
+    assert.equal(runtimeActions.includes('repair-coordinator-storage'), false)
+    assert.equal(runtimeActions.includes('reconcile-coordinator-storage'), true)
+})
+
+test('current storage write payloads cannot include the full legacy progress key', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const metricStorageSetBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
+    const projectionPayloadBody = extractFunction(source, 'function addContentPageStateProjectionPayload(payload = {})')
+    const storageAdapterSetBody = extractFunction(source, 'function createChromeLocalStorageAdapter(getStorageArea = () => browser.storage.local)')
+    const storageWriteSource = [
+        metricStorageSetBody,
+        projectionPayloadBody,
+        storageAdapterSetBody
+    ].join('\n')
+
+    assert.doesNotMatch(storageWriteSource, /mbProfileNukeProgress(?!View|Shard)/)
+    assert.doesNotMatch(storageWriteSource, /PROFILE_NUKE_PROGRESS_KEY/)
+    assert.doesNotMatch(storageWriteSource, /\[PROFILE_NUKE_PROGRESS_KEY\]/)
+    assert.match(metricStorageSetBody, /addContentPageStateProjectionPayload\(payload\)/)
+    assert.match(metricStorageSetBody, /PROFILE_NUKE_PROGRESS_VIEW_KEY/)
+    assert.match(metricStorageSetBody, /PROFILE_NUKE_PROGRESS_SHARD_PREFIX/)
+})
+
+test('runtime action contract enumerates current accepted actions and rejects old aliases', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const runtimeActions = getRuntimeRequestActionNames(source)
+    const expectedActions = [
+        'activate-confirmation-in-page-world',
+        'begin-profile-action',
+        'cancel-coordinator-current-work',
+        'cancel-coordinator-current-work-item',
+        'cancel-queued-owner-nukes',
+        'claim-tab-action',
+        'cleanup-owned-nuke-status',
+        'clear-profile-nuke-state',
+        'close-tab',
+        'confirm-space-feed-profiles-blocked',
+        'coordinator-page-ready',
+        'create-tab',
+        'enqueue-coordinator-items',
+        'get-content-page-coordinator-state',
+        'get-coordinator-queue-accounting',
+        'get-coordinator-why-not-running',
+        'get-owned-nuke-status',
+        'heartbeat-action-lease',
+        'open-coordinator',
+        'pause-coordinator-nukes',
+        'pause-owner-nukes',
+        'promote-queued-tab',
+        'reconcile-coordinator-storage',
+        'record-job-milestone',
+        'record-job-terminal',
+        'refresh-coordinator-queue-view',
+        'refresh-queue-wakeup-metrics-view',
+        'release-action-lease',
+        'release-job-tab',
+        'remove-pending-space-feed-entries',
+        'remove-pending-space-feed-urls',
+        'request-action-lease',
+        'requeue-coordinator-failed',
+        'reset-queue-wakeup-metrics',
+        'resolve-queued-profile-target',
+        'resolve-queued-profile-target-failed',
+        'resume-coordinator-queue',
+        'resume-paused-coordinator-nukes',
+        'retry-coordinator-failed',
+        'settle-terminal-coordinator-items',
+        'sweep-owned-blocked-profile-tabs',
+        'sweep-service-worker-blocked-profile-tabs'
+    ].sort()
+    const forbiddenActions = [
+        'record-nuke-progress',
+        'record-nuke-progress-batch',
+        'repair-coordinator-storage'
+    ]
+
+    assert.deepEqual(runtimeActions, expectedActions)
+    for(const action of forbiddenActions) {
+        assert.equal(runtimeActions.includes(action), false, `${action} must stay deleted`)
+    }
 })
 
 test('content script exposes queued profile action surface state for safe adoption', () => {
