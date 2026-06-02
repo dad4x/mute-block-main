@@ -83,9 +83,10 @@ The runner exits nonzero if any hard check fails.
 Baseline comparison intentionally uses a normalized comparable shape. It checks
 stable upgrade facts only: extension id/name/version/location/state/errors,
 final storage keys, forbidden-action summaries, non-user reconcile behavior,
-visible alarm names, work counts, and whether unexpected keys were added. It
-does not compare unstable inspection details such as extension view lists,
-extension install paths, or the full before/after storage delta.
+visible alarm names, work counts, phase-specific content-smoke facts, and
+whether unexpected keys were added. It does not compare unstable inspection
+details such as extension view lists, extension install paths, or the full
+before/after storage delta.
 
 ## Phase 1 Checks
 
@@ -143,6 +144,13 @@ Phase 2 may materialize current compact content projections such as
 `mbBrowserSessionMarker`, or `mbQuoraRuntimeActivated`. It must not create the
 full legacy `mbProfileNukeProgress` key, accept legacy runtime actions, expose
 queue rows for the page smoke, or increase active/queued work counts.
+
+Phase-specific baseline files are written under `tmp/upgrade-regression/` by
+default. A profile that has already run Phase 2 is a warmed phase2 profile
+because compact content projection shards may already exist. Capture pristine
+store-upgrade baselines only from a freshly recreated store `1.4.186` profile;
+otherwise label the snapshot accordingly, for example
+`store-1.4-to-current-warmed-phase2`.
 
 ## Later Phases
 

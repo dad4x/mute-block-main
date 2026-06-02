@@ -116,7 +116,14 @@ function parseArgs(argv) {
         else if(arg.startsWith('--extension-id=')) options.extensionId = arg.slice('--extension-id='.length)
         else if(arg === '--profile-label') options.profileLabel = readValue(options.profileLabel)
         else if(arg.startsWith('--profile-label=')) options.profileLabel = arg.slice('--profile-label='.length)
-        else if(arg === '--write-baseline') options.writeBaseline = readValue(defaultBaselinePath(options.profileLabel))
+        else if(arg === '--write-baseline') {
+            const next = argv[index + 1]
+            if(next && !next.startsWith('--')) {
+                index += 1
+                options.writeBaseline = next
+            }
+            else options.writeBaseline = true
+        }
         else if(arg.startsWith('--write-baseline=')) options.writeBaseline = arg.slice('--write-baseline='.length)
         else if(arg === '--compare-baseline') options.compareBaseline = readValue('')
         else if(arg.startsWith('--compare-baseline=')) options.compareBaseline = arg.slice('--compare-baseline='.length)
@@ -136,6 +143,7 @@ function parseArgs(argv) {
     if(![PHASE1, PHASE2].includes(options.phase)) {
         throw new Error(`unsupported --phase ${options.phase}; expected ${PHASE1} or ${PHASE2}`)
     }
+    if(options.writeBaseline === true) options.writeBaseline = defaultBaselinePath(options.profileLabel, options.phase)
     if(options.compareBaseline === true || options.compareBaseline === '') {
         if(argv.includes('--compare-baseline')) throw new Error('--compare-baseline requires a path')
     }
@@ -159,9 +167,10 @@ function printUsage() {
     ].join('\n'))
 }
 
-function defaultBaselinePath(profileLabel) {
+function defaultBaselinePath(profileLabel, phase = PHASE1) {
     const safeLabel = `${profileLabel || DEFAULT_PROFILE_LABEL}`.replace(/[^a-z0-9._-]+/gi, '-')
-    return path.join('tmp', 'upgrade-regression', `${safeLabel}.phase1-non-work-starting-smoke.json`)
+    const safePhase = `${phase || PHASE1}`.replace(/[^a-z0-9._-]+/gi, '-')
+    return path.join('tmp', 'upgrade-regression', `${safeLabel}.${safePhase}.json`)
 }
 
 function readCurrentVersion() {
@@ -408,7 +417,30 @@ function comparableReport(report) {
         alarms: (report.alarms || []).map(alarm => alarm.name).sort(),
         legacyActions: report.legacyActions,
         reconcileDisplayOnly: report.reconcileDisplayOnly,
+        contentSmoke: comparableContentSmoke(report.contentSmoke),
         workStateAfter: report.workStateAfter
+    }
+}
+
+function comparableContentSmoke(contentSmoke = null) {
+    if(!contentSmoke) return null
+
+    const page = contentSmoke.page || {}
+    const coordinatorState = contentSmoke.coordinatorState || {}
+    return {
+        contentReadyPresent: !!page.contentReady,
+        pageType: page.pageType || '',
+        mbControlCount: Number(page.mbControlCount || 0) || 0,
+        coordinatorState: {
+            ok: coordinatorState.ok === true,
+            scoped: coordinatorState.scoped === true,
+            pageType: coordinatorState.pageType || '',
+            queueRows: Number(coordinatorState.queueRows || 0) || 0,
+            progressRows: Number(coordinatorState.progressRows || 0) || 0,
+            responseKeys: Array.isArray(coordinatorState.responseKeys)
+                ? coordinatorState.responseKeys.slice().sort()
+                : []
+        }
     }
 }
 
