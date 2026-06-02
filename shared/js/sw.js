@@ -56,7 +56,6 @@ const owningParentByChild = new Map()
 const canceledQueuedUrlsByOwner = new Map()
 const pausedQueuedOwners = new Set()
 const OWNED_TAB_STATE_KEY = 'mbOwnedTabIdsByParent'
-const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
@@ -1341,7 +1340,6 @@ function getStorageMetricKeyName(key = '') {
     if(key === COORDINATOR_RUNS_KEY) return 'runs'
     if(key === COORDINATOR_EVENTS_KEY) return 'events'
     if(key === QUEUE_WAKEUP_METRICS_VIEW_KEY) return 'metricsView'
-    if(key === PROFILE_NUKE_PROGRESS_KEY) return 'progress'
     if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY) return 'progressView'
     if(`${key || ''}`.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) return 'progressShard'
     if(key === SPACE_PENDING_NUKED_POSTS_KEY) return 'pendingPosts'
@@ -6147,18 +6145,6 @@ function addContentPageStateProjectionPayload(payload = {}) {
         }
         if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX))) {
             Object.assign(next, buildCoordinatorContentSourceIndexShardPayload(queue, now))
-        }
-    }
-    if(
-        Object.prototype.hasOwnProperty.call(next, PROFILE_NUKE_PROGRESS_KEY) &&
-        next[PROFILE_NUKE_PROGRESS_KEY] &&
-        typeof next[PROFILE_NUKE_PROGRESS_KEY] === 'object'
-    ) {
-        if(!Object.prototype.hasOwnProperty.call(next, PROFILE_NUKE_PROGRESS_VIEW_KEY)) {
-            next[PROFILE_NUKE_PROGRESS_VIEW_KEY] = buildProfileNukeProgressView(next[PROFILE_NUKE_PROGRESS_KEY], now)
-        }
-        if(!Object.keys(next).some(key => `${key || ''}`.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX))) {
-            Object.assign(next, buildProfileNukeProgressShardPayload(next[PROFILE_NUKE_PROGRESS_KEY], now))
         }
     }
     return next
