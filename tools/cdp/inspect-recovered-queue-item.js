@@ -17,7 +17,6 @@ const {
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
-const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
 const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
 const PROFILE_NUKE_PROGRESS_SHARD_PREFIX = 'mbProfileNukeProgressShard.'
 
@@ -72,9 +71,7 @@ function recoverQueue(stored = {}) {
 }
 
 function getProgressRecords(stored = {}) {
-    const progress = {
-        ...(stored[PROFILE_NUKE_PROGRESS_KEY] || {})
-    }
+    const progress = {}
     const viewRecords = stored[PROFILE_NUKE_PROGRESS_VIEW_KEY]?.records || {}
     Object.assign(progress, viewRecords)
     for(const [key, value] of Object.entries(stored || {})) {

@@ -3607,7 +3607,6 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
             })
         : await loadCoordinatorCurrentAuthorityState({
             [COORDINATOR_QUEUE_KEY]: {},
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             [COORDINATOR_PAUSED_KEY]: false
         })
     const queue = currentAuthorityState.queue
@@ -3927,7 +3926,6 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
 async function observeCoordinatorReconcileSnapshot(reason = 'reconcile-observe', options = {}) {
     const currentAuthorityState = await loadCoordinatorCurrentAuthorityState({
         [COORDINATOR_QUEUE_KEY]: {},
-        [PROFILE_NUKE_PROGRESS_KEY]: {},
         [COORDINATOR_PAUSED_KEY]: false
     })
     const queue = currentAuthorityState.queue || {}
@@ -6124,13 +6122,6 @@ function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs =
         if(!requested || requested.has(profileHref)) progress[profileHref] = record
     }
     return progress
-}
-
-function getProfileNukeProgressRecordsFromStorage(stored = {}, profileHrefs = []) {
-    return {
-        ...normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {}),
-        ...getProfileNukeProgressRecordsFromProjection(stored, profileHrefs)
-    }
 }
 
 function addContentPageStateProjectionPayload(payload = {}) {
@@ -8618,12 +8609,6 @@ function createCoordinatorAuthority() {
             next.stored[COORDINATOR_EVENTS_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_EVENTS_KEY] || [])
             changed = true
         }
-        if(Object.prototype.hasOwnProperty.call(payload, PROFILE_NUKE_PROGRESS_KEY)) {
-            next.progress = normalizeStoredProfileNukeProgress(cloneCoordinatorAuthorityValue(payload[PROFILE_NUKE_PROGRESS_KEY] || {}))
-            next.stored[PROFILE_NUKE_PROGRESS_KEY] = cloneCoordinatorAuthorityValue(payload[PROFILE_NUKE_PROGRESS_KEY] || {})
-            changed = true
-        }
-
         if(changed) projection = next
         return changed
     }
@@ -9058,7 +9043,6 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
             [COORDINATOR_QUEUE_KEY]: {},
             ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
@@ -9073,7 +9057,7 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -9168,7 +9152,6 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
             [COORDINATOR_QUEUE_KEY]: {},
             ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
             ...getAllProfileNukeProgressShardDefaults(),
             ...defaults
@@ -9185,7 +9168,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -9237,7 +9220,6 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
             ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
         }, {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'
@@ -9253,7 +9235,7 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -9274,7 +9256,6 @@ async function loadCoordinatorReconcileProjection(options = {}) {
             ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
             [COORDINATOR_EVENTS_KEY]: [],
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs),
             [COORDINATOR_PAUSED_KEY]: false,
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
@@ -9293,7 +9274,7 @@ async function loadCoordinatorReconcileProjection(options = {}) {
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -9346,12 +9327,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
             [COORDINATOR_QUEUE_KEY]: {},
             ...getCoordinatorQueueWalStorageDefaults(),
             [COORDINATOR_RUNS_KEY]: {},
-            ...(progressProfileHrefs.length ? {
-                ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
-            } : {
-                [PROFILE_NUKE_PROGRESS_KEY]: {},
-                ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs)
-            }),
+            ...getProfileNukeProgressProjectionDefaults(progressProfileHrefs),
             [SPACE_PENDING_NUKED_POSTS_KEY]: {},
             [SPACE_NUKED_POSTS_KEY]: {}
         }, {
@@ -9367,9 +9343,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
         ))
         const queue = queueRecovery.queue
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
-        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => progressProfileHrefs.length
-            ? getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs)
-            : getProfileNukeProgressRecordsFromStorage(stored, progressProfileHrefs))
+        const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
 
         return {
@@ -9566,23 +9540,6 @@ function applyCoordinatorSourceMetadataMaterialization(item = {}, inferred = {})
     return changed ? next : item
 }
 
-function shouldRestoreQueuedProgressRecordToCoordinatorQueue(href = '', record = {}, queue = {}, now = Date.now(), run = null) {
-    if(!href || queue[href]) return false
-    if(`${record?.status || ''}` !== 'queued') return false
-    if(!`${record?.runId || ''}`.trim()) return false
-    if(`${record?.actionKind || 'mute-block'}` === UNBLOCK_UNMUTE_ACTION_KIND) return false
-    if(!run || typeof run !== 'object') return false
-
-    const runTargetHrefs = new Set(getNormalizedProfileHrefList([
-        ...getCoordinatorRunTargetHrefs(run),
-        ...(Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [])
-    ]))
-    if(!runTargetHrefs.has(href)) return false
-
-    const queuedAt = Number.parseInt(record?.queuedAt, 10) || 0
-    return !queuedAt || now - queuedAt <= CURRENT_WORK_RETENTION_MS
-}
-
 function getCoordinatorQueueProfileHrefSet(queue = {}) {
     const hrefs = new Set()
 
@@ -9718,121 +9675,6 @@ function materializeRemovedProfileDerivedStateFromAuthority(state = {}) {
     }
 }
 
-function importLegacyQueuedProgressRecordsToCoordinatorQueue(state = {}, options = {}) {
-    const queue = state.queue || {}
-    const runs = state.runs || {}
-    const events = state.events || []
-    const progress = state.progress || {}
-    const now = Number.parseInt(options.now, 10) || Date.now()
-    const affectedRunIds = new Set()
-    let restored = 0
-    let progressChanged = false
-
-    for(const [key, record] of Object.entries(progress || {})) {
-        const href = normalizeQuoraProfileUrl(record?.profileHref || key || '')
-        const runId = `${record.runId || ''}`.trim()
-        const run = runs[runId] || {}
-        if(!shouldRestoreQueuedProgressRecordToCoordinatorQueue(href, record, queue, now, run)) continue
-
-        const source = makeCoordinatorSourceFromRunMetadata(runId, run, events)
-        const sourceType = source.type || 'profile-list'
-        const sourcePageUrl = source.pageUrl || ''
-        const queuedAt = Number.parseInt(record.queuedAt, 10) || now
-        const actionKind = getCoordinatorActionKindForRequestedAction(record.actionKind || 'mute-block')
-        const item = applyCoordinatorJobEnvelope({
-            id: makeId('item'),
-            runId,
-            dedupeKey: href,
-            coordinatorKey: href,
-            actionKind,
-            executorTabAction: getCoordinatorExecutorTabActionForActionKind(actionKind),
-            executorMaxConcurrent: null,
-            executorNoForegroundFallback: record.executorNoForegroundFallback === true || record.noForegroundFallback === true,
-            executorOwner: 'service-worker',
-            serviceWorkerOwned: true,
-            targetProfileHref: href,
-            requestedUrl: href,
-            source,
-            sources: [source],
-            status: 'queued',
-            outcome: '',
-            error: '',
-            createdAt: queuedAt,
-            updatedAt: now,
-            queuedAt,
-            activeAt: 0,
-            terminalAt: 0,
-            tabId: null,
-            attempt: 0,
-            attemptId: makeAttemptId(),
-            attemptNumber: 1,
-            maxAttempts: 1,
-            sourceSettledAt: 0,
-            sourceSettlementKey: '',
-            sourceSettlementOutcome: '',
-            milestones: makeEmptyCoordinatorMilestones()
-        }, {
-            runInput: {id: runId, sourceType},
-            source,
-            runId,
-            targetProfileHref: href,
-            requestedUrl: href,
-            coordinatorKey: href,
-            actionKind
-        })
-
-        queue[href] = item
-        const resetRecord = normalizeProgressPatch(
-            href,
-            buildQueuedCoordinatorProgressResetPatch(item, {now: queuedAt, runId, actionKind}),
-            record
-        )
-        if(resetRecord) {
-            progress[href] = {
-                ...resetRecord,
-                updatedAt: now
-            }
-            progressChanged = true
-        }
-
-        const nextRun = runs[runId] || {}
-        runs[runId] = {
-            ...nextRun,
-            id: runId,
-            sourceType,
-            createdAt: nextRun.createdAt || queuedAt,
-            updatedAt: now,
-            status: 'active',
-            paused: false,
-            sourcePages: Array.from(new Set([...(nextRun.sourcePages || []), sourcePageUrl].filter(Boolean))),
-            targetProfileHrefs: Array.from(new Set([...getCoordinatorRunTargetHrefs(nextRun), href])),
-            targetWorkKeys: Array.from(new Set([...(nextRun.targetWorkKeys || []), href]))
-        }
-        affectedRunIds.add(runId)
-        restored += 1
-    }
-
-    if(restored > 0) {
-        Object.assign(runs, recomputeCoordinatorRuns(queue, runs, affectedRunIds))
-        events.push({
-            id: makeId('event'),
-            runId: '',
-            itemId: '',
-            type: 'legacy-import',
-            message: `Imported ${restored} legacy queued Current Work target${restored === 1 ? '' : 's'}`,
-            at: now,
-            details: {restored}
-        })
-    }
-
-    return {
-        restored,
-        progressChanged,
-        eventsChanged: restored > 0,
-        affectedRunIds: Array.from(affectedRunIds)
-    }
-}
-
 async function reconcileCoordinatorStorage(options = {}) {
     return enqueueSpaceFeedStorageUpdate(
         () => reconcileCoordinatorStorageLocked(options),
@@ -9849,7 +9691,6 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
     return promiseWithTimeout(
         reconcileCoordinatorStorage({
             reason: options.reason || 'reconcile-coordinator-storage',
-            legacyImport: options.legacyImport === true || options.importLegacy === true,
             timeoutMs: options.storageUpdateTimeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
         }),
         timeoutMs,
@@ -10441,20 +10282,6 @@ function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {}) {
     }
 }
 
-function importLegacyQueuedProgressRecordsReconcilePhase(ctx = {}, options = {}) {
-    if(options.legacyImport === true || options.importLegacy === true) {
-        const restoredQueued = importLegacyQueuedProgressRecordsToCoordinatorQueue(ctx.state, {now: ctx.now})
-        if(restoredQueued.restored > 0) {
-            ctx.changed = true
-            ctx.eventsChanged = ctx.eventsChanged || restoredQueued.eventsChanged
-            ctx.progressChanged = ctx.progressChanged || restoredQueued.progressChanged
-            ctx.runsMetadataChanged = true
-            ctx.materialized += restoredQueued.restored
-            addCoordinatorReconcileAffectedRunIds(ctx, restoredQueued.affectedRunIds)
-        }
-    }
-}
-
 async function reconcileCoordinatorRuntimeActorsPhase(ctx = {}) {
     ctx.liveProfileTabsByHref = await getLiveProfileTabsByHref()
 }
@@ -10866,7 +10693,6 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
     const ctx = await loadCoordinatorReconcileAuthorityPhase(options)
     coordinatorDiagnosticBatchDepth += 1
     try {
-        importLegacyQueuedProgressRecordsReconcilePhase(ctx, options)
         materializeCoordinatorReconcileDerivedProjectionPhase(ctx)
         await reconcileCoordinatorRuntimeActorsPhase(ctx)
         await applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx)
@@ -11043,7 +10869,6 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         [COORDINATOR_QUEUE_KEY]: {},
         ...getCoordinatorQueueWalStorageDefaults(),
         [COORDINATOR_RUNS_KEY]: {},
-        [PROFILE_NUKE_PROGRESS_KEY]: {},
         ...getProfileNukeProgressProjectionDefaults(requestedHrefs),
         [SPACE_PENDING_NUKED_POSTS_KEY]: {},
         [SPACE_NUKED_POSTS_KEY]: {}
@@ -11064,7 +10889,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         queue,
         runs: normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY])
     }
-    const progress = getProfileNukeProgressRecordsFromStorage(stored, requestedHrefs)
+    const progress = getProfileNukeProgressRecordsFromProjection(stored, requestedHrefs)
     const terminalEntries = getCoordinatorTerminalItemEntries(queue, requestedHrefs)
     const missingQueueHrefs = requestedHrefs.filter(href => !findCoordinatorQueueEntryForHref(queue, href))
     const missingConfirmedHrefs = new Set(missingQueueHrefs.filter(href => isSuccessfulProfileNukeRecord(progress[href])))
@@ -14336,7 +14161,7 @@ async function shouldAllowStoredWorkBeforeQuora(reason = 'stored-work-scheduler'
 
 function isCoordinatorReconcileEdgeTriggerReason(reason = '') {
     const normalized = `${reason || ''}`.trim()
-    return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|legacy-import.*|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
+    return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
 }
 
 function clearNamedSchedulerAlarm(name = '') {
@@ -16842,11 +16667,12 @@ function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null) {
 async function loadProfileNukeProgress() {
     try {
         const stored = await metricStorageGet({
-            [PROFILE_NUKE_PROGRESS_KEY]: {}
+            [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
+            ...getAllProfileNukeProgressShardDefaults()
         }, {
             metricPath: 'progress.load'
         })
-        profileNukeProgress = normalizeStoredProfileNukeProgress(stored?.[PROFILE_NUKE_PROGRESS_KEY] || {})
+        profileNukeProgress = getProfileNukeProgressRecordsFromProjection(stored)
     }
     catch {
         profileNukeProgress = {}
@@ -16877,12 +16703,11 @@ async function restoreRuntimeProfileNukeProgressRow(profileHref = '', fallbackRe
 
     try {
         const stored = await metricStorageGet({
-            [PROFILE_NUKE_PROGRESS_KEY]: {},
             ...getProfileNukeProgressProjectionDefaults([normalizedHref])
         }, {
             metricPath: 'progress.restoreRuntimeRow.load'
         })
-        const restored = getProfileNukeProgressRecordsFromStorage(stored, [normalizedHref])
+        const restored = getProfileNukeProgressRecordsFromProjection(stored, [normalizedHref])
         if(restored[normalizedHref]) {
             profileNukeProgress = {
                 ...profileNukeProgress,
@@ -26578,15 +26403,11 @@ async function rebuildContentPageStateProjectionFromFullStorage(reason = 'missin
         metricPath: `contentPageState.compatBuild.${reason}`
     })
     const stored = await metricStorageGet({
-        [PROFILE_NUKE_PROGRESS_KEY]: {},
         [PROFILE_NUKE_PROGRESS_VIEW_KEY]: null,
         ...getAllProfileNukeProgressShardDefaults()
     }, {metricPath: `contentPageState.compatBuild.${reason}.progress`})
     const queue = currentAuthorityState.queue
-    const progress = filterProfileNukeProgressForContentProjection({
-        ...normalizeStoredProfileNukeProgress(stored[PROFILE_NUKE_PROGRESS_KEY] || {}),
-        ...getProfileNukeProgressRecordsFromProjection(stored)
-    }, queue)
+    const progress = filterProfileNukeProgressForContentProjection(getProfileNukeProgressRecordsFromProjection(stored), queue)
     const queueIndex = buildCoordinatorContentQueueIndex(queue)
     const sourceShards = buildCoordinatorContentSourceIndexShardPayload(queue)
     const progressView = buildProfileNukeProgressView(progress)
@@ -26726,7 +26547,7 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return cancelCoordinatorCurrentWorkItem(request)
     }
     else if(request.action === 'reconcile-coordinator-storage') {
-        if(request.userInitiated !== true && request.legacyImport !== true) {
+        if(request.userInitiated !== true) {
             return Promise.resolve({
                 recovered: false,
                 displayOnly: true,
@@ -26737,16 +26558,12 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         const allowBeforeQuora = request.allowBeforeQuora === true ||
-            request.userInitiated === true ||
-            request.legacyImport === true
-        const reconcileRequestReason = request.legacyImport === true
-            ? 'legacy-import-request'
-            : 'user-reconcile-request'
+            request.userInitiated === true
+        const reconcileRequestReason = 'user-reconcile-request'
         const scheduledReason = `${reconcileRequestReason}-scheduled`
         const runDirectReconcile = async () => {
             const reconcile = await reconcileCoordinatorStorageBestEffort({
-                reason: reconcileRequestReason,
-                legacyImport: request.legacyImport === true
+                reason: reconcileRequestReason
             })
             const result = await kickCoordinatorQueueResume(reconcileRequestReason, {
                 direct: true,
@@ -26773,7 +26590,7 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         edgeTriggered: true,
                         allowBeforeQuora
                     })
-                    if(request.userInitiated === true || request.legacyImport === true) return runDirectReconcile()
+                    if(request.userInitiated === true) return runDirectReconcile()
                     void kickCoordinatorQueueResume(reconcileRequestReason).catch(() => null)
                     return {
                         recovered: false,
@@ -26790,7 +26607,7 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
             edgeTriggered: true,
             allowBeforeQuora
         })
-        if(request.userInitiated === true || request.legacyImport === true) return runDirectReconcile()
+        if(request.userInitiated === true) return runDirectReconcile()
         void kickCoordinatorQueueResume(reconcileRequestReason).catch(() => null)
         return Promise.resolve({
             recovered: false,
