@@ -98,7 +98,39 @@ function makePatch(ctx, overrides = {}) {
     }
 }
 
+function makeProgressProjection(records = {}) {
+    return {
+        version: 2,
+        updatedAt: Date.now(),
+        records,
+        total: Object.keys(records).length,
+        recordLimit: 500,
+        truncated: false
+    }
+}
+
+function getProgressShardKey(profileHref = '') {
+    let hash = 0
+    for(let index = 0; index < profileHref.length; index += 1) {
+        hash = ((hash * 31) + profileHref.charCodeAt(index)) >>> 0
+    }
+    return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
+}
+
+function makeProgressShardPayload(records = {}, now = Date.now()) {
+    const payload = {}
+    for(const [href, record] of Object.entries(records)) {
+        const key = getProgressShardKey(href)
+        if(!payload[key]) payload[key] = {version: 1, updatedAt: now, records: {}}
+        payload[key].records[href] = record
+    }
+    return payload
+}
+
 function makeProgressHarness(ctx) {
+    const progress = {
+        [ctx.href]: makeProgress(ctx)
+    }
     return loadServiceWorkerHarness({
         now: ctx.now,
         storage: {
@@ -110,9 +142,8 @@ function makeProgressHarness(ctx) {
                 [ctx.runId]: makeCoordinatorRun(ctx)
             },
             mbCoordinatorEvents: [],
-            mbProfileNukeProgress: {
-                [ctx.href]: makeProgress(ctx)
-            }
+            mbProfileNukeProgressView: makeProgressProjection(progress),
+            ...makeProgressShardPayload(progress, ctx.now)
         }
     })
 }
@@ -169,7 +200,7 @@ async function assertProgressProjectionFault(seed, behavior) {
     assert.equal(result.progressShadowWal.matched, false, `projection ${behavior}: shadow WAL should not match`)
     assert.equal(result.progressShadowWal.reason, 'non-durable', `projection ${behavior}: shadow WAL reason mismatch`)
     assert.equal(result.progressShadowWal.skippedNonDurable, true, `projection ${behavior}: non-durable skip missing`)
-    assert.equal(storage.mbProfileNukeProgressView, undefined, `projection ${behavior}: compact view should not be saved`)
+    assert.equal(storage.mbProfileNukeProgressView.records[ctx.href].status, 'tab-opened', `projection ${behavior}: compact view should not save changed row`)
     assert.equal(counters['progress.shadowWal.checked'] || 0, 0, `projection ${behavior}: non-durable row checked shadow WAL`)
     assert.equal(counters['progress.shadowWal.matched'] || 0, 0, `projection ${behavior}: non-durable row matched shadow WAL`)
     assert.equal(counters['progress.shadowWal.skippedNonDurable'] || 0, 1, `projection ${behavior}: skip counter mismatch`)

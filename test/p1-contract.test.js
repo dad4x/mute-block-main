@@ -1098,7 +1098,8 @@ test('routine CDP queue status helpers use compact storage by default', () => {
     assert.match(summary, /usedCompactView: !includeFullRead/)
     assert.doesNotMatch(summary, /chrome\.storage\.local\.get\(\{[\s\S]*mbCoordinatorQueue:/)
     assert.doesNotMatch(summary, /chrome\.storage\.local\.get\(\{[\s\S]*mbProfileNukeProgress:/)
-    assert.match(summary, /if\(includeFullRead\) \{[\s\S]*defaults\.mbCoordinatorQueue = \{\}[\s\S]*defaults\.mbProfileNukeProgress = \{\}/)
+    assert.match(summary, /if\(includeFullRead\) \{[\s\S]*defaults\.mbCoordinatorQueue = \{\}/)
+    assert.doesNotMatch(summary, /defaults\.mbProfileNukeProgress = \{\}/)
 })
 
 test('profile-search content uses scoped runtime state instead of full storage change stream', () => {

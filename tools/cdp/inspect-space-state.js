@@ -44,12 +44,12 @@ runMain(async () => {
                 mbSpacePendingNukedPosts: {},
                 mbCoordinatorQueue: {},
                 mbCoordinatorRuns: {},
-                mbProfileNukeProgress: {}
+                mbProfileNukeProgressView: {}
             })
             const pending = storage.mbSpacePendingNukedPosts || {}
             const queue = storage.mbCoordinatorQueue || {}
             const runs = storage.mbCoordinatorRuns || {}
-            const progress = storage.mbProfileNukeProgress || {}
+            const progress = storage.mbProfileNukeProgressView?.records || {}
             const tabs = await chrome.tabs.query({})
             const spaceTabs = tabs
                 .filter(tab => `${tab.url || ''}\n${tab.title || ''}`.toLowerCase().includes(needle))

@@ -23,11 +23,11 @@ runMain(async () => {
         const storage = await chrome.storage.local.get({
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
-            mbProfileNukeProgress: {}
+            mbProfileNukeProgressView: {}
         })
         const queue = storage.mbCoordinatorQueue || {}
         const runs = storage.mbCoordinatorRuns || {}
-        const progress = storage.mbProfileNukeProgress || {}
+        const progressRecords = storage.mbProfileNukeProgressView?.records || {}
         const tabs = await chrome.tabs.query({})
         const profileTabs = tabs.filter(tab => /^https:\/\/www\.quora\.com\/profile\//i.test(tab.url || ''))
         const runtimeQueuedActions = typeof queuedTabActions !== 'undefined'
@@ -116,7 +116,7 @@ runMain(async () => {
             runs: runRows.slice(0, 20),
             totalQueue: Object.keys(queue).length,
             totalRuns: Object.keys(runs).length,
-            totalProgress: Object.keys(progress).length,
+            totalProgress: Number.parseInt(storage.mbProfileNukeProgressView?.total, 10) || Object.keys(progressRecords).length,
             runtime: {
                 queuedActions: runtimeQueuedActions.length,
                 queuedActionSamples: runtimeQueuedActions.slice(0, 20),
