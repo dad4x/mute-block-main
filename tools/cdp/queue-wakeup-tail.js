@@ -66,8 +66,6 @@ runMain(async () => {
             pumpFastChanged: counters['pump.fastExecutor.changed'] || 0,
             pumpFastNoop: counters['pump.fastExecutor.noop'] || 0,
             liveQueuedTabAdoptionFailed: counters['pump.noop.liveQueuedTabAdoptionFailed'] || 0,
-            repairRequested: counters['repair.requested'] || 0,
-            repairActiveWithoutActorResidentAuthority: counters['repair.activeWithoutActor.usedResidentAuthority'] || 0,
             storageUpdateStarted: counters['storageUpdate.started'] || 0,
             storageUpdateCompleted: counters['storageUpdate.completed'] || 0,
             storageUpdateTimedOut: counters['storageUpdate.timedOut'] || 0,

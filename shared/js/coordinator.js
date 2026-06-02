@@ -1355,11 +1355,7 @@ function renderWakeupMetrics(queueItems = []) {
     const milestoneReceived = getMetricCounter(counters, 'milestone.received')
     const milestoneFlushes = getMetricCounter(counters, 'milestone.flushPerformed')
     const progressReceived = getMetricCounter(counters, 'progress.recordReceived')
-    const progressWrites = getMetricCounter(counters, 'progress.storageWrites')
-    const progressFlushes = getMetricCounter(counters, 'progress.flushPerformed')
     const progressPendingMax = getMetricCounter(counters, 'progress.pendingMax')
-    const progressChangedRows = getMetricCounter(counters, 'progress.changedRecordsPerStorageWrite')
-    const progressPayloadRows = getMetricCounter(counters, 'progress.payloadRowsPerStorageWrite')
     const payloadBytes = getMetricCounter(counters, 'storagePayload.write.total.bytes')
     const payloadCalls = getMetricCounter(counters, 'storagePayload.write.total.calls')
     const payloadQueueBytes = getMetricCounter(counters, 'storagePayload.write.queue.bytes')
@@ -1416,9 +1412,7 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), `queue ${formatBytes(payloadQueueBytes)}, runs ${formatBytes(payloadRunsBytes)}, progress ${formatBytes(payloadProgressBytes)}`),
             buildMetricCard('Write hot path', topWritePath.path || '--', formatStoragePayloadPathDetail(topWritePath)),
             buildMetricCard('Milestone batch', milestoneFlushes ? formatRatio(milestoneReceived / milestoneFlushes) : '--', `${milestoneReceived} records / ${milestoneFlushes} flushes`),
-            buildMetricCard('Progress batch', progressFlushes ? formatRatio(progressReceived / progressFlushes) : '--', `${progressReceived} records / ${progressFlushes} flushes; pending max ${progressPendingMax}`),
-            buildMetricCard('Progress changed', progressWrites ? formatRatio(progressChangedRows / progressWrites) : '--', `${progressChangedRows} changed rows / ${progressWrites} writes`),
-            buildMetricCard('Progress payload', progressWrites ? formatRatio(progressPayloadRows / progressWrites) : '--', `${progressPayloadRows} payload rows / ${progressWrites} writes`)
+            buildMetricCard('Progress events', `${progressReceived}`, `pending max ${progressPendingMax}`)
         ], state.loading ? 'Loading history...' : 'No wakeup metrics yet.')
     }
 

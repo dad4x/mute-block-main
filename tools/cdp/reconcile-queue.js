@@ -20,7 +20,7 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function repairQueue() {
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function reconcileQueue() {
         return new Promise(resolve => {
             let settled = false
             const finish = value => {

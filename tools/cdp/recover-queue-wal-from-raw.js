@@ -108,7 +108,7 @@ runMain(async () => {
 
     let writeResult = null
     if(shouldApply) {
-        writeResult = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function repair(payload, retiredKeys) {
+        writeResult = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function recover(payload, retiredKeys) {
             await chrome.storage.local.set(payload)
             if(retiredKeys.length) await chrome.storage.local.remove(retiredKeys)
             return {

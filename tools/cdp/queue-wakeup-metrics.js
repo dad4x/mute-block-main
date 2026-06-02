@@ -128,10 +128,9 @@ function analyzeMetrics(metrics = {}) {
     const nudgeAccepted = counter(currentEpoch, 'nudge.accepted')
     const pumpRequested = counter(currentEpoch, 'pump.requested')
     const pumpChanged = sumCounters(currentEpoch, 'pump.changed.')
-    const repairRequested = counter(currentEpoch, 'repair.requested')
     const jobsEnqueued = counter(currentEpoch, 'job.enqueued')
     const jobTerminal = counter(currentEpoch, 'job.terminal')
-    const completedOnlyAfterRepair = counter(currentEpoch, 'job.completedOnlyAfterRepair')
+    const completedOnlyAfterReconcile = counter(currentEpoch, 'job.completedOnlyAfterReconcile')
     const storageStarted = counter(currentEpoch, 'storageUpdate.started')
     const storageCompleted = counter(currentEpoch, 'storageUpdate.completed')
     const storageTimedOut = counter(currentEpoch, 'storageUpdate.timedOut')
@@ -142,8 +141,6 @@ function analyzeMetrics(metrics = {}) {
     const milestoneReceived = counter(currentEpoch, 'milestone.received')
     const milestoneFlushes = counter(currentEpoch, 'milestone.flushPerformed')
     const progressReceived = counter(currentEpoch, 'progress.recordReceived')
-    const progressWrites = counter(currentEpoch, 'progress.storageWrites')
-    const progressFlushes = counter(currentEpoch, 'progress.flushPerformed')
     const diagnosticReceived = counter(currentEpoch, 'diagnosticEvent.received')
     const diagnosticWrites = counter(currentEpoch, 'diagnosticEvent.storageWrites')
     const duplicatePumpNoops =
@@ -152,8 +149,7 @@ function analyzeMetrics(metrics = {}) {
         counter(currentEpoch, 'pump.noop.paused')
     const wakeups =
         nudgeSent +
-        pumpRequested +
-        repairRequested
+        pumpRequested
     const instrumentation = {
         hasStorageCounters: storageStarted > 0 ||
             storageCompleted > 0 ||
@@ -162,7 +158,6 @@ function analyzeMetrics(metrics = {}) {
             storageAbandoned > 0,
         hasNudgeCounters: nudgeSent > 0 || nudgeAccepted > 0,
         hasPumpCounters: pumpRequested > 0 || pumpChanged > 0,
-        hasRepairCounters: repairRequested > 0,
         hasJobCounters: jobsEnqueued > 0 || jobTerminal > 0
     }
     const ageMs = currentEpoch.updatedAt && currentEpoch.startedAt
@@ -221,10 +216,6 @@ function analyzeMetrics(metrics = {}) {
                 counters,
                 'queueWrite.reason.ordinaryMutation.operation.'
             ),
-            repairOperations: summarizeQueueWriteOperations(
-                counters,
-                'queueWrite.reason.repair.operation.'
-            ),
             allOperations: summarizeQueueWriteOperations(counters),
             topCounters: topCounters(counters, 'queueWrite.', 30)
         },
@@ -237,13 +228,7 @@ function analyzeMetrics(metrics = {}) {
             },
             progress: {
                 received: progressReceived,
-                flushes: progressFlushes,
-                storageWrites: progressWrites,
-                ratio: ratio(progressReceived, progressFlushes || progressWrites),
-                pendingMax: counter(currentEpoch, 'progress.pendingMax'),
-                changedRecordsPerStorageWrite: counter(currentEpoch, 'progress.changedRecordsPerStorageWrite'),
-                payloadRowsPerStorageWrite: counter(currentEpoch, 'progress.payloadRowsPerStorageWrite'),
-                payloadRowsPerStorageWriteLegacy: counter(currentEpoch, 'progress.recordsPerStorageWrite')
+                pendingMax: counter(currentEpoch, 'progress.pendingMax')
             },
             diagnosticEvent: {
                 received: diagnosticReceived,
@@ -257,7 +242,6 @@ function analyzeMetrics(metrics = {}) {
             nudgeAccepted,
             pumpRequested,
             pumpChanged,
-            repairRequested,
             wakeups,
             nudgeAcceptancePct: percent(ratio(nudgeAccepted, nudgeSent)),
             pumpYieldPct: percent(ratio(pumpChanged, pumpRequested)),
@@ -267,14 +251,13 @@ function analyzeMetrics(metrics = {}) {
         jobs: {
             enqueued: jobsEnqueued,
             terminal: jobTerminal,
-            completedOnlyAfterRepair,
-            completedOnlyAfterRepairPct: percent(ratio(completedOnlyAfterRepair, jobTerminal))
+            completedOnlyAfterReconcile,
+            completedOnlyAfterReconcilePct: percent(ratio(completedOnlyAfterReconcile, jobTerminal))
         },
         instrumentation,
         missingForFullModel: Object.entries({
             nudge: !instrumentation.hasNudgeCounters,
             pump: !instrumentation.hasPumpCounters,
-            repair: !instrumentation.hasRepairCounters,
             job: !instrumentation.hasJobCounters
         }).filter(([, missing]) => missing).map(([name]) => name),
         phases: summarizePhases(currentEpoch.phases || {}),
