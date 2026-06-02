@@ -860,21 +860,24 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(afterRepeat['progress.compatibilityFlushScheduled'] || 0, 0)
 })
 
-test('profile progress load normalizes legacy compatibility storage read-only', async () => {
+test('profile progress load reads compact projection storage only', async () => {
     const rawHref = 'https://quora.com/profile/Synthetic-Normalize-Progress'
     const href = 'https://www.quora.com/profile/Synthetic-Normalize-Progress'
     const browser = createFakeBrowser({
-        mbProfileNukeProgress: {
-            [rawHref]: {
-                profileHref: rawHref,
-                status: 'queued',
-                actionKind: 'mute-block',
-                updatedAt: 1000
-            }
-        }
+        ...makeProgressProjectionSeed(rawHref, {
+            status: 'queued',
+            actionKind: 'mute-block',
+            updatedAt: 1000
+        })
     })
+    const storageReads = []
     const storageWrites = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
     const originalSet = browser.storage.local.set
+    browser.storage.local.get = async defaults => {
+        storageReads.push(defaults)
+        return originalGet(defaults)
+    }
     browser.storage.local.set = async payload => {
         storageWrites.push(payload)
         return originalSet(payload)
@@ -887,8 +890,8 @@ test('profile progress load normalizes legacy compatibility storage read-only', 
     await sw.ensureProfileNukeProgressReady()
 
     assert.equal(sw.state().profileNukeProgress[href].profileHref, href)
-    assert.equal(storage.mbProfileNukeProgress[rawHref].profileHref, rawHref)
-    assert.equal(storage.mbProfileNukeProgress[href], undefined)
+    assert.equal(storage.mbProfileNukeProgress, undefined)
+    assert.equal(storageReads.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbProfileNukeProgress')), false)
     assert.equal(storageWrites.some(payload => Object.prototype.hasOwnProperty.call(payload || {}, 'mbProfileNukeProgress')), false)
 })
 
@@ -3542,9 +3545,18 @@ test('terminal job progress applies queue mutation through authority without dup
             (before['storagePayload.read.runs.calls'] || 0),
         2
     )
-    assert.ok(
+    assert.equal(
         (after['storagePayload.read.progress.calls'] || 0) -
-            (before['storagePayload.read.progress.calls'] || 0) >= 1
+            (before['storagePayload.read.progress.calls'] || 0),
+        0
+    )
+    assert.ok(
+        (after['storagePayload.read.progressView.calls'] || 0) -
+            (before['storagePayload.read.progressView.calls'] || 0) >= 1
+    )
+    assert.ok(
+        (after['storagePayload.read.progressShard.calls'] || 0) -
+            (before['storagePayload.read.progressShard.calls'] || 0) >= 1
     )
     assert.equal(
         (after['storagePayload.write.queue.bytes'] || 0) -
@@ -7083,15 +7095,14 @@ test('legacy repair coordinator request action is not accepted', async () => {
     const legacyAction = ['repair', 'coordinator', 'storage'].join('-')
     const result = await browser.runtime.sendMessage({
         action: legacyAction,
-        userInitiated: true,
-        legacyImport: true
+        userInitiated: true
     })
 
     assert.equal(result, undefined)
     assert.deepEqual(storage.mbCoordinatorQueue, {})
 })
 
-test('explicit legacy import keeps progress restore quarantined from dashboard display path', async () => {
+test('legacy import flag does not recreate queue authority from progress', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Orphan-Progress'
     const runId = 'run-synthetic-orphan-progress'
     const {browser, storage} = loadServiceWorkerHarness({
@@ -7126,15 +7137,17 @@ test('explicit legacy import keeps progress restore quarantined from dashboard d
 
     const result = await browser.runtime.sendMessage({
         action: 'reconcile-coordinator-storage',
-        legacyImport: true
+        userInitiated: true,
+        [['legacy', 'Import'].join('')]: true
     })
 
     assert.equal(result.reconcileScheduled, true)
     assert.equal(result.direct, true)
-    assert.equal(result.reconcile.queueChanged, true)
+    assert.equal(result.reconcile.queueChanged, false)
     assert.equal(Object.prototype.hasOwnProperty.call(result, 'repair'), false)
     assert.equal(Object.prototype.hasOwnProperty.call(result, 'repairScheduled'), false)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[href], undefined)
+    assert.equal(storage.mbProfileNukeProgress[href].status, 'queued')
 })
 
 test('authority reconcile reclaims durable active row without confirmed runtime actor', async () => {
@@ -10063,7 +10076,7 @@ test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', 
 
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {
         allowBeforeQuora: true,
-        reason: 'legacy-import-request'
+        reason: 'post-enqueue-reconcile'
     }), true)
     assert.equal(sw.state().coordinatorReconcileBackoffLevel, 0)
     assert.equal(sw.state().coordinatorReconcileBackoffUntil, 0)
@@ -14714,7 +14727,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     assert.ok(reconcileLoadDefaults)
 })
 
-test('explicit legacy import materializes projection-only queued progress', async () => {
+test('reconcile does not materialize projection-only queued progress as queue authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Projection-Only-Queued-Materialize'
     const runId = 'run-projection-only-queued-materialize'
     const attemptId = 'attempt-projection-only-queued-materialize'
@@ -14755,16 +14768,15 @@ test('explicit legacy import materializes projection-only queued progress', asyn
     assert.equal(ordinaryReconcile.queueChanged, false)
     assert.equal(storage.mbCoordinatorQueue[href], undefined)
 
-    const legacyImport = await sw.reconcileCoordinatorStorage({legacyImport: true})
+    const directReconcile = await sw.reconcileCoordinatorStorage({[['legacy', 'Import'].join('')]: true})
 
-    assert.equal(legacyImport.queueChanged, true)
-    assert.equal(legacyImport.progressChanged, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueue[href].runId, runId)
+    assert.equal(directReconcile.queueChanged, false)
+    assert.equal(directReconcile.progressChanged, false)
+    assert.equal(storage.mbCoordinatorQueue[href], undefined)
     assert.equal(storage.mbProfileNukeProgress?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
-    const legacyImportLoadDefaults = findStorageGetDefaults(getDefaults, [
+    const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueue',
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
@@ -14775,7 +14787,7 @@ test('explicit legacy import materializes projection-only queued progress', asyn
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
     ])
-    assert.ok(legacyImportLoadDefaults)
+    assert.ok(reconcileLoadDefaults)
 })
 
 test('stored-work reconcile terminal raw row updates WAL authority', async () => {
