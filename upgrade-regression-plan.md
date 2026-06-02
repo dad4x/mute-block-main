@@ -80,6 +80,13 @@ Expected output is compact JSON with at least:
 
 The runner exits nonzero if any hard check fails.
 
+Baseline comparison intentionally uses a normalized comparable shape. It checks
+stable upgrade facts only: extension id/name/version/location/state/errors,
+final storage keys, forbidden-action summaries, non-user reconcile behavior,
+visible alarm names, work counts, and whether unexpected keys were added. It
+does not compare unstable inspection details such as extension view lists,
+extension install paths, or the full before/after storage delta.
+
 ## Phase 1 Checks
 
 - Extension is installed, enabled, named `Mute Block`, has the repo current
@@ -111,9 +118,34 @@ Those probes may materialize the current diagnostic/projection keys listed
 above, so Phase 1 is intentionally named non-work-starting rather than
 read-only.
 
+## Phase 2 Content Smoke
+
+Run against an existing benign Quora tab, or pass a benign Quora URL for the
+runner to open in the target browser:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current \
+  --phase phase2-content-smoke \
+  --quora-url https://www.quora.com/
+```
+
+Phase 2 includes the Phase 1 non-work-starting checks, then verifies that the
+content script is injected on a Quora page and that
+`get-content-page-coordinator-state` returns scoped content-page state from the
+content-script context. It does not click UI, enqueue work, or start queue
+drain.
+
+Phase 2 may materialize current compact content projections such as
+`mbCoordinatorContentQueueIndex`, `mbCoordinatorContentSourceIndex.*`,
+`mbProfileNukeProgressView`, `mbProfileNukeProgressShard.*`,
+`mbBrowserSessionMarker`, or `mbQuoraRuntimeActivated`. It must not create the
+full legacy `mbProfileNukeProgress` key, accept legacy runtime actions, expose
+queue rows for the page smoke, or increase active/queued work counts.
+
 ## Later Phases
 
-Phase 2 should add a benign Quora page/content-script smoke without queueing
-work. Phase 3 should cover one controlled item. Phase 4 should cover a small
-batch. None of those phases should reintroduce legacy full-progress storage,
-legacy import, or repair-style compatibility behavior.
+Phase 3 should cover one controlled item. Phase 4 should cover a small batch.
+None of those phases should reintroduce legacy full-progress storage, legacy
+import, or repair-style compatibility behavior.
