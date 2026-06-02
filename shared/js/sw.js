@@ -3461,7 +3461,7 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
         reason: 'ordinaryMutation',
         metricPath: 'reconcile.terminalProgressActive.save',
         deferProjectionSave: true,
-        projectionRepairDelayMs: 30000,
+        projectionReconcileDelayMs: 30000,
         currentAuthorityState: null,
         mutate(currentItem, context) {
             if(!isActiveCoordinatorStatus(currentItem?.status)) {
@@ -7434,7 +7434,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         projectionSaved = 'deferred'
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionDeferred')
         const projectionQueue = cloneCoordinatorAuthorityValue(projectionQueueBase)
-        const repairDelayMs = Math.max(1000, Number.parseInt(options.projectionRepairDelayMs, 10) || 30000)
+        const reconcileDelayMs = Math.max(1000, Number.parseInt(options.projectionReconcileDelayMs, 10) || 30000)
         setTimeout(() => {
             void (async () => {
                 let deferredSaved = true
@@ -7459,7 +7459,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
                 }
                 if(!deferredSaved) {
                     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionFailed')
-                    scheduleCoordinatorReconcile(repairDelayMs, {
+                    scheduleCoordinatorReconcile(reconcileDelayMs, {
                         reason: 'queue-wal-projection-failed',
                         edgeTriggered: true
                     })
@@ -8823,7 +8823,7 @@ function createCoordinatorAuthority() {
                     deferProjectionSave: operation.deferProjectionSave === true,
                     projectionPayload: operation.projectionPayload || '',
                     projectionDeferDelayMs: operation.projectionDeferDelayMs,
-                    projectionRepairDelayMs: operation.projectionRepairDelayMs
+                    projectionReconcileDelayMs: operation.projectionReconcileDelayMs
                 })
                 : {
                     backend: 'snapshot',
@@ -18803,7 +18803,7 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
         currentAuthorityState,
         deferProjectionSave: true,
         projectionPayload: 'queueViewOnly',
-        projectionRepairDelayMs: 30000,
+        projectionReconcileDelayMs: 30000,
         mutate(currentItem, context) {
             if(!currentItem) {
                 return context.reject('missing-coordinator-item')
@@ -21164,7 +21164,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
             reason: 'ordinaryMutation',
             metricPath: 'backgroundBlockedSweepTerminal.save',
             deferProjectionSave: true,
-            projectionRepairDelayMs: 30000,
+            projectionReconcileDelayMs: 30000,
             currentAuthorityState,
             mutate(currentItem, context) {
                 if(!isActiveCoordinatorStatus(currentItem?.status)) return context.reject('row-changed')

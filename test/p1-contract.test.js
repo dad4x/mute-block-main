@@ -358,7 +358,7 @@ test('duplicate terminal progress preflights resident terminal authority', () =>
 
 test('content terminal mapping delegates to shared job state reducer', () => {
     const source = readRepoFile('shared/js/content.js')
-    const mapperBody = extractFunction(source, 'function mapProfileProgressToCoordinatorRepair(record = {})')
+    const mapperBody = extractFunction(source, 'function mapProfileProgressToCoordinatorState(record = {})')
 
     assert.match(source, /mapProgressToCoordinatorState/)
     assert.match(mapperBody, /mapProgressToCoordinatorState\(record\)/)
@@ -2732,7 +2732,7 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.match(transitionBody, /metricPath: 'activeTransition\.save'/)
     assert.match(transitionBody, /projectionPayload: 'queueViewOnly'/)
     assert.doesNotMatch(transitionBody, /deferProjectionSave: true/)
-    assert.doesNotMatch(transitionBody, /projectionRepairDelayMs: 30000/)
+    assert.doesNotMatch(transitionBody, /projectionReconcileDelayMs: 30000/)
     assert.match(transitionBody, /if\(runsChanged\) \{[\s\S]*saveCoordinatorState\(\{[\s\S]*runs: nextRuns[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*runs: true,[\s\S]*reason: 'ordinaryMutation',[\s\S]*queueOperation: 'active-transition-derived'/)
     assert.doesNotMatch(transitionBody, /saveCoordinatorQueueRunsProjection\(/)
     assert.match(transitionBody, /return true/)

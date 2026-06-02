@@ -1058,7 +1058,7 @@ async function recordProfileNukeProgress(href, patch = {}) {
     if(!nextRecord) return null
 
     const useJobProtocol = isActiveQueuedProgressRecord(normalizedHref)
-    const mapped = mapProfileProgressToCoordinatorRepair(nextRecord)
+    const mapped = mapProfileProgressToCoordinatorState(nextRecord)
 
     if(useJobProtocol) {
         profileNukeProgress = pruneProfileNukeProgress({
@@ -1133,7 +1133,7 @@ async function recordProfileNukeProgressBatch(updates) {
     return false
 }
 
-function mapProfileProgressToCoordinatorRepair(record = {}) {
+function mapProfileProgressToCoordinatorState(record = {}) {
     const mapped = mapProgressToCoordinatorState(record)
     return {
         status: mapped.status || '',
@@ -1314,7 +1314,7 @@ async function recordAlreadyBlockedCoordinatorProgress(href, item = {}, patch = 
     })
     if(!nextRecord) return null
 
-    const mapped = mapProfileProgressToCoordinatorRepair(nextRecord)
+    const mapped = mapProfileProgressToCoordinatorState(nextRecord)
     if(!mapped.terminal) return recordProfileNukeProgress(href, patch)
 
     profileNukeProgress = pruneProfileNukeProgress({

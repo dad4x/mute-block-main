@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.6.848",
+  "version": "1.6.849",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
