@@ -18,7 +18,19 @@ const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 9223
 const PHASE1 = 'phase1-non-work-starting-smoke'
 const PHASE2 = 'phase2-content-smoke'
+const PHASE3_SPACE = 'phase3-space-discovery-smoke'
+const PHASE3_SEARCH = 'phase3-search-discovery-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
+const SPACE_ASSET_URLS = [
+    'https://theqdefensecrew.quora.com/',
+    'https://instantblock.quora.com/'
+]
+const SPACE_TARGET_URLS = [
+    'https://terryspcfreetopics.quora.com/',
+    'https://jonspoliticalcorner29.quora.com/'
+]
+const DEFAULT_SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
+const SUPPORTED_PHASES = [PHASE1, PHASE2, PHASE3_SPACE, PHASE3_SEARCH]
 
 const LEGACY_ACTIONS = [
     'record-nuke-progress',
@@ -84,6 +96,11 @@ const ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS = [
     /^mbQuoraRuntimeActivated$/
 ]
 
+const ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS = [
+    ...ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS,
+    /^mbSpaceRegistry$/
+]
+
 function parseArgs(argv) {
     const options = {
         host: DEFAULT_HOST,
@@ -94,6 +111,9 @@ function parseArgs(argv) {
         compareBaseline: '',
         phase: PHASE1,
         quoraUrl: '',
+        searchUrl: DEFAULT_SEARCH_URL,
+        spaceAssetUrls: SPACE_ASSET_URLS.slice(),
+        spaceTargetUrls: SPACE_TARGET_URLS.slice(),
         verbose: false
     }
 
@@ -131,6 +151,12 @@ function parseArgs(argv) {
         else if(arg.startsWith('--phase=')) options.phase = arg.slice('--phase='.length)
         else if(arg === '--quora-url') options.quoraUrl = readValue('')
         else if(arg.startsWith('--quora-url=')) options.quoraUrl = arg.slice('--quora-url='.length)
+        else if(arg === '--search-url') options.searchUrl = readValue(options.searchUrl)
+        else if(arg.startsWith('--search-url=')) options.searchUrl = arg.slice('--search-url='.length)
+        else if(arg === '--space-asset-url') options.spaceAssetUrls.push(readValue(''))
+        else if(arg.startsWith('--space-asset-url=')) options.spaceAssetUrls.push(arg.slice('--space-asset-url='.length))
+        else if(arg === '--space-target-url') options.spaceTargetUrls.push(readValue(''))
+        else if(arg.startsWith('--space-target-url=')) options.spaceTargetUrls.push(arg.slice('--space-target-url='.length))
         else if(arg === '--verbose') options.verbose = true
         else if(arg === '--help' || arg === '-h') {
             printUsage()
@@ -140,9 +166,11 @@ function parseArgs(argv) {
     }
 
     if(!options.extensionId) throw new Error('--extension-id is required')
-    if(![PHASE1, PHASE2].includes(options.phase)) {
-        throw new Error(`unsupported --phase ${options.phase}; expected ${PHASE1} or ${PHASE2}`)
+    if(!SUPPORTED_PHASES.includes(options.phase)) {
+        throw new Error(`unsupported --phase ${options.phase}; expected one of ${SUPPORTED_PHASES.join(', ')}`)
     }
+    options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
+    options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
     if(options.writeBaseline === true) options.writeBaseline = defaultBaselinePath(options.profileLabel, options.phase)
     if(options.compareBaseline === true || options.compareBaseline === '') {
         if(argv.includes('--compare-baseline')) throw new Error('--compare-baseline requires a path')
@@ -159,12 +187,19 @@ function printUsage() {
         '  --host 127.0.0.1',
         '  --port 9223',
         '  --profile-label store-1.4-to-current',
-        `  --phase ${PHASE1}|${PHASE2}`,
+        `  --phase ${SUPPORTED_PHASES.join('|')}`,
         '  --quora-url https://www.quora.com/',
+        `  --search-url ${DEFAULT_SEARCH_URL}`,
+        '  --space-asset-url https://theqdefensecrew.quora.com/',
+        '  --space-target-url https://terryspcfreetopics.quora.com/',
         '  --write-baseline [path]',
         '  --compare-baseline path',
         '  --verbose'
     ].join('\n'))
+}
+
+function dedupeStrings(values = []) {
+    return Array.from(new Set((values || []).map(value => `${value || ''}`.trim()).filter(Boolean)))
 }
 
 function defaultBaselinePath(profileLabel, phase = PHASE1) {
@@ -324,7 +359,12 @@ function isAllowedStorageKey(key) {
 function isAllowedAddedStorageKey(key, phase = PHASE1) {
     if(ALLOWED_ADDED_STORAGE_KEYS.has(key)) return true
     if(phase === PHASE2) return ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
+    if(isDiscoveryPhase(phase)) return ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     return false
+}
+
+function isDiscoveryPhase(phase = '') {
+    return phase === PHASE3_SPACE || phase === PHASE3_SEARCH
 }
 
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
@@ -347,10 +387,21 @@ function diffStorageKeys(before = [], after = [], phase = PHASE1) {
 
 function allowedAddedStorageKeySummary(phase = PHASE1) {
     const literal = Array.from(ALLOWED_ADDED_STORAGE_KEYS).sort()
-    if(phase !== PHASE2) return {literal, patterns: []}
+    if(phase === PHASE2) {
+        return {
+            literal,
+            patterns: ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
+        }
+    }
+    if(isDiscoveryPhase(phase)) {
+        return {
+            literal,
+            patterns: ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
+        }
+    }
     return {
         literal,
-        patterns: ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
+        patterns: []
     }
 }
 
@@ -393,6 +444,90 @@ function summarizeWorkState(storage) {
     }
 }
 
+function stableJson(value) {
+    if(value === null || typeof value !== 'object') return JSON.stringify(value)
+    if(Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
+}
+
+function countRecordMap(value = null) {
+    if(!value || typeof value !== 'object') return 0
+    const records = value.records && typeof value.records === 'object' ? value.records : value
+    return Object.keys(records || {}).length
+}
+
+function summarizeAuthorityState(storage) {
+    const data = storage?.data || {}
+    const walKeys = Object.keys(data)
+        .filter(key => key === 'mbCoordinatorQueueWal' || key.startsWith('mbCoordinatorQueueWal.'))
+        .sort()
+    const progressShardKeys = Object.keys(data)
+        .filter(key => key.startsWith('mbProfileNukeProgressShard.'))
+        .sort()
+    const progressShardRecords = progressShardKeys
+        .reduce((total, key) => total + countRecordMap(data[key]), 0)
+    const queuedActionSurfaceState = data.mbQueuedActionSurfaceState && typeof data.mbQueuedActionSurfaceState === 'object'
+        ? data.mbQueuedActionSurfaceState
+        : {}
+
+    return {
+        work: summarizeWorkState(storage),
+        walKeys,
+        walSignature: stableJson(Object.fromEntries(walKeys.map(key => [key, data[key]]))),
+        progressViewRecords: countRecordMap(data.mbProfileNukeProgressView),
+        progressShardRecords,
+        pendingSpacePostRecords: countRecordMap(data.mbSpacePendingNukedPosts),
+        nukedSpacePostRecords: countRecordMap(data.mbSpaceNukedPosts),
+        queuedActionSurfaceRecords: countRecordMap(queuedActionSurfaceState)
+    }
+}
+
+function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
+    const changed = (name, details = {}) => fail(`discovery smoke created ${name}`, details)
+    if(after.work.rawQueueRows !== before.work.rawQueueRows || after.work.rawQueueRows !== 0) {
+        changed('coordinator queue rows', {before: before.work.rawQueueRows, after: after.work.rawQueueRows})
+    }
+    if(after.work.viewRows !== before.work.viewRows || after.work.viewRows !== 0) {
+        changed('coordinator queue view rows', {before: before.work.viewRows, after: after.work.viewRows})
+    }
+    if(after.walSignature !== before.walSignature) {
+        changed('coordinator queue WAL changes', {
+            beforeKeys: before.walKeys,
+            afterKeys: after.walKeys
+        })
+    }
+    if(after.progressViewRecords !== before.progressViewRecords || after.progressViewRecords !== 0) {
+        changed('profile progress view records', {
+            before: before.progressViewRecords,
+            after: after.progressViewRecords
+        })
+    }
+    if(after.progressShardRecords !== before.progressShardRecords || after.progressShardRecords !== 0) {
+        changed('profile progress shard records', {
+            before: before.progressShardRecords,
+            after: after.progressShardRecords
+        })
+    }
+    if(after.pendingSpacePostRecords !== before.pendingSpacePostRecords || after.pendingSpacePostRecords !== 0) {
+        changed('pending space post records', {
+            before: before.pendingSpacePostRecords,
+            after: after.pendingSpacePostRecords
+        })
+    }
+    if(after.nukedSpacePostRecords !== before.nukedSpacePostRecords || after.nukedSpacePostRecords !== 0) {
+        changed('nuked space post records', {
+            before: before.nukedSpacePostRecords,
+            after: after.nukedSpacePostRecords
+        })
+    }
+    if(after.queuedActionSurfaceRecords !== before.queuedActionSurfaceRecords || after.queuedActionSurfaceRecords !== 0) {
+        changed('queued action surface records', {
+            before: before.queuedActionSurfaceRecords,
+            after: after.queuedActionSurfaceRecords
+        })
+    }
+}
+
 function comparableReport(report) {
     const extension = report.extension || {}
     const storageKeyDelta = report.storageKeyDelta || {}
@@ -418,6 +553,7 @@ function comparableReport(report) {
         legacyActions: report.legacyActions,
         reconcileDisplayOnly: report.reconcileDisplayOnly,
         contentSmoke: comparableContentSmoke(report.contentSmoke),
+        discoverySmoke: comparableDiscoverySmoke(report.discoverySmoke),
         workStateAfter: report.workStateAfter
     }
 }
@@ -441,6 +577,28 @@ function comparableContentSmoke(contentSmoke = null) {
                 ? coordinatorState.responseKeys.slice().sort()
                 : []
         }
+    }
+}
+
+function comparableDiscoverySmoke(discoverySmoke = null) {
+    if(!discoverySmoke) return null
+    return {
+        kind: discoverySmoke.kind || '',
+        pageCount: Array.isArray(discoverySmoke.pages) ? discoverySmoke.pages.length : 0,
+        hasCandidates: (Number(discoverySmoke.totalCandidateCount || 0) || 0) > 0,
+        pages: (discoverySmoke.pages || []).map(page => ({
+            expectedCategory: page.expectedCategory || '',
+            observedCategory: page.page?.spaceCategory || '',
+            pageType: page.page?.pageType || '',
+            contentReadyPresent: !!page.page?.contentReady,
+            profileHrefsPresent: (Number(page.page?.profileHrefCount || 0) || 0) > 0,
+            discoveryCandidatesPresent: (Number(page.page?.discoveryCandidateCount || 0) || 0) > 0,
+            profileSearchToolbarPresent: page.page?.profileSearchToolbarPresent === true,
+            spaceCategoryHostPresent: page.page?.spaceCategoryHostPresent === true,
+            scoped: page.coordinatorState?.scoped === true,
+            queueRows: Number(page.coordinatorState?.queueRows || 0) || 0,
+            progressRows: Number(page.coordinatorState?.progressRows || 0) || 0
+        }))
     }
 }
 
@@ -502,6 +660,18 @@ function isQuoraUrl(url = '') {
     }
 }
 
+function normalizeComparableUrl(url = '') {
+    try {
+        const parsed = new URL(url)
+        parsed.hash = ''
+        if(parsed.pathname !== '/') parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/'
+        return parsed.href
+    }
+    catch {
+        return `${url || ''}`.trim()
+    }
+}
+
 async function findOrOpenQuoraPage(config, quoraUrl, warnings) {
     if(quoraUrl && !isQuoraUrl(quoraUrl)) throw new Error(`--quora-url must be an https Quora URL: ${quoraUrl}`)
 
@@ -526,6 +696,108 @@ async function findOrOpenQuoraPage(config, quoraUrl, warnings) {
         targets.find(target => target.type === 'page' && isQuoraUrl(target.url || ''))
     if(!page) throw new Error(`Quora page target not found after opening ${quoraUrl}`)
     return page
+}
+
+async function findOrOpenPage(config, url, warnings, reason = 'page') {
+    if(!url || !isQuoraUrl(url)) throw new Error(`${reason} URL must be an https Quora URL: ${url}`)
+
+    const normalizedUrl = normalizeComparableUrl(url)
+    let targets = await getTargets(config)
+    let page = targets.find(target =>
+        target.type === 'page' &&
+        normalizeComparableUrl(target.url || '') === normalizedUrl)
+    if(page) return page
+
+    const versionInfo = await getJson('/json/version', config)
+    const created = await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url,
+        background: true
+    }, 10000)
+    warnings.push(`opened ${reason}: ${url}`)
+    await sleep(4500)
+
+    targets = await getTargets(config)
+    page = targets.find(target => target.id === created.targetId) ||
+        targets.find(target => target.type === 'page' && normalizeComparableUrl(target.url || '') === normalizedUrl)
+    if(!page) throw new Error(`${reason} target not found after opening ${url}`)
+    return page
+}
+
+function normalizeSpaceUrl(url = '') {
+    try {
+        const parsed = new URL(url)
+        parsed.search = ''
+        parsed.hash = ''
+
+        if(parsed.hostname !== 'www.quora.com' && parsed.hostname.endsWith('.quora.com')) {
+            return `${parsed.protocol}//${parsed.hostname}`
+        }
+
+        let pathname = parsed.pathname.replace(/\/+$/, '')
+        if(!pathname) pathname = '/'
+        return `${parsed.protocol}//${parsed.hostname}${pathname}`
+    }
+    catch {
+        return ''
+    }
+}
+
+function extractSpaceSlug(url = '') {
+    try {
+        const parsed = new URL(url)
+        if(parsed.hostname !== 'www.quora.com') return parsed.hostname.replace(/\.quora\.com$/i, '')
+        const parts = parsed.pathname.split('/').filter(Boolean)
+        return parts[parts.length - 1] || parsed.hostname
+    }
+    catch {
+        return ''
+    }
+}
+
+function makeSpaceRegistryRecord(url = '', category = '') {
+    const normalizedUrl = normalizeSpaceUrl(url)
+    const slug = extractSpaceSlug(normalizedUrl)
+    if(!normalizedUrl || !slug || !['asset', 'target'].includes(category)) return null
+    return {
+        key: `quora-space:${normalizedUrl}`,
+        url: normalizedUrl,
+        slug,
+        name: slug.replace(/[-_]+/g, ' '),
+        category,
+        updatedAt: Date.now()
+    }
+}
+
+async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = []) {
+    const records = [
+        ...assetUrls.map(url => makeSpaceRegistryRecord(url, 'asset')),
+        ...targetUrls.map(url => makeSpaceRegistryRecord(url, 'target'))
+    ].filter(Boolean)
+    if(!records.length) return {updated: 0, records: []}
+
+    return evaluate(context.webSocketDebuggerUrl, `(${function setSpaceRegistry(nextRecords) {
+        return new Promise(resolve => {
+            chrome.storage.local.get({mbSpaceRegistry: {}}, stored => {
+                const registry = stored.mbSpaceRegistry && typeof stored.mbSpaceRegistry === 'object'
+                    ? stored.mbSpaceRegistry
+                    : {}
+                let updated = 0
+                for(const record of nextRecords || []) {
+                    if(!record?.key) continue
+                    const previous = registry[record.key] || null
+                    registry[record.key] = {
+                        ...previous,
+                        ...record
+                    }
+                    updated += 1
+                }
+                chrome.storage.local.set({mbSpaceRegistry: registry}, () => resolve({
+                    updated,
+                    keys: nextRecords.map(record => record.key).filter(Boolean)
+                }))
+            })
+        })
+    }})(${JSON.stringify(records)})`, 10000)
 }
 
 async function evaluateInExtensionIsolatedWorld(target, extensionId, expression, timeoutMs = 15000) {
@@ -674,6 +946,101 @@ async function inspectQuoraPage(target) {
     }})()`, 15000)
 }
 
+async function inspectDiscoveryPage(target) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function inspectPage() {
+        const normalizeProfileHref = href => {
+            try {
+                const url = new URL(href, location.href)
+                if(!/^https:$/.test(url.protocol)) return ''
+                if(!/(^|\.)quora\.com$/i.test(url.hostname)) return ''
+                if(!/^\/profile\//i.test(url.pathname)) return ''
+                url.hash = ''
+                return `https://www.quora.com${url.pathname.replace(/\/+$/, '')}`
+            }
+            catch {
+                return ''
+            }
+        }
+        const profileHrefs = Array.from(new Set(Array.from(document.querySelectorAll('a[href]'))
+            .map(anchor => normalizeProfileHref(anchor.getAttribute('href') || anchor.href || ''))
+            .filter(Boolean)))
+            .slice(0, 250)
+        const pageType = /\/profile\//i.test(location.pathname)
+            ? 'profile'
+            : /\/search/i.test(location.pathname)
+                ? 'profile-search'
+                : location.hostname !== 'www.quora.com'
+                    ? 'space'
+                    : 'unknown'
+        const profileSearchRows = Array.from(document.querySelectorAll('[data-mb-profile-search-href]'))
+        const profileSearchButtons = Array.from(document.querySelectorAll('.mb-ext_profile-search-row-btn[data-mb-profile-search-href]'))
+        const spaceFeedButtons = Array.from(document.querySelectorAll([
+            '.mb-ext_space-feed-nuke-btn',
+            '.mb-ext_space-feed-post-nuke-btn',
+            '.mb-ext_space-feed-post-queue-btn',
+            '.mb-ext_space-feed-post-single-nuke-btn'
+        ].join(',')))
+        const parseJsonArray = value => {
+            try {
+                const parsed = JSON.parse(value || '[]')
+                return Array.isArray(parsed) ? parsed : []
+            }
+            catch {
+                return []
+            }
+        }
+        const spaceFeedCandidateHrefs = new Set()
+        let spaceFeedEntryCount = 0
+        for(const button of spaceFeedButtons) {
+            for(const href of parseJsonArray(button.dataset.mbSpaceFeedUrls || '[]')) {
+                const normalized = normalizeProfileHref(href)
+                if(normalized) spaceFeedCandidateHrefs.add(normalized)
+            }
+            const entries = parseJsonArray(button.dataset.mbSpaceFeedEntries || '[]')
+            spaceFeedEntryCount += entries.length
+            for(const entry of entries) {
+                for(const href of entry?.candidateUrls || []) {
+                    const normalized = normalizeProfileHref(href)
+                    if(normalized) spaceFeedCandidateHrefs.add(normalized)
+                }
+            }
+        }
+        const categoryHost = document.querySelector('.mb-ext_space-category-host')
+        const activeCategoryButton = document.querySelector('.mb-ext_space-category-btn[data-active="true"]')
+        const toolbar = document.querySelector('.mb-ext_profile-search-toolbar')
+        const batchButton = document.querySelector('.mb-ext_profile-search-batch-btn')
+        const statusButton = document.querySelector('.mb-ext_space-feed-status-btn')
+        const discoveryCandidateCount = pageType === 'space'
+            ? Math.max(spaceFeedCandidateHrefs.size, profileHrefs.length)
+            : pageType === 'profile-search'
+                ? Math.max(profileSearchRows.length, profileSearchButtons.length, profileHrefs.length)
+                : profileHrefs.length
+        return {
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            visibilityState: document.visibilityState,
+            contentReady: document.documentElement?.getAttribute('data-mb-content-script-ready') || '',
+            pageType,
+            searchQuery: new URLSearchParams(location.search).get('q') || '',
+            profileHrefCount: profileHrefs.length,
+            profileHrefs,
+            discoveryCandidateCount,
+            profileSearchRowCount: profileSearchRows.length,
+            profileSearchButtonCount: profileSearchButtons.length,
+            profileSearchToolbarPresent: !!toolbar,
+            profileSearchBatchText: `${batchButton?.innerText || batchButton?.textContent || ''}`.replace(/\s+/g, ' ').trim(),
+            spaceCategory: activeCategoryButton?.dataset?.category || '',
+            spaceCategoryHostPresent: !!categoryHost,
+            spaceFeedButtonCount: spaceFeedButtons.length,
+            spaceFeedEntryCount,
+            spaceFeedCandidateCount: spaceFeedCandidateHrefs.size,
+            spaceFeedStatusText: `${statusButton?.innerText || statusButton?.textContent || ''}`.replace(/\s+/g, ' ').trim(),
+            timestampCount: document.querySelectorAll('a.post_timestamp').length
+        }
+    }})()`, 15000)
+}
+
 async function sendContentPageCoordinatorState(target, extensionId, pageState) {
     return evaluateInExtensionIsolatedWorld(target, extensionId, `(${function requestContentState(request) {
         return new Promise(resolve => {
@@ -686,7 +1053,9 @@ async function sendContentPageCoordinatorState(target, extensionId, pageState) {
         action: 'get-content-page-coordinator-state',
         pageType: pageState.pageType || '',
         url: pageState.url || '',
-        profileHrefs: pageState.profileHrefs || []
+        profileHrefs: pageState.profileHrefs || [],
+        sourcePageUrl: pageState.pageType === 'profile-search' ? pageState.url || '' : '',
+        searchQuery: pageState.searchQuery || ''
     })})`, 15000)
 }
 
@@ -732,6 +1101,92 @@ async function runContentSmoke(config, options, warnings, fail) {
     }
 }
 
+async function inspectDiscoveryWithState(target, options, expectedPageType, fail) {
+    let pageState = await inspectDiscoveryPage(target)
+    for(let attempt = 0; attempt < 4 && (!pageState.contentReady || pageState.discoveryCandidateCount <= 0); attempt += 1) {
+        await evaluate(target.webSocketDebuggerUrl, `(${function nudgeDiscovery() {
+            if(document.readyState !== 'complete') return
+            window.scrollBy({top: Math.max(400, Math.floor((window.innerHeight || 800) * 0.75)), left: 0, behavior: 'auto'})
+        }})()`, 5000).catch(() => null)
+        await sleep(2000)
+        pageState = await inspectDiscoveryPage(target)
+    }
+
+    const contentStateResult = await sendContentPageCoordinatorState(target, options.extensionId, pageState)
+    const contentState = summarizeContentStateResult(contentStateResult)
+    if(!pageState.contentReady) fail('content script ready marker is missing on discovery page', {url: pageState.url})
+    if(pageState.pageType !== expectedPageType) fail('discovery page type mismatch', {
+        expected: expectedPageType,
+        actual: pageState.pageType,
+        url: pageState.url
+    })
+    if(pageState.discoveryCandidateCount <= 0) fail('discovery page has no visible candidates', {
+        url: pageState.url,
+        pageType: pageState.pageType,
+        profileHrefCount: pageState.profileHrefCount,
+        spaceFeedCandidateCount: pageState.spaceFeedCandidateCount,
+        profileSearchRowCount: pageState.profileSearchRowCount
+    })
+    if(!contentState.ok) fail('discovery content state did not return from content script context', contentState)
+    else {
+        if(contentState.scoped !== true) fail('discovery content state is not scoped', contentState)
+        if(contentState.queueRows !== 0) fail('discovery content state exposed queue rows', contentState)
+        if(contentState.progressRows !== 0) fail('discovery content state exposed profile progress rows', contentState)
+    }
+
+    return {
+        target: {
+            id: target.id,
+            type: target.type || '',
+            url: target.url || ''
+        },
+        page: pageState,
+        coordinatorState: contentState
+    }
+}
+
+async function runSpaceDiscoverySmoke(config, options, context, warnings, fail) {
+    const classified = await classifySpacesForDiscovery(context, options.spaceAssetUrls, options.spaceTargetUrls)
+    const pages = []
+    const pageInputs = [
+        ...options.spaceAssetUrls.map(url => ({url, category: 'asset'})),
+        ...options.spaceTargetUrls.map(url => ({url, category: 'target'}))
+    ]
+
+    for(const input of pageInputs) {
+        const target = await findOrOpenPage(config, input.url, warnings, `phase 3 ${input.category} space`)
+        const page = await inspectDiscoveryWithState(target, options, 'space', fail)
+        if(page.page.spaceCategory && page.page.spaceCategory !== input.category) {
+            fail('space discovery category mismatch', {
+                url: page.page.url,
+                expected: input.category,
+                actual: page.page.spaceCategory
+            })
+        }
+        pages.push({
+            ...page,
+            expectedCategory: input.category
+        })
+    }
+
+    return {
+        kind: PHASE3_SPACE,
+        classified,
+        totalCandidateCount: pages.reduce((total, page) => total + (Number(page.page.discoveryCandidateCount || 0) || 0), 0),
+        pages
+    }
+}
+
+async function runSearchDiscoverySmoke(config, options, warnings, fail) {
+    const target = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 3 profile search')
+    const page = await inspectDiscoveryWithState(target, options, 'profile-search', fail)
+    return {
+        kind: PHASE3_SEARCH,
+        totalCandidateCount: Number(page.page.discoveryCandidateCount || 0) || 0,
+        pages: [page]
+    }
+}
+
 function writeJson(pathname, value) {
     fs.mkdirSync(path.dirname(pathname), {recursive: true})
     fs.writeFileSync(pathname, `${JSON.stringify(value, null, 2)}\n`)
@@ -762,6 +1217,7 @@ runMain(async () => {
     const context = await ensureExtensionContext(config, warnings)
     const storageBefore = await readStorage(context)
     const workStateBefore = summarizeWorkState(storageBefore)
+    const authorityStateBefore = summarizeAuthorityState(storageBefore)
 
     const legacyActions = {}
     for(const action of LEGACY_ACTIONS) {
@@ -786,13 +1242,23 @@ runMain(async () => {
     }
 
     let contentSmoke = null
+    let discoverySmoke = null
     if(options.phase === PHASE2) {
         contentSmoke = await runContentSmoke(config, options, warnings, fail)
+        await sleep(500)
+    }
+    else if(options.phase === PHASE3_SPACE) {
+        discoverySmoke = await runSpaceDiscoverySmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
+    else if(options.phase === PHASE3_SEARCH) {
+        discoverySmoke = await runSearchDiscoverySmoke(config, options, warnings, fail)
         await sleep(500)
     }
 
     const storageAfter = await readStorage(context)
     const workStateAfter = summarizeWorkState(storageAfter)
+    const authorityStateAfter = summarizeAuthorityState(storageAfter)
     const alarmsResult = await readAlarms(context)
     const alarms = alarmsResult.alarms || []
     const alarmNames = alarms.map(alarm => alarm.name)
@@ -838,6 +1304,9 @@ runMain(async () => {
             after: workStateAfter
         })
     }
+    if(isDiscoveryPhase(options.phase)) {
+        assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
+    }
 
     const legacyActionSummary = Object.fromEntries(Object.entries(legacyActions)
         .map(([action, result]) => [action, summarizeLegacyMessageResult(result)]))
@@ -872,8 +1341,11 @@ runMain(async () => {
         reconcileDisplayOnly: reconcileDisplayOnlySummary,
         currentActions: currentActionSummary,
         contentSmoke,
+        discoverySmoke,
         workStateBefore,
         workStateAfter,
+        authorityStateBefore,
+        authorityStateAfter,
         failures,
         warnings
     }

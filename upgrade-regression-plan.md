@@ -152,8 +152,61 @@ store-upgrade baselines only from a freshly recreated store `1.4.186` profile;
 otherwise label the snapshot accordingly, for example
 `store-1.4-to-current-warmed-phase2`.
 
+## Phase 3 Discovery-Only Smokes
+
+Phase 3 treats the suite as non-work-starting, not no-write. Persisted
+space/source/candidate discovery projections are acceptable. Profile authority,
+profile progress, coordinator queue authority, WAL appends, pending/nuked space
+post state, and queued action-surface state are not acceptable.
+
+Space discovery:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase3 \
+  --phase phase3-space-discovery-smoke
+```
+
+The default space inputs are:
+
+- assets: `https://theqdefensecrew.quora.com/`,
+  `https://instantblock.quora.com/`
+- targets: `https://terryspcfreetopics.quora.com/`,
+  `https://jonspoliticalcorner29.quora.com/`
+
+Additional space inputs can be supplied with repeated `--space-asset-url` or
+`--space-target-url` options. The runner records those as space-level registry
+state only, opens each page, lets the content script discover visible profile
+candidates, and fails if no candidates are visible/countable.
+
+Profile search discovery:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase3 \
+  --phase phase3-search-discovery-smoke \
+  --search-url 'https://www.quora.com/search?q=elon%20musk&type=profile'
+```
+
+Phase 3 also reruns the old-surface gates from earlier phases. Legacy runtime
+actions must still be rejected, the full legacy `mbProfileNukeProgress` storage
+key must not appear, legacy repair/import alarms must not appear, active/queued
+work counts must not increase, and the discovery authority summary must remain
+empty for queue rows, WAL changes, profile progress rows, pending/nuked space
+post rows, and queued action-surface records.
+
+Phase-specific baseline files are written under `tmp/upgrade-regression/` by
+default. Phase 3 baseline comparison keeps exact candidate counts in the full
+report but normalizes the strict comparable shape to stable facts such as
+candidate presence, page type, scoped state, category classification, and zero
+queue/progress rows. A Phase 3 baseline should be labeled as warmed unless it
+is captured from a recreated store `1.4.186` profile immediately after upgrade.
+
 ## Later Phases
 
-Phase 3 should cover one controlled item. Phase 4 should cover a small batch.
-None of those phases should reintroduce legacy full-progress storage, legacy
-import, or repair-style compatibility behavior.
+Later phases should cover one controlled item and then a small batch. Those
+phases intentionally create queue authority and should not be mixed with the
+discovery-only contract. None of those phases should reintroduce legacy
+full-progress storage, legacy import, or repair-style compatibility behavior.
