@@ -154,10 +154,18 @@ otherwise label the snapshot accordingly, for example
 
 ## Phase 3 Discovery-Only Smokes
 
-Phase 3 treats the suite as non-work-starting, not no-write. Persisted
-space/source/candidate discovery projections are acceptable. Profile authority,
-profile progress, coordinator queue authority, WAL appends, pending/nuked space
-post state, and queued action-surface state are not acceptable.
+Phase 3 is a warmed, non-work-starting, seeded space-registry suite. It treats
+the suite as non-work-starting, not no-write. Persisted space/source/candidate
+discovery projections are acceptable. Profile authority, profile progress,
+coordinator queue authority, WAL appends, pending/nuked space post state, and
+queued action-surface state are not acceptable.
+
+The space discovery smoke does not test the real mark-space UI path. It seeds
+asset/target classifications directly into `mbSpaceRegistry`, then verifies
+that discovery and display paths work without creating queue authority. A future
+UI-path space-mark smoke should be a separate phase because persistent
+`mbSpaceRegistry` mutation would be the behavior under test, not incidental
+setup.
 
 Space discovery:
 
