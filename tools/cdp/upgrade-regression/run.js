@@ -1010,10 +1010,18 @@ async function inspectDiscoveryPage(target) {
         const toolbar = document.querySelector('.mb-ext_profile-search-toolbar')
         const batchButton = document.querySelector('.mb-ext_profile-search-batch-btn')
         const statusButton = document.querySelector('.mb-ext_space-feed-status-btn')
+        const batchText = `${batchButton?.innerText || batchButton?.textContent || ''}`.replace(/\s+/g, ' ').trim()
+        const batchMatch = batchText.match(/\b(\d+)\b/)
+        const profileSearchBatchCandidateCount = batchMatch ? Number.parseInt(batchMatch[1], 10) || 0 : 0
+        const profileSearchExtensionCandidateCount = Math.max(
+            profileSearchRows.length,
+            profileSearchButtons.length,
+            profileSearchBatchCandidateCount
+        )
         const discoveryCandidateCount = pageType === 'space'
             ? Math.max(spaceFeedCandidateHrefs.size, profileHrefs.length)
             : pageType === 'profile-search'
-                ? Math.max(profileSearchRows.length, profileSearchButtons.length, profileHrefs.length)
+                ? profileSearchExtensionCandidateCount
                 : profileHrefs.length
         return {
             url: location.href,
@@ -1029,7 +1037,9 @@ async function inspectDiscoveryPage(target) {
             profileSearchRowCount: profileSearchRows.length,
             profileSearchButtonCount: profileSearchButtons.length,
             profileSearchToolbarPresent: !!toolbar,
-            profileSearchBatchText: `${batchButton?.innerText || batchButton?.textContent || ''}`.replace(/\s+/g, ' ').trim(),
+            profileSearchBatchText: batchText,
+            profileSearchBatchCandidateCount,
+            profileSearchExtensionCandidateCount,
             spaceCategory: activeCategoryButton?.dataset?.category || '',
             spaceCategoryHostPresent: !!categoryHost,
             spaceFeedButtonCount: spaceFeedButtons.length,
@@ -1124,6 +1134,9 @@ async function inspectDiscoveryWithState(target, options, expectedPageType, fail
         url: pageState.url,
         pageType: pageState.pageType,
         profileHrefCount: pageState.profileHrefCount,
+        profileSearchButtonCount: pageState.profileSearchButtonCount,
+        profileSearchBatchCandidateCount: pageState.profileSearchBatchCandidateCount,
+        profileSearchExtensionCandidateCount: pageState.profileSearchExtensionCandidateCount,
         spaceFeedCandidateCount: pageState.spaceFeedCandidateCount,
         profileSearchRowCount: pageState.profileSearchRowCount
     })
