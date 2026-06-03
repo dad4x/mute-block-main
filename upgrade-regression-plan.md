@@ -197,6 +197,14 @@ work counts must not increase, and the discovery authority summary must remain
 empty for queue rows, WAL changes, profile progress rows, pending/nuked space
 post rows, and queued action-surface records.
 
+For profile-search pages, raw Quora profile links are reported but do not count
+as a passing discovery surface by themselves. The search smoke requires an
+extension-built actionable candidate surface: nonzero profile-search rows,
+profile-search row buttons, or a nonzero batch candidate count exposed by the
+extension UI. If the page has raw profile links but `Nuke 'Em 0`, the smoke
+should fail; that means the extension did not build a queueable search
+candidate set.
+
 Phase-specific baseline files are written under `tmp/upgrade-regression/` by
 default. Phase 3 baseline comparison keeps exact candidate counts in the full
 report but normalizes the strict comparable shape to stable facts such as
