@@ -220,9 +220,42 @@ candidate presence, page type, scoped state, category classification, and zero
 queue/progress rows. A Phase 3 baseline should be labeled as warmed unless it
 is captured from a recreated store `1.4.186` profile immediately after upgrade.
 
-## Later Phases
+## Phase 4 UI Space-Mark Smoke
 
-Later phases should cover one controlled item and then a small batch. Those
-phases intentionally create queue authority and should not be mixed with the
-discovery-only contract. None of those phases should reintroduce legacy
-full-progress storage, legacy import, or repair-style compatibility behavior.
+Phase 4 remains non-work-starting. It exercises the real space asset/target UI
+path instead of seeding `mbSpaceRegistry` directly. The only intended persistent
+mutation is `mbSpaceRegistry`.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase4 \
+  --phase phase4-space-mark-ui-smoke \
+  --space-mark-url https://instantblock.quora.com/ \
+  --space-mark-category asset
+```
+
+The smoke opens the space page, clicks the real category controls, observes a
+temporary category, clicks the desired category, reloads the page, and verifies
+that the desired category display persists. It must not click queue/start,
+profile mark, nuke, mute, block, pause, cancel, clear-profile, or post-action
+controls.
+
+Forbidden side effects are unchanged from Phase 3: no coordinator queue rows,
+no queue view rows, no WAL changes, no profile progress rows, no pending/nuked
+space post records, no queued action-surface records, no profile marks, no full
+legacy `mbProfileNukeProgress` key, and no legacy runtime actions.
+
+Keep seeded Phase 3 as a separate discovery suite. Do not replace it with this
+UI-path smoke; the two phases prove different boundaries.
+
+## Queue-Authority Phases
+
+Queue-authority phases are a separate class of regression test. One controlled
+item and small-batch tests intentionally create queue authority and profile
+state, so they should run only in a disposable profile. Do not run them as the
+immediate next step while validating the non-work-starting suite.
+
+Those later phases must still preserve the architecture boundary: WAL-backed
+queue authority only, no legacy full-progress storage, no legacy import, and no
+repair-style compatibility behavior.

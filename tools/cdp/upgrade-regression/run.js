@@ -20,6 +20,7 @@ const PHASE1 = 'phase1-non-work-starting-smoke'
 const PHASE2 = 'phase2-content-smoke'
 const PHASE3_SPACE = 'phase3-space-discovery-smoke'
 const PHASE3_SEARCH = 'phase3-search-discovery-smoke'
+const PHASE4_SPACE_MARK = 'phase4-space-mark-ui-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
 const SPACE_ASSET_URLS = [
     'https://theqdefensecrew.quora.com/',
@@ -30,7 +31,9 @@ const SPACE_TARGET_URLS = [
     'https://jonspoliticalcorner29.quora.com/'
 ]
 const DEFAULT_SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
-const SUPPORTED_PHASES = [PHASE1, PHASE2, PHASE3_SPACE, PHASE3_SEARCH]
+const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
+const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
+const SUPPORTED_PHASES = [PHASE1, PHASE2, PHASE3_SPACE, PHASE3_SEARCH, PHASE4_SPACE_MARK]
 
 const LEGACY_ACTIONS = [
     'record-nuke-progress',
@@ -112,6 +115,8 @@ function parseArgs(argv) {
         phase: PHASE1,
         quoraUrl: '',
         searchUrl: DEFAULT_SEARCH_URL,
+        spaceMarkUrl: DEFAULT_SPACE_MARK_URL,
+        spaceMarkCategory: DEFAULT_SPACE_MARK_CATEGORY,
         spaceAssetUrls: SPACE_ASSET_URLS.slice(),
         spaceTargetUrls: SPACE_TARGET_URLS.slice(),
         verbose: false
@@ -153,6 +158,10 @@ function parseArgs(argv) {
         else if(arg.startsWith('--quora-url=')) options.quoraUrl = arg.slice('--quora-url='.length)
         else if(arg === '--search-url') options.searchUrl = readValue(options.searchUrl)
         else if(arg.startsWith('--search-url=')) options.searchUrl = arg.slice('--search-url='.length)
+        else if(arg === '--space-mark-url') options.spaceMarkUrl = readValue(options.spaceMarkUrl)
+        else if(arg.startsWith('--space-mark-url=')) options.spaceMarkUrl = arg.slice('--space-mark-url='.length)
+        else if(arg === '--space-mark-category') options.spaceMarkCategory = readValue(options.spaceMarkCategory)
+        else if(arg.startsWith('--space-mark-category=')) options.spaceMarkCategory = arg.slice('--space-mark-category='.length)
         else if(arg === '--space-asset-url') options.spaceAssetUrls.push(readValue(''))
         else if(arg.startsWith('--space-asset-url=')) options.spaceAssetUrls.push(arg.slice('--space-asset-url='.length))
         else if(arg === '--space-target-url') options.spaceTargetUrls.push(readValue(''))
@@ -171,6 +180,9 @@ function parseArgs(argv) {
     }
     options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
     options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
+    if(!['asset', 'neutral', 'target'].includes(options.spaceMarkCategory)) {
+        throw new Error('--space-mark-category must be one of asset, neutral, target')
+    }
     if(options.writeBaseline === true) options.writeBaseline = defaultBaselinePath(options.profileLabel, options.phase)
     if(options.compareBaseline === true || options.compareBaseline === '') {
         if(argv.includes('--compare-baseline')) throw new Error('--compare-baseline requires a path')
@@ -190,6 +202,8 @@ function printUsage() {
         `  --phase ${SUPPORTED_PHASES.join('|')}`,
         '  --quora-url https://www.quora.com/',
         `  --search-url ${DEFAULT_SEARCH_URL}`,
+        `  --space-mark-url ${DEFAULT_SPACE_MARK_URL}`,
+        `  --space-mark-category ${DEFAULT_SPACE_MARK_CATEGORY}`,
         '  --space-asset-url https://theqdefensecrew.quora.com/',
         '  --space-target-url https://terryspcfreetopics.quora.com/',
         '  --write-baseline [path]',
@@ -359,12 +373,16 @@ function isAllowedStorageKey(key) {
 function isAllowedAddedStorageKey(key, phase = PHASE1) {
     if(ALLOWED_ADDED_STORAGE_KEYS.has(key)) return true
     if(phase === PHASE2) return ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
-    if(isDiscoveryPhase(phase)) return ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
+    if(isNonWorkSpaceRegistryPhase(phase)) return ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     return false
 }
 
 function isDiscoveryPhase(phase = '') {
     return phase === PHASE3_SPACE || phase === PHASE3_SEARCH
+}
+
+function isNonWorkSpaceRegistryPhase(phase = '') {
+    return isDiscoveryPhase(phase) || phase === PHASE4_SPACE_MARK
 }
 
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
@@ -393,7 +411,7 @@ function allowedAddedStorageKeySummary(phase = PHASE1) {
             patterns: ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
         }
     }
-    if(isDiscoveryPhase(phase)) {
+    if(isNonWorkSpaceRegistryPhase(phase)) {
         return {
             literal,
             patterns: ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
@@ -483,7 +501,7 @@ function summarizeAuthorityState(storage) {
 }
 
 function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
-    const changed = (name, details = {}) => fail(`discovery smoke created ${name}`, details)
+    const changed = (name, details = {}) => fail(`non-work-starting smoke created ${name}`, details)
     if(after.work.rawQueueRows !== before.work.rawQueueRows || after.work.rawQueueRows !== 0) {
         changed('coordinator queue rows', {before: before.work.rawQueueRows, after: after.work.rawQueueRows})
     }
@@ -554,6 +572,7 @@ function comparableReport(report) {
         reconcileDisplayOnly: report.reconcileDisplayOnly,
         contentSmoke: comparableContentSmoke(report.contentSmoke),
         discoverySmoke: comparableDiscoverySmoke(report.discoverySmoke),
+        ...(report.spaceMarkSmoke ? {spaceMarkSmoke: comparableSpaceMarkSmoke(report.spaceMarkSmoke)} : {}),
         workStateAfter: report.workStateAfter
     }
 }
@@ -599,6 +618,23 @@ function comparableDiscoverySmoke(discoverySmoke = null) {
             queueRows: Number(page.coordinatorState?.queueRows || 0) || 0,
             progressRows: Number(page.coordinatorState?.progressRows || 0) || 0
         }))
+    }
+}
+
+function comparableSpaceMarkSmoke(spaceMarkSmoke = null) {
+    if(!spaceMarkSmoke) return null
+    return {
+        kind: spaceMarkSmoke.kind || '',
+        url: normalizeComparableUrl(spaceMarkSmoke.url || ''),
+        desiredCategory: spaceMarkSmoke.desiredCategory || '',
+        temporaryCategory: spaceMarkSmoke.temporaryCategory || '',
+        beforeCategory: spaceMarkSmoke.before?.page?.spaceCategory || '',
+        temporaryObservedCategory: spaceMarkSmoke.temporary?.page?.spaceCategory || '',
+        finalObservedCategory: spaceMarkSmoke.final?.page?.spaceCategory || '',
+        reloadedObservedCategory: spaceMarkSmoke.reloaded?.page?.spaceCategory || '',
+        contentReadyAfterReload: !!spaceMarkSmoke.reloaded?.page?.contentReady,
+        queueRowsAfterReload: Number(spaceMarkSmoke.reloaded?.coordinatorState?.queueRows || 0) || 0,
+        progressRowsAfterReload: Number(spaceMarkSmoke.reloaded?.coordinatorState?.progressRows || 0) || 0
     }
 }
 
@@ -1111,7 +1147,7 @@ async function runContentSmoke(config, options, warnings, fail) {
     }
 }
 
-async function inspectDiscoveryWithState(target, options, expectedPageType, fail) {
+async function inspectDiscoveryWithState(target, options, expectedPageType, fail, requireCandidates = true) {
     let pageState = await inspectDiscoveryPage(target)
     for(let attempt = 0; attempt < 4 && (!pageState.contentReady || pageState.discoveryCandidateCount <= 0); attempt += 1) {
         await evaluate(target.webSocketDebuggerUrl, `(${function nudgeDiscovery() {
@@ -1130,7 +1166,7 @@ async function inspectDiscoveryWithState(target, options, expectedPageType, fail
         actual: pageState.pageType,
         url: pageState.url
     })
-    if(pageState.discoveryCandidateCount <= 0) fail('discovery page has no visible candidates', {
+    if(requireCandidates && pageState.discoveryCandidateCount <= 0) fail('discovery page has no visible candidates', {
         url: pageState.url,
         pageType: pageState.pageType,
         profileHrefCount: pageState.profileHrefCount,
@@ -1200,6 +1236,97 @@ async function runSearchDiscoverySmoke(config, options, warnings, fail) {
     }
 }
 
+async function clickSpaceCategory(target, category) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function clickCategory(nextCategory) {
+        const categoriesBeforeClick = Array.from(document.querySelectorAll('.mb-ext_space-category-btn'))
+            .map(candidate => ({
+                category: candidate.dataset.category || '',
+                active: candidate.dataset.active || '',
+                text: `${candidate.innerText || candidate.textContent || ''}`.replace(/\s+/g, ' ').trim()
+            }))
+        const button = document.querySelector(`.mb-ext_space-category-btn[data-category="${nextCategory}"]`)
+        if(!button) {
+            return {
+                clicked: false,
+                reason: 'button-not-found',
+                categoriesBeforeClick
+            }
+        }
+        button.click()
+        return {
+            clicked: true,
+            category: button.dataset.category || '',
+            text: `${button.innerText || button.textContent || ''}`.replace(/\s+/g, ' ').trim(),
+            categoriesBeforeClick
+        }
+    }})(${JSON.stringify(category)})`, 10000)
+}
+
+async function waitForSpaceCategory(target, options, category, fail, label) {
+    let page = await inspectDiscoveryWithState(target, options, 'space', fail, false)
+    for(let attempt = 0; attempt < 10 && page.page.spaceCategory !== category; attempt += 1) {
+        await sleep(400)
+        page = await inspectDiscoveryWithState(target, options, 'space', fail, false)
+    }
+    if(page.page.spaceCategory !== category) {
+        fail(`space mark UI did not persist ${label} category`, {
+            expected: category,
+            actual: page.page.spaceCategory,
+            url: page.page.url,
+            spaceCategoryHostPresent: page.page.spaceCategoryHostPresent
+        })
+    }
+    return page
+}
+
+async function reloadPageTarget(target) {
+    await cdpCommand(target.webSocketDebuggerUrl, 'Page.reload', {ignoreCache: true}, 10000)
+    await sleep(4500)
+}
+
+async function runSpaceMarkUiSmoke(config, options, warnings, fail) {
+    const desiredCategory = options.spaceMarkCategory
+    const temporaryCategory = desiredCategory === 'neutral' ? 'asset' : 'neutral'
+    const target = await findOrOpenPage(config, options.spaceMarkUrl, warnings, 'phase 4 space mark UI')
+    const before = await inspectDiscoveryWithState(target, options, 'space', fail, false)
+
+    if(!before.page.spaceCategoryHostPresent) {
+        fail('space mark UI category host is missing', {
+            url: before.page.url,
+            contentReady: before.page.contentReady,
+            pageType: before.page.pageType
+        })
+    }
+
+    const temporaryClick = await clickSpaceCategory(target, temporaryCategory)
+    if(temporaryClick?.clicked !== true) {
+        fail('space mark UI temporary category click failed', temporaryClick)
+    }
+    const temporary = await waitForSpaceCategory(target, options, temporaryCategory, fail, 'temporary')
+
+    const finalClick = await clickSpaceCategory(target, desiredCategory)
+    if(finalClick?.clicked !== true) {
+        fail('space mark UI final category click failed', finalClick)
+    }
+    const final = await waitForSpaceCategory(target, options, desiredCategory, fail, 'final')
+
+    await reloadPageTarget(target)
+    const reloaded = await waitForSpaceCategory(target, options, desiredCategory, fail, 'reloaded')
+
+    return {
+        kind: PHASE4_SPACE_MARK,
+        url: reloaded.page.url || options.spaceMarkUrl,
+        desiredCategory,
+        temporaryCategory,
+        before,
+        temporaryClick,
+        temporary,
+        finalClick,
+        final,
+        reloaded
+    }
+}
+
 function writeJson(pathname, value) {
     fs.mkdirSync(path.dirname(pathname), {recursive: true})
     fs.writeFileSync(pathname, `${JSON.stringify(value, null, 2)}\n`)
@@ -1256,6 +1383,7 @@ runMain(async () => {
 
     let contentSmoke = null
     let discoverySmoke = null
+    let spaceMarkSmoke = null
     if(options.phase === PHASE2) {
         contentSmoke = await runContentSmoke(config, options, warnings, fail)
         await sleep(500)
@@ -1266,6 +1394,10 @@ runMain(async () => {
     }
     else if(options.phase === PHASE3_SEARCH) {
         discoverySmoke = await runSearchDiscoverySmoke(config, options, warnings, fail)
+        await sleep(500)
+    }
+    else if(options.phase === PHASE4_SPACE_MARK) {
+        spaceMarkSmoke = await runSpaceMarkUiSmoke(config, options, warnings, fail)
         await sleep(500)
     }
 
@@ -1317,7 +1449,7 @@ runMain(async () => {
             after: workStateAfter
         })
     }
-    if(isDiscoveryPhase(options.phase)) {
+    if(isNonWorkSpaceRegistryPhase(options.phase)) {
         assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
     }
 
@@ -1355,6 +1487,7 @@ runMain(async () => {
         currentActions: currentActionSummary,
         contentSmoke,
         discoverySmoke,
+        spaceMarkSmoke,
         workStateBefore,
         workStateAfter,
         authorityStateBefore,
