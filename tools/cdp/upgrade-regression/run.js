@@ -21,6 +21,7 @@ const PHASE2 = 'phase2-content-smoke'
 const PHASE3_SPACE = 'phase3-space-discovery-smoke'
 const PHASE3_SEARCH = 'phase3-search-discovery-smoke'
 const PHASE4_SPACE_MARK = 'phase4-space-mark-ui-smoke'
+const PHASE5_DASHBOARD_AUTHORITY = 'phase5-dashboard-readonly-authority-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
 const SPACE_ASSET_URLS = [
     'https://theqdefensecrew.quora.com/',
@@ -33,7 +34,14 @@ const SPACE_TARGET_URLS = [
 const DEFAULT_SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
 const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
-const SUPPORTED_PHASES = [PHASE1, PHASE2, PHASE3_SPACE, PHASE3_SEARCH, PHASE4_SPACE_MARK]
+const SUPPORTED_PHASES = [
+    PHASE1,
+    PHASE2,
+    PHASE3_SPACE,
+    PHASE3_SEARCH,
+    PHASE4_SPACE_MARK,
+    PHASE5_DASHBOARD_AUTHORITY
+]
 
 const LEGACY_ACTIONS = [
     'record-nuke-progress',
@@ -76,10 +84,34 @@ const FORBIDDEN_STORAGE_KEY_PATTERNS = [
     /record-nuke-progress-batch/,
     /legacyImport/,
     /importLegacy/,
+    /repair-/,
     /repair-coordinator-storage/,
     /mb-stored-work-repair/,
     /skipRepair/,
     /projectionRepairDelayMs/
+]
+
+const FORBIDDEN_DASHBOARD_MESSAGE_ACTION_PATTERNS = [
+    /^resume-coordinator-queue$/,
+    /^enqueue-coordinator-items$/,
+    /^claim-tab-action$/,
+    /^resolve-queued-profile-target/,
+    /^promote-queued-tab$/,
+    /^begin-profile-action$/,
+    /action-lease$/,
+    /^release-job-tab$/,
+    /^record-job-/,
+    /^settle-terminal-coordinator-items$/,
+    /^pause-/,
+    /^cancel-/,
+    /^retry-/,
+    /^requeue-/,
+    /^reset-/,
+    /^clear-profile-/,
+    /^remove-pending-/,
+    /^confirm-space-/,
+    /^sweep-/,
+    /^create-tab$/
 ]
 
 const ALLOWED_ADDED_STORAGE_KEYS = new Set([
@@ -283,11 +315,29 @@ async function ensureExtensionContext(config, warnings) {
     const extensionPrefix = `chrome-extension://${config.extensionId}/`
     const dashboardUrl = `${extensionPrefix}coordinator.html`
     let targets = await getTargets(config)
-    let target = targets.find(item => item.type === 'page' && item.url === dashboardUrl) ||
-        targets.find(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix)) ||
-        targets.find(item => item.type === 'service_worker' && (item.url || '').startsWith(extensionPrefix))
+    const candidates = [
+        ...targets.filter(item => item.type === 'page' && item.url === dashboardUrl),
+        ...targets.filter(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix) && item.url !== dashboardUrl),
+        ...targets.filter(item => item.type === 'service_worker' && (item.url || '').startsWith(extensionPrefix))
+    ]
 
-    if(target) return target
+    for(const candidate of candidates) {
+        const availability = await inspectExtensionApiAvailability(candidate).catch(error => ({
+            storage: false,
+            runtime: false,
+            error: error?.message || `${error || ''}`
+        }))
+        if(availability.storage && availability.runtime) return candidate
+        warnings.push({
+            message: 'skipped extension target without runtime/storage APIs',
+            target: {
+                id: candidate.id,
+                type: candidate.type || '',
+                url: candidate.url || ''
+            },
+            availability
+        })
+    }
 
     const versionInfo = await getJson('/json/version', config)
     await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
@@ -298,11 +348,102 @@ async function ensureExtensionContext(config, warnings) {
     await sleep(1000)
 
     targets = await getTargets(config)
-    target = targets.find(item => item.type === 'page' && item.url === dashboardUrl) ||
+    const target = targets.find(item => item.type === 'page' && item.url === dashboardUrl) ||
         targets.find(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix)) ||
         targets.find(item => item.type === 'service_worker' && (item.url || '').startsWith(extensionPrefix))
     if(!target) throw new Error(`extension context not found for ${config.extensionId}`)
+    const availability = await inspectExtensionApiAvailability(target).catch(error => ({
+        storage: false,
+        runtime: false,
+        error: error?.message || `${error || ''}`
+    }))
+    if(!availability.storage || !availability.runtime) {
+        throw new Error(`extension context lacks runtime/storage APIs: ${JSON.stringify({
+            target: {id: target.id, type: target.type || '', url: target.url || ''},
+            availability
+        })}`)
+    }
     return target
+}
+
+async function inspectExtensionApiAvailability(target) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function inspectApis() {
+        return {
+            href: `${globalThis.location?.href || ''}`,
+            title: `${globalThis.document?.title || ''}`,
+            bodyText: `${globalThis.document?.body?.innerText || ''}`.slice(0, 200),
+            runtime: typeof globalThis.chrome?.runtime?.sendMessage === 'function',
+            storage: typeof globalThis.chrome?.storage?.local?.get === 'function'
+        }
+    }})()`, 5000)
+}
+
+async function ensureDashboardPage(config, warnings) {
+    const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
+    let targets = await getTargets(config)
+    let target = targets.find(item => item.type === 'page' && item.url === dashboardUrl)
+    if(target && await isDashboardDocument(target).catch(() => false)) return target
+
+    const versionInfo = await getJson('/json/version', config)
+    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url: dashboardUrl,
+        background: true
+    }, 10000)
+    warnings.push('opened coordinator.html for dashboard authority smoke')
+    await sleep(1000)
+
+    targets = await getTargets(config)
+    target = targets.find(item => item.type === 'page' && item.url === dashboardUrl && item.id !== target?.id) ||
+        targets.find(item => item.type === 'page' && item.url === dashboardUrl)
+    if(!target) throw new Error('coordinator.html target not found')
+    return target
+}
+
+async function isDashboardDocument(target) {
+    const info = await evaluate(target.webSocketDebuggerUrl, `(${function inspectDashboardDocument() {
+        return {
+            title: `${document.title || ''}`,
+            hasCoordinator: !!document.querySelector('main.coordinator'),
+            blockedByClient: /ERR_BLOCKED_BY_CLIENT|blocked by Chrome|is blocked/i.test(`${document.body?.innerText || ''}`)
+        }
+    }})()`, 5000)
+    return info.hasCoordinator && !info.blockedByClient
+}
+
+async function installDashboardMessageProbe(target) {
+    await cdpCommand(target.webSocketDebuggerUrl, 'Page.addScriptToEvaluateOnNewDocument', {
+        source: `(${function installMessageProbe() {
+            const install = () => {
+                globalThis.__mbUpgradeRegressionMessages = globalThis.__mbUpgradeRegressionMessages || []
+                const runtime = globalThis.chrome?.runtime
+                if(!runtime || typeof runtime.sendMessage !== 'function') return false
+                if(runtime.sendMessage.__mbUpgradeRegressionWrapped) return true
+
+                const originalSendMessage = runtime.sendMessage.bind(runtime)
+                const wrappedSendMessage = function wrappedSendMessage(...args) {
+                    const payload = args.find(arg => arg && typeof arg === 'object' && !Array.isArray(arg)) || null
+                    globalThis.__mbUpgradeRegressionMessages.push({
+                        action: `${payload?.action || ''}`,
+                        reason: `${payload?.reason || ''}`,
+                        userInitiated: payload?.userInitiated === true,
+                        allowBeforeQuora: payload?.allowBeforeQuora === true,
+                        at: Date.now()
+                    })
+                    return originalSendMessage(...args)
+                }
+                wrappedSendMessage.__mbUpgradeRegressionWrapped = true
+                runtime.sendMessage = wrappedSendMessage
+                return true
+            }
+
+            if(install()) return
+            let attempts = 0
+            const timer = setInterval(() => {
+                attempts += 1
+                if(install() || attempts > 50) clearInterval(timer)
+            }, 20)
+        }})()`
+    }, 10000)
 }
 
 async function sendRuntimeMessage(target, payload, timeoutMs = 10000) {
@@ -336,13 +477,79 @@ async function sendRuntimeMessage(target, payload, timeoutMs = 10000) {
 async function readStorage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
-            chrome.storage.local.get(null, data => {
-                const keys = Object.keys(data || {}).sort()
-                resolve({
-                    keys,
-                    data: data || {}
-                })
-            })
+            let settled = false
+            const finish = value => {
+                if(settled) return
+                settled = true
+                resolve(value)
+            }
+            let attempts = 0
+            const tryRead = () => {
+                attempts += 1
+                const localStorage = globalThis.chrome?.storage?.local
+                if(typeof localStorage?.get !== 'function') {
+                    if(attempts < 20) {
+                        setTimeout(tryRead, 100)
+                        return
+                    }
+                    finish({
+                        keys: [],
+                        data: {},
+                        available: false,
+                        error: 'chrome.storage.local unavailable in target context'
+                    })
+                    return
+                }
+
+                const complete = (data = {}) => {
+                    const safeData = data && typeof data === 'object' ? data : {}
+                    finish({
+                        keys: Object.keys(safeData).sort(),
+                        data: safeData,
+                        available: true
+                    })
+                }
+
+                const callbackTimer = setTimeout(() => finish({
+                    keys: [],
+                    data: {},
+                    available: false,
+                    error: 'chrome.storage.local.get did not return'
+                }), 3000)
+
+                try {
+                    const maybePromise = localStorage.get.call(localStorage, null, data => {
+                        clearTimeout(callbackTimer)
+                        complete(data)
+                    })
+                    if(maybePromise && typeof maybePromise.then === 'function') {
+                        maybePromise
+                            .then(data => {
+                                clearTimeout(callbackTimer)
+                                complete(data)
+                            })
+                            .catch(error => {
+                                clearTimeout(callbackTimer)
+                                finish({
+                                    keys: [],
+                                    data: {},
+                                    available: false,
+                                    error: error?.message || `${error || ''}`
+                                })
+                            })
+                    }
+                }
+                catch(error) {
+                    clearTimeout(callbackTimer)
+                    finish({
+                        keys: [],
+                        data: {},
+                        available: false,
+                        error: error?.message || `${error || ''}`
+                    })
+                }
+            }
+            tryRead()
         })
     }})()`, 15000)
 }
@@ -462,6 +669,15 @@ function summarizeWorkState(storage) {
     }
 }
 
+function failIfStorageUnavailable(storage, fail, label) {
+    if(storage?.available === false) {
+        fail(`${label} storage context did not expose chrome.storage.local`, {
+            error: storage.error || '',
+            keys: storage.keys || []
+        })
+    }
+}
+
 function stableJson(value) {
     if(value === null || typeof value !== 'object') return JSON.stringify(value)
     if(Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
@@ -498,6 +714,48 @@ function summarizeAuthorityState(storage) {
         nukedSpacePostRecords: countRecordMap(data.mbSpaceNukedPosts),
         queuedActionSurfaceRecords: countRecordMap(queuedActionSurfaceState)
     }
+}
+
+function summarizeDashboardAuthoritySources(storage) {
+    const data = storage?.data || {}
+    const queueView = data.mbCoordinatorQueueView && typeof data.mbCoordinatorQueueView === 'object'
+        ? data.mbCoordinatorQueueView
+        : {}
+    const metricsView = data.mbQueueWakeupMetricsView && typeof data.mbQueueWakeupMetricsView === 'object'
+        ? data.mbQueueWakeupMetricsView
+        : {}
+    const rawQueue = data.mbCoordinatorQueue && typeof data.mbCoordinatorQueue === 'object'
+        ? data.mbCoordinatorQueue
+        : {}
+
+    return {
+        compactQueueViewPresent: hasCompactQueueViewShape(queueView),
+        compactQueueViewVersion: Number.parseInt(queueView.version, 10) || 0,
+        compactQueueViewRows: Array.isArray(queueView.items) ? queueView.items.length : 0,
+        compactQueueViewTotal: Number.parseInt(queueView.total, 10) || 0,
+        compactMetricsViewPresent: hasCompactMetricsViewShape(metricsView),
+        compactMetricsViewVersion: Number.parseInt(metricsView.version, 10) || 0,
+        compactMetricsViewEpochPresent: !!metricsView.currentEpoch,
+        rawQueueRows: Object.keys(rawQueue).length,
+        fullLegacyProgressPresent: Object.prototype.hasOwnProperty.call(data, 'mbProfileNukeProgress')
+    }
+}
+
+function hasCompactQueueViewShape(value = {}) {
+    return !!value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Number.parseInt(value.version, 10) >= 1 &&
+        Array.isArray(value.items)
+}
+
+function hasCompactMetricsViewShape(value = {}) {
+    return !!value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Number.parseInt(value.version, 10) >= 1 &&
+        Number.parseInt(value.viewVersion, 10) >= 1 &&
+        !!value.currentEpoch
 }
 
 function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
@@ -573,6 +831,9 @@ function comparableReport(report) {
         contentSmoke: comparableContentSmoke(report.contentSmoke),
         discoverySmoke: comparableDiscoverySmoke(report.discoverySmoke),
         ...(report.spaceMarkSmoke ? {spaceMarkSmoke: comparableSpaceMarkSmoke(report.spaceMarkSmoke)} : {}),
+        ...(report.dashboardAuthoritySmoke
+            ? {dashboardAuthoritySmoke: comparableDashboardAuthoritySmoke(report.dashboardAuthoritySmoke)}
+            : {}),
         workStateAfter: report.workStateAfter
     }
 }
@@ -635,6 +896,33 @@ function comparableSpaceMarkSmoke(spaceMarkSmoke = null) {
         contentReadyAfterReload: !!spaceMarkSmoke.reloaded?.page?.contentReady,
         queueRowsAfterReload: Number(spaceMarkSmoke.reloaded?.coordinatorState?.queueRows || 0) || 0,
         progressRowsAfterReload: Number(spaceMarkSmoke.reloaded?.coordinatorState?.progressRows || 0) || 0
+    }
+}
+
+function comparableDashboardAuthoritySmoke(dashboardAuthoritySmoke = null) {
+    if(!dashboardAuthoritySmoke) return null
+    const dashboard = dashboardAuthoritySmoke.dashboard || {}
+    const authoritySources = dashboardAuthoritySmoke.authoritySources || {}
+    return {
+        kind: dashboardAuthoritySmoke.kind || '',
+        dashboardReady: dashboard.ready === true,
+        appVersion: dashboard.appVersion || '',
+        refreshState: dashboard.refreshState || '',
+        currentWorkSummary: dashboard.currentWorkSummary || '',
+        queuedCount: Number(dashboard.queuedCount || 0) || 0,
+        activeCount: Number(dashboard.activeCount || 0) || 0,
+        terminalCount: Number(dashboard.terminalCount || 0) || 0,
+        eventCount: Number(dashboard.eventCount || 0) || 0,
+        queueListRows: Number(dashboard.queueListRows || 0) || 0,
+        metricsGridItems: Number(dashboard.metricsGridItems || 0) || 0,
+        compactQueueViewPresent: authoritySources.compactQueueViewPresent === true,
+        compactMetricsViewPresent: authoritySources.compactMetricsViewPresent === true,
+        fullLegacyProgressPresent: authoritySources.fullLegacyProgressPresent === true,
+        capturedActions: (dashboardAuthoritySmoke.capturedActions || []).slice().sort(),
+        forbiddenCapturedActions: (dashboardAuthoritySmoke.forbiddenCapturedActions || []).slice().sort(),
+        queueRowsAfter: Number(dashboardAuthoritySmoke.workStateAfter?.rawQueueRows || 0) || 0,
+        activeLikeAfter: Number(dashboardAuthoritySmoke.workStateAfter?.rawActiveLike || 0) || 0,
+        queuedLikeAfter: Number(dashboardAuthoritySmoke.workStateAfter?.rawQueuedLike || 0) || 0
     }
 }
 
@@ -1327,6 +1615,115 @@ async function runSpaceMarkUiSmoke(config, options, warnings, fail) {
     }
 }
 
+async function inspectDashboardPage(target) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function inspectDashboard() {
+        const text = id => `${document.getElementById(id)?.textContent || ''}`.replace(/\s+/g, ' ').trim()
+        const numericText = id => {
+            const value = Number.parseInt(text(id), 10)
+            return Number.isFinite(value) ? value : 0
+        }
+        const actions = (globalThis.__mbUpgradeRegressionMessages || [])
+            .filter(entry => entry && typeof entry === 'object')
+            .map(entry => ({
+                action: `${entry.action || ''}`,
+                reason: `${entry.reason || ''}`,
+                userInitiated: entry.userInitiated === true,
+                allowBeforeQuora: entry.allowBeforeQuora === true
+            }))
+
+        return {
+            url: location.href,
+            title: document.title,
+            ready: text('appVersion') !== 'v0.0.0' && text('refreshState') !== 'Loading',
+            appVersion: text('appVersion'),
+            refreshState: text('refreshState'),
+            pauseState: text('pauseCurrentWorkState'),
+            currentWorkSummary: text('currentWorkReadyCount'),
+            queueCount: text('queueCount'),
+            queuedCount: numericText('queuedCount'),
+            activeCount: numericText('activeCount'),
+            terminalCount: numericText('terminalCount'),
+            eventCount: numericText('eventCount'),
+            runCount: text('runCount'),
+            metricsUpdated: text('metricsUpdated'),
+            queueListRows: document.querySelectorAll('#queueList > *').length,
+            metricsGridItems: document.querySelectorAll('#metricsGrid > *').length,
+            metricsJournalRows: document.querySelectorAll('#metricsJournal > *').length,
+            runListRows: document.querySelectorAll('#runList > *').length,
+            eventListRows: document.querySelectorAll('#eventList > *').length,
+            startButtonHidden: document.getElementById('startCoordinatorButton')?.hidden === true,
+            messageActions: actions
+        }
+    }})()`, 10000)
+}
+
+async function waitForDashboardReady(target, fail) {
+    let dashboard = await inspectDashboardPage(target)
+    for(let attempt = 0; attempt < 15 && !dashboard.ready; attempt += 1) {
+        await sleep(400)
+        dashboard = await inspectDashboardPage(target)
+    }
+    if(!dashboard.ready) {
+        fail('dashboard did not render current authority state', dashboard)
+    }
+    return dashboard
+}
+
+async function runDashboardAuthoritySmoke(config, options, context, storageBefore, workStateBefore, warnings, fail) {
+    const dashboardTarget = await ensureDashboardPage(config, warnings)
+    await installDashboardMessageProbe(dashboardTarget)
+    await reloadPageTarget(dashboardTarget)
+    const dashboard = await waitForDashboardReady(dashboardTarget, fail)
+    const storageAfterDashboard = await readStorage(context)
+    failIfStorageUnavailable(storageAfterDashboard, fail, 'dashboard-smoke')
+    const workStateAfterDashboard = summarizeWorkState(storageAfterDashboard)
+    const authoritySources = summarizeDashboardAuthoritySources(storageAfterDashboard)
+    const capturedActions = dashboard.messageActions.map(entry => entry.action).filter(Boolean)
+    const forbiddenCapturedActions = capturedActions.filter(action =>
+        FORBIDDEN_DASHBOARD_MESSAGE_ACTION_PATTERNS.some(pattern => pattern.test(action)))
+
+    if(forbiddenCapturedActions.length) {
+        fail('dashboard sent queue-starting or profile-mutating runtime actions', {
+            forbiddenCapturedActions,
+            messageActions: dashboard.messageActions
+        })
+    }
+    if(!authoritySources.compactQueueViewPresent) {
+        fail('dashboard authority smoke did not have compact coordinator queue view', authoritySources)
+    }
+    if(!authoritySources.compactMetricsViewPresent) {
+        fail('dashboard authority smoke did not have compact wakeup metrics view', authoritySources)
+    }
+    if(authoritySources.fullLegacyProgressPresent) {
+        fail('dashboard authority smoke revived full legacy progress storage', authoritySources)
+    }
+    if(workStateAfterDashboard.rawActiveLike > workStateBefore.rawActiveLike ||
+            workStateAfterDashboard.rawQueuedLike > workStateBefore.rawQueuedLike ||
+            workStateAfterDashboard.viewActiveLike > workStateBefore.viewActiveLike ||
+            workStateAfterDashboard.viewQueuedLike > workStateBefore.viewQueuedLike) {
+        fail('dashboard authority smoke started or queued work', {
+            before: workStateBefore,
+            after: workStateAfterDashboard
+        })
+    }
+
+    return {
+        kind: PHASE5_DASHBOARD_AUTHORITY,
+        target: {
+            id: dashboardTarget.id,
+            type: dashboardTarget.type || '',
+            url: dashboardTarget.url || ''
+        },
+        dashboard,
+        capturedActions,
+        forbiddenCapturedActions,
+        authoritySources,
+        storageKeysAfterDashboard: storageAfterDashboard.keys,
+        workStateBefore,
+        workStateAfter: workStateAfterDashboard
+    }
+}
+
 function writeJson(pathname, value) {
     fs.mkdirSync(path.dirname(pathname), {recursive: true})
     fs.writeFileSync(pathname, `${JSON.stringify(value, null, 2)}\n`)
@@ -1353,9 +1750,55 @@ runMain(async () => {
     const extensionsPage = await ensureExtensionsPage(config, warnings)
     const extensionBefore = await getExtensionInfo(extensionsPage, options.extensionId)
     validateExtensionInfo(extensionBefore, options, expectedVersion, fail)
+    if(!extensionBefore) {
+        const report = {
+            pass: false,
+            phase: options.phase,
+            profileLabel: options.profileLabel,
+            generatedAt: new Date().toISOString(),
+            cdp: {
+                host: options.host,
+                port: options.port
+            },
+            extension: null,
+            extensionBefore: null,
+            expectedVersion,
+            storageKeys: [],
+            storageKeysBefore: [],
+            storageKeysAfter: [],
+            storageKeyDelta: {
+                before: [],
+                after: [],
+                added: [],
+                removed: [],
+                allowedAdded: [],
+                unexpectedAdded: []
+            },
+            allowedAddedStorageKeys: allowedAddedStorageKeySummary(options.phase),
+            alarms: [],
+            legacyActions: {},
+            reconcileDisplayOnly: null,
+            currentActions: {},
+            contentSmoke: null,
+            discoverySmoke: null,
+            spaceMarkSmoke: null,
+            dashboardAuthoritySmoke: null,
+            workStateBefore: null,
+            workStateAfter: null,
+            authorityStateBefore: null,
+            authorityStateAfter: null,
+            failures,
+            warnings
+        }
+        const comparable = comparableReport(report)
+        if(options.writeBaseline) writeJson(options.writeBaseline, {...report, comparable})
+        console.log(JSON.stringify(options.verbose ? {...report, comparable} : report, null, 2))
+        process.exit(1)
+    }
 
     const context = await ensureExtensionContext(config, warnings)
     const storageBefore = await readStorage(context)
+    failIfStorageUnavailable(storageBefore, fail, 'before-smoke')
     const workStateBefore = summarizeWorkState(storageBefore)
     const authorityStateBefore = summarizeAuthorityState(storageBefore)
 
@@ -1384,6 +1827,7 @@ runMain(async () => {
     let contentSmoke = null
     let discoverySmoke = null
     let spaceMarkSmoke = null
+    let dashboardAuthoritySmoke = null
     if(options.phase === PHASE2) {
         contentSmoke = await runContentSmoke(config, options, warnings, fail)
         await sleep(500)
@@ -1400,8 +1844,21 @@ runMain(async () => {
         spaceMarkSmoke = await runSpaceMarkUiSmoke(config, options, warnings, fail)
         await sleep(500)
     }
+    else if(options.phase === PHASE5_DASHBOARD_AUTHORITY) {
+        dashboardAuthoritySmoke = await runDashboardAuthoritySmoke(
+            config,
+            options,
+            context,
+            storageBefore,
+            workStateBefore,
+            warnings,
+            fail
+        )
+        await sleep(500)
+    }
 
     const storageAfter = await readStorage(context)
+    failIfStorageUnavailable(storageAfter, fail, 'after-smoke')
     const workStateAfter = summarizeWorkState(storageAfter)
     const authorityStateAfter = summarizeAuthorityState(storageAfter)
     const alarmsResult = await readAlarms(context)
@@ -1449,7 +1906,7 @@ runMain(async () => {
             after: workStateAfter
         })
     }
-    if(isNonWorkSpaceRegistryPhase(options.phase)) {
+    if(isNonWorkSpaceRegistryPhase(options.phase) || options.phase === PHASE5_DASHBOARD_AUTHORITY) {
         assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
     }
 
@@ -1488,6 +1945,7 @@ runMain(async () => {
         contentSmoke,
         discoverySmoke,
         spaceMarkSmoke,
+        dashboardAuthoritySmoke,
         workStateBefore,
         workStateAfter,
         authorityStateBefore,
