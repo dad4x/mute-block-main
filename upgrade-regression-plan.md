@@ -249,6 +249,35 @@ legacy `mbProfileNukeProgress` key, and no legacy runtime actions.
 Keep seeded Phase 3 as a separate discovery suite. Do not replace it with this
 UI-path smoke; the two phases prove different boundaries.
 
+## Phase 5 Dashboard Readonly Authority Smoke
+
+Phase 5 proves that the upgraded extension can wake, render its own dashboard,
+inspect current authority, and remain inert. It opens `coordinator.html`,
+captures dashboard-visible queue/accounting/wakeup state, and sends only the
+current non-work-starting diagnostic actions used by the earlier phases.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase5 \
+  --phase phase5-dashboard-readonly-authority-smoke
+```
+
+The smoke instruments dashboard runtime messages during page load. It fails if
+the dashboard sends queue-starting or profile-mutating actions such as resume,
+enqueue, claim, profile action, pause, cancel, retry, requeue, reset, pending
+post mutation, or sweep actions.
+
+The dashboard must render from compact/current authority views:
+`mbCoordinatorQueueView` and `mbQueueWakeupMetricsView`. It must not revive the
+full legacy `mbProfileNukeProgress` blob, accept `record-nuke-progress*`, expose
+repair/import alarms, create queue rows, change the WAL signature, create
+profile progress rows, or create queued action-surface records.
+
+This phase produces a normalized `dashboardAuthoritySmoke` comparable report so
+warmed baseline comparisons do not depend on open extension views, local paths,
+or raw before/after storage deltas.
+
 ## Queue-Authority Phases
 
 Queue-authority phases are a separate class of regression test. One controlled
