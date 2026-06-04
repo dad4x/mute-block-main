@@ -11,10 +11,205 @@ Defaults:
 - Override with `--host`, `--port`, `--extension-id`, or the matching
   `MB_CDP_HOST`, `MB_CDP_PORT`, `MB_EXTENSION_ID` environment variables.
 
+## Windows Chrome Profile Launcher
+
+Use `tools/cdp/windows-chrome-profile.js` when a test needs a fresh or
+controlled Windows Chrome profile behind Cygwin SSH. It avoids PowerShell and
+uses remote `cmd.exe` only.
+
+Launch a new disposable profile on the Windows host:
+
+```bash
+node tools/cdp/windows-chrome-profile.js \
+  --ssh USER@WINDOWS_HOST \
+  --remote-port 9224 \
+  --local-port 9224 \
+  --new-profile
+```
+
+Then keep the CDP tunnel open as a separate command:
+
+```bash
+ssh -N -L 9224:127.0.0.1:9224 USER@WINDOWS_HOST
+```
+
+Check the local endpoint:
+
+```bash
+curl http://127.0.0.1:9224/json/version
+```
+
+To reuse an existing Windows profile, pass its user-data-dir:
+
+```bash
+node tools/cdp/windows-chrome-profile.js \
+  --ssh USER@WINDOWS_HOST \
+  --remote-port 9224 \
+  --profile-dir 'C:\Users\DBROWER\AppData\Local\Temp\mb-existing-profile'
+```
+
+By default, the launcher kills only the listener on the requested remote debug
+port before starting Chrome. Add repeated `--kill-port PORT` options to clear
+other known debug ports. A new disposable profile needs a fresh Quora login
+before authenticated Quora tests can run.
+
+### DBROWER-X40-J Regression Browser
+
+The current Windows laptop setup has two separate tunnels:
+
+- CDP reverse tunnel: local `127.0.0.1:9223` reaches laptop Chrome
+  `127.0.0.1:9222`.
+- SSH/copy tunnel: local `127.0.0.1:10022` reaches laptop SSH port `22`.
+
+Use the current logged-in debug profile when the regression needs existing
+Quora authentication:
+
+```text
+C:\Users\DBROWER\AppData\Local\Temp\mb-chrome-debug
+```
+
+Use a fresh profile only for clean upgrade/install tests. A fresh profile will
+not be logged in to Quora; authenticate it manually before running any
+regression phase that needs Quora pages or account state.
+
+Plain SSH launches can create an invisible Windows session-0 Chrome. For a
+visible regression browser, launch through the logged-in desktop session. Check
+the active console session first:
+
+```bash
+ssh -F /home/dbrower/.ssh/config -p 10022 -o BatchMode=yes \
+  'DBROWER-X40-J+DBROWER@127.0.0.1' \
+  'cmd.exe /d /c query user'
+```
+
+The expected visible browser process is in Windows Console session `1`. A
+debug-profile Chrome in Services/session `0` is a stale invisible launch and
+should not be used for regression.
+
+For the keyed current Chrome build, use a load-only launch. Do not add
+`--disable-extensions-except`; in the managed Chrome environment it can hide
+the normal extension registry and make Web Store installs report that
+installation is not allowed. The known-good pattern is:
+
+1. Write a temporary `.cmd` on the laptop that starts Chrome with:
+   - `--user-data-dir=<profile>`
+   - `--remote-debugging-address=127.0.0.1`
+   - `--remote-debugging-port=9222`
+   - `--load-extension=<unpacked chrome build>`
+2. Run that `.cmd` via an interactive scheduled task:
+
+```bash
+ssh -F /home/dbrower/.ssh/config -p 10022 -o BatchMode=yes \
+  'DBROWER-X40-J+DBROWER@127.0.0.1' \
+  'cmd.exe /d /c "schtasks /Create /TN MBChromeDebug /SC ONCE /ST 23:59 /TR C:\Users\DBROWER\AppData\Local\Temp\mb-launch-debug.cmd /F /IT && schtasks /Run /TN MBChromeDebug"'
+```
+
+Then verify CDP locally:
+
+```bash
+curl --noproxy '*' http://127.0.0.1:9223/json/version
+```
+
+Command-line `--load-extension` may not register the unpacked Mute Block build
+by itself. If `chrome.developerPrivate.getExtensionsInfo()` or `/json/list`
+does not show a live service worker for
+`chrome-extension://nlmmkoljofpgbmlcojebolmniineboah/`, use the visible browser
+UI:
+
+```text
+>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
+```
+
+After manual load, verify that Mute Block is listed with:
+
+- id: `nlmmkoljofpgbmlcojebolmniineboah`
+- version: the current repo build
+- location: `UNPACKED`
+- state: `ENABLED`
+- zero manifest/runtime/install warnings or errors
+
+Then run the upgrade regression Phase 5 dashboard authority smoke before
+expanding to later browser phases:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase5 \
+  --phase phase5-dashboard-readonly-authority-smoke
+```
+
+### Known-Good Upgrade Regression Sequence
+
+For the keyed Chrome Web Store upgrade profile, the known-good sequence is:
+
+1. Launch visible Windows session-1 Chrome with `--load-extension` only.
+2. If command-line load does not register Mute Block, use manual
+   `chrome://extensions` Developer mode -> Load unpacked.
+3. Verify the post-load extension registry:
+   - id: `nlmmkoljofpgbmlcojebolmniineboah`
+   - name: `Mute Block`
+   - location: `UNPACKED`
+   - state: `ENABLED`
+   - zero manifest/runtime/install warnings or errors
+4. Run Phase 5 dashboard authority.
+5. Sign in to Quora if the runner prints the Quora operator prompt.
+6. Run Phase 6 authenticated content refresh/reinject.
+7. Run Phase 3 profile-search discovery.
+8. Run Phase 3 seeded space discovery.
+9. Optionally run Phase 4 space-mark UI if mutating `mbSpaceRegistry` is
+   acceptable in the warmed profile.
+10. Run Phase 7 discovery reload stability.
+
+Successful post-load verification command:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase5 \
+  --phase phase5-dashboard-readonly-authority-smoke
+```
+
+Successful authenticated completion commands:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase6-authenticated \
+  --phase phase6-stale-content-refresh-reinject-smoke \
+  --quora-url https://www.quora.com/
+```
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase3-search-authenticated \
+  --phase phase3-search-discovery-smoke
+```
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase3-space-authenticated \
+  --phase phase3-space-discovery-smoke
+```
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase7-authenticated \
+  --phase phase7-discovery-reload-stability-smoke
+```
+
+This sequence is still non-work-starting. It must not create coordinator queue
+rows, profile progress rows, WAL keys, queued action-surface records, the full
+legacy `mbProfileNukeProgress` key, repair/import alarms, or accepted legacy
+runtime actions. Queue-authority tests are a separate disposable-profile class.
+
 ## Dictionary
 
 | Script | Purpose | Typical command |
 | --- | --- | --- |
+| `tools/cdp/windows-chrome-profile.js` | Stop an existing Windows Chrome/CDP listener on selected debug ports and launch Windows Chrome through Cygwin SSH with either a disposable or existing profile. Prints the separate `ssh -N -L` tunnel command. | `node tools/cdp/windows-chrome-profile.js --ssh USER@WINDOWS_HOST --remote-port 9224 --new-profile` |
 | `tools/cdp/reload-extension.js` | Reload the unpacked extension from `chrome://extensions/`, reopen/find the Dashboard in the background, and report version plus extension errors/warnings. Requires `chrome://extensions/` to already be open. | `node tools/cdp/reload-extension.js` |
 | `tools/cdp/space-summary.js` | Summarize all open Quora space tabs and service-worker space/queue state. | `node tools/cdp/space-summary.js` |
 | `tools/cdp/reload-space-tabs.js` | Reload all open Quora space tabs without creating new tabs. | `node tools/cdp/reload-space-tabs.js` |

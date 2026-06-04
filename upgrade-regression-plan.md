@@ -13,6 +13,34 @@ nlmmkoljofpgbmlcojebolmniineboah
 This suite is browser-backed and CDP-only. It must not add or depend on legacy
 progress import, repair aliases, or compatibility migrations.
 
+## Operator Intervention
+
+Automation must stop and print an explicit operator prompt whenever the next
+step needs visible browser UI or user credentials. The prompt must be present
+in Codex output and in the JSON report as `operatorIntervention`, and every
+prompt must begin with this exact prefix:
+
+```text
+>>>>>> OPERATOR INTERVENTION: do ...
+```
+
+Known intervention prompts:
+
+```text
+>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
+```
+
+```text
+>>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.
+```
+
+The manual Load unpacked prompt is expected when Chrome has not registered the
+keyed current build under `nlmmkoljofpgbmlcojebolmniineboah`. Do not work
+around that by running the suite against a different local extension ID. The
+Quora login prompt is expected only when a content/discovery phase reaches a
+login wall. Do not store credentials or add compatibility behavior to bypass
+either intervention.
+
 ## Phase 1 Non-Work-Starting Smoke
 
 Run against an already-launched Chrome profile with remote debugging exposed on
@@ -256,6 +284,59 @@ inspect current authority, and remain inert. It opens `coordinator.html`,
 captures dashboard-visible queue/accounting/wakeup state, and sends only the
 current non-work-starting diagnostic actions used by the earlier phases.
 
+### Phase 5 Launch Requirements
+
+Phase 5 is only valid against the keyed current Chrome build registered under
+the Chrome Web Store extension ID:
+
+```text
+nlmmkoljofpgbmlcojebolmniineboah
+```
+
+Do not run Phase 5 against a local unpacked ID such as
+`gjjabgpgjpampikjhjpfhneeoapjbjaf`; that tests a separate extension identity,
+not the store-upgrade path.
+
+On the DBROWER-X40-J Windows laptop, launch the visible regression browser in
+the logged-in console session. Plain SSH can create an invisible session-0
+Chrome, so use an interactive scheduled task or another session-1 launch path
+and verify the process is in Windows Console session `1`.
+
+Use a load-only extension launch:
+
+```text
+--load-extension="C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current"
+```
+
+Do not use `--disable-extensions-except` for this upgrade regression profile.
+In the managed Chrome environment that flag hid the normal extension registry
+and made Web Store installs report that installation was not allowed. The
+load-only launch keeps managed/default extensions visible and allows the
+extension registry to behave normally.
+
+Command-line `--load-extension` may not register the unpacked build by itself.
+If the keyed extension is absent from `chrome://extensions` or CDP does not
+show a service worker under
+`chrome-extension://nlmmkoljofpgbmlcojebolmniineboah/`, stop and prompt the
+operator:
+
+```text
+>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
+```
+
+After manual load, the expected extension registry facts are:
+
+- name: `Mute Block`
+- id: `nlmmkoljofpgbmlcojebolmniineboah`
+- version: the current repo build
+- location: `UNPACKED`
+- state: `ENABLED`
+- zero manifest/runtime/install warnings or errors
+
+Only proceed when `/json/list` shows a live extension page or service worker
+for the keyed ID. If Chrome loads the unpacked build under any other ID, stop;
+the artifact/key assumption is wrong and the suite must not be weakened to pass.
+
 ```bash
 node tools/cdp/upgrade-regression/run.js \
   --extension-id nlmmkoljofpgbmlcojebolmniineboah \
@@ -277,6 +358,149 @@ profile progress rows, or create queued action-surface records.
 This phase produces a normalized `dashboardAuthoritySmoke` comparable report so
 warmed baseline comparisons do not depend on open extension views, local paths,
 or raw before/after storage deltas.
+
+## Phase 6 Stale-Content Refresh/Reinject Smoke
+
+Phase 6 remains non-work-starting. It proves that an upgraded extension can
+recover a benign Quora content page after reload, and can explicitly reinject
+the packaged content script if the current marker or scoped state is stale.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase6 \
+  --phase phase6-stale-content-refresh-reinject-smoke \
+  --quora-url https://www.quora.com/
+```
+
+The runner opens or reuses a benign Quora page, reloads it, verifies the
+content-script ready marker and `get-content-page-coordinator-state`, and
+injects `css/content.css` plus `js/content.js` only if the post-refresh state
+is not usable. It must finish with scoped current content state.
+
+Allowed side effects are limited to current compact diagnostic/content
+projection keys already allowed by Phase 2. Forbidden side effects are the
+same authority boundary used by discovery phases: no coordinator queue rows,
+no queue view rows, no WAL changes, no profile progress rows, no pending/nuked
+space post records, no queued action-surface records, no full legacy
+`mbProfileNukeProgress` key, no legacy runtime actions, and no repair/import
+alarms.
+
+If the page reaches a Quora login wall, the runner must report the standard
+operator prompt:
+
+```text
+>>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.
+```
+
+## Phase 7 Discovery Reload Stability Smoke
+
+Phase 7 remains non-work-starting. It proves logged-in discovery surfaces are
+stable across reload after candidate discovery has already run.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label store-1.4-to-current-warmed-phase7 \
+  --phase phase7-discovery-reload-stability-smoke
+```
+
+The runner opens or reuses the default profile search page and seeded
+asset/target space pages, verifies candidate discovery and scoped content
+state, reloads each page, and verifies the extension-built candidate/control
+surface returns. The profile-search check still requires actionable extension
+candidate rows/buttons or a nonzero extension batch candidate count; raw Quora
+profile links alone are not enough.
+
+For space pages, Phase 7 uses the same default seeded space registry inputs as
+Phase 3. Persisted `mbSpaceRegistry` classification is acceptable. Queue
+authority, profile authority/progress, WAL writes, pending/nuked space posts,
+queued action-surface records, the full legacy `mbProfileNukeProgress` key,
+legacy runtime actions, and repair/import alarms remain forbidden.
+
+## Authenticated Checkpoint 2026-06-04
+
+The meaningful non-work-starting browser upgrade suite completed against the
+visible logged-in Windows profile with the keyed unpacked Chrome build:
+
+- extension id: `nlmmkoljofpgbmlcojebolmniineboah`
+- extension version: `1.6.854`
+- extension location: `UNPACKED`
+- manifest/runtime/install warnings and errors: zero
+
+Baseline Phase 6 report:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase6-authenticated-20260604 \
+  --phase phase6-stale-content-refresh-reinject-smoke \
+  --quora-url https://www.quora.com/ \
+  --write-baseline tmp/upgrade-regression/session1-loadonly-manual-loaded-phase6-authenticated-20260604.phase6-stale-content-refresh-reinject-smoke.json
+```
+
+Result: pass. The authenticated Quora page returned scoped current content
+state, no operator intervention was needed, and queue/progress rows remained
+zero.
+
+Authenticated profile-search discovery:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase3-search-authenticated-20260604 \
+  --phase phase3-search-discovery-smoke
+```
+
+Result: pass. The default Elon search produced `6` extension candidate rows,
+`2` actionable buttons, and batch candidate count `2`. Raw Quora links alone
+were not the pass condition. Queue rows, profile progress rows, WAL keys, and
+queued action-surface records stayed zero.
+
+Authenticated seeded space discovery:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase3-space-authenticated-20260604 \
+  --phase phase3-space-discovery-smoke
+```
+
+Result: pass. The seeded asset/target spaces produced `99` visible/countable
+candidates across four spaces, all scoped states returned zero queue/progress
+rows, and no WAL or legacy progress state appeared.
+
+Optional authenticated Phase 4 space-mark UI:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase4-space-mark-authenticated-20260604 \
+  --phase phase4-space-mark-ui-smoke \
+  --space-mark-url https://instantblock.quora.com/ \
+  --space-mark-category asset
+```
+
+Result: pass. The UI changed the space category from `asset` to temporary
+`neutral`, then back to `asset`, and `asset` persisted after reload. The only
+intended persistent mutation was `mbSpaceRegistry`; queue/progress/WAL
+authority stayed empty.
+
+Authenticated Phase 7 discovery reload stability:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label session1-loadonly-manual-loaded-phase7-discovery-reload-authenticated-20260604 \
+  --phase phase7-discovery-reload-stability-smoke
+```
+
+Result: pass. Search candidates stayed at `6` after reload with `6` rows, `2`
+buttons, and batch candidate count `2`. All four seeded spaces still had
+visible/countable candidates after reload. Queue rows, profile progress rows,
+WAL keys, pending/nuked space post records, queued action-surface records, the
+full legacy `mbProfileNukeProgress` key, legacy runtime actions, and
+repair/import alarms stayed absent.
 
 ## Queue-Authority Phases
 

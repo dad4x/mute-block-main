@@ -22,6 +22,8 @@ const PHASE3_SPACE = 'phase3-space-discovery-smoke'
 const PHASE3_SEARCH = 'phase3-search-discovery-smoke'
 const PHASE4_SPACE_MARK = 'phase4-space-mark-ui-smoke'
 const PHASE5_DASHBOARD_AUTHORITY = 'phase5-dashboard-readonly-authority-smoke'
+const PHASE6_STALE_CONTENT_REFRESH = 'phase6-stale-content-refresh-reinject-smoke'
+const PHASE7_DISCOVERY_RELOAD = 'phase7-discovery-reload-stability-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
 const SPACE_ASSET_URLS = [
     'https://theqdefensecrew.quora.com/',
@@ -32,15 +34,19 @@ const SPACE_TARGET_URLS = [
     'https://jonspoliticalcorner29.quora.com/'
 ]
 const DEFAULT_SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
+const DEFAULT_BENIGN_QUORA_URL = 'https://www.quora.com/'
 const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
+const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = 'C:\\Users\\DBROWER\\Documents\\src\\mute-block-main\\chrome-unpacked-current'
 const SUPPORTED_PHASES = [
     PHASE1,
     PHASE2,
     PHASE3_SPACE,
     PHASE3_SEARCH,
     PHASE4_SPACE_MARK,
-    PHASE5_DASHBOARD_AUTHORITY
+    PHASE5_DASHBOARD_AUTHORITY,
+    PHASE6_STALE_CONTENT_REFRESH,
+    PHASE7_DISCOVERY_RELOAD
 ]
 
 const LEGACY_ACTIONS = [
@@ -54,6 +60,21 @@ const CURRENT_ACTIONS = [
     'get-coordinator-why-not-running',
     'refresh-queue-wakeup-metrics-view'
 ]
+
+const OPERATOR_LOAD_UNPACKED_PROMPT =
+    `>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select ${DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH}, and report the listed extension ID/version or the exact visible Chrome error text.`
+const OPERATOR_QUORA_LOGIN_PROMPT =
+    '>>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.'
+
+function addOperatorIntervention(interventions, prompt) {
+    if(prompt && !interventions.includes(prompt)) interventions.push(prompt)
+}
+
+function printOperatorInterventions(interventions = []) {
+    for(const prompt of interventions) {
+        console.error(prompt)
+    }
+}
 
 const PREFERENCE_KEYS = new Set([
     'coordinatorAutoStartOnBrowserStart',
@@ -232,7 +253,7 @@ function printUsage() {
         '  --port 9223',
         '  --profile-label store-1.4-to-current',
         `  --phase ${SUPPORTED_PHASES.join('|')}`,
-        '  --quora-url https://www.quora.com/',
+        `  --quora-url ${DEFAULT_BENIGN_QUORA_URL}`,
         `  --search-url ${DEFAULT_SEARCH_URL}`,
         `  --space-mark-url ${DEFAULT_SPACE_MARK_URL}`,
         `  --space-mark-category ${DEFAULT_SPACE_MARK_CATEGORY}`,
@@ -317,8 +338,7 @@ async function ensureExtensionContext(config, warnings) {
     let targets = await getTargets(config)
     const candidates = [
         ...targets.filter(item => item.type === 'page' && item.url === dashboardUrl),
-        ...targets.filter(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix) && item.url !== dashboardUrl),
-        ...targets.filter(item => item.type === 'service_worker' && (item.url || '').startsWith(extensionPrefix))
+        ...targets.filter(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix) && item.url !== dashboardUrl)
     ]
 
     for(const candidate of candidates) {
@@ -349,8 +369,7 @@ async function ensureExtensionContext(config, warnings) {
 
     targets = await getTargets(config)
     const target = targets.find(item => item.type === 'page' && item.url === dashboardUrl) ||
-        targets.find(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix)) ||
-        targets.find(item => item.type === 'service_worker' && (item.url || '').startsWith(extensionPrefix))
+        targets.find(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix))
     if(!target) throw new Error(`extension context not found for ${config.extensionId}`)
     const availability = await inspectExtensionApiAvailability(target).catch(error => ({
         storage: false,
@@ -579,17 +598,21 @@ function isAllowedStorageKey(key) {
 
 function isAllowedAddedStorageKey(key, phase = PHASE1) {
     if(ALLOWED_ADDED_STORAGE_KEYS.has(key)) return true
-    if(phase === PHASE2) return ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
+    if(isContentRefreshPhase(phase)) return ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     if(isNonWorkSpaceRegistryPhase(phase)) return ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     return false
 }
 
 function isDiscoveryPhase(phase = '') {
-    return phase === PHASE3_SPACE || phase === PHASE3_SEARCH
+    return phase === PHASE3_SPACE || phase === PHASE3_SEARCH || phase === PHASE7_DISCOVERY_RELOAD
 }
 
 function isNonWorkSpaceRegistryPhase(phase = '') {
     return isDiscoveryPhase(phase) || phase === PHASE4_SPACE_MARK
+}
+
+function isContentRefreshPhase(phase = '') {
+    return phase === PHASE2 || phase === PHASE6_STALE_CONTENT_REFRESH
 }
 
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
@@ -612,7 +635,7 @@ function diffStorageKeys(before = [], after = [], phase = PHASE1) {
 
 function allowedAddedStorageKeySummary(phase = PHASE1) {
     const literal = Array.from(ALLOWED_ADDED_STORAGE_KEYS).sort()
-    if(phase === PHASE2) {
+    if(isContentRefreshPhase(phase)) {
         return {
             literal,
             patterns: ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
@@ -834,6 +857,12 @@ function comparableReport(report) {
         ...(report.dashboardAuthoritySmoke
             ? {dashboardAuthoritySmoke: comparableDashboardAuthoritySmoke(report.dashboardAuthoritySmoke)}
             : {}),
+        ...(report.contentRefreshSmoke
+            ? {contentRefreshSmoke: comparableContentRefreshSmoke(report.contentRefreshSmoke)}
+            : {}),
+        ...(report.discoveryReloadSmoke
+            ? {discoveryReloadSmoke: comparableDiscoveryReloadSmoke(report.discoveryReloadSmoke)}
+            : {}),
         workStateAfter: report.workStateAfter
     }
 }
@@ -926,6 +955,58 @@ function comparableDashboardAuthoritySmoke(dashboardAuthoritySmoke = null) {
     }
 }
 
+function comparableContentRefreshSmoke(contentRefreshSmoke = null) {
+    if(!contentRefreshSmoke) return null
+    const final = contentRefreshSmoke.final || {}
+    const page = final.page || {}
+    const coordinatorState = final.coordinatorState || {}
+    return {
+        kind: contentRefreshSmoke.kind || '',
+        url: normalizeComparableUrl(page.url || ''),
+        reloaded: contentRefreshSmoke.reloaded === true,
+        reinjected: contentRefreshSmoke.reinjected === true,
+        reinjectionMatched: Number(contentRefreshSmoke.reinjection?.matched || 0) || 0,
+        reinjectionInjected: Number(contentRefreshSmoke.reinjection?.injected || 0) || 0,
+        contentReadyPresent: !!page.contentReady,
+        pageType: page.pageType || '',
+        scoped: coordinatorState.scoped === true,
+        queueRows: Number(coordinatorState.queueRows || 0) || 0,
+        progressRows: Number(coordinatorState.progressRows || 0) || 0,
+        responseKeys: Array.isArray(coordinatorState.responseKeys)
+            ? coordinatorState.responseKeys.slice().sort()
+            : []
+    }
+}
+
+function comparableDiscoveryReloadSmoke(discoveryReloadSmoke = null) {
+    if(!discoveryReloadSmoke) return null
+    const summarizePage = page => ({
+        kind: page.kind || '',
+        expectedCategory: page.expectedCategory || '',
+        beforeUrl: normalizeComparableUrl(page.before?.page?.url || ''),
+        afterUrl: normalizeComparableUrl(page.afterReload?.page?.url || ''),
+        beforePageType: page.before?.page?.pageType || '',
+        afterPageType: page.afterReload?.page?.pageType || '',
+        beforeCandidateCount: Number(page.before?.page?.discoveryCandidateCount || 0) || 0,
+        afterCandidateCount: Number(page.afterReload?.page?.discoveryCandidateCount || 0) || 0,
+        beforeSearchRows: Number(page.before?.page?.profileSearchRowCount || 0) || 0,
+        afterSearchRows: Number(page.afterReload?.page?.profileSearchRowCount || 0) || 0,
+        beforeSearchButtons: Number(page.before?.page?.profileSearchButtonCount || 0) || 0,
+        afterSearchButtons: Number(page.afterReload?.page?.profileSearchButtonCount || 0) || 0,
+        beforeSpaceCategory: page.before?.page?.spaceCategory || '',
+        afterSpaceCategory: page.afterReload?.page?.spaceCategory || '',
+        afterScoped: page.afterReload?.coordinatorState?.scoped === true,
+        afterQueueRows: Number(page.afterReload?.coordinatorState?.queueRows || 0) || 0,
+        afterProgressRows: Number(page.afterReload?.coordinatorState?.progressRows || 0) || 0
+    })
+    return {
+        kind: discoveryReloadSmoke.kind || '',
+        classifiedCount: Number(discoveryReloadSmoke.classified?.updated || 0) || 0,
+        search: summarizePage(discoveryReloadSmoke.search || {}),
+        spaces: (discoveryReloadSmoke.spaces || []).map(summarizePage)
+    }
+}
+
 function summarizeMessageResult(result = {}) {
     const response = result.response || null
     return {
@@ -996,7 +1077,7 @@ function normalizeComparableUrl(url = '') {
     }
 }
 
-async function findOrOpenQuoraPage(config, quoraUrl, warnings) {
+async function findOrOpenQuoraPage(config, quoraUrl, warnings, reason = 'content smoke') {
     if(quoraUrl && !isQuoraUrl(quoraUrl)) throw new Error(`--quora-url must be an https Quora URL: ${quoraUrl}`)
 
     let targets = await getTargets(config)
@@ -1012,7 +1093,7 @@ async function findOrOpenQuoraPage(config, quoraUrl, warnings) {
         url: quoraUrl,
         background: true
     }, 10000)
-    warnings.push(`opened Quora URL for phase 2 content smoke: ${quoraUrl}`)
+    warnings.push(`opened Quora URL for ${reason}: ${quoraUrl}`)
     await sleep(4000)
 
     targets = await getTargets(config)
@@ -1233,6 +1314,9 @@ async function evaluateInExtensionIsolatedWorld(target, extensionId, expression,
 async function inspectQuoraPage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function inspectPage() {
         const attr = document.documentElement?.getAttribute('data-mb-content-script-ready') || ''
+        const bodyText = `${document.body?.innerText || ''}`.replace(/\s+/g, ' ').slice(0, 5000)
+        const quoraLoginLikely = /log in|sign in|continue with google|continue with facebook/i.test(bodyText) &&
+            /email|password|log in|sign in/i.test(bodyText)
         const hrefs = Array.from(document.querySelectorAll('a[href]'))
             .map(anchor => {
                 try { return new URL(anchor.getAttribute('href') || '', location.href).href }
@@ -1265,6 +1349,7 @@ async function inspectQuoraPage(target) {
             profileHrefCount: profileHrefs.length,
             profileHrefs,
             mbControlCount: mbControls.length,
+            quoraLoginLikely,
             mbControlLabels: mbControls.map(node => `${node.innerText || node.textContent || node.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 20)
         }
     }})()`, 15000)
@@ -1272,6 +1357,9 @@ async function inspectQuoraPage(target) {
 
 async function inspectDiscoveryPage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function inspectPage() {
+        const bodyText = `${document.body?.innerText || ''}`.replace(/\s+/g, ' ').slice(0, 5000)
+        const quoraLoginLikely = /log in|sign in|continue with google|continue with facebook/i.test(bodyText) &&
+            /email|password|log in|sign in/i.test(bodyText)
         const normalizeProfileHref = href => {
             try {
                 const url = new URL(href, location.href)
@@ -1354,6 +1442,7 @@ async function inspectDiscoveryPage(target) {
             visibilityState: document.visibilityState,
             contentReady: document.documentElement?.getAttribute('data-mb-content-script-ready') || '',
             pageType,
+            quoraLoginLikely,
             searchQuery: new URLSearchParams(location.search).get('q') || '',
             profileHrefCount: profileHrefs.length,
             profileHrefs,
@@ -1427,11 +1516,151 @@ async function runContentSmoke(config, options, warnings, fail) {
             visibilityState: pageState.visibilityState,
             contentReady: pageState.contentReady,
             pageType: pageState.pageType,
+            quoraLoginLikely: pageState.quoraLoginLikely,
             profileHrefCount: pageState.profileHrefCount,
             mbControlCount: pageState.mbControlCount,
             mbControlLabels: pageState.mbControlLabels
         },
         coordinatorState: contentState
+    }
+}
+
+function contentStateIsUsable(pageState = {}, contentState = {}) {
+    return !!pageState.contentReady &&
+        contentState.ok === true &&
+        contentState.scoped === true &&
+        Number(contentState.queueRows || 0) === 0 &&
+        Number(contentState.progressRows || 0) === 0
+}
+
+async function injectContentScriptForPage(context, pageUrl) {
+    return evaluate(context.webSocketDebuggerUrl, `(${async function injectContentScript(url) {
+        const normalize = value => {
+            try {
+                const parsed = new URL(value || '')
+                parsed.hash = ''
+                if(parsed.pathname !== '/') parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/'
+                return parsed.href
+            }
+            catch {
+                return `${value || ''}`
+            }
+        }
+
+        const tabs = await chrome.tabs.query({})
+        const targetUrl = normalize(url)
+        const candidates = tabs.filter(tab => normalize(tab.url || '') === targetUrl)
+        const results = []
+
+        for(const tab of candidates) {
+            try {
+                await chrome.scripting.insertCSS({
+                    target: {tabId: tab.id},
+                    files: ['css/content.css']
+                }).catch(error => ({
+                    ignored: true,
+                    error: error?.message || `${error || ''}`
+                }))
+                await chrome.scripting.executeScript({
+                    target: {tabId: tab.id},
+                    files: ['js/content.js']
+                })
+                results.push({
+                    tabId: tab.id,
+                    url: tab.url || '',
+                    injected: true
+                })
+            }
+            catch(error) {
+                results.push({
+                    tabId: tab.id,
+                    url: tab.url || '',
+                    injected: false,
+                    error: error?.message || `${error || ''}`
+                })
+            }
+        }
+
+        return {
+            targetUrl,
+            matched: candidates.length,
+            injected: results.filter(result => result.injected).length,
+            results
+        }
+    }})( ${JSON.stringify(pageUrl)} )`, 20000)
+}
+
+async function inspectContentWithState(target, options) {
+    const pageState = await inspectQuoraPage(target)
+    const contentStateResult = await sendContentPageCoordinatorState(target, options.extensionId, pageState)
+    return {
+        pageState,
+        contentState: summarizeContentStateResult(contentStateResult)
+    }
+}
+
+async function runStaleContentRefreshSmoke(config, options, context, warnings, fail) {
+    const quoraUrl = options.quoraUrl || DEFAULT_BENIGN_QUORA_URL
+    const quoraPage = await findOrOpenQuoraPage(config, quoraUrl, warnings, 'phase 6 stale-content refresh/reinject smoke')
+    const before = await inspectContentWithState(quoraPage, options)
+
+    await reloadPageTarget(quoraPage)
+    let afterRefresh = await inspectContentWithState(quoraPage, options)
+    for(let attempt = 0; attempt < 5 && !contentStateIsUsable(afterRefresh.pageState, afterRefresh.contentState); attempt += 1) {
+        await sleep(500)
+        afterRefresh = await inspectContentWithState(quoraPage, options)
+    }
+
+    let reinjection = null
+    let final = afterRefresh
+    if(!contentStateIsUsable(afterRefresh.pageState, afterRefresh.contentState)) {
+        reinjection = await injectContentScriptForPage(context, afterRefresh.pageState.url || quoraPage.url || quoraUrl)
+        await sleep(1500)
+        final = await inspectContentWithState(quoraPage, options)
+    }
+
+    if(!final.pageState.contentReady) {
+        fail('stale-content smoke did not find content script ready marker after refresh/reinject', {
+            url: final.pageState.url,
+            readyState: final.pageState.readyState,
+            title: final.pageState.title,
+            reinjection
+        })
+    }
+    if(!final.contentState.ok) {
+        fail('stale-content smoke did not get current scoped state after refresh/reinject', final.contentState)
+    }
+    else {
+        if(final.contentState.scoped !== true) fail('stale-content current state is not scoped', final.contentState)
+        if(final.contentState.queueRows !== 0) fail('stale-content current state exposed queue rows', final.contentState)
+        if(final.contentState.progressRows !== 0) fail('stale-content current state exposed profile progress rows', final.contentState)
+    }
+    if(reinjection && reinjection.injected <= 0) {
+        fail('stale-content reinjection did not inject content script into the Quora tab', reinjection)
+    }
+
+    return {
+        kind: PHASE6_STALE_CONTENT_REFRESH,
+        target: {
+            id: quoraPage.id,
+            type: quoraPage.type || '',
+            url: quoraPage.url || ''
+        },
+        reloaded: true,
+        reinjected: !!reinjection,
+        reinjection,
+        before: {
+            page: before.pageState,
+            coordinatorState: before.contentState
+        },
+        afterRefresh: {
+            page: afterRefresh.pageState,
+            coordinatorState: afterRefresh.contentState
+        },
+        final: {
+            page: final.pageState,
+            coordinatorState: final.contentState
+        }
     }
 }
 
@@ -1521,6 +1750,53 @@ async function runSearchDiscoverySmoke(config, options, warnings, fail) {
         kind: PHASE3_SEARCH,
         totalCandidateCount: Number(page.page.discoveryCandidateCount || 0) || 0,
         pages: [page]
+    }
+}
+
+async function runDiscoveryReloadStabilitySmoke(config, options, context, warnings, fail) {
+    const classified = await classifySpacesForDiscovery(context, options.spaceAssetUrls, options.spaceTargetUrls)
+    const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 7 profile search reload')
+    const searchBefore = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail)
+    await reloadPageTarget(searchTarget)
+    const searchAfterReload = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail)
+
+    const spaces = []
+    const pageInputs = [
+        ...options.spaceAssetUrls.map(url => ({url, category: 'asset'})),
+        ...options.spaceTargetUrls.map(url => ({url, category: 'target'}))
+    ]
+
+    for(const input of pageInputs) {
+        const target = await findOrOpenPage(config, input.url, warnings, `phase 7 ${input.category} space reload`)
+        const before = await inspectDiscoveryWithState(target, options, 'space', fail)
+        await reloadPageTarget(target)
+        const afterReload = await inspectDiscoveryWithState(target, options, 'space', fail)
+        if(afterReload.page.spaceCategory && afterReload.page.spaceCategory !== input.category) {
+            fail('discovery reload space category mismatch', {
+                url: afterReload.page.url,
+                expected: input.category,
+                actual: afterReload.page.spaceCategory
+            })
+        }
+        spaces.push({
+            kind: 'space',
+            expectedCategory: input.category,
+            before,
+            afterReload
+        })
+    }
+
+    return {
+        kind: PHASE7_DISCOVERY_RELOAD,
+        classified,
+        search: {
+            kind: 'profile-search',
+            before: searchBefore,
+            afterReload: searchAfterReload
+        },
+        spaces,
+        totalCandidateCountAfterReload: (Number(searchAfterReload.page.discoveryCandidateCount || 0) || 0) +
+            spaces.reduce((total, item) => total + (Number(item.afterReload.page.discoveryCandidateCount || 0) || 0), 0)
     }
 }
 
@@ -1739,6 +2015,7 @@ runMain(async () => {
     const expectedVersion = readCurrentVersion()
     const failures = []
     const warnings = []
+    const operatorIntervention = []
 
     const fail = (message, details = null) => failures.push(details ? {message, details} : {message})
     const warn = (message, details = null) => warnings.push(details ? {message, details} : {message})
@@ -1751,10 +2028,12 @@ runMain(async () => {
     const extensionBefore = await getExtensionInfo(extensionsPage, options.extensionId)
     validateExtensionInfo(extensionBefore, options, expectedVersion, fail)
     if(!extensionBefore) {
+        addOperatorIntervention(operatorIntervention, OPERATOR_LOAD_UNPACKED_PROMPT)
         const report = {
             pass: false,
             phase: options.phase,
             profileLabel: options.profileLabel,
+            operatorIntervention,
             generatedAt: new Date().toISOString(),
             cdp: {
                 host: options.host,
@@ -1780,7 +2059,9 @@ runMain(async () => {
             reconcileDisplayOnly: null,
             currentActions: {},
             contentSmoke: null,
+            contentRefreshSmoke: null,
             discoverySmoke: null,
+            discoveryReloadSmoke: null,
             spaceMarkSmoke: null,
             dashboardAuthoritySmoke: null,
             workStateBefore: null,
@@ -1792,6 +2073,7 @@ runMain(async () => {
         }
         const comparable = comparableReport(report)
         if(options.writeBaseline) writeJson(options.writeBaseline, {...report, comparable})
+        printOperatorInterventions(operatorIntervention)
         console.log(JSON.stringify(options.verbose ? {...report, comparable} : report, null, 2))
         process.exit(1)
     }
@@ -1825,7 +2107,9 @@ runMain(async () => {
     }
 
     let contentSmoke = null
+    let contentRefreshSmoke = null
     let discoverySmoke = null
+    let discoveryReloadSmoke = null
     let spaceMarkSmoke = null
     let dashboardAuthoritySmoke = null
     if(options.phase === PHASE2) {
@@ -1855,6 +2139,28 @@ runMain(async () => {
             fail
         )
         await sleep(500)
+    }
+    else if(options.phase === PHASE6_STALE_CONTENT_REFRESH) {
+        contentRefreshSmoke = await runStaleContentRefreshSmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
+    else if(options.phase === PHASE7_DISCOVERY_RELOAD) {
+        discoveryReloadSmoke = await runDiscoveryReloadStabilitySmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
+
+    if(contentSmoke?.page?.quoraLoginLikely ||
+            contentRefreshSmoke?.before?.page?.quoraLoginLikely ||
+            contentRefreshSmoke?.afterRefresh?.page?.quoraLoginLikely ||
+            contentRefreshSmoke?.final?.page?.quoraLoginLikely ||
+            discoverySmoke?.pages?.some(page => page?.page?.quoraLoginLikely) ||
+            discoveryReloadSmoke?.search?.before?.page?.quoraLoginLikely ||
+            discoveryReloadSmoke?.search?.afterReload?.page?.quoraLoginLikely ||
+            discoveryReloadSmoke?.spaces?.some(page =>
+                page?.before?.page?.quoraLoginLikely || page?.afterReload?.page?.quoraLoginLikely) ||
+            spaceMarkSmoke?.before?.page?.quoraLoginLikely ||
+            spaceMarkSmoke?.reloaded?.page?.quoraLoginLikely) {
+        addOperatorIntervention(operatorIntervention, OPERATOR_QUORA_LOGIN_PROMPT)
     }
 
     const storageAfter = await readStorage(context)
@@ -1906,7 +2212,9 @@ runMain(async () => {
             after: workStateAfter
         })
     }
-    if(isNonWorkSpaceRegistryPhase(options.phase) || options.phase === PHASE5_DASHBOARD_AUTHORITY) {
+    if(isNonWorkSpaceRegistryPhase(options.phase) ||
+            options.phase === PHASE5_DASHBOARD_AUTHORITY ||
+            options.phase === PHASE6_STALE_CONTENT_REFRESH) {
         assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
     }
 
@@ -1921,6 +2229,7 @@ runMain(async () => {
         phase: options.phase,
         profileLabel: options.profileLabel,
         generatedAt: new Date().toISOString(),
+        operatorIntervention,
         cdp: {
             host: options.host,
             port: options.port
@@ -1943,7 +2252,9 @@ runMain(async () => {
         reconcileDisplayOnly: reconcileDisplayOnlySummary,
         currentActions: currentActionSummary,
         contentSmoke,
+        contentRefreshSmoke,
         discoverySmoke,
+        discoveryReloadSmoke,
         spaceMarkSmoke,
         dashboardAuthoritySmoke,
         workStateBefore,
@@ -1987,6 +2298,7 @@ runMain(async () => {
     if(options.verbose) report.comparable = comparable
 
     report.pass = failures.length === 0
+    printOperatorInterventions(operatorIntervention)
     console.log(JSON.stringify(report, null, 2))
     if(!report.pass) process.exitCode = 1
 })
