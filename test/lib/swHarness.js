@@ -468,6 +468,11 @@ module.exports.__test = {
     ensureProfileNukeProgressReady,
     reconcileCoordinatorStorage,
     recordCoordinatorJobProgress,
+    recordFlightRecorderEvent,
+    getFlightRecorder,
+    getFlightRecorderSnapshot,
+    isQueuedTabRetryBudgetReleaseReason,
+    shouldAdvanceRolledBackQueuedTabBeforeOpen,
     recordQueuedTabMetadataMilestone,
     getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
@@ -503,6 +508,11 @@ module.exports.__test = {
     switchCoordinatorAuthorityQueueWalCheckpoint,
     terminalizeCoordinatorKeyOnlyItem,
     terminalizeActiveCoordinatorNonProfileLanding,
+    __testResetFlightRecorder() {
+        flightRecorderSeq = 0
+        flightRecorderDroppedCount = 0
+        flightRecorderEntries.fill(undefined)
+    },
     __testDeactivateHarness() {
         __testHarnessDeactivated = true
         if(activeSpaceFeedStorageUpdateToken) {

@@ -202,7 +202,7 @@ node tools/cdp/upgrade-regression/run.js \
 
 This sequence is still non-work-starting. It must not create coordinator queue
 rows, profile progress rows, WAL keys, queued action-surface records, the full
-legacy `mbProfileNukeProgress` key, repair/import alarms, or accepted legacy
+the deleted full legacy progress blob key, repair/import alarms, or accepted legacy
 runtime actions. Queue-authority tests are a separate disposable-profile class.
 
 ## Dictionary

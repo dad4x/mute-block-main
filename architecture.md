@@ -226,6 +226,14 @@ Architecture health should be measurable:
 - WAL append bytes, record bytes, checkpoint generation switch count, active
   tail length, and physical segment count for segmented queue WAL storage.
 
+The service worker should also keep a bounded in-memory diagnostic journal,
+called the flight recorder. It records compact summaries of authority
+mutations, WAL/storage outcomes, scheduler decisions, page observations, and
+UI controls activated. The flight recorder is remotely probeable for failure
+analysis, but it is not persisted, not replay input, not authority, and not a
+trace file. See
+[flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md).
+
 Tests should exercise state snapshots directly:
 
 - delayed storage confirmation;
@@ -254,6 +262,9 @@ Tests should exercise state snapshots directly:
   WAL/checkpoint design.
 - [queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md):
   physical WAL segmentation follow-up.
+- [flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md):
+  bounded in-memory diagnostic journal for authority, scheduler, page
+  observation, and UI action evidence.
 - [shared-moderation-publication-design-2026-05-18.md](shared-moderation-publication-design-2026-05-18.md):
   shared moderation design.
 - [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable

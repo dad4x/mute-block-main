@@ -733,10 +733,18 @@ function isStaleAttempt(existing = {}, record = {}) {
 }
 
 function shouldApplyPatch(existing = null, patch = {}, record = {}) {
-    if(existing && isStaleAttempt(existing, record)) return {ok: false, reason: 'stale-attempt'}
-
     const existingStatus = `${existing?.status || ''}`
     const patchStatus = `${patch?.status || ''}`
+    if(existing && isStaleAttempt(existing, record)) {
+        const incomingNumber = getAttemptNumber(record)
+        const existingNumber = getAttemptNumber(existing)
+        const sameAttemptNumberTerminal = record.terminal === true &&
+            isTerminalStatus(patchStatus) &&
+            incomingNumber &&
+            existingNumber &&
+            incomingNumber === existingNumber
+        if(!sameAttemptNumberTerminal) return {ok: false, reason: 'stale-attempt'}
+    }
     if(existing &&
         record.operationKind === 'active-transition' &&
         existingStatus === 'queued' &&
