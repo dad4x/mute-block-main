@@ -103,6 +103,20 @@ const MAX_QUEUE_WAKEUP_METRIC_JOURNAL = 240
 const MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL = 30
 const MAX_QUEUE_WAKEUP_METRIC_PHASES = 64
 const MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY = 8
+const FLIGHT_RECORDER_CAPACITY = 512
+const FLIGHT_RECORDER_STRING_MAX = 240
+const FLIGHT_RECORDER_URL_MAX = 500
+const FLIGHT_RECORDER_KINDS = new Set([
+    "start-resume",
+    "fill-decision",
+    "authority-mutation",
+    "compact-view-materialized",
+    "dashboard-refresh",
+    "window-focus-request",
+    "tab-open-request",
+    "tab-action-claim",
+    "tab-action-release"
+])
 const CURRENT_WORK_RETENTION_MS = 24 * 60 * 60 * 1000
 const TERMINAL_COORDINATOR_STATUSES = new Set(['succeeded', 'failed', 'skipped', 'canceled'])
 const STALE_ACTIVE_QUEUED_TAB_MS = 10000
@@ -269,6 +283,9 @@ let queueWakeupMetricCycleSerial = 0
 let queueWakeupMetricGeneration = 0
 let queueWakeupMetricsReadyPromise = null
 let pendingQueueWakeupMetricsReset = null
+let flightRecorderSeq = 0
+let flightRecorderDroppedCount = 0
+const flightRecorderEntries = new Array(FLIGHT_RECORDER_CAPACITY)
 let browserSessionStartupResetChecked = false
 let browserSessionStartupResetPromise = null
 let activeQueueWakeupStorageContext = null
@@ -283,6 +300,145 @@ function getExtensionVersion() {
         return ''
     }
 }
+
+function sanitizeFlightRecorderString(value = "", maxLength = FLIGHT_RECORDER_STRING_MAX) {
+    if(value === null || value === undefined) return ""
+    const text = `${value}`.replace(/\s+/g, " ").trim()
+    const limit = Math.max(8, Number.parseInt(maxLength, 10) || FLIGHT_RECORDER_STRING_MAX)
+    return text.length > limit ? `${text.slice(0, limit - 3)}...` : text
+}
+
+function sanitizeFlightRecorderInteger(value = null) {
+    if(value === null || value === undefined || value === "") return undefined
+    const parsed = Number.parseInt(value, 10)
+    return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function sanitizeFlightRecorderBoolean(value = null) {
+    return typeof value === "boolean" ? value : undefined
+}
+
+function sanitizeFlightRecorderUrl(value = "") {
+    const text = sanitizeFlightRecorderString(value, FLIGHT_RECORDER_URL_MAX)
+    if(!text) return ""
+    return normalizeQuoraProfileUrl(text) || normalizeTabTargetUrl(text) || text
+}
+
+function sanitizeFlightRecorderEntry(entry = {}) {
+    const kind = sanitizeFlightRecorderString(entry?.kind || "")
+    if(!FLIGHT_RECORDER_KINDS.has(kind)) return null
+
+    const sanitized = {
+        at: sanitizeFlightRecorderInteger(entry?.at) || Date.now(),
+        seq: 0,
+        kind
+    }
+    const stringFields = [
+        "source",
+        "operationKind",
+        "rowKey",
+        "attemptId",
+        "runId",
+        "statusBefore",
+        "statusAfter",
+        "reason"
+    ]
+    for(const field of stringFields) {
+        const value = sanitizeFlightRecorderString(entry?.[field] || "")
+        if(value) sanitized[field] = value
+    }
+    const targetUrl = sanitizeFlightRecorderUrl(entry?.targetUrl || "")
+    if(targetUrl) sanitized.targetUrl = targetUrl
+
+    for(const field of ["attemptNumber", "tabId", "windowId", "elapsedMs"]) {
+        const value = sanitizeFlightRecorderInteger(entry?.[field])
+        if(value !== undefined) sanitized[field] = value
+    }
+    for(const field of ["accepted", "durable", "changed"]) {
+        const value = sanitizeFlightRecorderBoolean(entry?.[field])
+        if(value !== undefined) sanitized[field] = value
+    }
+
+    return sanitized
+}
+
+function getFlightRecorderBounds() {
+    const newestSeq = flightRecorderSeq
+    const retained = Math.min(newestSeq, FLIGHT_RECORDER_CAPACITY)
+    return {
+        oldestSeq: retained ? newestSeq - retained + 1 : 0,
+        newestSeq
+    }
+}
+
+function getFlightRecorderEntriesOrdered() {
+    const bounds = getFlightRecorderBounds()
+    const entries = []
+    for(let seq = bounds.oldestSeq; seq <= bounds.newestSeq; seq += 1) {
+        if(!seq) continue
+        const entry = flightRecorderEntries[seq % FLIGHT_RECORDER_CAPACITY]
+        if(entry?.seq === seq) entries.push({...entry})
+    }
+    return entries
+}
+
+function recordFlightRecorderEvent(entry = {}) {
+    try {
+        const sanitized = sanitizeFlightRecorderEntry(entry)
+        if(!sanitized) return false
+        flightRecorderSeq += 1
+        sanitized.seq = flightRecorderSeq
+        flightRecorderEntries[flightRecorderSeq % FLIGHT_RECORDER_CAPACITY] = sanitized
+        flightRecorderDroppedCount = Math.max(0, flightRecorderSeq - FLIGHT_RECORDER_CAPACITY)
+        return true
+    }
+    catch {
+        return false
+    }
+}
+
+function getFlightRecorderSnapshot(request = {}) {
+    try {
+        const bounds = getFlightRecorderBounds()
+        const limit = Math.max(1, Math.min(
+            FLIGHT_RECORDER_CAPACITY,
+            Number.parseInt(request?.limit, 10) || 100
+        ))
+        const sinceSeq = Math.max(0, Number.parseInt(request?.sinceSeq, 10) || 0)
+        const kind = sanitizeFlightRecorderString(request?.kind || "")
+        const rowKey = sanitizeFlightRecorderString(request?.rowKey || "")
+        const targetUrl = sanitizeFlightRecorderUrl(request?.targetUrl || "")
+        let entries = getFlightRecorderEntriesOrdered()
+            .filter(entry => entry.seq > sinceSeq)
+        if(kind) entries = entries.filter(entry => entry.kind === kind)
+        if(rowKey) entries = entries.filter(entry => entry.rowKey === rowKey)
+        if(targetUrl) entries = entries.filter(entry => entry.targetUrl === targetUrl)
+        entries = entries.slice(Math.max(0, entries.length - limit))
+        return {
+            readOnly: true,
+            capacity: FLIGHT_RECORDER_CAPACITY,
+            droppedCount: flightRecorderDroppedCount,
+            oldestSeq: bounds.oldestSeq,
+            newestSeq: bounds.newestSeq,
+            entries
+        }
+    }
+    catch {
+        return {
+            readOnly: true,
+            capacity: FLIGHT_RECORDER_CAPACITY,
+            droppedCount: flightRecorderDroppedCount,
+            oldestSeq: 0,
+            newestSeq: flightRecorderSeq,
+            entries: []
+        }
+    }
+}
+
+function getFlightRecorder(request = {}) {
+    return Promise.resolve(getFlightRecorderSnapshot(request))
+}
+
 
 function makeQueueWakeupMetricEpoch(resetReason = 'schema-reset', startedAt = Date.now()) {
     return {
@@ -3628,6 +3784,24 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
     }
     if(paused) return {changed: false, paused: true, actionBudget, actions: 0}
 
+    const preTerminalizedExhausted = await terminalizeExhaustedRolledBackQueuedCoordinatorItems(Object.values(queue), {
+        limit: actionBudget,
+        reason: 'executor-plan-active-transition-retry-budget-exhausted',
+        liveProfileTabsByHref
+    }).catch(error => ({
+        changed: false,
+        terminalized: 0,
+        keys: [],
+        reason: 'batch-terminalize-error',
+        error: error?.message || `${error || ''}`
+    }))
+    if(preTerminalizedExhausted?.terminalized > 0) {
+        actions += preTerminalizedExhausted.terminalized
+        terminalized += preTerminalizedExhausted.terminalized
+        currentAuthorityState = coordinatorAuthority.current()
+        incrementQueueWakeupMetric('reconcile.changed.terminalizedExhaustedRolledBack', preTerminalizedExhausted.terminalized)
+    }
+
     for(const tabId of Array.from(activeQueuedTabs)) {
         if(actions >= actionBudget) {
             budgetExhausted = true
@@ -3776,7 +3950,36 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                     actions += 1
                     if(requeueResult.status === 'queued') {
                         requeued += 1
-                        scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued-after-lease-release`)
+                        currentAuthorityState = coordinatorAuthority.current()
+                        const requeuedItem = requeueResult.item ||
+                            currentAuthorityState.queue?.[requeueResult.itemKey || itemKey] ||
+                            currentAuthorityState.queue?.[itemKey] ||
+                            null
+                        if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
+                            const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                                requeueResult.itemKey || itemKey,
+                                requeuedItem,
+                                {
+                                    currentAuthorityState,
+                                    reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                                }
+                            ).catch(error => ({
+                                changed: false,
+                                reason: 'terminalize-error',
+                                error: error?.message || `${error || ''}`
+                            }))
+                            if(terminalizeResult?.changed) {
+                                actions += 1
+                                terminalized += 1
+                                currentAuthorityState = coordinatorAuthority.current()
+                            }
+                            else {
+                                scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued-after-lease-release`)
+                            }
+                        }
+                        else {
+                            scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued-after-lease-release`)
+                        }
                     }
                     else if(requeueResult.adopted === true) {
                         adopted += 1
@@ -3880,7 +4083,36 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
         }
         else if(result.status === 'queued') {
             requeued += 1
-            scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued`)
+            currentAuthorityState = coordinatorAuthority.current()
+            const requeuedItem = result.item ||
+                currentAuthorityState.queue?.[result.itemKey || itemKey] ||
+                currentAuthorityState.queue?.[itemKey] ||
+                null
+            if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
+                const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                    result.itemKey || itemKey,
+                    requeuedItem,
+                    {
+                        currentAuthorityState,
+                        reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                    }
+                ).catch(error => ({
+                    changed: false,
+                    reason: 'terminalize-error',
+                    error: error?.message || `${error || ''}`
+                }))
+                if(terminalizeResult?.changed) {
+                    actions += 1
+                    terminalized += 1
+                    currentAuthorityState = coordinatorAuthority.current()
+                }
+                else {
+                    scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued`)
+                }
+            }
+            else {
+                scheduleCoordinatorQueueResume(1000, `${reason || 'reconcile'}-active-requeued`)
+            }
         }
         else if(isTerminalCoordinatorStatus(result.status)) failed += 1
         if(result.tabId) {
@@ -4890,6 +5122,33 @@ function getNextAttemptNumberFromValue(value = null) {
     return Math.max(1, getAttemptNumberFromValue(value) + 1)
 }
 
+function isAttemptTrackedCoordinatorItem(item = null) {
+    return !!item &&
+        isCoordinatorQueueAuthoritativeItem(item) &&
+        (getAttemptIdFromValue(item) || getAttemptNumberFromValue(item))
+}
+
+function isNewerTerminalProgressForCoordinatorItem(item = null, record = null) {
+    if(!item || !record) return false
+    if(isTerminalCoordinatorStatus(item?.status)) return false
+    if(!isTerminalProfileNukeRecord(record)) return false
+
+    const expectedAttemptNumber = getAttemptNumberFromValue(item)
+    const incomingAttemptNumber = getAttemptNumberFromValue(record)
+    if(!expectedAttemptNumber || !incomingAttemptNumber) return false
+    if(incomingAttemptNumber <= expectedAttemptNumber) return false
+
+    const itemRunId = `${item?.runId || ''}`.trim()
+    const recordRunId = `${record?.runId || ''}`.trim()
+    if(itemRunId && recordRunId && itemRunId !== recordRunId) return false
+
+    const itemQueuedAt = Number.parseInt(item?.queuedAt || item?.createdAt || 0, 10) || 0
+    const recordTerminalAt = Number.parseInt(record?.terminalAt || record?.tabClosedAt || record?.updatedAt || 0, 10) || 0
+    if(itemQueuedAt && recordTerminalAt && recordTerminalAt < itemQueuedAt) return false
+
+    return true
+}
+
 function normalizeCoordinatorMap(value) {
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 }
@@ -4906,6 +5165,8 @@ function hasMismatchedCoordinatorAttempt(item = null, record = null) {
         if(itemQueuedAt && recordTerminalAt && recordTerminalAt < itemQueuedAt) return true
     }
 
+    if(isNewerTerminalProgressForCoordinatorItem(item, record)) return false
+
     const expectedAttemptId = getAttemptIdFromValue(item)
     const incomingAttemptId = getAttemptIdFromValue(record)
     if(expectedAttemptId && incomingAttemptId && expectedAttemptId !== incomingAttemptId) return true
@@ -4913,6 +5174,11 @@ function hasMismatchedCoordinatorAttempt(item = null, record = null) {
     const expectedAttemptNumber = getAttemptNumberFromValue(item)
     const incomingAttemptNumber = getAttemptNumberFromValue(record)
     if(expectedAttemptNumber && incomingAttemptNumber && expectedAttemptNumber !== incomingAttemptNumber) return true
+
+    if(!isTerminalCoordinatorStatus(item?.status) && isAttemptTrackedCoordinatorItem(item)) {
+        if(expectedAttemptId && !incomingAttemptId) return true
+        if(expectedAttemptNumber && !incomingAttemptNumber) return true
+    }
 
     return !isTerminalCoordinatorStatus(item?.status) &&
         !!expectedAttemptId &&
@@ -6151,6 +6417,11 @@ function addContentPageStateProjectionPayload(payload = {}) {
 }
 
 async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refresh') {
+    recordFlightRecorderEvent({
+        kind: 'dashboard-refresh',
+        source: 'refreshCoordinatorQueueViewForDashboard',
+        reason
+    })
     const currentAuthorityState = await loadCoordinatorQueueProjection({
         metricPath: `queueView.${reason}`
     })
@@ -6159,6 +6430,12 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
     await metricStorageSet({
         [COORDINATOR_QUEUE_VIEW_KEY]: view
     }, {metricPath: `queueView.${reason}`})
+    recordFlightRecorderEvent({
+        kind: 'compact-view-materialized',
+        source: 'refreshCoordinatorQueueViewForDashboard',
+        reason,
+        changed: true
+    })
     return {
         refreshed: true,
         reason,
@@ -6428,6 +6705,8 @@ function mergeReducedCoordinatorProgressItem(item = {}, reducedItem = {}, legacy
 function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {}) {
     const now = Number.parseInt(options.now, 10) || Date.now()
     const resetRetry = options.resetRetry === true
+    const status = `${mapped.status || ''}`.trim()
+    const mappedTerminal = isTerminalCoordinatorStatus(status)
     const legacyItem = buildLegacyCoordinatorItemFromProgress(item, record, mapped, {
         ...options,
         now
@@ -6438,13 +6717,13 @@ function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = 
         outcome: mapped.outcome || '',
         error: mapped.error || '',
         at: now,
-        terminalAt: isTerminalCoordinatorStatus(mapped.status)
+        terminalAt: mappedTerminal
             ? getCoordinatorTransitionTerminalAt(item, record, now, options)
             : 0,
         tabId: getPersistedQueuedTabId(item, record) || null,
         attemptId: getAttemptIdFromValue(record) || getAttemptIdFromValue(item),
         attemptNumber: getAttemptNumberFromValue(record) || getAttemptNumberFromValue(item),
-        reason: isTerminalCoordinatorStatus(mapped.status) ? 'terminal-progress' : '',
+        reason: mappedTerminal ? 'terminal-progress' : '',
         milestones: getCoordinatorMilestonesFromProgress(record)
     }
     let reducerItem = item
@@ -6482,6 +6761,9 @@ function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = 
                 ...options,
                 now
             })
+        }
+        if(mappedTerminal) {
+            return legacyItem
         }
         return resetRetry ? legacyItem : item
     }
@@ -7472,6 +7754,23 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         }
     }
 
+    recordFlightRecorderEvent({
+        kind: 'authority-mutation',
+        source: 'persistCoordinatorAuthorityQueueWalMutation',
+        operationKind: record.operationKind || result.operationKind || '',
+        rowKey: result.rowKey || record.key || '',
+        targetUrl: getCoordinatorItemHref(result.nextRow || {}) || result.nextRow?.targetProfileHref || '',
+        attemptId: record.attemptId || getAttemptIdFromValue(result.nextRow || {}),
+        attemptNumber: record.attemptNumber || getAttemptNumberFromValue(result.nextRow || {}),
+        runId: record.runId || result.nextRow?.runId || '',
+        statusBefore: result.previousRow?.status || '',
+        statusAfter: result.nextRow?.status || record.status || '',
+        accepted: result.accepted === true,
+        durable: true,
+        changed: result.changed === true,
+        reason: result.reason || record.reason || ''
+    })
+
     return {
         saved: true,
         backend: 'queue-wal',
@@ -7630,6 +7929,24 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     }
     else {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionSaved')
+    }
+
+    for(const record of records) {
+        recordFlightRecorderEvent({
+            kind: 'authority-mutation',
+            source: 'persistCoordinatorAuthorityQueueWalBatchMutation',
+            operationKind: record.operationKind || operationKind || '',
+            rowKey: record.key || '',
+            targetUrl: getCoordinatorItemHref(record.value || {}) || record.value?.targetProfileHref || '',
+            attemptId: record.attemptId || getAttemptIdFromValue(record.value || {}),
+            attemptNumber: record.attemptNumber || getAttemptNumberFromValue(record.value || {}),
+            runId: record.runId || record.value?.runId || '',
+            statusAfter: record.value?.status || record.status || '',
+            accepted: true,
+            durable: true,
+            changed: true,
+            reason: record.reason || options.reason || ''
+        })
     }
 
     return {
@@ -11451,9 +11768,19 @@ function markQueuedTabExecutorActionPlanned(action = {}, decision = {}, reason =
     }
 }
 
+function isQueuedTabRetryBudgetReleaseReason(reason = '') {
+    const normalized = `${reason || ''}`.trim()
+    return normalized === 'active-transition-failed' ||
+        normalized === 'queued-tab-release-fast-executor-preflight' ||
+        /(?:^|-)active-missing-tab(?:-|$)/.test(normalized) ||
+        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(normalized) ||
+        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(normalized) ||
+        /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized)
+}
+
 function shouldAdvanceRolledBackQueuedTabBeforeOpen(item = null) {
     if(!item || isTerminalCoordinatorStatus(item.status) || isActiveCoordinatorStatus(item.status)) return false
-    return `${item.actionLeaseReleaseReason || ''}` === 'active-transition-failed' &&
+    return isQueuedTabRetryBudgetReleaseReason(item.actionLeaseReleaseReason) &&
         !!getAttemptIdFromValue(item) &&
         !!getAttemptNumberFromValue(item)
 }
@@ -11498,10 +11825,21 @@ async function planQueuedTabExecutorAction(action = {}, options = {}) {
         QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
         'queued tab open decision'
     ).catch(error => ({
-        open: true,
+        open: false,
         reason: 'open-decision-timeout',
+        authorityUnavailable: true,
         error: error?.message || `${error || ''}`
     }))
+    if(openDecision.authorityUnavailable === true) {
+        scheduleCoordinatorQueueResume(1000, 'queued-tab-open-decision-authority-unavailable', {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: 'queued-tab-open-decision-authority-unavailable',
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+    }
     if(!openDecision.open) return null
 
     return markQueuedTabExecutorActionPlanned(action, {
@@ -11764,10 +12102,21 @@ async function validateQueuedTabOpenAgainstCurrentAuthority(action = {}) {
         QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
         'queued tab final open decision'
     ).catch(error => ({
-        open: true,
+        open: false,
         reason: 'final-open-decision-timeout',
+        authorityUnavailable: true,
         error: error?.message || `${error || ''}`
     }))
+    if(openDecision.authorityUnavailable === true) {
+        scheduleCoordinatorQueueResume(1000, 'queued-tab-final-open-authority-unavailable', {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: 'queued-tab-final-open-authority-unavailable',
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+    }
 
     return openDecision
 }
@@ -11998,7 +12347,7 @@ async function shouldOpenQueuedTabAction(action = null, options = {}) {
         progress = currentAuthorityState.progress
     }
     catch {
-        return {open: true, reason: 'queue-read-failed'}
+        return {open: false, reason: 'queue-read-failed', authorityUnavailable: true}
     }
 
     const item = normalizedHref
@@ -12298,26 +12647,6 @@ function shouldKeepQueuedTabOpenAfterActiveTransitionFailure(action = {}, tab = 
     if(hasMismatchedCoordinatorAttempt(expectedAttempt, record)) return false
 
     return hasActiveQueuedTabActionPhaseProgress(record, metadata)
-}
-
-function shouldDeferWorkerWindowActiveTransitionFailure(action = {}, tab = {}, plan = {}) {
-    const tabId = normalizeTabId(tab?.id)
-    if(!tabId) return false
-
-    const metadata = getQueuedTabMetadata(tabId) || plan?.metadata || {}
-    const actionSurfaceMode = action?.actionSurfaceMode || metadata?.actionSurfaceMode || ''
-    const noForegroundFallback = action?.noForegroundFallback === true || metadata?.noForegroundFallback === true
-    if(actionSurfaceMode !== 'worker-window' || !noForegroundFallback) return false
-    if(metadata?.closeRequestedAt || metadata?.closeReason) return false
-
-    const profileHref = normalizeQuoraProfileUrl(
-        action?.profileHref ||
-        action?.targetProfileHref ||
-        action?.url ||
-        metadata?.profileHref ||
-        ''
-    )
-    return !!profileHref
 }
 
 async function rollbackFailedQueuedTabOpen(action = {}, tab = {}, details = {}) {
@@ -13068,6 +13397,23 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         currentAuthorityState = orphanProfileTabs.authorityState || coordinatorAuthority.current()
         liveProfileTabsByHref = await getLiveProfileTabsByHref()
     }
+    let terminalizedExhausted = 0
+    const preTerminalizedExhausted = await terminalizeExhaustedRolledBackQueuedCoordinatorItems(Object.values(currentAuthorityState.queue || {}), {
+        limit: COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT,
+        reason: 'executor-plan-active-transition-retry-budget-exhausted',
+        liveProfileTabsByHref
+    }).catch(error => ({
+        changed: false,
+        terminalized: 0,
+        keys: [],
+        reason: 'batch-terminalize-error',
+        error: error?.message || `${error || ''}`
+    }))
+    terminalizedExhausted += preTerminalizedExhausted?.terminalized || 0
+    if(terminalizedExhausted > 0) {
+        currentAuthorityState = coordinatorAuthority.current()
+        incrementMetric('changed.terminalizedExhaustedRolledBack', terminalizedExhausted)
+    }
     const queue = currentAuthorityState.queue
     const progress = options.queueOnlyAuthority === true ? {} : currentAuthorityState.progress
     const pendingItems = []
@@ -13134,7 +13480,26 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                             null
                         const requeuedHref = getCoordinatorItemHref(requeuedItem) || normalizeQuoraProfileUrl(requeueResult.itemKey || itemKey)
                         const requeuedCoordinatorKey = getCoordinatorItemQueueKey(requeuedItem, requeueResult.itemKey || itemKey)
-                        if(requeuedItem &&
+                        if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
+                            const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                                requeueResult.itemKey || itemKey,
+                                requeuedItem,
+                                {
+                                    currentAuthorityState,
+                                    reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                                }
+                            ).catch(error => ({
+                                changed: false,
+                                reason: 'terminalize-error',
+                                error: error?.message || `${error || ''}`
+                            }))
+                            if(terminalizeResult?.changed) {
+                                terminalizedExhausted += 1
+                                currentAuthorityState = coordinatorAuthority.current()
+                                incrementMetric('changed.requeuedMissingActiveTabTerminalized')
+                            }
+                        }
+                        else if(requeuedItem &&
                             (requeuedHref || requeuedCoordinatorKey) &&
                             shouldResumeCoordinatorItem(requeuedItem, liveProfileTabsByHref, {record: null})) {
                             pendingItems.push({
@@ -13210,6 +13575,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 pending: 0,
                 adopted,
                 requeued,
+                terminalizedExhausted,
                 paused: false,
                 reason: 'requeued-missing-active-tabs'
             }
@@ -13233,7 +13599,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         liveProfileTabsByHref
     })
     const queued = enqueueResult.queued || 0
-    const terminalizedExhausted = enqueueResult.terminalizedExhausted || 0
+    terminalizedExhausted += enqueueResult.terminalizedExhausted || 0
     if(queued > 0 || adopted > 0) {
         if(options.queuedMetricSuffix) incrementMetric(options.queuedMetricSuffix, queued)
     }
@@ -13257,6 +13623,14 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
 }
 
 async function kickCoordinatorQueueResume(reason = 'resume-request', options = {}) {
+    recordFlightRecorderEvent({
+        kind: 'start-resume',
+        source: 'kickCoordinatorQueueResume',
+        reason,
+        accepted: true,
+        durable: options.forceDurableQueueReload === true,
+        changed: options.direct === true || options.backgroundFastPath === true
+    })
     const cycle = startQueueWakeupMetricCycle('pump', 'kickCoordinatorQueueResume', reason, {
         direct: options.direct === true
     })
@@ -13382,6 +13756,14 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
 }
 
 async function startUserInitiatedCoordinatorQueueResume(reason = 'dashboard-resume', options = {}) {
+    recordFlightRecorderEvent({
+        kind: 'start-resume',
+        source: 'startUserInitiatedCoordinatorQueueResume',
+        reason,
+        accepted: true,
+        durable: true,
+        changed: true
+    })
     const allowBeforeQuora = options.allowBeforeQuora === true
     const startedAt = Date.now()
     const startedActiveRows = Number.parseInt(
@@ -13699,6 +14081,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
         pending: applyResult.pending || 0,
         active: applyResult.active,
         adopted: applyResult.adopted || 0,
+        requeued: applyResult.requeued || 0,
         terminalizedExhausted: applyResult.terminalizedExhausted || 0,
         reason: applyResult.reason
     }
@@ -19597,6 +19980,14 @@ async function restoreQueuedActionSurfaceCallerFocus(previousActiveTab = null) {
     const restored = await browser.tabs.update(previousActiveTab.id, {active: true}).catch(() => null)
     const windowId = restored?.windowId || previousActiveTab.windowId || null
     if(windowId && browser.windows?.update) {
+        recordFlightRecorderEvent({
+            kind: 'window-focus-request',
+            source: 'restoreQueuedActionSurfaceCallerFocus',
+            tabId: previousActiveTab.id,
+            windowId,
+            accepted: true,
+            reason: 'restore-caller-focus'
+        })
         await browser.windows.update(windowId, {focused: true}).catch(() => null)
     }
     return !!restored
@@ -19731,6 +20122,14 @@ async function createOwnedTab(action = {}) {
 }
 
 async function createQueuedExecutorBrowserTab(options = {}, label = 'queued executor tab create') {
+    recordFlightRecorderEvent({
+        kind: 'tab-open-request',
+        source: 'createQueuedExecutorBrowserTab',
+        targetUrl: options.url || '',
+        windowId: options.windowId || null,
+        accepted: true,
+        reason: label
+    })
     let timedOut = false
     let settled = false
     let timeoutId = null
@@ -19831,6 +20230,15 @@ async function restoreBackgroundQueuedTabFocus(tab = null, previousActiveTab = n
     const restored = await browser.tabs.update(previousActiveTab.id, {active: true}).catch(() => null)
     const windowId = restored?.windowId || previousActiveTab.windowId || null
     if(windowId && browser.windows?.update) {
+        recordFlightRecorderEvent({
+            kind: 'window-focus-request',
+            source: 'restoreBackgroundQueuedTabFocus',
+            tabId: previousActiveTab.id,
+            targetUrl: action.profileHref || action.targetProfileHref || action.url || '',
+            windowId,
+            accepted: true,
+            reason: 'restore-background-tab-focus'
+        })
         await browser.windows.update(windowId, {focused: true}).catch(() => null)
     }
     if(action.profileHref || action.targetProfileHref || action.url) {
@@ -20449,6 +20857,19 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
 
     const windowId = updateResult.windowId || tab.windowId || metadata?.ownerWindowId || null
     if(windowId && browser.windows?.update && (!actionSurfaceMode || isForegroundRequiredProfileActionRequest({reason}))) {
+        recordFlightRecorderEvent({
+            kind: 'window-focus-request',
+            source: 'promoteQueuedTab',
+            rowKey: metadata?.coordinatorKey || metadata?.profileHref || '',
+            targetUrl: metadata?.profileHref || metadata?.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(metadata || {}),
+            attemptNumber: getAttemptNumberFromValue(metadata || {}),
+            runId: metadata?.runId || '',
+            tabId: normalizedTabId,
+            windowId,
+            accepted: true,
+            reason
+        })
         await browser.windows.update(windowId, {focused: true}).catch(() => null)
     }
 
@@ -22999,6 +23420,21 @@ async function releaseQueuedTab(tabId, options = {}) {
         incrementQueueWakeupMetric('job.releaseIgnored.noRuntimeState')
     }
 
+    recordFlightRecorderEvent({
+        kind: 'tab-action-release',
+        source: 'releaseQueuedTab',
+        rowKey: metadata?.coordinatorKey || metadata?.profileHref || '',
+        targetUrl: metadata?.profileHref || metadata?.requestedUrl || '',
+        attemptId: getAttemptIdFromValue(metadata || pendingAction || {}),
+        attemptNumber: getAttemptNumberFromValue(metadata || pendingAction || {}),
+        runId: metadata?.runId || pendingAction?.runId || '',
+        tabId,
+        accepted: hadQueuedRuntimeState === true,
+        durable: wasActive === true,
+        changed: wasActive === true || hadPendingAction === true,
+        reason: metadata?.closeReason || options.reason || 'queued-tab-slot-release'
+    })
+
     if(options.awaitFill === true) {
         return Promise.resolve(followUpPromise || null).then(result => ({
             ...(result && typeof result === 'object' ? result : {}),
@@ -23278,13 +23714,32 @@ async function claimPendingTabAction(sender = {}) {
         ? null
         : await recoverPendingTabActionFromCoordinatorQueue(sender)
     const action = pendingTabActions.get(tabId) || recovered?.action || null
-    if(!action) return null
+    if(!action) {
+        recordFlightRecorderEvent({
+            kind: 'tab-action-claim',
+            source: 'claimPendingTabAction',
+            tabId,
+            accepted: false,
+            reason: 'no-pending-action'
+        })
+        return null
+    }
 
     const metadata = getQueuedTabMetadata(tabId) || recovered?.metadata || null
     const claimableAction = makeClaimableQueuedTabAction(action, metadata)
     const normalizedHref = normalizeQuoraProfileUrl(metadata?.profileHref || claimableAction?.targetUrl || '')
     const coordinatorKey = metadata?.coordinatorKey || claimableAction?.coordinatorKey || ''
-    if(!metadata || (!normalizedHref && !coordinatorKey)) return claimableAction
+    if(!metadata || (!normalizedHref && !coordinatorKey)) {
+        recordFlightRecorderEvent({
+            kind: 'tab-action-claim',
+            source: 'claimPendingTabAction',
+            targetUrl: claimableAction?.targetUrl || '',
+            tabId,
+            accepted: false,
+            reason: 'missing-claim-metadata'
+        })
+        return claimableAction
+    }
 
     const attemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(claimableAction) || ''
     const attemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(claimableAction) || 0
@@ -23353,6 +23808,19 @@ async function claimPendingTabAction(sender = {}) {
     }
 
     if(!durableClaimed) {
+        recordFlightRecorderEvent({
+            kind: 'tab-action-claim',
+            source: 'claimPendingTabAction',
+            rowKey: coordinatorKey || normalizedHref || '',
+            targetUrl: normalizedHref || durableClaimAction.requestedUrl || '',
+            attemptId,
+            attemptNumber,
+            runId: durableClaimAction.runId || '',
+            tabId,
+            accepted: false,
+            durable: false,
+            reason: 'claim-durable-confirmation-failed'
+        })
         scheduleCoordinatorReconcile(1000, {
             reason: 'claim-durable-confirmation-failed',
             edgeTriggered: true
@@ -23361,6 +23829,20 @@ async function claimPendingTabAction(sender = {}) {
     }
 
     markQueuedTabDurablyActive(tabId, 'claim-current-profile-tab-action')
+    recordFlightRecorderEvent({
+        kind: 'tab-action-claim',
+        source: 'claimPendingTabAction',
+        rowKey: coordinatorKey || normalizedHref || '',
+        targetUrl: normalizedHref || durableClaimAction.requestedUrl || '',
+        attemptId,
+        attemptNumber,
+        runId: durableClaimAction.runId || '',
+        tabId,
+        accepted: true,
+        durable: true,
+        changed: true,
+        reason: 'claim-current-profile-tab-action'
+    })
     incrementQueueWakeupMetric('job.claimAccepted')
     if(openedAt) recordQueueWakeupPhase('tabOpenToClaimAccepted', Date.now() - openedAt)
 
@@ -24771,6 +25253,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     senderTabId: options.senderTabId || null,
                     message: 'Ignored direct job progress from stale attempt'
                 })
+                results[normalizedHref] = {recorded: false, terminal: false, reason: 'stale-attempt'}
             }
             else if(!item) {
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'missing-coordinator-item'}
@@ -24797,7 +25280,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                 }
             }
 
-            results[normalizedHref] = {recorded: accepted, terminal, record}
+            if(!results[normalizedHref]) {
+                results[normalizedHref] = {recorded: accepted, terminal, record}
+            }
         }
 
         const nextRuns = affectedRunIds.size
@@ -25315,22 +25800,16 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
             'queued tab active confirmation check'
         ).catch(() => false)
         if(!activeTransitionAccepted) {
-            const deferredWorkerWindowTransition = shouldDeferWorkerWindowActiveTransitionFailure(action, tab, plan)
-            activeTransitionContinued = deferredWorkerWindowTransition || shouldKeepQueuedTabOpenAfterActiveTransitionFailure(
+            activeTransitionContinued = shouldKeepQueuedTabOpenAfterActiveTransitionFailure(
                 action,
                 tab,
                 plan.activeTransitionDetails || {}
             )
         }
         if(activeTransitionContinued) {
-            const deferredWorkerWindowTransition = shouldDeferWorkerWindowActiveTransitionFailure(action, tab, plan)
             setQueuedTabMetadata(tab.id, {
                 activeTransitionContinuedAt: Date.now(),
-                activeTransitionError,
-                ...(deferredWorkerWindowTransition ? {
-                    activeTransitionDeferredAt: Date.now(),
-                    activeTransitionDeferredReason: 'worker-window-opening'
-                } : {})
+                activeTransitionError
             })
             scheduleCoordinatorQueueResume(1000, 'active-transition-continued', {
                 allowBeforeQuora: true
@@ -25535,6 +26014,14 @@ async function fillQueuedTabsOnce(options = {}) {
         throttle
     })
     let openedTabs = 0
+    recordFlightRecorderEvent({
+        kind: 'fill-decision',
+        source: 'fillQueuedTabsOnce',
+        reason: options.reason || 'fill-slots',
+        accepted: queuedTabActions.length > 0,
+        durable: options.queueOnlyAuthority === true,
+        changed: false
+    })
 
     const pausedState = options.pauseAlreadyChecked === true
         ? null
@@ -25545,6 +26032,13 @@ async function fillQueuedTabsOnce(options = {}) {
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: 'coordinator-paused',
+            accepted: false,
+            changed: false
         })
         return {
             openedTabs: 0,
@@ -25570,6 +26064,13 @@ async function fillQueuedTabsOnce(options = {}) {
             retryInMs: delayMs,
             throttleLevel: throttle.level,
             reason: throttle.reason
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: 'queue-load-throttled',
+            accepted: false,
+            changed: false
         })
         return {
             openedTabs: 0,
@@ -25811,6 +26312,13 @@ async function fillQueuedTabsOnce(options = {}) {
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length
         })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: 'opened-tab',
+            accepted: true,
+            changed: true
+        })
         return {
             openedTabs,
             active: activeQueuedTabs.size,
@@ -25825,6 +26333,13 @@ async function fillQueuedTabsOnce(options = {}) {
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: 'no-tab-opened',
+            accepted: false,
+            changed: false
         })
         return {
             openedTabs: 0,
@@ -26611,6 +27126,9 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     else if(request.action === 'get-coordinator-why-not-running') {
         return getCoordinatorWhyNotRunning(request)
+    }
+    else if(request.action === 'get-flight-recorder') {
+        return getFlightRecorder(request)
     }
     else if(request.action === 'refresh-queue-wakeup-metrics-view') {
         return refreshQueueWakeupMetricsViewForDashboard(request.reason || 'dashboard-refresh')

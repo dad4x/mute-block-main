@@ -178,6 +178,76 @@ test('rejects stale attempt patches', () => {
     assert.equal(projected.ignored[0].reason, 'stale-attempt')
 })
 
+test('allows same-attempt-number terminal replay after actorless requeue changed attempt id', () => {
+    const state = baseState()
+    state.queue['https://www.quora.com/profile/A'] = {
+        ...state.queue['https://www.quora.com/profile/A'],
+        status: 'queued',
+        attemptId: 'attempt-requeued-without-actor',
+        attemptNumber: 2,
+        actionLeaseReleaseReason: 'runtime-authority-missing-active-row'
+    }
+    const checkpoint = makeCheckpoint(state, {snapshotSeq: 0})
+    const projected = projectSnapshot(checkpoint, [{
+        seq: 1,
+        id: 'old-actor-terminal-same-number',
+        kind: 'map.set',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        operationKind: 'terminal-progress',
+        terminal: true,
+        attemptId: 'attempt-old-actor',
+        attemptNumber: 2,
+        value: {
+            status: 'failed',
+            outcome: 'action-error',
+            error: 'Durable active queue row had no confirmed runtime actor',
+            attemptId: 'attempt-old-actor',
+            attemptNumber: 2,
+            runId: 'run-1',
+            terminalAt: 1500
+        }
+    }])
+
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].status, 'failed')
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].outcome, 'action-error')
+    assert.deepEqual(projected.ignored, [])
+})
+
+test('rejects same-attempt-number nonterminal replay after actorless requeue changed attempt id', () => {
+    const state = baseState()
+    state.queue['https://www.quora.com/profile/A'] = {
+        ...state.queue['https://www.quora.com/profile/A'],
+        status: 'queued',
+        attemptId: 'attempt-requeued-without-actor',
+        attemptNumber: 2,
+        actionLeaseReleaseReason: 'runtime-authority-missing-active-row'
+    }
+    const checkpoint = makeCheckpoint(state, {snapshotSeq: 0})
+    const projected = projectSnapshot(checkpoint, [{
+        seq: 1,
+        id: 'old-actor-nonterminal-same-number',
+        kind: 'map.set',
+        area: 'queue',
+        key: 'https://www.quora.com/profile/A',
+        operationKind: 'active-transition',
+        attemptId: 'attempt-old-actor',
+        attemptNumber: 2,
+        value: {
+            status: 'active',
+            attemptId: 'attempt-old-actor',
+            attemptNumber: 2,
+            runId: 'run-1',
+            tabId: 42
+        }
+    }])
+
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].status, 'queued')
+    assert.equal(projected.state.queue['https://www.quora.com/profile/A'].attemptId, 'attempt-requeued-without-actor')
+    assert.equal(projected.ignored.length, 1)
+    assert.equal(projected.ignored[0].reason, 'stale-attempt')
+})
+
 test('rejects non-terminal regression after terminal state', () => {
     const state = baseState()
     state.queue['https://www.quora.com/profile/A'].status = 'succeeded'

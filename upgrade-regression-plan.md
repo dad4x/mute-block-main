@@ -512,3 +512,128 @@ immediate next step while validating the non-work-starting suite.
 Those later phases must still preserve the architecture boundary: WAL-backed
 queue authority only, no legacy full-progress storage, no legacy import, and no
 repair-style compatibility behavior.
+
+## Phase 8 One-Item Queue Authority Smoke
+
+Phase 8 is the first work-producing browser upgrade test. It must run only in a
+disposable logged-in profile copied from the authenticated non-work-starting
+profile, or in a fresh logged-in profile. Do not run it against the main
+working profile.
+
+The phase is gated so it cannot run accidentally:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label disposable-phase8-one-item \
+  --phase phase8-one-item-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=elon%20musk&type=profile' \
+  --phase8-target-profile-href https://www.quora.com/profile/example \
+  --phase8-timeout-ms 120000 \
+  --allow-work-producing
+```
+
+If `--phase8-target-profile-href` is omitted, the runner clicks the first
+enabled profile-search row button. Supplying an already-blocked, harmless, or
+throwaway profile URL is preferred.
+
+Phase 8 behavior:
+
+- Opens or reuses the profile-search page and verifies actionable extension
+  candidate controls.
+- Pauses coordinator work before queueing so the post-enqueue checkpoint can
+  inspect durable queued authority before Start.
+- Queues exactly one profile through the real profile-search row UI button.
+- Asserts one durable queue row, one compact queue view row, and queue WAL
+  records.
+- Restarts the service worker before Start, wakes it through current diagnostic
+  actions, and verifies the queued row hydrates from authority.
+- Resumes the paused coordinator and calls the user-equivalent Start path:
+  `resume-coordinator-queue` with `userInitiated: true`.
+- Waits for one terminal row with bounded timeout.
+- Restarts the service worker after terminal, wakes it, and verifies terminal
+  state hydrates without reopening work.
+
+Accepted terminal outcomes are succeeded, skipped, canceled, or cancelled. A
+failed terminal is treated as a Phase 8 failure because this smoke is intended
+to prove the smallest happy or already-settled queue authority path.
+
+Hard stops:
+
+- extension ID is not `nlmmkoljofpgbmlcojebolmniineboah`
+- queue authority is non-empty before the one-item enqueue
+- full legacy `mbProfileNukeProgress` appears
+- legacy repair/import alarm appears
+- no queue WAL records appear after enqueue
+- compact queue view does not agree with the durable queue row count
+- active/queued state remains after the terminal timeout
+- queued action-surface records remain after terminal or after terminal hydrate
+- terminal hydrate reopens work after service-worker restart
+
+## Phase 9 Small Batch Queue Authority Smoke
+
+Phase 9 is the bounded small-batch work-producing smoke. It should still run in
+a disposable logged-in profile. For the current upgrade investigation, the
+operator explicitly allowed using the warmed current profile, so Phase 9 scopes
+its assertions to the selected targets and forbids unrelated active/queued
+growth instead of requiring globally empty terminal history.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label disposable-phase9-small-batch \
+  --phase phase9-small-batch-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=tim%20cook&type=profile' \
+  --phase9-target-count 3 \
+  --phase9-timeout-ms 240000 \
+  --allow-work-producing
+```
+
+Phase 9 behavior:
+
+- Opens or reuses the profile-search page and verifies actionable extension
+  candidate controls.
+- Selects 3 to 5 enabled profile-search row buttons and records the exact
+  normalized profile URLs before clicking.
+- Temporarily sets `profilesPerBatch` to 1 before opening/reloading the search
+  page so the profile-search UI enqueues low-concurrency rows, then restores
+  the prior value before the report is finalized.
+- Pauses coordinator work before queueing.
+- Queues each selected target through its real row UI button.
+- Asserts every selected target has one durable queue authority row, one compact
+  queue view row, and queue WAL records before Start.
+- Restarts the service worker before Start and verifies the selected queued rows
+  hydrate from WAL/current authority.
+- Resumes the paused coordinator and calls the user-equivalent Start path once:
+  `resume-coordinator-queue` with `userInitiated: true`.
+- Waits for all selected targets to reach terminal state with a bounded timeout.
+- Restarts the service worker after terminal and verifies terminal rows hydrate
+  without reopening selected or unrelated work.
+
+Accepted terminal outcomes are succeeded, skipped, canceled, or cancelled. The
+runner tracks rows by normalized profile URL and fails on any selected row that
+remains active/opening/acting after the timeout. It also fails if any
+active/queued row is visible outside the selected target set.
+
+Hard stops:
+
+- extension ID is not `nlmmkoljofpgbmlcojebolmniineboah`
+- fewer than the requested number of enabled profile-search row buttons exist
+- any selected row is missing durable queue authority or compact queue view
+- service-worker restart loses queued or terminal selected rows
+- full legacy `mbProfileNukeProgress` appears
+- legacy repair/import alarm appears
+- no queue WAL records appear after enqueue
+- queued action-surface records remain after terminal or after terminal hydrate
+- unrelated active/queued rows appear outside the selected target set
+
+Live status on 2026-06-04: Phase 9 runner implementation is present, but the
+current warmed profile did not pass. Reports under `tmp/upgrade-regression/`
+show selected rows entering WAL/current authority with no legacy full-progress
+storage, no repair/import alarm, and no queued action-surface leak. The failures
+were current-authority behavior: one concurrent Tim Cook run failed
+`active-without-actor`, and low-concurrency Sundar Pichai left one selected row
+queued after the bounded timeout while compact queue view state later diverged
+from raw authority for another selected row. Treat Phase 9 as an active
+regression exposing queue continuation/projection issues, not as a validated
+baseline.

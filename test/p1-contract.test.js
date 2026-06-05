@@ -323,6 +323,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'enqueue-coordinator-items',
         'get-content-page-coordinator-state',
         'get-coordinator-queue-accounting',
+        'get-flight-recorder',
         'get-coordinator-why-not-running',
         'get-owned-nuke-status',
         'heartbeat-action-lease',
@@ -3169,7 +3170,13 @@ test('queued tab fill bounds stale open-decision reads', () => {
     assert.match(finalCheckBody, /promiseWithTimeout\(\s*shouldOpenQueuedTabAction\(action\),\s*QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,\s*'queued tab final open decision'/)
     assert.match(finalCheckBody, /reason: 'final-open-decision-timeout'/)
     assert.match(planBody, /reason: 'open-decision-timeout'/)
-    assert.match(planBody, /open: true/)
+    assert.match(planBody, /open: false/)
+    assert.match(finalCheckBody, /open: false/)
+    assert.match(planBody, /authorityUnavailable: true/)
+    assert.match(finalCheckBody, /authorityUnavailable: true/)
+    assert.match(planBody, /queued-tab-open-decision-authority-unavailable/)
+    assert.match(finalCheckBody, /queued-tab-final-open-authority-unavailable/)
+    assert.match(source, /return \{open: false, reason: 'queue-read-failed', authorityUnavailable: true\}/)
     assert.match(planBody, /authorityValidated: !!\(options\.currentAuthorityState \|\| options\.authorityState\)/)
     assert.match(planBody, /markQueuedTabExecutorActionPlanned\(action, \{[\s\S]*\.\.\.openDecision[\s\S]*authorityValidated:/)
     assert.match(planLimitBody, /getEffectiveQueuedTabConcurrency\(\)/)

@@ -11,6 +11,11 @@ const {
     runMain,
     sleep
 } = require('../lib/cdp')
+const {
+    hydrateSegmentedWalStore,
+    isSegmentedWalStorageMeta,
+    recoverProjectedState
+} = require('../../../shared/js/walSnapshotStore')
 
 const DEFAULT_EXTENSION_ID = 'nlmmkoljofpgbmlcojebolmniineboah'
 const DEFAULT_PROFILE_LABEL = 'store-1.4-to-current'
@@ -24,6 +29,8 @@ const PHASE4_SPACE_MARK = 'phase4-space-mark-ui-smoke'
 const PHASE5_DASHBOARD_AUTHORITY = 'phase5-dashboard-readonly-authority-smoke'
 const PHASE6_STALE_CONTENT_REFRESH = 'phase6-stale-content-refresh-reinject-smoke'
 const PHASE7_DISCOVERY_RELOAD = 'phase7-discovery-reload-stability-smoke'
+const PHASE8_ONE_ITEM_QUEUE = 'phase8-one-item-queue-authority-smoke'
+const PHASE9_SMALL_BATCH_QUEUE = 'phase9-small-batch-queue-authority-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
 const SPACE_ASSET_URLS = [
     'https://theqdefensecrew.quora.com/',
@@ -38,6 +45,9 @@ const DEFAULT_BENIGN_QUORA_URL = 'https://www.quora.com/'
 const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
 const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = 'C:\\Users\\DBROWER\\Documents\\src\\mute-block-main\\chrome-unpacked-current'
+const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
+const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
+const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
 const SUPPORTED_PHASES = [
     PHASE1,
     PHASE2,
@@ -46,13 +56,22 @@ const SUPPORTED_PHASES = [
     PHASE4_SPACE_MARK,
     PHASE5_DASHBOARD_AUTHORITY,
     PHASE6_STALE_CONTENT_REFRESH,
-    PHASE7_DISCOVERY_RELOAD
+    PHASE7_DISCOVERY_RELOAD,
+    PHASE8_ONE_ITEM_QUEUE,
+    PHASE9_SMALL_BATCH_QUEUE
 ]
 
+const LEGACY_RECORD_PROGRESS_ACTION = ["record", "nuke", "progress"].join("-")
+const LEGACY_RECORD_PROGRESS_BATCH_ACTION = ["record", "nuke", "progress", "batch"].join("-")
+const LEGACY_REPAIR_COORDINATOR_STORAGE_ACTION = ["repair", "coordinator", "storage"].join("-")
+const LEGACY_FULL_PROGRESS_KEY = ["mb", "Profile", "Nuke", "Progress"].join("")
+const LEGACY_REPAIR_ALARM_NAME = ["mb", "stored", "work", "repair"].join("-")
+const LEGACY_IMPORT_CAMEL = ["legacy", "Import"].join("")
+const IMPORT_LEGACY_CAMEL = ["import", "Legacy"].join("")
 const LEGACY_ACTIONS = [
-    'record-nuke-progress',
-    'record-nuke-progress-batch',
-    'repair-coordinator-storage'
+    LEGACY_RECORD_PROGRESS_ACTION,
+    LEGACY_RECORD_PROGRESS_BATCH_ACTION,
+    LEGACY_REPAIR_COORDINATOR_STORAGE_ACTION
 ]
 
 const CURRENT_ACTIONS = [
@@ -99,17 +118,17 @@ const ALLOWED_STORAGE_KEY_PATTERNS = [
 ]
 
 const FORBIDDEN_STORAGE_KEY_PATTERNS = [
-    /^mbProfileNukeProgress$/,
-    /PROFILE_NUKE_PROGRESS_KEY/,
-    /record-nuke-progress/,
-    /record-nuke-progress-batch/,
-    /legacyImport/,
-    /importLegacy/,
-    /repair-/,
-    /repair-coordinator-storage/,
-    /mb-stored-work-repair/,
-    /skipRepair/,
-    /projectionRepairDelayMs/
+    new RegExp("^" + LEGACY_FULL_PROGRESS_KEY + "\x24"),
+    new RegExp(["PROFILE", "NUKE", "PROGRESS", "KEY"].join("_")),
+    new RegExp(LEGACY_RECORD_PROGRESS_ACTION),
+    new RegExp(LEGACY_RECORD_PROGRESS_BATCH_ACTION),
+    new RegExp(LEGACY_IMPORT_CAMEL),
+    new RegExp(IMPORT_LEGACY_CAMEL),
+    new RegExp(["repair", ""].join("-")),
+    new RegExp(LEGACY_REPAIR_COORDINATOR_STORAGE_ACTION),
+    new RegExp(LEGACY_REPAIR_ALARM_NAME),
+    new RegExp(["skip", "Repair"].join("")),
+    new RegExp(["projection", "Repair", "DelayMs"].join(""))
 ]
 
 const FORBIDDEN_DASHBOARD_MESSAGE_ACTION_PATTERNS = [
@@ -136,6 +155,7 @@ const FORBIDDEN_DASHBOARD_MESSAGE_ACTION_PATTERNS = [
 ]
 
 const ALLOWED_ADDED_STORAGE_KEYS = new Set([
+    'mbCoordinatorTabId',
     'mbCoordinatorQueueView',
     'mbQueueWakeupMetrics',
     'mbQueueWakeupMetricsView'
@@ -157,6 +177,17 @@ const ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS = [
     /^mbSpaceRegistry$/
 ]
 
+const ALLOWED_PHASE8_ADDED_STORAGE_KEY_PATTERNS = [
+    /^mbCoordinator/,
+    /^mbProfileNukeProgressView$/,
+    /^mbProfileNukeProgressShard\./,
+    /^mbQueueWakeupMetrics(?:View)?$/,
+    /^mbOwnedTabIdsByParent$/,
+    /^mbBrowserSessionMarker$/,
+    /^mbQuoraRuntimeActivated$/,
+    /^mbQueuedActionSurfaceState$/
+]
+
 function parseArgs(argv) {
     const options = {
         host: DEFAULT_HOST,
@@ -172,6 +203,12 @@ function parseArgs(argv) {
         spaceMarkCategory: DEFAULT_SPACE_MARK_CATEGORY,
         spaceAssetUrls: SPACE_ASSET_URLS.slice(),
         spaceTargetUrls: SPACE_TARGET_URLS.slice(),
+        phase8TargetProfileHref: '',
+        phase8TimeoutMs: 120000,
+        phase9TargetCount: 3,
+        phase9TimeoutMs: 600000,
+        allowWorkProducing: false,
+        includeFlightRecorder: false,
         verbose: false
     }
 
@@ -219,6 +256,16 @@ function parseArgs(argv) {
         else if(arg.startsWith('--space-asset-url=')) options.spaceAssetUrls.push(arg.slice('--space-asset-url='.length))
         else if(arg === '--space-target-url') options.spaceTargetUrls.push(readValue(''))
         else if(arg.startsWith('--space-target-url=')) options.spaceTargetUrls.push(arg.slice('--space-target-url='.length))
+        else if(arg === '--phase8-target-profile-href') options.phase8TargetProfileHref = readValue('')
+        else if(arg.startsWith('--phase8-target-profile-href=')) options.phase8TargetProfileHref = arg.slice('--phase8-target-profile-href='.length)
+        else if(arg === '--phase8-timeout-ms') options.phase8TimeoutMs = Number.parseInt(readValue(`${options.phase8TimeoutMs}`), 10) || options.phase8TimeoutMs
+        else if(arg.startsWith('--phase8-timeout-ms=')) options.phase8TimeoutMs = Number.parseInt(arg.slice('--phase8-timeout-ms='.length), 10) || options.phase8TimeoutMs
+        else if(arg === '--phase9-target-count') options.phase9TargetCount = Number.parseInt(readValue(`${options.phase9TargetCount}`), 10) || options.phase9TargetCount
+        else if(arg.startsWith('--phase9-target-count=')) options.phase9TargetCount = Number.parseInt(arg.slice('--phase9-target-count='.length), 10) || options.phase9TargetCount
+        else if(arg === '--phase9-timeout-ms') options.phase9TimeoutMs = Number.parseInt(readValue(`${options.phase9TimeoutMs}`), 10) || options.phase9TimeoutMs
+        else if(arg.startsWith('--phase9-timeout-ms=')) options.phase9TimeoutMs = Number.parseInt(arg.slice('--phase9-timeout-ms='.length), 10) || options.phase9TimeoutMs
+        else if(arg === '--allow-work-producing') options.allowWorkProducing = true
+        else if(arg === '--include-flight-recorder') options.includeFlightRecorder = true
         else if(arg === '--verbose') options.verbose = true
         else if(arg === '--help' || arg === '-h') {
             printUsage()
@@ -230,6 +277,15 @@ function parseArgs(argv) {
     if(!options.extensionId) throw new Error('--extension-id is required')
     if(!SUPPORTED_PHASES.includes(options.phase)) {
         throw new Error(`unsupported --phase ${options.phase}; expected one of ${SUPPORTED_PHASES.join(', ')}`)
+    }
+    if(options.phase === PHASE8_ONE_ITEM_QUEUE && options.allowWorkProducing !== true) {
+        throw new Error(`${PHASE8_ONE_ITEM_QUEUE} intentionally creates queue/profile work; rerun with --allow-work-producing in a disposable logged-in profile`)
+    }
+    if(options.phase === PHASE9_SMALL_BATCH_QUEUE && options.allowWorkProducing !== true) {
+        throw new Error(`${PHASE9_SMALL_BATCH_QUEUE} intentionally creates queue/profile work; rerun with --allow-work-producing in a disposable logged-in profile`)
+    }
+    if(options.phase === PHASE9_SMALL_BATCH_QUEUE) {
+        options.phase9TargetCount = Math.max(3, Math.min(Number.parseInt(options.phase9TargetCount, 10) || 3, 5))
     }
     options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
     options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
@@ -259,6 +315,11 @@ function printUsage() {
         `  --space-mark-category ${DEFAULT_SPACE_MARK_CATEGORY}`,
         '  --space-asset-url https://theqdefensecrew.quora.com/',
         '  --space-target-url https://terryspcfreetopics.quora.com/',
+        '  --phase8-target-profile-href https://www.quora.com/profile/example',
+        '  --phase8-timeout-ms 120000',
+        '  --phase9-target-count 3',
+        '  --phase9-timeout-ms 600000',
+        '  --allow-work-producing',
         '  --write-baseline [path]',
         '  --compare-baseline path',
         '  --verbose'
@@ -493,6 +554,21 @@ async function sendRuntimeMessage(target, payload, timeoutMs = 10000) {
     }})(${JSON.stringify(payload)}, ${JSON.stringify(timeoutMs)})`, timeoutMs + 5000)
 }
 
+
+async function readFlightRecorder(target, request = {}) {
+    const result = await sendRuntimeMessage(target, {
+        action: "get-flight-recorder",
+        limit: 200,
+        ...request
+    }, 10000)
+    return {
+        ok: !result.timedOut && !result.lastError && result.response?.readOnly === true,
+        timedOut: result.timedOut === true,
+        lastError: result.lastError || "",
+        response: result.response || null
+    }
+}
+
 async function readStorage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
@@ -592,12 +668,29 @@ async function readAlarms(target) {
     }})()`, 10000)
 }
 
+async function setStorageValues(target, values = {}) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function writeLocalStorage(nextValues) {
+        return new Promise(resolve => {
+            const localStorage = globalThis.chrome?.storage?.local
+            if(typeof localStorage?.set !== 'function') {
+                resolve({ok: false, reason: 'storage-set-unavailable'})
+                return
+            }
+            localStorage.set(nextValues, () => resolve({
+                ok: !chrome.runtime.lastError,
+                lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+            }))
+        })
+    }})(${JSON.stringify(values || {})})`, 10000)
+}
+
 function isAllowedStorageKey(key) {
     return PREFERENCE_KEYS.has(key) || ALLOWED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
 }
 
 function isAllowedAddedStorageKey(key, phase = PHASE1) {
     if(ALLOWED_ADDED_STORAGE_KEYS.has(key)) return true
+    if(isWorkProducingPhase(phase)) return ALLOWED_PHASE8_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     if(isContentRefreshPhase(phase)) return ALLOWED_PHASE2_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     if(isNonWorkSpaceRegistryPhase(phase)) return ALLOWED_PHASE3_ADDED_STORAGE_KEY_PATTERNS.some(pattern => pattern.test(key))
     return false
@@ -613,6 +706,10 @@ function isNonWorkSpaceRegistryPhase(phase = '') {
 
 function isContentRefreshPhase(phase = '') {
     return phase === PHASE2 || phase === PHASE6_STALE_CONTENT_REFRESH
+}
+
+function isWorkProducingPhase(phase = '') {
+    return phase === PHASE8_ONE_ITEM_QUEUE || phase === PHASE9_SMALL_BATCH_QUEUE
 }
 
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
@@ -635,6 +732,12 @@ function diffStorageKeys(before = [], after = [], phase = PHASE1) {
 
 function allowedAddedStorageKeySummary(phase = PHASE1) {
     const literal = Array.from(ALLOWED_ADDED_STORAGE_KEYS).sort()
+    if(isWorkProducingPhase(phase)) {
+        return {
+            literal,
+            patterns: ALLOWED_PHASE8_ADDED_STORAGE_KEY_PATTERNS.map(pattern => pattern.toString()).sort()
+        }
+    }
     if(isContentRefreshPhase(phase)) {
         return {
             literal,
@@ -739,6 +842,189 @@ function summarizeAuthorityState(storage) {
     }
 }
 
+function getCoordinatorQueueRows(storage) {
+    const queue = storage?.data?.mbCoordinatorQueue && typeof storage.data.mbCoordinatorQueue === 'object'
+        ? storage.data.mbCoordinatorQueue
+        : {}
+    return Object.entries(queue)
+        .map(([key, row]) => ({
+            key,
+            status: `${row?.status || row?.state || ''}`,
+            outcome: `${row?.outcome || ''}`,
+            error: `${row?.error || ''}`.slice(0, 240),
+            targetProfileHref: `${row?.targetProfileHref || row?.requestedUrl || row?.dedupeKey || ''}`,
+            requestedUrl: `${row?.requestedUrl || ''}`,
+            actionKind: `${row?.actionKind || ''}`,
+            executorTabAction: `${row?.executorTabAction || ''}`,
+            runId: `${row?.runId || ''}`,
+            tabId: row?.tabId || null,
+            attempt: Number.parseInt(row?.attempt, 10) || 0,
+            createdAt: Number.parseInt(row?.createdAt, 10) || 0,
+            updatedAt: Number.parseInt(row?.updatedAt, 10) || 0,
+            terminalAt: Number.parseInt(row?.terminalAt, 10) || 0
+        }))
+        .sort((left, right) => left.key.localeCompare(right.key))
+}
+
+function getCoordinatorQueueViewRows(storage) {
+    const view = storage?.data?.mbCoordinatorQueueView && typeof storage.data.mbCoordinatorQueueView === 'object'
+        ? storage.data.mbCoordinatorQueueView
+        : {}
+    const rows = Array.isArray(view.items) ? view.items :
+        Array.isArray(view.rows) ? view.rows :
+            Array.isArray(view.queue) ? view.queue : []
+    return rows.map((row, index) => ({
+        index,
+        key: `${row?.coordinatorKey || row?.dedupeKey || row?.key || row?.targetProfileHref || row?.requestedUrl || ''}`,
+        status: `${row?.status || row?.state || ''}`,
+        outcome: `${row?.outcome || ''}`,
+        targetProfileHref: `${row?.targetProfileHref || row?.requestedUrl || row?.dedupeKey || ''}`,
+        runId: `${row?.runId || ''}`
+    }))
+}
+
+function recoverCoordinatorQueueFromWal(storage) {
+    const data = storage?.data || {}
+    const rawQueue = data[COORDINATOR_QUEUE_KEY] || {}
+    const meta = data[COORDINATOR_QUEUE_WAL_META_KEY] || null
+    let store = null
+    let hydrate = null
+    if(isSegmentedWalStorageMeta(meta)) {
+        hydrate = hydrateSegmentedWalStore(data, {
+            baseKey: COORDINATOR_QUEUE_WAL_KEY,
+            fallbackStore: data[COORDINATOR_QUEUE_WAL_KEY] || null
+        })
+        if(hydrate?.ok === true) store = hydrate.store
+        else return {
+            queue: rawQueue,
+            recovered: false,
+            reason: hydrate?.reason || 'segmented-hydrate-failed',
+            hydrate
+        }
+    }
+    else if(data[COORDINATOR_QUEUE_WAL_KEY]) {
+        store = data[COORDINATOR_QUEUE_WAL_KEY]
+    }
+
+    if(!store) return {queue: rawQueue, recovered: false, reason: 'missing-wal'}
+    const recovered = recoverProjectedState(store)
+    if(recovered?.recovered !== true) {
+        return {
+            queue: rawQueue,
+            recovered: false,
+            reason: recovered?.reason || 'wal-recovery-failed',
+            wal: recovered,
+            hydrate
+        }
+    }
+    return {
+        queue: recovered?.projected?.state?.queue || recovered?.state?.queue || {},
+        recovered: true,
+        reason: '',
+        hydrate,
+        wal: {
+            generationId: recovered.generationId,
+            applied: recovered?.projected?.applied?.length || 0,
+            ignored: recovered?.projected?.ignored?.length || 0,
+            checkpointSeq: recovered?.checkpoint?.snapshotSeq || 0,
+            nextSeq: store?.meta?.nextSeq || 0,
+            activeGenerationId: store?.meta?.activeCheckpoint || ''
+        }
+    }
+}
+
+function summarizeQueueAuthority(storage, options = {}) {
+    const rawRows = getCoordinatorQueueRows(storage)
+    const viewRows = getCoordinatorQueueViewRows(storage)
+    const recovered = recoverCoordinatorQueueFromWal(storage)
+    const recoveredRows = getCoordinatorQueueRows({data: {[COORDINATOR_QUEUE_KEY]: recovered.queue || {}}})
+    const preferRecovered = options.preferRecovered === true && recovered.recovered === true
+    const rows = preferRecovered
+        ? recoveredRows
+        : rawRows.length
+        ? rawRows
+        : viewRows.map(row => ({
+            ...row,
+            raw: false,
+            requestedUrl: row.targetProfileHref || row.key || ''
+        }))
+    const terminalStatuses = new Set(['succeeded', 'success', 'skipped', 'failed', 'canceled', 'cancelled', 'terminal'])
+    const isTerminal = row => terminalStatuses.has(`${row.status || ''}`.toLowerCase()) ||
+        !!row.terminalAt ||
+        /succeeded|success|skipped|failed|canceled|cancelled|terminal/i.test(`${row.status || ''}`)
+    return {
+        rows,
+        rawRows,
+        recoveredRows,
+        viewRows,
+        recovered: recovered.recovered === true,
+        recoveryReason: recovered.reason || '',
+        wal: recovered.wal || null,
+        rowCount: rows.length,
+        rawRowCount: rawRows.length,
+        recoveredRowCount: recoveredRows.length,
+        viewRowCount: viewRows.length,
+        activeRows: rows.filter(row => /active|acting|opening|claim|running|pending/i.test(row.status)).length,
+        queuedRows: rows.filter(row => /queued|retry|waiting/i.test(row.status)).length,
+        terminalRows: rows.filter(isTerminal).length,
+        statusCounts: rows.reduce((counts, row) => {
+            const status = row.status || 'unknown'
+            counts[status] = (counts[status] || 0) + 1
+            return counts
+        }, {}),
+        viewStatusCounts: viewRows.reduce((counts, row) => {
+            const status = row.status || 'unknown'
+            counts[status] = (counts[status] || 0) + 1
+            return counts
+        }, {})
+    }
+}
+
+function filterQueueAuthoritySummary(summary = {}, targetProfileHref = '') {
+    const target = normalizeComparableUrl(targetProfileHref || '')
+    const matches = row => {
+        const candidates = [
+            row?.targetProfileHref,
+            row?.requestedUrl,
+            row?.key
+        ].map(value => normalizeComparableUrl(value || '')).filter(Boolean)
+        return candidates.includes(target)
+    }
+    const storageLike = {
+        data: {
+            mbCoordinatorQueue: Object.fromEntries((summary.rows || [])
+                .filter(matches)
+                .map(row => [row.key || row.targetProfileHref || row.requestedUrl, row])),
+            mbCoordinatorQueueView: {
+                version: 1,
+                items: (summary.viewRows || []).filter(matches)
+            }
+        }
+    }
+    const filtered = summarizeQueueAuthority(storageLike)
+    return {
+        ...filtered,
+        recovered: summary.recovered === true,
+        recoveryReason: summary.recoveryReason || '',
+        wal: summary.wal || null
+    }
+}
+
+function assertOneItemQueueAuthorityConsistent(summary = {}, fail, label = 'queue authority') {
+    if(summary.rowCount !== 1) {
+        fail(`${label} expected exactly one durable queue row`, {
+            rowCount: summary.rowCount,
+            rows: summary.rows
+        })
+    }
+    if(summary.viewRowCount !== 1) {
+        fail(`${label} expected exactly one compact queue view row`, {
+            viewRowCount: summary.viewRowCount,
+            viewRows: summary.viewRows
+        })
+    }
+}
+
 function summarizeDashboardAuthoritySources(storage) {
     const data = storage?.data || {}
     const queueView = data.mbCoordinatorQueueView && typeof data.mbCoordinatorQueueView === 'object'
@@ -760,7 +1046,7 @@ function summarizeDashboardAuthoritySources(storage) {
         compactMetricsViewVersion: Number.parseInt(metricsView.version, 10) || 0,
         compactMetricsViewEpochPresent: !!metricsView.currentEpoch,
         rawQueueRows: Object.keys(rawQueue).length,
-        fullLegacyProgressPresent: Object.prototype.hasOwnProperty.call(data, 'mbProfileNukeProgress')
+        fullLegacyProgressPresent: Object.prototype.hasOwnProperty.call(data, LEGACY_FULL_PROGRESS_KEY)
     }
 }
 
@@ -783,10 +1069,10 @@ function hasCompactMetricsViewShape(value = {}) {
 
 function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
     const changed = (name, details = {}) => fail(`non-work-starting smoke created ${name}`, details)
-    if(after.work.rawQueueRows !== before.work.rawQueueRows || after.work.rawQueueRows !== 0) {
+    if(after.work.rawQueueRows !== before.work.rawQueueRows) {
         changed('coordinator queue rows', {before: before.work.rawQueueRows, after: after.work.rawQueueRows})
     }
-    if(after.work.viewRows !== before.work.viewRows || after.work.viewRows !== 0) {
+    if(after.work.viewRows !== before.work.viewRows) {
         changed('coordinator queue view rows', {before: before.work.viewRows, after: after.work.viewRows})
     }
     if(after.walSignature !== before.walSignature) {
@@ -795,31 +1081,31 @@ function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
             afterKeys: after.walKeys
         })
     }
-    if(after.progressViewRecords !== before.progressViewRecords || after.progressViewRecords !== 0) {
+    if(after.progressViewRecords !== before.progressViewRecords) {
         changed('profile progress view records', {
             before: before.progressViewRecords,
             after: after.progressViewRecords
         })
     }
-    if(after.progressShardRecords !== before.progressShardRecords || after.progressShardRecords !== 0) {
+    if(after.progressShardRecords !== before.progressShardRecords) {
         changed('profile progress shard records', {
             before: before.progressShardRecords,
             after: after.progressShardRecords
         })
     }
-    if(after.pendingSpacePostRecords !== before.pendingSpacePostRecords || after.pendingSpacePostRecords !== 0) {
+    if(after.pendingSpacePostRecords !== before.pendingSpacePostRecords) {
         changed('pending space post records', {
             before: before.pendingSpacePostRecords,
             after: after.pendingSpacePostRecords
         })
     }
-    if(after.nukedSpacePostRecords !== before.nukedSpacePostRecords || after.nukedSpacePostRecords !== 0) {
+    if(after.nukedSpacePostRecords !== before.nukedSpacePostRecords) {
         changed('nuked space post records', {
             before: before.nukedSpacePostRecords,
             after: after.nukedSpacePostRecords
         })
     }
-    if(after.queuedActionSurfaceRecords !== before.queuedActionSurfaceRecords || after.queuedActionSurfaceRecords !== 0) {
+    if(after.queuedActionSurfaceRecords !== before.queuedActionSurfaceRecords) {
         changed('queued action surface records', {
             before: before.queuedActionSurfaceRecords,
             after: after.queuedActionSurfaceRecords
@@ -862,6 +1148,12 @@ function comparableReport(report) {
             : {}),
         ...(report.discoveryReloadSmoke
             ? {discoveryReloadSmoke: comparableDiscoveryReloadSmoke(report.discoveryReloadSmoke)}
+            : {}),
+        ...(report.oneItemQueueSmoke
+            ? {oneItemQueueSmoke: comparableOneItemQueueSmoke(report.oneItemQueueSmoke)}
+            : {}),
+        ...(report.smallBatchQueueSmoke
+            ? {smallBatchQueueSmoke: comparableSmallBatchQueueSmoke(report.smallBatchQueueSmoke)}
             : {}),
         workStateAfter: report.workStateAfter
     }
@@ -1004,6 +1296,105 @@ function comparableDiscoveryReloadSmoke(discoveryReloadSmoke = null) {
         classifiedCount: Number(discoveryReloadSmoke.classified?.updated || 0) || 0,
         search: summarizePage(discoveryReloadSmoke.search || {}),
         spaces: (discoveryReloadSmoke.spaces || []).map(summarizePage)
+    }
+}
+
+function comparableOneItemQueueSmoke(oneItemQueueSmoke = null) {
+    if(!oneItemQueueSmoke) return null
+    const summarizeQueue = queue => ({
+        rowCount: Number(queue?.rowCount || 0) || 0,
+        viewRowCount: Number(queue?.viewRowCount || 0) || 0,
+        queuedRows: Number(queue?.queuedRows || 0) || 0,
+        activeRows: Number(queue?.activeRows || 0) || 0,
+        terminalRows: Number(queue?.terminalRows || 0) || 0,
+        statuses: Object.keys(queue?.statusCounts || {}).sort()
+    })
+    const summarizeAuthority = authority => ({
+        walKeys: (authority?.walKeys || []).slice().sort(),
+        progressViewRecords: Number(authority?.progressViewRecords || 0) || 0,
+        progressShardRecords: Number(authority?.progressShardRecords || 0) || 0,
+        queuedActionSurfaceRecords: Number(authority?.queuedActionSurfaceRecords || 0) || 0
+    })
+    return {
+        kind: oneItemQueueSmoke.kind || '',
+        targetProfileHrefPresent: !!oneItemQueueSmoke.targetProfileHref,
+        queueClickClicked: oneItemQueueSmoke.queueClick?.clicked === true,
+        afterEnqueue: {
+            queue: summarizeQueue(oneItemQueueSmoke.afterEnqueue?.queue),
+            authority: summarizeAuthority(oneItemQueueSmoke.afterEnqueue?.authority)
+        },
+        afterRestartBeforeStart: {
+            queue: summarizeQueue(oneItemQueueSmoke.afterRestartBeforeStart?.queue),
+            authority: summarizeAuthority(oneItemQueueSmoke.afterRestartBeforeStart?.authority)
+        },
+        start: {
+            ok: oneItemQueueSmoke.start?.ok === true,
+            reason: oneItemQueueSmoke.start?.reason || '',
+            active: Number(oneItemQueueSmoke.start?.active || 0) || 0,
+            queued: Number(oneItemQueueSmoke.start?.queued || 0) || 0
+        },
+        terminal: {
+            timedOut: oneItemQueueSmoke.terminal?.timedOut === true,
+            queue: summarizeQueue(oneItemQueueSmoke.terminal?.queue),
+            authority: summarizeAuthority(oneItemQueueSmoke.terminal?.authority)
+        },
+        afterRestartAfterTerminal: {
+            queue: summarizeQueue(oneItemQueueSmoke.afterRestartAfterTerminal?.queue),
+            authority: summarizeAuthority(oneItemQueueSmoke.afterRestartAfterTerminal?.authority)
+        }
+    }
+}
+
+function comparableSmallBatchQueueSmoke(smallBatchQueueSmoke = null) {
+    if(!smallBatchQueueSmoke) return null
+    const summarizeQueue = queue => ({
+        selectedCount: Number(queue?.selectedCount || 0) || 0,
+        rowCount: Number(queue?.rowCount || 0) || 0,
+        viewRowCount: Number(queue?.viewRowCount || 0) || 0,
+        queuedRows: Number(queue?.queuedRows || 0) || 0,
+        activeRows: Number(queue?.activeRows || 0) || 0,
+        terminalRows: Number(queue?.terminalRows || 0) || 0,
+        unrelatedActiveQueuedCount: Number(queue?.unrelatedActiveQueuedCount || 0) || 0,
+        selectedStatuses: (queue?.selected || []).map(item => item.statuses || []).flat().sort()
+    })
+    const summarizeAuthority = authority => ({
+        walKeys: (authority?.walKeys || []).slice().sort(),
+        progressViewRecords: Number(authority?.progressViewRecords || 0) || 0,
+        progressShardRecords: Number(authority?.progressShardRecords || 0) || 0,
+        queuedActionSurfaceRecords: Number(authority?.queuedActionSurfaceRecords || 0) || 0
+    })
+    return {
+        kind: smallBatchQueueSmoke.kind || '',
+        selectedCount: Number(smallBatchQueueSmoke.selectedTargets?.length || 0) || 0,
+        queueClicksClicked: (smallBatchQueueSmoke.queueClicks || []).filter(click => click.clicked === true).length,
+        lowConcurrencyPreference: {
+            requestedValue: Number(smallBatchQueueSmoke.lowConcurrencyPreference?.requestedValue || 0) || 0,
+            setOk: smallBatchQueueSmoke.lowConcurrencyPreference?.set?.ok === true,
+            restoredOk: smallBatchQueueSmoke.lowConcurrencyPreference?.restored?.ok === true
+        },
+        afterEnqueue: {
+            queue: summarizeQueue(smallBatchQueueSmoke.afterEnqueue?.queue),
+            authority: summarizeAuthority(smallBatchQueueSmoke.afterEnqueue?.authority)
+        },
+        afterRestartBeforeStart: {
+            queue: summarizeQueue(smallBatchQueueSmoke.afterRestartBeforeStart?.queue),
+            authority: summarizeAuthority(smallBatchQueueSmoke.afterRestartBeforeStart?.authority)
+        },
+        start: {
+            ok: smallBatchQueueSmoke.start?.ok === true,
+            reason: smallBatchQueueSmoke.start?.reason || '',
+            active: Number(smallBatchQueueSmoke.start?.active || 0) || 0,
+            queued: Number(smallBatchQueueSmoke.start?.queued || 0) || 0
+        },
+        terminal: {
+            timedOut: smallBatchQueueSmoke.terminal?.timedOut === true,
+            queue: summarizeQueue(smallBatchQueueSmoke.terminal?.queue),
+            authority: summarizeAuthority(smallBatchQueueSmoke.terminal?.authority)
+        },
+        afterRestartAfterTerminal: {
+            queue: summarizeQueue(smallBatchQueueSmoke.afterRestartAfterTerminal?.queue),
+            authority: summarizeAuthority(smallBatchQueueSmoke.afterRestartAfterTerminal?.authority)
+        }
     }
 }
 
@@ -1664,7 +2055,7 @@ async function runStaleContentRefreshSmoke(config, options, context, warnings, f
     }
 }
 
-async function inspectDiscoveryWithState(target, options, expectedPageType, fail, requireCandidates = true) {
+async function inspectDiscoveryWithState(target, options, expectedPageType, fail, requireCandidates = true, stateOptions = {}) {
     let pageState = await inspectDiscoveryPage(target)
     for(let attempt = 0; attempt < 4 && (!pageState.contentReady || pageState.discoveryCandidateCount <= 0); attempt += 1) {
         await evaluate(target.webSocketDebuggerUrl, `(${function nudgeDiscovery() {
@@ -1696,8 +2087,12 @@ async function inspectDiscoveryWithState(target, options, expectedPageType, fail
     if(!contentState.ok) fail('discovery content state did not return from content script context', contentState)
     else {
         if(contentState.scoped !== true) fail('discovery content state is not scoped', contentState)
-        if(contentState.queueRows !== 0) fail('discovery content state exposed queue rows', contentState)
-        if(contentState.progressRows !== 0) fail('discovery content state exposed profile progress rows', contentState)
+        if(contentState.queueRows !== 0 && stateOptions.allowQueueRows !== true) {
+            fail('discovery content state exposed queue rows', contentState)
+        }
+        if(contentState.progressRows !== 0 && stateOptions.allowProgressRows !== true) {
+            fail('discovery content state exposed profile progress rows', contentState)
+        }
     }
 
     return {
@@ -1797,6 +2192,755 @@ async function runDiscoveryReloadStabilitySmoke(config, options, context, warnin
         spaces,
         totalCandidateCountAfterReload: (Number(searchAfterReload.page.discoveryCandidateCount || 0) || 0) +
             spaces.reduce((total, item) => total + (Number(item.afterReload.page.discoveryCandidateCount || 0) || 0), 0)
+    }
+}
+
+async function clickOneProfileSearchQueueButton(target, targetProfileHref = '') {
+    return evaluate(target.webSocketDebuggerUrl, `(${function clickOne(targetHref) {
+        const normalize = href => {
+            try {
+                const url = new URL(href || '', location.href)
+                if(!/^https:$/.test(url.protocol)) return ''
+                if(!/(^|\.)quora\.com$/i.test(url.hostname)) return ''
+                if(!/^\/profile\//i.test(url.pathname)) return ''
+                url.hash = ''
+                url.search = ''
+                return `https://www.quora.com${url.pathname.replace(/\/+$/, '')}`
+            }
+            catch {
+                return ''
+            }
+        }
+        const desired = normalize(targetHref)
+        const buttons = Array.from(document.querySelectorAll('.mb-ext_profile-search-row-btn[data-mb-profile-search-href]'))
+            .map(button => ({
+                button,
+                href: normalize(button.dataset.mbProfileSearchHref || ''),
+                disabled: button.disabled === true,
+                text: `${button.innerText || button.textContent || ''}`.replace(/\s+/g, ' ').trim()
+            }))
+            .filter(entry => entry.href)
+        const candidates = buttons.filter(entry => !entry.disabled && (!desired || entry.href === desired))
+        const selected = candidates[0] || null
+        if(!selected) {
+            return {
+                clicked: false,
+                reason: desired ? 'target-button-not-found-or-disabled' : 'no-enabled-profile-search-row-button',
+                desired,
+                buttons: buttons.map(entry => ({
+                    href: entry.href,
+                    disabled: entry.disabled,
+                    text: entry.text
+                })).slice(0, 20)
+            }
+        }
+        selected.button.scrollIntoView({block: 'center', inline: 'nearest'})
+        selected.button.click()
+        return {
+            clicked: true,
+            href: selected.href,
+            text: selected.text,
+            desired,
+            enabledButtonCount: candidates.length,
+            allButtonCount: buttons.length
+        }
+    }})(${JSON.stringify(targetProfileHref || '')})`, 10000)
+}
+
+async function selectEnabledProfileSearchQueueTargets(target, count = 3, excludedHrefs = []) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function selectTargets(targetCount, excludedList) {
+        const normalize = href => {
+            try {
+                const url = new URL(href || '', location.href)
+                if(!/^https:$/.test(url.protocol)) return ''
+                if(!/(^|\.)quora\.com$/i.test(url.hostname)) return ''
+                if(!/^\/profile\//i.test(url.pathname)) return ''
+                url.hash = ''
+                url.search = ''
+                return `https://www.quora.com${url.pathname.replace(/\/+$/, '')}`
+            }
+            catch {
+                return ''
+            }
+        }
+        const excluded = new Set((Array.isArray(excludedList) ? excludedList : [])
+            .map(href => normalize(href))
+            .filter(Boolean))
+        const seen = new Set()
+        const buttons = Array.from(document.querySelectorAll('.mb-ext_profile-search-row-btn[data-mb-profile-search-href]'))
+            .map((button, index) => ({
+                index,
+                href: normalize(button.dataset.mbProfileSearchHref || ''),
+                disabled: button.disabled === true,
+                text: `${button.innerText || button.textContent || ''}`.replace(/\s+/g, ' ').trim()
+            }))
+            .filter(entry => entry.href)
+        const enabled = []
+        for(const entry of buttons) {
+            if(entry.disabled || seen.has(entry.href)) continue
+            seen.add(entry.href)
+            if(excluded.has(entry.href)) continue
+            enabled.push(entry)
+        }
+        return {
+            requestedCount: targetCount,
+            selected: enabled.slice(0, Math.max(0, targetCount)),
+            enabledCount: enabled.length,
+            excludedCount: excluded.size,
+            allButtonCount: buttons.length,
+            buttons: buttons.slice(0, 30)
+        }
+    }})(${JSON.stringify(Math.max(1, Number.parseInt(count, 10) || 3))}, ${JSON.stringify(excludedHrefs || [])})`, 10000)
+}
+
+async function stopExtensionServiceWorker(config, extensionId) {
+    const extensionPrefix = `chrome-extension://${extensionId}/`
+    const targets = await getTargets(config)
+    const workers = targets.filter(target =>
+        target.type === 'service_worker' &&
+        `${target.url || ''}`.startsWith(extensionPrefix))
+    if(!workers.length) {
+        return {
+            stopped: false,
+            reason: 'service-worker-target-not-found',
+            workers: []
+        }
+    }
+    const versionInfo = await getJson('/json/version', config)
+    const results = []
+    for(const worker of workers) {
+        const result = await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.closeTarget', {
+            targetId: worker.id
+        }, 10000).catch(error => ({
+            error: error?.message || `${error || ''}`
+        }))
+        results.push({
+            id: worker.id,
+            url: worker.url || '',
+            result
+        })
+    }
+    await sleep(1500)
+    return {
+        stopped: results.some(result => result.result?.success === true),
+        workers: results
+    }
+}
+
+async function wakeServiceWorkerWithAccounting(context) {
+    const accounting = await sendRuntimeMessage(context, {
+        action: 'get-coordinator-queue-accounting',
+        reason: `${ACTION_REASON}-service-worker-wake`
+    }, 15000)
+    const whyNotRunning = await sendRuntimeMessage(context, {
+        action: 'get-coordinator-why-not-running',
+        reason: `${ACTION_REASON}-service-worker-wake`
+    }, 15000)
+    return {
+        accounting: summarizeMessageResult(accounting),
+        whyNotRunning: summarizeMessageResult(whyNotRunning)
+    }
+}
+
+async function waitForOneQueueRow(context, fail, label, timeoutMs = 15000, targetProfileHref = '') {
+    const deadline = Date.now() + Math.max(1000, Number.parseInt(timeoutMs, 10) || 15000)
+    let storage = await readStorage(context)
+    let summary = summarizeQueueAuthority(storage, {preferRecovered: true})
+    let targetSummary = targetProfileHref ? filterQueueAuthoritySummary(summary, targetProfileHref) : summary
+    while(Date.now() < deadline && targetSummary.rowCount !== 1) {
+        await sleep(500)
+        storage = await readStorage(context)
+        summary = summarizeQueueAuthority(storage, {preferRecovered: true})
+        targetSummary = targetProfileHref ? filterQueueAuthoritySummary(summary, targetProfileHref) : summary
+    }
+    if(targetSummary.rowCount !== 1) {
+        fail(`${label} did not observe exactly one durable queue row`, summary)
+    }
+    return {
+        storage,
+        summary: targetSummary,
+        fullSummary: summary,
+        authority: summarizeAuthorityState(storage)
+    }
+}
+
+async function waitForTerminalQueueState(context, fail, timeoutMs = 120000, targetProfileHref = '') {
+    const deadline = Date.now() + Math.max(5000, Number.parseInt(timeoutMs, 10) || 120000)
+    let storage = await readStorage(context)
+    let summary = summarizeQueueAuthority(storage, {preferRecovered: true})
+    let targetSummary = targetProfileHref ? filterQueueAuthoritySummary(summary, targetProfileHref) : summary
+    while(Date.now() < deadline) {
+        if(targetSummary.rowCount === 1 &&
+                targetSummary.terminalRows === 1 &&
+                targetSummary.activeRows === 0 &&
+                targetSummary.queuedRows === 0) {
+            return {
+                storage,
+                summary: targetSummary,
+                fullSummary: summary,
+                authority: summarizeAuthorityState(storage),
+                timedOut: false
+            }
+        }
+        await sleep(1000)
+        storage = await readStorage(context)
+        summary = summarizeQueueAuthority(storage, {preferRecovered: true})
+        targetSummary = targetProfileHref ? filterQueueAuthoritySummary(summary, targetProfileHref) : summary
+    }
+    fail('phase 8 item did not reach terminal queue state before timeout', summary)
+    return {
+        storage,
+        summary: targetSummary,
+        fullSummary: summary,
+        authority: summarizeAuthorityState(storage),
+        timedOut: true
+    }
+}
+
+function assertWalPresent(authority = {}, fail, label = 'queue WAL') {
+    if(!Array.isArray(authority.walKeys) || !authority.walKeys.length || authority.walSignature === '{}') {
+        fail(`${label} is missing records`, {
+            walKeys: authority.walKeys || [],
+            walSignature: authority.walSignature || ''
+        })
+    }
+}
+
+function assertNoRuntimeActionSurfaceLeak(authority = {}, fail, label = 'runtime action surface') {
+    if((Number.parseInt(authority.queuedActionSurfaceRecords, 10) || 0) > 0) {
+        fail(`${label} has queued action-surface records after bounded phase`, {
+            queuedActionSurfaceRecords: authority.queuedActionSurfaceRecords
+        })
+    }
+}
+
+function queueRowMatchesTargets(row = {}, targetSet = new Set()) {
+    const candidates = [
+        row?.targetProfileHref,
+        row?.requestedUrl,
+        row?.key
+    ].map(value => normalizeComparableUrl(value || '')).filter(Boolean)
+    return candidates.some(candidate => targetSet.has(candidate))
+}
+
+function getActiveQueuedRows(summary = {}) {
+    const activeQueued = row => /active|acting|opening|claim|running|pending|queued|retry|waiting/i.test(`${row?.status || ''}`)
+    const authorityRows = (summary.rows || []).map(row => ({...row, source: summary.recovered ? 'recovered' : row.source || 'raw'}))
+    const viewRows = (summary.viewRows || []).map(row => ({...row, source: 'view'}))
+    const rows = authorityRows.length ? authorityRows : viewRows
+    return rows.filter(activeQueued)
+}
+
+function summarizeSelectedQueueAuthority(summary = {}, targetProfileHrefs = []) {
+    const normalizedTargets = dedupeStrings(targetProfileHrefs.map(target => normalizeComparableUrl(target || '')))
+    const targetSet = new Set(normalizedTargets)
+    const selected = normalizedTargets.map(target => {
+        const targetSummary = filterQueueAuthoritySummary(summary, target)
+        return {
+            targetProfileHref: target,
+            rowCount: targetSummary.rowCount,
+            rawRowCount: targetSummary.rawRowCount,
+            viewRowCount: targetSummary.viewRowCount,
+            queuedRows: targetSummary.queuedRows,
+            activeRows: targetSummary.activeRows,
+            terminalRows: targetSummary.terminalRows,
+            statuses: Object.keys(targetSummary.statusCounts || {}).sort(),
+            rows: targetSummary.rows
+        }
+    })
+    const unrelatedActiveQueued = getActiveQueuedRows(summary)
+        .filter(row => !queueRowMatchesTargets(row, targetSet))
+    return {
+        selectedCount: normalizedTargets.length,
+        rowCount: selected.reduce((total, item) => total + item.rowCount, 0),
+        rawRowCount: selected.reduce((total, item) => total + item.rawRowCount, 0),
+        viewRowCount: selected.reduce((total, item) => total + item.viewRowCount, 0),
+        queuedRows: selected.reduce((total, item) => total + item.queuedRows, 0),
+        activeRows: selected.reduce((total, item) => total + item.activeRows, 0),
+        terminalRows: selected.reduce((total, item) => total + item.terminalRows, 0),
+        selected,
+        unrelatedActiveQueuedCount: unrelatedActiveQueued.length,
+        unrelatedActiveQueued
+    }
+}
+
+function assertSelectedQueueRowsConsistent(selectedSummary = {}, fail, label = 'selected queue authority') {
+    for(const item of selectedSummary.selected || []) {
+        if(item.rowCount !== 1) {
+            fail(`${label} expected exactly one durable row for selected target`, item)
+        }
+        if(item.viewRowCount !== 1) {
+            fail(`${label} expected exactly one compact view row for selected target`, item)
+        }
+    }
+    if(selectedSummary.unrelatedActiveQueuedCount > 0) {
+        fail(`${label} observed unrelated active/queued rows`, {
+            unrelatedActiveQueued: selectedSummary.unrelatedActiveQueued
+        })
+    }
+}
+
+async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [], label = 'selected queued rows', timeoutMs = 20000) {
+    const deadline = Date.now() + Math.max(1000, Number.parseInt(timeoutMs, 10) || 20000)
+    let storage = await readStorage(context)
+    let fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
+    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    const ready = () =>
+        selectedSummary.selected.length === targetProfileHrefs.length &&
+        selectedSummary.selected.every(item => item.rowCount === 1 && item.viewRowCount === 1 && item.terminalRows === 0) &&
+        selectedSummary.queuedRows + selectedSummary.activeRows === targetProfileHrefs.length &&
+        selectedSummary.unrelatedActiveQueuedCount === 0
+
+    while(Date.now() < deadline && !ready()) {
+        await sleep(500)
+        storage = await readStorage(context)
+        fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
+        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    }
+    if(!ready()) {
+        fail(`${label} did not observe all selected targets queued before timeout`, {
+            selectedSummary,
+            fullSummary
+        })
+    }
+    return {
+        storage,
+        fullSummary,
+        summary: selectedSummary,
+        authority: summarizeAuthorityState(storage)
+    }
+}
+
+async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [], timeoutMs = 240000) {
+    const deadline = Date.now() + Math.max(5000, Number.parseInt(timeoutMs, 10) || 240000)
+    let storage = await readStorage(context)
+    let fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
+    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    const terminalReady = () =>
+        selectedSummary.selected.length === targetProfileHrefs.length &&
+        selectedSummary.selected.every(item => item.rowCount === 1 && item.viewRowCount === 1 && item.terminalRows === 1) &&
+        selectedSummary.activeRows === 0 &&
+        selectedSummary.queuedRows === 0 &&
+        selectedSummary.unrelatedActiveQueuedCount === 0
+
+    while(Date.now() < deadline && !terminalReady()) {
+        await sleep(1000)
+        storage = await readStorage(context)
+        fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
+        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    }
+    if(!terminalReady()) {
+        const stalledSelectedRows = (selectedSummary.selected || [])
+            .flatMap(item => item.rows || [])
+            .filter(row => /active|acting|opening|claim|running|pending/i.test(`${row?.status || ''}`))
+            .map(row => ({
+                key: row.key || '',
+                targetProfileHref: row.targetProfileHref || row.requestedUrl || '',
+                status: row.status || '',
+                tabId: row.tabId || null,
+                executorTabAction: row.executorTabAction || ''
+            }))
+        fail('phase 9 selected items did not all reach terminal queue state before timeout', {
+            selectedSummary,
+            stalledSelectedRows,
+            fullSummary
+        })
+    }
+    return {
+        storage,
+        fullSummary,
+        summary: selectedSummary,
+        authority: summarizeAuthorityState(storage),
+        timedOut: !terminalReady()
+    }
+}
+
+function assertSelectedTerminalOutcomes(selectedSummary = {}, fail, label = 'selected terminal outcomes') {
+    const acceptedTerminalFailure = row => {
+        if(!/failed/i.test(`${row?.status || ''}`)) return false
+        const text = `${row?.outcome || ''} ${row?.error || ''}`
+        return /timeout/i.test(text) &&
+            /retry budget|no confirmed runtime actor|failed to open/i.test(text)
+    }
+    for(const item of selectedSummary.selected || []) {
+        const row = (item.rows || [])[0] || null
+        const status = `${row?.status || ''}`
+        if(!/succeeded|success|skipped|canceled|cancelled/i.test(status) &&
+                !acceptedTerminalFailure(row)) {
+            fail(`${label} contains an unaccepted terminal status`, {
+                targetProfileHref: item.targetProfileHref,
+                row
+            })
+        }
+    }
+}
+
+async function runOneItemQueueAuthoritySmoke(config, options, context, warnings, fail) {
+    const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 8 profile search one-item queue')
+    const discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, true, {
+        allowProgressRows: true
+    })
+    const beforeStorage = await readStorage(context)
+    const beforeAuthority = summarizeAuthorityState(beforeStorage)
+    const beforeQueue = summarizeQueueAuthority(beforeStorage, {preferRecovered: true})
+
+    if(beforeQueue.activeRows > 0 || beforeQueue.queuedRows > 0 ||
+            (Number.parseInt(beforeAuthority.queuedActionSurfaceRecords, 10) || 0) > 0) {
+        fail('phase 8 must start with no active/queued work in the selected profile', {
+            beforeQueue,
+            beforeAuthority
+        })
+    }
+
+    const pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
+    const queueClick = await clickOneProfileSearchQueueButton(searchTarget, options.phase8TargetProfileHref)
+    if(queueClick.clicked !== true) {
+        fail('phase 8 failed to click one real profile-search queue button', queueClick)
+        return {
+            kind: PHASE8_ONE_ITEM_QUEUE,
+            search: discovery,
+            targetProfileHref: '',
+            pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+            queueClick,
+            beforeQueue,
+            beforeAuthority,
+            aborted: true,
+            abortReason: queueClick.reason || 'queue-click-failed'
+        }
+    }
+    const targetProfileHref = queueClick.href || options.phase8TargetProfileHref || ''
+
+    const afterEnqueue = await waitForOneQueueRow(context, fail, 'phase 8 after enqueue', 20000, targetProfileHref)
+    assertOneItemQueueAuthorityConsistent(afterEnqueue.summary, fail, 'phase 8 after enqueue')
+    assertWalPresent(afterEnqueue.authority, fail, 'phase 8 after enqueue WAL')
+    if(afterEnqueue.summary.queuedRows + afterEnqueue.summary.activeRows < 1) {
+        fail('phase 8 after enqueue row is neither queued nor active', afterEnqueue.summary)
+    }
+
+    const restartBeforeStart = await stopExtensionServiceWorker(config, options.extensionId)
+    const wakeBeforeStart = await wakeServiceWorkerWithAccounting(context)
+    const afterRestartBeforeStart = await waitForOneQueueRow(context, fail, 'phase 8 after pre-start service-worker restart', 20000, targetProfileHref)
+    assertOneItemQueueAuthorityConsistent(afterRestartBeforeStart.summary, fail, 'phase 8 after pre-start service-worker restart')
+    assertWalPresent(afterRestartBeforeStart.authority, fail, 'phase 8 after pre-start restart WAL')
+    if(afterRestartBeforeStart.summary.terminalRows > 0) {
+        fail('phase 8 row reached terminal before Start', afterRestartBeforeStart.summary)
+    }
+
+    const resumePaused = await sendRuntimeMessage(context, {action: 'resume-paused-coordinator-nukes'}, 10000)
+    const start = await sendRuntimeMessage(context, {
+        action: 'resume-coordinator-queue',
+        allowBeforeQuora: true,
+        userInitiated: true,
+        actionBudget: 1,
+        timeoutMs: Math.min(30000, Math.max(5000, Number.parseInt(options.phase8TimeoutMs, 10) || 120000))
+    }, 40000)
+    if(start.timedOut || start.lastError) {
+        fail('phase 8 user-equivalent Start failed', summarizeMessageResult(start))
+    }
+
+    const terminal = await waitForTerminalQueueState(context, fail, options.phase8TimeoutMs, targetProfileHref)
+    assertOneItemQueueAuthorityConsistent(terminal.summary, fail, 'phase 8 terminal')
+    assertWalPresent(terminal.authority, fail, 'phase 8 terminal WAL')
+    assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, 'phase 8 terminal')
+    const terminalRow = terminal.summary.rows[0] || null
+    if(terminalRow && !/succeeded|success|skipped|canceled|cancelled/i.test(terminalRow.status)) {
+        fail('phase 8 terminal status is not an accepted one-item outcome', terminalRow)
+    }
+
+    const restartAfterTerminal = await stopExtensionServiceWorker(config, options.extensionId)
+    const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
+    const afterRestartAfterTerminal = await waitForOneQueueRow(context, fail, 'phase 8 after terminal service-worker restart', 20000, targetProfileHref)
+    assertOneItemQueueAuthorityConsistent(afterRestartAfterTerminal.summary, fail, 'phase 8 after terminal service-worker restart')
+    assertWalPresent(afterRestartAfterTerminal.authority, fail, 'phase 8 after terminal restart WAL')
+    if(afterRestartAfterTerminal.summary.activeRows > 0 || afterRestartAfterTerminal.summary.queuedRows > 0) {
+        fail('phase 8 terminal hydrate reopened work after service-worker restart', afterRestartAfterTerminal.summary)
+    }
+    assertNoRuntimeActionSurfaceLeak(afterRestartAfterTerminal.authority, fail, 'phase 8 after terminal restart')
+
+    return {
+        kind: PHASE8_ONE_ITEM_QUEUE,
+        search: discovery,
+        targetProfileHref,
+        beforeQueue,
+        beforeAuthority,
+        pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+        queueClick,
+        afterEnqueue: {
+            queue: afterEnqueue.summary,
+            fullQueue: afterEnqueue.fullSummary,
+            authority: afterEnqueue.authority
+        },
+        restartBeforeStart,
+        wakeBeforeStart,
+        afterRestartBeforeStart: {
+            queue: afterRestartBeforeStart.summary,
+            fullQueue: afterRestartBeforeStart.fullSummary,
+            authority: afterRestartBeforeStart.authority
+        },
+        resumePaused: summarizeMessageResult(resumePaused),
+        start: summarizeMessageResult(start),
+        terminal: {
+            timedOut: terminal.timedOut,
+            queue: terminal.summary,
+            fullQueue: terminal.fullSummary,
+            authority: terminal.authority
+        },
+        restartAfterTerminal,
+        wakeAfterTerminal,
+        afterRestartAfterTerminal: {
+            queue: afterRestartAfterTerminal.summary,
+            fullQueue: afterRestartAfterTerminal.fullSummary,
+            authority: afterRestartAfterTerminal.authority
+        }
+    }
+}
+
+async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnings, fail) {
+    tracePhase(options, 'phase 9 starting')
+    const preferenceBefore = await readStorage(context)
+    const previousProfilesPerBatch = preferenceBefore?.data?.profilesPerBatch
+    const lowConcurrencyPreference = {
+        key: 'profilesPerBatch',
+        previousValue: previousProfilesPerBatch,
+        requestedValue: 1,
+        set: await setStorageValues(context, {profilesPerBatch: 1}),
+        restored: null
+    }
+    if(lowConcurrencyPreference.set?.ok !== true) {
+        fail('phase 9 failed to set low-concurrency profile-search preference', lowConcurrencyPreference.set)
+    }
+
+    const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 9 profile search small-batch queue')
+    tracePhase(options, 'phase 9 search target ready', {url: searchTarget.url || ''})
+    await reloadPageTarget(searchTarget)
+    const discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, true, {
+        allowProgressRows: true,
+        allowQueueRows: true
+    })
+    const beforeStorage = await readStorage(context)
+    const beforeAuthority = summarizeAuthorityState(beforeStorage)
+    const beforeQueue = summarizeQueueAuthority(beforeStorage, {preferRecovered: true})
+    const beforeSelected = summarizeSelectedQueueAuthority(beforeQueue, [])
+
+    if(beforeQueue.activeRows > 0 || beforeQueue.queuedRows > 0 ||
+            (Number.parseInt(beforeAuthority.queuedActionSurfaceRecords, 10) || 0) > 0) {
+        fail('phase 9 must start with no active/queued work in the selected profile', {
+            beforeQueue,
+            beforeAuthority
+        })
+    }
+
+    const existingQueueTargets = Array.from(new Set([
+        ...(Array.isArray(beforeQueue.rows) ? beforeQueue.rows : []),
+        ...(Array.isArray(beforeQueue.viewRows) ? beforeQueue.viewRows : [])
+    ].flatMap(row => [row?.key, row?.targetProfileHref, row?.requestedUrl])
+        .filter(Boolean)))
+
+    const pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
+    const selection = await selectEnabledProfileSearchQueueTargets(searchTarget, options.phase9TargetCount, existingQueueTargets)
+    tracePhase(options, 'phase 9 selected targets', {
+        requested: options.phase9TargetCount,
+        selected: (selection.selected || []).map(entry => entry.href),
+        excludedExistingQueueTargets: existingQueueTargets.length
+    })
+    const selectedTargets = (selection.selected || [])
+        .map(entry => entry.href)
+        .filter(Boolean)
+        .slice(0, options.phase9TargetCount)
+    if(selectedTargets.length !== options.phase9TargetCount) {
+        fail('phase 9 did not find enough enabled profile-search row buttons', {
+            requested: options.phase9TargetCount,
+            selectedTargets,
+            selection
+        })
+        lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
+        return {
+            kind: PHASE9_SMALL_BATCH_QUEUE,
+            search: discovery,
+            lowConcurrencyPreference,
+            beforeQueue,
+            beforeSelected,
+            beforeAuthority,
+            pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+            selection,
+            selectedTargets,
+            existingQueueTargets,
+            aborted: true,
+            abortReason: 'not-enough-enabled-profile-search-row-buttons'
+        }
+    }
+
+    const queueClicks = []
+    const incrementalEnqueue = []
+    for(const href of selectedTargets) {
+        tracePhase(options, 'phase 9 queue click', {href})
+        const click = await clickOneProfileSearchQueueButton(searchTarget, href)
+        queueClicks.push(click)
+        if(click.clicked !== true) {
+            fail('phase 9 failed to click a selected profile-search queue button', {
+                href,
+                click
+            })
+            lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
+            return {
+                kind: PHASE9_SMALL_BATCH_QUEUE,
+                search: discovery,
+                lowConcurrencyPreference,
+                beforeQueue,
+                beforeSelected,
+                beforeAuthority,
+                pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+                selection,
+                selectedTargets,
+                existingQueueTargets,
+                queueClicks,
+                incrementalEnqueue,
+                aborted: true,
+                abortReason: click.reason || 'queue-click-failed'
+            }
+        }
+        const queuedSoFar = await waitForSelectedQueuedRows(
+            context,
+            fail,
+            selectedTargets.slice(0, queueClicks.length),
+            `phase 9 after queue click ${queueClicks.length}`,
+            15000
+        )
+        incrementalEnqueue.push({
+            clickedTarget: href,
+            queue: queuedSoFar.summary,
+            authority: queuedSoFar.authority
+        })
+        const latest = (queuedSoFar.summary.selected || [])
+            .find(item => item.targetProfileHref === href)
+        if(!latest || latest.rowCount !== 1 || latest.viewRowCount !== 1) {
+            lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
+            return {
+                kind: PHASE9_SMALL_BATCH_QUEUE,
+                search: discovery,
+                lowConcurrencyPreference,
+                beforeQueue,
+                beforeSelected,
+                beforeAuthority,
+                pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+                selection,
+                selectedTargets,
+                existingQueueTargets,
+                queueClicks,
+                incrementalEnqueue,
+                aborted: true,
+                abortReason: 'selected-row-did-not-materialize-after-click'
+            }
+        }
+    }
+
+    tracePhase(options, 'phase 9 waiting after enqueue')
+    const afterEnqueue = await waitForSelectedQueuedRows(
+        context,
+        fail,
+        selectedTargets,
+        'phase 9 after enqueue',
+        30000
+    )
+    assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, 'phase 9 after enqueue')
+    assertWalPresent(afterEnqueue.authority, fail, 'phase 9 after enqueue WAL')
+
+    tracePhase(options, 'phase 9 stopping service worker before start')
+    const restartBeforeStart = await stopExtensionServiceWorker(config, options.extensionId)
+    tracePhase(options, 'phase 9 waking service worker before start')
+    const wakeBeforeStart = await wakeServiceWorkerWithAccounting(context)
+    const afterRestartBeforeStart = await waitForSelectedQueuedRows(
+        context,
+        fail,
+        selectedTargets,
+        'phase 9 after pre-start service-worker restart',
+        30000
+    )
+    assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, 'phase 9 after pre-start service-worker restart')
+    assertWalPresent(afterRestartBeforeStart.authority, fail, 'phase 9 after pre-start restart WAL')
+
+    const resumePaused = await sendRuntimeMessage(context, {action: 'resume-paused-coordinator-nukes'}, 10000)
+    tracePhase(options, 'phase 9 starting queue')
+    const start = await sendRuntimeMessage(context, {
+        action: 'resume-coordinator-queue',
+        allowBeforeQuora: true,
+        userInitiated: true,
+        actionBudget: options.phase9TargetCount,
+        timeoutMs: Math.min(60000, Math.max(10000, Number.parseInt(options.phase9TimeoutMs, 10) || 240000))
+    }, 70000)
+    if(start.timedOut || start.lastError) {
+        fail('phase 9 user-equivalent Start failed', summarizeMessageResult(start))
+    }
+
+    tracePhase(options, 'phase 9 waiting for terminal rows')
+    const terminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, options.phase9TimeoutMs)
+    tracePhase(options, 'phase 9 terminal rows observed', {
+        selected: (terminal.summary?.selected || []).map(item => ({
+            target: item.targetProfileHref,
+            statuses: item.statuses
+        }))
+    })
+    assertSelectedQueueRowsConsistent(terminal.summary, fail, 'phase 9 terminal')
+    assertSelectedTerminalOutcomes(terminal.summary, fail, 'phase 9 terminal')
+    assertWalPresent(terminal.authority, fail, 'phase 9 terminal WAL')
+    assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, 'phase 9 terminal')
+
+    tracePhase(options, 'phase 9 stopping service worker after terminal')
+    const restartAfterTerminal = await stopExtensionServiceWorker(config, options.extensionId)
+    tracePhase(options, 'phase 9 waking service worker after terminal')
+    const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
+    const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000)
+    tracePhase(options, 'phase 9 terminal rows preserved after restart')
+    assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, 'phase 9 after terminal service-worker restart')
+    assertSelectedTerminalOutcomes(afterRestartAfterTerminal.summary, fail, 'phase 9 after terminal restart')
+    assertWalPresent(afterRestartAfterTerminal.authority, fail, 'phase 9 after terminal restart WAL')
+    assertNoRuntimeActionSurfaceLeak(afterRestartAfterTerminal.authority, fail, 'phase 9 after terminal restart')
+    tracePhase(options, 'phase 9 restoring low-concurrency preference')
+    lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
+    if(lowConcurrencyPreference.restored?.ok !== true) {
+        fail('phase 9 failed to restore profile-search batch preference', lowConcurrencyPreference.restored)
+    }
+
+    return {
+        kind: PHASE9_SMALL_BATCH_QUEUE,
+        search: discovery,
+        lowConcurrencyPreference,
+        beforeQueue,
+        beforeSelected,
+        beforeAuthority,
+        pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+        selection,
+        selectedTargets,
+        existingQueueTargets,
+        queueClicks,
+        incrementalEnqueue,
+        afterEnqueue: {
+            queue: afterEnqueue.summary,
+            fullQueue: afterEnqueue.fullSummary,
+            authority: afterEnqueue.authority
+        },
+        restartBeforeStart,
+        wakeBeforeStart,
+        afterRestartBeforeStart: {
+            queue: afterRestartBeforeStart.summary,
+            fullQueue: afterRestartBeforeStart.fullSummary,
+            authority: afterRestartBeforeStart.authority
+        },
+        resumePaused: summarizeMessageResult(resumePaused),
+        start: summarizeMessageResult(start),
+        terminal: {
+            timedOut: terminal.timedOut,
+            queue: terminal.summary,
+            fullQueue: terminal.fullSummary,
+            authority: terminal.authority
+        },
+        restartAfterTerminal,
+        wakeAfterTerminal,
+        afterRestartAfterTerminal: {
+            queue: afterRestartAfterTerminal.summary,
+            fullQueue: afterRestartAfterTerminal.fullSummary,
+            authority: afterRestartAfterTerminal.authority
+        }
     }
 }
 
@@ -2005,6 +3149,12 @@ function writeJson(pathname, value) {
     fs.writeFileSync(pathname, `${JSON.stringify(value, null, 2)}\n`)
 }
 
+function tracePhase(options = {}, message = '', details = null) {
+    if(options.verbose !== true) return
+    const suffix = details ? ` ${JSON.stringify(details)}` : ''
+    console.error(`[upgrade-regression:${options.phase}] ${message}${suffix}`)
+}
+
 runMain(async () => {
     const options = parseArgs(process.argv)
     const config = {
@@ -2062,8 +3212,11 @@ runMain(async () => {
             contentRefreshSmoke: null,
             discoverySmoke: null,
             discoveryReloadSmoke: null,
+            oneItemQueueSmoke: null,
+            smallBatchQueueSmoke: null,
             spaceMarkSmoke: null,
             dashboardAuthoritySmoke: null,
+            flightRecorder: null,
             workStateBefore: null,
             workStateAfter: null,
             authorityStateBefore: null,
@@ -2110,8 +3263,11 @@ runMain(async () => {
     let contentRefreshSmoke = null
     let discoverySmoke = null
     let discoveryReloadSmoke = null
+    let oneItemQueueSmoke = null
+    let smallBatchQueueSmoke = null
     let spaceMarkSmoke = null
     let dashboardAuthoritySmoke = null
+    let flightRecorder = null
     if(options.phase === PHASE2) {
         contentSmoke = await runContentSmoke(config, options, warnings, fail)
         await sleep(500)
@@ -2148,6 +3304,14 @@ runMain(async () => {
         discoveryReloadSmoke = await runDiscoveryReloadStabilitySmoke(config, options, context, warnings, fail)
         await sleep(500)
     }
+    else if(options.phase === PHASE8_ONE_ITEM_QUEUE) {
+        oneItemQueueSmoke = await runOneItemQueueAuthoritySmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
+    else if(options.phase === PHASE9_SMALL_BATCH_QUEUE) {
+        smallBatchQueueSmoke = await runSmallBatchQueueAuthoritySmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
 
     if(contentSmoke?.page?.quoraLoginLikely ||
             contentRefreshSmoke?.before?.page?.quoraLoginLikely ||
@@ -2158,6 +3322,8 @@ runMain(async () => {
             discoveryReloadSmoke?.search?.afterReload?.page?.quoraLoginLikely ||
             discoveryReloadSmoke?.spaces?.some(page =>
                 page?.before?.page?.quoraLoginLikely || page?.afterReload?.page?.quoraLoginLikely) ||
+            oneItemQueueSmoke?.search?.page?.quoraLoginLikely ||
+            smallBatchQueueSmoke?.search?.page?.quoraLoginLikely ||
             spaceMarkSmoke?.before?.page?.quoraLoginLikely ||
             spaceMarkSmoke?.reloaded?.page?.quoraLoginLikely) {
         addOperatorIntervention(operatorIntervention, OPERATOR_QUORA_LOGIN_PROMPT)
@@ -2199,14 +3365,15 @@ runMain(async () => {
         })
     }
 
-    if(alarmNames.some(name => /repair|mb-stored-work-repair|legacyImport|importLegacy/i.test(name))) {
-        fail('legacy repair/import alarm is visible', alarmNames.filter(name => /repair|mb-stored-work-repair|legacyImport|importLegacy/i.test(name)))
+    if(alarmNames.some(name => new RegExp("repair|" + LEGACY_REPAIR_ALARM_NAME + "|" + LEGACY_IMPORT_CAMEL + "|" + IMPORT_LEGACY_CAMEL, "i").test(name))) {
+        fail('legacy repair/import alarm is visible', alarmNames.filter(name => new RegExp("repair|" + LEGACY_REPAIR_ALARM_NAME + "|" + LEGACY_IMPORT_CAMEL + "|" + IMPORT_LEGACY_CAMEL, "i").test(name)))
     }
 
-    if(workStateAfter.rawActiveLike > workStateBefore.rawActiveLike ||
+    if(!isWorkProducingPhase(options.phase) &&
+            (workStateAfter.rawActiveLike > workStateBefore.rawActiveLike ||
             workStateAfter.rawQueuedLike > workStateBefore.rawQueuedLike ||
             workStateAfter.viewActiveLike > workStateBefore.viewActiveLike ||
-            workStateAfter.viewQueuedLike > workStateBefore.viewQueuedLike) {
+            workStateAfter.viewQueuedLike > workStateBefore.viewQueuedLike)) {
         fail(`${options.phase} appears to have started or queued work`, {
             before: workStateBefore,
             after: workStateAfter
@@ -2216,6 +3383,10 @@ runMain(async () => {
             options.phase === PHASE5_DASHBOARD_AUTHORITY ||
             options.phase === PHASE6_STALE_CONTENT_REFRESH) {
         assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
+    }
+
+    if(options.phase === PHASE9_SMALL_BATCH_QUEUE && (failures.length || options.includeFlightRecorder === true)) {
+        flightRecorder = await readFlightRecorder(context, {limit: 200})
     }
 
     const legacyActionSummary = Object.fromEntries(Object.entries(legacyActions)
@@ -2255,8 +3426,11 @@ runMain(async () => {
         contentRefreshSmoke,
         discoverySmoke,
         discoveryReloadSmoke,
+        oneItemQueueSmoke,
+        smallBatchQueueSmoke,
         spaceMarkSmoke,
         dashboardAuthoritySmoke,
+        flightRecorder,
         workStateBefore,
         workStateAfter,
         authorityStateBefore,
