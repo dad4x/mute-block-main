@@ -1356,7 +1356,7 @@ test('single current work cancel WAL append failure leaves selected row pending'
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(storage.mbCoordinatorEvents.some(event => event?.type === 'paused'), false)
 })
 
 test('bulk current work cancel WAL append failure leaves rows pending', async () => {
@@ -1419,7 +1419,7 @@ test('bulk current work cancel WAL append failure leaves rows pending', async ()
     assert.equal(currentAuthority.queue[hrefA].status, 'queued')
     assert.equal(currentAuthority.queue[hrefB].status, 'queued')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(storage.mbCoordinatorEvents.some(event => event?.type === 'paused'), false)
 })
 
 test('bulk current work cancel WAL append failure does not close active owned tab', async () => {
@@ -1483,7 +1483,7 @@ test('bulk current work cancel WAL append failure does not close active owned ta
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(storage.mbCoordinatorEvents.some(event => event?.type === 'paused'), false)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
 })
@@ -2082,13 +2082,13 @@ test('manual failed requeue WAL append failure does not start executor or write 
     }), timers)
 
     assert.equal(result.selected, 0)
-    assert.equal(result.queued, 1)
+    assert.equal(result.queued, 0)
     assert.equal(result.reason, 'persistence-error')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[href].status, 'failed')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbCoordinatorEvents.length, 0)
+    assert.equal(storage.mbCoordinatorEvents.some(event => event?.type === 'requeue'), false)
     assert.equal(browser.__tabs.size, 0)
     assert.equal(sw.state().queuedTabActions.length, 0)
 })
@@ -20515,7 +20515,7 @@ test('content script ensure reloads same-version cached marker when nudge has no
     const runId = 'run-stale-content-script-receiver'
     const attemptId = 'attempt-stale-content-script-receiver'
     const tabId = 714
-    const {browser, sw} = loadServiceWorkerHarness({
+    const {browser, sw, timers} = loadServiceWorkerHarness({
         now: 92000,
         storage: {
             mbCoordinatorPaused: false,

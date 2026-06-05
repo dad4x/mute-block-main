@@ -19241,6 +19241,12 @@ async function requestCoordinatorActionLease(request = {}, sender = {}) {
     const profileHref = normalizeQuoraProfileUrl(metadata?.profileHref || request.profileHref || request.href || '')
     if(!profileHref) return {granted: false, reason: 'invalid-profile-href'}
 
+    const incomingAttemptId = normalizeAttemptId(request.attemptId || request.attempt?.id || '')
+    const incomingAttemptNumber = Number.parseInt(request.attemptNumber || request.attempt?.number, 10) || 0
+    if(!incomingAttemptId || !incomingAttemptNumber) {
+        return {granted: false, staleAttempt: true, reason: 'missing-attempt-identity'}
+    }
+
     if(!await validateQueuedTabAttempt(sender, request, {
         profileHref,
         message: 'Ignored stale action-lease request'
@@ -19254,8 +19260,8 @@ async function requestCoordinatorActionLease(request = {}, sender = {}) {
             reason: 'ordinaryMutation',
             profileHref,
             tabId,
-            attemptId: request.attemptId || metadata?.attemptId || '',
-            attemptNumber: request.attemptNumber || metadata?.attemptNumber || 0,
+            attemptId: incomingAttemptId,
+            attemptNumber: incomingAttemptNumber,
             actionKind: request.actionKind || metadata?.actionKind || '',
             requestReason: request.reason || '',
             currentAuthorityState: getHydratedCoordinatorAuthorityState('actionLease.request.messageResidentAuthority')

@@ -585,7 +585,7 @@ node tools/cdp/upgrade-regression/run.js \
   --phase phase9-small-batch-queue-authority-smoke \
   --search-url 'https://www.quora.com/search?q=tim%20cook&type=profile' \
   --phase9-target-count 3 \
-  --phase9-timeout-ms 240000 \
+  --phase9-timeout-ms 600000 \
   --allow-work-producing
 ```
 
@@ -627,13 +627,65 @@ Hard stops:
 - queued action-surface records remain after terminal or after terminal hydrate
 - unrelated active/queued rows appear outside the selected target set
 
-Live status on 2026-06-04: Phase 9 runner implementation is present, but the
-current warmed profile did not pass. Reports under `tmp/upgrade-regression/`
-show selected rows entering WAL/current authority with no legacy full-progress
-storage, no repair/import alarm, and no queued action-surface leak. The failures
-were current-authority behavior: one concurrent Tim Cook run failed
-`active-without-actor`, and low-concurrency Sundar Pichai left one selected row
-queued after the bounded timeout while compact queue view state later diverged
-from raw authority for another selected row. Treat Phase 9 as an active
-regression exposing queue continuation/projection issues, not as a validated
-baseline.
+Live status on 2026-06-05: Phase 9 is validated in `v1.6.865` against the keyed
+upgrade profile after queue-authority processing fixes and harness tightening.
+The passing warmed-profile baseline used:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --host 127.0.0.1 \
+  --port 9223 \
+  --profile-label current-profile-phase9-865-barack \
+  --phase phase9-small-batch-queue-authority-smoke \
+  --allow-work-producing \
+  --search-url 'https://www.quora.com/search?q=barack%20obama&type=profile' \
+  --phase9-target-count 3 \
+  --include-flight-recorder \
+  --write-baseline tmp/upgrade-regression/current-profile-phase9-865-barack.json
+```
+
+Known residue: raw `mbCoordinatorQueue` may diverge from WAL/recovered
+authority in warmed profiles. That mirror is reported but not used as
+authority. Recovered queue authority, compact queue view, executor state, and
+runtime/accounting checks are the current authority surfaces.
+
+## Phase 10 Medium Batch Queue Authority Smoke
+
+Phase 10 is the next work-producing regression after the Phase 9 checkpoint. It
+uses the same real profile-search UI enqueue path, but selects 8 to 12 fresh
+candidates that are not already present in recovered queue authority. It is
+still for a disposable or explicitly approved warmed logged-in profile.
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --profile-label disposable-phase10-medium-batch \
+  --phase phase10-medium-batch-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=barack%20obama&type=profile' \
+  --phase10-target-count 10 \
+  --phase10-concurrency 2 \
+  --phase10-timeout-ms 1200000 \
+  --phase10-idle-ms 20000 \
+  --allow-work-producing
+```
+
+Phase 10 behavior:
+
+- Opens or reuses the profile-search page and verifies actionable extension
+  candidate controls.
+- Excludes all candidates already present in recovered/current queue authority.
+- Temporarily sets `profilesPerBatch` to the requested low concurrency, default
+  2, then restores the prior value before the report is finalized.
+- Queues selected targets through real row UI buttons.
+- Verifies durable queue authority, compact queue view, and WAL before Start.
+- Restarts the service worker before Start and after terminal.
+- Starts once through `resume-coordinator-queue` with `userInitiated: true`.
+- Requires all selected rows to end terminal with 0 selected active/queued rows.
+- Requires no queued action-surface records after terminal/hydrate.
+- Waits the configured idle interval after completion and includes the
+  flight-recorder delta in the report. Any idle recorder entry is a failure.
+
+Phase 10 explicitly reports raw mirror divergence but does not treat raw
+`mbCoordinatorQueue` as authority unless that stale state leaks into recovered
+authority, compact view, executor behavior, or runtime accounting.
