@@ -205,6 +205,32 @@ rows, profile progress rows, WAL keys, queued action-surface records, the full
 the deleted full legacy progress blob key, repair/import alarms, or accepted legacy
 runtime actions. Queue-authority tests are a separate disposable-profile class.
 
+Work-producing queue-authority sequence after the non-work-starting phases:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --phase phase9-small-batch-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=barack%20obama&type=profile' \
+  --phase9-target-count 3 \
+  --allow-work-producing
+```
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id nlmmkoljofpgbmlcojebolmniineboah \
+  --phase phase10-medium-batch-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=barack%20obama&type=profile' \
+  --phase10-target-count 10 \
+  --phase10-concurrency 2 \
+  --phase10-timeout-ms 1200000 \
+  --phase10-idle-ms 20000 \
+  --allow-work-producing
+```
+
+Run these only in a disposable or explicitly approved warmed logged-in profile.
+They intentionally create WAL-backed queue authority and profile terminal state.
+
 ## Dictionary
 
 | Script | Purpose | Typical command |

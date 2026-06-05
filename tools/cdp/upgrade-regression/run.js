@@ -31,6 +31,7 @@ const PHASE6_STALE_CONTENT_REFRESH = 'phase6-stale-content-refresh-reinject-smok
 const PHASE7_DISCOVERY_RELOAD = 'phase7-discovery-reload-stability-smoke'
 const PHASE8_ONE_ITEM_QUEUE = 'phase8-one-item-queue-authority-smoke'
 const PHASE9_SMALL_BATCH_QUEUE = 'phase9-small-batch-queue-authority-smoke'
+const PHASE10_MEDIUM_BATCH_QUEUE = 'phase10-medium-batch-queue-authority-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
 const SPACE_ASSET_URLS = [
     'https://theqdefensecrew.quora.com/',
@@ -58,7 +59,8 @@ const SUPPORTED_PHASES = [
     PHASE6_STALE_CONTENT_REFRESH,
     PHASE7_DISCOVERY_RELOAD,
     PHASE8_ONE_ITEM_QUEUE,
-    PHASE9_SMALL_BATCH_QUEUE
+    PHASE9_SMALL_BATCH_QUEUE,
+    PHASE10_MEDIUM_BATCH_QUEUE
 ]
 
 const LEGACY_RECORD_PROGRESS_ACTION = ["record", "nuke", "progress"].join("-")
@@ -207,6 +209,10 @@ function parseArgs(argv) {
         phase8TimeoutMs: 120000,
         phase9TargetCount: 3,
         phase9TimeoutMs: 600000,
+        phase10TargetCount: 10,
+        phase10TimeoutMs: 1200000,
+        phase10Concurrency: 2,
+        phase10IdleMs: 20000,
         allowWorkProducing: false,
         includeFlightRecorder: false,
         verbose: false
@@ -264,6 +270,14 @@ function parseArgs(argv) {
         else if(arg.startsWith('--phase9-target-count=')) options.phase9TargetCount = Number.parseInt(arg.slice('--phase9-target-count='.length), 10) || options.phase9TargetCount
         else if(arg === '--phase9-timeout-ms') options.phase9TimeoutMs = Number.parseInt(readValue(`${options.phase9TimeoutMs}`), 10) || options.phase9TimeoutMs
         else if(arg.startsWith('--phase9-timeout-ms=')) options.phase9TimeoutMs = Number.parseInt(arg.slice('--phase9-timeout-ms='.length), 10) || options.phase9TimeoutMs
+        else if(arg === '--phase10-target-count') options.phase10TargetCount = Number.parseInt(readValue(`${options.phase10TargetCount}`), 10) || options.phase10TargetCount
+        else if(arg.startsWith('--phase10-target-count=')) options.phase10TargetCount = Number.parseInt(arg.slice('--phase10-target-count='.length), 10) || options.phase10TargetCount
+        else if(arg === '--phase10-timeout-ms') options.phase10TimeoutMs = Number.parseInt(readValue(`${options.phase10TimeoutMs}`), 10) || options.phase10TimeoutMs
+        else if(arg.startsWith('--phase10-timeout-ms=')) options.phase10TimeoutMs = Number.parseInt(arg.slice('--phase10-timeout-ms='.length), 10) || options.phase10TimeoutMs
+        else if(arg === '--phase10-concurrency') options.phase10Concurrency = Number.parseInt(readValue(`${options.phase10Concurrency}`), 10) || options.phase10Concurrency
+        else if(arg.startsWith('--phase10-concurrency=')) options.phase10Concurrency = Number.parseInt(arg.slice('--phase10-concurrency='.length), 10) || options.phase10Concurrency
+        else if(arg === '--phase10-idle-ms') options.phase10IdleMs = Number.parseInt(readValue(`${options.phase10IdleMs}`), 10) || options.phase10IdleMs
+        else if(arg.startsWith('--phase10-idle-ms=')) options.phase10IdleMs = Number.parseInt(arg.slice('--phase10-idle-ms='.length), 10) || options.phase10IdleMs
         else if(arg === '--allow-work-producing') options.allowWorkProducing = true
         else if(arg === '--include-flight-recorder') options.includeFlightRecorder = true
         else if(arg === '--verbose') options.verbose = true
@@ -284,8 +298,16 @@ function parseArgs(argv) {
     if(options.phase === PHASE9_SMALL_BATCH_QUEUE && options.allowWorkProducing !== true) {
         throw new Error(`${PHASE9_SMALL_BATCH_QUEUE} intentionally creates queue/profile work; rerun with --allow-work-producing in a disposable logged-in profile`)
     }
+    if(options.phase === PHASE10_MEDIUM_BATCH_QUEUE && options.allowWorkProducing !== true) {
+        throw new Error(`${PHASE10_MEDIUM_BATCH_QUEUE} intentionally creates queue/profile work; rerun with --allow-work-producing in a disposable logged-in profile`)
+    }
     if(options.phase === PHASE9_SMALL_BATCH_QUEUE) {
         options.phase9TargetCount = Math.max(3, Math.min(Number.parseInt(options.phase9TargetCount, 10) || 3, 5))
+    }
+    if(options.phase === PHASE10_MEDIUM_BATCH_QUEUE) {
+        options.phase10TargetCount = Math.max(8, Math.min(Number.parseInt(options.phase10TargetCount, 10) || 10, 12))
+        options.phase10Concurrency = Math.max(1, Math.min(Number.parseInt(options.phase10Concurrency, 10) || 2, 3))
+        options.phase10IdleMs = Math.max(5000, Math.min(Number.parseInt(options.phase10IdleMs, 10) || 20000, 60000))
     }
     options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
     options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
@@ -319,6 +341,10 @@ function printUsage() {
         '  --phase8-timeout-ms 120000',
         '  --phase9-target-count 3',
         '  --phase9-timeout-ms 600000',
+        '  --phase10-target-count 10',
+        '  --phase10-timeout-ms 1200000',
+        '  --phase10-concurrency 2',
+        '  --phase10-idle-ms 20000',
         '  --allow-work-producing',
         '  --write-baseline [path]',
         '  --compare-baseline path',
@@ -569,6 +595,32 @@ async function readFlightRecorder(target, request = {}) {
     }
 }
 
+async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
+    const before = await readFlightRecorder(target, {limit: 1})
+    const beforeSeq = Number.parseInt(before.response?.newestSeq, 10) || 0
+    await sleep(Math.max(1000, Number.parseInt(idleMs, 10) || 20000))
+    const after = await readFlightRecorder(target, {
+        sinceSeq: beforeSeq,
+        limit: 200
+    })
+    const entries = Array.isArray(after.response?.entries) ? after.response.entries : []
+    const noisyKinds = new Set([
+        'start-resume',
+        'window-focus-request',
+        'tab-open-request'
+    ])
+    return {
+        idleMs: Math.max(1000, Number.parseInt(idleMs, 10) || 20000),
+        beforeSeq,
+        ok: before.ok === true && after.ok === true,
+        before,
+        after,
+        entryCount: entries.length,
+        noisyEntryCount: entries.filter(entry => noisyKinds.has(`${entry?.kind || ''}`)).length,
+        entries
+    }
+}
+
 async function readStorage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
@@ -709,7 +761,9 @@ function isContentRefreshPhase(phase = '') {
 }
 
 function isWorkProducingPhase(phase = '') {
-    return phase === PHASE8_ONE_ITEM_QUEUE || phase === PHASE9_SMALL_BATCH_QUEUE
+    return phase === PHASE8_ONE_ITEM_QUEUE ||
+        phase === PHASE9_SMALL_BATCH_QUEUE ||
+        phase === PHASE10_MEDIUM_BATCH_QUEUE
 }
 
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
@@ -1155,6 +1209,9 @@ function comparableReport(report) {
         ...(report.smallBatchQueueSmoke
             ? {smallBatchQueueSmoke: comparableSmallBatchQueueSmoke(report.smallBatchQueueSmoke)}
             : {}),
+        ...(report.mediumBatchQueueSmoke
+            ? {mediumBatchQueueSmoke: comparableSmallBatchQueueSmoke(report.mediumBatchQueueSmoke)}
+            : {}),
         workStateAfter: report.workStateAfter
     }
 }
@@ -1394,6 +1451,11 @@ function comparableSmallBatchQueueSmoke(smallBatchQueueSmoke = null) {
         afterRestartAfterTerminal: {
             queue: summarizeQueue(smallBatchQueueSmoke.afterRestartAfterTerminal?.queue),
             authority: summarizeAuthority(smallBatchQueueSmoke.afterRestartAfterTerminal?.authority)
+        },
+        idleFlightRecorder: {
+            ok: smallBatchQueueSmoke.idleFlightRecorder?.ok === true,
+            entryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.entryCount || 0) || 0,
+            noisyEntryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.noisyEntryCount || 0) || 0
         }
     }
 }
@@ -2511,7 +2573,7 @@ async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [],
     }
 }
 
-async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [], timeoutMs = 240000) {
+async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [], timeoutMs = 240000, label = 'selected items') {
     const deadline = Date.now() + Math.max(5000, Number.parseInt(timeoutMs, 10) || 240000)
     let storage = await readStorage(context)
     let fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
@@ -2540,7 +2602,7 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
                 tabId: row.tabId || null,
                 executorTabAction: row.executorTabAction || ''
             }))
-        fail('phase 9 selected items did not all reach terminal queue state before timeout', {
+        fail(`${label} did not all reach terminal queue state before timeout`, {
             selectedSummary,
             stalledSelectedRows,
             fullSummary
@@ -2576,6 +2638,7 @@ function assertSelectedTerminalOutcomes(selectedSummary = {}, fail, label = 'sel
 }
 
 async function runOneItemQueueAuthoritySmoke(config, options, context, warnings, fail) {
+    const idleFlightRecorder = null
     const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 8 profile search one-item queue')
     const discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, true, {
         allowProgressRows: true
@@ -2691,27 +2754,36 @@ async function runOneItemQueueAuthoritySmoke(config, options, context, warnings,
             queue: afterRestartAfterTerminal.summary,
             fullQueue: afterRestartAfterTerminal.fullSummary,
             authority: afterRestartAfterTerminal.authority
-        }
+        },
+        idleFlightRecorder
     }
 }
 
 async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnings, fail) {
-    tracePhase(options, 'phase 9 starting')
+    const mediumBatch = options.phase === PHASE10_MEDIUM_BATCH_QUEUE
+    const batchKind = mediumBatch ? PHASE10_MEDIUM_BATCH_QUEUE : PHASE9_SMALL_BATCH_QUEUE
+    const phaseLabel = mediumBatch ? 'phase 10' : 'phase 9'
+    const targetCount = mediumBatch ? options.phase10TargetCount : options.phase9TargetCount
+    const timeoutMs = mediumBatch ? options.phase10TimeoutMs : options.phase9TimeoutMs
+    const concurrency = mediumBatch ? options.phase10Concurrency : 1
+    const idleMs = mediumBatch ? options.phase10IdleMs : 0
+
+    tracePhase(options, `${phaseLabel} starting`)
     const preferenceBefore = await readStorage(context)
     const previousProfilesPerBatch = preferenceBefore?.data?.profilesPerBatch
     const lowConcurrencyPreference = {
         key: 'profilesPerBatch',
         previousValue: previousProfilesPerBatch,
-        requestedValue: 1,
-        set: await setStorageValues(context, {profilesPerBatch: 1}),
+        requestedValue: concurrency,
+        set: await setStorageValues(context, {profilesPerBatch: concurrency}),
         restored: null
     }
     if(lowConcurrencyPreference.set?.ok !== true) {
-        fail('phase 9 failed to set low-concurrency profile-search preference', lowConcurrencyPreference.set)
+        fail(`${phaseLabel} failed to set low-concurrency profile-search preference`, lowConcurrencyPreference.set)
     }
 
-    const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, 'phase 9 profile search small-batch queue')
-    tracePhase(options, 'phase 9 search target ready', {url: searchTarget.url || ''})
+    const searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, `${phaseLabel} profile search batch queue`)
+    tracePhase(options, `${phaseLabel} search target ready`, {url: searchTarget.url || ''})
     await reloadPageTarget(searchTarget)
     const discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, true, {
         allowProgressRows: true,
@@ -2724,7 +2796,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
 
     if(beforeQueue.activeRows > 0 || beforeQueue.queuedRows > 0 ||
             (Number.parseInt(beforeAuthority.queuedActionSurfaceRecords, 10) || 0) > 0) {
-        fail('phase 9 must start with no active/queued work in the selected profile', {
+        fail(`${phaseLabel} must start with no active/queued work in the selected profile`, {
             beforeQueue,
             beforeAuthority
         })
@@ -2737,25 +2809,25 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         .filter(Boolean)))
 
     const pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
-    const selection = await selectEnabledProfileSearchQueueTargets(searchTarget, options.phase9TargetCount, existingQueueTargets)
-    tracePhase(options, 'phase 9 selected targets', {
-        requested: options.phase9TargetCount,
+    const selection = await selectEnabledProfileSearchQueueTargets(searchTarget, targetCount, existingQueueTargets)
+    tracePhase(options, `${phaseLabel} selected targets`, {
+        requested: targetCount,
         selected: (selection.selected || []).map(entry => entry.href),
         excludedExistingQueueTargets: existingQueueTargets.length
     })
     const selectedTargets = (selection.selected || [])
         .map(entry => entry.href)
         .filter(Boolean)
-        .slice(0, options.phase9TargetCount)
-    if(selectedTargets.length !== options.phase9TargetCount) {
-        fail('phase 9 did not find enough enabled profile-search row buttons', {
-            requested: options.phase9TargetCount,
+        .slice(0, targetCount)
+    if(selectedTargets.length !== targetCount) {
+        fail(`${phaseLabel} did not find enough enabled profile-search row buttons`, {
+            requested: targetCount,
             selectedTargets,
             selection
         })
         lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
         return {
-            kind: PHASE9_SMALL_BATCH_QUEUE,
+            kind: batchKind,
             search: discovery,
             lowConcurrencyPreference,
             beforeQueue,
@@ -2773,17 +2845,17 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     const queueClicks = []
     const incrementalEnqueue = []
     for(const href of selectedTargets) {
-        tracePhase(options, 'phase 9 queue click', {href})
+        tracePhase(options, `${phaseLabel} queue click`, {href})
         const click = await clickOneProfileSearchQueueButton(searchTarget, href)
         queueClicks.push(click)
         if(click.clicked !== true) {
-            fail('phase 9 failed to click a selected profile-search queue button', {
+            fail(`${phaseLabel} failed to click a selected profile-search queue button`, {
                 href,
                 click
             })
             lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
             return {
-                kind: PHASE9_SMALL_BATCH_QUEUE,
+                kind: batchKind,
                 search: discovery,
                 lowConcurrencyPreference,
                 beforeQueue,
@@ -2803,7 +2875,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             context,
             fail,
             selectedTargets.slice(0, queueClicks.length),
-            `phase 9 after queue click ${queueClicks.length}`,
+            `${phaseLabel} after queue click ${queueClicks.length}`,
             15000
         )
         incrementalEnqueue.push({
@@ -2816,7 +2888,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         if(!latest || latest.rowCount !== 1 || latest.viewRowCount !== 1) {
             lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
             return {
-                kind: PHASE9_SMALL_BATCH_QUEUE,
+                kind: batchKind,
                 search: discovery,
                 lowConcurrencyPreference,
                 beforeQueue,
@@ -2834,75 +2906,90 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         }
     }
 
-    tracePhase(options, 'phase 9 waiting after enqueue')
+    tracePhase(options, `${phaseLabel} waiting after enqueue`)
     const afterEnqueue = await waitForSelectedQueuedRows(
         context,
         fail,
         selectedTargets,
-        'phase 9 after enqueue',
+        `${phaseLabel} after enqueue`,
         30000
     )
-    assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, 'phase 9 after enqueue')
-    assertWalPresent(afterEnqueue.authority, fail, 'phase 9 after enqueue WAL')
+    assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, `${phaseLabel} after enqueue`)
+    assertWalPresent(afterEnqueue.authority, fail, `${phaseLabel} after enqueue WAL`)
 
-    tracePhase(options, 'phase 9 stopping service worker before start')
+    tracePhase(options, `${phaseLabel} stopping service worker before start`)
     const restartBeforeStart = await stopExtensionServiceWorker(config, options.extensionId)
-    tracePhase(options, 'phase 9 waking service worker before start')
+    tracePhase(options, `${phaseLabel} waking service worker before start`)
     const wakeBeforeStart = await wakeServiceWorkerWithAccounting(context)
     const afterRestartBeforeStart = await waitForSelectedQueuedRows(
         context,
         fail,
         selectedTargets,
-        'phase 9 after pre-start service-worker restart',
+        `${phaseLabel} after pre-start service-worker restart`,
         30000
     )
-    assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, 'phase 9 after pre-start service-worker restart')
-    assertWalPresent(afterRestartBeforeStart.authority, fail, 'phase 9 after pre-start restart WAL')
+    assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, `${phaseLabel} after pre-start service-worker restart`)
+    assertWalPresent(afterRestartBeforeStart.authority, fail, `${phaseLabel} after pre-start restart WAL`)
 
     const resumePaused = await sendRuntimeMessage(context, {action: 'resume-paused-coordinator-nukes'}, 10000)
-    tracePhase(options, 'phase 9 starting queue')
+    tracePhase(options, `${phaseLabel} starting queue`)
     const start = await sendRuntimeMessage(context, {
         action: 'resume-coordinator-queue',
         allowBeforeQuora: true,
         userInitiated: true,
-        actionBudget: options.phase9TargetCount,
-        timeoutMs: Math.min(60000, Math.max(10000, Number.parseInt(options.phase9TimeoutMs, 10) || 240000))
+        actionBudget: targetCount,
+        timeoutMs: Math.min(60000, Math.max(10000, Number.parseInt(timeoutMs, 10) || 240000))
     }, 70000)
     if(start.timedOut || start.lastError) {
-        fail('phase 9 user-equivalent Start failed', summarizeMessageResult(start))
+        fail(`${phaseLabel} user-equivalent Start failed`, summarizeMessageResult(start))
     }
 
-    tracePhase(options, 'phase 9 waiting for terminal rows')
-    const terminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, options.phase9TimeoutMs)
-    tracePhase(options, 'phase 9 terminal rows observed', {
+    tracePhase(options, `${phaseLabel} waiting for terminal rows`)
+    const terminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, timeoutMs, `${phaseLabel} selected items`)
+    tracePhase(options, `${phaseLabel} terminal rows observed`, {
         selected: (terminal.summary?.selected || []).map(item => ({
             target: item.targetProfileHref,
             statuses: item.statuses
         }))
     })
-    assertSelectedQueueRowsConsistent(terminal.summary, fail, 'phase 9 terminal')
-    assertSelectedTerminalOutcomes(terminal.summary, fail, 'phase 9 terminal')
-    assertWalPresent(terminal.authority, fail, 'phase 9 terminal WAL')
-    assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, 'phase 9 terminal')
+    assertSelectedQueueRowsConsistent(terminal.summary, fail, `${phaseLabel} terminal`)
+    assertSelectedTerminalOutcomes(terminal.summary, fail, `${phaseLabel} terminal`)
+    assertWalPresent(terminal.authority, fail, `${phaseLabel} terminal WAL`)
+    assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, `${phaseLabel} terminal`)
 
-    tracePhase(options, 'phase 9 stopping service worker after terminal')
+    tracePhase(options, `${phaseLabel} stopping service worker after terminal`)
     const restartAfterTerminal = await stopExtensionServiceWorker(config, options.extensionId)
-    tracePhase(options, 'phase 9 waking service worker after terminal')
+    tracePhase(options, `${phaseLabel} waking service worker after terminal`)
     const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
-    const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000)
-    tracePhase(options, 'phase 9 terminal rows preserved after restart')
-    assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, 'phase 9 after terminal service-worker restart')
-    assertSelectedTerminalOutcomes(afterRestartAfterTerminal.summary, fail, 'phase 9 after terminal restart')
-    assertWalPresent(afterRestartAfterTerminal.authority, fail, 'phase 9 after terminal restart WAL')
-    assertNoRuntimeActionSurfaceLeak(afterRestartAfterTerminal.authority, fail, 'phase 9 after terminal restart')
-    tracePhase(options, 'phase 9 restoring low-concurrency preference')
+    const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000, `${phaseLabel} selected items after terminal restart`)
+    tracePhase(options, `${phaseLabel} terminal rows preserved after restart`)
+    assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal service-worker restart`)
+    assertSelectedTerminalOutcomes(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal restart`)
+    assertWalPresent(afterRestartAfterTerminal.authority, fail, `${phaseLabel} after terminal restart WAL`)
+    assertNoRuntimeActionSurfaceLeak(afterRestartAfterTerminal.authority, fail, `${phaseLabel} after terminal restart`)
+
+    let idleFlightRecorder = null
+    if(mediumBatch) {
+        tracePhase(options, `${phaseLabel} waiting for idle flight recorder delta`, {idleMs})
+        idleFlightRecorder = await readIdleFlightRecorderDelta(context, idleMs)
+        if(idleFlightRecorder.ok !== true || idleFlightRecorder.entryCount > 0) {
+            fail(`${phaseLabel} observed flight-recorder activity while idle after completion`, {
+                ok: idleFlightRecorder.ok,
+                entryCount: idleFlightRecorder.entryCount,
+                noisyEntryCount: idleFlightRecorder.noisyEntryCount,
+                entries: idleFlightRecorder.entries
+            })
+        }
+    }
+
+    tracePhase(options, `${phaseLabel} restoring low-concurrency preference`)
     lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
     if(lowConcurrencyPreference.restored?.ok !== true) {
-        fail('phase 9 failed to restore profile-search batch preference', lowConcurrencyPreference.restored)
+        fail(`${phaseLabel} failed to restore profile-search batch preference`, lowConcurrencyPreference.restored)
     }
 
     return {
-        kind: PHASE9_SMALL_BATCH_QUEUE,
+        kind: batchKind,
         search: discovery,
         lowConcurrencyPreference,
         beforeQueue,
@@ -3214,6 +3301,7 @@ runMain(async () => {
             discoveryReloadSmoke: null,
             oneItemQueueSmoke: null,
             smallBatchQueueSmoke: null,
+            mediumBatchQueueSmoke: null,
             spaceMarkSmoke: null,
             dashboardAuthoritySmoke: null,
             flightRecorder: null,
@@ -3265,6 +3353,7 @@ runMain(async () => {
     let discoveryReloadSmoke = null
     let oneItemQueueSmoke = null
     let smallBatchQueueSmoke = null
+    let mediumBatchQueueSmoke = null
     let spaceMarkSmoke = null
     let dashboardAuthoritySmoke = null
     let flightRecorder = null
@@ -3312,6 +3401,10 @@ runMain(async () => {
         smallBatchQueueSmoke = await runSmallBatchQueueAuthoritySmoke(config, options, context, warnings, fail)
         await sleep(500)
     }
+    else if(options.phase === PHASE10_MEDIUM_BATCH_QUEUE) {
+        mediumBatchQueueSmoke = await runSmallBatchQueueAuthoritySmoke(config, options, context, warnings, fail)
+        await sleep(500)
+    }
 
     if(contentSmoke?.page?.quoraLoginLikely ||
             contentRefreshSmoke?.before?.page?.quoraLoginLikely ||
@@ -3324,6 +3417,7 @@ runMain(async () => {
                 page?.before?.page?.quoraLoginLikely || page?.afterReload?.page?.quoraLoginLikely) ||
             oneItemQueueSmoke?.search?.page?.quoraLoginLikely ||
             smallBatchQueueSmoke?.search?.page?.quoraLoginLikely ||
+            mediumBatchQueueSmoke?.search?.page?.quoraLoginLikely ||
             spaceMarkSmoke?.before?.page?.quoraLoginLikely ||
             spaceMarkSmoke?.reloaded?.page?.quoraLoginLikely) {
         addOperatorIntervention(operatorIntervention, OPERATOR_QUORA_LOGIN_PROMPT)
@@ -3385,7 +3479,8 @@ runMain(async () => {
         assertDiscoveryDidNotCreateAuthority(authorityStateBefore, authorityStateAfter, fail)
     }
 
-    if(options.phase === PHASE9_SMALL_BATCH_QUEUE && (failures.length || options.includeFlightRecorder === true)) {
+    if((options.phase === PHASE9_SMALL_BATCH_QUEUE || options.phase === PHASE10_MEDIUM_BATCH_QUEUE) &&
+            (failures.length || options.includeFlightRecorder === true)) {
         flightRecorder = await readFlightRecorder(context, {limit: 200})
     }
 
@@ -3428,6 +3523,7 @@ runMain(async () => {
         discoveryReloadSmoke,
         oneItemQueueSmoke,
         smallBatchQueueSmoke,
+        mediumBatchQueueSmoke,
         spaceMarkSmoke,
         dashboardAuthoritySmoke,
         flightRecorder,

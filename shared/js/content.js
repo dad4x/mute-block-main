@@ -10875,7 +10875,7 @@ async function maybeRunAutoProfileAction() {
             queuedActionLeaseDeniedReason = 'timed-out-waiting'
             return false
         }
-        const heartbeatQueuedActionLease = async (options = {}) => {
+        async function heartbeatQueuedActionLease(options = {}) {
             if(!queuedActionLeaseHeld && !options.probe) return {heartbeat: false, skipped: true}
             const timeoutMs = Number.parseInt(options.timeoutMs, 10) || QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS
 
@@ -10892,7 +10892,8 @@ async function maybeRunAutoProfileAction() {
 
             return response
         }
-        const releaseQueuedActionLease = async reason => {
+
+        async function releaseQueuedActionLease(reason) {
             if(!queuedActionLeaseHeld) return false
             queuedActionLeaseHeld = false
 
@@ -11396,6 +11397,10 @@ function isUnmuteConfirmContextText(text) {
     return hasUnmuteActionText(value) &&
         !hasUnblockActionText(value) &&
         !/\bblock\b|\bblocked\b|\bblocking\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(value)
+}
+
+function isUnblockConfirmPending() {
+    return !!getUnblockConfirmAction()
 }
 
 function getUnmuteConfirmCandidates() {
