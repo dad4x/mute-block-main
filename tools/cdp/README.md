@@ -61,6 +61,12 @@ The current Windows laptop setup has two separate tunnels:
   `127.0.0.1:9222`.
 - SSH/copy tunnel: local `127.0.0.1:10022` reaches laptop SSH port `22`.
 
+Codex agents have standing permission to use the established tunneled SSH
+route for this repo's live-browser workflow. Do not ask again before running
+bounded `ssh` or `rsync` commands through `127.0.0.1:10022` to inspect the
+Windows regression browser state, clean stale delivery directories, or copy the
+rebuilt unpacked extension into the canonical Windows delivery path.
+
 Use the current logged-in debug profile when the regression needs existing
 Quora authentication:
 
@@ -117,7 +123,7 @@ does not show a live service worker for
 UI:
 
 ```text
->>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome-unpacked-current, and report the listed extension ID/version or the exact visible Chrome error text.
+>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome, and report the listed extension ID/version or the exact visible Chrome error text.
 ```
 
 After manual load, verify that Mute Block is listed with:
@@ -127,6 +133,13 @@ After manual load, verify that Mute Block is listed with:
 - location: `UNPACKED`
 - state: `ENABLED`
 - zero manifest/runtime/install warnings or errors
+
+Do not use the `chrome://extensions` Update button to pick up a newer local
+build when the unpacked build uses the keyed Chrome Web Store ID. Chrome treats
+that ID as store-backed, so Update can load the latest store version instead of
+the later unpacked local build. To validate a new local artifact, explicitly
+click `Load unpacked` again and select the current unpacked build directory,
+then re-check the version and path.
 
 Then run the upgrade regression Phase 5 dashboard authority smoke before
 expanding to later browser phases:
@@ -236,7 +249,7 @@ They intentionally create WAL-backed queue authority and profile terminal state.
 | Script | Purpose | Typical command |
 | --- | --- | --- |
 | `tools/cdp/windows-chrome-profile.js` | Stop an existing Windows Chrome/CDP listener on selected debug ports and launch Windows Chrome through Cygwin SSH with either a disposable or existing profile. Prints the separate `ssh -N -L` tunnel command. | `node tools/cdp/windows-chrome-profile.js --ssh USER@WINDOWS_HOST --remote-port 9224 --new-profile` |
-| `tools/cdp/reload-extension.js` | Reload the unpacked extension from `chrome://extensions/`, reopen/find the Dashboard in the background, and report version plus extension errors/warnings. Requires `chrome://extensions/` to already be open. | `node tools/cdp/reload-extension.js` |
+| `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. For the keyed Mute Block ID, use visible `Load unpacked` from `C:\Users\DBROWER\Documents\src\mute-block-main\chrome`; `chrome.developerPrivate.reload` can fall back to the store payload. | `node tools/cdp/reload-extension.js` |
 | `tools/cdp/space-summary.js` | Summarize all open Quora space tabs and service-worker space/queue state. | `node tools/cdp/space-summary.js` |
 | `tools/cdp/reload-space-tabs.js` | Reload all open Quora space tabs without creating new tabs. | `node tools/cdp/reload-space-tabs.js` |
 | `tools/cdp/inspect-space-state.js` | Inspect one space by URL/title substring, including source-page controls, pending post records, queue rows, and worker ownership. | `node tools/cdp/inspect-space-state.js --needle theobvioustrollshootinggallery` |

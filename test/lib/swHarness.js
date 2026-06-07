@@ -404,7 +404,7 @@ function loadServiceWorkerHarness(options = {}) {
     const timers = options.timers || createFakeTimers(options.now || 0)
     const browser = options.browser || createFakeBrowser(options.storage || {})
     const baseRequire = createRequire(swPath)
-    let source = `let __testHarnessDeactivated = false;\n${fs.readFileSync(swPath, 'utf8')}`
+    let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\n${fs.readFileSync(swPath, 'utf8')}`
 
     if(!options.runStartupWork) {
         source = source
@@ -423,6 +423,17 @@ function loadServiceWorkerHarness(options = {}) {
             "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    return null\n    if(coordinatorQueueWalCheckpointSwitchPromise) {"
         )
     }
+    if(options.fastExecutorResumeTimeoutMs) {
+        const timeoutMs = Math.max(1000, Number.parseInt(options.fastExecutorResumeTimeoutMs, 10) || 0)
+        source = source.replace(
+            'const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = 180000',
+            `const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = ${timeoutMs}`
+        )
+    }
+    source = source.replace(
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise',
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise'
+    )
     if(options.suppressBackgroundWorkAfterDeactivate === true) {
         source = source.replace(
             'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
@@ -452,6 +463,7 @@ module.exports.__test = {
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
     buildQueueWakeupMetricsView,
+    classifyCoordinatorExecutorState,
     coordinatorAuthority,
     enqueueSpaceFeedStorageUpdate,
     enqueueExistingExecutorForCoordinator,
@@ -471,6 +483,7 @@ module.exports.__test = {
     recordFlightRecorderEvent,
     getFlightRecorder,
     getFlightRecorderSnapshot,
+    getCoordinatorWhyNotRunning,
     isQueuedTabRetryBudgetReleaseReason,
     shouldAdvanceRolledBackQueuedTabBeforeOpen,
     recordQueuedTabMetadataMilestone,
@@ -489,6 +502,7 @@ module.exports.__test = {
     releaseCoordinatorActionLease,
     releaseCoordinatorActionLeaseForTab,
     releaseQueuedTabAndCleanup,
+    requeueDurableActiveCoordinatorItemWithoutActor,
     runCoordinatorAuthorityReconcileActions,
     runCoordinatorReconcileTick,
     pruneMissingQueuedTabRuntimeState,
@@ -508,6 +522,8 @@ module.exports.__test = {
     switchCoordinatorAuthorityQueueWalCheckpoint,
     terminalizeCoordinatorKeyOnlyItem,
     terminalizeActiveCoordinatorNonProfileLanding,
+    terminalizeExhaustedRolledBackQueuedCoordinatorItem,
+    terminalizeExhaustedRolledBackQueuedCoordinatorItems,
     __testResetFlightRecorder() {
         flightRecorderSeq = 0
         flightRecorderDroppedCount = 0
@@ -555,6 +571,9 @@ module.exports.__test = {
             ...action
         })
     },
+    __testClearQueuedActions() {
+        queuedTabActions.splice(0, queuedTabActions.length)
+    },
     __testSetCoordinatorAuthorityShadowWalStore(value) {
         coordinatorAuthorityShadowWalStore = value
     },
@@ -567,6 +586,12 @@ module.exports.__test = {
     __testSetQueuedTabFillPromise(promise, startedAt = Date.now()) {
         queuedTabFillPromise = promise
         queuedTabFillPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
+    },
+    __testSetCoordinatorExecutorStartPromise(promise) {
+        coordinatorExecutorStartPromise = promise
+    },
+    __testSetCoordinatorExecutorStartThrow(error) {
+        __testCoordinatorExecutorStartThrow = error
     },
     __testSetCoordinatorReconcilePromise(promise, startedAt = Date.now()) {
         coordinatorReconcilePromise = promise
