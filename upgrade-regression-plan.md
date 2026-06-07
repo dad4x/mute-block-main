@@ -41,6 +41,14 @@ Quora login prompt is expected only when a content/discovery phase reaches a
 login wall. Do not store credentials or add compatibility behavior to bypass
 either intervention.
 
+Do not use the `chrome://extensions` Update button to advance a keyed local
+unpacked build. Because the local artifact uses the same ID as the Chrome Web
+Store extension, Update can fetch or activate the latest store version rather
+than the newer local unpacked build. For local validation, explicitly use
+Developer mode -> `Load unpacked` again, select the current unpacked build
+directory, and verify the listed ID, version, location, and path before running
+the suite.
+
 ## Phase 1 Non-Work-Starting Smoke
 
 Run against an already-launched Chrome profile with remote debugging exposed on
@@ -332,6 +340,12 @@ After manual load, the expected extension registry facts are:
 - location: `UNPACKED`
 - state: `ENABLED`
 - zero manifest/runtime/install warnings or errors
+
+Do not use the `chrome://extensions` Update button as a local reload step for
+this keyed build. It can update against the Chrome Web Store package for the
+same ID instead of loading the current unpacked repo artifact. Use `Load
+unpacked` explicitly for each new local build, then confirm the local path and
+version.
 
 Only proceed when `/json/list` shows a live extension page or service worker
 for the keyed ID. If Chrome loads the unpacked build under any other ID, stop;

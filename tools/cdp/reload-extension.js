@@ -63,6 +63,30 @@ runMain(async () => {
     if(!extensionsPage) throw new Error('chrome://extensions/ target not found')
 
     const clearedErrors = await clearExtensionErrors(config, extensionsPage)
+    const beforeInfo = await evaluate(extensionsPage.webSocketDebuggerUrl, `new Promise(resolve => chrome.developerPrivate.getExtensionInfo(${jsString(config.extensionId)}, info => resolve(info ? {
+        id: info.id,
+        name: info.name,
+        state: info.state,
+        version: info.version,
+        location: info.location,
+        path: info.path || '',
+        updateUrl: info.updateUrl || '',
+        webStoreUrl: info.webStoreUrl || ''
+    } : null)))`)
+    if(beforeInfo?.updateUrl || beforeInfo?.webStoreUrl) {
+        console.log(JSON.stringify({
+            clearedErrors,
+            reload: {
+                ok: false,
+                blocked: true,
+                lastError: 'Refusing chrome.developerPrivate.reload for a Web Store-backed keyed extension; use Load unpacked from the canonical chrome directory instead.'
+            },
+            version: beforeInfo.version || '',
+            info: beforeInfo
+        }, null, 2))
+        return
+    }
+
     const reload = await evaluate(extensionsPage.webSocketDebuggerUrl, `new Promise(resolve => {
         chrome.developerPrivate.reload(${jsString(config.extensionId)}, {failQuietly: false}, () => resolve({
             ok: !chrome.runtime.lastError,

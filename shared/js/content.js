@@ -762,7 +762,7 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
 
     const updates = Array.from(updatesByHref.values())
     if(updates.length) {
-        await recordProfileNukeProgressBatch(updates)
+        applyLocalProfileNukeProgressUpdates(updates)
     }
 
     return updates.length > 0
@@ -963,6 +963,7 @@ function normalizeProfileProgressPatch(href, patch = {}, existing = null) {
             selectedActionRect: null,
             menuActionLabels: [],
             visibleProfileMenuLabels: [],
+            directBlockFailureDetail: null,
             profileMenuOpen: false,
             profileBlocked: false
         })
@@ -1035,6 +1036,7 @@ function buildQueuedProfileProgressPatch(event, extraPatch = {}) {
         blockSucceeded: false,
         blockAttemptedAt: 0,
         blockError: '',
+        directBlockFailureDetail: null,
         actionReadyAt: 0,
         blockedAt: 0,
         mutedAt: 0,
@@ -1109,7 +1111,7 @@ function isActiveQueuedProgressRecord(normalizedHref = '') {
         activeQueuedAttemptProfileHref === normalizedHref
 }
 
-async function recordProfileNukeProgressBatch(updates) {
+function applyLocalProfileNukeProgressUpdates(updates) {
     const normalizedUpdates = []
     const nextProgress = {
         ...profileNukeProgress
@@ -1172,6 +1174,34 @@ async function recordCurrentProfileNukeProgress(patch = {}) {
 
 function noteCurrentProfileNukeProgress(patch = {}) {
     void recordCurrentProfileNukeProgress(patch)
+}
+
+function getDirectBlockActionDiagnostic(branch = '', extra = {}) {
+    const blockButton = getMenuAction(isBlockActionLabel)
+    const unblockButton = getMenuAction(isUnblockActionLabel)
+    const confirmButton = getBlockConfirmAction()
+    return {
+        branch,
+        url: location.href,
+        pageType: getPageType() || 'unknown',
+        profileBlocked: isProfileBlocked(),
+        profileMenuOpen: isProfileMenuOpen(),
+        profileMenuButtonRect: getProfileMenuButtonDebugRect(),
+        menuActionLabels: getVisibleProfileMenuActionLabels(),
+        blockOptionPresent: !!blockButton,
+        blockOptionLabel: getActionDebugLabel(blockButton),
+        blockOptionRect: getActionDebugRect(blockButton),
+        unblockOptionPresent: !!unblockButton,
+        unblockOptionLabel: getActionDebugLabel(unblockButton),
+        unblockOptionRect: getActionDebugRect(unblockButton),
+        blockConfirmPresent: !!confirmButton,
+        blockConfirmLabel: getActionDebugLabel(confirmButton),
+        blockConfirmRect: getActionDebugRect(confirmButton),
+        securityVerification: !!getSecurityVerificationReason(),
+        securityVerificationReason: getSecurityVerificationReason(),
+        unavailableReason: getProfileUnavailableReason() || '',
+        ...extra
+    }
 }
 
 async function clearProfileNukeState(href, reason = '') {
@@ -10569,14 +10599,15 @@ async function maybeRunAutoProfileAction() {
             await releaseQueuedTabSlot()
             await requestCloseTab(2, 100, true)
         }
-        const abandonQueuedTab = async message => {
+        const abandonQueuedTab = async (message, extraPatch = {}) => {
             console.info(message)
             await recordQueuedProfileProgress({
                 status: 'error',
                 openedViablePage: false,
                 finalError: message,
                 errorPageUrl: location.href,
-                event: message
+                event: message,
+                ...extraPatch
             })
             await failCurrentQueuedProfile(getResolvedSpaceFeedProfileHrefs(queuedProfileHref || location.href))
             await releaseQueuedTabSlot()
@@ -11222,7 +11253,12 @@ async function maybeRunAutoProfileAction() {
                     return
                 }
 
-                await abandonQueuedTab('Queued direct block action did not complete')
+                await abandonQueuedTab('Queued direct block action did not complete', {
+                    directBlockFailureDetail: getDirectBlockActionDiagnostic('queued-direct-block-action-did-not-complete', {
+                        finalBlockedState: isProfileBlocked(),
+                        previousBlockError: getProfileNukeProgressRecord(queuedProfileHref || location.href)?.blockError || ''
+                    })
+                })
                 return
             }
 
@@ -12377,9 +12413,14 @@ async function blockProfile(options = {}) {
 
     const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
+        const diagnostic = getDirectBlockActionDiagnostic('profile-menu-did-not-open', {
+            menuOpenResult: false,
+            finalBlockedState: isProfileBlocked()
+        })
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Profile menu did not open',
+            directBlockFailureDetail: diagnostic,
             event: 'Block flow failed because the profile menu did not open'
         })
         return false
@@ -12450,6 +12491,10 @@ async function blockProfile(options = {}) {
             menuActionLabels: getVisibleProfileMenuActionLabels(),
             profileMenuOpen: isProfileMenuOpen(),
             profileMenuButtonRect: getProfileMenuButtonDebugRect(),
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-option-not-found', {
+                blockOptionLookupResult: false,
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block option not found'
         })
         reportActionIssue('Block option not found', silent)
@@ -12489,6 +12534,10 @@ async function blockProfile(options = {}) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Block button not found',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-button-not-found', {
+                confirmLookupResult: false,
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block confirm button not found'
         })
         await dismissPendingConfirmationAfterFailure('block', 'confirm-button-not-found')
@@ -12520,6 +12569,11 @@ async function blockProfile(options = {}) {
             blockSucceeded: false,
             blockError: 'Block confirm foreground unavailable',
             finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-foreground-unavailable', {
+                confirmLookupResult: true,
+                confirmActivationResult: activation,
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block confirm foreground unavailable',
             confirmationForegroundReason: activation.reason || ''
         })
@@ -12540,6 +12594,11 @@ async function blockProfile(options = {}) {
                     blockSucceeded: false,
                     blockError: 'Block confirm foreground unavailable',
                     finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+                    directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-foreground-unavailable-retry', {
+                        confirmLookupResult: true,
+                        confirmActivationResult: activation,
+                        finalBlockedState: isProfileBlocked()
+                    }),
                     event: 'Block confirm foreground unavailable',
                     confirmationForegroundReason: activation.reason || ''
                 })
@@ -12555,6 +12614,10 @@ async function blockProfile(options = {}) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Block confirm did not complete',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-did-not-complete', {
+                confirmLookupResult: !!getBlockConfirmAction(),
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block confirm did not complete'
         })
         await dismissPendingConfirmationAfterFailure('block', 'confirm-did-not-complete')
@@ -12567,6 +12630,9 @@ async function blockProfile(options = {}) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Block did not take effect',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-did-not-take-effect', {
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block did not take effect'
         })
         reportActionIssue('Block did not take effect', silent)
