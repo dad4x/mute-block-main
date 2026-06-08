@@ -7,9 +7,71 @@ experimental and not worth preserving.
 Defaults:
 
 - CDP endpoint: `127.0.0.1:9223`
-- Extension id: `ajcjckiafbnhioeafaejlaehkmdcdeha`
-- Override with `--host`, `--port`, `--extension-id`, or the matching
-  `MB_CDP_HOST`, `MB_CDP_PORT`, `MB_EXTENSION_ID` environment variables.
+- Extension id: use `--extension-id auto` for normal live iteration.
+- Dev unpacked path: `C:\Users\DBROWER\Documents\src\mute-block-main\chrome-dev`
+- Override with `--host`, `--port`, `--extension-id`, `--extension-path`,
+  `--extension-version`, or the matching `MB_CDP_HOST`, `MB_CDP_PORT`,
+  `MB_EXTENSION_ID`, `MB_EXTENSION_PATH`, `MB_EXTENSION_VERSION` environment
+  variables.
+
+## Dev-Unpacked Live Loop
+
+Normal Phase 8/9/10 debugging should use the dev unpacked extension, not the
+store-keyed `nlmmkoljofpgbmlcojebolmniineboah` ID. The dev output is generated
+from `chrome/` with the manifest `key` stripped, so Chrome assigns a separate
+unpacked extension ID that can be discovered and reloaded by path/version.
+
+Build and copy the dev unpacked directory:
+
+```bash
+npm run prod
+npm run build:chrome-dev
+npm run sync:chrome-dev
+```
+
+First-time setup still requires loading `chrome-dev` once from the visible
+Chrome extensions page. After that, reload and discovery are scripted:
+
+```bash
+npm run reload:chrome-dev
+node tools/cdp/extension-info.js --extension-id auto
+```
+
+Reset browser tabs before a live phase:
+
+```bash
+npm run reset:chrome-dev-tabs
+```
+
+The reset keeps `chrome://extensions/` and an already-open Mute Block dashboard
+for the discovered dev extension, then closes search/profile/other page tabs. It
+does not create the dashboard; if the dashboard is missing, the command reports
+that as a failed precondition instead of silently opening one.
+
+Run Phase 10 against the discovered dev ID:
+
+```bash
+node tools/cdp/upgrade-regression/run.js \
+  --extension-id auto \
+  --phase phase10-medium-batch-queue-authority-smoke \
+  --search-url 'https://www.quora.com/search?q=barack%20obama&type=profile' \
+  --phase10-target-count 8 \
+  --phase10-concurrency 2 \
+  --phase10-timeout-ms 1200000 \
+  --phase10-idle-ms 20000 \
+  --allow-work-producing
+```
+
+Or run the build/copy/reload/phase sequence as one repo-local helper:
+
+```bash
+node tools/cdp/live-test-loop.js \
+  --phase phase10-medium-batch-queue-authority-smoke \
+  --phase-args "--search-url=https://www.quora.com/search?q=barack%20obama&type=profile --phase10-target-count=8 --phase10-concurrency=2 --phase10-timeout-ms=1200000 --phase10-idle-ms=20000" \
+  --allow-work-producing
+```
+
+Use the keyed store ID only for explicit store/distribution upgrade tests.
 
 ## Windows Chrome Profile Launcher
 
@@ -248,8 +310,13 @@ They intentionally create WAL-backed queue authority and profile terminal state.
 
 | Script | Purpose | Typical command |
 | --- | --- | --- |
+| `tools/build-chrome-dev.js` | Generate `chrome-dev/` from `chrome/` with the manifest key stripped for a separate unpacked dev ID. | `npm run build:chrome-dev` |
+| `tools/cdp/sync-windows-build.js` | Copy `chrome-dev/` to the Windows regression machine through the SSH tunnel, with bounded rsync and fallback copy. | `npm run sync:chrome-dev` |
+| `tools/cdp/reload-windows-extension.js` | Discover the loaded unpacked dev extension by path/version and reload it through `chrome.developerPrivate.reload`. | `npm run reload:chrome-dev` |
+| `tools/cdp/reset-windows-tabs.js` | Keep `chrome://extensions/` plus an existing dashboard for the dev extension and close search/profile/other page tabs. Does not create the dashboard. | `npm run reset:chrome-dev-tabs` |
+| `tools/cdp/live-test-loop.js` | Build, sync, reload, reset tabs, discover ID, and optionally run one regression phase against the dev extension. | `node tools/cdp/live-test-loop.js --phase phase5-dashboard-readonly-authority-smoke` |
 | `tools/cdp/windows-chrome-profile.js` | Stop an existing Windows Chrome/CDP listener on selected debug ports and launch Windows Chrome through Cygwin SSH with either a disposable or existing profile. Prints the separate `ssh -N -L` tunnel command. | `node tools/cdp/windows-chrome-profile.js --ssh USER@WINDOWS_HOST --remote-port 9224 --new-profile` |
-| `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. For the keyed Mute Block ID, use visible `Load unpacked` from `C:\Users\DBROWER\Documents\src\mute-block-main\chrome`; `chrome.developerPrivate.reload` can fall back to the store payload. | `node tools/cdp/reload-extension.js` |
+| `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. Prefer `reload-windows-extension.js` for the dev loop. | `node tools/cdp/reload-extension.js --extension-id auto` |
 | `tools/cdp/space-summary.js` | Summarize all open Quora space tabs and service-worker space/queue state. | `node tools/cdp/space-summary.js` |
 | `tools/cdp/reload-space-tabs.js` | Reload all open Quora space tabs without creating new tabs. | `node tools/cdp/reload-space-tabs.js` |
 | `tools/cdp/inspect-space-state.js` | Inspect one space by URL/title substring, including source-page controls, pending post records, queue rows, and worker ownership. | `node tools/cdp/inspect-space-state.js --needle theobvioustrollshootinggallery` |

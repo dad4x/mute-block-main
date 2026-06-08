@@ -14,9 +14,10 @@ runMain(async () => {
         target.type === 'service_worker' && (target.url || '').includes(config.extensionId)
     )
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
-    const target = serviceWorker ||
+    const target =
         targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
-        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`))
+        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`)) ||
+        serviceWorker
     if(!target) {
         console.log(JSON.stringify({target: false, reason: 'extension-target-not-found'}, null, 2))
         process.exitCode = 1

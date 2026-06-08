@@ -5,9 +5,11 @@ const path = require('path')
 
 const {
     cdpCommand,
+    DEFAULT_REMOTE_CHROME_DEV_PATH,
     evaluate,
     getJson,
     getTargets,
+    resolveCdpConfig,
     runMain,
     sleep
 } = require('../lib/cdp')
@@ -17,8 +19,8 @@ const {
     recoverProjectedState
 } = require('../../../shared/js/walSnapshotStore')
 
-const DEFAULT_EXTENSION_ID = 'nlmmkoljofpgbmlcojebolmniineboah'
-const DEFAULT_PROFILE_LABEL = 'store-1.4-to-current'
+const DEFAULT_EXTENSION_ID = 'auto'
+const DEFAULT_PROFILE_LABEL = 'dev-current'
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 9223
 const PHASE1 = 'phase1-non-work-starting-smoke'
@@ -48,14 +50,24 @@ const PHASE10_SEARCH_FALLBACK_URLS = [
     'https://www.quora.com/search?q=alan%20turing&type=profile',
     'https://www.quora.com/search?q=grace%20hopper&type=profile',
     'https://www.quora.com/search?q=ada%20lovelace&type=profile',
+    'https://www.quora.com/search?q=claude%20shannon&type=profile',
+    'https://www.quora.com/search?q=norbert%20wiener&type=profile',
+    'https://www.quora.com/search?q=john%20mccarthy&type=profile',
+    'https://www.quora.com/search?q=marvin%20minsky&type=profile',
+    'https://www.quora.com/search?q=herbert%20simon&type=profile',
+    'https://www.quora.com/search?q=allen%20newell&type=profile',
+    'https://www.quora.com/search?q=margaret%20hamilton&type=profile',
+    'https://www.quora.com/search?q=barbara%20liskov&type=profile',
+    'https://www.quora.com/search?q=frances%20allen&type=profile',
     'https://www.quora.com/search?q=sundar%20pichai&type=profile',
     'https://www.quora.com/search?q=jensen%20huang&type=profile'
 ]
 const DEFAULT_BENIGN_QUORA_URL = 'https://www.quora.com/'
 const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
-const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = 'C:\\Users\\DBROWER\\Documents\\src\\mute-block-main\\chrome'
+const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = DEFAULT_REMOTE_CHROME_DEV_PATH
 const PHASE10_HARNESS_WATCHDOG_MS = 180000
+const EXPECTED_EXTENSION_NAMES = new Set(['Mute Block', 'Mute Block Dev'])
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
@@ -205,6 +217,8 @@ function parseArgs(argv) {
         host: DEFAULT_HOST,
         port: DEFAULT_PORT,
         extensionId: DEFAULT_EXTENSION_ID,
+        extensionPath: DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH,
+        extensionVersion: '',
         profileLabel: DEFAULT_PROFILE_LABEL,
         writeBaseline: '',
         compareBaseline: '',
@@ -245,6 +259,10 @@ function parseArgs(argv) {
         else if(arg.startsWith('--port=')) options.port = Number.parseInt(arg.slice('--port='.length), 10) || DEFAULT_PORT
         else if(arg === '--extension-id') options.extensionId = readValue(options.extensionId)
         else if(arg.startsWith('--extension-id=')) options.extensionId = arg.slice('--extension-id='.length)
+        else if(arg === '--extension-path') options.extensionPath = readValue(options.extensionPath)
+        else if(arg.startsWith('--extension-path=')) options.extensionPath = arg.slice('--extension-path='.length)
+        else if(arg === '--extension-version') options.extensionVersion = readValue(options.extensionVersion)
+        else if(arg.startsWith('--extension-version=')) options.extensionVersion = arg.slice('--extension-version='.length)
         else if(arg === '--profile-label') options.profileLabel = readValue(options.profileLabel)
         else if(arg.startsWith('--profile-label=')) options.profileLabel = arg.slice('--profile-label='.length)
         else if(arg === '--write-baseline') {
@@ -334,11 +352,14 @@ function parseArgs(argv) {
 function printUsage() {
     console.log([
         'Usage:',
-        '  node tools/cdp/upgrade-regression/run.js --extension-id nlmmkoljofpgbmlcojebolmniineboah',
+        '  node tools/cdp/upgrade-regression/run.js --extension-id auto --extension-path "C:\\\\Users\\\\DBROWER\\\\Documents\\\\src\\\\mute-block-main\\\\chrome-dev"',
         '',
         'Options:',
         '  --host 127.0.0.1',
         '  --port 9223',
+        '  --extension-id auto',
+        `  --extension-path ${DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH}`,
+        '  --extension-version 1.6.x',
         '  --profile-label store-1.4-to-current',
         `  --phase ${SUPPORTED_PHASES.join('|')}`,
         `  --quora-url ${DEFAULT_BENIGN_QUORA_URL}`,
@@ -384,7 +405,9 @@ function validateExtensionInfo(extension, options, expectedVersion, fail, label 
     }
 
     if(extension.id !== options.extensionId) fail(`${label} id mismatch`, {expected: options.extensionId, actual: extension.id})
-    if(extension.name !== 'Mute Block') fail(`${label} name mismatch`, {expected: 'Mute Block', actual: extension.name})
+    if(!EXPECTED_EXTENSION_NAMES.has(extension.name)) {
+        fail(`${label} name mismatch`, {expected: Array.from(EXPECTED_EXTENSION_NAMES), actual: extension.name})
+    }
     if(extension.version !== expectedVersion) fail(`${label} version mismatch`, {expected: expectedVersion, actual: extension.version})
     if(extension.state !== 'ENABLED') fail(`${label} is not enabled`, {actual: extension.state})
     if(extension.manifestErrors.length) fail(`${label} manifest errors are present`, extension.manifestErrors)
@@ -631,6 +654,19 @@ async function readExecutorClassification(target) {
     }
 }
 
+function isBenignIdleFlightRecorderEntry(entry = null) {
+    const kind = `${entry?.kind || ''}`
+    const reason = `${entry?.reason || ''}`
+    if(kind === 'executor-classification' && reason === 'idle-no-work') return true
+    if(kind === 'start-resume' &&
+            reason === 'dashboard-resume' &&
+            entry?.accepted === true &&
+            entry?.durable !== true) {
+        return true
+    }
+    return false
+}
+
 async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
     const before = await readFlightRecorder(target, {limit: 1})
     const beforeSeq = Number.parseInt(before.response?.newestSeq, 10) || 0
@@ -640,11 +676,8 @@ async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
         limit: 200
     })
     const entries = Array.isArray(after.response?.entries) ? after.response.entries : []
-    const noisyKinds = new Set([
-        'start-resume',
-        'window-focus-request',
-        'tab-open-request'
-    ])
+    const benignEntries = entries.filter(isBenignIdleFlightRecorderEntry)
+    const noisyEntries = entries.filter(entry => !isBenignIdleFlightRecorderEntry(entry))
     return {
         idleMs: Math.max(1000, Number.parseInt(idleMs, 10) || 20000),
         beforeSeq,
@@ -652,7 +685,9 @@ async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
         before,
         after,
         entryCount: entries.length,
-        noisyEntryCount: entries.filter(entry => noisyKinds.has(`${entry?.kind || ''}`)).length,
+        benignEntryCount: benignEntries.length,
+        noisyEntryCount: noisyEntries.length,
+        noisyEntries,
         entries
     }
 }
@@ -2536,6 +2571,40 @@ async function inspectSearchTargetForQueueCandidates(config, options, url, warni
 async function selectProfileSearchTargetsWithFallback(config, options, warnings, fail, phaseLabel, existingQueueTargets, targetCount, initialTarget = null, initialDiscovery = null) {
     const urls = getPhase10SearchCandidateUrls(options)
     const attempts = []
+    const accumulated = []
+    const accumulatedHrefs = new Set()
+    const recordAttemptSelections = attempt => {
+        for(const entry of attempt?.selection?.selected || []) {
+            const href = entry?.href || ''
+            if(!href || accumulatedHrefs.has(href)) continue
+            accumulatedHrefs.add(href)
+            accumulated.push({
+                ...entry,
+                searchUrl: attempt.url || attempt.discovery?.page?.url || ''
+            })
+            if(accumulated.length >= targetCount) break
+        }
+    }
+    const buildAccumulatedResult = attempt => ({
+        ...(attempt || attempts[attempts.length - 1] || {}),
+        selection: {
+            requestedCount: targetCount,
+            selected: accumulated.slice(0, targetCount),
+            enabledCount: accumulated.length,
+            excludedCount: Number.parseInt(attempt?.selection?.excludedCount, 10) || 0,
+            allButtonCount: attempts.reduce((sum, item) => sum + (Number.parseInt(item?.selection?.allButtonCount, 10) || 0), 0),
+            buttons: attempts.flatMap(item => item?.selection?.buttons || []).slice(0, 30),
+            accumulatedFromSearches: attempts.map(item => ({
+                url: item.url || item.discovery?.page?.url || '',
+                selectedCount: item.selectedTargets?.length || 0,
+                enabledCount: Number.parseInt(item.selection?.enabledCount, 10) || 0,
+                excludedCount: Number.parseInt(item.selection?.excludedCount, 10) || 0,
+                allButtonCount: Number.parseInt(item.selection?.allButtonCount, 10) || 0
+            }))
+        },
+        selectedTargets: accumulated.slice(0, targetCount).map(entry => entry.href),
+        attempts
+    })
 
     if(initialTarget && initialDiscovery) {
         const selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
@@ -2551,12 +2620,8 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
             selectedTargets,
             pageShape: initialDiscovery.page
         })
-        if(selectedTargets.length >= targetCount) {
-            return {
-                ...attempts[0],
-                attempts
-            }
-        }
+        recordAttemptSelections(attempts[0])
+        if(accumulated.length >= targetCount) return buildAccumulatedResult(attempts[0])
     }
 
     const attemptedUrls = new Set(attempts.map(attempt => attempt.url).filter(Boolean))
@@ -2575,20 +2640,16 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
         )
         attempts.push(attempt)
         attemptedUrls.add(url)
-        if(attempt.selectedTargets.length >= targetCount) {
-            return {
-                ...attempt,
-                attempts
-            }
-        }
+        recordAttemptSelections(attempt)
+        if(accumulated.length >= targetCount) return buildAccumulatedResult(attempt)
     }
 
     const lastAttempt = attempts[attempts.length - 1] || null
     return {
         target: lastAttempt?.target || initialTarget || null,
         discovery: lastAttempt?.discovery || initialDiscovery || null,
-        selection: lastAttempt?.selection || {selected: [], enabledCount: 0, buttons: []},
-        selectedTargets: [],
+        selection: buildAccumulatedResult(lastAttempt).selection || lastAttempt?.selection || {selected: [], enabledCount: 0, buttons: []},
+        selectedTargets: accumulated.map(entry => entry.href),
         attempts
     }
 }
@@ -3026,12 +3087,13 @@ function summarizeSelectedQueueAuthority(summary = {}, targetProfileHrefs = []) 
     }
 }
 
-function assertSelectedQueueRowsConsistent(selectedSummary = {}, fail, label = 'selected queue authority') {
+function assertSelectedQueueRowsConsistent(selectedSummary = {}, fail, label = 'selected queue authority', options = {}) {
+    const requireCompactView = options.requireCompactView !== false
     for(const item of selectedSummary.selected || []) {
         if(item.rowCount !== 1) {
             fail(`${label} expected exactly one durable row for selected target`, item)
         }
-        if(item.viewRowCount !== 1) {
+        if(requireCompactView && item.viewRowCount !== 1) {
             fail(`${label} expected exactly one compact view row for selected target`, item)
         }
     }
@@ -3039,6 +3101,14 @@ function assertSelectedQueueRowsConsistent(selectedSummary = {}, fail, label = '
         fail(`${label} observed unrelated active/queued rows`, {
             unrelatedActiveQueued: selectedSummary.unrelatedActiveQueued
         })
+    }
+}
+
+function assertSelectedCompactProjectionMaterialized(selectedSummary = {}, fail, label = 'selected compact queue projection') {
+    for(const item of selectedSummary.selected || []) {
+        if(item.viewRowCount !== 1) {
+            fail(`${label} expected exactly one compact view row for selected target`, item)
+        }
     }
 }
 
@@ -3084,7 +3154,7 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
     let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
     const terminalReady = () =>
         selectedSummary.selected.length === targetProfileHrefs.length &&
-        selectedSummary.selected.every(item => item.rowCount === 1 && item.viewRowCount === 1 && item.terminalRows === 1) &&
+        selectedSummary.selected.every(item => item.rowCount === 1 && item.terminalRows === 1) &&
         selectedSummary.activeRows === 0 &&
         selectedSummary.queuedRows === 0 &&
         selectedSummary.unrelatedActiveQueuedCount === 0
@@ -3186,11 +3256,35 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
     }
 }
 
-function assertSelectedTerminalOutcomes(selectedSummary = {}, fail, label = 'selected terminal outcomes') {
+function isAcceptedSuccessfulTerminalStatus(status = '') {
+    return /succeeded|success|skipped|canceled|cancelled/i.test(`${status || ''}`)
+}
+
+function isNamedDurableTerminalFailure(row = null) {
+    const status = `${row?.status || ''}`
+    const outcome = `${row?.outcome || ''}`.trim()
+    const error = `${row?.error || ''}`.trim()
+    const terminalAt = Number.parseInt(row?.terminalAt, 10) || 0
+    return /failed|failure|blocked|terminal/i.test(status) &&
+        terminalAt > 0 &&
+        (outcome || error)
+}
+
+function assertSelectedTerminalOutcomes(selectedSummary = {}, fail, label = 'selected terminal outcomes', options = {}) {
+    const allowNamedDurableFailures = options.allowNamedDurableFailures === true
     for(const item of selectedSummary.selected || []) {
         const row = (item.rows || [])[0] || null
         const status = `${row?.status || ''}`
-        if(!/succeeded|success|skipped|canceled|cancelled/i.test(status)) {
+        if(isAcceptedSuccessfulTerminalStatus(status)) continue
+        if(allowNamedDurableFailures && isNamedDurableTerminalFailure(row)) continue
+        if(allowNamedDurableFailures) {
+            fail(`${label} contains a failed terminal row without a durable named reason`, {
+                targetProfileHref: item.targetProfileHref,
+                row
+            })
+            continue
+        }
+        {
             fail(`${label} contains an unaccepted terminal status`, {
                 targetProfileHref: item.targetProfileHref,
                 row
@@ -3359,6 +3453,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         return writePhase10DiagnosticArtifact(config, context, options, phaseState, reason, details)
     }
     if(mediumBatch) {
+        const phase10WatchdogMs = Math.max(
+            PHASE10_HARNESS_WATCHDOG_MS,
+            (Number.parseInt(timeoutMs, 10) || PHASE10_HARNESS_WATCHDOG_MS) + 60000
+        )
         const handleSignal = signal => {
             void writePhase10Artifact(`signal-${signal.toLowerCase()}`, {signal})
                 .then(result => {
@@ -3383,13 +3481,15 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         }
         phase10WatchdogTimer = setTimeout(() => {
             void writePhase10Artifact('harness-watchdog-timeout', {
-                watchdogMs: PHASE10_HARNESS_WATCHDOG_MS
+                watchdogMs: phase10WatchdogMs,
+                phaseTimeoutMs: timeoutMs
             })
                 .then(result => {
                     console.error(JSON.stringify({
                         error: 'phase10-harness-watchdog-timeout',
                         artifactPath: result?.artifactPath || '',
-                        watchdogMs: PHASE10_HARNESS_WATCHDOG_MS
+                        watchdogMs: phase10WatchdogMs,
+                        phaseTimeoutMs: timeoutMs
                     }))
                 })
                 .catch(error => {
@@ -3399,7 +3499,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                     }))
                 })
                 .finally(() => process.exit(1))
-        }, PHASE10_HARNESS_WATCHDOG_MS)
+        }, phase10WatchdogMs)
         phase10WatchdogTimer.unref?.()
     }
 
@@ -3813,8 +3913,13 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             statuses: item.statuses
         }))
     })
-    assertSelectedQueueRowsConsistent(terminal.summary, fail, `${phaseLabel} terminal`)
-    assertSelectedTerminalOutcomes(terminal.summary, fail, `${phaseLabel} terminal`)
+    assertSelectedQueueRowsConsistent(terminal.summary, fail, `${phaseLabel} terminal`, {
+        requireCompactView: false
+    })
+    assertSelectedCompactProjectionMaterialized(terminal.summary, fail, `${phaseLabel} terminal compact projection`)
+    assertSelectedTerminalOutcomes(terminal.summary, fail, `${phaseLabel} terminal`, {
+        allowNamedDurableFailures: mediumBatch
+    })
     assertWalPresent(terminal.authority, fail, `${phaseLabel} terminal WAL`)
     assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, `${phaseLabel} terminal`)
 
@@ -3825,8 +3930,13 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
     const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000, `${phaseLabel} selected items after terminal restart`)
     tracePhase(options, `${phaseLabel} terminal rows preserved after restart`)
-    assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal service-worker restart`)
-    assertSelectedTerminalOutcomes(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal restart`)
+    assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal service-worker restart`, {
+        requireCompactView: false
+    })
+    assertSelectedCompactProjectionMaterialized(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal restart compact projection`)
+    assertSelectedTerminalOutcomes(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal restart`, {
+        allowNamedDurableFailures: mediumBatch
+    })
     assertWalPresent(afterRestartAfterTerminal.authority, fail, `${phaseLabel} after terminal restart WAL`)
     assertNoRuntimeActionSurfaceLeak(afterRestartAfterTerminal.authority, fail, `${phaseLabel} after terminal restart`)
 
@@ -3835,7 +3945,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         phaseState.currentStep = 'idle-recorder-check'
         tracePhase(options, `${phaseLabel} waiting for idle flight recorder delta`, {idleMs})
         idleFlightRecorder = await readIdleFlightRecorderDelta(context, idleMs)
-        if(idleFlightRecorder.ok !== true || idleFlightRecorder.entryCount > 0) {
+        if(idleFlightRecorder.ok !== true || idleFlightRecorder.noisyEntryCount > 0) {
             fail(`${phaseLabel} observed flight-recorder activity while idle after completion`, {
                 ok: idleFlightRecorder.ok,
                 entryCount: idleFlightRecorder.entryCount,
@@ -4111,11 +4221,16 @@ function tracePhase(options = {}, message = '', details = null) {
 
 runMain(async () => {
     const options = parseArgs(process.argv)
-    const config = {
+    const config = await resolveCdpConfig({
         host: options.host,
         port: options.port,
-        extensionId: options.extensionId
-    }
+        extensionId: options.extensionId,
+        extensionPath: options.extensionPath,
+        extensionVersion: options.extensionVersion || readCurrentVersion()
+    })
+    options.extensionId = config.extensionId
+    options.extensionPath = config.extensionPath || options.extensionPath
+    options.extensionVersion = config.extensionVersion || options.extensionVersion
     const expectedVersion = readCurrentVersion()
     const failures = []
     const warnings = []

@@ -5,11 +5,12 @@ const {
     getCdpConfig,
     getTargets,
     jsString,
+    resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     const targets = await getTargets(config)
     const extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
     if(!extensionsPage) {

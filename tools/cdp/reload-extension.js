@@ -7,6 +7,8 @@ const {
     getJson,
     getTargets,
     jsString,
+    openChromeExtensionsPage,
+    resolveCdpConfig,
     runMain,
     sleep
 } = require('./lib/cdp')
@@ -35,29 +37,11 @@ async function clearExtensionErrors(config, extensionsPage) {
 }
 
 async function openExtensionsPage(config, targets) {
-    let extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
-    if(extensionsPage) return extensionsPage
-
-    const versionInfo = await getJson('/json/version', config)
-    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
-        url: 'chrome://extensions/',
-        background: true
-    })
-    await sleep(1500)
-    targets = await getTargets(config)
-    extensionsPage = targets.find(target => target.url === 'chrome://extensions/')
-    if(extensionsPage) return extensionsPage
-
-    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
-        url: 'chrome://extensions/'
-    })
-    await sleep(1500)
-    targets = await getTargets(config)
-    return targets.find(target => target.url === 'chrome://extensions/') || null
+    return openChromeExtensionsPage(config, targets)
 }
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     let targets = await getTargets(config)
     const extensionsPage = await openExtensionsPage(config, targets)
     if(!extensionsPage) throw new Error('chrome://extensions/ target not found')
