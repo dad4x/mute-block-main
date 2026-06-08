@@ -1132,7 +1132,6 @@ async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
     }
 
     return kickCoordinatorQueueResume('quora-runtime-activated-auto-resume', {
-        executorFastPath: true,
         awaitFill: true
     })
 }
@@ -11984,6 +11983,16 @@ async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {
     return coordinatorExecutorStartPromise
 }
 
+function resetCoordinatorExecutorStartPromiseAfterTimeout(reason = 'executor-start-timeout') {
+    coordinatorExecutorStartPromise = Promise.resolve()
+    incrementQueueWakeupMetric('pump.executorStartPromiseReset')
+    recordCoordinatorDiagnosticEvent(
+        'coordinator-executor-start-promise-reset',
+        reason || 'executor start promise reset'
+    )
+    return true
+}
+
 function getQueuedActionNoForegroundFallback(item = null, options = {}) {
     if(item?.executorNoForegroundFallback === false || item?.noForegroundFallback === false) return false
     if(item?.executorNoForegroundFallback === true || item?.noForegroundFallback === true) return true
@@ -12442,8 +12451,11 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
 }
 
 async function validateQueuedTabOpenAgainstCurrentAuthority(action = {}) {
+    const currentAuthorityState = getHydratedCoordinatorAuthorityState('pump.finalOpenDecision.usedResidentAuthority')
     const openDecision = await promiseWithTimeout(
-        shouldOpenQueuedTabAction(action),
+        shouldOpenQueuedTabAction(action, {
+            currentAuthorityState
+        }),
         QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
         'queued tab final open decision'
     ).catch(error => ({
@@ -14103,11 +14115,12 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
             ) === actionKey
         })
         if(!hasMatchingQueuedAction()) {
+            scheduleQueuedWorkContinuation('queued-stale-runtime-action-already-pruned')
             return {
-                changed: false,
-                consumed: false,
+                changed: true,
+                consumed: true,
                 unresolved: true,
-                reason: 'queued-stale-runtime-queued-action-missing-before-fill'
+                reason: 'queued-stale-runtime-action-already-pruned'
             }
         }
         const fillResult = await promiseWithTimeout(fillQueuedTabs({
@@ -14144,11 +14157,43 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
         }
         const stillQueued = hasMatchingQueuedAction()
         if(!stillQueued) {
+            scheduleQueuedWorkContinuation('queued-stale-runtime-action-drained-before-authority')
             return {
-                changed: false,
-                consumed: false,
+                changed: true,
+                consumed: true,
                 unresolved: true,
-                reason: 'queued-stale-runtime-fill-drained-without-authority'
+                reason: 'queued-stale-runtime-action-drained-before-authority'
+            }
+        }
+        if(fillResult?.error) {
+            let pruned = 0
+            for(let index = queuedTabActions.length - 1; index >= 0; index -= 1) {
+                const action = queuedTabActions[index]
+                if(action === queuedAction) {
+                    queuedTabActions.splice(index, 1)
+                    pruned += 1
+                    continue
+                }
+                if(!actionKey) continue
+                const candidateSubject = action.profileHref || action.coordinatorKey || action.url || ''
+                if(getQueuedTabActionKey(
+                    action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+                    candidateSubject,
+                    action.tabAction || ''
+                ) !== actionKey) continue
+                queuedTabActions.splice(index, 1)
+                pruned += 1
+            }
+            if(pruned > 0) {
+                incrementQueueWakeupMetric('reconcile.executor.changed.prunedStaleQueuedRuntimeAction', pruned)
+                scheduleQueuedWorkContinuation('queued-stale-runtime-action-pruned-after-fill-timeout')
+                return {
+                    changed: true,
+                    consumed: true,
+                    unresolved: false,
+                    reason: 'queued-stale-runtime-action-pruned-after-fill-timeout',
+                    item: currentItem || item
+                }
             }
         }
         return {
@@ -14744,12 +14789,25 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             : 'coordinator-executor-enqueue-error'
     }))
     if(enqueueResult?.error) {
+        const enqueueErrorReason = enqueueResult.reason || 'coordinator-executor-enqueue-error'
         for(const contract of pendingExecutorContracts.values()) {
             unresolvedExecutorCases.push({
                 ...contract,
-                reason: enqueueResult.reason || 'coordinator-executor-enqueue-error',
+                reason: enqueueErrorReason,
                 error: enqueueResult.error
             })
+        }
+        scheduleCoordinatorQueueResume(1000, enqueueErrorReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: enqueueErrorReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        if(enqueueErrorReason === 'coordinator-executor-enqueue-timeout') {
+            resetCoordinatorExecutorStartPromiseAfterTimeout(enqueueErrorReason)
+            scheduleQueuedWorkContinuation(enqueueErrorReason)
         }
     }
     const queued = enqueueResult.queued || 0
@@ -14852,6 +14910,7 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
     }
     const alarmCreated = resumeScheduled &&
         coordinatorQueueResumeAlarmCreatedForDueAt === coordinatorQueueResumeDueAt
+    const serviceWorkerOwned = options.serviceWorkerOwned === true
 
     if(options.backgroundFastPath === true && options.direct !== true) {
         void runCoordinatorQueueExecutorFastPath(reason || 'resume-request', {
@@ -20628,6 +20687,7 @@ async function beginCoordinatorProfileAction(request = {}, sender = {}) {
     const tabId = sender.tab?.id || null
     if(!tabId) return {begun: false, granted: false, reason: 'invalid-tab-id'}
 
+    let metadata = getQueuedTabMetadata(tabId)
     const leaseResult = await requestCoordinatorActionLease(request, sender)
     if(!leaseResult?.granted) {
         return {
@@ -20637,9 +20697,15 @@ async function beginCoordinatorProfileAction(request = {}, sender = {}) {
     }
 
     if(isForegroundRequiredProfileActionRequest(request)) {
+        if(!activeQueuedTabs.has(tabId) && !pendingTabActions.has(tabId)) {
+            const recovered = await recoverPendingTabActionFromCoordinatorQueue(sender).catch(() => null)
+            const restored = recovered || restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId, sender.tab || null, metadata)
+            metadata = restored?.metadata || metadata
+        }
         const promotion = await promoteQueuedTab(tabId, request.reason || 'begin-profile-action', {
             senderTab: sender.tab || null,
-            requireForegroundWork: true
+            requireForegroundWork: true,
+            metadata
         }).catch(error => ({
             promoted: false,
             reason: error?.message || `${error || ''}`
@@ -20687,6 +20753,62 @@ function isForegroundRequiredProfileActionRequest(request = {}) {
         reason === 'unmute-confirmation' ||
         reason === 'unblock-confirmation' ||
         reason.endsWith('-confirmation')
+}
+
+function restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId = null, senderTab = null, metadata = null) {
+    const normalizedTabId = normalizeTabId(tabId)
+    if(!normalizedTabId || normalizeTabId(senderTab?.id) !== normalizedTabId || !metadata) return null
+
+    const currentAuthorityState = coordinatorAuthority.current()
+    const queue = currentAuthorityState?.queue || {}
+    const href = normalizeQuoraProfileUrl(metadata.profileHref || metadata.requestedUrl || '')
+    const coordinatorKey = `${metadata.coordinatorKey || href || ''}`.trim()
+    const entry = coordinatorKey && queue[coordinatorKey]
+        ? {key: coordinatorKey, item: queue[coordinatorKey]}
+        : findCoordinatorQueueEntryForHref(queue, href)
+    const item = entry?.item || null
+    if(!item ||
+        !isActiveCoordinatorStatus(item.status) ||
+        !coordinatorItemMatchesQueuedTabRuntime(item, entry?.key || coordinatorKey, metadata, normalizedTabId)) {
+        return null
+    }
+
+    const restoredMetadata = {
+        ...metadata,
+        profileHref: getCoordinatorItemHref(item) || href,
+        coordinatorKey: getCoordinatorItemQueueKey(item, entry?.key || coordinatorKey),
+        requestedUrl: item.requestedUrl || metadata.requestedUrl || href,
+        tabAction: getCoordinatorItemExecutorTabAction(item, metadata.tabAction || 'nuke'),
+        actionKind: getCoordinatorActionKindForRequestedAction(item.actionKind || metadata.actionKind || metadata.tabAction || 'mute-block'),
+        runId: item.runId || metadata.runId || '',
+        attemptId: getAttemptIdFromValue(item) || getAttemptIdFromValue(metadata),
+        attemptNumber: getAttemptNumberFromValue(item) || getAttemptNumberFromValue(metadata),
+        durableActiveAt: item.activeAt || Date.now(),
+        durableActiveReason: 'begin-profile-action-runtime-restored'
+    }
+    const action = makeClaimableQueuedTabAction({
+        action: restoredMetadata.tabAction,
+        profileHref: restoredMetadata.profileHref,
+        targetUrl: restoredMetadata.profileHref,
+        coordinatorKey: restoredMetadata.coordinatorKey,
+        requestedUrl: restoredMetadata.requestedUrl,
+        actionKind: restoredMetadata.actionKind,
+        runId: restoredMetadata.runId,
+        ownerTabId: restoredMetadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+        ownerWindowId: restoredMetadata.ownerWindowId || senderTab?.windowId || null,
+        noForegroundFallback: !!restoredMetadata.noForegroundFallback,
+        actionSurfaceMode: restoredMetadata.actionSurfaceMode || '',
+        attemptId: restoredMetadata.attemptId,
+        attemptNumber: restoredMetadata.attemptNumber
+    }, restoredMetadata)
+
+    removedQueuedRuntimeTabIds.delete(normalizedTabId)
+    activeQueuedTabs.add(normalizedTabId)
+    setQueuedTabMetadata(normalizedTabId, restoredMetadata)
+    if(action) pendingTabActions.set(normalizedTabId, action)
+    registerOwnedTab(restoredMetadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, normalizedTabId)
+    incrementQueueWakeupMetric('beginProfileAction.runtimeRestoredFromAuthority')
+    return {metadata: restoredMetadata, action}
 }
 
 function hasOwnedQueuedTabState(tabId) {
@@ -27234,6 +27356,12 @@ async function fillQueuedTabs(options = {}) {
                     queuedTabActions.unshift(action)
                     if(actionKey) existingKeys.add(actionKey)
                 }
+                if(actionsAtStart.length) {
+                    scheduleCoordinatorQueueResume(1000, 'queued-tab-fill-timeout-restored-actions', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleQueuedWorkContinuation('queued-tab-fill-timeout-restored-actions')
+                }
             }
             return {
                 openedTabs: 0,
@@ -27798,6 +27926,37 @@ async function fillQueuedTabsOnce(options = {}) {
                         error: finalOpenDecision.error || ''
                     }
                 })
+                if(finalOpenDecision.authorityUnavailable === true) {
+                    const retryReason = finalOpenDecision.reason || 'queued-tab-final-open-authority-unavailable'
+                    const actionKey = getQueuedTabActionKey(
+                        next.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+                        next.profileHref || next.coordinatorKey || next.url || '',
+                        next.tabAction || ''
+                    )
+                    const alreadyQueued = actionKey && queuedTabActions.some(action => {
+                        const candidateSubject = action.profileHref || action.coordinatorKey || action.url || ''
+                        return getQueuedTabActionKey(
+                            action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+                            candidateSubject,
+                            action.tabAction || ''
+                        ) === actionKey
+                    })
+                    if(!alreadyQueued) {
+                        queuedTabActions.unshift(next)
+                        incrementQueueWakeupMetric('pump.changed.requeuedFinalOpenAuthorityUnavailable')
+                    }
+                    scheduleCoordinatorQueueResume(1000, retryReason, {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: retryReason,
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    fillFailureReason = retryReason
+                    fillFailureError = finalOpenDecision.error || ''
+                    break
+                }
                 continue
             }
             next.executorFinalOpenDecisionReason = finalOpenDecision.reason || ''

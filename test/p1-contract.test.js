@@ -3267,7 +3267,8 @@ test('queued tab fill bounds stale open-decision reads', () => {
     const boundedCreateIndex = fillBody.indexOf("'queued owned tab create'")
 
     assert.match(planBody, /promiseWithTimeout\(\s*shouldOpenQueuedTabAction\(action, \{[\s\S]*currentAuthorityState: options\.currentAuthorityState \|\| options\.authorityState \|\| null[\s\S]*\}\),\s*QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,\s*'queued tab open decision'/)
-    assert.match(finalCheckBody, /promiseWithTimeout\(\s*shouldOpenQueuedTabAction\(action\),\s*QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,\s*'queued tab final open decision'/)
+    assert.match(finalCheckBody, /const currentAuthorityState = getHydratedCoordinatorAuthorityState\('pump\.finalOpenDecision\.usedResidentAuthority'\)/)
+    assert.match(finalCheckBody, /promiseWithTimeout\(\s*shouldOpenQueuedTabAction\(action, \{[\s\S]*currentAuthorityState[\s\S]*\}\),\s*QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,\s*'queued tab final open decision'/)
     assert.match(finalCheckBody, /reason: 'final-open-decision-timeout'/)
     assert.match(planBody, /reason: 'open-decision-timeout'/)
     assert.match(planBody, /open: false/)

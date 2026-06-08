@@ -14958,7 +14958,7 @@ test('queued profile actions are throttled and opened background', async () => {
     )
 
     assert.equal(opened.length, 1)
-    assert.equal(opened[0].active, true)
+    assert.equal(opened[0].active, false)
     await waitFor(
         () => sw.coordinatorAuthority.current().queue[opened[0].url]?.status === 'active',
         'legacy foreground executor tab did not persist active authority state',
@@ -16396,11 +16396,131 @@ test('awaited queue fill releases promise when tab creation hangs', async () => 
     assert.equal(result.fastPath, true)
     assert.equal(result.changed, true)
     assert.equal(result.queued, 1)
-    assert.equal(sw.state().queuedTabActions.length, 0)
+    assert.equal(sw.state().queuedTabActions.length, 1)
+    assert.equal(sw.state().queuedTabActions[0].profileHref, href)
     assert.ok((sw.state().queueWakeupCounters['pump.noop.tabCreateTimedOut'] || 0) >= 1)
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+})
+
+test('final open authority timeout preserves queued action for retry', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Final-Open-Timeout-Retry'
+    const runId = 'run-final-open-timeout-retry'
+    const attemptId = 'attempt-final-open-timeout-retry'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3644,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 3644})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const originalCurrent = sw.coordinatorAuthority.current
+    sw.coordinatorAuthority.current = () => {
+        const stack = new Error().stack || ''
+        if(stack.includes('validateQueuedTabOpenAgainstCurrentAuthority')) return null
+        return originalCurrent()
+    }
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = defaults => {
+        const stack = new Error().stack || ''
+        if(stack.includes('validateQueuedTabOpenAgainstCurrentAuthority')) {
+            throw new Error('synthetic final open authority unavailable')
+        }
+        return originalGet(defaults)
+    }
+
+    const result = await settleWithFakeTimers(
+        sw.runCoordinatorQueueExecutorFastPath('synthetic-final-open-timeout-retry', {
+            awaitFill: true,
+            skipAuthorityReconcile: true,
+            forceDurableQueueReload: false
+        }),
+        timers,
+        [
+            0,
+            500,
+            1000,
+            5000
+        ]
+    )
+    sw.coordinatorAuthority.current = originalCurrent
+    browser.storage.local.get = originalGet
+
+    assert.equal(result.fastPath, true)
+    assert.equal(sw.state().queuedTabActions.length, 1)
+    assert.equal(sw.state().queuedTabActions[0].profileHref, href)
+    assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.ok((sw.state().queueWakeupCounters['pump.changed.requeuedFinalOpenAuthorityUnavailable'] || 0) >= 1)
+    assert.ok(sw.state().hasCoordinatorQueueResumeTimeout)
+    assert.ok(sw.state().hasCoordinatorReconcileTimeout)
+})
+
+test('final open decision uses hydrated resident authority before storage reload', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Final-Open-Resident-Authority'
+    const runId = 'run-final-open-resident-authority'
+    const attemptId = 'attempt-final-open-resident-authority'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3645,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 3645})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    const forbiddenReads = []
+    browser.storage.local.get = defaults => {
+        const stack = new Error().stack || ''
+        if(stack.includes('validateQueuedTabOpenAgainstCurrentAuthority')) {
+            forbiddenReads.push(Object.keys(defaults || {}).sort())
+            throw new Error('synthetic final open storage reload should not run')
+        }
+        return originalGet(defaults)
+    }
+
+    const result = await settleWithFakeTimers(
+        sw.runCoordinatorQueueExecutorFastPath('synthetic-final-open-resident-authority', {
+            awaitFill: true,
+            skipAuthorityReconcile: true,
+            forceDurableQueueReload: false
+        }),
+        timers,
+        [
+            0,
+            500,
+            1000,
+            5000
+        ]
+    )
+    browser.storage.local.get = originalGet
+
+    assert.deepEqual(forbiddenReads, [])
+    assert.equal(result.fastPath, true)
+    assert.equal(result.changed, true)
+    assert.equal(result.queued, 1)
+    assert.equal(listTabs(browser).some(tab => tab.url === href), true)
+    assert.ok(['opening', 'active', 'acting', 'settling'].includes(sw.coordinatorAuthority.current().queue[href]?.status))
+    assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
 })
 
 test('scheduled queue wakeup reloads durable queue instead of stale resident authority', async () => {
@@ -17508,6 +17628,71 @@ test('executor apply reports queued-authority enqueue timeout as unresolved', as
     assert.match(result.primaryUnresolvedCase.error, /coordinator executor enqueue timed out/)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
+    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+})
+
+test('executor apply retries queued-authority after enqueue timeout resets start gate', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Timeout-Retry'
+    const runId = 'run-classifier-queued-enqueue-timeout-retry'
+    const attemptId = 'attempt-classifier-queued-enqueue-timeout-retry'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3758,
+        fastExecutorResumeTimeoutMs: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3758}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetCoordinatorExecutorStartPromise(new Promise(() => {}))
+
+    const timeoutResult = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-timeout-retry-first', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000, 5000]
+    )
+
+    assert.equal(timeoutResult.primaryUnresolvedCase.case, 'queued-authority-without-executor-surface')
+    assert.equal(timeoutResult.primaryUnresolvedCase.reason, 'coordinator-executor-enqueue-timeout')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+
+    const retryResult = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-timeout-retry-second', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(retryResult.reason === 'started-persisted-coordinator-queue' ||
+        retryResult.reason === 'executor-cases-unresolved', true)
+    assert.equal(sw.state().activeQueuedTabs.length, 1)
+    assert.equal(listTabs(browser).some(tab => tab.url === href), true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
 })
 
 test('executor apply consumes active-with-tab-missing-pending-action classifier case', async () => {
@@ -17741,6 +17926,149 @@ test('executor apply consumes queued-with-stale-runtime-surface by promoting run
     assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
     assert.equal(sw.state().queuedTabActions.length, 0)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+})
+
+test('executor apply prunes queued stale runtime action after fill timeout', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Stale-Runtime-Timeout'
+    const runId = 'run-classifier-queued-stale-runtime-timeout'
+    const attemptId = 'attempt-classifier-queued-stale-runtime-timeout'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 100000}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        noForegroundFallback: true,
+        executorPlanKind: 'open-tab',
+        executorPlanReason: 'synthetic-preplanned-open',
+        executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(() => {}), 100000)
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-timeout-before'})
+    assert.equal(before.executor.primaryCase, 'queued-with-stale-runtime-surface')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-queued-stale-runtime-timeout', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 5000, 10000, 20000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-with-stale-runtime-surface' &&
+        item.reason === 'queued-stale-runtime-action-pruned-after-fill-timeout'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
+    assert.equal(sw.state().queuedTabActions.length, 0)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
+})
+
+test('executor apply consumes queued stale runtime action drained before authority transition', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Stale-Runtime-Drained'
+    const runId = 'run-classifier-queued-stale-runtime-drained'
+    const attemptId = 'attempt-classifier-queued-stale-runtime-drained'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 100000}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        noForegroundFallback: true,
+        executorPlanKind: 'open-tab',
+        executorPlanReason: 'synthetic-preplanned-open',
+        executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'synthetic-drained-before-authority'
+            })
+        }, 0)
+    }), 100000)
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-drained-before'})
+    assert.equal(before.executor.primaryCase, 'queued-with-stale-runtime-surface')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-queued-stale-runtime-drained', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 5000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-with-stale-runtime-surface' &&
+        item.reason === 'queued-stale-runtime-action-drained-before-authority'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
+    assert.equal(sw.state().queuedTabActions.length, 0)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
 test('service-worker executor terminalizes queued authority from same-attempt terminal progress', async () => {

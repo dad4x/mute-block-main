@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+
+'use strict'
+
+const { spawn } = require('child_process')
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000
+const KILL_GRACE_MS = 5000
+
+const lanes = [
+  {
+    name: 'unit',
+    commandTimeoutMs: 30000,
+    commands: [
+      ['node', 'test/subject.test.js'],
+      ['node', 'test/jobState.test.js'],
+      ['node', 'test/storageInvariants.test.js'],
+      ['node', 'test/rawReportPages.test.js'],
+      ['node', 'test/sharedModeration.test.js'],
+      ['node', 'test/contentActionSelectors.test.js'],
+      ['node', 'test/contentSpaceScopedState.test.js']
+    ]
+  },
+  {
+    name: 'wal',
+    commandTimeoutMs: 60000,
+    commands: [
+      ['node', 'test/walSnapshotStore.test.js'],
+      ['node', 'test/walSnapshotStoreFuzz.test.js']
+    ]
+  },
+  {
+    name: 'contract',
+    commandTimeoutMs: 30000,
+    commands: [
+      ['node', 'test/p1-contract.test.js']
+    ]
+  },
+  {
+    name: 'synthetic',
+    commandTimeoutMs: 420000,
+    commands: [
+      ['node', 'test/swSynthetic.test.js']
+    ]
+  },
+  {
+    name: 'scenario',
+    commandTimeoutMs: 300000,
+    commands: [
+      ['node', 'test/sharedModerationFuzz.test.js'],
+      ['node', 'test/swScenarioFuzz.test.js']
+    ]
+  },
+  {
+    name: 'lint',
+    commandTimeoutMs: 30000,
+    commands: [
+      ['node', 'tools/lint-correctness.js']
+    ]
+  }
+]
+
+function formatCommand(command) {
+  return command.join(' ')
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) {
+    return `${ms}ms`
+  }
+  return `${(ms / 1000).toFixed(1)}s`
+}
+
+function writePrefixedLine(laneName, text, stream) {
+  stream.write(`[${laneName}] ${text}\n`)
+}
+
+function prefixStream(readable, laneName, stream) {
+  let buffered = ''
+  readable.setEncoding('utf8')
+  readable.on('data', chunk => {
+    buffered += chunk
+    const lines = buffered.split(/\r?\n/)
+    buffered = lines.pop()
+    for (const line of lines) {
+      writePrefixedLine(laneName, line, stream)
+    }
+  })
+  return () => {
+    if (buffered.length > 0) {
+      writePrefixedLine(laneName, buffered, stream)
+      buffered = ''
+    }
+  }
+}
+
+function runCommand(laneName, command, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) {
+  return new Promise(resolve => {
+    const startedAt = Date.now()
+    const commandText = formatCommand(command)
+    let resolved = false
+    let timedOut = false
+    let killTimer = null
+    writePrefixedLine(laneName, `START ${commandText} timeout=${formatDuration(timeoutMs)}`, process.stdout)
+
+    const child = spawn(command[0], command.slice(1), {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+
+    const flushStdout = prefixStream(child.stdout, laneName, process.stdout)
+    const flushStderr = prefixStream(child.stderr, laneName, process.stderr)
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true
+      writePrefixedLine(laneName, `TIMEOUT ${commandText} after=${formatDuration(timeoutMs)}`, process.stderr)
+      child.kill('SIGTERM')
+      killTimer = setTimeout(() => {
+        writePrefixedLine(laneName, `TIMEOUT-KILL ${commandText} signal=SIGKILL`, process.stderr)
+        child.kill('SIGKILL')
+      }, KILL_GRACE_MS)
+    }, timeoutMs)
+
+    function finish(result, stream, line) {
+      if (resolved) {
+        return
+      }
+      resolved = true
+      clearTimeout(timeoutTimer)
+      if (killTimer) {
+        clearTimeout(killTimer)
+      }
+      flushStdout()
+      flushStderr()
+      writePrefixedLine(laneName, line, stream)
+      resolve(result)
+    }
+
+    child.on('error', err => {
+      const durationMs = Date.now() - startedAt
+      finish({
+          command: commandText,
+          durationMs,
+          exitCode: null,
+          signal: null,
+          timedOut,
+          error: err
+        },
+        process.stderr,
+        `FAIL ${commandText} spawn-error=${err.message} duration=${formatDuration(durationMs)}`
+      )
+    })
+
+    child.on('close', (exitCode, signal) => {
+      const durationMs = Date.now() - startedAt
+      const status = exitCode === 0 && !timedOut ? 'PASS' : 'FAIL'
+      const suffix = signal ? ` signal=${signal}` : ` exit=${exitCode}`
+      const timeoutSuffix = timedOut ? ' timeout=true' : ''
+      finish({
+          command: commandText,
+          durationMs,
+          exitCode,
+          signal,
+          timedOut,
+          error: null
+        },
+        status === 'PASS' ? process.stdout : process.stderr,
+        `${status} ${commandText}${suffix}${timeoutSuffix} duration=${formatDuration(durationMs)}`
+      )
+    })
+  })
+}
+
+async function runLane(lane) {
+  const startedAt = Date.now()
+  const completedCommands = []
+  let failedCommand = null
+
+  writePrefixedLine(lane.name, `LANE START commands=${lane.commands.length}`, process.stdout)
+  for (const command of lane.commands) {
+    const result = await runCommand(lane.name, command, lane.commandTimeoutMs)
+    completedCommands.push(result)
+    if (result.exitCode !== 0 || result.signal || result.error || result.timedOut) {
+      failedCommand = result
+      writePrefixedLine(lane.name, `LANE FAIL firstFailure="${result.command}"`, process.stderr)
+      break
+    }
+  }
+
+  const durationMs = Date.now() - startedAt
+  const passed = failedCommand === null
+  writePrefixedLine(lane.name, `LANE ${passed ? 'PASS' : 'FAIL'} duration=${formatDuration(durationMs)}`, passed ? process.stdout : process.stderr)
+
+  return {
+    name: lane.name,
+    commandCount: lane.commands.length,
+    completedCount: completedCommands.length,
+    passed,
+    durationMs,
+    failedCommand
+  }
+}
+
+async function main() {
+  console.log('parallel test lanes:')
+  for (const lane of lanes) {
+    console.log(`- ${lane.name}: ${lane.commands.map(formatCommand).join(' ; ')}`)
+  }
+
+  const results = await Promise.all(lanes.map(runLane))
+  const failed = results.filter(result => !result.passed)
+
+  console.log('\nparallel test summary:')
+  for (const result of results) {
+    const status = result.passed ? 'PASS' : 'FAIL'
+    const failure = result.failedCommand ? ` failingCommand="${result.failedCommand.command}"` : ''
+    console.log(`- ${result.name}: ${status} commands=${result.completedCount}/${result.commandCount} duration=${formatDuration(result.durationMs)}${failure}`)
+  }
+
+  if (failed.length > 0) {
+    console.error(`parallel test failed lanes: ${failed.map(result => result.name).join(', ')}`)
+    process.exitCode = 1
+  }
+}
+
+main().catch(err => {
+  console.error(err && err.stack ? err.stack : err)
+  process.exitCode = 1
+})

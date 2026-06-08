@@ -1,8 +1,10 @@
 const http = require('http')
+const path = require('path')
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 9223
 const DEFAULT_EXTENSION_ID = 'ajcjckiafbnhioeafaejlaehkmdcdeha'
+const DEFAULT_REMOTE_CHROME_DEV_PATH = 'C:\\Users\\DBROWER\\Documents\\src\\mute-block-main\\chrome-dev'
 
 function getOption(name, fallback = '') {
     const prefix = `--${name}=`
@@ -19,7 +21,9 @@ function getCdpConfig() {
     return {
         host: getOption('host', process.env.MB_CDP_HOST || DEFAULT_HOST),
         port: Number.parseInt(getOption('port', process.env.MB_CDP_PORT || DEFAULT_PORT), 10) || DEFAULT_PORT,
-        extensionId: getOption('extension-id', process.env.MB_EXTENSION_ID || DEFAULT_EXTENSION_ID)
+        extensionId: getOption('extension-id', process.env.MB_EXTENSION_ID || DEFAULT_EXTENSION_ID),
+        extensionPath: getOption('extension-path', process.env.MB_EXTENSION_PATH || ''),
+        extensionVersion: getOption('extension-version', process.env.MB_EXTENSION_VERSION || '')
     }
 }
 
@@ -46,6 +50,111 @@ async function getJson(path, config = getCdpConfig(), timeoutMs = 30000) {
 
 async function getTargets(config = getCdpConfig()) {
     return getJson('/json/list', config)
+}
+
+function normalizeExtensionPath(value = '') {
+    return `${value || ''}`
+        .replace(/\\/g, '/')
+        .replace(/\/+$/g, '')
+        .toLowerCase()
+}
+
+async function openChromeExtensionsPage(config = getCdpConfig(), targets = null) {
+    const currentTargets = targets || await getTargets(config)
+    let extensionsPage = currentTargets.find(target => target.url === 'chrome://extensions/')
+    if(extensionsPage) return extensionsPage
+
+    const versionInfo = await getJson('/json/version', config)
+    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url: 'chrome://extensions/',
+        background: true
+    })
+    await sleep(1500)
+    extensionsPage = (await getTargets(config)).find(target => target.url === 'chrome://extensions/')
+    if(extensionsPage) return extensionsPage
+
+    await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.createTarget', {
+        url: 'chrome://extensions/'
+    })
+    await sleep(1500)
+    return (await getTargets(config)).find(target => target.url === 'chrome://extensions/') || null
+}
+
+async function getInstalledExtensions(config = getCdpConfig(), extensionsPage = null) {
+    const page = extensionsPage || await openChromeExtensionsPage(config)
+    if(!page) throw new Error('chrome://extensions/ target not found')
+    return evaluate(page.webSocketDebuggerUrl, `new Promise(resolve => {
+        chrome.developerPrivate.getExtensionsInfo(info => resolve((info || []).map(item => ({
+            id: item.id || '',
+            name: item.name || '',
+            version: item.version || '',
+            location: item.location || '',
+            state: item.state || '',
+            path: item.path || '',
+            updateUrl: item.updateUrl || '',
+            webStoreUrl: item.webStoreUrl || '',
+            manifestErrors: (item.manifestErrors || []).length,
+            runtimeErrors: (item.runtimeErrors || []).length,
+            installWarnings: (item.installWarnings || []).length
+        }))))
+    })`, 15000)
+}
+
+function extensionMatchesAutoCriteria(info = {}, config = {}) {
+    if(!info || !info.id) return false
+    if(info.location !== 'UNPACKED') return false
+    if(!/^Mute Block(?: Dev)?$/i.test(info.name || '')) return false
+    if(config.extensionVersion && info.version !== config.extensionVersion) return false
+
+    const expectedPath = normalizeExtensionPath(config.extensionPath || '')
+    if(expectedPath) {
+        const actualPath = normalizeExtensionPath(info.path || '')
+        if(actualPath !== expectedPath && !actualPath.endsWith(`/${path.posix.basename(expectedPath)}`)) return false
+    }
+
+    return true
+}
+
+async function resolveExtensionId(config = getCdpConfig(), options = {}) {
+    if(config.extensionId && config.extensionId !== 'auto') return config.extensionId
+
+    const normalizedConfig = {
+        ...config,
+        extensionPath: config.extensionPath || options.extensionPath || DEFAULT_REMOTE_CHROME_DEV_PATH,
+        extensionVersion: config.extensionVersion || options.extensionVersion || ''
+    }
+    const extensions = await getInstalledExtensions(normalizedConfig)
+    const matches = extensions.filter(info => extensionMatchesAutoCriteria(info, normalizedConfig))
+    if(matches.length !== 1) {
+        throw new Error(`auto extension discovery expected one unpacked Mute Block match, found ${matches.length}: ${JSON.stringify(matches.map(item => ({
+            id: item.id,
+            name: item.name,
+            version: item.version,
+            path: item.path,
+            location: item.location,
+            state: item.state
+        })))}`)
+    }
+    return matches[0].id
+}
+
+async function resolveCdpConfig(config = getCdpConfig(), options = {}) {
+    if(config.extensionId && config.extensionId !== 'auto') return config
+
+    const extensionPath = config.extensionPath || options.extensionPath || DEFAULT_REMOTE_CHROME_DEV_PATH
+    const extensionVersion = config.extensionVersion || options.extensionVersion || ''
+    const extensionId = await resolveExtensionId({
+        ...config,
+        extensionPath,
+        extensionVersion
+    })
+    return {
+        ...config,
+        extensionId,
+        extensionPath,
+        extensionVersion,
+        extensionIdResolvedFrom: 'auto'
+    }
 }
 
 function connect(wsUrl, timeoutMs = 5000) {
@@ -152,15 +261,20 @@ async function runMain(main) {
 
 module.exports = {
     DEFAULT_EXTENSION_ID,
+    DEFAULT_REMOTE_CHROME_DEV_PATH,
     cdpCommand,
     cdpGet,
     evaluate,
     getCdpConfig,
+    getInstalledExtensions,
     getJson,
     getOption,
     getTargets,
     isSpacePageTarget,
     jsString,
+    openChromeExtensionsPage,
+    resolveCdpConfig,
+    resolveExtensionId,
     runMain,
     sleep,
     spaceKeyFromUrl
