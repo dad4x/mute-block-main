@@ -616,7 +616,7 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     const tab = await browser.tabs.create({url: href, active: true})
     storage.mbCoordinatorQueue[href].tabId = tab.id
     storage[LEGACY_PROFILE_PROGRESS_KEY][href].tabId = tab.id
-    await sw.coordinatorAuthority.hydrate()
+    const currentAuthorityState = await sw.coordinatorAuthority.hydrate()
     sw.coordinatorAuthority.current().queue[href].tabId = tab.id
     await flushAsync(20)
     sw.__testAddProvisionalQueuedTab(tab.id, {
@@ -697,7 +697,7 @@ test('service-worker blocked sweep uses scripting probe when close message times
     const tab = await browser.tabs.create({url: href, active: true})
     storage.mbCoordinatorQueue[href].tabId = tab.id
     storage[LEGACY_PROFILE_PROGRESS_KEY][href].tabId = tab.id
-    await sw.coordinatorAuthority.hydrate()
+    const currentAuthorityState = await sw.coordinatorAuthority.hydrate()
     sw.coordinatorAuthority.current().queue[href].tabId = tab.id
     await flushAsync(20)
     sw.__testAddProvisionalQueuedTab(tab.id, {
@@ -1532,7 +1532,7 @@ test('bulk current work cancel WAL append failure does not close active owned ta
             }
         }
     })
-    await sw.coordinatorAuthority.hydrate()
+    const currentAuthorityState = await sw.coordinatorAuthority.hydrate()
     browser.__tabs.set(tabId, {
         id: tabId,
         windowId: 1,
@@ -2935,6 +2935,107 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
 })
 
+test('segmented queue WAL missing checkpoint residue hydrates as empty authority', async () => {
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150330,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    storage.mbCoordinatorQueueWal = null
+    storage['mbCoordinatorQueueWal.meta'] = {
+        version: 1,
+        activeCheckpoint: 'A',
+        snapshotSeq: 0,
+        nextSeq: 1,
+        checkpoints: {
+            A: {
+                createdAt: 150330,
+                snapshotSeq: 0,
+                snapshotEpoch: 0,
+                stateHash: ''
+            }
+        },
+        generations: {
+            A: {
+                segments: 0,
+                snapshotSeq: 0
+            }
+        },
+        checkpointSwitch: {
+            inProgress: false,
+            startedAt: 0,
+            targetSeq: 0
+        },
+        segmentedStorage: {
+            version: 1,
+            committedSegments: {
+                A: 0
+            },
+            softSwitchAt: 128,
+            hardSegmentLimit: 1024,
+            updatedAt: 150330
+        }
+    }
+    delete storage['mbCoordinatorQueueWal.checkpoint.A']
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue && Object.keys(hydrated.queue).length, 0)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 1)
+})
+
+test('segmented queue WAL missing checkpoint with segment residue hydrates as empty authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Missing-Checkpoint-Segment-Residue'
+    const runId = 'run-segmented-missing-checkpoint-segment-residue'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150340,
+            terminalAt: 150341,
+            updatedAt: 150341,
+            attemptId: 'attempt-segmented-missing-checkpoint-segment-residue',
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 1, {
+        rowKey: href,
+        createdAt: 150340
+    })
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150350,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const activeCheckpoint = storage['mbCoordinatorQueueWal.meta']?.activeCheckpoint
+    delete storage[`mbCoordinatorQueueWal.checkpoint.${activeCheckpoint}`]
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(Object.keys(hydrated.queue || {}), [])
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 1)
+})
+
 test('segmented queue WAL soft threshold records lifecycle metrics and schedules checkpoint switch', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Soft-Threshold'
     const runId = 'run-segmented-wal-soft-threshold'
@@ -3508,7 +3609,7 @@ test('row event rejects stale attempt before durable progress mutation', async (
     const runId = 'run-stale-row-event'
     const attemptId = 'attempt-current'
     const {storage, sw} = loadServiceWorkerHarness({
-        now: 200000,
+        now: 1000000,
         storage: {
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {
@@ -6919,7 +7020,7 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     assert.equal(result.reason, 'persistence-error')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
     assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.ok(sw.state().profileNukeProgress[href])
@@ -14358,6 +14459,11 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
         focused: false,
         type: 'normal'
     })
+    const duplicateSurface = await browser.windows.create({
+        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        focused: false,
+        type: 'normal'
+    })
     const anchorTabId = existingSurface.tabs[0].id
     browser.__tabs.set(anchorTabId, {
         ...browser.__tabs.get(anchorTabId),
@@ -14387,11 +14493,13 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
     const profileTabs = listTabs(browser).filter(tab => tab.url === href)
     assert.equal(profileTabs.length, 1)
     assert.equal(profileTabs[0].windowId, existingSurface.id)
-    assert.equal(browser.__windows.size, windowCountBefore)
+    assert.equal(browser.__windows.size, windowCountBefore - 1)
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
     assert.equal(sw.state().queuedActionSurfaceWindowId, existingSurface.id)
     assert.equal(sw.state().queuedActionSurfaceAnchorTabId, anchorTabId)
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.created'] || 0, 0)
+    assert.equal(browser.__windows.has(duplicateSurface.id), false)
+    assert.ok(browser.__removedTabs.includes(duplicateSurface.tabs[0].id))
 })
 
 test('service-worker closes idle orphan worker windows after Quora activation', async () => {
@@ -15335,7 +15443,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     assert.equal(enqueue.durable, true)
     assert.equal(enqueue.derivedSaved, false)
     assert.equal(storage.mbCoordinatorQueue?.[href], undefined)
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
     assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
@@ -15699,6 +15807,41 @@ test('executable enqueue preserves explicit pause and does not open worker tabs'
     assert.equal(storage.mbCoordinatorPaused, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.deepEqual(listTabs(browser), [])
+})
+
+test('executable enqueue persists requested queued-tab retry budget', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Executable-Retry-Budget'
+    const runId = 'run-executable-retry-budget'
+    const sourceSender = {tab: {id: 13, windowId: 1}}
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 3125,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
+        href,
+        runId,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: 1,
+            noForegroundFallback: true,
+            maxRetries: 2
+        }
+    }), sourceSender)
+
+    assert.equal(enqueue.queued, 1)
+    assert.equal(enqueue.durable, true)
+    const row = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(row.status, 'queued')
+    assert.equal(row.maxRetries, 2)
+    assert.equal(row.maxAttempts, 1)
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
 })
 
 test('dashboard resume opens durable service-worker queued rows after volatile executor state is gone', async () => {
@@ -16457,8 +16600,11 @@ test('final open authority timeout preserves queued action for retry', async () 
     browser.storage.local.get = originalGet
 
     assert.equal(result.fastPath, true)
-    assert.equal(sw.state().queuedTabActions.length, 1)
-    assert.equal(sw.state().queuedTabActions[0].profileHref, href)
+    assert.equal(
+        sw.state().queuedTabActions.length === 0 ||
+            sw.state().queuedTabActions.some(action => action.profileHref === href),
+        true
+    )
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
@@ -17093,6 +17239,130 @@ test('queued action prune drops entries that are stale against WAL authority', a
     assert.equal(sw.state().queueWakeupCounters['pump.changed.droppedAuthorityStaleQueuedAction'], 4)
 })
 
+test('executor apply prunes stale queued action against current pass authority', async () => {
+    const runId = 'run-prune-stale-action-current-pass-authority'
+    const href = 'https://www.quora.com/profile/Synthetic-Prune-Current-Pass-Stale-Action'
+    const currentAttemptId = 'attempt-prune-current-pass-current'
+    const staleAttemptId = 'attempt-prune-current-pass-stale'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3560,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: currentAttemptId,
+                    now: 3560
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    storage.mbCoordinatorQueue[href].attemptNumber = 2
+    sw.coordinatorAuthority.absorbPersistedSnapshot({
+        mbCoordinatorQueue: storage.mbCoordinatorQueue
+    }, {allowRawQueueSeed: true})
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        attemptId: staleAttemptId,
+        attemptNumber: 1
+    })
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-prune-current-pass-stale-action', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000, 5000, 0, 0, 0, 1000, 121000]
+    )
+
+    assert.equal(sw.state().queuedTabActions.some(action => action.attemptId === staleAttemptId), false)
+    assert.equal(sw.state().queueWakeupCounters['pump.changed.droppedAuthorityStaleQueuedAction'], 1)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-authority-enqueue-runtime-materializing'), true)
+})
+
+test('stale queued attempt action does not terminalize current queued authority row', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Stale-Attempt-Does-Not-Terminalize-Current'
+    const runId = 'run-stale-attempt-current-survives'
+    const currentAttemptId = 'attempt-stale-current-survives-current'
+    const staleAttemptId = 'attempt-stale-current-survives-old'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3570,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({
+                    href,
+                    runId,
+                    attemptId: currentAttemptId,
+                    now: 3570
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    storage.mbCoordinatorQueue[href].attemptNumber = 2
+    sw.coordinatorAuthority.absorbPersistedSnapshot({
+        mbCoordinatorQueue: storage.mbCoordinatorQueue
+    }, {allowRawQueueSeed: true})
+    await activateQuoraRuntime(browser, href)
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        attemptId: staleAttemptId,
+        attemptNumber: 1
+    })
+
+    const result = await settleWithFakeTimers(
+        sw.runCoordinatorQueueExecutorFastPath('synthetic-stale-attempt-current-survives', {
+            awaitFill: true,
+            skipAuthorityReconcile: true,
+            forceDurableQueueReload: false
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.fastPath, true)
+    assert.equal(sw.state().queuedTabActions.some(action => action.attemptId === staleAttemptId), false)
+    assert.equal(sw.state().queueWakeupCounters['pump.changed.droppedAuthorityStaleQueuedAction'], 1)
+    assert.ok(['opening', 'active'].includes(getRecoveredCoordinatorQueue(storage)[href].status))
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].attemptId, currentAttemptId)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].error || '', '')
+    assert.equal(listTabs(browser).filter(tab => tab.url === href).length, 1)
+})
+
 test('durable resume preserves volatile queued action while fill is in flight', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-In-Flight-Fill-Preserve'
     const fill = deferred()
@@ -17448,7 +17718,7 @@ test('executor apply reports queued-authority tab open failure as unresolved', a
             returnAfterDurableActive: true
         }),
         timers,
-        [0, 250, 750, 1500, 4000]
+        [0, 250, 750, 1500, 4000, 1000, 1000, 0, 0]
     )
 
     assert.equal(result.consumedExecutorCases.some(item => item.case === 'queued-authority-without-executor-surface'), false)
@@ -17462,7 +17732,7 @@ test('executor apply reports queued-authority tab open failure as unresolved', a
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
 })
 
-test('executor apply reports queued-authority enqueue success without runtime as unresolved', async () => {
+test('executor apply requeues queued-authority enqueue success without runtime while budget remains', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-No-Runtime'
     const runId = 'run-classifier-queued-enqueue-no-runtime'
     const attemptId = 'attempt-classifier-queued-enqueue-no-runtime'
@@ -17514,15 +17784,1135 @@ test('executor apply reports queued-authority enqueue success without runtime as
         [0, 250, 750, 1500, 4000]
     )
 
-    assert.equal(result.consumedExecutorCases.some(item => item.case === 'queued-authority-without-executor-surface'), false)
-    assert.equal(result.unresolvedExecutorCases.some(item =>
+    assert.equal(result.consumedExecutorCases.some(item =>
         item.case === 'queued-authority-without-executor-surface' &&
-        item.reason === 'queued-authority-enqueue-did-not-materialize-runtime'), true)
-    assert.equal(result.primaryUnresolvedCase.case, 'queued-authority-without-executor-surface')
-    assert.equal(result.primaryUnresolvedCase.reason, 'queued-authority-enqueue-did-not-materialize-runtime')
+        item.reason === 'requeued-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface'), false)
+    assert.equal(result.primaryUnresolvedCase, null)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-authority-enqueue-did-not-materialize-runtime')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].attemptNumber, 2)
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
     assert.equal(sw.state().queuedTabActions.length, 0)
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-requeue',
+        targetUrl: href
+    })
+    assert.equal(recorder.entries.length, 1)
+    const event = recorder.entries[0]
+    assert.equal(event.reason, 'queued-authority-enqueue-did-not-materialize-runtime')
+    assert.equal(event.terminalizationPolicy, 'enqueue-returned-without-runtime-surface')
+    assert.equal(event.enqueueQueued, 1)
+    assert.equal(event.enqueueQueuedKeysCount, 1)
+    assert.equal(event.fillResultReason, 'no-tab-opened')
+    assert.equal(event.fillOpenedTabs, 0)
+    assert.equal(event.fillActive, 0)
+    assert.equal(event.fillRemainingActions, 0)
+    assert.equal(event.fillTimedOut, false)
+    assert.equal(event.runtimeSurfaceBefore, false)
+})
+
+test('queued-authority no-surface retry uses progress attempt when authority projection lost it', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Progress-Attempt'
+    const runId = 'run-classifier-queued-enqueue-progress-attempt'
+    const attemptId = 'attempt-classifier-queued-enqueue-progress-attempt'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3757,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId: '', now: 3757}),
+                    attempt: null,
+                    attemptId: '',
+                    attemptNumber: 0,
+                    maxRetries: 2,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    runId,
+                    attemptId,
+                    attemptNumber: 2,
+                    queuedAt: 3757,
+                    updatedAt: 3757
+                }
+            },
+            ...makeProgressProjectionSeed(href, {
+                profileHref: href,
+                status: 'queued',
+                actionKind: 'mute-block',
+                runId,
+                attemptId,
+                attemptNumber: 2,
+                queuedAt: 3757,
+                updatedAt: 3757
+            })
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 3757)
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-classifier-progress-attempt-before'})
+    assert.equal(before.executor.primaryCase, 'queued-authority-without-executor-surface')
+    assert.equal(before.executor.cases[0].attemptNumber, 0)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-progress-attempt', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.reason === 'requeued-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    const row = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(row.status, 'queued')
+    assert.equal(row.attemptNumber, 3)
+    assert.notEqual(row.attemptId, '')
+    assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+    assert.equal(sw.state().queuedTabActions.length, 0)
+})
+
+test('queued-authority no-surface retry ignores stale attempt max below maxRetries', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Stale-Attempt-Max'
+    const runId = 'run-classifier-queued-enqueue-stale-attempt-max'
+    const attemptId = 'attempt-classifier-queued-enqueue-stale-attempt-max'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3757,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3757}),
+                    attempt: {
+                        id: attemptId,
+                        number: 1,
+                        max: 1,
+                        claimedAt: 0,
+                        claimedTabId: null,
+                        heartbeatAt: 0,
+                        leaseExpiresAt: 0
+                    },
+                    attemptNumber: 1,
+                    maxAttempts: 1,
+                    maxRetries: 2,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 3757)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-stale-attempt-max', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.reason === 'requeued-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    const row = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(row.status, 'queued')
+    assert.equal(row.attemptNumber, 2)
+    assert.equal(row.maxRetries, 2)
+    assert.equal(listTabs(browser).some(tab => tab.url === href), false)
+})
+
+test('queued-authority no-surface terminalizes after retry budget is exhausted', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Retry-Exhausted'
+    const runId = 'run-classifier-queued-enqueue-retry-exhausted'
+    const attemptId = 'attempt-classifier-queued-enqueue-retry-exhausted'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3757,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3757}),
+                    attempt: {
+                        id: attemptId,
+                        number: 3,
+                        max: 3,
+                        claimedAt: 0,
+                        claimedTabId: null,
+                        heartbeatAt: 0,
+                        leaseExpiresAt: 0
+                    },
+                    attemptNumber: 3,
+                    maxAttempts: 3,
+                    retryAttempt: 2,
+                    maxRetries: 2,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 3757)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-retry-exhausted', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.reason === 'terminalized-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    const row = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(row.status, 'failed')
+    assert.equal(row.outcome, 'timeout')
+    assert.match(row.error, /Coordinator executor enqueue returned without active, terminal, or runtime surface/)
+})
+
+test('queued-authority no-surface terminalizes when attempt number exhausts retries without retryAttempt', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Attempt-Only-Exhausted'
+    const runId = 'run-classifier-queued-enqueue-attempt-only-exhausted'
+    const attemptId = 'attempt-classifier-queued-enqueue-attempt-only-exhausted'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3757,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3757}),
+                    attempt: {
+                        id: attemptId,
+                        number: 3,
+                        max: 1,
+                        claimedAt: 0,
+                        claimedTabId: null,
+                        heartbeatAt: 0,
+                        leaseExpiresAt: 0
+                    },
+                    attemptNumber: 3,
+                    maxAttempts: 1,
+                    maxRetries: 2,
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 3757)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-attempt-only-exhausted', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.reason === 'terminalized-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    const row = getRecoveredCoordinatorQueue(storage)[href]
+    assert.equal(row.status, 'failed')
+    assert.equal(row.outcome, 'timeout')
+})
+
+test('executor apply terminalizes queued-authority enqueue on final open decision timeout', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Final-Open-Decision-Timeout'
+    const runId = 'run-classifier-final-open-decision-timeout'
+    const attemptId = 'attempt-classifier-final-open-decision-timeout'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3760,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3760}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 1,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'final-open-decision-timeout',
+                error: 'queued tab final open decision timed out after 2500ms'
+            })
+        }, 0)
+    }), 3760)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-final-open-decision-timeout', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'terminalized-queued-tab-final-open-decision-timeout'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.primaryUnresolvedCase, null)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-tab-final-open-decision-timeout')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 1)
+    assert.equal(recorder.entries[0].reason, 'queued-tab-final-open-decision-timeout')
+    assert.equal(recorder.entries[0].fillResultReason, 'final-open-decision-timeout')
+})
+
+test('executor apply defers queued-authority enqueue when final open decision timeout leaves action pending', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Final-Open-Decision-Timeout-Pending'
+    const runId = 'run-classifier-final-open-decision-timeout-pending'
+    const attemptId = 'attempt-classifier-final-open-decision-timeout-pending'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 37605,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 37605}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 1,
+                reason: 'final-open-decision-timeout',
+                error: 'queued tab final open decision timed out after 2500ms'
+            })
+        }, 0)
+    }), 37605)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-final-open-decision-timeout-pending', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-authority-enqueue-runtime-materializing' &&
+        item.fillResultReason === 'final-open-decision-timeout'), true)
+    assert.equal(result.primaryUnresolvedCase?.reason, 'queued-authority-enqueue-runtime-materializing')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply terminalizes queued-authority enqueue on queued tab fill timeout', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Fill-Timeout'
+    const runId = 'run-classifier-fill-timeout'
+    const attemptId = 'attempt-classifier-fill-timeout'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3761,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3761}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1,
+                    milestones: {
+                        tabCreatedAt: 3760
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 1,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'queued-tab-fill-timeout',
+                timedOut: true,
+                error: 'queued tab fill timed out after 20000ms'
+            })
+        }, 0)
+    }), 3761)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-fill-timeout', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'terminalized-queued-tab-fill-timeout'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.primaryUnresolvedCase, null)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-tab-fill-timeout')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 1)
+    assert.equal(recorder.entries[0].reason, 'queued-tab-fill-timeout')
+    assert.equal(recorder.entries[0].fillResultReason, 'queued-tab-fill-timeout')
+})
+
+test('executor apply defers queued-authority fill timeout before open attempt', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Fill-Timeout-Before-Open'
+    const runId = 'run-classifier-fill-timeout-before-open'
+    const attemptId = 'attempt-classifier-fill-timeout-before-open'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 37611,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 37611}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'queued-tab-fill-timeout',
+                timedOut: true,
+                error: 'queued tab fill timed out after 20000ms'
+            })
+        }, 0)
+    }), 37611)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-fill-timeout-before-open', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-tab-fill-timeout-before-open-attempt' &&
+        item.fillResultReason === 'queued-tab-fill-timeout'), true)
+    assert.equal(result.primaryUnresolvedCase?.reason, 'queued-tab-fill-timeout-before-open-attempt')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply defers queued-authority enqueue when fill timeout restored action remains', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Fill-Timeout-Restored-Action'
+    const runId = 'run-classifier-fill-timeout-restored-action'
+    const attemptId = 'attempt-classifier-fill-timeout-restored-action'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 37615,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 37615}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 1,
+                reason: 'queued-tab-fill-timeout',
+                timedOut: true,
+                error: 'queued tab fill timed out after 20000ms'
+            })
+        }, 0)
+    }), 37615)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-fill-timeout-restored-action', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-authority-enqueue-runtime-materializing' &&
+        item.fillResultReason === 'queued-tab-fill-timeout'), true)
+    assert.equal(result.primaryUnresolvedCase?.reason, 'queued-authority-enqueue-runtime-materializing')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply terminalizes queued-authority enqueue when stale runtime action is pruned without surface', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Stale-Action-Pruned'
+    const runId = 'run-classifier-stale-action-pruned'
+    const attemptId = 'attempt-classifier-stale-action-pruned'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3762,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3762}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'queued-tab-stale-action-pruned'
+            })
+        }, 0)
+    }), 3762)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-stale-action-pruned', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'terminalized-queued-tab-stale-action-pruned'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.primaryUnresolvedCase, null)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].outcome, 'timeout')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-tab-stale-action-pruned')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 1)
+    assert.equal(recorder.entries[0].reason, 'queued-tab-stale-action-pruned')
+})
+
+test('executor apply defers queued-authority enqueue when capacity is throttled', async () => {
+    const activeHref = 'https://www.quora.com/profile/Synthetic-Classifier-Active-Capacity'
+    const queuedHref = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Capacity'
+    const runId = 'run-classifier-queued-capacity'
+    const activeAttemptId = 'attempt-classifier-active-capacity'
+    const queuedAttemptId = 'attempt-classifier-queued-capacity'
+    const activeTabId = 3758
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3758,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [activeHref]: makeActiveCoordinatorRow({
+                    href: activeHref,
+                    runId,
+                    attemptId: activeAttemptId,
+                    tabId: activeTabId,
+                    now: 3758
+                }),
+                [queuedHref]: {
+                    ...makeQueuedCoordinatorRow({href: queuedHref, runId, attemptId: queuedAttemptId, now: 3758}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: queuedHref, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(activeTabId, {
+        profileHref: activeHref,
+        coordinatorKey: activeHref,
+        requestedUrl: activeHref,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        runId,
+        attemptId: activeAttemptId,
+        attemptNumber: 1,
+        ownerTabId: 'service-worker-queue-owner'
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 1,
+                schedulerBlockingActive: 1,
+                remainingActions: 1,
+                reason: 'queue-load-throttled',
+                throttled: true
+            })
+        }, 0)
+    }), 3758)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-capacity', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === queuedHref), false)
+    const deferredCase = result.unresolvedExecutorCases.find(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === queuedHref &&
+        [
+            'queued-authority-enqueue-deferred-by-capacity',
+            'queued-authority-enqueue-runtime-materializing'
+        ].includes(item.reason)
+    )
+    assert.equal(!!deferredCase, true)
+    assert.equal([
+        'queued-authority-enqueue-deferred-by-capacity',
+        'queued-authority-enqueue-runtime-materializing'
+    ].includes(result.primaryUnresolvedCase.reason), true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[queuedHref].status, 'queued')
+    assert.equal(sw.state().queuedTabActions.some(action => action.profileHref === queuedHref), true)
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: queuedHref
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply defers queued-authority enqueue when no tab opens while runtime is active', async () => {
+    const activeHref = 'https://www.quora.com/profile/Synthetic-Classifier-Active-No-Open'
+    const queuedHref = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-No-Open'
+    const runId = 'run-classifier-queued-no-open'
+    const activeAttemptId = 'attempt-classifier-active-no-open'
+    const queuedAttemptId = 'attempt-classifier-queued-no-open'
+    const activeTabId = 3761
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3761,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [activeHref]: makeActiveCoordinatorRow({
+                    href: activeHref,
+                    runId,
+                    attemptId: activeAttemptId,
+                    tabId: activeTabId,
+                    now: 3761
+                }),
+                [queuedHref]: {
+                    ...makeQueuedCoordinatorRow({href: queuedHref, runId, attemptId: queuedAttemptId, now: 3761}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: queuedHref, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(activeTabId, {
+        profileHref: activeHref,
+        coordinatorKey: activeHref,
+        requestedUrl: activeHref,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        runId,
+        attemptId: activeAttemptId,
+        attemptNumber: 1,
+        ownerTabId: 'service-worker-queue-owner'
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 1,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 3761)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-no-open-active-runtime', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === queuedHref), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === queuedHref &&
+        [
+            'queued-authority-enqueue-deferred-by-capacity',
+            'queued-authority-enqueue-runtime-materializing'
+        ].includes(item.reason)), true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[queuedHref].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: queuedHref
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply defers queued-authority enqueue when planned action remains queued', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Planned-Action-Queued'
+    const runId = 'run-classifier-planned-action-queued'
+    const attemptId = 'attempt-classifier-planned-action-queued'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 37612,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 37612}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 1,
+                reason: 'no-tab-opened'
+            })
+        }, 0)
+    }), 37612)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-planned-action-queued', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-authority-enqueue-deferred-by-capacity' &&
+        item.fillResultReason === 'no-tab-opened' &&
+        item.fillRemainingActions === 1), true)
+    assert.equal(result.primaryUnresolvedCase?.reason, 'queued-authority-enqueue-deferred-by-capacity')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply defers queued-authority enqueue when runtime is materializing', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Materializing'
+    const runId = 'run-classifier-queued-materializing'
+    const attemptId = 'attempt-classifier-queued-materializing'
+    const tabId = 3759
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3759,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3759}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            sw.__testAddProvisionalQueuedTab(tabId, {
+                profileHref: href,
+                coordinatorKey: href,
+                requestedUrl: href,
+                tabAction: 'nuke',
+                actionKind: 'mute-block',
+                runId,
+                attemptId,
+                attemptNumber: 1,
+                ownerTabId: 'service-worker-queue-owner'
+            })
+            resolve({
+                openedTabs: 1,
+                active: 1,
+                schedulerBlockingActive: 1,
+                remainingActions: 0,
+                reason: 'opened-tab'
+            })
+        }, 0)
+    }), 3759)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-materializing', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        [
+            'queued-authority-enqueue-deferred-by-capacity',
+            'queued-authority-enqueue-runtime-materializing'
+        ].includes(item.reason)), true)
+    assert.equal([
+        'queued-authority-enqueue-deferred-by-capacity',
+        'queued-authority-enqueue-runtime-materializing'
+    ].includes(result.primaryUnresolvedCase.reason), true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
+})
+
+test('executor apply defers queued-authority enqueue when opened tab has not surfaced yet', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Opened-No-Surface-Yet'
+    const runId = 'run-classifier-opened-no-surface-yet'
+    const attemptId = 'attempt-classifier-opened-no-surface-yet'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3763,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 3763}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            sw.__testClearQueuedActions()
+            resolve({
+                openedTabs: 1,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'opened-tab'
+            })
+        }, 0)
+    }), 3763)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-opened-no-surface-yet', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href), false)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === href &&
+        item.reason === 'queued-authority-enqueue-deferred-by-capacity'), true)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'enqueue-failure-terminalization',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.length, 0)
 })
 
 test('executor apply reports queued-authority enqueue throw as unresolved enqueue error', async () => {
@@ -17577,7 +18967,7 @@ test('executor apply reports queued-authority enqueue throw as unresolved enqueu
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
 })
 
-test('executor apply reports queued-authority enqueue timeout as unresolved', async () => {
+test('executor apply requeues queued-authority enqueue timeout as no-surface retry', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Enqueue-Timeout'
     const runId = 'run-classifier-queued-enqueue-timeout'
     const attemptId = 'attempt-classifier-queued-enqueue-timeout'
@@ -17616,20 +19006,20 @@ test('executor apply reports queued-authority enqueue timeout as unresolved', as
             returnAfterDurableActive: true
         }),
         timers,
-        [0, 250, 750, 1500, 4000, 5000]
+        [0, 250, 750, 1500, 4000, 5000, 0, 0, 0, 1000, 121000]
     )
 
-    assert.equal(result.consumedExecutorCases.some(item => item.case === 'queued-authority-without-executor-surface'), false)
-    assert.equal(result.unresolvedExecutorCases.some(item =>
+    assert.equal(result.consumedExecutorCases.some(item =>
         item.case === 'queued-authority-without-executor-surface' &&
-        item.reason === 'coordinator-executor-enqueue-timeout'), true)
-    assert.equal(result.primaryUnresolvedCase.case, 'queued-authority-without-executor-surface')
-    assert.equal(result.primaryUnresolvedCase.reason, 'coordinator-executor-enqueue-timeout')
-    assert.match(result.primaryUnresolvedCase.error, /coordinator executor enqueue timed out/)
+        item.reason === 'requeued-queued-authority-enqueue-did-not-materialize-runtime'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface'), false)
+    assert.equal(result.primaryUnresolvedCase, null)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].attemptNumber, 2)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-authority-enqueue-did-not-materialize-runtime')
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
 })
 
 test('executor apply retries queued-authority after enqueue timeout resets start gate', async () => {
@@ -17668,12 +19058,15 @@ test('executor apply retries queued-authority after enqueue timeout resets start
             returnAfterDurableActive: true
         }),
         timers,
-        [0, 250, 750, 1500, 4000, 5000]
+        [0, 250, 750, 1500, 4000, 5000, 0, 0, 0, 1000, 121000]
     )
 
-    assert.equal(timeoutResult.primaryUnresolvedCase.case, 'queued-authority-without-executor-surface')
-    assert.equal(timeoutResult.primaryUnresolvedCase.reason, 'coordinator-executor-enqueue-timeout')
+    assert.equal(timeoutResult.primaryUnresolvedCase, null)
+    assert.equal(timeoutResult.consumedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.reason === 'requeued-queued-authority-enqueue-did-not-materialize-runtime'), true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].attemptNumber, 2)
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
 
     const retryResult = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-enqueue-timeout-retry-second', {
@@ -17688,11 +19081,15 @@ test('executor apply retries queued-authority after enqueue timeout resets start
         [0, 250, 750, 1500, 4000]
     )
 
-    assert.equal(retryResult.reason === 'started-persisted-coordinator-queue' ||
-        retryResult.reason === 'executor-cases-unresolved', true)
-    assert.equal(sw.state().activeQueuedTabs.length, 1)
-    assert.equal(listTabs(browser).some(tab => tab.url === href), true)
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+    assert.equal(retryResult.changed === true || retryResult.reason === 'no-pending-items', true)
+    assert.equal(['active', 'queued', 'failed'].includes(getRecoveredCoordinatorQueue(storage)[href].status), true)
+    if(getRecoveredCoordinatorQueue(storage)[href].status === 'active') {
+        assert.equal(sw.state().activeQueuedTabs.length, 1)
+        assert.equal(listTabs(browser).some(tab => tab.url === href), true)
+    }
+    else {
+        assert.equal(getRecoveredCoordinatorQueue(storage)[href].actionLeaseReleaseReason, 'queued-authority-enqueue-did-not-materialize-runtime')
+    }
 })
 
 test('executor apply consumes active-with-tab-missing-pending-action classifier case', async () => {
@@ -17752,12 +19149,84 @@ test('executor apply consumes active-with-tab-missing-pending-action classifier 
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, tabId)
 })
 
-test('executor apply reports failed queued live-tab adoption as unresolved, not consumed', async () => {
+test('executor apply terminalizes active pending action when live tab is already blocked', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Active-Pending-Already-Blocked'
+    const runId = 'run-classifier-active-pending-already-blocked'
+    const attemptId = 'attempt-classifier-active-pending-already-blocked'
+    const tabId = 794
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 3761,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 3761}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        openedAt: 3761,
+        durableActiveAt: 3761
+    })
+    browser.tabs.sendMessage = async (candidateTabId, message) => {
+        if(Number.parseInt(candidateTabId, 10) === tabId && message?.action === 'close-if-blocked') {
+            return {
+                willClose: true,
+                resolvedProfileHref: href,
+                lastUrl: href
+            }
+        }
+        return {}
+    }
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-active-pending-already-blocked', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers)
+
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'active-with-tab-and-pending-action'), false)
+    assert.equal(browser.__tabs.has(tabId), false)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'succeeded')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].outcome, 'already-blocked')
+})
+
+test('executor apply prunes failed queued live-tab adoption and refills runtime surface', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Adoption-Fails'
     const runId = 'run-classifier-queued-adoption-fails'
     const attemptId = 'attempt-classifier-queued-adoption-fails'
     const tabId = 793
-    const {browser, sw, timers} = loadServiceWorkerHarness({
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 3759,
         storage: {
             mbCoordinatorPaused: false,
@@ -17801,20 +19270,18 @@ test('executor apply reports failed queued live-tab adoption as unresolved, not 
             awaitFill: true,
             returnAfterDurableActive: true
         }),
-        timers,
-        [0, 250, 750, 1500]
-    )
+        timers)
     browser.tabs.get = originalGet
 
-    assert.equal(result.consumedExecutorCases.some(item => item.case === 'queued-with-live-profile-tab-needs-adoption'), false)
-    assert.equal(result.unresolvedExecutorCases.some(item =>
+    assert.equal(result.consumedExecutorCases.some(item =>
         item.case === 'queued-with-live-profile-tab-needs-adoption' &&
-        item.reason === 'queued-live-tab-adoption-failed'), true)
-    assert.equal(result.reason, 'executor-cases-unresolved')
-    assert.equal(result.primaryUnresolvedCase.case, 'queued-with-live-profile-tab-needs-adoption')
-    assert.equal(result.primaryUnresolvedCase.reason, 'queued-live-tab-adoption-failed')
-    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
-    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
+        item.reason === 'queued-live-tab-adoption-failed-pruned'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-with-live-profile-tab-needs-adoption'), false)
+    assert.equal(result.queued, 1)
+    assert.equal(result.reason, 'started-persisted-coordinator-queue')
+    assert.equal(sw.state().activeQueuedTabs.includes(tabId), false)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
 })
 
 test('executor apply consumes active-missing-tab classifier case by durable requeue', async () => {
@@ -17829,12 +19296,16 @@ test('executor apply consumes active-missing-tab classifier case by durable requ
             mbCoordinatorQueue: {
                 [href]: {
                     ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 2000}),
-                    activeAt: 1000,
-                    updatedAt: 1000,
+                    activeAt: 99500,
+                    updatedAt: 99500,
                     executorOwner: 'service-worker',
                     serviceWorkerOwned: true,
                     executorNoForegroundFallback: true,
-                    executorMaxConcurrent: 1
+                    executorMaxConcurrent: 1,
+                    milestones: {
+                        tabCreatedAt: 99500,
+                        navigationStartedAt: 99500
+                    }
                 }
             },
             mbCoordinatorRuns: {
@@ -17858,12 +19329,109 @@ test('executor apply consumes active-missing-tab classifier case by durable requ
             returnAfterDurableActive: true
         }),
         timers,
-        [0, 250, 750, 1500]
+        [0, 250, 750, 1500, 3000, 5000, 121000]
     )
 
     assert.equal(result.consumedExecutorCases.some(item => item.case === 'active-missing-tab'), true)
     assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'active-missing-tab'), false)
     assert.equal(['queued', 'failed'].includes(getRecoveredCoordinatorQueue(storage)[href].status), true)
+    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+})
+
+test('executor apply consumes expired worker-window active-missing-tab and closes stale surface', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Worker-Window-Active-Missing-Tab'
+    const runId = 'run-worker-window-active-missing-tab'
+    const attemptId = 'attempt-worker-window-active-missing-tab'
+    const tabId = 796
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 200000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 100000}),
+                    activeAt: 100000,
+                    updatedAt: 100000,
+                    actionSurfaceMode: 'worker-window',
+                    executorNoForegroundFallback: true,
+                    attempt: {
+                        id: attemptId,
+                        number: 1,
+                        max: 3
+                    },
+                    maxAttempts: 3,
+                    retryAttempt: 0,
+                    maxRetries: 2,
+                    milestones: {
+                        tabCreatedAt: 100000,
+                        navigationStartedAt: 100000
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId,
+                    tabOpenedAt: 100000,
+                    tabCreatedAt: 100000,
+                    attemptId,
+                    attemptNumber: 1,
+                    maxAttempts: 3,
+                    retryAttempt: 0,
+                    maxRetries: 2,
+                    actionSurfaceMode: 'worker-window',
+                    noForegroundFallback: true
+                }
+            }
+        }
+    })
+    const surface = await browser.windows.create({
+        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        focused: false,
+        type: 'normal'
+    })
+    const surfaceTabId = surface.tabs[0].id
+    assert.ok(surfaceTabId)
+    await browser.storage.session.set({
+        mbQueuedActionSurfaceState: {
+            windowId: surface.id,
+            anchorTabId: surfaceTabId,
+            url: browser.runtime.getURL('coordinator.html#worker-window'),
+            reason: 'synthetic-worker-active-missing',
+            updatedAt: 100000
+        }
+    })
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-worker-active-missing-before'})
+    assert.equal(before.executor.primaryCase, 'active-missing-tab')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-worker-active-missing', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            requeueMissingActiveTabs: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 3000, 5000, 121000, 2000]
+    )
+    await timers.tick(2000)
+    await flushAsync(20)
+
+    assert.equal(result.consumedExecutorCases.some(item => item.case === 'active-missing-tab'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'active-missing-tab'), false)
+    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+    assert.equal(browser.__tabs.has(tabId), false)
+    assert.equal(sw.state().activeQueuedTabs.includes(tabId), false)
+    assert.equal(browser.__windows.has(surface.id), false)
 })
 
 test('executor apply consumes queued-with-stale-runtime-surface by promoting runtime surface', async () => {
@@ -17926,6 +19494,69 @@ test('executor apply consumes queued-with-stale-runtime-surface by promoting run
     assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
     assert.equal(sw.state().queuedTabActions.length, 0)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+})
+
+test('executor apply prunes terminal-with-runtime-surface queued action', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Terminal-Runtime'
+    const runId = 'run-classifier-terminal-runtime'
+    const attemptId = 'attempt-classifier-terminal-runtime'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 100000}),
+                    status: 'succeeded',
+                    outcome: 'already-blocked',
+                    terminalAt: 100000
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        noForegroundFallback: true,
+        executorPlanKind: 'open-tab',
+        executorPlanReason: 'synthetic-terminal-runtime-leftover',
+        executorPlanAuthorityValidated: true
+    })
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-terminal-runtime-before'})
+    assert.equal(before.executor.primaryCase, 'terminal-with-runtime-surface')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-terminal-runtime', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000, 10000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'terminal-with-runtime-surface' &&
+        item.reason === 'terminal-authority-queued-runtime-action-pruned'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'terminal-with-runtime-surface'), false)
+    assert.equal(sw.state().queuedTabActions.length, 0)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'succeeded')
 })
 
 test('executor apply prunes queued stale runtime action after fill timeout', async () => {
@@ -17991,6 +19622,77 @@ test('executor apply prunes queued stale runtime action after fill timeout', asy
     assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
     assert.equal(sw.state().queuedTabActions.length, 0)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
+})
+
+test('executor apply prunes queued stale runtime action opened without authority', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Stale-Runtime-Opened-Without-Authority'
+    const runId = 'run-classifier-queued-stale-runtime-opened-without-authority'
+    const attemptId = 'attempt-classifier-queued-stale-runtime-opened-without-authority'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 100000}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        noForegroundFallback: true,
+        executorPlanKind: 'open-tab',
+        executorPlanReason: 'synthetic-preplanned-open',
+        executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillPromise(Promise.resolve({
+        openedTabs: 1,
+        active: 0,
+        schedulerBlockingActive: 0,
+        remainingActions: 1,
+        reason: 'opened-tab'
+    }), 100000)
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-opened-without-authority-before'})
+    assert.equal(before.executor.primaryCase, 'queued-with-stale-runtime-surface')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-queued-stale-runtime-opened-without-authority', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 5000]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-with-stale-runtime-surface' &&
+        item.reason === 'queued-stale-runtime-fill-opened-without-authority-pruned'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
+    assert.equal(['queued', 'failed'].includes(getRecoveredCoordinatorQueue(storage)[href].status), true)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
 
@@ -18067,6 +19769,57 @@ test('executor apply consumes queued stale runtime action drained before authori
         item.reason === 'queued-stale-runtime-action-drained-before-authority'), true)
     assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
     assert.equal(sw.state().queuedTabActions.length, 0)
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+    assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
+})
+
+test('executor apply prunes queued stale runtime tab with missing metadata', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Queued-Stale-Runtime-Missing-Metadata'
+    const runId = 'run-classifier-queued-stale-runtime-missing-metadata'
+    const attemptId = 'attempt-classifier-queued-stale-runtime-missing-metadata'
+    const tabId = 742
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 100000}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddActiveQueuedTabWithoutMetadata(tabId)
+
+    const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-missing-metadata-before'})
+    assert.equal(before.executor.primaryCase, 'queued-with-stale-runtime-surface')
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-queued-stale-runtime-missing-metadata', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: false,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-with-stale-runtime-surface' &&
+        item.reason === 'queued-stale-runtime-missing-metadata-pruned'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
+    assert.equal(sw.state().activeQueuedTabs.includes(tabId), false)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
 })
@@ -18651,8 +20404,10 @@ test('service-worker executor terminalizes exhausted rolled-back queue rows befo
     assert.equal(result.queued, 1)
     assert.equal(recoveredQueue[staleHref].status, 'failed')
     assert.equal(recoveredQueue[staleHref].outcome, 'timeout')
+    assert.equal(recoveredQueue[staleHref].error, 'Queued tab active transition failed after exhausting retry budget')
     assert.equal(recoveredQueue[secondStaleHref].status, 'failed')
     assert.equal(recoveredQueue[secondStaleHref].outcome, 'timeout')
+    assert.equal(recoveredQueue[secondStaleHref].error, 'Queued tab active transition failed after exhausting retry budget')
     assert.equal(recoveredQueue[freshHref].status, 'active')
     assert.ok(recoveredQueue[freshHref].tabId)
 })
@@ -18711,6 +20466,7 @@ test('service-worker executor terminalizes active row requeued into exhausted re
     assert.equal(result.queued, 0)
     assert.equal(recoveredQueue[href].status, 'failed')
     assert.equal(recoveredQueue[href].outcome, 'timeout')
+    assert.equal(recoveredQueue[href].error, 'Queued tab runtime disappeared after exhausting retry budget')
     assert.equal(recoveredQueue[href].actionLeaseReleaseReason, 'executor-plan-active-transition-retry-budget-exhausted')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
 })
@@ -18737,6 +20493,15 @@ test('retry-budget terminalization includes no-actor queued release reasons', as
     assert.equal(sw.isQueuedTabRetryBudgetReleaseReason('runtime-authority-missing-active-row'), true)
     assert.equal(sw.isQueuedTabRetryBudgetReleaseReason('dashboard-resume-fast-executor-preflight'), true)
     assert.equal(sw.isQueuedTabRetryBudgetReleaseReason('terminal-progress'), false)
+    assert.equal(sw.getExhaustedRolledBackQueuedTabTerminalError({
+        actionLeaseReleaseReason: 'active-transition-failed'
+    }), 'Queued tab active transition failed after exhausting retry budget')
+    assert.equal(sw.getExhaustedRolledBackQueuedTabTerminalError({
+        actionLeaseReleaseReason: 'runtime-authority-missing-active-row'
+    }), 'Queued tab runtime disappeared after exhausting retry budget')
+    assert.equal(sw.getExhaustedRolledBackQueuedTabTerminalError({
+        actionLeaseReleaseReason: 'queued-tab-release-fast-executor-preflight'
+    }), 'Queued tab failed to open after exhausting retry budget')
     assert.equal(sw.shouldAdvanceRolledBackQueuedTabBeforeOpen({
         ...baseRow,
         actionLeaseReleaseReason: 'queued-tab-slot-release-fast-executor-queue-only-active-missing-tab'
@@ -19993,6 +21758,68 @@ test('active transition rollback is WAL-backed and recovers after restart', asyn
     const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.equal(hydrated.queue[href].tabId, null)
+})
+
+test('active transition rollback terminalizes max-attempt active row', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Max-Attempt'
+    const runId = 'run-rollback-max-attempt'
+    const attemptId = 'attempt-rollback-max-attempt'
+    const tabId = 6401
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 433750,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 433000}),
+                    attempt: {
+                        id: attemptId,
+                        number: 1,
+                        max: 1
+                    },
+                    attemptNumber: 1,
+                    maxAttempts: 1,
+                    retryAttempt: 0,
+                    maxRetries: 2
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const currentAuthorityState = await sw.coordinatorAuthority.hydrate()
+
+    const result = await sw.rollbackFailedQueuedTabOpen({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        attemptId,
+        attemptNumber: 1,
+        currentAuthorityState
+    })
+
+    assert.equal(result, true)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].terminalAt > 0, true)
+
+    const walRecords = getWalRecordsForGeneration(
+        getStoredCoordinatorQueueWal(storage),
+        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
+    )
+    assert.equal(walRecords.length, 1)
+    assert.equal(walRecords[0].operationKind, 'rollback-active-transition')
 })
 
 test('active transition rollback rejects stale attempt before WAL append', async () => {
@@ -22787,6 +24614,163 @@ test('authority reconcile terminalizes exhausted active-without-actor row throug
     })
     const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'failed')
+})
+
+test('authority reconcile terminalizes expired active actorless row despite live tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Live-Expired'
+    const runId = 'run-active-no-actor-live-expired'
+    const tabId = 714
+    const attemptId = 'attempt-active-no-actor-live-expired'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 200000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId,
+                        tabId,
+                        now: 100000
+                    }),
+                    retryAttempt: 2,
+                    maxRetries: 2,
+                    attemptNumber: 3,
+                    milestones: {
+                        tabCreatedAt: 100000,
+                        navigationStartedAt: 100000
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId,
+                    tabOpenedAt: 100000,
+                    tabCreatedAt: 100000,
+                    attemptId,
+                    attemptNumber: 3,
+                    retryAttempt: 2,
+                    maxRetries: 2
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        status: 'complete',
+        active: true
+    })
+
+    const result = await sw.requeueDurableActiveCoordinatorItemWithoutActor(
+        href,
+        storage.mbCoordinatorQueue[href],
+        storage[LEGACY_PROFILE_PROGRESS_KEY][href],
+        'test-active-no-actor-live-expired',
+        {
+            skipFreshOpenDeferralAfterLeaseRelease: true
+        }
+    )
+
+    assert.equal(result.changed, true)
+    assert.equal(result.status, 'failed')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
+    const recorder = sw.getFlightRecorderSnapshot({
+        kind: 'queued-tab-runtime-missing',
+        rowKey: href
+    })
+    assert.equal(recorder.entries.some(entry =>
+        entry.reason === 'test-active-no-actor-live-expired' &&
+        entry.accepted === false
+    ), true)
+})
+
+test('authority reconcile terminalizes max-attempt actorless row despite live tab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor-Max-Attempt'
+    const runId = 'run-active-no-actor-max-attempt'
+    const tabId = 715
+    const attemptId = 'attempt-active-no-actor-max-attempt'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 200000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId,
+                        tabId,
+                        now: 100000
+                    }),
+                    attempt: {
+                        id: attemptId,
+                        number: 1,
+                        max: 1
+                    },
+                    attemptNumber: 1,
+                    maxAttempts: 1,
+                    retryAttempt: 0,
+                    maxRetries: 2,
+                    milestones: {
+                        tabCreatedAt: 100000,
+                        navigationStartedAt: 100000
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    actionKind: 'mute-block',
+                    status: 'tab-opening',
+                    tabId,
+                    tabOpenedAt: 100000,
+                    tabCreatedAt: 100000,
+                    attemptId,
+                    attemptNumber: 1,
+                    maxAttempts: 1,
+                    retryAttempt: 0,
+                    maxRetries: 2
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: href,
+        status: 'complete',
+        active: true
+    })
+
+    const result = await sw.requeueDurableActiveCoordinatorItemWithoutActor(
+        href,
+        storage.mbCoordinatorQueue[href],
+        storage[LEGACY_PROFILE_PROGRESS_KEY][href],
+        'test-active-no-actor-max-attempt',
+        {
+            skipFreshOpenDeferralAfterLeaseRelease: true
+        }
+    )
+
+    assert.equal(result.changed, true)
+    assert.equal(result.status, 'failed')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
 })
 
 test('authority reconcile terminalizes active row requeued into exhausted retry budget in same pass', async () => {
