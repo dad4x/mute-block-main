@@ -54,6 +54,16 @@ the suite.
 Run against an already-launched Chrome profile with remote debugging exposed on
 `127.0.0.1:9223`:
 
+For shell-level CDP health checks, always bypass proxy configuration:
+
+```bash
+timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version
+```
+
+Plain `curl` can time out through proxy settings even when the reverse tunnel
+and Windows Chrome are healthy. The repo CDP runners use direct Node `http`
+requests and do not need the curl flag.
+
 ```bash
 node tools/cdp/upgrade-regression/run.js \
   --extension-id nlmmkoljofpgbmlcojebolmniineboah \

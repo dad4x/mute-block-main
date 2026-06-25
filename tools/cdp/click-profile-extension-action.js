@@ -8,36 +8,16 @@ const {
     runMain
 } = require('./lib/cdp')
 
-runMain(async () => {
-    const config = getCdpConfig()
-    const needle = getOption('needle', '').toLowerCase()
-    const closeAfter = getOption('close-after', 'false') === 'true'
-    const targets = await getTargets(config)
-    const profilePages = targets.filter(target => {
-        if(target.type !== 'page') return false
-        if(!/^https:\/\/www\.quora\.com\/profile\//i.test(target.url || '')) return false
-        if(!needle) return true
-        return `${target.url || ''}\n${target.title || ''}`.toLowerCase().includes(needle)
-    })
-
-    if(profilePages.length !== 1) {
-        console.log(JSON.stringify({
-            matched: profilePages.length,
-            pages: profilePages.map(target => ({
-                id: target.id,
-                title: target.title || '',
-                url: target.url || ''
-            }))
-        }, null, 2))
-        process.exitCode = 1
-        return
-    }
-
-    const target = profilePages[0]
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${function clickExtensionAction(closeAfter) {
-        const visibleText = node => `${node?.innerText || node?.textContent || node?.getAttribute?.('aria-label') || ''}`
-            .replace(/\s+/g, ' ')
-            .trim()
+function getClickExtensionActionPageFunction() {
+    return function clickExtensionAction(closeAfter) {
+        const visibleText = value => {
+            if(typeof value === 'string') return value
+                .replace(/\s+/g, ' ')
+                .trim()
+            return `${value?.innerText || value?.textContent || value?.getAttribute?.('aria-label') || ''}`
+                .replace(/\s+/g, ' ')
+                .trim()
+        }
         const visible = node => {
             if(!node) return false
             const rect = node.getBoundingClientRect()
@@ -59,7 +39,8 @@ runMain(async () => {
             }))
         const button = buttons.find(item => {
             const label = `${item.text}\n${item.aria}\n${item.title}`
-            if(closeAfter) return /Mute-Block Extension: Mute and block this profile, then close the tab/i.test(label)
+            if(closeAfter) return /Mute-Block Extension: Mute and block this profile, then close the tab/i.test(label) ||
+                /Mute-Block Extension: Close this tab/i.test(label)
             return /Mute-Block Extension: Mute and block this profile$/i.test(label) ||
                 /^Mute Block$/i.test(item.text)
         })
@@ -87,7 +68,36 @@ runMain(async () => {
                 title: button.title
             }
         }
-    }})( ${JSON.stringify(closeAfter)} )`, 10000)
+    }
+}
+
+async function main() {
+    const config = getCdpConfig()
+    const needle = getOption('needle', '').toLowerCase()
+    const closeAfter = getOption('close-after', 'false') === 'true'
+    const targets = await getTargets(config)
+    const profilePages = targets.filter(target => {
+        if(target.type !== 'page') return false
+        if(!/^https:\/\/www\.quora\.com\/profile\//i.test(target.url || '')) return false
+        if(!needle) return true
+        return `${target.url || ''}\n${target.title || ''}`.toLowerCase().includes(needle)
+    })
+
+    if(profilePages.length !== 1) {
+        console.log(JSON.stringify({
+            matched: profilePages.length,
+            pages: profilePages.map(target => ({
+                id: target.id,
+                title: target.title || '',
+                url: target.url || ''
+            }))
+        }, null, 2))
+        process.exitCode = 1
+        return
+    }
+
+    const target = profilePages[0]
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${getClickExtensionActionPageFunction().toString()})( ${JSON.stringify(closeAfter)} )`, 10000)
 
     console.log(JSON.stringify({
         tab: {
@@ -97,4 +107,12 @@ runMain(async () => {
         },
         result
     }, null, 2))
-})
+}
+
+if(require.main === module) {
+    runMain(main)
+}
+
+module.exports = {
+    getClickExtensionActionPageFunction
+}

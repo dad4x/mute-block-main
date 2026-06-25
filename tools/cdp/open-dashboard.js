@@ -6,12 +6,13 @@ const {
     getCdpConfig,
     getJson,
     getTargets,
+    resolveCdpConfig,
     runMain,
     sleep
 } = require('./lib/cdp')
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     let targets = await getTargets(config)
     let dashboard = targets.find(target => target.type === 'page' && target.url === dashboardUrl)

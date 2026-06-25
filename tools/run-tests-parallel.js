@@ -2,6 +2,7 @@
 
 'use strict'
 
+const os = require('os')
 const { spawn } = require('child_process')
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30000
@@ -69,6 +70,44 @@ function formatDuration(ms) {
     return `${ms}ms`
   }
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+function getDefaultLaneConcurrency() {
+  const available = typeof os.availableParallelism === 'function'
+    ? os.availableParallelism()
+    : os.cpus().length
+  const normalizedAvailable = Number.isFinite(available) && available > 0 ? available : 1
+  return Math.max(1, Math.min(lanes.length, normalizedAvailable, 4))
+}
+
+function getLaneConcurrency() {
+  const raw = `${process.env.TEST_PARALLEL_JOBS || ''}`.trim()
+  if (!raw) {
+    return getDefaultLaneConcurrency()
+  }
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    console.warn(`Ignoring invalid TEST_PARALLEL_JOBS=${JSON.stringify(raw)}; using default concurrency`)
+    return getDefaultLaneConcurrency()
+  }
+  return Math.max(1, Math.min(lanes.length, parsed))
+}
+
+async function runLanesWithLimit(limit) {
+  const results = new Array(lanes.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (nextIndex < lanes.length) {
+      const laneIndex = nextIndex
+      nextIndex += 1
+      results[laneIndex] = await runLane(lanes[laneIndex])
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, lanes.length))
+  await Promise.all(Array.from({length: workerCount}, () => worker()))
+  return results
 }
 
 function writePrefixedLine(laneName, text, stream) {
@@ -207,7 +246,10 @@ async function main() {
     console.log(`- ${lane.name}: ${lane.commands.map(formatCommand).join(' ; ')}`)
   }
 
-  const results = await Promise.all(lanes.map(runLane))
+  const laneConcurrency = getLaneConcurrency()
+  console.log(`lane concurrency: ${laneConcurrency}/${lanes.length}`)
+
+  const results = await runLanesWithLimit(laneConcurrency)
   const failed = results.filter(result => !result.passed)
 
   console.log('\nparallel test summary:')

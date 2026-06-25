@@ -5232,7 +5232,9 @@ function getOriginalPosterProfileHrefFromInlineData() {
         /\\"contentObject\\":\{\\"__typename\\":\\"Question\\"[\s\S]{0,12000}?\\"asker\\":\{[\s\S]{0,4000}?\\"profileUrl\\":\\"(\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
         /"contentObject":\{"__typename":"Question"[\s\S]{0,12000}?"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/,
         /\\"asker\\":\{[\s\S]{0,4000}?\\"profileUrl\\":\\"(\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
-        /"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/
+        /"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/,
+        /\\"feedReason\\":\{[\s\S]{0,8000}?\\"user(?:Names|Photos)\\"\\s*:\\s*\\[\\{[\s\S]{0,4000}?\\"profileUrl\\":\\"((?:https?:\/\/(?:www\\.)?quora\\.com)?\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
+        /"feedReason":\{[\s\S]{0,8000}?"user(?:Names|Photos)"\s*:\s*\[\{[\s\S]{0,4000}?"profileUrl":"((?:https?:\/\/(?:www\.)?quora\.com)?\/profile\/[^"?#]+)(?:[?#][^"]*)?"/
     ]
 
     for(const script of Array.from(document.scripts || [])) {
@@ -5251,6 +5253,29 @@ function getOriginalPosterProfileHrefFromInlineData() {
     return null
 }
 
+function getOriginalPosterProfileHrefFromParsedInlinePayload(data = null) {
+    const directCandidates = [
+        data?.data?.contentObject?.asker?.profileUrl,
+        data?.data?.contentObject?.author?.profileUrl,
+        data?.data?.contentObject?.tribeItem?.author?.profileUrl,
+        data?.data?.question?.asker?.profileUrl,
+        data?.data?.question?.author?.profileUrl
+    ]
+    for(const candidate of directCandidates) {
+        const href = normalizeQuoraProfileHref(candidate)
+        if(href) return href
+    }
+
+    const feedReason = data?.data?.feedReason || data?.data?.question?.feedReason || null
+    const relevantUsers = [
+        ...(Array.isArray(feedReason?.userNames) ? feedReason.userNames : []),
+        ...(Array.isArray(feedReason?.userPhotos) ? feedReason.userPhotos : []),
+        ...(Array.isArray(feedReason?.relevantUsers) ? feedReason.relevantUsers : [])
+    ]
+    const hrefs = getNormalizedProfileHrefList(relevantUsers.map(user => user?.profileUrl || ''))
+    return hrefs.length === 1 ? hrefs[0] : null
+}
+
 function getOriginalPosterProfileHrefFromInlinePayloads() {
     for(const script of Array.from(document.scripts || [])) {
         const text = script.textContent || ''
@@ -5264,7 +5289,7 @@ function getOriginalPosterProfileHrefFromInlinePayloads() {
             try {
                 const payload = JSON.parse(`"${escapedPayload}"`)
                 const data = JSON.parse(payload)
-                const href = normalizeQuoraProfileHref(data?.data?.contentObject?.asker?.profileUrl)
+                const href = getOriginalPosterProfileHrefFromParsedInlinePayload(data)
                 if(href) return href
             }
             catch {
@@ -7328,6 +7353,8 @@ function getQueueableSpaceFeedEntryUrls(entry) {
 
 function isQueueableSpaceFeedResolverEntry(entry) {
     if(!isResolvableSpaceFeedEntry(entry)) return false
+    if(getQueueableSpaceFeedEntryUrls(entry).length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) return false
+    if(`${entry?.resolutionReason || ''}`.trim() === 'low-confidence-profile-artifact') return false
     if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
     if(isSpaceFeedEntryNuked(entry)) return false
     if(isSpaceFeedPostPending(entry.postKey)) return false
@@ -7448,6 +7475,8 @@ function isSpaceFeedEntryNukedForRender(entry = null, context = null) {
 
 function isQueueableSpaceFeedResolverEntryForRender(entry = null, context = null) {
     if(!isResolvableSpaceFeedEntry(entry)) return false
+    if(getQueueableSpaceFeedEntryUrlsForRender(entry, context).length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) return false
+    if(`${entry?.resolutionReason || ''}`.trim() === 'low-confidence-profile-artifact') return false
     if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
     if(isSpaceFeedEntryNukedForRender(entry, context)) return false
     if(isSpaceFeedPostPendingForRender(entry.postKey, context)) return false
@@ -7773,7 +7802,7 @@ function getSpaceFeedPostEntries() {
             needsSourceResolution = candidateUrls.needsSourceResolution === true
             let node = postRoot.parentElement
 
-            while(!candidateUrls.length && !needsSourceResolution && node && node !== contentRoot) {
+            while(!candidateUrls.length && node && node !== contentRoot) {
                 if(isSpaceFeedRootCandidate(node, timestamp)) {
                     candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
                     candidateEvidenceByHref = mergeSpaceFeedCandidateEvidenceByHref(
@@ -7803,7 +7832,7 @@ function getSpaceFeedPostEntries() {
             postUrl,
             candidateUrls,
             candidateEvidenceByHref,
-            resolveProfileFromPage: isAssetSpacePage() && !!postUrl && (!candidateUrls.length || needsSourceResolution),
+            resolveProfileFromPage: isAssetSpacePage() && !!postUrl && needsSourceResolution,
             resolutionReason: needsSourceResolution ? 'low-confidence-profile-artifact' : ''
         })
     }
@@ -8950,6 +8979,7 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
         event = 'Queued profile action',
         maxConcurrent = getProfilesPerBatch(),
         noForegroundFallback = false,
+        maxRetries = null,
         sourceExtra = {}
     } = options
     const profileHrefs = getNormalizedProfileHrefList(urls)
@@ -8973,7 +9003,10 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
         execute: {
             tabAction: 'nuke',
             maxConcurrent,
-            noForegroundFallback
+            noForegroundFallback,
+            ...(Number.isFinite(Number.parseInt(maxRetries, 10)) && Number.parseInt(maxRetries, 10) >= 0
+                ? {maxRetries: Number.parseInt(maxRetries, 10)}
+                : {})
         },
         items: profileHrefs.map(profileHref => ({
             runId,
@@ -9983,6 +10016,7 @@ async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
         event: options.event || 'Queued from profile search',
         maxConcurrent: getProfileSearchProfilesPerBatch(),
         noForegroundFallback: true,
+        maxRetries: 2,
         sourceExtra: {
             searchQuery: new URLSearchParams(location.search).get('q') || '',
             sourceLabel: getProfileSearchQueryLabel()
@@ -10707,8 +10741,13 @@ async function maybeRunAutoProfileAction() {
             }
 
             const canProceedWithoutForegroundGate = () => {
-                return !allowForegroundFallback &&
-                    (typeof readyPredicate !== 'function' || readyPredicate() || !!getProfileUnavailableReason())
+                const readyForLocalAction = typeof readyPredicate !== 'function' ||
+                    readyPredicate() ||
+                    !!getProfileUnavailableReason()
+                if(!readyForLocalAction) return false
+
+                return !allowForegroundFallback ||
+                    (claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible')
             }
 
             const beginLocalNoForegroundActionGate = async () => {
@@ -10763,7 +10802,9 @@ async function maybeRunAutoProfileAction() {
                     foregroundLeaseAcquiredAt: response?.foregroundLeaseAcquiredAt || response?.actionLease?.grantedAt || Date.now(),
                     foregroundPromotedAt: response?.foregroundPromotedAt || 0,
                     foregroundPromotionReason: `${reason || ''}`.trim(),
-                    event: response?.localNoForegroundGate
+                    event: response?.workerWindowActionGate
+                        ? 'Queued tab proceeded locally using worker-window action surface'
+                        : response?.localNoForegroundGate
                         ? 'Queued tab proceeded locally without foreground action gate'
                         : response?.localActionGateFallback
                         ? 'Queued tab proceeded locally after durable profile action gate timeout'
@@ -10815,6 +10856,7 @@ async function maybeRunAutoProfileAction() {
                     begun: true,
                     granted: true,
                     localActionGateFallback: true,
+                    workerWindowActionGate: claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible',
                     foregroundLeaseAcquiredAt: Date.now()
                 })
             }
@@ -10861,6 +10903,7 @@ async function maybeRunAutoProfileAction() {
                                 begun: true,
                                 granted: true,
                                 localActionGateFallback: true,
+                                workerWindowActionGate: claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible',
                                 foregroundLeaseAcquiredAt: Date.now()
                             }
                         }

@@ -23,21 +23,28 @@ function isProfileSearchTarget(target, needle) {
     }
 }
 
+function hasOption(name) {
+    return process.argv.includes('--' + name) || process.argv.some(arg => arg.startsWith('--' + name + '='))
+}
+
 runMain(async () => {
-    const config = getCdpConfig()
     const needle = getOption('needle', process.env.MB_SEARCH_NEEDLE || '').toLowerCase()
     const limit = Math.max(1, Number.parseInt(getOption('limit', '3'), 10) || 3)
     const maxConcurrent = Math.max(1, Number.parseInt(getOption('max-concurrent', '1'), 10) || 1)
     const noForegroundFallback = getOption('no-foreground-fallback', 'true') !== 'false'
-    const explicitUrls = getOption('urls', '')
-        .split(',')
-        .map(entry => entry.trim())
-        .filter(Boolean)
+    const dryRun = hasOption('dry-run') && getOption('dry-run', 'true') !== 'false'
+    if(hasOption('urls') || hasOption('urls-file')) {
+        console.error('flattened URL-file enqueue is disabled; use in-space collect candidates plus in-space nuke button')
+        process.exitCode = 1
+        return
+    }
+
+    const config = getCdpConfig()
     const targets = await getTargets(config)
     const target = targets.find(candidate => isProfileSearchTarget(candidate, needle))
-    const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
+    const dashboardUrl = 'chrome-extension://' + config.extensionId + '/coordinator.html'
     const extensionPage = targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl) ||
-        targets.find(candidate => candidate.type === 'page' && (candidate.url || '').startsWith(`chrome-extension://${config.extensionId}/`))
+        targets.find(candidate => candidate.type === 'page' && (candidate.url || '').startsWith('chrome-extension://' + config.extensionId + '/'))
 
     if(!target) {
         console.log(JSON.stringify({ok: false, reason: 'profile-search-target-not-found', needle}, null, 2))
@@ -50,9 +57,7 @@ runMain(async () => {
         return
     }
 
-    const visible = explicitUrls.length
-        ? {pageUrl: target.url || '', title: target.title || '', searchQuery: needle, links: explicitUrls}
-        : await evaluate(target.webSocketDebuggerUrl, `(${function collectVisibleProfileSearchLinks() {
+    const visible = await evaluate(target.webSocketDebuggerUrl, `(${function collectVisibleProfileSearchLinks() {
         const normalizeProfileHref = href => {
             try {
                 const parsed = new URL(href, location.href)
@@ -96,7 +101,7 @@ runMain(async () => {
             type: 'profile-search',
             pageUrl: visible?.pageUrl || '',
             searchQuery: visible?.searchQuery || '',
-            sourceLabel: visible?.title || ''
+            sourceLabel: visible?.sourceLabel || visible?.title || ''
         }
 
         return chrome.storage.local.get({mbCoordinatorQueue: {}, mbProfileNukeProgressView: {}}).then(async stored => {
@@ -155,7 +160,7 @@ runMain(async () => {
     }})( ${JSON.stringify(visible)}, ${JSON.stringify(limit)}, ${JSON.stringify(maxConcurrent)}, ${JSON.stringify(noForegroundFallback)} )`, 30000)
 
     console.log(JSON.stringify({
-        target: {id: target.id, title: target.title || '', url: target.url || ''},
+        target: target ? {id: target.id, title: target.title || '', url: target.url || ''} : null,
         extensionPage: {id: extensionPage.id, title: extensionPage.title || '', url: extensionPage.url || ''},
         ...result
     }, null, 2))

@@ -157,20 +157,70 @@ async function resolveCdpConfig(config = getCdpConfig(), options = {}) {
     }
 }
 
+
+function getWebSocketState(ws) {
+    if(!ws) return -1
+    if(typeof ws.readyState === 'number') return ws.readyState
+    return -1
+}
+
+function safeCloseWebSocket(ws, reason = 'cleanup') {
+    if(!ws) return false
+    try {
+        const noop = () => {}
+        if(typeof ws.addEventListener === 'function') {
+            ws.addEventListener('error', noop)
+            ws.addEventListener('close', noop)
+        }
+        else if(typeof ws.on === 'function') {
+            ws.on('error', noop)
+            ws.on('close', noop)
+        }
+    }
+    catch {}
+
+    const state = getWebSocketState(ws)
+    const openState = typeof WebSocket !== 'undefined' ? WebSocket.OPEN : 1
+    const closingState = typeof WebSocket !== 'undefined' ? WebSocket.CLOSING : 2
+    if(state !== openState && state !== closingState) return false
+
+    try {
+        ws.close(1000, `${reason || 'cleanup'}`.slice(0, 120))
+        return true
+    }
+    catch {
+        return false
+    }
+}
+
 function connect(wsUrl, timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl)
+        let settled = false
+        const finishReject = error => {
+            if(settled) return
+            settled = true
+            clearTimeout(timeout)
+            reject(error)
+        }
         const timeout = setTimeout(() => {
-            try { ws.close() } catch {}
-            reject(new Error(`WebSocket timeout opening ${wsUrl}`))
+            finishReject(new Error(`WebSocket timeout opening ${wsUrl}`))
+            safeCloseWebSocket(ws, 'connect-timeout')
         }, timeoutMs)
         ws.addEventListener('open', () => {
+            if(settled) {
+                safeCloseWebSocket(ws, 'late-open-after-connect-timeout')
+                return
+            }
+            settled = true
             clearTimeout(timeout)
             resolve(ws)
         }, {once: true})
         ws.addEventListener('error', event => {
-            clearTimeout(timeout)
-            reject(event.error || new Error(`WebSocket error for ${wsUrl}`))
+            finishReject(event.error || new Error(`WebSocket error for ${wsUrl}`))
+        }, {once: true})
+        ws.addEventListener('close', () => {
+            finishReject(new Error(`WebSocket closed before opening ${wsUrl}`))
         }, {once: true})
     })
 }
@@ -181,7 +231,7 @@ async function cdpCommand(wsUrl, method, params = {}, timeoutMs = 15000) {
         return await new Promise((resolve, reject) => {
             const id = 1
             const timeout = setTimeout(() => {
-                try { ws.close() } catch {}
+                safeCloseWebSocket(ws, 'cdp-command-timeout')
                 reject(new Error(`${method} timed out after ${timeoutMs}ms`))
             }, timeoutMs)
             ws.addEventListener('message', event => {
@@ -190,13 +240,13 @@ async function cdpCommand(wsUrl, method, params = {}, timeoutMs = 15000) {
                 clearTimeout(timeout)
                 if(message.error) reject(new Error(JSON.stringify(message.error)))
                 else resolve(message.result || {})
-                try { ws.close() } catch {}
+                safeCloseWebSocket(ws, 'cdp-command-complete')
             })
             ws.send(JSON.stringify({id, method, params}))
         })
     }
     finally {
-        try { ws.close() } catch {}
+        safeCloseWebSocket(ws, 'cdp-command-cleanup')
     }
 }
 
@@ -206,7 +256,7 @@ async function evaluate(wsUrl, expression, timeoutMs = 20000) {
         return await new Promise((resolve, reject) => {
             const id = 1
             const timeout = setTimeout(() => {
-                try { ws.close() } catch {}
+                safeCloseWebSocket(ws, 'evaluate-timeout')
                 reject(new Error(`Runtime.evaluate timed out after ${timeoutMs}ms`))
             }, timeoutMs)
             ws.addEventListener('message', event => {
@@ -216,7 +266,7 @@ async function evaluate(wsUrl, expression, timeoutMs = 20000) {
                 if(message.error) reject(new Error(JSON.stringify(message.error)))
                 else if(message.result?.exceptionDetails) reject(new Error(JSON.stringify(message.result.exceptionDetails)))
                 else resolve(message.result?.result?.value)
-                try { ws.close() } catch {}
+                safeCloseWebSocket(ws, 'evaluate-complete')
             })
             ws.send(JSON.stringify({
                 id,
@@ -226,7 +276,7 @@ async function evaluate(wsUrl, expression, timeoutMs = 20000) {
         })
     }
     finally {
-        try { ws.close() } catch {}
+        safeCloseWebSocket(ws, 'evaluate-cleanup')
     }
 }
 

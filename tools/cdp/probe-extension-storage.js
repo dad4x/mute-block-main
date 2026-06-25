@@ -5,13 +5,14 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
 
 const DEFAULT_KEY = 'mbQueueWakeupMetrics'
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     const key = getOption('key', DEFAULT_KEY)
     const targets = await getTargets(config)
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
