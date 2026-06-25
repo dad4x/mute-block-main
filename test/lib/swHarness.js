@@ -430,6 +430,18 @@ function loadServiceWorkerHarness(options = {}) {
             `const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = ${timeoutMs}`
         )
     }
+    if(options.shadowWalRecordLimit) {
+        const recordLimit = Math.max(2, Number.parseInt(options.shadowWalRecordLimit, 10) || 0)
+        source = source
+            .replace(
+                'const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = 128',
+                `const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = ${recordLimit}`
+            )
+            .replace(
+                'const MAX_PROGRESS_SHADOW_WAL_RECORDS = 128',
+                `const MAX_PROGRESS_SHADOW_WAL_RECORDS = ${recordLimit}`
+            )
+    }
     source = source.replace(
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise',
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise'
@@ -632,6 +644,7 @@ module.exports.__test = {
             coordinatorReconcilePromise: !!coordinatorReconcilePromise,
             coordinatorReconcilePromiseAgeMs: coordinatorReconcilePromise ? getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) : 0,
             activeQueuedTabs: Array.from(activeQueuedTabs),
+            schedulerBlockingQueuedExecutors: getSchedulerBlockingQueuedExecutorCount(),
             pausedQueuedOwners: Array.from(pausedQueuedOwners),
             queuedTabActions: queuedTabActions.map(action => ({...action})),
             pendingTabActions: Array.from(pendingTabActions.entries()).map(([tabId, action]) => [tabId, {...action}]),
