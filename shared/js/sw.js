@@ -153,6 +153,7 @@ const QUORA_RUNTIME_TAB_QUERY_TIMEOUT_MS = 1000
 const QUEUED_TAB_GET_TIMEOUT_MS = 2500
 const COORDINATOR_RECONCILE_GATE_TIMEOUT_MS = 15000
 const COORDINATOR_RESUME_GATE_TIMEOUT_MS = 30000
+const BACKGROUND_FAST_RESUME_RESPONSE_BUDGET_MS = 3000
 const COORDINATOR_STORED_WORK_RESTORE_TIMEOUT_MS = 20000
 const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = 180000
 const QUEUED_TAB_FILL_PROMISE_STALE_MS = COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS
@@ -162,6 +163,7 @@ const COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS = 30000
 const COORDINATOR_EXECUTOR_PLAN_BATCH_FALLBACK_LIMIT = 1
 const COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT = 25
 const COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS = 120000
+const QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS = COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS + 60000
 const SCHEDULER_ALARM_LATE_TOLERANCE_MS = 60000
 const COORDINATOR_JOB_MILESTONE_FLUSH_MS = 3000
 const PERSISTENT_FAILED_RETRY_INTERVAL_MS = 5000
@@ -173,7 +175,11 @@ const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const CONTENT_SCRIPT_READY_ATTR = 'data-mb-content-script-ready'
 const QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS = 750
 const QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS = 5000
-const QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS = 2500
+const QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS = 10000
+const QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS = 15000
+const QUEUED_TAB_FINAL_OPEN_DECISION_TIMEOUT_MS = QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS
+const QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS = 30000
+const QUEUED_TAB_CLAIM_NUDGE_TIMEOUT_ESCALATION_MS = 5000
 const QUEUED_TAB_ACTIVE_TRANSITION_TIMEOUT_MS = SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS + 5000
 const QUEUED_TAB_FAST_ACTIVE_TRANSITION_TIMEOUT_MS = 5000
 const QUEUED_TAB_CREATE_TIMEOUT_MS = 10000
@@ -200,6 +206,7 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'current-work-item-cancel',
     'stale-retry',
     'terminalize-exhausted-rolled-back-queued',
+    'recover-exhausted-rolled-back-queued',
     'terminalize-queued-authority-enqueue-failure',
     'terminalize-queued-authority-enqueue-timeout',
     'rollback-active-transition',
@@ -295,6 +302,7 @@ let coordinatorExecutorStartPromise = Promise.resolve()
 let coordinatorStoredWorkRestorePromise = null
 let lastUserStartQueueResult = null
 let lastCoordinatorExecutorApplyResult = null
+let coordinatorExecutorClassificationSeq = 0
 let queuedForegroundLeaseTabId = null
 let queueWakeupMetrics = makeEmptyQueueWakeupMetrics()
 let queueWakeupMetricsFlushPromise = null
@@ -728,6 +736,14 @@ function rememberQueueLoadProgress(reason = 'action-phase-progress') {
     return queueLoadThrottle
 }
 
+function shouldEscalateQueuedTabClaimNudgeTimeout(metadata = null, now = Date.now()) {
+    const lastFailedAt = Number.parseInt(metadata?.lastNudgeFailedAt, 10) || 0
+    if(!lastFailedAt) return false
+    const lastFailure = `${metadata?.lastNudgeFailure || ''}`.trim()
+    if(!/timed out/i.test(lastFailure)) return false
+    return now - lastFailedAt >= QUEUED_TAB_CLAIM_NUDGE_TIMEOUT_ESCALATION_MS
+}
+
 function sumQueueWakeupCounters(counters = {}, prefix = '') {
     return Object.entries(counters || {})
         .filter(([key]) => `${key || ''}`.startsWith(prefix))
@@ -1123,7 +1139,7 @@ async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
     const stored = currentAuthorityState?.stored || {}
     const wasPaused = stored?.[COORDINATOR_PAUSED_KEY] === true
     const storedPauseGeneration = Number.parseInt(stored?.[COORDINATOR_PAUSE_GENERATION_KEY], 10) || 0
-    if(wasPaused && storedPauseGeneration > 0) {
+    if(wasPaused && storedPauseGeneration) {
         incrementQueueWakeupMetric('pump.deferredExplicitPause')
         pushQueueWakeupJournalEntry({
             kind: 'state-change',
@@ -1137,20 +1153,16 @@ async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
         return {resumed: false, paused: true, reason: 'coordinator-paused'}
     }
     if(wasPaused) {
-        const pauseGeneration = nextCoordinatorPauseGeneration()
-        coordinatorPauseRequested = false
-        await setCoordinatorPauseControlState(false, pauseGeneration, 'ordinaryMutation')
+        await setCoordinatorPauseControlState(false, 0, 'ordinaryMutation')
         void setCoordinatorRunsPaused(false).catch(() => null)
-        pausedQueuedOwners.delete(SERVICE_WORKER_QUEUE_OWNER_ID)
-        if(coordinatorTabId) pausedQueuedOwners.delete(coordinatorTabId)
-        incrementQueueWakeupMetric('pump.changed.clearedStalePause')
+        incrementQueueWakeupMetric('pump.changed.stalePauseCleared')
         pushQueueWakeupJournalEntry({
             kind: 'state-change',
             name: 'coordinator-stale-pause-cleared',
             reason,
             result: 'state-changed',
             details: {
-                pauseGeneration
+                pauseGeneration: storedPauseGeneration
             }
         })
     }
@@ -1288,6 +1300,15 @@ async function handleCoordinatorBrowserStartup() {
         resetQueueWakeupMetricsEpochAfterLoad('browser-startup', {deferUntilQuora: true})
     ]).catch(() => null)
 
+    if(await isCoordinatorPausedInStorage('browser-startup-paused-check')) {
+        incrementQueueWakeupMetric('pump.noop.startupPaused')
+        return {
+            autoStart: false,
+            paused: true,
+            reason: 'coordinator-paused'
+        }
+    }
+
     if(!await isCoordinatorAutoStartOnBrowserStartEnabled()) {
         return {
             autoStart: false,
@@ -1304,7 +1325,26 @@ async function handleCoordinatorBrowserStartup() {
 }
 
 async function rearmStoredWorkAfterExtensionReload(reason = 'extension-updated') {
-    if(!await hasUnpausedStoredCoordinatorWorkInQueueView(`${reason || 'extension-updated'}-stored-work`)) {
+    if(await isCoordinatorPausedInStorage(`${reason || 'extension-updated'}-paused-check`)) {
+        incrementQueueWakeupMetric('pump.noop.rearmPaused')
+        return {rearmed: false, paused: true, reason: 'coordinator-paused'}
+    }
+
+    if(await refreshStaleCompactQueueViewIfNeeded(reason, 'pump.changed.staleQueueViewRefreshed')) {
+        return {rearmed: false, reason: 'stale-queue-view-refreshed'}
+    }
+
+    const storedWorkReason = `${reason || 'extension-updated'}-stored-work`
+    const queueViewHasStoredWork = await hasUnpausedStoredCoordinatorWorkInQueueView(storedWorkReason)
+    let hasStoredWork = false
+    if(queueViewHasStoredWork) {
+        hasStoredWork = true
+    }
+    else {
+        hasStoredWork = await hasUnpausedStoredCoordinatorWorkInDurableQueue(storedWorkReason)
+    }
+
+    if(!hasStoredWork) {
         return {rearmed: false, reason: 'no-stored-work'}
     }
 
@@ -1319,6 +1359,20 @@ async function rearmStoredWorkAfterExtensionReload(reason = 'extension-updated')
         rearmed: true,
         reason: resume?.reason || `${reason || 'extension-updated'}-scheduled`
     }
+}
+
+async function refreshStaleCompactQueueViewIfNeeded(reason = 'dashboard-ready', metricName = '') {
+    const storedWorkReason = `${reason || 'dashboard-ready'}-stored-work`
+    const queueViewHasStoredWork = await hasUnpausedStoredCoordinatorWorkInQueueView(storedWorkReason)
+    if(!queueViewHasStoredWork) return false
+
+    const durableQueueHasStoredWork = await hasUnpausedStoredCoordinatorWorkInDurableQueue(storedWorkReason)
+    if(durableQueueHasStoredWork) return false
+
+    await refreshCoordinatorQueueViewForDashboard(`${reason || 'dashboard-ready'}-stale-queue-view`)
+        .catch(() => null)
+    if(metricName) incrementQueueWakeupMetric(metricName)
+    return true
 }
 
 async function rearmStoredWorkAfterServiceWorkerReload(reason = 'service-worker-reload') {
@@ -2307,9 +2361,25 @@ function chooseCoordinatorReclaimProfileTab(candidates = []) {
         })[0] || null
 }
 
+function mergeLiveTabsById(...lists) {
+    const merged = []
+    const seen = new Set()
+    for(const list of lists) {
+        for(const tab of list || []) {
+            const tabId = normalizeTabId(tab?.id)
+            if(!tabId || seen.has(tabId)) continue
+            seen.add(tabId)
+            merged.push(tab)
+        }
+    }
+    return merged
+}
+
 function isQueuedCoordinatorLiveTabReclaimReason(reason = '') {
     const normalizedReason = `${reason || ''}`.trim()
     return normalizedReason === 'active-transition-failed' ||
+        /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalizedReason) ||
+        /(?:^|-)active-transition-retry-budget-recovered(?:-|$)/.test(normalizedReason) ||
         /active-missing-tab$/.test(normalizedReason)
 }
 
@@ -2910,10 +2980,10 @@ function hasDurableQueueMatchForRuntimeTab(tabId = null, queue = {}, progress = 
     return false
 }
 
-function buildRequeuedActiveCoordinatorItemWithoutActor(item = {}, record = null, now = Date.now(), reason = 'reconcile-active-without-actor') {
+function buildRequeuedActiveCoordinatorItemWithoutActor(item = {}, record = null, now = Date.now(), reason = 'reconcile-active-without-actor', options = {}) {
     const retryAttempt = getQueuedTabRetryAttempt(item, record)
     const maxRetries = getQueuedTabMaxRetries(item, record)
-    if(isQueuedTabAttemptBudgetExhausted(item, record)) {
+    if(isQueuedTabAttemptBudgetExhausted(item, record) && options.forceRequeueExhaustedActorless !== true) {
         return buildTerminalCoordinatorQueueItem(item, {
             status: 'failed',
             outcome: 'timeout',
@@ -2929,13 +2999,24 @@ function buildRequeuedActiveCoordinatorItemWithoutActor(item = {}, record = null
         getAttemptNumberFromValue(item),
         getAttemptNumberFromValue(record)
     ) + 1
+    const nextRetryAttempt = retryAttempt + 1
+    const effectiveMaxRetries = options.extendActorlessRetryBudget === true
+        ? Math.max(maxRetries, nextRetryAttempt + 1)
+        : maxRetries
+    const configuredMaxAttempts = Math.max(
+        Number.parseInt(item?.attempt?.max, 10) || 0,
+        Number.parseInt(item?.maxAttempts, 10) || 0
+    )
+    const effectiveMaxAttempts = options.extendActorlessRetryBudget === true
+        ? Math.max(configuredMaxAttempts, attemptNumber + 1, effectiveMaxRetries + 1)
+        : configuredMaxAttempts
     const actionKind = getCoordinatorActionKindForRequestedAction(item.actionKind || item.tabAction || item.executorTabAction || '')
     const reducedRetry = reduceJobEvent(item, {
         type: JOB_EVENT_RETRY,
         attemptId,
         attemptNumber,
         at: now,
-        retryCount: item.retryCount || 0,
+        retryCount: nextRetryAttempt,
         lastRetryAt: item.lastRetryAt || 0
     })
     const retryBase = reducedRetry.accepted ? reducedRetry.item : item
@@ -2953,9 +3034,18 @@ function buildRequeuedActiveCoordinatorItemWithoutActor(item = {}, record = null
         activeAt: 0,
         terminalAt: 0,
         tabId: null,
-        attempt: 0,
-        retryAttempt: retryAttempt + 1,
-        maxRetries,
+        attempt: options.extendActorlessRetryBudget === true && effectiveMaxAttempts > 0
+            ? {
+                id: attemptId,
+                number: attemptNumber,
+                max: effectiveMaxAttempts
+            }
+            : 0,
+        retryAttempt: nextRetryAttempt,
+        maxRetries: effectiveMaxRetries,
+        ...(options.extendActorlessRetryBudget === true && effectiveMaxAttempts > 0
+            ? {maxAttempts: effectiveMaxAttempts}
+            : {}),
         actionLease: null,
         actionLeaseReleasedAt: now,
         actionLeaseReleaseReason: reason,
@@ -3007,6 +3097,15 @@ async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = '', exp
     }
     const expectedPersistedTabStatus = await getPersistedLiveTabStatusForCoordinatorItem(expectedItem, expectedRecord, itemKey)
     const retryBudgetExhausted = isQueuedTabAttemptBudgetExhausted(expectedItem, expectedRecord)
+    const timedOutPersistedTabLookupTreatedMissing = shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(
+        expectedItem,
+        expectedRecord,
+        expectedPersistedTabStatus
+    )
+    const shouldRecoverExhaustedMissingActor = retryBudgetExhausted === true &&
+        isCoordinatorQueueAuthoritativeItem(expectedItem) &&
+        !expectedPersistedTabStatus.tab &&
+        (expectedPersistedTabStatus.timedOut !== true || timedOutPersistedTabLookupTreatedMissing)
     if(expectedPersistedTabStatus.tab &&
         contentReadinessReason !== 'content-actor-readiness-window-expired' &&
         retryBudgetExhausted !== true &&
@@ -3088,10 +3187,13 @@ async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = '', exp
             currentAuthorityState: options.currentAuthorityState || null,
             reconcileReason: reason,
             contentReadinessReason,
-            skipFreshOpenDeferralAfterLeaseRelease: options.skipFreshOpenDeferralAfterLeaseRelease === true
+            skipActionPhaseProtection: options.skipActionPhaseProtection === true,
+            skipFreshOpenDeferralAfterLeaseRelease: options.skipFreshOpenDeferralAfterLeaseRelease === true,
+            forceRequeueExhaustedActorless: options.forceRequeueExhaustedActorless === true || shouldRecoverExhaustedMissingActor,
+            extendActorlessRetryBudget: options.extendActorlessRetryBudget === true || shouldRecoverExhaustedMissingActor
         })
     }, {
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         reason: 'reconcile-active-without-actor'
     })
         .finally(() => {
@@ -3195,7 +3297,7 @@ async function releaseMissingActionLeaseForActiveCoordinatorItem(itemKey = '', e
             currentAuthorityState: options.currentAuthorityState || null
         })
     }, {
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         reason: 'reconcile-action-lease-missing-tab'
     })
         .finally(() => {
@@ -3230,7 +3332,7 @@ async function terminalizeDurableActiveCoordinatorItemFromTerminalProgress(itemK
             reconcileReason: reason
         })
     }, {
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         reason: 'terminal-progress-active'
     })
 }
@@ -3272,7 +3374,7 @@ async function terminalizeActiveCoordinatorProfileRedirectMismatch(itemKey = '',
             reconcileReason: options.reconcileReason || 'profile-redirect-mismatch'
         })
     }, {
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         reason: 'terminalize-profile-redirect-mismatch'
     })
 }
@@ -3664,9 +3766,22 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         return {changed: false, reason: 'invalid-item'}
     }
 
-    let currentAuthorityState = await loadCoordinatorQueueRunsProjection({
-        metricPath: 'reconcile.activeWithoutActor.load'
-    })
+    let currentAuthorityState = null
+    if(operation.currentAuthorityState?.queue &&
+        operation.currentAuthorityState?.runs) {
+        currentAuthorityState = {
+            stored: operation.currentAuthorityState.stored || {},
+            queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(operation.currentAuthorityState.queue || {})),
+            runs: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(operation.currentAuthorityState.runs || {})),
+            progress: cloneCoordinatorAuthorityValue(operation.currentAuthorityState.progress || {})
+        }
+        incrementQueueWakeupMetric('reconcile.activeWithoutActor.usedResidentAuthority')
+    }
+    if(!currentAuthorityState) {
+        currentAuthorityState = await loadCoordinatorQueueRunsProjection({
+            metricPath: 'reconcile.activeWithoutActor.load'
+        })
+    }
     const queue = currentAuthorityState.queue
     const progress = currentAuthorityState.progress || {}
     const current = queue[itemKey] || null
@@ -3721,12 +3836,14 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
             reason: 'fresh-worker-window-startup-progress'
         }
     }
-    const actionPhaseProtection = await getActionPhaseLiveTabProtectionForCoordinatorItem(current, currentRecord, itemKey)
-    if(actionPhaseProtection.protected) {
-        return {
-            changed: false,
-            reason: actionPhaseProtection.reason,
-            error: actionPhaseProtection.error || ''
+    if(operation.skipActionPhaseProtection !== true) {
+        const actionPhaseProtection = await getActionPhaseLiveTabProtectionForCoordinatorItem(current, currentRecord, itemKey)
+        if(actionPhaseProtection.protected) {
+            return {
+                changed: false,
+                reason: actionPhaseProtection.reason,
+                error: actionPhaseProtection.error || ''
+            }
         }
     }
 
@@ -3779,7 +3896,10 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
                 getCoordinatorItemQueueKey(currentItem, itemKey) !== currentCoordinatorKey) {
                 return context.reject('row-target-changed-before-authority-apply')
             }
-            return buildRequeuedActiveCoordinatorItemWithoutActor(currentItem, currentRecord, now, reconcileReason)
+            return buildRequeuedActiveCoordinatorItemWithoutActor(currentItem, currentRecord, now, reconcileReason, {
+                forceRequeueExhaustedActorless: operation.forceRequeueExhaustedActorless === true,
+                extendActorlessRetryBudget: operation.extendActorlessRetryBudget === true
+            })
         }
     })
 
@@ -4138,17 +4258,28 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
     }
     if(paused) return {changed: false, paused: true, actionBudget, actions: 0}
 
-    const preTerminalizedExhausted = await terminalizeExhaustedRolledBackQueuedCoordinatorItems(Object.values(queue), {
+    const preTerminalizedExhausted = await settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(Object.values(queue), {
         limit: actionBudget,
-        reason: 'executor-plan-active-transition-retry-budget-exhausted',
+        recoverReason: 'executor-plan-active-transition-retry-budget-recovered',
+        terminalizeReason: 'executor-plan-active-transition-retry-budget-exhausted',
+        queueOnlyAuthority: options.queueOnlyAuthority === true,
+        recoverActiveTransitionFailures: true,
+        recoverQueueLoadPressure: true,
         liveProfileTabsByHref
     }).catch(error => ({
         changed: false,
         terminalized: 0,
+        recovered: 0,
         keys: [],
         reason: 'batch-terminalize-error',
         error: error?.message || `${error || ''}`
     }))
+    if(preTerminalizedExhausted?.recovered > 0) {
+        actions += preTerminalizedExhausted.recovered
+        requeued += preTerminalizedExhausted.recovered
+        currentAuthorityState = coordinatorAuthority.current()
+        incrementQueueWakeupMetric('reconcile.changed.recoveredExhaustedRolledBack', preTerminalizedExhausted.recovered)
+    }
     if(preTerminalizedExhausted?.terminalized > 0) {
         actions += preTerminalizedExhausted.terminalized
         terminalized += preTerminalizedExhausted.terminalized
@@ -4190,7 +4321,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
         if(isTerminalProfileNukeRecord(record)) {
             const result = await terminalizeDurableActiveCoordinatorItemFromTerminalProgress(itemKey, item, record, reason, {
                 currentAuthorityState,
-                timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+                timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
             })
                 .catch(error => ({
                     changed: false,
@@ -4229,7 +4360,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
             const result = await releaseMissingActionLeaseForActiveCoordinatorItem(itemKey, item, reason, {
                 expectedRecord: record,
                 currentAuthorityState,
-                timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+                timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
             }).catch(error => ({
                 changed: false,
                 reason: 'active-action-lease-release-error',
@@ -4291,7 +4422,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                     skipActionPhaseProtection: true,
                     skipFreshContentReadiness: true,
                     skipFreshOpenDeferralAfterLeaseRelease: true,
-                    timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+                    timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
                 }).catch(error => ({
                     changed: false,
                     reason: 'active-row-requeue-after-lease-release-error',
@@ -4307,21 +4438,39 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                             currentAuthorityState.queue?.[itemKey] ||
                             null
                         if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
-                            const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
-                                requeueResult.itemKey || itemKey,
-                                requeuedItem,
-                                {
-                                    currentAuthorityState,
-                                    reason: 'executor-plan-active-transition-retry-budget-exhausted'
-                                }
-                            ).catch(error => ({
+                            const terminalizeResult = await (shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, {
+                                recoverActiveTransitionFailures: true,
+                                recoverQueueLoadPressure: true,
+                                serviceWorkerOwned: true
+                            })
+                                ? recoverExhaustedRolledBackQueuedCoordinatorItem(
+                                    requeueResult.itemKey || itemKey,
+                                    requeuedItem,
+                                    {
+                                        currentAuthorityState,
+                                        reason: 'executor-plan-active-transition-retry-budget-recovered'
+                                    }
+                                )
+                                : terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                                    requeueResult.itemKey || itemKey,
+                                    requeuedItem,
+                                    {
+                                        currentAuthorityState,
+                                        reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                                    }
+                                )).catch(error => ({
                                 changed: false,
                                 reason: 'terminalize-error',
                                 error: error?.message || `${error || ''}`
                             }))
                             if(terminalizeResult?.changed) {
                                 actions += 1
-                                terminalized += 1
+                                if(terminalizeResult.recovered === true) {
+                                    requeued += 1
+                                }
+                                else {
+                                    terminalized += 1
+                                }
                                 currentAuthorityState = coordinatorAuthority.current()
                             }
                             else {
@@ -4416,7 +4565,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
             currentAuthorityState,
             skipFreshContentReadiness: true,
             skipFreshOpenDeferralAfterLeaseRelease: true,
-            timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+            timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
         })
             .catch(error => ({
                 changed: false,
@@ -4442,21 +4591,35 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                 currentAuthorityState.queue?.[itemKey] ||
                 null
             if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
-                const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
-                    result.itemKey || itemKey,
-                    requeuedItem,
-                    {
-                        currentAuthorityState,
-                        reason: 'executor-plan-active-transition-retry-budget-exhausted'
-                    }
-                ).catch(error => ({
+                const terminalizeResult = await (options.queueOnlyAuthority === true
+                    ? recoverExhaustedRolledBackQueuedCoordinatorItem(
+                        result.itemKey || itemKey,
+                        requeuedItem,
+                        {
+                            currentAuthorityState,
+                            reason: 'executor-plan-active-transition-retry-budget-recovered'
+                        }
+                    )
+                    : terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                        result.itemKey || itemKey,
+                        requeuedItem,
+                        {
+                            currentAuthorityState,
+                            reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                        }
+                    )).catch(error => ({
                     changed: false,
                     reason: 'terminalize-error',
                     error: error?.message || `${error || ''}`
                 }))
                 if(terminalizeResult?.changed) {
                     actions += 1
-                    terminalized += 1
+                    if(terminalizeResult.recovered === true) {
+                        requeued += 1
+                    }
+                    else {
+                        terminalized += 1
+                    }
                     currentAuthorityState = coordinatorAuthority.current()
                 }
                 else {
@@ -4695,6 +4858,12 @@ function isRuntimeAndStorageIdleForPromiseLatch() {
         pendingTabActions.size <= 0
 }
 
+function isExecutorRuntimeIdleForPromiseLatch() {
+    return getSchedulerBlockingQueuedExecutorCount() <= 0 &&
+        activeQueuedTabs.size <= 0 &&
+        pendingTabActions.size <= 0
+}
+
 function clearStaleQueuedTabFillPromise(reason = 'queued-tab-fill') {
     if(!queuedTabFillPromise) return false
 
@@ -4768,20 +4937,26 @@ function clearStaleCoordinatorReconcilePromise(reason = 'coordinator-reconcile')
 
 function clearStorageTimeoutPromiseLatches(reason = 'storage-timeout', timeoutMs = SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS) {
     const normalizedReason = `${reason || 'storage-timeout'}`.trim() || 'storage-timeout'
+    const executorIdle = isExecutorRuntimeIdleForPromiseLatch()
     const recoveryStaleMs = Math.max(
-        QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS,
+        executorIdle
+            ? QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS
+            : QUEUED_TAB_FILL_PROMISE_STALE_MS,
         Number.parseInt(timeoutMs, 10) || SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS
     )
+    const effectiveRecoveryStaleMs = executorIdle
+        ? Math.min(recoveryStaleMs, QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS)
+        : recoveryStaleMs
     let cleared = false
 
-    if(queuedTabFillPromise && getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) >= recoveryStaleMs) {
+    if(queuedTabFillPromise && getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) >= effectiveRecoveryStaleMs) {
         queuedTabFillPromise = null
         queuedTabFillPromiseStartedAt = 0
         cleared = true
         incrementQueueWakeupMetric('storageUpdate.clearedTimedOutFillPromise')
     }
 
-    if(coordinatorReconcilePromise && getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) >= recoveryStaleMs) {
+    if(coordinatorReconcilePromise && getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) >= effectiveRecoveryStaleMs) {
         coordinatorReconcilePromise = null
         coordinatorReconcilePromiseStartedAt = 0
         cleared = true
@@ -4796,7 +4971,8 @@ function clearStorageTimeoutPromiseLatches(reason = 'storage-timeout', timeoutMs
             result: 'state-changed',
             resultReason: 'storage-timeout-recovery',
             details: {
-                recoveryStaleMs
+                recoveryStaleMs: effectiveRecoveryStaleMs,
+                executorIdle
             }
         })
     }
@@ -5203,14 +5379,17 @@ function getCoordinatorItemQueueKey(item = null, fallbackKey = '') {
     return normalizeQuoraProfileUrl(fallbackKey || '') || `${fallbackKey || ''}`.trim()
 }
 
-function getCoordinatorItemOpenUrl(item = null) {
+function getCoordinatorItemOpenUrl(item = null, fallbackKey = '') {
     const href = getCoordinatorItemHref(item || {})
     if(href) return href
     if(isProfileResolutionItem(item)) {
-        return normalizeCoordinatorRequestedUrl(item?.requestedUrl || stripProfileResolutionQueueKey(item?.dedupeKey || ''))
+        return normalizeCoordinatorRequestedUrl(
+            item?.requestedUrl ||
+            stripProfileResolutionQueueKey(item?.dedupeKey || fallbackKey || '')
+        )
     }
 
-    return normalizeTabTargetUrl(item?.requestedUrl || item?.dedupeKey || '')
+    return normalizeTabTargetUrl(item?.requestedUrl || item?.dedupeKey || fallbackKey || '')
 }
 
 function makeCoordinatorScope(runInput = {}, source = {}, runId = '') {
@@ -5987,8 +6166,26 @@ function summarizeCoordinatorQueueViewItem(key = '', item = {}) {
     }
 }
 
-function buildCoordinatorQueueView(queue = {}, now = Date.now()) {
-    const entries = Object.entries(queue || {})
+function filterCoordinatorQueueForCompactView(queue = {}, runs = {}) {
+    const knownRunIds = new Set(
+        Object.keys(runs && typeof runs === 'object' ? runs : {})
+            .map(runId => `${runId || ''}`.trim())
+            .filter(Boolean)
+    )
+    if(!knownRunIds.size) return queue
+
+    const filteredQueue = {}
+    for(const [key, item] of Object.entries(queue || {})) {
+        const runId = `${item?.runId || ''}`.trim()
+        if(runId && !knownRunIds.has(runId) && isTerminalCoordinatorStatus(item?.status)) continue
+        filteredQueue[key] = item
+    }
+    return filteredQueue
+}
+
+function buildCoordinatorQueueView(queue = {}, now = Date.now(), options = {}) {
+    const compactQueue = filterCoordinatorQueueForCompactView(queue, options.runs || {})
+    const entries = Object.entries(compactQueue || {})
     const epochStartedAt = getCoordinatorQueueViewEpochStartedAt()
     const counts = {}
     const authoritativeCounts = {}
@@ -6019,8 +6216,8 @@ function buildCoordinatorQueueView(queue = {}, now = Date.now()) {
         counts,
         authoritativeCounts,
         hasAuthoritativeStoredWork,
-        actualBlockTiming: summarizeCoordinatorActualBlockTiming(queue, epochStartedAt),
-        itemLimit: 0,
+        actualBlockTiming: summarizeCoordinatorActualBlockTiming(compactQueue, epochStartedAt),
+        itemLimit: items.length,
         truncated: false,
         items
     }
@@ -6145,18 +6342,21 @@ async function getCoordinatorQueueAccounting(request = {}) {
     const stored = await metricStorageGet({
         [COORDINATOR_QUEUE_KEY]: {},
         ...getCoordinatorQueueWalStorageDefaults(),
+        [COORDINATOR_RUNS_KEY]: {},
         [COORDINATOR_QUEUE_VIEW_KEY]: null
     }, {metricPath: 'queueAccounting.read'})
     const rawQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY] || {})
+    const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
     const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, rawQueue, {
         metricPath: 'queueAccounting.read.segments'
     })
     const recovery = recoverCoordinatorQueueFromWal(rawQueue, walStore)
     const recoveredQueue = normalizeCoordinatorMap(recovery.queue || rawQueue)
+    const compactRecoveredQueue = filterCoordinatorQueueForCompactView(recoveredQueue, runs)
     const raw = makeCoordinatorQueueAccountingCounts(rawQueue)
     const recovered = makeCoordinatorQueueAccountingCounts(recoveredQueue)
     const storedView = normalizeCoordinatorQueueViewAccounting(stored[COORDINATOR_QUEUE_VIEW_KEY])
-    const rebuiltView = normalizeCoordinatorQueueViewAccounting(buildCoordinatorQueueView(recoveredQueue))
+    const rebuiltView = normalizeCoordinatorQueueViewAccounting(buildCoordinatorQueueView(recoveredQueue, Date.now(), {runs}))
     const rawDivergences = makeCoordinatorQueueAccountingComparison(raw, recovered, 'raw-vs-recovered-')
     const viewMismatches = makeCoordinatorQueueAccountingComparison(storedView, rebuiltView, 'stored-view-vs-recovered-')
     const mismatches = []
@@ -6173,7 +6373,7 @@ async function getCoordinatorQueueAccounting(request = {}) {
         recovered,
         storedView,
         rebuiltView,
-        currentWork: makeCoordinatorCurrentWorkAccounting(recoveredQueue),
+        currentWork: makeCoordinatorCurrentWorkAccounting(compactRecoveredQueue),
         wal: summarizeCoordinatorQueueWalAccounting(walStore, recovery),
         rawDivergences,
         mismatches
@@ -6814,8 +7014,12 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
     const currentAuthorityState = await loadCoordinatorQueueProjection({
         metricPath: `queueView.${reason}`
     })
+    const stored = await metricStorageGet({
+        [COORDINATOR_RUNS_KEY]: {}
+    }, {metricPath: `queueView.${reason}.runs`})
     const queue = currentAuthorityState.queue
-    const view = buildCoordinatorQueueView(queue)
+    const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
+    const view = buildCoordinatorQueueView(queue, Date.now(), {runs})
     await metricStorageSet({
         [COORDINATOR_QUEUE_VIEW_KEY]: view
     }, {metricPath: `queueView.${reason}`})
@@ -7038,6 +7242,12 @@ function buildProjectedCoordinatorItemFromProgress(item = {}, record = {}, mappe
         attempt: resetRetry ? 0 : Number.parseInt(record.retryAttempt, 10) || item.attempt || 0,
         attemptId: resetRetry ? '' : getAttemptIdFromValue(record) || getAttemptIdFromValue(item),
         attemptNumber: resetRetry ? 0 : getAttemptNumberFromValue(record) || getAttemptNumberFromValue(item),
+        retryAttempt: resetRetry
+            ? Number.parseInt(record.retryAttempt, 10) || Number.parseInt(item.retryAttempt, 10) || 0
+            : Number.parseInt(record.retryAttempt, 10) || Number.parseInt(item.retryAttempt, 10) || 0,
+        maxRetries: resetRetry
+            ? Number.parseInt(record.maxRetries, 10) || Number.parseInt(item.maxRetries, 10) || 0
+            : Number.parseInt(record.maxRetries, 10) || Number.parseInt(item.maxRetries, 10) || 0,
         maxAttempts: (Number.parseInt(record.maxRetries, 10) || 0) + 1 || item.maxAttempts || 1,
         milestones: resetRetry ? {
             ...makeEmptyCoordinatorMilestones(),
@@ -7080,8 +7290,8 @@ function mergeReducedCoordinatorProgressItem(item = {}, reducedItem = {}, projec
         actionLeaseReleaseReason: mappedTerminal || resetRetry
             ? reducedItem.actionLeaseReleaseReason || projectedItem.actionLeaseReleaseReason || ''
             : projectedItem.actionLeaseReleaseReason || '',
-        attemptId: resetRetry ? projectedItem.attemptId || '' : reducedItem.attemptId || projectedItem.attemptId || '',
-        attemptNumber: resetRetry ? projectedItem.attemptNumber || 0 : reducedItem.attemptNumber || projectedItem.attemptNumber || 0,
+        attemptId: resetRetry ? reducedItem.attemptId || projectedItem.attemptId || '' : reducedItem.attemptId || projectedItem.attemptId || '',
+        attemptNumber: resetRetry ? reducedItem.attemptNumber || projectedItem.attemptNumber || 0 : reducedItem.attemptNumber || projectedItem.attemptNumber || 0,
         milestones: {
             ...makeEmptyCoordinatorMilestones(),
             ...(item.milestones || {}),
@@ -7112,6 +7322,10 @@ function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = 
         tabId: getPersistedQueuedTabId(item, record) || null,
         attemptId: getAttemptIdFromValue(record) || getAttemptIdFromValue(item),
         attemptNumber: getAttemptNumberFromValue(record) || getAttemptNumberFromValue(item),
+        retryCount: resetRetry
+            ? Number.parseInt(record.retryAttempt, 10) || item.retryCount || 0
+            : item.retryCount || 0,
+        lastRetryAt: resetRetry ? now : item.lastRetryAt || 0,
         reason: mappedTerminal ? 'terminal-progress' : '',
         milestones: getCoordinatorMilestonesFromProgress(record)
     }
@@ -9606,8 +9820,9 @@ function createCoordinatorAuthority() {
             }),
             {
                 reason: `coordinator-authority.${operationKind}`,
-                timeoutMs: operation.timeoutMs,
-                failureValue: fallbackResult
+                timeoutMs: operation.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
+                failureValue: fallbackResult,
+                suppressDurableIdleResume: operation.suppressDurableIdleResume === true
             }
         )
     }
@@ -10348,7 +10563,7 @@ async function reconcileCoordinatorStorage(options = {}) {
         () => reconcileCoordinatorStorageLocked(options),
         {
         reason: options.reason || 'reconcile-coordinator-storage',
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
         }
     )
 }
@@ -10359,7 +10574,7 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
     return promiseWithTimeout(
         reconcileCoordinatorStorage({
             reason: options.reason || 'reconcile-coordinator-storage',
-            timeoutMs: options.storageUpdateTimeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+            timeoutMs: options.storageUpdateTimeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
         }),
         timeoutMs,
         'coordinator storage reconcile'
@@ -11401,7 +11616,7 @@ function settleConfirmedSpaceFeedProfiles(currentPending = {}, currentNuked = {}
 async function settleTerminalCoordinatorItems(options = {}) {
     return enqueueSpaceFeedStorageUpdate(() => settleTerminalCoordinatorItemsLocked(options), {
         reason: options.storageReason || 'settle-terminal-coordinator-items',
-        timeoutMs: options.timeoutMs || COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -12080,6 +12295,312 @@ function resetCoordinatorExecutorStartPromiseAfterTimeout(reason = 'executor-sta
     return true
 }
 
+function queuedRuntimeActionMatchesTabRuntime(action = {}, tabId = null) {
+    const normalizedTabId = normalizeTabId(tabId)
+    if(!normalizedTabId) return false
+
+    const metadata = getQueuedTabMetadata(normalizedTabId) || {}
+    const pendingAction = pendingTabActions.get(normalizedTabId) || {}
+    const actionHref = normalizeQuoraProfileUrl(
+        action?.profileHref ||
+        action?.targetProfileHref ||
+        action?.targetUrl ||
+        action?.url ||
+        action?.requestedUrl ||
+        ''
+    )
+    const runtimeHref = normalizeQuoraProfileUrl(
+        metadata.profileHref ||
+        pendingAction.profileHref ||
+        pendingAction.targetProfileHref ||
+        pendingAction.targetUrl ||
+        pendingAction.url ||
+        pendingAction.requestedUrl ||
+        ''
+    )
+    const actionCoordinatorKey = `${action?.coordinatorKey || actionHref || ''}`.trim()
+    const runtimeCoordinatorKey = `${metadata.coordinatorKey || pendingAction.coordinatorKey || runtimeHref || ''}`.trim()
+    if(actionHref && runtimeHref && actionHref !== runtimeHref) return false
+    if(actionCoordinatorKey && runtimeCoordinatorKey && actionCoordinatorKey !== runtimeCoordinatorKey) return false
+    if(!actionHref && !actionCoordinatorKey) return false
+    if(!runtimeHref && !runtimeCoordinatorKey) return false
+
+    const actionAttemptId = getAttemptIdFromValue(action)
+    const runtimeAttemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(pendingAction)
+    if(actionAttemptId && runtimeAttemptId && actionAttemptId !== runtimeAttemptId) return false
+
+    const actionAttemptNumber = getAttemptNumberFromValue(action)
+    const runtimeAttemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(pendingAction)
+    if(actionAttemptNumber && runtimeAttemptNumber && actionAttemptNumber !== runtimeAttemptNumber) return false
+
+    const actionKind = getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || action?.action || '')
+    const runtimeActionKind = getCoordinatorActionKindForRequestedAction(
+        metadata.actionKind ||
+        metadata.tabAction ||
+        pendingAction.actionKind ||
+        pendingAction.tabAction ||
+        pendingAction.action ||
+        ''
+    )
+    if(actionKind && runtimeActionKind && actionKind !== runtimeActionKind) return false
+
+    return true
+}
+
+function queuedRuntimeActionHasActiveOrPendingSurface(action = {}) {
+    const runtimeTabIds = new Set([
+        ...Array.from(activeQueuedTabs.values()),
+        ...Array.from(pendingTabActions.keys())
+    ])
+    for(const tabId of runtimeTabIds) {
+        if(queuedRuntimeActionMatchesTabRuntime(action, tabId)) return true
+    }
+    return false
+}
+
+function getQueuedRuntimeActionAuthorityEntry(action = {}, currentAuthorityState = null) {
+    const queue = currentAuthorityState?.queue || coordinatorAuthority.current()?.queue || {}
+    const normalizedHref = normalizeQuoraProfileUrl(
+        action?.profileHref ||
+        action?.targetProfileHref ||
+        action?.targetUrl ||
+        action?.url ||
+        action?.requestedUrl ||
+        ''
+    )
+    const coordinatorKey = action?.coordinatorKey || (normalizedHref
+        ? normalizedHref
+        : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
+    const directItem = normalizedHref
+        ? queue[normalizedHref] || queue[coordinatorKey] || null
+        : queue[coordinatorKey] || null
+    if(directItem) {
+        return {
+            item: directItem,
+            key: normalizedHref && queue[normalizedHref] ? normalizedHref : coordinatorKey,
+            href: normalizedHref
+        }
+    }
+
+    for(const [key, item] of Object.entries(queue || {})) {
+        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
+        const itemKey = getCoordinatorItemQueueKey(item, key)
+        if((normalizedHref && itemHref === normalizedHref) ||
+            (coordinatorKey && itemKey === coordinatorKey)) {
+            return {item, key, href: itemHref || normalizedHref}
+        }
+    }
+
+    return {
+        item: null,
+        key: normalizedHref || coordinatorKey || '',
+        href: normalizedHref
+    }
+}
+
+async function getRecoverableLiveTabForQueuedRuntimeAction(action = {}, entry = {}, options = {}) {
+    const item = entry.item || null
+    const itemKey = entry.key || entry.href || ''
+    if(!item || `${item.status || ''}`.trim() !== 'queued') {
+        return {tab: null, deferred: false, reason: 'queued-runtime-action-not-durable-queued'}
+    }
+
+    const liveProfileTabsByHref = options.liveProfileTabsByHref || await getLiveProfileTabsByHref().catch(() => new Map())
+    const progress = options.currentAuthorityState?.progress || coordinatorAuthority.current()?.progress || {}
+    const record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
+    const safeTab = getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, record) ||
+        getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item, record, itemKey, liveProfileTabsByHref) ||
+        await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item, itemKey, liveProfileTabsByHref, record)
+    if(safeTab) {
+        return {
+            tab: safeTab,
+            deferred: false,
+            reason: 'queued-runtime-action-live-tab-adoptable',
+            liveProfileTabsByHref,
+            record
+        }
+    }
+
+    const href = entry.href || getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+    const liveTabs = getLiveTabsForProfileHref(liveProfileTabsByHref, href)
+        .filter(tab => normalizeTabId(tab?.id))
+    if(liveTabs.length) {
+        return {
+            tab: null,
+            deferred: true,
+            reason: 'queued-runtime-action-live-tab-needs-reconcile',
+            liveProfileTabs: liveTabs.length,
+            liveProfileTabsByHref,
+            record
+        }
+    }
+
+    return {
+        tab: null,
+        deferred: false,
+        reason: 'queued-runtime-action-no-live-tab',
+        liveProfileTabsByHref,
+        record
+    }
+}
+
+async function recoverQueuedRuntimeActionsAfterExecutorEnqueueTimeout(ownerTabId = null, options = {}) {
+    if(!queuedTabActions.length) {
+        let fillPromiseCleared = false
+        if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
+            queuedTabFillPromise = null
+            queuedTabFillPromiseStartedAt = 0
+            fillPromiseCleared = true
+            incrementQueueWakeupMetric('pump.changed.clearedExecutorTimeoutIdleFillPromise')
+            recordCoordinatorDiagnosticEvent(
+                'coordinator-executor-timeout-idle-fill-promise-cleared',
+                'Cleared idle queued-tab fill promise after executor enqueue timeout with no runtime actions'
+            )
+            scheduleQueuedWorkContinuation(options.reason || 'coordinator-executor-enqueue-timeout')
+        }
+        return {
+            changed: fillPromiseCleared,
+            adopted: 0,
+            preserved: 0,
+            deferred: 0,
+            fillPromiseCleared,
+            keys: [],
+            reason: fillPromiseCleared
+                ? 'coordinator-executor-enqueue-timeout-idle-fill-promise-cleared'
+                : 'no-timeout-runtime-actions-to-recover'
+        }
+    }
+
+    let currentAuthorityState = options.currentAuthorityState || coordinatorAuthority.current() || null
+    let liveProfileTabsByHref = options.liveProfileTabsByHref || null
+    const keys = []
+    let adopted = 0
+    let preserved = 0
+    let deferred = 0
+    for(let index = queuedTabActions.length - 1; index >= 0; index -= 1) {
+        const action = queuedTabActions[index]
+        const actionOwnerTabId = action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID
+        if(ownerTabId && actionOwnerTabId !== ownerTabId) continue
+
+        const entry = getQueuedRuntimeActionAuthorityEntry(action, currentAuthorityState)
+        const item = entry.item || null
+        if(`${item?.status || ''}`.trim() !== 'queued') continue
+        if(queuedRuntimeActionHasActiveOrPendingSurface(action)) {
+            preserved += 1
+            keys.push(entry.href || entry.key)
+            continue
+        }
+
+        if(!liveProfileTabsByHref) {
+            liveProfileTabsByHref = await getLiveProfileTabsByHref().catch(() => new Map())
+        }
+        const recovery = await getRecoverableLiveTabForQueuedRuntimeAction(action, entry, {
+            currentAuthorityState,
+            liveProfileTabsByHref
+        })
+        if(recovery.liveProfileTabsByHref) liveProfileTabsByHref = recovery.liveProfileTabsByHref
+        if(recovery.tab) {
+            const adoptedLiveTab = await adoptLiveCoordinatorQueuedTab(
+                item,
+                entry.key || entry.href,
+                recovery.tab,
+                actionOwnerTabId,
+                {currentAuthorityState}
+            ).catch(() => false)
+            if(adoptedLiveTab) {
+                queuedTabActions.splice(index, 1)
+                adopted += 1
+                keys.push(entry.href || entry.key)
+                currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                continue
+            }
+        }
+
+        preserved += 1
+        if(recovery.deferred === true) deferred += 1
+        keys.push(entry.href || entry.key)
+    }
+
+    let fillPromiseCleared = false
+    if(adopted + preserved > 0) {
+        if(queuedTabFillPromise) {
+            queuedTabFillPromise = null
+            queuedTabFillPromiseStartedAt = 0
+            fillPromiseCleared = true
+            incrementQueueWakeupMetric('pump.changed.clearedExecutorTimeoutFillPromise')
+        }
+        if(adopted > 0) incrementQueueWakeupMetric('pump.changed.adoptedExecutorTimeoutQueuedRuntimeAction', adopted)
+        if(preserved > 0) incrementQueueWakeupMetric('pump.changed.preservedExecutorTimeoutQueuedRuntimeAction', preserved)
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-executor-timeout-queued-runtime-recovered',
+            `${adopted} queued runtime action(s) adopted and ${preserved} preserved after executor enqueue timeout`
+        )
+        scheduleQueuedWorkContinuation(options.reason || 'coordinator-executor-enqueue-timeout')
+    }
+
+    return {
+        changed: adopted + preserved > 0,
+        adopted,
+        preserved,
+        deferred,
+        fillPromiseCleared,
+        keys,
+        reason: adopted > 0
+            ? 'coordinator-executor-enqueue-timeout-runtime-adopted'
+            : preserved > 0
+            ? 'coordinator-executor-enqueue-timeout-runtime-preserved'
+            : 'no-matching-timeout-runtime-actions'
+    }
+}
+
+async function recoverQueuedRuntimeActionBeforeOpen(action = {}, options = {}) {
+    const currentAuthorityState = options.currentAuthorityState || coordinatorAuthority.current() || null
+    const entry = getQueuedRuntimeActionAuthorityEntry(action, currentAuthorityState)
+    const item = entry.item || null
+    if(`${item?.status || ''}`.trim() !== 'queued') {
+        return {changed: false, adopted: false, deferred: false, reason: 'queued-runtime-action-not-durable-queued'}
+    }
+    if(queuedRuntimeActionHasActiveOrPendingSurface(action)) {
+        return {changed: false, adopted: false, deferred: true, reason: 'queued-runtime-action-already-has-runtime-surface'}
+    }
+
+    const recovery = await getRecoverableLiveTabForQueuedRuntimeAction(action, entry, {
+        currentAuthorityState,
+        liveProfileTabsByHref: options.liveProfileTabsByHref || null
+    })
+    if(recovery.tab) {
+        const ownerTabId = action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID
+        const adopted = await adoptLiveCoordinatorQueuedTab(
+            item,
+            entry.key || entry.href,
+            recovery.tab,
+            ownerTabId,
+            {currentAuthorityState}
+        ).catch(() => false)
+        if(adopted) {
+            return {
+                changed: true,
+                adopted: true,
+                deferred: false,
+                reason: 'queued-runtime-action-live-tab-adopted-before-open',
+                tabId: normalizeTabId(recovery.tab?.id)
+            }
+        }
+    }
+
+    if(recovery.deferred === true) {
+        return {
+            changed: false,
+            adopted: false,
+            deferred: true,
+            reason: recovery.reason || 'queued-runtime-action-live-tab-needs-reconcile',
+            liveProfileTabs: recovery.liveProfileTabs || 0
+        }
+    }
+
+    return {changed: false, adopted: false, deferred: false, reason: recovery.reason || 'queued-runtime-action-no-live-tab'}
+}
+
 function getQueuedActionNoForegroundFallback(item = null, options = {}) {
     if(item?.executorNoForegroundFallback === false || item?.noForegroundFallback === false) return false
     if(item?.executorNoForegroundFallback === true || item?.noForegroundFallback === true) return true
@@ -12101,10 +12622,17 @@ function isQueuedTabRetryBudgetReleaseReason(reason = '') {
     const normalized = `${reason || ''}`.trim()
     return normalized === 'active-transition-failed' ||
         normalized === 'queued-tab-release-fast-executor-preflight' ||
+        normalized === 'executor-plan-active-transition-retry-budget-exhausted' ||
         /(?:^|-)active-missing-tab(?:-|$)/.test(normalized) ||
         /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(normalized) ||
         /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(normalized) ||
-        /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized)
+        /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized) ||
+        /(?:^|-)content-script-(?:ensure-failed|unscriptable|version-mismatch)(?:-|$)/.test(normalized) ||
+        /(?:^|-)claim-nudge-not-accepted(?:-|$)/.test(normalized) ||
+        /(?:^|-)fresh-content-script-recovery(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-tab-final-open-decision-timeout(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-stale-runtime-(?:missing-metadata|missing-queued-action|action-already-pruned|action-drained-before-authority|action-pruned-after-fill-timeout)(?:-|$)/.test(normalized)
 }
 
 function getExhaustedRolledBackQueuedTabTerminalError(item = null) {
@@ -12137,6 +12665,65 @@ function getRolledBackQueuedTabRetryAttempt(item = {}) {
 function isExhaustedRolledBackQueuedTabRetry(item = null) {
     if(!shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) return false
     return getRolledBackQueuedTabRetryAttempt(item) >= getQueuedTabMaxRetries(item)
+}
+
+function isActiveTransitionRolledBackQueuedTabRetry(item = null) {
+    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
+    return reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)
+}
+
+function isTransientOpenRolledBackQueuedTabRetry(item = null) {
+    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
+    if(!reason) return false
+    if(isActiveTransitionRolledBackQueuedTabRetry(item)) return false
+    if(/(?:^|-)active-missing-tab(?:-|$)/.test(reason) ||
+        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(reason) ||
+        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(reason)) {
+        return false
+    }
+    return isQueuedTabRetryBudgetReleaseReason(reason)
+}
+
+function shouldRecoverExhaustedOpenRetryUnderQueuePressure(item = null, options = {}) {
+    if(options.recoverQueueLoadPressure !== true) return false
+    if(!item || !isTransientOpenRolledBackQueuedTabRetry(item)) return false
+    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
+    if(options.serviceWorkerOwned !== true &&
+        item?.serviceWorkerOwned !== true &&
+        item?.executorOwner !== 'service-worker') {
+        return false
+    }
+    if(normalizeTabId(item?.tabId || item?.activeTabId || null)) return false
+    if((Number.parseInt(item?.activeAt, 10) || 0) > 0) return false
+
+    const throttle = getQueueLoadThrottle()
+    const pressureReason = `${throttle?.reason || ''}`.trim()
+    if(throttle?.active === true &&
+        /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)) {
+        return true
+    }
+
+    const lastPressureAt = Number.parseInt(throttle?.lastPressureAt, 10) || 0
+    return lastPressureAt > 0 &&
+        Date.now() - lastPressureAt <= QUEUE_LOAD_THROTTLE_MAX_MS &&
+        /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)
+}
+
+function shouldRecoverExhaustedRolledBackQueuedTabRetry(item = null, options = {}) {
+    if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
+    if(options.queueOnlyAuthority === true) return true
+    if(options.recoverActiveTransitionFailures !== true) return false
+    const activeTransitionRetry = isActiveTransitionRolledBackQueuedTabRetry(item)
+    const transientOpenRetry = isTransientOpenRolledBackQueuedTabRetry(item)
+    const pressureOpenRetry = shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options)
+    if(!activeTransitionRetry &&
+        !(transientOpenRetry && (options.recoverTransientOpenRetry === true || pressureOpenRetry))) {
+        return false
+    }
+    return isCoordinatorQueueAuthoritativeItem(item) &&
+        (options.serviceWorkerOwned === true ||
+            item?.serviceWorkerOwned === true ||
+            item?.executorOwner === 'service-worker')
 }
 
 function wouldActiveMissingTabRequeueExhaustRetryBudget(item = null) {
@@ -12175,6 +12762,124 @@ function buildRolledBackQueuedTabRetryAction(item = {}, action = {}) {
         attemptNumber: getNextAttemptNumberFromValue(item),
         maxRetries
     }
+}
+
+function buildForcedRolledBackQueuedTabRetryItem(item = {}, now = Date.now(), reason = 'executor-plan-active-transition-retry-budget-recovered') {
+    const sourceAttemptId = getAttemptIdFromValue(item)
+    const sourceAttemptNumber = getAttemptNumberFromValue(item)
+    if(!sourceAttemptId || !sourceAttemptNumber) return null
+
+    const retryAttempt = getRolledBackQueuedTabRetryAttempt(item)
+    const attemptId = makeAttemptId()
+    const attemptNumber = getNextAttemptNumberFromValue(item)
+    const nextRetryAttempt = retryAttempt + 1
+    const maxRetries = Math.max(getQueuedTabMaxRetries(item), nextRetryAttempt + 1)
+    const configuredMaxAttempts = Math.max(
+        Number.parseInt(item?.attempt?.max, 10) || 0,
+        Number.parseInt(item?.maxAttempts, 10) || 0
+    )
+    const maxAttempts = Math.max(configuredMaxAttempts, attemptNumber + 1, maxRetries + 1)
+    const reduced = reduceJobEvent(item, {
+        type: JOB_EVENT_RETRY,
+        sourceAttemptId,
+        sourceAttemptNumber,
+        attemptId,
+        attemptNumber,
+        at: now,
+        retryCount: nextRetryAttempt,
+        lastRetryAt: now
+    })
+    if(!reduced.accepted) return null
+
+    const actionKind = getCoordinatorActionKindForRequestedAction(item.actionKind || item.tabAction || item.executorTabAction || '')
+    return applyCoordinatorJobEnvelope({
+        ...reduced.item,
+        attempt: {
+            id: attemptId,
+            number: attemptNumber,
+            max: maxAttempts
+        },
+        attemptId,
+        attemptNumber,
+        maxAttempts,
+        actionKind,
+        status: 'queued',
+        outcome: '',
+        error: '',
+        updatedAt: now,
+        queuedAt: now,
+        activeAt: 0,
+        terminalAt: 0,
+        tabId: null,
+        retryAttempt: nextRetryAttempt,
+        maxRetries,
+        actionLease: null,
+        actionLeaseReleasedAt: now,
+        actionLeaseReleaseReason: reason,
+        milestones: makeEmptyCoordinatorMilestones()
+    }, {
+        runInput: {id: item.runId || '', sourceType: item.source?.type || item.scope?.type || ''},
+        source: item.source || {},
+        runId: item.runId || '',
+        targetProfileHref: getCoordinatorItemHref(item),
+        requestedUrl: item.requestedUrl || getCoordinatorItemHref(item),
+        coordinatorKey: item.coordinatorKey || getCoordinatorItemHref(item),
+        actionKind
+    })
+}
+
+function buildQueuedDirectBlockActionRetryRecord(item = {}, record = {}, now = Date.now()) {
+    const retryAttempt = getQueuedTabRetryAttempt(item, record)
+    const nextRetryAttempt = retryAttempt + 1
+    const maxRetries = Math.max(getQueuedTabMaxRetries(item, record), nextRetryAttempt + 1)
+    return normalizeProgressPatch(getCoordinatorItemHref(item) || record.profileHref || '', {
+        ...record,
+        status: 'queued',
+        outcome: '',
+        error: '',
+        finalError: '',
+        terminalAt: 0,
+        completedAt: 0,
+        tabClosedAt: 0,
+        actionKind: record.actionKind || item.actionKind || 'mute-block',
+        runId: record.runId || item.runId || '',
+        queuedAt: now,
+        retryAttempt: nextRetryAttempt,
+        maxRetries,
+        attemptId: makeAttemptId(),
+        attemptNumber: getNextAttemptNumberFromValue(item),
+        directBlockFailureDetail: null,
+        directBlockRetryRecovery: true,
+        event: 'Queued direct block action did not complete; retrying queued action',
+        replaceProgressRecord: true
+    }, record)
+}
+
+function buildQueuedProfileActionGateRetryRecord(item = {}, record = {}, now = Date.now()) {
+    const retryAttempt = getQueuedTabRetryAttempt(item, record)
+    const nextRetryAttempt = retryAttempt + 1
+    const maxRetries = Math.max(getQueuedTabMaxRetries(item, record), nextRetryAttempt + 1)
+    return normalizeProgressPatch(getCoordinatorItemHref(item) || record.profileHref || '', {
+        ...record,
+        status: 'queued',
+        outcome: '',
+        error: '',
+        finalError: '',
+        terminalAt: 0,
+        completedAt: 0,
+        tabClosedAt: 0,
+        openedViablePage: false,
+        actionKind: record.actionKind || item.actionKind || 'mute-block',
+        runId: record.runId || item.runId || '',
+        queuedAt: now,
+        retryAttempt: nextRetryAttempt,
+        maxRetries,
+        attemptId: makeAttemptId(),
+        attemptNumber: getNextAttemptNumberFromValue(item),
+        profileActionGateRetryRecovery: true,
+        event: 'Queued profile action did not receive profile action gate; retrying queued action',
+        replaceProgressRecord: true
+    }, record)
 }
 
 async function planQueuedTabExecutorAction(action = {}, options = {}) {
@@ -12218,6 +12923,210 @@ async function planQueuedTabExecutorAction(action = {}, options = {}) {
         authorityValidated: !!(options.currentAuthorityState || options.authorityState),
         authorityState: options.currentAuthorityState || options.authorityState || null
     }, 'executor-apply-phase')
+}
+
+function buildCoordinatorExecutorActionForQueuedItem(item = {}, ownerTabId = null, ownerWindowId = null, options = {}) {
+    const tabAction = getCoordinatorItemExecutorTabAction(item, options.tabAction)
+    const fallbackKey = `${options.fallbackKey || ''}`.trim()
+    const url = getCoordinatorItemOpenUrl(item, fallbackKey)
+    const normalizedHref = getCoordinatorItemHref(item)
+    const coordinatorKey = getCoordinatorItemQueueKey(item, fallbackKey)
+    const actionSubjectKey = normalizedHref || coordinatorKey
+    if(!url || !actionSubjectKey) return null
+
+    const requestedActionKind = getCoordinatorActionKindForRequestedAction(item?.actionKind || tabAction)
+    const noForegroundFallback = getQueuedActionNoForegroundFallback(item, options)
+    return {
+        url,
+        profileHref: normalizedHref || '',
+        coordinatorKey,
+        requestedUrl: normalizeCoordinatorRequestedUrl(item?.requestedUrl || url),
+        resolutionMode: item?.resolutionMode || '',
+        resolveProfileFromPage: item?.resolveProfileFromPage === true,
+        resolutionReason: item?.resolutionReason || '',
+        candidateConfidence: item?.candidateConfidence || '',
+        candidateCollector: item?.candidateCollector || '',
+        tabAction,
+        actionKind: requestedActionKind,
+        jobKey: item.jobKey || '',
+        scope: item.scope || null,
+        canonicalSubject: item.canonicalSubject || null,
+        attempt: item.attempt || null,
+        runId: item.runId || '',
+        ownerTabId,
+        ownerWindowId,
+        noForegroundFallback,
+        retryAttempt: 0,
+        attemptId: getAttemptIdFromValue(item),
+        attemptNumber: getAttemptNumberFromValue(item),
+        maxRetries: STALE_QUEUED_TAB_MAX_RETRIES
+    }
+}
+
+async function reprimeRecoveredServiceWorkerQueuedAction(item = {}, itemKey = '', options = {}) {
+    if(!item || `${item.status || ''}`.trim() !== 'queued') return {reprimed: 0, reason: 'not-queued'}
+    if(item.serviceWorkerOwned !== true && item.executorOwner !== 'service-worker') {
+        return {reprimed: 0, reason: 'not-service-worker-owned'}
+    }
+
+    const currentAuthorityState = options.currentAuthorityState || coordinatorAuthority.current() || null
+    const tabAction = getCoordinatorItemExecutorTabAction(item, options.tabAction)
+    const actionSubjectKey = getCoordinatorItemHref(item) ||
+        getCoordinatorItemQueueKey(item, itemKey) ||
+        `${itemKey || ''}`.trim()
+    const actionKey = getQueuedTabActionKey(SERVICE_WORKER_QUEUE_OWNER_ID, actionSubjectKey, tabAction)
+    if(actionKey && collectQueuedTabActionKeys(SERVICE_WORKER_QUEUE_OWNER_ID).has(actionKey)) {
+        return {reprimed: 0, reason: 'action-already-queued'}
+    }
+
+    const executorAction = buildCoordinatorExecutorActionForQueuedItem(
+        item,
+        SERVICE_WORKER_QUEUE_OWNER_ID,
+        null,
+        {
+            ...options,
+            fallbackKey: actionSubjectKey,
+            tabAction
+        }
+    )
+    const plannedAction = executorAction
+        ? await planQueuedTabExecutorAction(executorAction, {currentAuthorityState})
+        : null
+    if(!plannedAction) return {reprimed: 0, reason: 'plan-declined'}
+
+    queuedTabActions.unshift(plannedAction)
+    return {
+        reprimed: 1,
+        reason: 'reprimed-recovered-service-worker-action'
+    }
+}
+
+async function reprimeFreshQueuedTabActionsForPrunedStaleAttempts(plannedActions = [], ownerTabId = null, ownerWindowId = null, options = {}) {
+    if(!plannedActions.length) return {reprimed: 0, reason: 'no-planned-actions'}
+
+    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState()
+        .catch(() => null)
+    const queue = currentAuthorityState?.queue || null
+    if(!queue) return {reprimed: 0, reason: 'authority-load-failed'}
+
+    refreshResidentCoordinatorAuthorityState(
+        currentAuthorityState,
+        'executor.reprimeStaleActionPruned.refreshedAuthority'
+    )
+
+    const existingKeys = collectQueuedTabActionKeys(ownerTabId)
+    const seen = new Set()
+    const freshActions = []
+    for(const staleAction of plannedActions) {
+        const href = normalizeQuoraProfileUrl(staleAction?.profileHref || staleAction?.url || '')
+        const coordinatorKey = staleAction?.coordinatorKey ||
+            (href ? href : makeProfileResolutionQueueKey(staleAction?.requestedUrl || staleAction?.url || ''))
+        const entry = coordinatorKey && queue[coordinatorKey]
+            ? {key: coordinatorKey, item: queue[coordinatorKey]}
+            : findCoordinatorQueueEntryForHref(queue, href)
+        const item = entry?.item || null
+        if(!item || `${item.status || ''}`.trim() !== 'queued') continue
+
+        const tabAction = getCoordinatorItemExecutorTabAction(item, staleAction?.tabAction || options.tabAction)
+        const actionSubjectKey = getCoordinatorItemHref(item) || getCoordinatorItemQueueKey(item, entry?.key || '') || href || coordinatorKey
+        const actionKey = getQueuedTabActionKey(ownerTabId, actionSubjectKey, tabAction)
+        if(actionKey && (existingKeys.has(actionKey) || seen.has(actionKey))) continue
+
+        const executorAction = buildCoordinatorExecutorActionForQueuedItem(item, ownerTabId, ownerWindowId, {
+            ...options,
+            fallbackKey: entry?.key || coordinatorKey,
+            tabAction
+        })
+        const plannedAction = executorAction
+            ? await planQueuedTabExecutorAction(executorAction, {currentAuthorityState})
+            : null
+        if(!plannedAction) continue
+
+        freshActions.push(plannedAction)
+        if(actionKey) {
+            seen.add(actionKey)
+            existingKeys.add(actionKey)
+        }
+    }
+
+    if(freshActions.length) {
+        queuedTabActions.unshift(...freshActions)
+    }
+    return {
+        reprimed: freshActions.length,
+        reason: freshActions.length ? 'reprimed-current-authority-actions' : 'no-current-authority-actions'
+    }
+}
+
+async function reprimeFreshQueuedTabActionsForCurrentPendingItems(pendingItems = [], ownerTabId = null, ownerWindowId = null, options = {}) {
+    if(!pendingItems.length) return {reprimed: 0, reason: 'no-pending-items'}
+
+    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState()
+        .catch(() => null)
+    const queue = currentAuthorityState?.queue || null
+    if(!queue) return {reprimed: 0, reason: 'authority-load-failed'}
+
+    refreshResidentCoordinatorAuthorityState(
+        currentAuthorityState,
+        'executor.reprimeCurrentPending.refreshedAuthority'
+    )
+
+    const existingKeys = collectQueuedTabActionKeys(ownerTabId)
+    const seen = new Set()
+    const freshActions = []
+    const keys = []
+    const limit = Math.max(1, Number.parseInt(options.limit, 10) || 1)
+    const liveProfileTabsByHref = options.liveProfileTabsByHref instanceof Map
+        ? options.liveProfileTabsByHref
+        : new Map()
+
+    for(const pendingItem of pendingItems || []) {
+        if(freshActions.length >= limit) break
+
+        const href = getCoordinatorItemHref(pendingItem)
+        const coordinatorKey = getCoordinatorItemQueueKey(pendingItem)
+        const actionSubjectKey = href || coordinatorKey
+        if(!actionSubjectKey) continue
+
+        const item = href && queue[href]
+            ? queue[href]
+            : queue[coordinatorKey] || queue[actionSubjectKey] || null
+        if(!item || `${item.status || ''}`.trim() !== 'queued') continue
+        if(!shouldResumeCoordinatorItem(item, liveProfileTabsByHref, {record: null})) continue
+
+        const tabAction = getCoordinatorItemExecutorTabAction(item, pendingItem?.tabAction || options.tabAction)
+        const currentHref = getCoordinatorItemHref(item)
+        const currentCoordinatorKey = getCoordinatorItemQueueKey(item, actionSubjectKey)
+        const currentSubjectKey = currentHref || currentCoordinatorKey || actionSubjectKey
+        const actionKey = getQueuedTabActionKey(ownerTabId, currentSubjectKey, tabAction)
+        if(actionKey && (existingKeys.has(actionKey) || seen.has(actionKey))) continue
+
+        const executorAction = buildCoordinatorExecutorActionForQueuedItem(item, ownerTabId, ownerWindowId, {
+            ...options,
+            fallbackKey: actionSubjectKey,
+            tabAction
+        })
+        const plannedAction = executorAction
+            ? await planQueuedTabExecutorAction(executorAction, {currentAuthorityState})
+            : null
+        if(!plannedAction) continue
+
+        freshActions.push(plannedAction)
+        keys.push(currentSubjectKey)
+        if(actionKey) {
+            seen.add(actionKey)
+            existingKeys.add(actionKey)
+        }
+    }
+
+    if(freshActions.length) {
+        queuedTabActions.unshift(...freshActions)
+    }
+    return {
+        reprimed: freshActions.length,
+        keys,
+        reason: freshActions.length ? 'reprimed-current-pending-authority-actions' : 'no-current-pending-authority-actions'
+    }
 }
 
 function countQueuedExecutorSlotsForOwner(ownerTabId = null) {
@@ -12360,6 +13269,202 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItem(itemKey = '',
         })
     terminalizeExhaustedRolledBackQueuedPromises.set(terminalizationKey, terminalizationPromise)
     return terminalizationPromise
+}
+
+async function recoverExhaustedRolledBackQueuedCoordinatorItem(itemKey = '', expectedItem = null, options = {}) {
+    if(!itemKey || !isExhaustedRolledBackQueuedTabRetry(expectedItem)) {
+        return {changed: false, reason: 'not-exhausted-rolled-back-row'}
+    }
+
+    const expectedAttemptId = getAttemptIdFromValue(expectedItem)
+    const expectedAttemptNumber = getAttemptNumberFromValue(expectedItem)
+    const now = Number.parseInt(options.now, 10) || Date.now()
+    const recoverReason = options.reason || 'executor-plan-active-transition-retry-budget-recovered'
+    const authorityOperation = {
+        operationKind: 'recover-exhausted-rolled-back-queued',
+        rowKey: itemKey,
+        expectedAttemptId,
+        expectedAttemptNumber,
+        reason: 'ordinaryMutation',
+        metricPath: 'reconcile.exhaustedRolledBackQueued.recover.save',
+        projectionPayload: 'queueViewOnly',
+        suppressDurableIdleResume: options.suppressRecoveredQueueResume === true,
+        currentAuthorityState: options.currentAuthorityState || null,
+        mutate(currentItem, context) {
+            if(!isExhaustedRolledBackQueuedTabRetry(currentItem)) {
+                return context.reject('not-exhausted-rolled-back-row')
+            }
+            const nextItem = buildForcedRolledBackQueuedTabRetryItem(currentItem, now, recoverReason)
+            if(!nextItem) return context.reject('recovery-reducer-rejected')
+            return nextItem
+        }
+    }
+    const authorityResult = activeQueueWakeupStorageContext
+        ? await coordinatorAuthority.applyWithinStorageUpdate(authorityOperation)
+        : await coordinatorAuthority.apply(authorityOperation)
+
+    if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
+        return {
+            changed: false,
+            reason: authorityResult?.reason || 'authority-apply-failed'
+        }
+    }
+
+    recordFlightRecorderEvent({
+        kind: 'retry-budget-recovery',
+        source: 'recoverExhaustedRolledBackQueuedCoordinatorItem',
+        rowKey: itemKey,
+        targetUrl: getCoordinatorItemHref(expectedItem) || expectedItem.requestedUrl || itemKey,
+        attemptId: expectedAttemptId,
+        attemptNumber: expectedAttemptNumber,
+        runId: expectedItem.runId || '',
+        statusBefore: expectedItem.status || '',
+        statusAfter: authorityResult.nextRow?.status || 'queued',
+        reason: recoverReason,
+        accepted: true,
+        durable: true
+    })
+    if(options.suppressRecoveredQueueResume !== true) {
+        scheduleCoordinatorQueueResume(1000, 'exhausted-rolled-back-queued-recovered', {
+            allowBeforeQuora: true
+        })
+    }
+    if(options.suppressRecoveredWorkContinuation !== true) {
+        scheduleQueuedWorkContinuation('exhausted-rolled-back-queued-recovered')
+    }
+    const currentReprimeAuthorityState = coordinatorAuthority.current()
+    const recoveredRow = authorityResult.nextRow || currentReprimeAuthorityState?.queue?.[itemKey] || null
+    const reprimeAuthorityState = currentReprimeAuthorityState?.queue && recoveredRow
+        ? {
+            ...currentReprimeAuthorityState,
+            queue: {
+                ...currentReprimeAuthorityState.queue,
+                [itemKey]: recoveredRow
+            }
+        }
+        : currentReprimeAuthorityState
+    const reprimeResult = options.suppressRecoveredActionReprime === true
+        ? {reprimed: 0, reason: 'reprime-suppressed-by-caller'}
+        : await reprimeRecoveredServiceWorkerQueuedAction(
+            recoveredRow,
+            itemKey,
+            {
+                currentAuthorityState: reprimeAuthorityState
+            }
+        ).catch(error => ({
+            reprimed: 0,
+            reason: 'reprime-recovered-service-worker-action-error',
+            error: error?.message || `${error || ''}`
+        }))
+    if(reprimeResult?.reprimed > 0) {
+        incrementQueueWakeupMetric('pump.changed.reprimedRecoveredExhaustedRolledBack', reprimeResult.reprimed)
+    }
+    return {
+        changed: true,
+        recovered: true,
+        status: authorityResult.nextRow?.status || 'queued',
+        item: authorityResult.nextRow || null,
+        itemKey,
+        reprimed: reprimeResult?.reprimed || 0,
+        reason: 'recovered-exhausted-rolled-back-row'
+    }
+}
+
+async function recoverExhaustedRolledBackQueuedCoordinatorItems(items = [], options = {}) {
+    const limit = Math.max(0, Number.parseInt(options.limit, 10) ||
+        COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT)
+    const recoveredKeys = []
+    const errors = []
+    for(const item of items || []) {
+        if(recoveredKeys.length >= limit) break
+        if(!isExhaustedRolledBackQueuedTabRetry(item)) continue
+        const itemKey = getCoordinatorItemHref(item) || getCoordinatorItemQueueKey(item)
+        if(!itemKey || recoveredKeys.includes(itemKey)) continue
+        const result = await recoverExhaustedRolledBackQueuedCoordinatorItem(itemKey, item, options)
+            .catch(error => ({
+                changed: false,
+                reason: 'recover-exhausted-rolled-back-error',
+                error: error?.message || `${error || ''}`
+            }))
+        if(result?.changed === true) {
+            recoveredKeys.push(itemKey)
+        }
+        else if(result?.error || result?.reason) {
+            errors.push({
+                itemKey,
+                reason: result?.reason || 'recover-exhausted-rolled-back-failed',
+                ...(result?.error ? {error: result.error} : {})
+            })
+        }
+    }
+    return {
+        changed: recoveredKeys.length > 0,
+        recovered: recoveredKeys.length,
+        keys: recoveredKeys,
+        errors,
+        reason: recoveredKeys.length
+            ? 'recovered-exhausted-rolled-back-rows'
+            : errors[0]?.reason || 'no-exhausted-rolled-back-rows'
+    }
+}
+
+async function settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(items = [], options = {}) {
+    const recoverable = []
+    const terminalizable = []
+    const seenRecoverable = new Set()
+    const seenTerminalizable = new Set()
+    for(const item of items || []) {
+        if(!isExhaustedRolledBackQueuedTabRetry(item)) continue
+        const itemKey = getCoordinatorItemHref(item) || getCoordinatorItemQueueKey(item)
+        if(!itemKey) continue
+        if(shouldRecoverExhaustedRolledBackQueuedTabRetry(item, options)) {
+            if(seenRecoverable.has(itemKey)) continue
+            seenRecoverable.add(itemKey)
+            recoverable.push(item)
+            continue
+        }
+        if(seenTerminalizable.has(itemKey)) continue
+        seenTerminalizable.add(itemKey)
+        terminalizable.push(item)
+    }
+
+    const limit = Math.max(0, Number.parseInt(options.limit, 10) ||
+        COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT)
+    const recoverLimit = Math.max(0, limit)
+    const terminalizeLimit = Math.max(0, limit - Math.min(recoverable.length, recoverLimit))
+    const recoveredResult = recoverable.length
+        ? await recoverExhaustedRolledBackQueuedCoordinatorItems(recoverable, {
+            ...options,
+            limit: recoverLimit,
+            reason: options.recoverReason || options.reason || 'executor-plan-active-transition-retry-budget-recovered'
+        })
+        : {changed: false, recovered: 0, keys: [], errors: [], reason: 'no-recoverable-exhausted-rolled-back-rows'}
+    const terminalizedResult = terminalizable.length && terminalizeLimit > 0
+        ? await terminalizeExhaustedRolledBackQueuedCoordinatorItems(terminalizable, {
+            ...options,
+            limit: terminalizeLimit,
+            reason: options.terminalizeReason || 'executor-plan-active-transition-retry-budget-exhausted'
+        })
+        : {changed: false, terminalized: 0, keys: [], errors: [], reason: 'no-terminalizable-exhausted-rolled-back-rows'}
+
+    return {
+        changed: recoveredResult.changed === true || terminalizedResult.changed === true,
+        recovered: Number.parseInt(recoveredResult.recovered, 10) || 0,
+        terminalized: Number.parseInt(terminalizedResult.terminalized, 10) || 0,
+        recoveredKeys: recoveredResult.keys || [],
+        terminalizedKeys: terminalizedResult.keys || [],
+        keys: [
+            ...(recoveredResult.keys || []),
+            ...(terminalizedResult.keys || [])
+        ],
+        errors: [
+            ...(recoveredResult.errors || []),
+            ...(terminalizedResult.errors || [])
+        ],
+        reason: recoveredResult.changed === true
+            ? recoveredResult.reason || 'recovered-exhausted-rolled-back-rows'
+            : terminalizedResult.reason || recoveredResult.reason || 'no-exhausted-rolled-back-rows'
+    }
 }
 
 async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], options = {}) {
@@ -12530,7 +13635,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
         }
     }, {
         reason: 'coordinator-authority.terminalize-exhausted-rolled-back-queued-batch',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
         .finally(() => {
             const completedPromise = terminalizeExhaustedRolledBackQueuedBatchPromise
@@ -12576,6 +13681,71 @@ function buildEnqueueFailureTerminalizationDiagnostics(enqueueResult = {}, optio
     }
 }
 
+function getCoordinatorFailureClassification(reason = '', error = '') {
+    const normalizedReason = `${reason || ''}`.trim()
+    const normalizedError = `${error || ''}`.trim()
+    const joined = `${normalizedReason} ${normalizedError}`.trim()
+    if(normalizedReason === 'queued-authority-enqueue-no-open-attempt') return 'no-open-attempt'
+    if(normalizedReason === 'queued-authority-enqueue-runtime-materializing' ||
+        normalizedReason === 'queued-authority-enqueue-runtime-surface-materialized') {
+        return 'runtime-materializing'
+    }
+    if(normalizedReason === 'queued-tab-stale-action-pruned') return 'stale-queued-action'
+    if(normalizedReason === 'queued-tab-final-open-decision-timeout' ||
+        /final open decision timed out/i.test(joined) ||
+        /final open authority unavailable/i.test(joined)) {
+        return 'final-open-authority-timeout'
+    }
+    if(normalizedReason === 'queued-tab-open-failed') return 'tab-open-failure'
+    if(normalizedReason === 'queued-tab-fill-timeout') return 'queued-tab-fill-timeout'
+    if(normalizedReason === 'queued-authority-enqueue-did-not-materialize-runtime') return 'no-runtime-surface'
+    if(/active-missing-tab/i.test(normalizedReason) ||
+        /no confirmed runtime actor/i.test(joined)) {
+        return 'actorless-active-without-runtime'
+    }
+    if(/without active, terminal, or runtime surface/i.test(joined)) return 'no-runtime-surface'
+    if(/failed to open after exhausting retry budget/i.test(joined)) return 'tab-open-failure'
+    return ''
+}
+
+function buildCoordinatorFailureClassification(reason = '', error = '', diagnostics = {}) {
+    const classification = getCoordinatorFailureClassification(reason, error)
+    if(!classification) return null
+    const result = {
+        classification,
+        reason: `${reason || ''}`.trim()
+    }
+    const errorText = `${error || ''}`.trim()
+    if(errorText) result.error = errorText.slice(0, 240)
+    for(const field of [
+        'terminalizationPolicy',
+        'enqueueResultReason',
+        'fillResultReason',
+        'fillError'
+    ]) {
+        const value = `${diagnostics?.[field] || ''}`.trim()
+        if(value) result[field] = value.slice(0, 240)
+    }
+    for(const field of [
+        'enqueueQueued',
+        'fillOpenedTabs',
+        'fillActive',
+        'fillSchedulerBlockingActive',
+        'fillRemainingActions',
+        'queuedTabActionsCount',
+        'activeQueuedTabsCount',
+        'pendingTabActionsCount',
+        'durablyActiveQueuedTabsCount'
+    ]) {
+        const value = Number.parseInt(diagnostics?.[field], 10)
+        if(Number.isFinite(value)) result[field] = value
+    }
+    for(const field of ['fillTimedOut', 'runtimeSurfaceBefore']) {
+        if(typeof diagnostics?.[field] === 'boolean') result[field] = diagnostics[field]
+    }
+    return result
+}
+
 function isExecutorMaterializationDeferredByCapacity(enqueueResult = {}) {
     const fillResult = enqueueResult?.fillResult || {}
     const activeCount = (Number.parseInt(fillResult.active, 10) || 0) ||
@@ -12583,7 +13753,6 @@ function isExecutorMaterializationDeferredByCapacity(enqueueResult = {}) {
         pendingTabActions.size ||
         getDurablyActiveQueuedTabCount()
     const remainingActions = Number.parseInt(fillResult.remainingActions, 10) || 0
-    if(fillResult?.reason === 'opened-tab') return true
     if(remainingActions > 0) return true
     if(fillResult?.reason === 'no-tab-opened' && activeCount > 0) return true
     if(fillResult?.reason !== 'queue-load-throttled') return false
@@ -12598,7 +13767,8 @@ function isExecutorEnqueueTimeoutStillMaterializing(enqueueResult = {}) {
     const fillResult = enqueueResult?.fillResult || {}
     const fillReason = fillResult?.reason || ''
     if(fillReason !== 'queued-tab-fill-timeout' &&
-        fillReason !== 'final-open-decision-timeout') {
+        fillReason !== 'final-open-decision-timeout' &&
+        fillReason !== 'queued-tab-final-open-decision-timeout') {
         return false
     }
     return (Number.parseInt(fillResult.remainingActions, 10) || 0) > 0 ||
@@ -12621,15 +13791,41 @@ function coordinatorItemHasExecutorOpenAttempt(item = null) {
         (Number.parseInt(milestones.navigationStartedAt, 10) || 0) > 0
 }
 
+function normalizeQueuedAuthorityEnqueueMaterializationReason(item = null, runtimeSurface = {}, reason = '') {
+    if(reason !== 'queued-authority-enqueue-did-not-materialize-runtime') return reason
+    if(runtimeSurface?.hasSurface === true) return reason
+    return coordinatorItemHasExecutorOpenAttempt(item)
+        ? reason
+        : 'queued-authority-enqueue-no-open-attempt'
+}
+
 function getQueuedAuthorityEnqueueMaterializationReason(enqueueResult = {}) {
     const fillReason = enqueueResult?.fillResult?.reason || ''
     if(fillReason === 'queued-tab-open-failed') return 'queued-tab-open-failed'
+    if(fillReason === 'opened-tab') {
+        const activeCount = (Number.parseInt(enqueueResult?.fillResult?.active, 10) || 0) ||
+            (Number.parseInt(enqueueResult?.fillResult?.schedulerBlockingActive, 10) || 0)
+        return activeCount > 0
+            ? 'queued-authority-enqueue-runtime-surface-materialized'
+            : 'queued-authority-enqueue-did-not-materialize-runtime'
+    }
     if(fillReason === 'queued-tab-stale-action-pruned') return 'queued-tab-stale-action-pruned'
+    if(fillReason === 'queued-live-tab-adopted-after-final-open-decline' ||
+        fillReason === 'queued-live-tab-adopted-after-materialization-timeout') {
+        return 'queued-authority-enqueue-runtime-surface-materialized'
+    }
+    if(fillReason === 'no-tab-opened' &&
+        !(Number.parseInt(enqueueResult?.fillResult?.restoredActions, 10) > 0) &&
+        isExecutorMaterializationDeferredByCapacity(enqueueResult)) {
+        return 'queued-authority-enqueue-deferred-by-capacity'
+    }
+    if(fillReason === 'no-tab-opened') return 'queued-authority-enqueue-no-open-attempt'
+    if(fillReason === 'final-open-decision-timeout' ||
+        fillReason === 'queued-tab-final-open-decision-timeout') return 'queued-tab-final-open-decision-timeout'
     if(isExecutorEnqueueTimeoutStillMaterializing(enqueueResult)) {
         return 'queued-authority-enqueue-runtime-materializing'
     }
     if(fillReason === 'queued-tab-fill-timeout') return 'queued-tab-fill-timeout'
-    if(fillReason === 'final-open-decision-timeout') return 'queued-tab-final-open-decision-timeout'
     if(isExecutorMaterializationDeferredByCapacity(enqueueResult)) {
         return 'queued-authority-enqueue-deferred-by-capacity'
     }
@@ -12650,6 +13846,255 @@ function hasBlockingRuntimeSurfaceAfterEnqueueFailure(runtimeSurface = {}, enque
     }
 
     return (runtimeSurface.queuedActions || []).length > 0
+}
+
+function shouldRecoverLiveSurfaceAfterFinalOpenDecline(decision = {}) {
+    const reason = `${decision?.reason || ''}`.trim()
+    return decision?.authorityUnavailable === true ||
+        reason === 'queued-tab-final-open-decision-timeout' ||
+        reason === 'queued-tab-final-open-authority-unavailable' ||
+        reason === 'stale-attempt' ||
+        reason === 'stale-attempt-number'
+}
+
+async function recoverQueuedAuthorityLiveTabAfterMaterializationFailure(item = null, itemKey = '', record = null, options = {}) {
+    if(!item || `${item.status || ''}`.trim() !== 'queued') {
+        return {changed: false, unresolved: false, reason: 'queued-live-tab-recovery-not-queued'}
+    }
+    if(!isCoordinatorQueueAuthoritativeItem(item)) {
+        return {changed: false, unresolved: false, reason: 'queued-live-tab-recovery-not-authoritative'}
+    }
+
+    const liveProfileTabsByHref = await getLiveProfileTabsByHref().catch(() => new Map())
+    const safeTab = getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, record) ||
+        getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item, record, itemKey, liveProfileTabsByHref) ||
+        await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item, itemKey, liveProfileTabsByHref, record)
+    if(safeTab) {
+        const tabId = normalizeTabId(safeTab?.id)
+        const adopted = await adoptLiveCoordinatorQueuedTab(
+            item,
+            itemKey,
+            safeTab,
+            options.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+            {currentAuthorityState: options.currentAuthorityState || null}
+        ).catch(() => false)
+        if(adopted) {
+            const currentAuthorityState = coordinatorAuthority.current() || options.currentAuthorityState || null
+            await pruneQueuedTabActions(options.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, {
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                currentAuthorityState,
+                ignoreActiveFillPromise: true,
+                reason: 'queued-live-tab-adopted-after-materialization-timeout'
+            }).catch(() => null)
+            return {
+                changed: true,
+                adopted: true,
+                unresolved: false,
+                reason: 'queued-live-tab-adopted-after-materialization-timeout',
+                tabId,
+                currentAuthorityState,
+                liveProfileTabsByHref
+            }
+        }
+        const tabStatus = await getQueuedExecutorTabStatusWithTimeout(tabId, 'queued-live-tab-adoption-after-materialization-failed')
+        if(tabStatus.missing) {
+            detachQueuedTabRuntimeState(tabId, 'queued-live-tab-adoption-vanished')
+            await releaseCoordinatorActionLeaseForTab(tabId, 'queued-live-tab-adoption-vanished').catch(() => null)
+            scheduleCoordinatorQueueResume(1000, 'queued-live-tab-adoption-vanished', {
+                allowBeforeQuora: true
+            })
+            scheduleCoordinatorReconcile(1000, {
+                reason: 'queued-live-tab-adoption-vanished',
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            return {
+                changed: false,
+                unresolved: false,
+                reason: 'queued-live-tab-recovery-vanished-before-adoption',
+                tabId,
+                liveProfileTabsByHref
+            }
+        }
+        return {
+            changed: false,
+            unresolved: true,
+            reason: 'queued-live-tab-adoption-after-materialization-timeout-failed',
+            tabId,
+            liveProfileTabsByHref
+        }
+    }
+
+    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
+    if(!href) {
+        return {
+            changed: false,
+            unresolved: false,
+            reason: 'queued-live-tab-recovery-no-live-profile-tab',
+            liveProfileTabsByHref
+        }
+    }
+
+    const liveTabs = getLiveTabsForProfileHref(liveProfileTabsByHref, href)
+        .filter(tab => normalizeTabId(tab?.id))
+    if(liveTabs.length) {
+        const runtimeSurface = options.runtimeSurface && typeof options.runtimeSurface === 'object'
+            ? options.runtimeSurface
+            : null
+        const hasActiveOrPendingRuntimeSurface = (runtimeSurface?.activeTabs || []).length > 0 ||
+            (runtimeSurface?.pendingActions || []).length > 0
+        if(hasActiveOrPendingRuntimeSurface) {
+            return {
+                changed: false,
+                unresolved: false,
+                reason: 'queued-live-tab-recovery-deferred-to-runtime-surface',
+                liveProfileTabsByHref
+            }
+        }
+        const selectedTab = chooseCoordinatorReclaimProfileTab(liveTabs)
+        const selectedTabId = normalizeTabId(selectedTab?.id)
+        if(selectedTabId) {
+            for(const extraTab of liveTabs) {
+                const extraTabId = normalizeTabId(extraTab?.id)
+                if(!extraTabId || extraTabId === selectedTabId) continue
+                markQueuedTabClosing(extraTabId, 'queued-live-tab-duplicate-reclaim')
+                cleanupQueuedTabMetadataOnly(extraTabId)
+                await browser.tabs.remove(extraTabId).catch(() => null)
+            }
+
+            const adopted = await adoptLiveCoordinatorQueuedTab(
+                item,
+                itemKey,
+                selectedTab,
+                options.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+                {currentAuthorityState: options.currentAuthorityState || null}
+            ).catch(() => false)
+            if(adopted) {
+                const currentAuthorityState = coordinatorAuthority.current() || options.currentAuthorityState || null
+                await pruneQueuedTabActions(options.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, {
+                    queueOnlyAuthority: options.queueOnlyAuthority === true,
+                    currentAuthorityState,
+                    ignoreActiveFillPromise: true,
+                    reason: 'queued-live-tab-duplicate-adopted-after-materialization-timeout'
+                }).catch(() => null)
+                incrementQueueWakeupMetric('pump.changed.adoptedDuplicateLiveTabAfterMaterialization')
+                return {
+                    changed: true,
+                    adopted: true,
+                    unresolved: false,
+                    reason: 'queued-live-tab-duplicate-adopted-after-materialization-timeout',
+                    tabId: selectedTabId,
+                    currentAuthorityState,
+                    liveProfileTabsByHref
+                }
+            }
+        }
+        return {
+            changed: false,
+            unresolved: true,
+            reason: 'queued-authority-live-profile-tab-unclassified',
+            liveProfileTabs: liveTabs.length,
+            liveProfileTabsByHref
+        }
+    }
+
+    return {
+        changed: false,
+        unresolved: false,
+        reason: 'queued-live-tab-recovery-no-live-profile-tab',
+        liveProfileTabsByHref
+    }
+}
+
+async function recoverQueuedActionLiveTabAfterFinalOpenDecline(action = {}, decision = {}, options = {}) {
+    if(!shouldRecoverLiveSurfaceAfterFinalOpenDecline(decision)) {
+        return {changed: false, unresolved: false, reason: 'final-open-decline-not-recoverable'}
+    }
+
+    const href = normalizeQuoraProfileUrl(
+        action?.profileHref ||
+        action?.targetProfileHref ||
+        action?.targetUrl ||
+        action?.requestedUrl ||
+        action?.url ||
+        ''
+    )
+    const coordinatorKey = action?.coordinatorKey ||
+        (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
+    if(!href && !coordinatorKey) {
+        return {changed: false, unresolved: false, reason: 'final-open-live-recovery-missing-key'}
+    }
+
+    let currentAuthorityState = getHydratedCoordinatorAuthorityState('pump.finalOpenDeclineRecovery.usedResidentAuthority')
+    if(!currentAuthorityState) {
+        currentAuthorityState = await promiseWithTimeout(
+            loadCoordinatorCurrentAuthorityState(),
+            QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
+            'queued tab final open recovery authority reload'
+        ).catch(() => null)
+    }
+    const queue = currentAuthorityState?.queue || {}
+    const item = (href && queue[href]) ||
+        (coordinatorKey && queue[coordinatorKey]) ||
+        null
+    if(!item || `${item.status || ''}`.trim() !== 'queued') {
+        return {changed: false, unresolved: false, reason: 'final-open-live-recovery-no-queued-item'}
+    }
+
+    const progress = currentAuthorityState?.progress || {}
+    const record = getCoordinatorProgressRecordForItem(
+        href || coordinatorKey,
+        item,
+        progress
+    )
+    const recovery = await recoverQueuedAuthorityLiveTabAfterMaterializationFailure(
+        item,
+        href || coordinatorKey,
+        record,
+        {
+            ownerTabId: action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+            queueOnlyAuthority: options.queueOnlyAuthority === true,
+            currentAuthorityState
+        }
+    )
+    if(recovery?.adopted === true) {
+        return {
+            ...recovery,
+            reason: 'queued-live-tab-adopted-after-final-open-decline'
+        }
+    }
+    if(recovery?.unresolved === true) {
+        return {
+            ...recovery,
+            reason: recovery.reason || 'queued-authority-live-profile-tab-unclassified'
+        }
+    }
+    return recovery || {changed: false, unresolved: false, reason: 'final-open-live-recovery-no-live-tab'}
+}
+
+function shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure(item = null, options = {}) {
+    if(options.retryBeforeTerminal !== true) return false
+    if(!item || `${item.status || ''}`.trim() !== 'queued') return false
+    if(!isQueuedAuthorityNoSurfaceRetryBudgetExhausted(item, options.record || null)) return false
+    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
+    if(options.queueOnlyAuthority !== true &&
+        options.serviceWorkerOwned !== true &&
+        item?.serviceWorkerOwned !== true &&
+        item?.executorOwner !== 'service-worker') {
+        return false
+    }
+    if(normalizeTabId(item?.tabId || item?.activeTabId || null)) return false
+    if((Number.parseInt(item?.activeAt, 10) || 0) > 0) return false
+
+    const throttle = getQueueLoadThrottle()
+    const pressureReason = `${throttle?.reason || ''}`.trim()
+    const pressurePattern = /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i
+    if(throttle?.active === true && pressurePattern.test(pressureReason)) return true
+
+    const lastPressureAt = Number.parseInt(throttle?.lastPressureAt, 10) || 0
+    return lastPressureAt > 0 &&
+        Date.now() - lastPressureAt <= QUEUE_LOAD_THROTTLE_MAX_MS &&
+        pressurePattern.test(pressureReason)
 }
 
 async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = [], options = {}) {
@@ -12694,8 +14139,35 @@ async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = 
         : {}
     const terminalizedKeys = []
     const requeuedKeys = []
+    const skippedKeys = []
     const errors = []
     for(const candidate of candidates) {
+        const latestAuthorityItem = coordinatorAuthority.current()?.queue?.[candidate.itemKey] ||
+            options.currentAuthorityState?.queue?.[candidate.itemKey] ||
+            null
+        const latestAttemptId = getAttemptIdFromValue(latestAuthorityItem)
+        const latestAttemptNumber = getAttemptNumberFromValue(latestAuthorityItem)
+        if(latestAuthorityItem && (
+            `${latestAuthorityItem.status || ""}`.trim() !== "queued" ||
+            (candidate.expectedAttemptId && latestAttemptId !== candidate.expectedAttemptId) ||
+            (candidate.expectedAttemptNumber && latestAttemptNumber !== candidate.expectedAttemptNumber))) {
+            skippedKeys.push(candidate.itemKey)
+            recordFlightRecorderEvent({
+                kind: "enqueue-failure-terminalization-skip",
+                source: terminalSource,
+                rowKey: candidate.itemKey,
+                targetUrl: getCoordinatorItemHref(candidate.item) || candidate.item.requestedUrl || candidate.itemKey,
+                attemptId: candidate.expectedAttemptId,
+                attemptNumber: candidate.expectedAttemptNumber,
+                runId: candidate.item.runId || "",
+                statusBefore: candidate.item.status || "",
+                statusAfter: latestAuthorityItem?.status || "",
+                reason: "queued-authority-enqueue-candidate-already-moved",
+                accepted: true,
+                durable: false
+            })
+            continue
+        }
         const now = Date.now()
         const authorityOperation = {
             operationKind: terminalOperationKind,
@@ -12723,11 +14195,31 @@ async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = 
                         terminalReason
                     )
                 }
+                if(shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure(currentItem, {
+                    ...options,
+                    record: candidate.record
+                })) {
+                    return buildRequeuedActiveCoordinatorItemWithoutActor(
+                        currentItem,
+                        candidate.record,
+                        now,
+                        terminalReason,
+                        {
+                            forceRequeueExhaustedActorless: true,
+                            extendActorlessRetryBudget: true
+                        }
+                    )
+                }
                 return buildTerminalCoordinatorQueueItem(currentItem, {
                     status: 'failed',
                     outcome: 'timeout',
                     error: options.error || 'Coordinator executor enqueue failed before materializing runtime work',
                     reason: terminalReason,
+                    failureClassification: buildCoordinatorFailureClassification(
+                        terminalReason,
+                        options.error || 'Coordinator executor enqueue failed before materializing runtime work',
+                        enqueueDiagnostics
+                    ),
                     eventType: JOB_EVENT_TERMINAL,
                     now
                 })
@@ -12790,6 +14282,7 @@ async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = 
         requeued: requeuedKeys.length,
         keys: terminalizedKeys,
         requeuedKeys,
+        skippedKeys,
         errors,
         reason: requeuedKeys.length
             ? `requeued-${terminalReason}`
@@ -12800,24 +14293,31 @@ async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = 
 }
 
 async function validateQueuedTabOpenAgainstCurrentAuthority(action = {}) {
-    const currentAuthorityState = getHydratedCoordinatorAuthorityState('pump.finalOpenDecision.usedResidentAuthority')
+    let currentAuthorityState = getHydratedCoordinatorAuthorityState('pump.finalOpenDecision.usedResidentAuthority')
+    if(!currentAuthorityState) {
+        currentAuthorityState = await promiseWithTimeout(
+            loadCoordinatorCurrentAuthorityState(),
+            QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
+            'queued tab final open authority reload'
+        ).catch(() => null)
+    }
     const openDecision = await promiseWithTimeout(
         shouldOpenQueuedTabAction(action, {
             currentAuthorityState
         }),
-        QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
+        QUEUED_TAB_FINAL_OPEN_DECISION_TIMEOUT_MS,
         'queued tab final open decision'
     ).catch(error => ({
         open: false,
-        reason: 'final-open-decision-timeout',
+        reason: 'queued-tab-final-open-decision-timeout',
         authorityUnavailable: true,
         error: error?.message || `${error || ''}`
     }))
     if(openDecision.authorityUnavailable === true) {
-        scheduleCoordinatorQueueResume(1000, 'queued-tab-final-open-authority-unavailable', {
+        scheduleCoordinatorQueueResume(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, 'queued-tab-final-open-authority-unavailable', {
             allowBeforeQuora: true
         })
-        scheduleCoordinatorReconcile(1000, {
+        scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, {
             reason: 'queued-tab-final-open-authority-unavailable',
             edgeTriggered: true,
             allowBeforeQuora: true
@@ -12887,25 +14387,46 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
     const liveProfileTabsByHrefForTerminalize = (items || []).some(isExhaustedRolledBackQueuedTabRetry)
         ? await getLiveProfileTabsForPlanning()
         : cachedLiveProfileTabsByHref
-    const preTerminalizedExhausted = await terminalizeExhaustedRolledBackQueuedCoordinatorItems(items, {
+    const preTerminalizedExhausted = await settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(items, {
         limit: COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT,
-        reason: 'executor-plan-active-transition-retry-budget-exhausted',
+        recoverReason: 'executor-plan-active-transition-retry-budget-recovered',
+        terminalizeReason: 'executor-plan-active-transition-retry-budget-exhausted',
+        queueOnlyAuthority: options.queueOnlyAuthority === true,
+        recoverActiveTransitionFailures: true,
+        serviceWorkerOwned,
+        currentAuthorityState: options.currentAuthorityState || null,
         liveProfileTabsByHref: liveProfileTabsByHrefForTerminalize
     }).catch(error => ({
         changed: false,
         terminalized: 0,
+        recovered: 0,
         keys: [],
         reason: 'batch-terminalize-error',
         error: error?.message || `${error || ''}`
     }))
     terminalizedExhausted += preTerminalizedExhausted?.terminalized || 0
+    const recoveredExhausted = preTerminalizedExhausted?.recovered || 0
+    if(recoveredExhausted > 0) {
+        incrementQueueWakeupMetric('pump.changed.recoveredExhaustedRolledBack', recoveredExhausted)
+    }
     if(terminalizedExhausted > 0) {
         incrementQueueWakeupMetric('pump.changed.terminalizedExhaustedRolledBack', terminalizedExhausted)
     }
     const preTerminalizedExhaustedKeys = new Set(preTerminalizedExhausted?.keys || [])
-    let latestPlanAuthorityState = terminalizedExhausted > 0
+    let latestPlanAuthorityState = terminalizedExhausted > 0 || recoveredExhausted > 0
         ? coordinatorAuthority.current()
         : options.currentAuthorityState || null
+    if(recoveredExhausted > 0) {
+        const recoveredQueue = latestPlanAuthorityState?.queue || {}
+        for(const recoveredKey of preTerminalizedExhausted?.recoveredKeys || []) {
+            const recoveredItem = recoveredQueue[recoveredKey] || null
+            if(!recoveredItem) continue
+            await reprimeRecoveredServiceWorkerQueuedAction(recoveredItem, recoveredKey, {
+                ...options,
+                currentAuthorityState: latestPlanAuthorityState
+            }).catch(() => ({reprimed: 0}))
+        }
+    }
     for(const queuedItem of items || []) {
         let item = queuedItem
         let planAuthorityState = latestPlanAuthorityState
@@ -12914,9 +14435,11 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
             break
         }
         const tabAction = getCoordinatorItemExecutorTabAction(item, options.tabAction)
-        const url = getCoordinatorItemOpenUrl(item)
+        const queuedItemKey = `${queuedItem?.rowKey || queuedItem?.coordinatorKey || ''}`.trim()
         const normalizedHref = getCoordinatorItemHref(item)
-        const coordinatorKey = getCoordinatorItemQueueKey(item)
+        const fallbackKey = normalizedHref || getCoordinatorItemQueueKey(item, queuedItemKey) || queuedItemKey
+        const url = getCoordinatorItemOpenUrl(item, fallbackKey)
+        const coordinatorKey = getCoordinatorItemQueueKey(item, fallbackKey)
         const actionSubjectKey = normalizedHref || coordinatorKey
         if(actionSubjectKey && preTerminalizedExhaustedKeys.has(actionSubjectKey)) continue
         if(!url || !actionSubjectKey || seen.has(actionSubjectKey)) continue
@@ -12946,33 +14469,11 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
         const actionKey = getQueuedTabActionKey(ownerTabId, actionSubjectKey, tabAction)
         if(actionKey && queuedActionKeys.has(actionKey)) continue
 
-        const requestedActionKind = getCoordinatorActionKindForRequestedAction(item?.actionKind || tabAction)
-        const noForegroundFallback = getQueuedActionNoForegroundFallback(item, options)
-        let executorAction = {
-            url,
-            profileHref: normalizedHref || '',
-            coordinatorKey,
-            requestedUrl: normalizeCoordinatorRequestedUrl(item?.requestedUrl || url),
-            resolutionMode: item?.resolutionMode || '',
-            resolveProfileFromPage: item?.resolveProfileFromPage === true,
-            resolutionReason: item?.resolutionReason || '',
-            candidateConfidence: item?.candidateConfidence || '',
-            candidateCollector: item?.candidateCollector || '',
-            tabAction,
-            actionKind: requestedActionKind,
-            jobKey: item.jobKey || '',
-            scope: item.scope || null,
-            canonicalSubject: item.canonicalSubject || null,
-            attempt: item.attempt || null,
-            runId: item.runId || '',
-            ownerTabId,
-            ownerWindowId,
-            noForegroundFallback,
-            retryAttempt: 0,
-            attemptId: getAttemptIdFromValue(item),
-            attemptNumber: getAttemptNumberFromValue(item),
-            maxRetries: STALE_QUEUED_TAB_MAX_RETRIES
-        }
+        let executorAction = buildCoordinatorExecutorActionForQueuedItem(item, ownerTabId, ownerWindowId, {
+            ...options,
+            fallbackKey: actionSubjectKey
+        })
+        if(!executorAction) continue
         if(shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) {
             const retryAction = buildRolledBackQueuedTabRetryAction(item, executorAction)
             if(!retryAction) {
@@ -12994,22 +14495,40 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
                 }
                 else if(terminalizedExhausted < COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT &&
                     isExhaustedRolledBackQueuedTabRetry(item)) {
-                    const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
-                        normalizedHref || coordinatorKey,
-                        item,
-                        {
-                            currentAuthorityState: planAuthorityState,
-                            reason: 'executor-plan-active-transition-retry-budget-exhausted'
-                        }
-                    ).catch(error => ({
+                    const terminalizeResult = await (shouldRecoverExhaustedRolledBackQueuedTabRetry(item, {
+                        queueOnlyAuthority: options.queueOnlyAuthority === true,
+                        recoverActiveTransitionFailures: true,
+                        serviceWorkerOwned
+                    })
+                        ? recoverExhaustedRolledBackQueuedCoordinatorItem(
+                            normalizedHref || coordinatorKey,
+                            item,
+                            {
+                                currentAuthorityState: planAuthorityState,
+                                reason: 'executor-plan-active-transition-retry-budget-recovered'
+                            }
+                        )
+                        : terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                            normalizedHref || coordinatorKey,
+                            item,
+                            {
+                                currentAuthorityState: planAuthorityState,
+                                reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                            }
+                        )).catch(error => ({
                         changed: false,
                         reason: 'terminalize-error',
                         error: error?.message || `${error || ''}`
                     }))
                     if(terminalizeResult?.changed) {
-                        terminalizedExhausted += 1
-                        terminalizedExhaustedKeys.push(normalizedHref || coordinatorKey || actionSubjectKey)
-                        incrementQueueWakeupMetric('pump.changed.terminalizedExhaustedRolledBack')
+                        if(terminalizeResult.recovered === true) {
+                            incrementQueueWakeupMetric('pump.changed.recoveredExhaustedRolledBack')
+                        }
+                        else {
+                            terminalizedExhausted += 1
+                            terminalizedExhaustedKeys.push(normalizedHref || coordinatorKey || actionSubjectKey)
+                            incrementQueueWakeupMetric('pump.changed.terminalizedExhaustedRolledBack')
+                        }
                         planAuthorityState = coordinatorAuthority.current()
                         latestPlanAuthorityState = planAuthorityState
                     }
@@ -13072,6 +14591,98 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
         if(fillResult?.timedOut === true && plannedActions.length && !queuedTabActions.length) {
             queuedTabActions.unshift(...plannedActions)
         }
+        else if(fillResult?.reason === 'queued-tab-fill-timeout' &&
+            plannedActions.length &&
+            !queuedTabActions.length &&
+            (Number.parseInt(fillResult.openedTabs, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.active, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.remainingActions, 10) || 0) <= 0) {
+            queuedTabActions.unshift(...plannedActions)
+            fillResult = {
+                ...fillResult,
+                remainingActions: queuedTabActions.length,
+                restoredActions: plannedActions.length
+            }
+            incrementQueueWakeupMetric('pump.changed.reprimedFillTimeoutBeforeOpenActions', plannedActions.length)
+            scheduleCoordinatorQueueResume(1000, 'queued-tab-fill-timeout-restored-actions', {
+                allowBeforeQuora: true
+            })
+            scheduleQueuedWorkContinuation('queued-tab-fill-timeout-restored-actions')
+        }
+        else if(fillResult?.reason === 'no-tab-opened' &&
+            plannedActions.length &&
+            (Number.parseInt(fillResult.remainingActions, 10) || 0) > 0 &&
+            (Number.parseInt(fillResult.openedTabs, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.active, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) <= 0) {
+            const restoredPendingActions = queuedTabActions.length
+                ? 0
+                : plannedActions.length
+            if(restoredPendingActions > 0) {
+                queuedTabActions.unshift(...plannedActions)
+                incrementQueueWakeupMetric('pump.changed.restoredNoOpenPendingActions', restoredPendingActions)
+            }
+            fillResult = {
+                ...fillResult,
+                remainingActions: Math.max(
+                    Number.parseInt(fillResult.remainingActions, 10) || 0,
+                    queuedTabActions.length
+                ),
+                restoredPendingActions,
+                reason: 'no-tab-opened'
+            }
+            scheduleCoordinatorQueueResume(1000, 'queued-tab-no-open-attempt-runtime-action-pending', {
+                allowBeforeQuora: true
+            })
+            scheduleQueuedWorkContinuation('queued-tab-no-open-attempt-runtime-action-pending')
+        }
+        else if(fillResult?.reason === 'no-tab-opened' &&
+            plannedActions.length &&
+            !queuedTabActions.length &&
+            (Number.parseInt(fillResult.openedTabs, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.active, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.remainingActions, 10) || 0) <= 0) {
+            queuedTabActions.unshift(...plannedActions)
+            fillResult = {
+                ...fillResult,
+                remainingActions: queuedTabActions.length,
+                restoredActions: plannedActions.length,
+                reason: 'no-tab-opened'
+            }
+            incrementQueueWakeupMetric('pump.changed.reprimedNoOpenAttemptActions', plannedActions.length)
+            scheduleCoordinatorQueueResume(1000, 'queued-tab-no-open-attempt-reprimed', {
+                allowBeforeQuora: true
+            })
+        }
+        else if(fillResult?.reason === 'queued-tab-stale-action-pruned' &&
+            plannedActions.length &&
+            !queuedTabActions.length &&
+            (Number.parseInt(fillResult.openedTabs, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.active, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) <= 0 &&
+            (Number.parseInt(fillResult.remainingActions, 10) || 0) <= 0) {
+            const reprimeResult = await reprimeFreshQueuedTabActionsForPrunedStaleAttempts(
+                plannedActions,
+                ownerTabId,
+                ownerWindowId,
+                options
+            )
+            if(reprimeResult.reprimed > 0) {
+                fillResult = {
+                    ...fillResult,
+                    remainingActions: queuedTabActions.length,
+                    reprimedActions: reprimeResult.reprimed,
+                    reason: 'queued-tab-stale-action-pruned'
+                }
+                incrementQueueWakeupMetric('pump.changed.reprimedStaleActionPrunedActions', reprimeResult.reprimed)
+                scheduleCoordinatorQueueResume(1000, 'queued-tab-stale-action-pruned-reprimed', {
+                    allowBeforeQuora: true
+                })
+                scheduleQueuedWorkContinuation('queued-tab-stale-action-pruned-reprimed')
+            }
+        }
     }
     return {
         queued,
@@ -13088,7 +14699,7 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
 async function shouldOpenQueuedTabAction(action = null, options = {}) {
     const normalizedHref = normalizeQuoraProfileUrl(action?.profileHref || action?.url || '')
     const coordinatorKey = action?.coordinatorKey || (normalizedHref ? normalizedHref : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
-    if(!normalizedHref && !coordinatorKey) return {open: false, reason: 'invalid-target'}
+    if(!normalizedHref && !coordinatorKey) return {open: false, reason: 'invalid-target', decisionBranch: 'invalid-target'}
 
     let queue = {}
     let progress = {}
@@ -13098,28 +14709,28 @@ async function shouldOpenQueuedTabAction(action = null, options = {}) {
         progress = currentAuthorityState.progress
     }
     catch {
-        return {open: false, reason: 'queue-read-failed', authorityUnavailable: true}
+        return {open: false, reason: 'queue-read-failed', authorityUnavailable: true, decisionBranch: 'authority-load-failed'}
     }
 
     const item = normalizedHref
         ? queue[normalizedHref] || queue[coordinatorKey] || null
         : queue[coordinatorKey] || null
-    if(!item) return {open: false, reason: 'missing-coordinator-item'}
+    if(!item) return {open: false, reason: 'missing-coordinator-item', decisionBranch: 'missing-coordinator-item'}
 
     const actionKind = getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || '')
     if(!shouldApplyProgressToCoordinatorItem(item, {actionKind})) {
-        return {open: false, reason: 'action-kind-changed'}
+        return {open: false, reason: 'action-kind-changed', decisionBranch: 'action-kind-changed'}
     }
 
     if(hasMismatchedCoordinatorAttempt(item, action)) {
-        return {open: false, reason: 'stale-attempt'}
+        return {open: false, reason: 'stale-attempt', decisionBranch: 'stale-attempt'}
     }
 
     if(isTerminalCoordinatorStatus(item.status)) {
         if(normalizedHref) {
             await settleTerminalCoordinatorItems({profileHrefs: [normalizedHref]})
         }
-        return {open: false, reason: 'terminal-coordinator-item'}
+        return {open: false, reason: 'terminal-coordinator-item', decisionBranch: 'terminal-coordinator-item'}
     }
     if(`${item.status || ''}`.trim() !== 'queued') {
         const progressRecord = normalizedHref ? progress[normalizedHref] || null : null
@@ -13128,12 +14739,12 @@ async function shouldOpenQueuedTabAction(action = null, options = {}) {
             shouldApplyProgressToCoordinatorItem(item, progressRecord) &&
             !hasMismatchedCoordinatorAttempt(item, progressRecord)) {
             await syncSuccessfulCoordinatorProgress(normalizedHref, progressRecord)
-            return {open: false, reason: 'successful-progress-record'}
+            return {open: false, reason: 'successful-progress-record', decisionBranch: 'successful-progress-record'}
         }
-        return {open: false, reason: 'non-queued-coordinator-item'}
+        return {open: false, reason: 'non-queued-coordinator-item', decisionBranch: 'non-queued-coordinator-item'}
     }
 
-    return {open: true, reason: 'queued-coordinator-item'}
+    return {open: true, reason: 'queued-coordinator-item', decisionBranch: 'queued-coordinator-item'}
 }
 
 async function transitionCoordinatorItemForQueuedTab(action = {}, tab = {}, details = {}) {
@@ -13170,20 +14781,33 @@ async function transitionCoordinatorItemForQueuedTab(action = {}, tab = {}, deta
         reason: 'attempt'
     })
 
-    const transitionPromise = enqueueSpaceFeedStorageUpdate(() => {
-        return mutateCoordinatorProjection({
-            kind: 'transitionQueuedTabActive',
-            reason: 'ordinaryMutation',
-            action,
-            tab,
-            details,
-            href,
-            coordinatorKey
+    const transitionPromise = (activeQueueWakeupStorageContext
+        ? Promise.resolve().then(() => {
+            incrementQueueWakeupMetric('activeTransition.usedCurrentStorageUpdate')
+            return mutateCoordinatorProjection({
+                kind: 'transitionQueuedTabActive',
+                reason: 'ordinaryMutation',
+                action,
+                tab,
+                details,
+                href,
+                coordinatorKey
+            })
         })
-    }, {
-        reason: 'active-transition',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
-    })
+        : enqueueSpaceFeedStorageUpdate(() => {
+            return mutateCoordinatorProjection({
+                kind: 'transitionQueuedTabActive',
+                reason: 'ordinaryMutation',
+                action,
+                tab,
+                details,
+                href,
+                coordinatorKey
+            })
+        }, {
+            reason: 'active-transition',
+            timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
+        }))
         .finally(() => {
             queuedTabActiveTransitionPromises.delete(inFlightKey)
         })
@@ -13510,7 +15134,7 @@ async function rollbackFailedQueuedTabOpen(action = {}, tab = {}, details = {}) 
         })
     }, {
         reason: 'rollback-active-transition',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 
     if(rolledBack === true) {
@@ -13652,21 +15276,24 @@ function makeCoordinatorExecutorClassificationCase(caseName = '', rowKey = '', i
     }
 }
 
-function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '') {
+function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '', options = {}) {
     const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
     const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
+    const allowAttemptMismatch = options.allowAttemptMismatch === true
     const matchesRuntime = runtime => {
         if(!runtime) return false
         const runtimeHref = normalizeQuoraProfileUrl(runtime.profileHref || runtime.targetUrl || runtime.requestedUrl || runtime.url || '')
         const runtimeCoordinatorKey = `${runtime.coordinatorKey || ''}`.trim()
         if(itemHref && runtimeHref && itemHref !== runtimeHref) return false
         if(coordinatorKey && runtimeCoordinatorKey && coordinatorKey !== runtimeCoordinatorKey) return false
-        const itemAttemptId = getAttemptIdFromValue(item)
-        const runtimeAttemptId = getAttemptIdFromValue(runtime)
-        if(itemAttemptId && runtimeAttemptId && itemAttemptId !== runtimeAttemptId) return false
-        const itemAttemptNumber = getAttemptNumberFromValue(item)
-        const runtimeAttemptNumber = getAttemptNumberFromValue(runtime)
-        if(itemAttemptNumber && runtimeAttemptNumber && itemAttemptNumber !== runtimeAttemptNumber) return false
+        if(!allowAttemptMismatch) {
+            const itemAttemptId = getAttemptIdFromValue(item)
+            const runtimeAttemptId = getAttemptIdFromValue(runtime)
+            if(itemAttemptId && runtimeAttemptId && itemAttemptId !== runtimeAttemptId) return false
+            const itemAttemptNumber = getAttemptNumberFromValue(item)
+            const runtimeAttemptNumber = getAttemptNumberFromValue(runtime)
+            if(itemAttemptNumber && runtimeAttemptNumber && itemAttemptNumber !== runtimeAttemptNumber) return false
+        }
         return !!(itemHref || coordinatorKey)
     }
     const activeTabs = []
@@ -13693,7 +15320,7 @@ function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '') {
     for(const action of queuedTabActions) {
         if(matchesRuntime(action)) {
             queuedActions.push({
-                tabId: null,
+                tabId: normalizeTabId(action.tabId || action.createdTabId || action.targetTabId),
                 runtime: action
             })
         }
@@ -13743,7 +15370,19 @@ async function classifyCoordinatorExecutorState(options = {}) {
         const record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
         const effectiveRecord = record && !hasMismatchedCoordinatorAttempt(item, record) ? record : null
         const status = `${item.status || ''}`.trim()
-        const runtimeSurface = getRuntimeSurfaceForCoordinatorItem(item, itemKey)
+        let runtimeSurface = getRuntimeSurfaceForCoordinatorItem(item, itemKey)
+        const hasQueuedSurfaceBreadcrumbs = status === 'queued' && (
+            `${item?.actionSurfaceMode || ''}`.trim() === 'worker-window' ||
+            !!Number.parseInt(item?.actionSurfaceWindowId, 10) ||
+            !!normalizeTabId(item?.actionSurfaceAnchorTabId) ||
+            (Number.parseInt(item?.actionSurfaceActivatedAt, 10) || 0) > 0
+        )
+        if(hasQueuedSurfaceBreadcrumbs && !runtimeSurface.hasSurface) {
+            const staleRuntimeSurface = getRuntimeSurfaceForCoordinatorItem(item, itemKey, {
+                allowAttemptMismatch: true
+            })
+            if(staleRuntimeSurface.hasSurface) runtimeSurface = staleRuntimeSurface
+        }
         rememberAuthorityRuntime(runtimeSurface)
 
         if(isCoordinatorQueueAuthoritativeItem(item) && !isTerminalCoordinatorStatus(status)) {
@@ -13760,6 +15399,12 @@ async function classifyCoordinatorExecutorState(options = {}) {
         }
 
         if(isTerminalCoordinatorStatus(status)) {
+            if(!runtimeSurface.hasSurface) {
+                const staleRuntimeSurface = getRuntimeSurfaceForCoordinatorItem(item, itemKey, {
+                    allowAttemptMismatch: true
+                })
+                if(staleRuntimeSurface.hasSurface) runtimeSurface = staleRuntimeSurface
+            }
             if(runtimeSurface.hasSurface) {
                 const firstTab = runtimeSurface.activeTabs[0] || runtimeSurface.pendingActions[0] || null
                 const classified = makeCoordinatorExecutorClassificationCase('terminal-with-runtime-surface', itemKey, item, {
@@ -13806,11 +15451,9 @@ async function classifyCoordinatorExecutorState(options = {}) {
         }
 
         if(status === 'queued') {
-            const liveTab = href
-                ? getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord) ||
-                    getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item, effectiveRecord, itemKey, liveProfileTabsByHref) ||
-                    await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord)
-                : null
+            const liveTab = getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord) ||
+                getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item, effectiveRecord, itemKey, liveProfileTabsByHref) ||
+                await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord)
             let caseName = ''
             let reason = ''
             if(liveTab) {
@@ -13862,6 +15505,9 @@ async function classifyCoordinatorExecutorState(options = {}) {
         }))
     }
 
+    const generatedAt = Date.now()
+    const executorClassificationId = 'executor-classification-' + (++coordinatorExecutorClassificationSeq) + '-' + generatedAt
+
     if(!workRows && !activeQueuedTabs.size && !queuedTabActions.length && !pendingTabActions.size) {
         cases.push({
             case: 'idle-no-work',
@@ -13876,7 +15522,8 @@ async function classifyCoordinatorExecutorState(options = {}) {
 
     return {
         readOnly: true,
-        generatedAt: Date.now(),
+        executorClassificationId,
+        generatedAt,
         cases,
         internalRows
     }
@@ -13947,9 +15594,12 @@ async function isLikelyQueuedWorkerActionSurfaceWindowForTab(tab = null, href = 
     if(!tabs.length) return false
 
     const profileTabs = tabs.filter(candidate => normalizeQuoraProfileUrl(candidate?.url || ''))
-    if(profileTabs.length !== 1) return false
-    if(normalizeTabId(profileTabs[0]?.id) !== tabId) return false
-    if(normalizeQuoraProfileUrl(profileTabs[0]?.url || '') !== normalizedHref) return false
+    if(!profileTabs.length) return false
+    const sameHrefProfileTabs = profileTabs.filter(candidate =>
+        normalizeQuoraProfileUrl(candidate?.url || '') === normalizedHref
+    )
+    if(sameHrefProfileTabs.length !== profileTabs.length) return false
+    if(!sameHrefProfileTabs.some(candidate => normalizeTabId(candidate?.id) === tabId)) return false
 
     return tabs.some(candidate => {
         const candidateId = normalizeTabId(candidate?.id)
@@ -13989,26 +15639,44 @@ async function getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item = null, item
     if(!isCoordinatorQueueAuthoritativeItem(item)) return null
     if(isTerminalProfileNukeRecord(record)) return null
     if(!(item.serviceWorkerOwned === true || item.executorOwner === 'service-worker')) return null
-    if(getQueuedActionNoForegroundFallback(item) !== true) return null
 
     const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
-    if(!href) return null
-
-    const candidates = getLiveTabsForProfileHref(liveProfileTabsByHref, href)
+    const expectedUrl = getCoordinatorItemExpectedExecutorUrl(item, record, itemKey)
+    let candidates = getLiveTabsForProfileHref(liveProfileTabsByHref, href)
         .filter(tab => normalizeTabId(tab?.id) && !hasOwnedQueuedTabState(tab.id))
+    if((isProfileResolutionItem(item) || !href) && expectedUrl) {
+        let requestedUrlTabs = []
+        try {
+            requestedUrlTabs = (await browser.tabs.query({url: 'https://*.quora.com/*'}))
+                .filter(tab =>
+                    normalizeTabId(tab?.id) &&
+                    !hasOwnedQueuedTabState(tab.id) &&
+                    queuedTabMatchesExpectedOpenUrl(tab, expectedUrl)
+                )
+        }
+        catch {
+            requestedUrlTabs = []
+        }
+        candidates = mergeLiveTabsById(candidates, requestedUrlTabs)
+    }
     if(!candidates.length) return null
 
     const surfaceWindowIds = new Set()
+    const addSurfaceWindowId = value => {
+        const windowId = Number.parseInt(value, 10) || 0
+        if(windowId) surfaceWindowIds.add(windowId)
+    }
     const currentWindowId = Number.parseInt(queuedActionSurfaceWindowId, 10) || 0
-    if(currentWindowId) surfaceWindowIds.add(currentWindowId)
+    addSurfaceWindowId(currentWindowId)
+    addSurfaceWindowId(item?.actionSurfaceWindowId)
+    addSurfaceWindowId(record?.actionSurfaceWindowId)
 
     const surface = await getLiveQueuedWorkerActionSurface().catch(() => null)
-    if(surface?.windowId) surfaceWindowIds.add(Number.parseInt(surface.windowId, 10) || 0)
+    addSurfaceWindowId(surface?.windowId)
 
     const anchors = await getQueuedWorkerActionSurfaceAnchorTabs().catch(() => [])
     for(const anchor of anchors || []) {
-        const windowId = Number.parseInt(anchor?.windowId, 10) || 0
-        if(windowId) surfaceWindowIds.add(windowId)
+        addSurfaceWindowId(anchor?.windowId)
     }
     const surfaceCandidates = candidates.filter(tab => {
         const windowId = Number.parseInt(tab?.windowId, 10) || 0
@@ -14016,6 +15684,10 @@ async function getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item = null, item
     })
     if(surfaceCandidates.length === 1) return surfaceCandidates[0]
     if(surfaceCandidates.length > 1) return selectQueuedWorkerReclaimTab(surfaceCandidates, 'surface-window')
+    if((isProfileResolutionItem(item) || !href) && candidates.length === 1) return candidates[0]
+    if((isProfileResolutionItem(item) || !href) && candidates.length > 1) {
+        return selectQueuedWorkerReclaimTab(candidates, 'requested-url')
+    }
 
     const likelySurfaceCandidates = []
     for(const candidate of candidates) {
@@ -14089,6 +15761,8 @@ async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = '', tab = nu
         attemptNumber,
         maxRetries,
         openedAt,
+        liveTabAdoptedAt: openedAt,
+        liveTabAdoptionReason: 'queued-with-live-profile-tab-needs-adoption',
         lastUrl: liveTab?.url || tab?.url || requestedUrl,
         reattachedAt: Date.now(),
         contentScriptEnsureUrl: '',
@@ -14174,10 +15848,21 @@ async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = '', tab = nu
             activeTransitionConfirmTabMissingAt: Date.now(),
             activeTransitionConfirmTabMissingReason: 'resume-live-active-tab-confirm-timeout'
         })
+        const detached = detachQueuedTabRuntimeState(tabId, 'resume-live-active-tab-confirm-missing')
+        void releaseQueuedTab(tabId, {
+            runtimeDetached: true,
+            metadata: detached.metadata,
+            wasActive: detached.wasActive,
+            foregroundLeaseReleased: detached.foregroundLeaseReleased
+        })
         scheduleCoordinatorReconcile(1000, {
             reason: 'resume-live-active-tab-confirm-timeout',
             edgeTriggered: true
         })
+        scheduleCoordinatorQueueResume(1000, 'resume-live-active-tab-confirm-timeout', {
+            allowBeforeQuora: true
+        })
+        return false
     }
     markQueuedTabDurablyActive(tabId, 'resume-live-active-tab')
     scheduleOwnedBlockedProfileSweep(ownerTabId, 4000)
@@ -14214,6 +15899,136 @@ async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = '', tab = nu
         void nudgeQueuedTabActionClaimWithRetries(tabId, 'resume-live-active-tab-content-script-deferred')
     })
     return true
+}
+
+async function restoreActiveLiveCoordinatorQueuedTabAction(item = null, itemKey = '', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {}) {
+    const tabId = normalizeTabId(tab?.id || item?.tabId)
+    const profileHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
+    const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
+    if(!tabId || (!profileHref && !coordinatorKey)) return {changed: false, reason: 'active-live-runtime-missing-key'}
+    if(wasQueuedRuntimeTabRemoved(tabId)) return {changed: false, reason: 'active-live-runtime-tab-removed'}
+
+    const liveTabStatus = await getQueuedExecutorTabStatusWithTimeout(tabId, 'restore-active-live-queued-tab')
+    const liveTab = liveTabStatus.tab ||
+        (liveTabStatus.timedOut && normalizeTabId(tab?.id) === tabId ? tab : null)
+    if(!liveTab) {
+        return {
+            changed: false,
+            reason: liveTabStatus.timedOut
+                ? 'active-live-runtime-tab-lookup-timeout'
+                : 'active-live-runtime-tab-missing',
+            ...(liveTabStatus.error ? {error: liveTabStatus.error} : {})
+        }
+    }
+
+    const liveHref = normalizeQuoraProfileUrl(liveTab.url || liveTab.pendingUrl || tab?.url || '')
+    if(profileHref && liveHref && profileHref !== liveHref) {
+        return {changed: false, reason: 'active-live-runtime-profile-mismatch', liveHref}
+    }
+
+    const tabAction = getCoordinatorItemExecutorTabAction(item)
+    const actionKind = getCoordinatorActionKindForItem(item) ||
+        getCoordinatorActionKindForRequestedAction(item?.actionKind || tabAction)
+    const requestedUrl = normalizeCoordinatorRequestedUrl(item?.requestedUrl || liveTab?.url || tab?.url || profileHref)
+    const attemptId = getAttemptIdFromValue(item)
+    const attemptNumber = getAttemptNumberFromValue(item)
+    const retryAttempt = Number.parseInt(item?.retryAttempt, 10) || 0
+    const maxRetries = Number.parseInt(item?.maxRetries ?? item?.maxAttempts, 10) || STALE_QUEUED_TAB_MAX_RETRIES
+    const openedAt = Number.parseInt(item?.activeAt || item?.updatedAt || item?.createdAt, 10) || Date.now()
+    const actionSurfaceMode = item?.actionSurfaceMode || (isQueuedWorkerActionSurfaceTab(liveTab, item) ? 'worker-window' : '')
+    const actionSurfaceWindowId = Number.parseInt(item?.actionSurfaceWindowId, 10) ||
+        (actionSurfaceMode === 'worker-window' ? liveTab?.windowId || tab?.windowId || null : null)
+    const action = {
+        url: profileHref || requestedUrl,
+        profileHref,
+        targetProfileHref: profileHref,
+        targetUrl: profileHref || requestedUrl,
+        coordinatorKey,
+        requestedUrl,
+        resolutionMode: item?.resolutionMode || '',
+        resolveProfileFromPage: item?.resolveProfileFromPage === true,
+        resolutionReason: item?.resolutionReason || '',
+        candidateConfidence: item?.candidateConfidence || '',
+        candidateCollector: item?.candidateCollector || '',
+        tabAction,
+        action: tabAction,
+        actionKind,
+        jobKey: item?.jobKey || '',
+        scope: item?.scope || null,
+        canonicalSubject: item?.canonicalSubject || null,
+        attempt: item?.attempt || null,
+        runId: item?.runId || '',
+        ownerTabId,
+        ownerWindowId: liveTab?.windowId || tab?.windowId || null,
+        noForegroundFallback: getQueuedActionNoForegroundFallback(item),
+        retryAttempt,
+        attemptId,
+        attemptNumber,
+        maxRetries,
+        actionSurfaceMode,
+        actionSurfaceWindowId,
+        actionSurfaceAnchorTabId: item?.actionSurfaceAnchorTabId || null,
+        actionSurfaceActivatedAt: Number.parseInt(item?.actionSurfaceActivatedAt, 10) || 0
+    }
+    const plan = buildQueuedTabOpenEffectPlan(action, liveTab, openedAt)
+    plan.metadata = {
+        ...(plan.metadata || {}),
+        liveTabRestoredAt: Date.now(),
+        liveTabRestoredReason: 'active-with-tab-missing-pending-action',
+        liveTabAdoptionReason: 'active-with-tab-missing-pending-action',
+        durableActiveAt: Number.parseInt(item?.activeAt || item?.updatedAt, 10) || openedAt,
+        durableActiveReason: 'active-live-runtime-restored',
+        lastUrl: liveTab?.url || tab?.url || requestedUrl
+    }
+    applyQueuedTabOpenRuntimeEffect(plan)
+
+    const confirmedActive = await confirmQueuedTabDurablyActive(action, liveTab, {
+        retryAttempt,
+        attemptId,
+        attemptNumber,
+        maxRetries,
+        openedAt,
+        profileHref,
+        coordinatorKey,
+        actionKind
+    }).catch(() => false)
+    if(!confirmedActive) {
+        detachQueuedTabRuntimeState(tabId, 'active-live-runtime-confirm-failed')
+        return {changed: false, reason: 'active-live-runtime-confirm-failed'}
+    }
+
+    markQueuedTabDurablyActive(tabId, 'active-live-runtime-restored')
+    registerOwnedTab(ownerTabId, tabId)
+    scheduleOwnedBlockedProfileSweep(ownerTabId, 4000)
+    void promiseWithTimeout(
+        ensureQueuedTabContentScript(tabId, 'active-live-runtime-restored'),
+        QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
+        'active live queued tab content script ensure'
+    ).then(async () => {
+        await terminalizeAlreadyBlockedQueuedTab(tabId, 'active-live-runtime-restored-already-blocked')
+    }).catch(() => null)
+    const nudgeResult = await nudgeQueuedTabActionClaimWithRetries(tabId, 'active-live-runtime-restored', [0])
+        .catch(error => ({nudged: false, reason: 'active-live-runtime-nudge-error', error: error?.message || `${error || ''}`}))
+    scheduleQueuedWorkContinuation(nudgeResult?.nudged === true
+        ? 'active-live-runtime-restored-nudged'
+        : nudgeResult?.reason || 'active-live-runtime-restored')
+    scheduleCoordinatorReconcile(1000, {
+        reason: nudgeResult?.nudged === true
+            ? 'active-live-runtime-restored-nudged'
+            : nudgeResult?.reason || 'active-live-runtime-restored',
+        edgeTriggered: true,
+        allowBeforeQuora: true
+    })
+
+    return {
+        changed: true,
+        reason: nudgeResult?.nudged === true
+            ? 'active-live-runtime-restored-nudged'
+            : 'active-live-runtime-restored',
+        ensured: true,
+        nudged: nudgeResult?.nudged === true,
+        nudgeReason: nudgeResult?.reason || ''
+    }
 }
 
 async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-blocked-queued-tab') {
@@ -14468,6 +16283,39 @@ function finishCoordinatorExecutorApplyResult(result = {}) {
     }
 }
 
+async function recoverQueuedStaleRuntimeMissingQueuedAction(itemKey = '', item = null, options = {}, staleReason = 'queued-stale-runtime-missing-queued-action') {
+    if(!itemKey || !item) return null
+    if(!shouldRecoverExhaustedRolledBackQueuedTabRetry(item, {
+        queueOnlyAuthority: options.queueOnlyAuthority === true,
+        recoverActiveTransitionFailures: true,
+        serviceWorkerOwned: options.serviceWorkerOwned === true
+    })) {
+        return null
+    }
+
+    const result = await recoverExhaustedRolledBackQueuedCoordinatorItem(itemKey, item, {
+        currentAuthorityState: options.currentAuthorityState || null,
+        reason: `${staleReason || 'queued-stale-runtime-missing-queued-action'}-retry-budget-recovered`
+    }).catch(error => ({
+        changed: false,
+        reason: 'queued-stale-runtime-recovery-error',
+        error: error?.message || `${error || ''}`
+    }))
+    if(result?.changed !== true) {
+        return null
+    }
+
+    return {
+        changed: true,
+        consumed: true,
+        unresolved: false,
+        recovered: true,
+        reason: `${staleReason || 'queued-stale-runtime-missing-queued-action'}-recovered`,
+        item: result.item || null,
+        itemKey
+    }
+}
+
 async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options = {}) {
     const contract = classified?.contract || null
     const item = classified?.item || null
@@ -14477,12 +16325,82 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
     }
 
     const tabId = normalizeTabId(contract.tabId)
+    const getQueuedRuntimeActionSubject = (action = null, targetItem = item) => action?.profileHref ||
+        action?.coordinatorKey ||
+        action?.url ||
+        action?.requestedUrl ||
+        getCoordinatorItemHref(targetItem) ||
+        itemKey
+    const queuedRuntimeActionMatchesTarget = (action = null, queuedAction = null, targetItem = item) => {
+        if(!action) return false
+        if(queuedAction && action === queuedAction) return true
+
+        const actionTabId = normalizeTabId(action.tabId || action.createdTabId || action.targetTabId)
+        if(tabId && actionTabId && actionTabId === tabId) return true
+
+        const targetSubject = getQueuedRuntimeActionSubject(queuedAction, targetItem)
+        const candidateSubject = getQueuedRuntimeActionSubject(action, targetItem)
+        if(!targetSubject || !candidateSubject) return false
+
+        const targetOwner = queuedAction?.ownerTabId || action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID
+        const targetAction = queuedAction?.tabAction ||
+            getCoordinatorItemExecutorTabAction(targetItem || item)
+        const targetKey = getQueuedTabActionKey(targetOwner, targetSubject, targetAction)
+        const candidateKey = getQueuedTabActionKey(
+            action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+            candidateSubject,
+            action.tabAction || ''
+        )
+        if(!targetKey || candidateKey !== targetKey) return false
+
+        const targetAttemptId = getAttemptIdFromValue(queuedAction) || getAttemptIdFromValue(targetItem)
+        const candidateAttemptId = getAttemptIdFromValue(action)
+        if(targetAttemptId && candidateAttemptId && targetAttemptId !== candidateAttemptId) return false
+
+        const targetAttemptNumber = getAttemptNumberFromValue(queuedAction) || getAttemptNumberFromValue(targetItem)
+        const candidateAttemptNumber = getAttemptNumberFromValue(action)
+        if(targetAttemptNumber && candidateAttemptNumber && targetAttemptNumber !== candidateAttemptNumber) return false
+
+        return true
+    }
+    const pruneQueuedRuntimeActionsForTarget = (queuedAction = null, metricSuffix = '', targetItem = item) => {
+        let pruned = 0
+        for(let index = queuedTabActions.length - 1; index >= 0; index -= 1) {
+            if(!queuedRuntimeActionMatchesTarget(queuedTabActions[index], queuedAction, targetItem)) continue
+            queuedTabActions.splice(index, 1)
+            pruned += 1
+        }
+        if(pruned > 0 && metricSuffix) {
+            incrementQueueWakeupMetric(metricSuffix, pruned)
+        }
+        return pruned
+    }
     if(!tabId) {
         const runtimeSurface = item
-            ? getRuntimeSurfaceForCoordinatorItem(item, itemKey)
+            ? getRuntimeSurfaceForCoordinatorItem(item, itemKey, {
+                allowAttemptMismatch: true
+            })
             : {queuedActions: []}
         const queuedAction = runtimeSurface.queuedActions?.[0]?.runtime || null
         if(!queuedAction) {
+            const recovered = await recoverQueuedStaleRuntimeMissingQueuedAction(itemKey, item, options, 'queued-stale-runtime-missing-queued-action')
+            if(recovered?.changed === true) return recovered
+            const currentItem = coordinatorAuthority.current()?.queue?.[itemKey] ||
+                options.currentAuthorityState?.queue?.[itemKey] ||
+                item ||
+                null
+            if(`${currentItem?.status || ''}`.trim() === 'queued') {
+                incrementQueueWakeupMetric('reconcile.executor.changed.reprimedMissingQueuedRuntimeAction')
+                return {
+                    changed: true,
+                    consumed: true,
+                    unresolved: false,
+                    reason: 'queued-stale-runtime-missing-queued-action-reprimed',
+                    reprimeQueuedAuthority: true,
+                    item: currentItem,
+                    itemKey
+                }
+            }
             return {
                 changed: false,
                 consumed: false,
@@ -14535,12 +16453,32 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
             return pruned
         }
         if(!hasMatchingQueuedAction()) {
+            const recovered = await recoverQueuedStaleRuntimeMissingQueuedAction(itemKey, item, options, 'queued-stale-runtime-action-already-pruned')
+            if(recovered?.changed === true) return recovered
             scheduleQueuedWorkContinuation('queued-stale-runtime-action-already-pruned')
             return {
                 changed: true,
                 consumed: true,
                 unresolved: true,
-                reason: 'queued-stale-runtime-action-already-pruned'
+                reason: 'queued-stale-runtime-action-already-pruned',
+                reprimeQueuedAuthority: true,
+                item,
+                itemKey
+            }
+        }
+        if(options.awaitFill === false) {
+            const currentItem = coordinatorAuthority.current()?.queue?.[itemKey] ||
+                options.currentAuthorityState?.queue?.[itemKey] ||
+                item ||
+                null
+            return {
+                changed: true,
+                consumed: true,
+                unresolved: false,
+                deferredFill: true,
+                reason: 'queued-stale-runtime-fill-deferred-by-caller',
+                item: currentItem,
+                itemKey
             }
         }
         const fillResult = await promiseWithTimeout(fillQueuedTabs({
@@ -14581,12 +16519,17 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
         }
         const stillQueued = hasMatchingQueuedAction()
         if(!stillQueued) {
+            const recovered = await recoverQueuedStaleRuntimeMissingQueuedAction(itemKey, item, options, 'queued-stale-runtime-action-drained-before-authority')
+            if(recovered?.changed === true) return recovered
             scheduleQueuedWorkContinuation('queued-stale-runtime-action-drained-before-authority')
             return {
                 changed: true,
                 consumed: true,
                 unresolved: true,
-                reason: 'queued-stale-runtime-action-drained-before-authority'
+                reason: 'queued-stale-runtime-action-drained-before-authority',
+                reprimeQueuedAuthority: true,
+                item: currentItem || item,
+                itemKey
             }
         }
         if(fillResult?.error) {
@@ -14616,7 +16559,9 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
                     consumed: true,
                     unresolved: false,
                     reason: 'queued-stale-runtime-action-pruned-after-fill-timeout',
-                    item: currentItem || item
+                    item: currentItem || item,
+                    reprimeQueuedAuthority: true,
+                    itemKey
                 }
             }
         }
@@ -14648,7 +16593,27 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
                     consumed: true,
                     unresolved: false,
                     reason: 'queued-stale-runtime-fill-opened-without-authority-pruned',
-                    item: currentItem || item
+                    item: currentItem || item,
+                    reprimeQueuedAuthority: true,
+                    itemKey
+                }
+            }
+        }
+        if(fillResult?.reason === 'queued-runtime-action-live-tab-needs-reconcile' && stillQueued) {
+            const pruned = pruneMatchingQueuedAction(
+                'reconcile.executor.changed.prunedStaleQueuedRuntimeActionBeforeOpenReconcile'
+            )
+            if(pruned > 0) {
+                scheduleQueuedWorkContinuation('queued-stale-runtime-pre-open-live-tab-reconcile-pruned')
+                return {
+                    changed: true,
+                    consumed: true,
+                    unresolved: false,
+                    reason: 'queued-stale-runtime-pre-open-live-tab-reconcile-pruned',
+                    item: currentItem || item,
+                    reprimeQueuedAuthority: true,
+                    itemKey,
+                    pruned
                 }
             }
         }
@@ -14664,7 +16629,18 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
             ...(fillResult?.error ? {error: fillResult.error} : {})
         }
     }
-    const metadata = getQueuedTabMetadata(tabId) || pendingTabActions.get(tabId) || contract.runtime || null
+    const queuedRuntimeSurface = item
+        ? getRuntimeSurfaceForCoordinatorItem(item, itemKey, {
+            allowAttemptMismatch: true
+        })
+        : {queuedActions: []}
+    const queuedRuntimeAction = queuedRuntimeSurface.queuedActions?.find(surface =>
+        normalizeTabId(surface?.tabId) === tabId
+    )?.runtime || queuedRuntimeSurface.queuedActions?.[0]?.runtime || null
+    const metadata = getQueuedTabMetadata(tabId) ||
+        pendingTabActions.get(tabId) ||
+        queuedRuntimeAction ||
+        null
     if(!metadata) {
         const detached = detachQueuedTabRuntimeState(tabId, 'queued-stale-runtime-missing-metadata')
         await releaseCoordinatorActionLeaseForTab(tabId, 'queued-stale-runtime-missing-metadata').catch(() => null)
@@ -14715,12 +16691,39 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
         }
     }
     if(!activeQueuedTabs.has(tabId) && !pendingTabActions.has(tabId)) {
+        const releasedItem = currentItem || item
+        const releasedSurface = releasedItem
+            ? getRuntimeSurfaceForCoordinatorItem(releasedItem, itemKey, {
+                allowAttemptMismatch: true
+            })
+            : {queuedActions: []}
+        const releasedQueuedAction = releasedSurface.queuedActions?.[0]?.runtime ||
+            contract.runtime ||
+            metadata ||
+            null
+        const pruned = pruneQueuedRuntimeActionsForTarget(
+            releasedQueuedAction,
+            'reconcile.executor.changed.prunedStaleQueuedRuntimeActionAfterRelease',
+            releasedItem
+        )
+        if(pruned > 0) {
+            return {
+                changed: true,
+                consumed: true,
+                unresolved: false,
+                reason: 'queued-stale-runtime-released',
+                item: releasedItem,
+                itemKey,
+                pruned
+            }
+        }
         return {
             changed: true,
             consumed: true,
             unresolved: false,
             reason: 'queued-stale-runtime-released',
-            item: currentItem || item
+            item: releasedItem,
+            itemKey
         }
     }
     if(resolved?.error) {
@@ -14776,6 +16779,15 @@ async function resolveTerminalRuntimeExecutorCase(classified = null, options = {
         : {queuedActions: []}
     const queuedAction = runtimeSurface.queuedActions?.[0]?.runtime || contract.runtime || null
     if(!queuedAction) {
+        if(`${item?.error || ''}`.trim() === 'Durable active queue row had no confirmed runtime actor') {
+            scheduleQueuedWorkContinuation('terminal-authority-runtime-missing-queued-action')
+            return {
+                changed: true,
+                consumed: true,
+                unresolved: false,
+                reason: 'terminal-authority-runtime-missing-queued-action'
+            }
+        }
         return {
             changed: false,
             consumed: false,
@@ -14831,11 +16843,180 @@ async function resolveTerminalRuntimeExecutorCase(classified = null, options = {
     }
 }
 
+async function recoverActivePendingActionProfileMismatch(classified = null, itemKey = '', item = null, record = null, currentAuthorityState = null, reason = 'active-pending-action-profile-mismatch') {
+    const contract = classified?.contract || null
+    if(!contract || contract.case !== 'active-with-tab-and-pending-action') {
+        return {changed: false, reason: 'not-active-pending-action'}
+    }
+    if(!item || !isActiveCoordinatorStatus(item.status)) {
+        return {changed: false, reason: 'not-active-authority-row'}
+    }
+
+    const tabId = normalizeTabId(contract.tabId || item?.tabId || record?.tabId)
+    if(!tabId) return {changed: false, reason: 'active-pending-action-profile-mismatch-missing-tab'}
+
+    const tabStatus = await getQueuedExecutorTabStatusWithTimeout(tabId, 'active-pending-action-profile-mismatch')
+    const tab = tabStatus.tab || null
+    if(!tab) {
+        return {
+            changed: false,
+            reason: tabStatus.timedOut
+                ? 'active-pending-action-profile-mismatch-tab-lookup-timeout'
+                : tabStatus.missing
+                ? 'active-pending-action-profile-mismatch-tab-missing'
+                : 'active-pending-action-profile-mismatch-tab-unknown',
+            ...(tabStatus.error ? {error: tabStatus.error} : {})
+        }
+    }
+
+    const expectedHref = getCoordinatorItemHref(item) ||
+        normalizeQuoraProfileUrl(itemKey) ||
+        normalizeQuoraProfileUrl(record?.profileHref || '')
+    const observedHref = normalizeQuoraProfileUrl(tab.url || tab.pendingUrl || '')
+    if(!expectedHref || !observedHref || expectedHref === observedHref) {
+        return {changed: false, reason: 'active-pending-action-profile-matches'}
+    }
+
+    const metadata = getQueuedTabMetadata(tabId) || {}
+    const pendingAction = pendingTabActions.get(tabId) || {}
+    const runtimeHref = normalizeQuoraProfileUrl(
+        metadata.profileHref ||
+        pendingAction.profileHref ||
+        pendingAction.targetUrl ||
+        pendingAction.url ||
+        ''
+    )
+    if(runtimeHref && runtimeHref !== expectedHref) {
+        return {
+            changed: false,
+            reason: 'active-pending-action-runtime-belongs-to-different-authority',
+            expectedHref,
+            observedHref,
+            runtimeHref
+        }
+    }
+
+    cleanupQueuedTabMetadataOnly(tabId)
+    await releaseCoordinatorActionLeaseForTab(tabId, reason).catch(() => null)
+    incrementQueueWakeupMetric('reconcile.executor.changed.activePendingProfileMismatchRuntimePruned')
+
+    const requeueResult = await requeueDurableActiveCoordinatorItemWithoutActor(
+        itemKey,
+        item,
+        record,
+        reason,
+        {
+            currentAuthorityState,
+            timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
+            skipFreshOpenDeferralAfterLeaseRelease: true,
+            skipActionPhaseProtection: true,
+            skipFreshContentReadiness: true,
+            skipLiveReclaimAdoption: true,
+            forceRequeueExhaustedActorless: true,
+            extendActorlessRetryBudget: true
+        }
+    ).catch(error => ({
+        changed: false,
+        reason: 'active-pending-action-profile-mismatch-requeue-error',
+        error: error?.message || `${error || ''}`
+    }))
+
+    return {
+        changed: true,
+        requeued: requeueResult?.changed === true && requeueResult?.status === 'queued',
+        reason: requeueResult?.changed === true
+            ? 'active-pending-action-profile-mismatch-requeued'
+            : 'active-pending-action-profile-mismatch-runtime-pruned',
+        expectedHref,
+        observedHref,
+        runtimeHref,
+        ...(requeueResult?.error ? {error: requeueResult.error} : {})
+    }
+}
+
+async function requeueStalledActivePendingAction(classified = null, itemKey = '', item = null, record = null, reason = 'active-pending-action-stale-claim') {
+    const contract = classified?.contract || null
+    if(!contract || contract.case !== 'active-with-tab-and-pending-action') {
+        return {changed: false, reason: 'not-active-pending-action'}
+    }
+    if(!item || !isActiveCoordinatorStatus(item.status)) {
+        return {changed: false, reason: 'not-active-authority-row'}
+    }
+
+    const tabId = normalizeTabId(contract.tabId || item?.tabId || record?.tabId)
+    if(!tabId) return {changed: false, reason: 'active-pending-action-stale-claim-missing-tab'}
+
+    const metadata = getQueuedTabMetadata(tabId) || pendingTabActions.get(tabId) || null
+    if(!metadata) return {changed: false, reason: 'active-pending-action-stale-claim-missing-runtime'}
+    if(!hasStaleAcceptedQueuedTabNudge(metadata, record)) {
+        return {changed: false, reason: 'active-pending-action-stale-claim-not-stale'}
+    }
+
+    const retryAction = buildRetryQueuedTabAction({
+        ...metadata,
+        loadPressureRequeue: true
+    }, record, {
+        forceRetryWhenExhausted: true
+    })
+    if(!retryAction) {
+        return {changed: false, reason: 'active-pending-action-stale-claim-no-retry'}
+    }
+
+    const closedAt = Date.now()
+    const closeRequestedAt = markQueuedTabClosing(tabId, reason)
+    const retryAdvanced = await advanceCoordinatorQueueForStaleRetryAction(retryAction, closedAt)
+    if(!retryAdvanced) {
+        return {changed: false, reason: 'active-pending-action-stale-claim-advance-skipped'}
+    }
+
+    setQueuedTabMetadata(tabId, {
+        retryRequestedAt: closedAt,
+        retryAttempt: retryAction.retryAttempt,
+        maxRetries: retryAction.maxRetries,
+        attemptId: retryAction.attemptId,
+        attemptNumber: retryAction.attemptNumber
+    })
+    queuedTabActions.unshift(markQueuedTabExecutorActionPlanned(
+        retryAction,
+        {open: true, reason: 'active-pending-action-stale-claim-retry'},
+        'active-pending-action-stale-claim-retry'
+    ))
+    if(metadata?.profileHref) {
+        await recordQueuedTabMetadataMilestone(tabId, {
+            ...metadata,
+            attemptId: retryAction.attemptId,
+            attemptNumber: retryAction.attemptNumber
+        }, {
+            status: 'queued',
+            retryAttempt: retryAction.retryAttempt,
+            maxRetries: retryAction.maxRetries,
+            attemptId: retryAction.attemptId,
+            attemptNumber: retryAction.attemptNumber,
+            closeRequestedAt: closeRequestedAt || closedAt,
+            closedByExtension: true,
+            closeReason: reason,
+            finalError: '',
+            event: 'Accepted queued tab claim made no progress; retrying under load pressure'
+        }).catch(() => null)
+    }
+    await releaseQueuedTabAndCleanup(tabId, {awaitFill: false}).catch(() => null)
+    await browser.tabs.remove(tabId).catch(() => null)
+    scheduleQueuedWorkContinuation('active-pending-action-stale-claim-retry')
+
+    return {
+        changed: true,
+        requeued: true,
+        status: 'queued',
+        reason: 'active-pending-action-stale-claim-requeued'
+    }
+}
+
 async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-apply', options = {}) {
     const serviceWorkerOwned = options.serviceWorkerOwned === true
     const ownerTabId = options.ownerTabId || (serviceWorkerOwned ? SERVICE_WORKER_QUEUE_OWNER_ID : null)
     const ownerWindowId = serviceWorkerOwned ? null : options.ownerWindowId || null
     const metricPrefix = options.metricPrefix || 'reconcile.executor'
+    const requeueMissingActiveTabs = options.requeueMissingActiveTabs !== false
     const incrementMetric = (suffix, count = 1) => {
         if(metricPrefix && suffix) incrementQueueWakeupMetric(`${metricPrefix}.${suffix}`, count)
     }
@@ -14889,18 +17070,51 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         liveProfileTabsByHref = await getLiveProfileTabsByHref()
     }
     let terminalizedExhausted = 0
-    const preTerminalizedExhausted = await terminalizeExhaustedRolledBackQueuedCoordinatorItems(Object.values(currentAuthorityState.queue || {}), {
+    const preTerminalizedExhausted = await settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(Object.values(currentAuthorityState.queue || {}), {
         limit: COORDINATOR_EXHAUSTED_ROLLBACK_TERMINALIZE_BATCH_LIMIT,
-        reason: 'executor-plan-active-transition-retry-budget-exhausted',
+        recoverReason: 'executor-plan-active-transition-retry-budget-recovered',
+        terminalizeReason: 'executor-plan-active-transition-retry-budget-exhausted',
+        queueOnlyAuthority: options.queueOnlyAuthority === true,
+        recoverActiveTransitionFailures: true,
+        serviceWorkerOwned,
+        currentAuthorityState,
+        suppressRecoveredQueueResume: options.awaitFill === false,
+        suppressRecoveredWorkContinuation: true,
+        suppressRecoveredActionReprime: true,
         liveProfileTabsByHref
     }).catch(error => ({
         changed: false,
         terminalized: 0,
+        recovered: 0,
         keys: [],
         reason: 'batch-terminalize-error',
         error: error?.message || `${error || ''}`
     }))
     terminalizedExhausted += preTerminalizedExhausted?.terminalized || 0
+    const preRecoveredExhaustedKeys = new Set(preTerminalizedExhausted?.recoveredKeys || [])
+    const preRecoveredExhausted = preTerminalizedExhausted?.recovered || 0
+    if(preRecoveredExhausted > 0) {
+        currentAuthorityState = coordinatorAuthority.current()
+        incrementMetric('changed.recoveredExhaustedRolledBack', preRecoveredExhausted)
+        const recoveredQueue = currentAuthorityState?.queue || {}
+        for(const recoveredKey of preTerminalizedExhausted?.recoveredKeys || []) {
+            const recoveredEntry = recoveredQueue[recoveredKey]
+                ? {key: recoveredKey, item: recoveredQueue[recoveredKey]}
+                : findCoordinatorQueueEntryForHref(recoveredQueue, recoveredKey)
+            const recoveredItem = recoveredEntry?.item || null
+            if(!recoveredItem) continue
+            const recoveredItemKey = recoveredEntry?.key || recoveredKey
+            const recoveredHref = getCoordinatorItemHref(recoveredItem)
+            const recoveredCoordinatorKey = getCoordinatorItemQueueKey(recoveredItem, recoveredItemKey)
+            if(recoveredItemKey) preRecoveredExhaustedKeys.add(recoveredItemKey)
+            if(recoveredHref) preRecoveredExhaustedKeys.add(recoveredHref)
+            if(recoveredCoordinatorKey) preRecoveredExhaustedKeys.add(recoveredCoordinatorKey)
+            await reprimeRecoveredServiceWorkerQueuedAction(recoveredItem, recoveredKey, {
+                ...options,
+                currentAuthorityState
+            }).catch(() => ({reprimed: 0}))
+        }
+    }
     if(terminalizedExhausted > 0) {
         currentAuthorityState = coordinatorAuthority.current()
         incrementMetric('changed.terminalizedExhaustedRolledBack', terminalizedExhausted)
@@ -14939,6 +17153,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         progress,
         paused: false
     })
+    const executorClassificationId = executorClassification.executorClassificationId || ''
+    const classificationGeneratedAt = executorClassification.generatedAt || 0
     const primaryExecutorCase = executorClassification.cases.find(item => item.case !== 'idle-no-work') ||
         executorClassification.cases[0] ||
         null
@@ -14967,12 +17183,32 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
         if(!href && !coordinatorKey) continue
+        if(preRecoveredExhaustedKeys.has(href) ||
+            preRecoveredExhaustedKeys.has(coordinatorKey) ||
+            preRecoveredExhaustedKeys.has(itemKey) ||
+            (preRecoveredExhausted > 0 &&
+                `${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered')) {
+            consumedExecutorCases.push({
+                case: 'queued-authority-without-executor-surface',
+                rowKey: itemKey,
+                status: 'queued',
+                tabId: null,
+                reason: 'recovered-exhausted-rolled-back-row-reprimed'
+            })
+            continue
+        }
         const progressRecord = getCoordinatorProgressRecordForItem(itemKey, item, progress)
         const progressAttemptMismatched = progressRecord && hasMismatchedCoordinatorAttempt(item, progressRecord)
+        const recoverableQueuedAuthorityLostAttemptRecord = progressAttemptMismatched &&
+            String(item?.status || "").trim() === 'queued' &&
+            !getAttemptIdFromValue(item) &&
+            !getAttemptNumberFromValue(item) &&
+            getAttemptNumberFromValue(progressRecord) > 0 &&
+            (!item.runId || !progressRecord.runId || item.runId === progressRecord.runId)
         if(progressAttemptMismatched) {
             incrementMetric('ignored.mismatchedProgress')
         }
-        const record = progressAttemptMismatched ? null : progressRecord
+        const record = progressAttemptMismatched ? recoverableQueuedAuthorityLostAttemptRecord ? progressRecord : null : progressRecord
         const terminalRecordSettlesQueuedAuthority = `${item?.status || ''}`.trim() === 'queued' &&
             record &&
             isTerminalProfileNukeRecord(record) &&
@@ -15004,7 +17240,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     })
                 }, {
                     reason: 'terminal-progress',
-                    timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+                    timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
                 }).catch(error => ({
                     accepted: false,
                     durable: false,
@@ -15060,16 +17296,45 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             if(liveTab) {
                 const liveTabGuard = await getTokenMatchedLiveOrPersistedTabForCoordinatorItem(item, record, itemKey, liveProfileTabsByHref)
                 const liveTabGuardMatches = liveTabGuard && normalizeTabId(liveTabGuard.id) === normalizeTabId(liveTab.id)
-                if(liveTabGuardMatches &&
-                    await adoptLiveCoordinatorQueuedTab(item, itemKey, liveTab, ownerTabId, {currentAuthorityState})) {
-                    adopted += 1
-                    currentAuthorityState = coordinatorAuthority.current()
-                    consumedExecutorCases.push(classified.contract)
+                if(liveTabGuardMatches) {
+                    const restoreResult = await restoreActiveLiveCoordinatorQueuedTabAction(
+                        item,
+                        itemKey,
+                        liveTab,
+                        ownerTabId,
+                        {currentAuthorityState}
+                    ).catch(error => ({
+                        changed: false,
+                        reason: 'active-live-runtime-restore-error',
+                        error: error?.message || `${error || ''}`
+                    }))
+                    if(restoreResult?.changed === true) {
+                        incrementMetric('changed.restoredActiveLiveRuntime')
+                        consumedExecutorCases.push({
+                            ...(classified.contract || {}),
+                            reason: restoreResult.reason || 'active-live-runtime-restored',
+                            nudged: restoreResult.nudged === true,
+                            nudgeReason: restoreResult.nudgeReason || ''
+                        })
+                        continue
+                    }
+                    incrementMetric('noop.activeLiveRuntimeRestoreFailed')
+                    unresolvedExecutorCases.push({
+                        ...(classified.contract || {}),
+                        reason: restoreResult?.reason || 'active-live-runtime-restore-failed',
+                        ...(restoreResult?.error ? {error: restoreResult.error} : {})
+                    })
+                    scheduleCoordinatorQueueResume(1000, restoreResult?.reason || 'active-live-runtime-restore-failed', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: restoreResult?.reason || 'active-live-runtime-restore-failed',
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
                     continue
                 }
-                if(!liveTabGuardMatches) {
-                    incrementMetric('assertion.classifiedActiveLiveTabGuardMismatch')
-                }
+                incrementMetric('assertion.classifiedActiveLiveTabGuardMismatch')
                 const requeueResult = await requeueDurableActiveCoordinatorItemWithoutActor(
                     itemKey,
                     item,
@@ -15079,11 +17344,13 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         : `${reason || 'coordinator-executor'}-active-live-tab-guard-missing`,
                     {
                         currentAuthorityState,
-                        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+                        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
                         skipFreshOpenDeferralAfterLeaseRelease: true,
                         skipActionPhaseProtection: true,
                         skipFreshContentReadiness: true,
-                        skipLiveReclaimAdoption: true
+                        skipLiveReclaimAdoption: true,
+                        forceRequeueExhaustedActorless: true,
+                        extendActorlessRetryBudget: true
                     }
                 ).catch(error => ({
                     changed: false,
@@ -15127,6 +17394,41 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 continue
             }
             if(classifiedCase === 'active-with-tab-and-pending-action') {
+                const profileMismatchRecovery = await recoverActivePendingActionProfileMismatch(
+                    classified,
+                    itemKey,
+                    item,
+                    record,
+                    currentAuthorityState,
+                    'active-pending-action-profile-mismatch'
+                ).catch(error => ({
+                    changed: false,
+                    reason: 'active-pending-action-profile-mismatch-error',
+                    error: error?.message || `${error || ''}`
+                }))
+                if(profileMismatchRecovery?.changed === true) {
+                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    consumedExecutorCases.push({
+                        ...(classified.contract || {}),
+                        reason: profileMismatchRecovery.reason || 'active-pending-action-profile-mismatch-recovered',
+                        expectedProfileHref: profileMismatchRecovery.expectedHref || '',
+                        observedProfileHref: profileMismatchRecovery.observedHref || '',
+                        runtimeProfileHref: profileMismatchRecovery.runtimeHref || '',
+                        ...(profileMismatchRecovery.error ? {error: profileMismatchRecovery.error} : {})
+                    })
+                    if(profileMismatchRecovery.requeued === true) {
+                        requeued += 1
+                    }
+                    scheduleCoordinatorQueueResume(1000, profileMismatchRecovery.reason || 'active-pending-action-profile-mismatch-recovered', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: profileMismatchRecovery.reason || 'active-pending-action-profile-mismatch-recovered',
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    continue
+                }
                 const blockedLiveTabTerminal = await terminalizeActiveCoordinatorItemFromBlockedLiveTab(
                     itemKey,
                     item,
@@ -15155,12 +17457,83 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     })
                     continue
                 }
+                const stalledPendingActionRecovery = await requeueStalledActivePendingAction(
+                    classified,
+                    itemKey,
+                    item,
+                    record,
+                    'active-pending-action-stale-claim'
+                ).catch(error => ({
+                    changed: false,
+                    reason: 'active-pending-action-stale-claim-error',
+                    error: error?.message || `${error || ''}`
+                }))
+                if(stalledPendingActionRecovery?.changed === true) {
+                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    consumedExecutorCases.push({
+                        ...(classified.contract || {}),
+                        reason: stalledPendingActionRecovery.reason || 'active-pending-action-stale-claim-recovered',
+                        ...(stalledPendingActionRecovery.error ? {error: stalledPendingActionRecovery.error} : {})
+                    })
+                    if(stalledPendingActionRecovery.requeued === true) {
+                        requeued += 1
+                    }
+                    scheduleCoordinatorQueueResume(1000, stalledPendingActionRecovery.reason || 'active-pending-action-stale-claim-recovered', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: stalledPendingActionRecovery.reason || 'active-pending-action-stale-claim-recovered',
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    continue
+                }
                 incrementMetric('noop.activeRuntimeSurfaceAlreadyClaimable')
+                const nudgeResult = await nudgeQueuedTabActionClaim(
+                    liveTab?.id || item?.tabId || record?.tabId,
+                    'active-pending-action-nudged'
+                ).catch(error => ({
+                    nudged: false,
+                    reason: 'active-pending-action-nudge-error',
+                    error: error?.message || String(error || '')
+                }))
+                const nudgeReason = nudgeResult?.nudged === true
+                    ? 'active-pending-action-nudged'
+                    : nudgeResult?.reason || 'active-pending-action-nudge-failed'
+                unresolvedExecutorCases.push({
+                    ...(classified.contract || {}),
+                    reason: nudgeReason,
+                    ...(nudgeResult?.error ? {error: nudgeResult.error} : {})
+                })
+                scheduleQueuedWorkContinuation(nudgeReason)
+                scheduleCoordinatorReconcile(1000, {
+                    reason: nudgeReason,
+                    edgeTriggered: true,
+                    allowBeforeQuora: true
+                })
                 continue
             }
-            if(options.requeueMissingActiveTabs === true &&
+            if(requeueMissingActiveTabs &&
                 classifiedCase === 'active-missing-tab') {
-                const freshStartupActor = getFreshQueuedTabStartupRuntimeActorForCoordinatorItem(item, record, itemKey, Date.now(), null, {
+                const latestAuthorityItem = coordinatorAuthority.current()?.queue?.[itemKey] ||
+                    currentAuthorityState?.queue?.[itemKey] ||
+                    null
+                if(!latestAuthorityItem ||
+                    !isActiveCoordinatorStatus(latestAuthorityItem.status) ||
+                    getAttemptIdFromValue(latestAuthorityItem) !== getAttemptIdFromValue(item) ||
+                    getAttemptNumberFromValue(latestAuthorityItem) !== getAttemptNumberFromValue(item)) {
+                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    consumedExecutorCases.push({
+                        ...(classified.contract || {}),
+                        reason: 'active-missing-tab-authority-already-moved'
+                    })
+                    continue
+                }
+                const latestRecord = getCoordinatorProgressRecordForItem(itemKey, latestAuthorityItem, progress)
+                const activeMissingTabRecord = latestRecord && !hasMismatchedCoordinatorAttempt(latestAuthorityItem, latestRecord)
+                    ? latestRecord
+                    : null
+                const freshStartupActor = getFreshQueuedTabStartupRuntimeActorForCoordinatorItem(latestAuthorityItem, activeMissingTabRecord, itemKey, Date.now(), null, {
                     requireDurable: false
                 })
                 if(freshStartupActor) {
@@ -15178,16 +17551,18 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 }
                 const requeueResult = await requeueDurableActiveCoordinatorItemWithoutActor(
                     itemKey,
-                    item,
-                    record,
+                    latestAuthorityItem,
+                    activeMissingTabRecord,
                     `${reason || 'coordinator-executor'}-queue-only-active-missing-tab`,
                     {
                         currentAuthorityState,
-                        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+                        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
                         skipFreshOpenDeferralAfterLeaseRelease: true,
                         skipActionPhaseProtection: true,
                         skipFreshContentReadiness: true,
-                        skipLiveReclaimAdoption: true
+                        skipLiveReclaimAdoption: true,
+                        forceRequeueExhaustedActorless: true,
+                        extendActorlessRetryBudget: true
                     }
                 ).catch(error => ({
                     changed: false,
@@ -15207,39 +17582,41 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                             currentAuthorityState?.queue?.[requeueResult.itemKey || itemKey] ||
                             currentAuthorityState?.queue?.[itemKey] ||
                             null
-                        const requeuedHref = getCoordinatorItemHref(requeuedItem) || normalizeQuoraProfileUrl(requeueResult.itemKey || itemKey)
-                        const requeuedCoordinatorKey = getCoordinatorItemQueueKey(requeuedItem, requeueResult.itemKey || itemKey)
                         if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
-                            const terminalizeResult = await terminalizeExhaustedRolledBackQueuedCoordinatorItem(
-                                requeueResult.itemKey || itemKey,
-                                requeuedItem,
-                                {
-                                    currentAuthorityState,
-                                    reason: 'executor-plan-active-transition-retry-budget-exhausted'
-                                }
-                            ).catch(error => ({
+                            const terminalizeResult = await (shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, {
+                                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                                recoverActiveTransitionFailures: true,
+                                serviceWorkerOwned
+                            })
+                                ? recoverExhaustedRolledBackQueuedCoordinatorItem(
+                                    requeueResult.itemKey || itemKey,
+                                    requeuedItem,
+                                    {
+                                        currentAuthorityState,
+                                        reason: 'executor-plan-active-transition-retry-budget-recovered'
+                                    }
+                                )
+                                : terminalizeExhaustedRolledBackQueuedCoordinatorItem(
+                                    requeueResult.itemKey || itemKey,
+                                    requeuedItem,
+                                    {
+                                        currentAuthorityState,
+                                        reason: 'executor-plan-active-transition-retry-budget-exhausted'
+                                    }
+                                )).catch(error => ({
                                 changed: false,
                                 reason: 'terminalize-error',
                                 error: error?.message || `${error || ''}`
                             }))
                             if(terminalizeResult?.changed) {
-                                terminalizedExhausted += 1
+                                if(terminalizeResult.recovered !== true) {
+                                    terminalizedExhausted += 1
+                                }
                                 currentAuthorityState = coordinatorAuthority.current()
-                                incrementMetric('changed.requeuedMissingActiveTabTerminalized')
+                                incrementMetric(terminalizeResult.recovered === true
+                                    ? 'changed.requeuedMissingActiveTabRecovered'
+                                    : 'changed.requeuedMissingActiveTabTerminalized')
                             }
-                        }
-                        else if(requeuedItem &&
-                            (requeuedHref || requeuedCoordinatorKey) &&
-                            shouldResumeCoordinatorItem(requeuedItem, liveProfileTabsByHref, {record: null})) {
-                            pendingItems.push({
-                                ...requeuedItem,
-                                targetProfileHref: requeuedHref || '',
-                                requestedUrl: normalizeCoordinatorRequestedUrl(requeuedItem?.requestedUrl || requeuedHref),
-                                dedupeKey: requeuedHref || requeuedCoordinatorKey,
-                                coordinatorKey: requeuedCoordinatorKey,
-                                tabAction: getCoordinatorItemExecutorTabAction(requeuedItem)
-                            })
-                            incrementMetric('changed.requeuedMissingActiveTabQueuedForFill')
                         }
                     }
                     scheduleCoordinatorQueueResume(1000, `${reason || 'coordinator-executor'}-active-requeued`, {
@@ -15284,7 +17661,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 continue
             }
         }
-        if(`${item?.status || ''}`.trim() === 'queued' && href) {
+        if(`${item?.status || ''}`.trim() === 'queued') {
             const liveTab = classified?.contract?.case === 'queued-with-live-profile-tab-needs-adoption'
                 ? classified.liveTab || null
                 : null
@@ -15327,7 +17704,10 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             }
             if(classified?.contract?.case === 'queued-with-stale-runtime-surface') {
                 const staleRuntimeResult = await resolveQueuedStaleRuntimeExecutorCase(classified, {
-                    currentAuthorityState
+                    currentAuthorityState,
+                    queueOnlyAuthority: options.queueOnlyAuthority === true,
+                    serviceWorkerOwned,
+                    awaitFill: options.awaitFill !== false
                 })
                 if(staleRuntimeResult.changed && staleRuntimeResult.consumed) {
                     currentAuthorityState = coordinatorAuthority.current()
@@ -15337,6 +17717,39 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         reason: staleRuntimeResult.reason || 'queued-stale-runtime-resolved'
                     })
                     incrementMetric('changed.queuedStaleRuntimeResolved')
+                    const reprimeItemKey = staleRuntimeResult.itemKey || itemKey
+                    const reprimeItem = staleRuntimeResult.reprimeQueuedAuthority === true
+                        ? currentAuthorityState?.queue?.[reprimeItemKey] || staleRuntimeResult.item || item
+                        : null
+                    if(reprimeItem && `${reprimeItem.status || ''}`.trim() === 'queued') {
+                        const reprimeHref = getCoordinatorItemHref(reprimeItem) || href || normalizeQuoraProfileUrl(reprimeItemKey)
+                        const reprimeCoordinatorKey = getCoordinatorItemQueueKey(reprimeItem, reprimeItemKey) || coordinatorKey
+                        if(shouldResumeCoordinatorItem(reprimeItem, liveProfileTabsByHref, {record})) {
+                            pendingItems.push({
+                                ...reprimeItem,
+                                tabId: null,
+                                targetProfileHref: reprimeHref || '',
+                                requestedUrl: normalizeCoordinatorRequestedUrl(reprimeItem?.requestedUrl || reprimeHref),
+                                dedupeKey: reprimeHref || reprimeCoordinatorKey,
+                                coordinatorKey: reprimeCoordinatorKey,
+                                tabAction: getCoordinatorItemExecutorTabAction(reprimeItem)
+                            })
+                            if(record) {
+                                if(reprimeHref) pendingProgressRecordsByKey.set(reprimeHref, record)
+                                if(reprimeCoordinatorKey) pendingProgressRecordsByKey.set(reprimeCoordinatorKey, record)
+                                if(reprimeItemKey) pendingProgressRecordsByKey.set(reprimeItemKey, record)
+                            }
+                            pendingExecutorContracts.set(reprimeHref || reprimeCoordinatorKey || reprimeItemKey, {
+                                ...(classified.contract || {}),
+                                case: 'queued-authority-without-executor-surface',
+                                rowKey: reprimeItemKey,
+                                status: 'queued',
+                                tabId: null,
+                                reason: `${staleRuntimeResult.reason || 'queued-stale-runtime-resolved'}-reprimed`
+                            })
+                            incrementMetric('changed.queuedStaleRuntimeReprimed')
+                        }
+                    }
                     continue
                 }
                 unresolvedExecutorCases.push({
@@ -15408,6 +17821,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 adopted,
                 active: activeQueuedTabs.size,
                 executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
                 consumedExecutorCases,
                 unresolvedExecutorCases,
                 paused: false,
@@ -15423,10 +17838,14 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 requeued,
                 terminalizedExhausted,
                 executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
                 consumedExecutorCases,
                 unresolvedExecutorCases,
                 paused: false,
-                reason: 'requeued-missing-active-tabs'
+                reason: terminalizedExhausted > 0
+                    ? 'terminalized-requeued-missing-active-tab'
+                    : 'requeued-missing-active-tabs'
             })
         }
         if(resolvedStaleRuntime > 0) {
@@ -15439,6 +17858,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 resolvedStaleRuntime,
                 terminalizedExhausted,
                 executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
                 consumedExecutorCases,
                 unresolvedExecutorCases,
                 paused: false,
@@ -15456,6 +17877,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 resolvedTerminalRuntime,
                 terminalizedExhausted,
                 executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
                 consumedExecutorCases,
                 unresolvedExecutorCases,
                 paused: false,
@@ -15473,10 +17896,32 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 terminalizedBlocked,
                 terminalizedExhausted,
                 executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
                 consumedExecutorCases,
                 unresolvedExecutorCases,
                 paused: false,
                 reason: 'terminalized-blocked-active-runtime'
+            })
+        }
+        if(preRecoveredExhausted > 0) {
+            return finishCoordinatorExecutorApplyResult({
+                changed: true,
+                queued: 0,
+                pending: 0,
+                adopted,
+                requeued,
+                resolvedStaleRuntime,
+                resolvedTerminalRuntime,
+                terminalizedBlocked,
+                terminalizedExhausted,
+                executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
+                consumedExecutorCases,
+                unresolvedExecutorCases,
+                paused: false,
+                reason: 'recovered-exhausted-rolled-back-rows'
             })
         }
         incrementMetric('noop.noPendingItems')
@@ -15487,6 +17932,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             pending: 0,
             adopted: 0,
             executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
             consumedExecutorCases,
             unresolvedExecutorCases,
             primaryUnresolvedCase,
@@ -15528,104 +17975,43 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             ? 'coordinator-executor-enqueue-timeout'
             : 'coordinator-executor-enqueue-error'
     }))
-    if(enqueueResult?.reason === 'coordinator-executor-enqueue-timeout') {
-        resetCoordinatorExecutorStartPromiseAfterTimeout(enqueueResult.reason)
-        enqueueResult = {
-            queued: pendingItems.length,
-            terminalizedExhausted: 0,
-            queuedKeys: pendingItems
-                .map(item => getCoordinatorItemHref(item) || getCoordinatorItemQueueKey(item))
-                .filter(Boolean),
-            terminalizedExhaustedKeys: [],
-            fillResult: {
-                openedTabs: 0,
-                active: 0,
-                schedulerBlockingActive: 0,
-                remainingActions: 0,
-                reason: 'coordinator-executor-enqueue-timeout',
-                error: enqueueResult.error || 'coordinator executor enqueue timed out before materializing runtime work'
-            },
-            recoveredFromTimeout: true
-        }
-    }
     if(enqueueResult?.error) {
         const enqueueErrorReason = enqueueResult.reason || 'coordinator-executor-enqueue-error'
+        let enqueueTimeoutRuntimeRecovery = null
         if(enqueueErrorReason === 'coordinator-executor-enqueue-timeout') {
             resetCoordinatorExecutorStartPromiseAfterTimeout(enqueueErrorReason)
+            enqueueTimeoutRuntimeRecovery = await recoverQueuedRuntimeActionsAfterExecutorEnqueueTimeout(ownerTabId, {
+                currentAuthorityState,
+                reason: enqueueErrorReason
+            })
         }
         const consumedTimeoutKeys = new Set()
         let timeoutTerminalizeResult = null
-        if(enqueueErrorReason === 'coordinator-executor-enqueue-timeout') {
-            const latestAuthorityState = await loadCoordinatorCurrentAuthorityState()
-                .catch(() => null)
-            if(latestAuthorityState?.queue) {
-                currentAuthorityState = latestAuthorityState
-                refreshResidentCoordinatorAuthorityState(
-                    currentAuthorityState,
-                    'reconcile.executor.enqueueTimeout.refreshedAuthority'
-                )
-            }
-            const timeoutItems = Array.from(pendingExecutorContracts.keys())
-                .map(key => currentAuthorityState?.queue?.[key])
-                .filter(Boolean)
-            const terminalizeResult = await terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(timeoutItems, {
-                operationKind: 'terminalize-queued-authority-enqueue-timeout',
-                metricPath: 'coordinatorExecutor.enqueueTimeout.terminalize',
-                source: 'terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems',
-                reason: 'coordinator-executor-enqueue-timeout',
-                terminalizedReason: 'terminalized-coordinator-executor-enqueue-timeout',
-                retryBeforeTerminal: true,
-                recordByKey: pendingProgressRecordsByKey,
-                currentAuthorityState,
-                error: enqueueResult.error,
-                enqueueDiagnostics: buildEnqueueFailureTerminalizationDiagnostics(enqueueResult, {
-                    runtimeSurfaceBefore: false
-                })
-            }).catch(error => ({
-                changed: false,
-                terminalized: 0,
-                requeued: 0,
-                keys: [],
-                requeuedKeys: [],
-                reason: 'queued-authority-enqueue-timeout-terminalize-error',
-                error: error?.message || `${error || ''}`
-            }))
-            timeoutTerminalizeResult = terminalizeResult
-            if(terminalizeResult?.changed) {
-                terminalizedExhausted += terminalizeResult.terminalized || 0
-                currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
-                for(const key of [
-                    ...(terminalizeResult.keys || []),
-                    ...(terminalizeResult.requeuedKeys || [])
-                ]) {
-                    if(key) consumedTimeoutKeys.add(key)
-                }
-                for(const key of consumedTimeoutKeys) {
-                    const contract = pendingExecutorContracts.get(key) ||
-                        Array.from(pendingExecutorContracts.values()).find(candidate => candidate?.rowKey === key) ||
-                        null
-                    if(contract) {
-                        consumedExecutorCases.push({
-                            ...contract,
-                            reason: terminalizeResult.reason || enqueueErrorReason
-                        })
-                    }
-                }
-            }
-        }
         for(const [key, contract] of pendingExecutorContracts.entries()) {
             if(consumedTimeoutKeys.has(key)) continue
             unresolvedExecutorCases.push({
                 ...contract,
                 reason: enqueueErrorReason,
                 error: enqueueResult.error,
-                terminalizeReason: timeoutTerminalizeResult?.reason || '',
-                terminalizeErrors: timeoutTerminalizeResult?.errors || []
+                terminalizeReason: enqueueErrorReason === 'coordinator-executor-enqueue-timeout'
+                    ? 'executor-start-gate-reset'
+                    : timeoutTerminalizeResult?.reason || '',
+                terminalizeErrors: timeoutTerminalizeResult?.errors || [],
+                ...(enqueueTimeoutRuntimeRecovery?.changed === true
+                    ? {
+                        runtimeActionsAdopted: enqueueTimeoutRuntimeRecovery.adopted || 0,
+                        runtimeActionsPreserved: enqueueTimeoutRuntimeRecovery.preserved || 0,
+                        runtimeRecoveryReason: enqueueTimeoutRuntimeRecovery.reason || ''
+                    }
+                    : {})
             })
         }
         scheduleCoordinatorQueueResume(1000, enqueueErrorReason, {
             allowBeforeQuora: true
         })
+        if(enqueueErrorReason === 'coordinator-executor-enqueue-timeout') {
+            await awaitCoordinatorResumeAlarmPersistence('coordinator executor enqueue timeout resume alarm')
+        }
         scheduleCoordinatorReconcile(1000, {
             reason: enqueueErrorReason,
             edgeTriggered: true,
@@ -15635,14 +18021,73 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             scheduleQueuedWorkContinuation(enqueueErrorReason)
         }
     }
-    const queued = enqueueResult.queued || 0
+    let queued = enqueueResult.queued || 0
     terminalizedExhausted += enqueueResult.terminalizedExhausted || 0
     currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+    if(enqueueResult?.fillResult?.reason === 'queued-tab-stale-action-pruned' &&
+        queued <= 0 &&
+        adopted <= 0 &&
+        activeQueuedTabs.size <= 0 &&
+        queuedTabActions.length <= 0 &&
+        pendingTabActions.size <= 0 &&
+        pendingItems.length > 0) {
+        const reprimeResult = await reprimeFreshQueuedTabActionsForCurrentPendingItems(
+            pendingItems,
+            ownerTabId,
+            ownerWindowId,
+            {
+                ...options,
+                currentAuthorityState,
+                liveProfileTabsByHref,
+                limit: getCoordinatorExecutorPlanBatchLimit(ownerTabId, options)
+            }
+        ).catch(error => ({
+            reprimed: 0,
+            keys: [],
+            reason: 'current-pending-reprime-error',
+            error: error?.message || `${error || ''}`
+        }))
+        if(reprimeResult.reprimed > 0) {
+            queued = reprimeResult.reprimed
+            incrementMetric('changed.reprimedCurrentAfterStaleActionPruned', reprimeResult.reprimed)
+            scheduleCoordinatorQueueResume(1000, 'queued-tab-stale-action-pruned-current-reprimed', {
+                allowBeforeQuora: true
+            })
+            scheduleQueuedWorkContinuation('queued-tab-stale-action-pruned-current-reprimed')
+            scheduleCoordinatorReconcile(1000, {
+                reason: 'queued-tab-stale-action-pruned-current-reprimed',
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            return finishCoordinatorExecutorApplyResult({
+                changed: true,
+                queued,
+                queuedKeys: reprimeResult.keys || [],
+                pending: pendingItems.length,
+                terminalizedExhausted,
+                terminalizedBlocked,
+                adopted,
+                requeued,
+                resolvedStaleRuntime,
+                resolvedTerminalRuntime,
+                executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
+                consumedExecutorCases,
+                unresolvedExecutorCases,
+                primaryUnresolvedCase: null,
+                paused: false,
+                reason: 'reprimed-current-authority-after-stale-action-pruned'
+            })
+        }
+        incrementMetric(`noop.reprimeCurrentAfterStaleActionPruned.${normalizeStorageMetricPathName(reprimeResult.reason || 'notReprimed')}`)
+    }
     const fillLeftRuntimeActions = (Number.parseInt(enqueueResult?.fillResult?.remainingActions, 10) || 0) > 0
     const fillTimedOutBeforeMaterialization =
         enqueueResult?.fillResult?.reason === 'queued-tab-fill-timeout' ||
-        enqueueResult?.fillResult?.reason === 'final-open-decision-timeout'
-    if(fillLeftRuntimeActions || fillTimedOutBeforeMaterialization) {
+        enqueueResult?.fillResult?.reason === 'final-open-decision-timeout' ||
+        enqueueResult?.fillResult?.reason === 'queued-tab-final-open-decision-timeout'
+    if(fillTimedOutBeforeMaterialization) {
         const refreshedAuthorityState = await loadCoordinatorCurrentAuthorityState()
             .catch(() => null)
         if(refreshedAuthorityState?.queue) {
@@ -15652,6 +18097,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 'reconcile.executor.postFillPrune.refreshedAuthority'
             )
         }
+    }
+    if(fillTimedOutBeforeMaterialization && !fillLeftRuntimeActions) {
         await pruneQueuedTabActions(ownerTabId, {
             queueOnlyAuthority: options.queueOnlyAuthority === true,
             currentAuthorityState,
@@ -15672,8 +18119,109 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
     }
     const terminalizedMaterializationKeys = new Set()
     const deferredMaterializationKeys = new Set()
-    const enqueueMaterializationReason = getQueuedAuthorityEnqueueMaterializationReason(enqueueResult)
-    if(!enqueueResult?.error &&
+    const awaitedExecutorFill = options.awaitFill !== false
+    const enqueueMaterializationReason = awaitedExecutorFill
+        ? getQueuedAuthorityEnqueueMaterializationReason(enqueueResult)
+        : 'queued-authority-enqueue-planned-runtime'
+    const applyPostMaterializationLiveTabRecovery = async (
+        currentItem = null,
+        currentItemKey = '',
+        contract = null,
+        runtimeSurface = {},
+        fallbackReason = ''
+    ) => {
+        const recoveryRecord = pendingProgressRecordsByKey.get(currentItemKey) ||
+            pendingProgressRecordsByKey.get(getCoordinatorItemQueueKey(currentItem, currentItemKey)) ||
+            pendingProgressRecordsByKey.get(getCoordinatorItemHref(currentItem)) ||
+            null
+        const recovery = await recoverQueuedAuthorityLiveTabAfterMaterializationFailure(
+            currentItem,
+            currentItemKey,
+            recoveryRecord,
+            {
+                ownerTabId,
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                currentAuthorityState,
+                runtimeSurface
+            }
+        )
+        if(recovery?.liveProfileTabsByHref instanceof Map) {
+            liveProfileTabsByHref = recovery.liveProfileTabsByHref
+        }
+        if(recovery?.adopted === true) {
+            adopted += 1
+            currentAuthorityState = recovery.currentAuthorityState || coordinatorAuthority.current() || currentAuthorityState
+            if(contract) {
+                consumedExecutorCases.push({
+                    ...contract,
+                    reason: recovery.reason || 'queued-live-tab-adopted-after-materialization-timeout',
+                    fillResultReason: enqueueResult?.fillResult?.reason || '',
+                    fillActive: enqueueResult?.fillResult?.active || 0,
+                    fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                    runtimeSurfaceBefore: runtimeSurface?.hasSurface === true,
+                    tabId: recovery.tabId || null
+                })
+            }
+            incrementMetric('changed.adoptedLiveTabAfterMaterializationTimeout')
+            consumedQueuedKeys.delete(currentItemKey)
+            return true
+        }
+        if(recovery?.unresolved === true) {
+            if(contract) {
+                unresolvedExecutorCases.push({
+                    ...contract,
+                    reason: recovery.reason || 'queued-authority-live-profile-tab-unclassified',
+                    deferredReason: fallbackReason || enqueueMaterializationReason,
+                    fillResultReason: enqueueResult?.fillResult?.reason || '',
+                    fillActive: enqueueResult?.fillResult?.active || 0,
+                    fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                    ...(enqueueResult?.fillResult?.error ? {error: enqueueResult.fillResult.error} : {}),
+                    runtimeSurfaceBefore: runtimeSurface?.hasSurface === true,
+                    liveProfileTabs: recovery.liveProfileTabs || 0,
+                    tabId: recovery.tabId || null
+                })
+            }
+            scheduleCoordinatorReconcile(1000, {
+                reason: recovery.reason || 'queued-authority-live-profile-tab-unclassified',
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            incrementMetric('noop.liveProfileTabUnclassifiedAfterMaterializationTimeout')
+            deferredMaterializationKeys.add(currentItemKey)
+            consumedQueuedKeys.delete(currentItemKey)
+            return true
+        }
+        return false
+    }
+    const shouldConsumeFastMaterializedRuntimeSurface = (runtimeSurface = {}, materializationReason = '') => {
+        if(options.returnAfterDurableActive === false) return false
+        if(runtimeSurface?.hasSurface !== true) return false
+        if(materializationReason === 'queued-authority-enqueue-runtime-materializing') return true
+        if(materializationReason === 'queued-authority-enqueue-runtime-surface-materialized') return true
+        if(materializationReason === 'queued-tab-fill-timeout') {
+            return (Number.parseInt(enqueueResult?.fillResult?.openedTabs, 10) || 0) > 0
+        }
+        return false
+    }
+    const consumeFastMaterializedRuntimeSurface = (
+        contract = null,
+        runtimeSurface = {},
+        materializationReason = ''
+    ) => {
+        if(!contract) return false
+        consumedExecutorCases.push({
+            ...contract,
+            reason: materializationReason || 'queued-authority-enqueue-runtime-materializing',
+            fillResultReason: enqueueResult?.fillResult?.reason || '',
+            fillActive: enqueueResult?.fillResult?.active || 0,
+            fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+            runtimeSurfaceBefore: runtimeSurface?.hasSurface === true
+        })
+        incrementMetric('changed.consumedFastMaterializedRuntimeSurface')
+        return true
+    }
+    if(awaitedExecutorFill &&
+        !enqueueResult?.error &&
         consumedQueuedKeys.size > 0 &&
         (enqueueResult.terminalizedExhausted || 0) === 0) {
         const fillOpenedTabs = Number.parseInt(enqueueResult?.fillResult?.openedTabs, 10) || 0
@@ -15688,6 +18236,15 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 const contract = pendingExecutorContracts.get(itemKey) ||
                     Array.from(pendingExecutorContracts.values()).find(candidate => candidate?.rowKey === itemKey) ||
                     null
+                if(await applyPostMaterializationLiveTabRecovery(
+                    currentItem,
+                    itemKey,
+                    contract,
+                    runtimeSurface,
+                    'queued-tab-fill-timeout-before-open-attempt'
+                )) {
+                    continue
+                }
                 if(contract) {
                     unresolvedExecutorCases.push({
                         ...contract,
@@ -15695,6 +18252,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         fillResultReason: enqueueResult?.fillResult?.reason || '',
                         fillActive: enqueueResult?.fillResult?.active || 0,
                         fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                        ...(enqueueResult?.fillResult?.error ? {error: enqueueResult.fillResult.error} : {}),
                         runtimeSurfaceBefore: runtimeSurface.hasSurface === true
                     })
                 }
@@ -15708,16 +18266,73 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 consumedQueuedKeys.delete(itemKey)
                 continue
             }
+            const normalizedEnqueueMaterializationReason = normalizeQueuedAuthorityEnqueueMaterializationReason(
+                currentItem,
+                runtimeSurface,
+                enqueueMaterializationReason
+            )
+            const contract = pendingExecutorContracts.get(itemKey) ||
+                Array.from(pendingExecutorContracts.values()).find(candidate => candidate?.rowKey === itemKey) ||
+                null
+            if(shouldConsumeFastMaterializedRuntimeSurface(runtimeSurface, normalizedEnqueueMaterializationReason) &&
+                consumeFastMaterializedRuntimeSurface(contract, runtimeSurface, normalizedEnqueueMaterializationReason)) {
+                consumedQueuedKeys.delete(itemKey)
+                continue
+            }
+            if(normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-no-open-attempt') {
+                if(await applyPostMaterializationLiveTabRecovery(
+                    currentItem,
+                    itemKey,
+                    contract,
+                    runtimeSurface,
+                    normalizedEnqueueMaterializationReason
+                )) {
+                    continue
+                }
+                if(contract) {
+                    unresolvedExecutorCases.push({
+                        ...contract,
+                        reason: normalizedEnqueueMaterializationReason,
+                        fillResultReason: enqueueResult?.fillResult?.reason || '',
+                        fillActive: enqueueResult?.fillResult?.active || 0,
+                        fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                        runtimeSurfaceBefore: runtimeSurface.hasSurface === true
+                    })
+                }
+                scheduleCoordinatorQueueResume(1000, normalizedEnqueueMaterializationReason, {
+                    allowBeforeQuora: true
+                })
+                scheduleQueuedWorkContinuation(normalizedEnqueueMaterializationReason)
+                scheduleCoordinatorReconcile(1000, {
+                    reason: normalizedEnqueueMaterializationReason,
+                    edgeTriggered: true,
+                    allowBeforeQuora: true
+                })
+                deferredMaterializationKeys.add(itemKey)
+                continue
+            }
             if(enqueueResult?.fillResult?.reason === 'queued-tab-open-failed' ||
-                enqueueMaterializationReason === 'queued-authority-enqueue-runtime-materializing' ||
-                enqueueMaterializationReason === 'queued-authority-enqueue-deferred-by-capacity' ||
+                normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-runtime-surface-materialized' ||
+                normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-runtime-materializing' ||
+                normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-deferred-by-capacity' ||
+                normalizedEnqueueMaterializationReason === 'queued-tab-stale-action-pruned' ||
+                normalizedEnqueueMaterializationReason === 'queued-tab-final-open-decision-timeout' ||
                 hasBlockingRuntimeSurfaceAfterEnqueueFailure(runtimeSurface, enqueueResult)) {
-                const deferredReason = hasBlockingRuntimeSurfaceAfterEnqueueFailure(runtimeSurface, enqueueResult)
+                const deferredReason = normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-did-not-materialize-runtime' &&
+                    hasBlockingRuntimeSurfaceAfterEnqueueFailure(runtimeSurface, enqueueResult)
                     ? 'queued-authority-enqueue-runtime-materializing'
-                    : enqueueMaterializationReason
-                const contract = pendingExecutorContracts.get(itemKey) ||
-                    Array.from(pendingExecutorContracts.values()).find(candidate => candidate?.rowKey === itemKey) ||
-                    null
+                    : normalizedEnqueueMaterializationReason
+                if((normalizedEnqueueMaterializationReason === 'queued-tab-final-open-decision-timeout' ||
+                        normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-runtime-materializing') &&
+                    await applyPostMaterializationLiveTabRecovery(
+                        currentItem,
+                        itemKey,
+                        contract,
+                        runtimeSurface,
+                        normalizedEnqueueMaterializationReason
+                    )) {
+                    continue
+                }
                 if(contract) {
                     unresolvedExecutorCases.push({
                         ...contract,
@@ -15725,10 +18340,14 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         fillResultReason: enqueueResult?.fillResult?.reason || '',
                         fillActive: enqueueResult?.fillResult?.active || 0,
                         fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                        ...(enqueueResult?.fillResult?.error ? {error: enqueueResult.fillResult.error} : {}),
                         runtimeSurfaceBefore: runtimeSurface.hasSurface === true
                     })
                 }
                 scheduleQueuedWorkContinuation(deferredReason)
+                scheduleCoordinatorQueueResume(1000, deferredReason, {
+                    allowBeforeQuora: true
+                })
                 scheduleCoordinatorReconcile(1000, {
                     reason: deferredReason,
                     edgeTriggered: true,
@@ -15737,16 +18356,29 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 deferredMaterializationKeys.add(itemKey)
                 continue
             }
+            if(normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-did-not-materialize-runtime') {
+                if(await applyPostMaterializationLiveTabRecovery(
+                    currentItem,
+                    itemKey,
+                    contract,
+                    runtimeSurface,
+                    enqueueMaterializationReason
+                )) {
+                    continue
+                }
+            }
             const terminalizeResult = await terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems([currentItem], {
                 operationKind: 'terminalize-queued-authority-enqueue-failure',
                 metricPath: 'coordinatorExecutor.enqueueFailure.terminalize',
                 source: 'terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems',
-                reason: enqueueMaterializationReason,
-                terminalizedReason: `terminalized-${enqueueMaterializationReason}`,
-                retryBeforeTerminal: enqueueMaterializationReason === 'queued-authority-enqueue-did-not-materialize-runtime',
+                reason: normalizedEnqueueMaterializationReason,
+                terminalizedReason: `terminalized-${normalizedEnqueueMaterializationReason}`,
+                retryBeforeTerminal: normalizedEnqueueMaterializationReason === 'queued-authority-enqueue-did-not-materialize-runtime',
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                serviceWorkerOwned,
                 recordByKey: pendingProgressRecordsByKey,
                 error: enqueueResult?.fillResult?.error || (
-                    enqueueMaterializationReason === 'queued-tab-final-open-decision-timeout'
+                    normalizedEnqueueMaterializationReason === 'queued-tab-final-open-decision-timeout'
                         ? 'queued tab final open decision timed out'
                         : 'Coordinator executor enqueue returned without active, terminal, or runtime surface'
                 ),
@@ -15763,14 +18395,20 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             if(!terminalizeResult?.changed) continue
             terminalizedExhausted += terminalizeResult.terminalized || 0
             currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+            await pruneQueuedTabActions(ownerTabId, {
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                currentAuthorityState,
+                ignoreActiveFillPromise: true,
+                reason: 'enqueue-failure-terminalized-authority-prune'
+            })
             terminalizedMaterializationKeys.add(itemKey)
-            const contract = pendingExecutorContracts.get(itemKey) ||
+            const terminalizedContract = pendingExecutorContracts.get(itemKey) ||
                 Array.from(pendingExecutorContracts.values()).find(candidate => candidate?.rowKey === itemKey) ||
                 null
-            if(contract) {
+            if(terminalizedContract) {
                 consumedExecutorCases.push({
-                    ...contract,
-                    reason: terminalizeResult.reason || enqueueMaterializationReason
+                    ...terminalizedContract,
+                    reason: terminalizeResult.reason || normalizedEnqueueMaterializationReason
                 })
             }
         }
@@ -15795,16 +18433,33 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             const candidateKey = getCoordinatorItemHref(candidate) || getCoordinatorItemQueueKey(candidate) || ''
             return candidateKey === contract.rowKey || candidateKey === currentItemKey
         }) || null
-        const materializationReason = enqueueMaterializationReason
-        const fillOpenedTabs = Number.parseInt(enqueueResult?.fillResult?.openedTabs, 10) || 0
         const terminalizationCandidate = currentItem || pendingItemForContract
         const terminalizationCandidateKey = currentItemKey || contract.rowKey || ''
         const terminalizationRuntimeSurface = terminalizationCandidate
             ? getRuntimeSurfaceForCoordinatorItem(terminalizationCandidate, terminalizationCandidateKey)
             : {hasSurface: false}
+        const materializationReason = normalizeQueuedAuthorityEnqueueMaterializationReason(
+            terminalizationCandidate,
+            terminalizationRuntimeSurface,
+            enqueueMaterializationReason
+        )
+        if(shouldConsumeFastMaterializedRuntimeSurface(terminalizationRuntimeSurface, materializationReason) &&
+            consumeFastMaterializedRuntimeSurface(contract, terminalizationRuntimeSurface, materializationReason)) {
+            continue
+        }
+        const fillOpenedTabs = Number.parseInt(enqueueResult?.fillResult?.openedTabs, 10) || 0
         if(materializationReason === 'queued-tab-fill-timeout' &&
             `${terminalizationCandidate?.status || ''}`.trim() === 'queued' &&
             fillOpenedTabs <= 0) {
+            if(await applyPostMaterializationLiveTabRecovery(
+                terminalizationCandidate,
+                terminalizationCandidateKey,
+                contract,
+                terminalizationRuntimeSurface,
+                'queued-tab-fill-timeout-before-open-attempt'
+            )) {
+                continue
+            }
             unresolvedExecutorCases.push({
                 ...contract,
                 reason: 'queued-tab-fill-timeout-before-open-attempt',
@@ -15821,6 +18476,17 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             })
             deferredMaterializationKeys.add(key)
             consumedQueuedKeys.delete(key)
+            continue
+        }
+        if((materializationReason === 'queued-authority-enqueue-did-not-materialize-runtime' ||
+                materializationReason === 'queued-authority-enqueue-runtime-materializing') &&
+            await applyPostMaterializationLiveTabRecovery(
+                terminalizationCandidate,
+                terminalizationCandidateKey,
+                contract,
+                terminalizationRuntimeSurface,
+                materializationReason
+            )) {
             continue
         }
         if(materializationReason === 'queued-authority-enqueue-did-not-materialize-runtime' &&
@@ -15841,11 +18507,98 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             })
             continue
         }
+        if(materializationReason === 'queued-authority-enqueue-no-open-attempt') {
+            if(await applyPostMaterializationLiveTabRecovery(
+                terminalizationCandidate,
+                terminalizationCandidateKey,
+                contract,
+                terminalizationRuntimeSurface,
+                materializationReason
+            )) {
+                continue
+            }
+            unresolvedExecutorCases.push({
+                ...contract,
+                reason: materializationReason,
+                fillResultReason: enqueueResult?.fillResult?.reason || '',
+                fillActive: enqueueResult?.fillResult?.active || 0,
+                fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                runtimeSurfaceBefore: terminalizationRuntimeSurface.hasSurface === true
+            })
+            scheduleCoordinatorQueueResume(1000, materializationReason, {
+                allowBeforeQuora: true
+            })
+            scheduleQueuedWorkContinuation(materializationReason)
+            scheduleCoordinatorReconcile(1000, {
+                reason: materializationReason,
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            continue
+        }
+        if(materializationReason === 'queued-tab-stale-action-pruned') {
+            unresolvedExecutorCases.push({
+                ...contract,
+                reason: materializationReason,
+                fillResultReason: enqueueResult?.fillResult?.reason || '',
+                fillActive: enqueueResult?.fillResult?.active || 0,
+                fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                runtimeSurfaceBefore: terminalizationRuntimeSurface.hasSurface === true
+            })
+            scheduleQueuedWorkContinuation(materializationReason)
+            scheduleCoordinatorQueueResume(1000, materializationReason, {
+                allowBeforeQuora: true
+            })
+            scheduleCoordinatorReconcile(1000, {
+                reason: materializationReason,
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            continue
+        }
+        if(materializationReason === 'queued-tab-final-open-decision-timeout') {
+            if(await applyPostMaterializationLiveTabRecovery(
+                terminalizationCandidate,
+                terminalizationCandidateKey,
+                contract,
+                terminalizationRuntimeSurface,
+                materializationReason
+            )) {
+                continue
+            }
+            unresolvedExecutorCases.push({
+                ...contract,
+                reason: materializationReason,
+                fillResultReason: enqueueResult?.fillResult?.reason || '',
+                fillActive: enqueueResult?.fillResult?.active || 0,
+                fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                ...(enqueueResult?.fillResult?.error ? {error: enqueueResult.fillResult.error} : {}),
+                runtimeSurfaceBefore: terminalizationRuntimeSurface.hasSurface === true
+            })
+            scheduleQueuedWorkContinuation(materializationReason)
+            scheduleCoordinatorQueueResume(1000, materializationReason, {
+                allowBeforeQuora: true
+            })
+            scheduleCoordinatorReconcile(1000, {
+                reason: materializationReason,
+                edgeTriggered: true,
+                allowBeforeQuora: true
+            })
+            continue
+        }
         if(`${terminalizationCandidate?.status || ''}`.trim() === 'queued' &&
             (materializationReason === 'queued-authority-enqueue-did-not-materialize-runtime' ||
-                materializationReason === 'queued-tab-final-open-decision-timeout' ||
-                materializationReason === 'queued-tab-stale-action-pruned' ||
                 materializationReason === 'queued-tab-fill-timeout')) {
+            if(materializationReason === 'queued-authority-enqueue-did-not-materialize-runtime' &&
+                await applyPostMaterializationLiveTabRecovery(
+                    terminalizationCandidate,
+                    terminalizationCandidateKey,
+                    contract,
+                    terminalizationRuntimeSurface,
+                    materializationReason
+                )) {
+                continue
+            }
             const terminalizeResult = await terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems([terminalizationCandidate], {
                 operationKind: 'terminalize-queued-authority-enqueue-failure',
                 metricPath: 'coordinatorExecutor.enqueueFailure.terminalize',
@@ -15853,6 +18606,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 reason: materializationReason,
                 terminalizedReason: `terminalized-${materializationReason}`,
                 retryBeforeTerminal: materializationReason === 'queued-authority-enqueue-did-not-materialize-runtime',
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                serviceWorkerOwned,
                 recordByKey: pendingProgressRecordsByKey,
                 error: enqueueResult?.fillResult?.error || (
                     materializationReason === 'queued-tab-final-open-decision-timeout'
@@ -15876,6 +18631,12 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             if(terminalizeResult?.changed) {
                 terminalizedExhausted += terminalizeResult.terminalized || 0
                 currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                await pruneQueuedTabActions(ownerTabId, {
+                    queueOnlyAuthority: options.queueOnlyAuthority === true,
+                    currentAuthorityState,
+                    ignoreActiveFillPromise: true,
+                    reason: 'enqueue-failure-terminalized-authority-prune'
+                })
                 consumedExecutorCases.push({
                     ...contract,
                     reason: terminalizeResult.reason || materializationReason
@@ -15893,6 +18654,9 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 runtimeSurfaceBefore: terminalizationRuntimeSurface.hasSurface === true
             })
             scheduleQueuedWorkContinuation(materializationReason)
+            scheduleCoordinatorQueueResume(1000, materializationReason, {
+                allowBeforeQuora: true
+            })
             scheduleCoordinatorReconcile(1000, {
                 reason: materializationReason,
                 edgeTriggered: true,
@@ -15910,6 +18674,9 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 runtimeSurfaceBefore: terminalizationRuntimeSurface.hasSurface === true
             })
             scheduleQueuedWorkContinuation(materializationReason)
+            scheduleCoordinatorQueueResume(1000, materializationReason, {
+                allowBeforeQuora: true
+            })
             scheduleCoordinatorReconcile(1000, {
                 reason: materializationReason,
                 edgeTriggered: true,
@@ -15923,7 +18690,17 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         if(isActiveCoordinatorStatus(currentItem?.status) ||
             isTerminalCoordinatorStatus(currentItem?.status) ||
             runtimeSurface.hasSurface) {
-            consumedExecutorCases.push(contract)
+            const consumedReason = isActiveCoordinatorStatus(currentItem?.status)
+                ? 'queued-authority-enqueue-materialized-active'
+                : materializationReason
+            consumedExecutorCases.push({
+                ...contract,
+                reason: consumedReason,
+                fillResultReason: enqueueResult?.fillResult?.reason || '',
+                fillActive: enqueueResult?.fillResult?.active || 0,
+                fillRemainingActions: enqueueResult?.fillResult?.remainingActions || 0,
+                runtimeSurfaceBefore: runtimeSurface.hasSurface === true
+            })
             continue
         }
         unresolvedExecutorCases.push({
@@ -15961,11 +18738,13 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         resolvedStaleRuntime,
         resolvedTerminalRuntime,
         executorCases: executorClassification.cases,
+                executorClassificationId,
+                classificationGeneratedAt,
         consumedExecutorCases,
         unresolvedExecutorCases,
         primaryUnresolvedCase,
         paused: false,
-        reason: onlyUnresolvedCases
+        reason: terminalizedExhausted > 0 ? 'terminalized-exhausted-rolled-back-rows' : requeued > 0 ? 'requeued-missing-active-tabs' : onlyUnresolvedCases
             ? 'executor-cases-unresolved'
             : options.enqueuedReason || 'started-persisted-coordinator-queue'
     })
@@ -16009,9 +18788,10 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
     const alarmCreated = resumeScheduled &&
         coordinatorQueueResumeAlarmCreatedForDueAt === coordinatorQueueResumeDueAt
     const serviceWorkerOwned = options.serviceWorkerOwned === true
+    let backgroundFastResumePromise = null
 
     if(options.backgroundFastPath === true && options.direct !== true) {
-        void runCoordinatorQueueExecutorFastPath(reason || 'resume-request', {
+        backgroundFastResumePromise = runCoordinatorQueueExecutorFastPath(reason || 'resume-request', {
             awaitFill: options.awaitFill !== false,
             returnAfterDurableActive: options.returnAfterDurableActive !== false,
             skipAuthorityReconcile: options.skipAuthorityReconcile === true,
@@ -16025,7 +18805,14 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
             scheduleCoordinatorQueueResume(1000, 'background-fast-resume-failed', {
                 allowBeforeQuora: true
             })
-            return null
+            return {
+                changed: false,
+                queued: 0,
+                pending: 0,
+                active: 0,
+                error: error?.message || `${error || ''}`,
+                reason: 'background-fast-resume-failed'
+            }
         })
     }
     if(options.executorFastPath === true) {
@@ -16052,6 +18839,20 @@ async function kickCoordinatorQueueResume(reason = 'resume-request', options = {
         }
     }
     if(options.direct !== true) {
+        if(backgroundFastResumePromise) {
+            const responseBudgetMs = Math.max(
+                250,
+                Math.min(
+                    COORDINATOR_RESUME_GATE_TIMEOUT_MS,
+                    Number.parseInt(options.backgroundFastPathWaitMs, 10) || BACKGROUND_FAST_RESUME_RESPONSE_BUDGET_MS
+                )
+            )
+            await promiseWithTimeout(
+                backgroundFastResumePromise,
+                responseBudgetMs,
+                'background fast resume response budget'
+            ).catch(() => null)
+        }
         await pruneMissingQueuedTabRuntimeState('scheduled-resume-runtime-prune')
         finishQueueWakeupMetricCycle(cycle, 'no-op', `${reason || 'resume-request'}-scheduled`, {
             alarmCreated,
@@ -16283,7 +19084,14 @@ async function getCoordinatorWhyNotRunning(request = {}) {
             metricPath: 'whyNotRunning.load'
         })
     const queue = currentAuthorityState?.queue || {}
-    const paused = !!currentAuthorityState?.stored?.[COORDINATOR_PAUSED_KEY]
+    const projectedStored = currentAuthorityState?.stored || {}
+    const projectedHasPause = Object.prototype.hasOwnProperty.call(projectedStored, COORDINATOR_PAUSED_KEY)
+    const persistedPauseState = projectedHasPause
+        ? projectedStored
+        : await metricStorageGet({[COORDINATOR_PAUSED_KEY]: false}, {
+            phase: 'why-not-running-paused'
+        }).catch(() => ({[COORDINATOR_PAUSED_KEY]: false}))
+    const paused = !!persistedPauseState?.[COORDINATOR_PAUSED_KEY]
     const counts = getCoordinatorQueueWorkCounts(queue)
     const runtime = getQueueWakeupMetricRuntimeSnapshot()
     const throttle = getQueueLoadThrottle()
@@ -16398,7 +19206,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
         serviceWorkerOwned,
             queueOnlyAuthority,
             queuedOnly: options.queuedOnly === true,
-            requeueMissingActiveTabs: options.requeueMissingActiveTabs === true,
+            requeueMissingActiveTabs: options.requeueMissingActiveTabs !== false,
             forceDurableQueueReload,
             scopedProgressForQueueOnly: options.scopedProgressForQueueOnly === true,
             awaitFill: options.awaitFill !== false,
@@ -16649,7 +19457,22 @@ async function resumePausedCoordinatorNukes() {
     void setCoordinatorRunsPaused(false).catch(() => null)
     pausedQueuedOwners.delete(SERVICE_WORKER_QUEUE_OWNER_ID)
     if(coordinatorTabId) pausedQueuedOwners.delete(coordinatorTabId)
-    return kickCoordinatorQueueResume('dashboard-resume', {direct: true})
+    if(await refreshStaleCompactQueueViewIfNeeded('dashboard-resume', 'pump.changed.staleQueueViewRefreshed')) {
+        return {
+            queued: 0,
+            pending: 0,
+            active: activeQueuedTabs.size,
+            reason: 'stale-queue-view-refreshed'
+        }
+    }
+    return kickCoordinatorQueueResume('dashboard-resume', {
+        direct: true,
+        allowBeforeQuora: true,
+        serviceWorkerOwned: true,
+        forceDurableQueueReload: true,
+        awaitFill: true,
+        returnAfterDurableActive: true
+    })
 }
 
 async function cancelCoordinatorCurrentWork() {
@@ -16657,6 +19480,19 @@ async function cancelCoordinatorCurrentWork() {
     const storedResult = await cancelStoredCoordinatorWork({
         reason: 'current-work-cancel-request'
     })
+    if(storedResult &&
+        typeof storedResult === 'object' &&
+        !storedResult.reason &&
+        !(storedResult.canceledUrls || []).length &&
+        !(storedResult.canceledWorkKeys || []).length &&
+        await refreshStaleCompactQueueViewIfNeeded('current-work-cancel', 'pump.changed.staleQueueViewRefreshed')) {
+        return {
+            canceledUrls: [],
+            canceledWorkKeys: [],
+            ownedTabIds: [],
+            reason: 'stale-queue-view-refreshed'
+        }
+    }
     if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false) {
         return {
             canceledUrls: storedResult?.canceledUrls || [],
@@ -16834,6 +19670,15 @@ function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
     const now = Number.parseInt(options.now, 10) || Date.now()
     const status = `${options.status || 'failed'}`.trim()
     const reason = `${options.reason || ''}`.trim()
+    const explicitFailureClassification = options.failureClassification &&
+        typeof options.failureClassification === 'object'
+        ? options.failureClassification
+        : null
+    const failureClassification = explicitFailureClassification ||
+        buildCoordinatorFailureClassification(
+            reason,
+            options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state')
+        )
     const eventType = options.eventType ||
         (status === 'canceled' ? JOB_EVENT_PAUSE : JOB_EVENT_TERMINAL)
     const reduced = reduceJobEvent(item, {
@@ -16858,6 +19703,7 @@ function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
             actionLease: null,
             actionLeaseReleasedAt: Number.parseInt(reduced.item?.actionLeaseReleasedAt, 10) || now,
             actionLeaseReleaseReason: reduced.item?.actionLeaseReleaseReason || reason,
+            ...(failureClassification ? {failureClassification} : {}),
             tabId: null
         }
     }
@@ -16872,6 +19718,7 @@ function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
         actionLease: null,
         actionLeaseReleasedAt: now,
         actionLeaseReleaseReason: reason,
+        ...(failureClassification ? {failureClassification} : {}),
         tabId: null,
         milestones: {
             ...makeEmptyCoordinatorMilestones(),
@@ -16920,6 +19767,40 @@ async function hasUnpausedStoredCoordinatorWorkInQueueView(reason = 'stored-work
 
     if(!stored || stored[COORDINATOR_PAUSED_KEY] === true) return false
     return hasStoredCoordinatorWorkInQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY] || null)
+}
+
+async function hasUnpausedStoredCoordinatorWorkInDurableQueue(reason = 'stored-work-scheduler') {
+    const metricPath = reason || 'stored-work-scheduler'
+    const stored = await metricStorageGet({
+        ...getCoordinatorQueueWalStorageDefaults(),
+        [COORDINATOR_PAUSED_KEY]: false
+    }, {
+        phase: metricPath,
+        metricPath
+    }).catch(() => null)
+
+    if(!stored || stored[COORDINATOR_PAUSED_KEY] === true) return false
+
+    const queueSnapshot = {}
+    const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        metricPath: `${metricPath}.segments`
+    }).catch(() => null)
+    if(!walStore) return false
+
+    const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+        queueSnapshot,
+        walStore
+    ))
+    return hasStoredCoordinatorWork(queueRecovery.queue)
+}
+
+async function isCoordinatorPausedInStorage(reason = 'pause-check') {
+    const stored = await metricStorageGet({
+        [COORDINATOR_PAUSED_KEY]: false
+    }, {
+        phase: reason || 'pause-check'
+    }).catch(() => null)
+    return stored?.[COORDINATOR_PAUSED_KEY] === true
 }
 
 async function shouldAllowStoredWorkBeforeQuora(reason = 'stored-work-scheduler') {
@@ -17139,6 +20020,17 @@ function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resum
         incrementQueueWakeupMetric('pump.coalesced')
         return false
     }
+    if(coordinatorQueueResumeTimeout &&
+        coordinatorQueueResumeDueAt &&
+        coordinatorQueueResumeReason === 'queued-tab-final-open-authority-unavailable' &&
+        normalizedReason !== 'queued-tab-final-open-authority-unavailable') {
+        if(options.allowBeforeQuora === true) coordinatorQueueResumeAllowBeforeQuora = true
+        if(coordinatorQueueResumeAlarmCreatedForDueAt !== coordinatorQueueResumeDueAt) {
+            scheduleCoordinatorResumeAlarm(coordinatorQueueResumeDueAt)
+        }
+        incrementQueueWakeupMetric('pump.coalescedFinalOpenAuthorityRetry')
+        return false
+    }
 
     if(coordinatorQueueResumeTimeout) {
         clearTimeout(coordinatorQueueResumeTimeout)
@@ -17163,14 +20055,44 @@ function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resum
     return true
 }
 
+async function awaitCoordinatorResumeAlarmPersistence(reason = 'scheduled-resume-alarm') {
+    if(!coordinatorQueueResumeAlarmPromise) return false
+
+    return promiseWithTimeout(
+        coordinatorQueueResumeAlarmPromise,
+        1000,
+        reason || 'coordinator resume alarm schedule'
+    ).catch(() => false)
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     incrementQueueWakeupMetric('pump.fastExecutor.requested')
+    if(await isCoordinatorPausedInStorage(`${reason || 'resume-fast-executor'}-paused-check`)) {
+        incrementQueueWakeupMetric('pump.fastExecutor.paused')
+        void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
+        return {
+            queued: 0,
+            pending: 0,
+            active: 0,
+            changed: false,
+            paused: true,
+            fastPath: true,
+            reason: 'coordinator-paused'
+        }
+    }
     const runtimeSurfaceEmptyAtStart = !getSchedulerBlockingQueuedExecutorCount() &&
         !queuedTabActions.length &&
         !pendingTabActions.size
+    const residentAuthorityState = options.currentAuthorityState || coordinatorAuthority.current() || null
+    const residentAuthorityCounts = getCoordinatorQueueWorkCounts(residentAuthorityState?.queue || {})
+    const residentAuthorityHasDurableWork = residentAuthorityCounts.durableActiveRows > 0 ||
+        residentAuthorityCounts.durableQueuedRows > 0
     const forceDurableQueueReloadForRuntimeRecovery = options.forceDurableQueueReload === true ||
-        (runtimeSurfaceEmptyAtStart && options.awaitFill !== false)
-    if(forceDurableQueueReloadForRuntimeRecovery && options.forceDurableQueueReload !== true) {
+        (!residentAuthorityHasDurableWork &&
+            runtimeSurfaceEmptyAtStart &&
+            options.awaitFill !== false)
+    if(forceDurableQueueReloadForRuntimeRecovery &&
+        options.forceDurableQueueReload !== true) {
         incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeInitialDurableReload')
     }
     const throttle = getQueueLoadThrottle()
@@ -17189,6 +20111,9 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
             fastPath: true,
             reason: 'queue-load-throttled'
         }
+    }
+    if(throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() <= 0) {
+        rememberQueueLoadProgress('fast-executor-idle-durable-work')
     }
 
     let authorityPreflight = null
@@ -17225,7 +20150,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
     const forceDurableQueueReload = forceDurableQueueReloadForRuntimeRecovery && authorityPreflightChanged !== true
     const currentAuthorityState = authorityPreflightChanged
         ? coordinatorAuthority.current()
-        : options.currentAuthorityState || null
+        : residentAuthorityState
 
     const result = await promiseWithTimeout(
         resumeCoordinatorQueueExecutionOnce({
@@ -17241,7 +20166,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
             scopedProgressForQueueOnly: forceDurableQueueReloadForRuntimeRecovery,
             currentAuthorityState,
             awaitFill: options.awaitFill !== false,
-            returnAfterDurableActive: options.returnAfterDurableActive === true,
+            returnAfterDurableActive: options.returnAfterDurableActive !== false,
             reason: `${reason || 'resume'}-fast-executor`
         }),
         COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS,
@@ -17346,6 +20271,16 @@ async function runScheduledCoordinatorQueueResume(reason = '', options = {}) {
     coordinatorQueueResumeAllowBeforeQuora = false
     coordinatorQueueResumeAlarmCreatedForDueAt = 0
     coordinatorQueueResumeAlarmPromise = null
+
+    if(await isCoordinatorPausedInStorage(`${resumeReason || 'scheduled-resume'}-paused-check`)) {
+        incrementQueueWakeupMetric('pump.noop.scheduledResumePaused')
+        void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
+        return {
+            recovered: false,
+            paused: true,
+            reason: 'coordinator-paused'
+        }
+    }
 
     const fastResult = await runCoordinatorQueueExecutorFastPath(resumeReason, {
         awaitFill: true,
@@ -17798,6 +20733,7 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
     const now = Number.parseInt(options.now, 10) || Date.now()
     const runId = options.runId || makeId('failed-reset')
     const request = options.request || {}
+    const resetQueuedTabRuntime = options.resetQueuedTabRuntime === true
     const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
     const retryViaResolution = !!resolutionRetryUrl
     const sourceHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -17826,6 +20762,14 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
     })
     const retryBase = reducedRetry.accepted ? reducedRetry.item : item
     const executorMaxConcurrent = Number.parseInt(options.maxConcurrent, 10) || 0
+    const maxRetries = getQueuedTabMaxRetries(item)
+    const maxAttempts = resetQueuedTabRuntime
+        ? Math.max(
+            Number.parseInt(item?.maxAttempts || item?.attempt?.max, 10) || 0,
+            attemptNumber + maxRetries + 1,
+            maxRetries + 1
+        )
+        : Number.parseInt(item?.maxAttempts || item?.attempt?.max, 10) || 0
 
     const nextItem = applyCoordinatorJobEnvelope({
         ...retryBase,
@@ -17856,12 +20800,21 @@ function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) 
         terminalAt: 0,
         tabId: null,
         attempt: 0,
+        retryAttempt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.retryAttempt, 10) || 0,
+        maxRetries,
+        ...(maxAttempts > 0 ? {maxAttempts} : {}),
         retryCount,
         lastRetryAt,
         retryReason,
         actionLease: null,
-        actionLeaseReleasedAt: 0,
-        actionLeaseReleaseReason: '',
+        actionLeaseReleasedAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.actionLeaseReleasedAt, 10) || 0,
+        actionLeaseReleaseReason: resetQueuedTabRuntime ? '' : retryBase?.actionLeaseReleaseReason || '',
+        actionSurfaceMode: resetQueuedTabRuntime ? '' : retryBase?.actionSurfaceMode || '',
+        actionSurfaceWindowId: resetQueuedTabRuntime ? null : retryBase?.actionSurfaceWindowId || null,
+        actionSurfaceAnchorTabId: resetQueuedTabRuntime ? null : retryBase?.actionSurfaceAnchorTabId || null,
+        actionSurfaceActivatedAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.actionSurfaceActivatedAt, 10) || 0,
+        loadPressureRequeueCount: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.loadPressureRequeueCount, 10) || 0,
+        lastLoadPressureAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.lastLoadPressureAt, 10) || 0,
         sourceSettledAt: 0,
         sourceSettlementKey: '',
         sourceSettlementOutcome: '',
@@ -18164,7 +21117,7 @@ async function retryCoordinatorFailedItems(request = {}, sender = {}) {
         })
     }, {
         reason: 'retry-failed',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         failureValue: {
             queued: 0,
             selected: 0,
@@ -18255,6 +21208,7 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
             now,
             runId,
             request,
+            resetQueuedTabRuntime: true,
             retryCount: 0,
             lastRetryAt: 0,
             retryReason: '',
@@ -18479,7 +21433,7 @@ async function requeueCoordinatorFailedItems(request = {}, sender = {}) {
         })
     }, {
         reason: 'requeue-failed',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
         failureValue: {
             queued: 0,
             executionQueued: 0,
@@ -18501,7 +21455,7 @@ async function requeueCoordinatorFailedItems(request = {}, sender = {}) {
     const result = await runCoordinatorReconcileTick('requeue-failed-reconcile', {
         direct: true,
         skipStoredWorkCheck: true,
-        awaitFill: true
+        awaitFill: false
     })
 
     return {
@@ -18530,7 +21484,8 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
     if(acceptedItems > 0) incrementQueueWakeupMetric('job.enqueued', acceptedItems)
     void finishCoordinatorEnqueue(request, sender, result)
         .catch(error => console.info('Mute Block coordinator execution setup failed after durable enqueue', error))
-    await pruneMissingQueuedTabRuntimeState('post-enqueue-runtime-prune')
+    void pruneMissingQueuedTabRuntimeState('post-enqueue-runtime-prune')
+        .catch(error => console.info('Mute Block post-enqueue runtime prune failed', error))
     return result
 }
 
@@ -19032,7 +21987,8 @@ function enqueueSpaceFeedStorageUpdate(update, options = {}) {
         timeoutPhase: '',
         timeoutRecoveryRequested: false,
         serializedTailRecovered: false,
-        phaseIntervals: {}
+        phaseIntervals: {},
+        suppressDurableIdleResume: options.suppressDurableIdleResume === true
     }
     if(parentStorageContext) {
         parentStorageContext.nestedUpdateCount = (Number(parentStorageContext.nestedUpdateCount) || 0) + 1
@@ -20926,6 +23882,11 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     const action = operation.action || {}
     const tab = operation.tab || {}
     const details = operation.details || {}
+    const rollbackReleaseReason = `${details.releaseReason || ''}`.trim() || (
+        /content-script|claim-nudge/i.test(`${details.activeTransitionError || ''}`)
+            ? `${details.activeTransitionError || ''}`.trim()
+            : 'active-transition-failed'
+    )
     const href = normalizeQuoraProfileUrl(operation.href || action?.profileHref || action?.url || '')
     const coordinatorKey = operation.coordinatorKey || action?.coordinatorKey || (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
     if(!href && !coordinatorKey) return false
@@ -20937,6 +23898,7 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
         })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
+    const progress = currentAuthorityState.progress || {}
     const runs = currentAuthorityState.runs
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
@@ -20958,9 +23920,59 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
     const tabId = normalizeTabId(tab?.id)
     if(itemTabId && tabId && itemTabId !== tabId) return false
 
+    const projectionRecord = getCoordinatorProgressRecordForItem(itemKey, item, progress)
+    const residentRecord = projectionRecord || getCoordinatorProgressRecordForItem(itemKey, item, profileNukeProgress || {})
+    const currentRecord = residentRecord && hasMismatchedCoordinatorAttempt(item, residentRecord)
+        ? null
+        : residentRecord
+
     const now = Date.now()
+    const shouldRecoverExhaustedActiveTransitionRollback = (currentItem, record = null) => {
+        if(!isQueuedTabAttemptBudgetExhausted(currentItem)) return false
+        if(!isCoordinatorQueueAuthoritativeItem(currentItem)) return false
+        if(currentItem?.serviceWorkerOwned !== true &&
+            currentItem?.executorOwner !== 'service-worker' &&
+            details.serviceWorkerOwned !== true) {
+            return false
+        }
+        const releaseReason = `${currentItem?.actionLeaseReleaseReason || ''}`.trim()
+        const transitionError = `${details.activeTransitionError || ''}`.trim()
+        const actionSurfaceMode = `${record?.actionSurfaceMode || currentItem?.actionSurfaceMode || ''}`.trim()
+        const workerWindowPreActionReady = actionSurfaceMode === 'worker-window' &&
+            (
+                (Number.parseInt(record?.contentOpenedAt, 10) || 0) > 0 ||
+                (Number.parseInt(record?.foregroundLeaseAcquiredAt, 10) || 0) > 0 ||
+                (Number.parseInt(record?.waitingForForegroundAt, 10) || 0) > 0
+            ) &&
+            (Number.parseInt(record?.actionReadyAt, 10) || 0) <= 0 &&
+            (Number.parseInt(record?.blockAttemptedAt, 10) || 0) <= 0 &&
+            record?.blockSucceeded !== true
+        const workerWindowDurablePreAction = actionSurfaceMode === 'worker-window' &&
+            (Number.parseInt(currentItem?.actionSurfaceActivatedAt, 10) || 0) > 0 &&
+            (Number.parseInt(currentItem?.activeAt, 10) || 0) > 0 &&
+            (Number.parseInt(currentItem?.milestones?.blockAttemptedAt, 10) || 0) <= 0
+        return /(?:^|-)queued-stale-runtime-(?:missing-metadata|missing-queued-action|action-drained-before-authority|action-pruned-after-fill-timeout)(?:-|$)/.test(releaseReason) ||
+            /(?:^|-)content-script-(?:ensure-failed|unscriptable|version-mismatch)(?:-|$)/.test(releaseReason) ||
+            /(?:^|-)claim-nudge-not-accepted(?:-|$)/.test(releaseReason) ||
+            /(?:^|-)fresh-content-script-recovery(?:-|$)/.test(releaseReason) ||
+            /(?:tab-missing|missing tab|timed out|timeout|content-script|claim-nudge|storage|metadata)/i.test(transitionError) ||
+            workerWindowPreActionReady ||
+            workerWindowDurablePreAction
+    }
     const buildNextRollbackItem = currentItem => {
         if(isQueuedTabAttemptBudgetExhausted(currentItem)) {
+            if(shouldRecoverExhaustedActiveTransitionRollback(currentItem, currentRecord)) {
+                return buildRequeuedActiveCoordinatorItemWithoutActor(
+                    currentItem,
+                    currentRecord,
+                    now,
+                    rollbackReleaseReason,
+                    {
+                        forceRequeueExhaustedActorless: true,
+                        extendActorlessRetryBudget: true
+                    }
+                )
+            }
             return buildTerminalCoordinatorQueueItem(currentItem, {
                 status: 'failed',
                 outcome: 'timeout',
@@ -20984,7 +23996,7 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
             tabId: null,
             actionLease: null,
             actionLeaseReleasedAt: now,
-            actionLeaseReleaseReason: 'active-transition-failed',
+            actionLeaseReleaseReason: rollbackReleaseReason,
             milestones: {
                 ...makeEmptyCoordinatorMilestones(),
                 ...(currentItem.milestones || {}),
@@ -21145,6 +24157,8 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
             retryAttempt: Number.parseInt(action.retryAttempt, 10) || 0,
             maxRetries,
             maxAttempts: maxRetries + 1,
+            actionLeaseReleasedAt: action.actionLeaseReleaseReason ? at : Number.parseInt(currentItem.actionLeaseReleasedAt, 10) || 0,
+            actionLeaseReleaseReason: action.actionLeaseReleaseReason || currentItem.actionLeaseReleaseReason || '',
             loadPressureRequeueCount: loadPressureRequeue
                 ? (Number.parseInt(currentItem.loadPressureRequeueCount, 10) || 0) + 1
                 : Number.parseInt(currentItem.loadPressureRequeueCount, 10) || 0,
@@ -21760,7 +24774,7 @@ async function requestCoordinatorActionLease(request = {}, sender = {}) {
         })
     }, {
         reason: 'action-lease-request',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -21782,7 +24796,7 @@ async function heartbeatCoordinatorActionLease(request = {}, sender = {}) {
         })
     }, {
         reason: 'action-lease-heartbeat',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -21805,7 +24819,7 @@ async function releaseCoordinatorActionLease(request = {}, sender = {}, reason =
         })
     }, {
         reason: 'action-lease-release',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
     await restoreOwnerTabFocus(metadata, tabId).catch(() => false)
     return result
@@ -21824,7 +24838,7 @@ async function releaseCoordinatorActionLeaseForTab(tabId = null, reason = '') {
         })
     }, {
         reason: 'action-lease-tab-release',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -21900,9 +24914,10 @@ function isForegroundRequiredProfileActionRequest(request = {}) {
         reason.endsWith('-confirmation')
 }
 
-function restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId = null, senderTab = null, metadata = null) {
+function restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId = null, senderTab = null, metadata = null, options = {}) {
     const normalizedTabId = normalizeTabId(tabId)
     if(!normalizedTabId || normalizeTabId(senderTab?.id) !== normalizedTabId || !metadata) return null
+    if(wasQueuedRuntimeTabRemoved(normalizedTabId) && options.allowRemovedSenderTab !== true) return null
 
     const currentAuthorityState = coordinatorAuthority.current()
     const queue = currentAuthorityState?.queue || {}
@@ -21928,6 +24943,10 @@ function restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId = null, sende
         runId: item.runId || metadata.runId || '',
         attemptId: getAttemptIdFromValue(item) || getAttemptIdFromValue(metadata),
         attemptNumber: getAttemptNumberFromValue(item) || getAttemptNumberFromValue(metadata),
+        actionSurfaceMode: item.actionSurfaceMode || metadata.actionSurfaceMode || '',
+        actionSurfaceWindowId: item.actionSurfaceWindowId || metadata.actionSurfaceWindowId || senderTab?.windowId || null,
+        actionSurfaceAnchorTabId: item.actionSurfaceAnchorTabId || metadata.actionSurfaceAnchorTabId || null,
+        actionSurfaceActivatedAt: item.actionSurfaceActivatedAt || metadata.actionSurfaceActivatedAt || 0,
         durableActiveAt: item.activeAt || Date.now(),
         durableActiveReason: 'begin-profile-action-runtime-restored'
     }
@@ -22590,7 +25609,7 @@ async function getOrCreateQueuedWorkerActionSurface(previousActiveTab = null) {
         queuedActionSurfaceAnchorTabId = normalizeTabId(anchorTab?.id)
         if(anchorTab?.id) await reconcileQueuedWorkerActionSurfaceSingleton(anchorTab, 'created')
         void persistQueuedWorkerActionSurfaceState(windowId, queuedActionSurfaceAnchorTabId, 'created')
-        await restoreQueuedActionSurfaceCallerFocus(previousActiveTab)
+        void restoreQueuedActionSurfaceCallerFocus(previousActiveTab)
         incrementQueueWakeupMetric('actionSurface.workerWindow.created')
 
         return {
@@ -22650,12 +25669,18 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
     )
     const activatedAt = Date.now()
     const activatedTab = await browser.tabs.update(tab.id, {active: true}).catch(() => null)
-    if(!activatedTab?.id) {
-        await browser.tabs.remove(tab.id).catch(() => null)
+    const activatedTabId = normalizeTabId(activatedTab?.id)
+    const createdTabId = normalizeTabId(tab?.id)
+    const activatedWindowId = Number.parseInt(activatedTab?.windowId || tab?.windowId, 10) || 0
+    const surfaceWindowId = Number.parseInt(surface.windowId, 10) || 0
+    if(!activatedTabId ||
+        activatedTabId !== createdTabId ||
+        (surfaceWindowId && activatedWindowId && activatedWindowId !== surfaceWindowId)) {
+        await browser.tabs.remove(activatedTabId || createdTabId).catch(() => null)
         incrementQueueWakeupMetric('actionSurface.workerWindow.activateFailed')
         throw new Error('worker-action-surface-activate-failed')
     }
-    await restoreQueuedActionSurfaceCallerFocus(previousActiveTab)
+    void restoreQueuedActionSurfaceCallerFocus(previousActiveTab)
     tagActionWithQueuedWorkerSurface(action, surface, activatedTab || tab, activatedAt)
     incrementQueueWakeupMetric('actionSurface.workerWindow.openedTab')
 
@@ -23160,6 +26185,112 @@ async function ensureQueuedTabContentScript(tabId, reason = '') {
     }
 }
 
+function shouldDeferQueuedWorkerContentScriptEnsureRelease(tabId, metadata = null) {
+    const normalizedTabId = normalizeTabId(tabId)
+    if(!normalizedTabId || !metadata) return false
+    if(!activeQueuedTabs.has(normalizedTabId) || !pendingTabActions.has(normalizedTabId)) return false
+    if(!isDurablyActiveQueuedTab(normalizedTabId)) return false
+    if(metadata.closeRequestedAt || metadata.closeReason) return false
+    if(metadata.noForegroundFallback !== true) return false
+    return isQueuedWorkerActionSurfaceTab({id: normalizedTabId, windowId: metadata.actionSurfaceWindowId}, metadata)
+}
+
+async function handleQueuedTabContentScriptEnsureResult(tabId, ensureResult = null, sourceReason = '') {
+    const normalizedTabId = normalizeTabId(tabId)
+    const releasePostReloadClaim = ensureResult?.ensured === true &&
+        ensureResult?.reloaded === true &&
+        ensureResult?.nudge?.nudged !== true
+    if(!normalizedTabId || (ensureResult?.ensured === true && !releasePostReloadClaim)) return false
+    if(!activeQueuedTabs.has(normalizedTabId) && !pendingTabActions.has(normalizedTabId)) return false
+
+    const releaseReason = releasePostReloadClaim
+        ? 'queued-tab-slot-release-content-script-claim-not-accepted'
+        : 'queued-tab-slot-release-content-script-ensure-failed'
+    const metadataBeforeRelease = getQueuedTabMetadata(normalizedTabId) || {}
+    if(shouldDeferQueuedWorkerContentScriptEnsureRelease(normalizedTabId, metadataBeforeRelease)) {
+        incrementQueueWakeupMetric('contentScriptEnsure.workerWindowReleaseDeferred')
+        setQueuedTabMetadata(normalizedTabId, {
+            contentScriptEnsureReleaseDeferredAt: Date.now(),
+            contentScriptEnsureReleaseDeferredReason: releaseReason,
+            contentScriptEnsureReleaseSource: `${sourceReason || ''}`.trim(),
+            contentScriptEnsureReleaseError: ensureResult?.error || ''
+        })
+        return true
+    }
+    if(spaceFeedStorageUpdateDepth > 0) {
+        const releaseAttempt = Number.parseInt(ensureResult?.releaseAttempt, 10) || 0
+        setTimeout(() => {
+            void handleQueuedTabContentScriptEnsureResult(normalizedTabId, {
+                ...(ensureResult || {}),
+                releaseAttempt: releaseAttempt + 1
+            }, sourceReason)
+        }, releaseAttempt < 5 ? 100 : 1000)
+        scheduleCoordinatorQueueResume(1000, releaseReason, {
+            allowBeforeQuora: true
+        })
+        return true
+    }
+
+    setQueuedTabMetadata(normalizedTabId, {
+        contentScriptEnsureReleaseReason: releaseReason,
+        contentScriptEnsureReleaseSource: `${sourceReason || ''}`.trim(),
+        contentScriptEnsureReleaseError: ensureResult?.error || '',
+        contentScriptEnsureReleaseAt: Date.now()
+    })
+    markQueuedTabClosing(normalizedTabId, releaseReason)
+    const metadata = getQueuedTabMetadata(normalizedTabId) || {}
+    if(metadata?.profileHref || metadata?.coordinatorKey) {
+        await rollbackFailedQueuedTabOpen({
+            ...metadata,
+            url: metadata.profileHref || metadata.requestedUrl || ''
+        }, {
+            id: normalizedTabId
+        }, {
+            attemptId: metadata.attemptId || '',
+            attemptNumber: metadata.attemptNumber || 0,
+            retryAttempt: metadata.retryAttempt || 0,
+            maxRetries: metadata.maxRetries || 0,
+            activeTransitionError: releaseReason,
+            releaseReason,
+            serviceWorkerOwned: true,
+            currentAuthorityState: coordinatorAuthority.current()
+        }).catch(() => false)
+    }
+    const detached = detachQueuedTabRuntimeState(normalizedTabId, releaseReason)
+    try {
+        await browser.tabs.remove(normalizedTabId)
+    }
+    catch {}
+    await releaseQueuedTabAndCleanup(normalizedTabId, {
+        awaitFill: true,
+        runtimeDetached: true,
+        metadata: detached.metadata,
+        wasActive: detached.wasActive,
+        foregroundLeaseReleased: detached.foregroundLeaseReleased,
+        reason: releaseReason,
+        releaseReason
+    }).catch(error => {
+        recordCoordinatorDiagnosticEvent(
+            'queued-tab-content-script-ensure-release-failed',
+            error?.message || 'Queued tab content script ensure release failed'
+        )
+        scheduleCoordinatorQueueResume(1000, 'queued-tab-content-script-ensure-release-failed', {
+            allowBeforeQuora: true
+        })
+        return null
+    })
+    scheduleCoordinatorQueueResume(1000, releaseReason, {
+        allowBeforeQuora: true
+    })
+    scheduleQueuedWorkContinuation(releaseReason)
+    scheduleCoordinatorReconcile(1000, {
+        reason: releaseReason,
+        edgeTriggered: true,
+        allowBeforeQuora: true
+    })
+    return true
+}
+
 async function reloadQueuedTabAfterUnresponsiveContentScript(tabId, metadata = null, nudgeResult = null, currentUrl = '', event = '', fallbackReason = 'claim-nudge-not-accepted') {
     const normalizedTabId = normalizeTabId(tabId)
     if(!normalizedTabId) return false
@@ -23248,6 +26379,13 @@ async function nudgeQueuedTabActionClaim(tabId, reason = '') {
         )
         if(response?.accepted === true) {
             incrementQueueWakeupMetric('nudge.accepted')
+            setQueuedTabMetadata(normalizedTabId, {
+                lastNudgedAt: Date.now(),
+                lastNudgeAcceptedAt: Date.now(),
+                lastNudgeReason: `${reason || ''}`.trim(),
+                lastNudgeFailedAt: 0,
+                lastNudgeFailure: ''
+            })
         }
         else {
             incrementQueueWakeupMetric('nudge.rejected.missingAction')
@@ -23265,6 +26403,8 @@ async function nudgeQueuedTabActionClaim(tabId, reason = '') {
         const timedOut = /timed out/i.test(error?.message || '')
         const missingTab = /no tab|invalid tab|cannot find tab|not found/i.test(error?.message || '')
         const failedAt = Date.now()
+        const shouldEscalateTimeoutPressure = timedOut &&
+            shouldEscalateQueuedTabClaimNudgeTimeout(metadata, failedAt)
         if(missingTab) {
             if(normalizedTabId && activeQueuedTabs.has(normalizedTabId)) {
                 await releaseQueuedTabRuntimeIfAuthorityNotActive(
@@ -23330,11 +26470,13 @@ async function nudgeQueuedTabActionClaim(tabId, reason = '') {
                 lastNudgeFailedAt: failedAt,
                 lastNudgeFailure: error?.message || `${error || ''}`
             })
-            rememberQueueLoadPressure(timedOut ? 'claim-nudge-timeout' : 'claim-nudge-failed', {
-                tabId: normalizedTabId,
-                profileHref: metadata?.profileHref || '',
-                coordinatorKey: metadata?.coordinatorKey || ''
-            })
+            if(shouldEscalateTimeoutPressure || !timedOut) {
+                rememberQueueLoadPressure(timedOut ? 'claim-nudge-timeout' : 'claim-nudge-failed', {
+                    tabId: normalizedTabId,
+                    profileHref: metadata?.profileHref || '',
+                    coordinatorKey: metadata?.coordinatorKey || ''
+                })
+            }
             if(timedOut) {
                 scheduleOwnedBlockedProfileSweep(metadata?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, 1000)
             }
@@ -23403,7 +26545,14 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
     const normalizedTabId = normalizeTabId(tabId)
     if(!normalizedTabId) return {promoted: false, reason: 'invalid-tab-id'}
 
-    const metadata = options.metadata || getQueuedTabMetadata(normalizedTabId)
+    let metadata = options.metadata || getQueuedTabMetadata(normalizedTabId)
+    const senderTab = normalizeTabId(options.senderTab?.id) === normalizedTabId ? options.senderTab : null
+    if(!activeQueuedTabs.has(normalizedTabId) && !pendingTabActions.has(normalizedTabId)) {
+        const restored = restoreQueuedTabRuntimeFromActiveAuthorityForSender(normalizedTabId, senderTab, metadata, {
+            allowRemovedSenderTab: true
+        })
+        metadata = restored?.metadata || metadata
+    }
     const progressRecord = metadata?.profileHref
         ? profileNukeProgress?.[normalizeQuoraProfileUrl(metadata.profileHref)] || null
         : null
@@ -23414,7 +26563,6 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
         return {promoted: false, reason: 'not-active-queued-tab'}
     }
 
-    const senderTab = normalizeTabId(options.senderTab?.id) === normalizedTabId ? options.senderTab : null
     const tab = await getQueuedExecutorTabWithTimeout(normalizedTabId, 'queued-tab-promote') || senderTab
     if(!tab?.id) return {promoted: false, reason: 'missing-tab'}
 
@@ -24007,7 +27155,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
         }
     }, {
         reason: 'background-blocked-sweep-terminal',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 
     if(result?.terminal) scheduleQueuedWorkContinuation('background-blocked-sweep-terminal')
@@ -24134,20 +27282,23 @@ async function sweepProfileTabsWithoutActiveQueueAuthority(options = {}) {
         const record = getCoordinatorProgressRecordForItem(entry.key, entry.item, progress)
         const progressAttemptMismatched = record && hasMismatchedCoordinatorAttempt(entry.item, record)
         const reclaimRecord = progressAttemptMismatched ? null : record
+        const reclaimableQueuedTab = entry?.item &&
+            !isTerminalCoordinatorStatus(entry.item.status) &&
+            (getLiveTabForCoordinatorItem(entry.item, entry.key, liveProfileTabsByHref, reclaimRecord) ||
+                getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(entry.item, reclaimRecord, entry.key, liveProfileTabsByHref) ||
+                await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(entry.item, entry.key, liveProfileTabsByHref, reclaimRecord))
+        const reclaimableQueuedTabId = normalizeTabId(reclaimableQueuedTab?.id)
 
         for(const tab of tabs || []) {
             const tabId = normalizeTabId(tab?.id)
             if(!tabId) continue
-            const reclaimableQueuedTab = entry?.item &&
-                !isTerminalCoordinatorStatus(entry.item.status) &&
-                (getLiveTabForCoordinatorItem(entry.item, entry.key, liveProfileTabsByHref, reclaimRecord) ||
-                    getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(entry.item, reclaimRecord, entry.key, liveProfileTabsByHref) ||
-                    await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(entry.item, entry.key, liveProfileTabsByHref, reclaimRecord))
-            if(reclaimableQueuedTab && normalizeTabId(reclaimableQueuedTab.id) === tabId) {
+            if(reclaimableQueuedTabId && reclaimableQueuedTabId === tabId) {
                 incrementQueueWakeupMetric('profileTabsWithoutActiveAuthority.preservedQueuedLiveTab')
                 continue
             }
-            if(`${entry.item.status || ''}`.trim() === 'queued' && !hasOwnedQueuedTabState(tabId)) {
+            if(`${entry.item.status || ''}`.trim() === 'queued' &&
+                !reclaimableQueuedTabId &&
+                !hasOwnedQueuedTabState(tabId)) {
                 incrementQueueWakeupMetric('profileTabsWithoutActiveAuthority.preservedUnownedQueuedLiveTab')
                 continue
             }
@@ -24367,6 +27518,54 @@ function isRetryableTerminalProfileNukeRecord(record) {
     if(status === 'error') return true
 
     return false
+}
+
+function isQueuedDirectBlockActionIncompleteProgress(record = null, mapped = null) {
+    if(!record || record.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return false
+    if(!isTerminalProfileNukeRecord(record)) return false
+    const status = `${record.status || ''}`.trim()
+    if(status !== 'error' && status !== 'interrupted') return false
+    const errorText = `${mapped?.error || record.finalError || ''}`.trim()
+    if(errorText !== 'Queued direct block action did not complete') return false
+
+    const detailReason = `${record?.directBlockFailureDetail?.reason || record?.directBlockFailureDetail?.code || ''}`.trim()
+    return !detailReason || detailReason === 'queued-direct-block-action-did-not-complete'
+}
+
+function shouldRecoverQueuedDirectBlockActionTerminalProgress(item = null, record = null, mapped = null, options = {}) {
+    if(!item || !isActiveCoordinatorStatus(item?.status)) return false
+    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
+    if(!isQueuedDirectBlockActionIncompleteProgress(record, mapped)) return false
+    if(hasMismatchedCoordinatorAttempt(item, record)) return false
+    if(record?.blockSucceeded === true || record?.status === 'blocked' || record?.status === 'already-blocked') return false
+
+    const senderTabId = normalizeTabId(options.senderTabId || record?.tabId || null)
+    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
+    return !senderTabId || !itemTabId || senderTabId === itemTabId
+}
+
+function isQueuedProfileActionGateTimeoutProgress(record = null, mapped = null) {
+    if(!record || record.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return false
+    if(!isTerminalProfileNukeRecord(record)) return false
+    if(isExplicitSecurityVerificationRecord(record)) return false
+
+    const status = `${record.status || ''}`.trim()
+    if(status !== 'error' && status !== 'interrupted') return false
+
+    const errorText = `${mapped?.error || record.finalError || ''}`.trim()
+    return errorText === 'Queued profile action did not receive profile action gate: timed-out-waiting'
+}
+
+function shouldRecoverQueuedProfileActionGateTerminalProgress(item = null, record = null, mapped = null, options = {}) {
+    if(!item || !isActiveCoordinatorStatus(item?.status)) return false
+    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
+    if(!isQueuedProfileActionGateTimeoutProgress(record, mapped)) return false
+    if(hasMismatchedCoordinatorAttempt(item, record)) return false
+    if(record?.blockSucceeded === true || record?.status === 'blocked' || record?.status === 'already-blocked') return false
+
+    const senderTabId = normalizeTabId(options.senderTabId || record?.tabId || null)
+    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
+    return !senderTabId || !itemTabId || senderTabId === itemTabId
 }
 
 function isExplicitSecurityVerificationRecord(record = null) {
@@ -24932,15 +28131,30 @@ function getQueuedTabMaxRetries(metadata = null, record = null) {
     return Math.max(0, maxRetries)
 }
 
-function isQueuedTabLoadPressure(liveTab = null, record = null, metadata = null) {
+function hasStaleAcceptedQueuedTabNudge(metadata = null, record = null, now = Date.now()) {
+    if(hasActiveQueuedTabActionPhaseProgress(record, metadata)) return false
+    const acceptedAt = Math.max(
+        Number.parseInt(metadata?.lastNudgeAcceptedAt, 10) || 0,
+        Number.parseInt(metadata?.lastNudgedAt, 10) || 0
+    )
+    if(!acceptedAt) return false
+
+    const failedAt = Number.parseInt(metadata?.lastNudgeFailedAt, 10) || 0
+    if(failedAt >= acceptedAt) return false
+
+    return now - acceptedAt >= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS
+}
+
+function isQueuedTabLoadPressure(liveTab = null, record = null, metadata = null, now = Date.now()) {
     if(hasActiveQueuedTabActionPhaseProgress(record, metadata)) return false
     if(`${liveTab?.status || ''}`.trim() === 'loading') return true
     if(Number.isFinite(metadata?.contentScriptEnsureFailedAt) && metadata.contentScriptEnsureFailedAt > 0) return true
     if(Number.isFinite(metadata?.lastNudgeFailedAt) && metadata.lastNudgeFailedAt > 0) return true
+    if(hasStaleAcceptedQueuedTabNudge(metadata, record, now)) return true
     return false
 }
 
-function buildRetryQueuedTabAction(metadata = null, record = null) {
+function buildRetryQueuedTabAction(metadata = null, record = null, options = {}) {
     const url = normalizeTabTargetUrl(metadata?.profileHref || metadata?.requestedUrl || '')
     if(!url) return null
     if(metadata?.ownerTabId && pausedQueuedOwners.has(metadata.ownerTabId)) return null
@@ -24948,11 +28162,21 @@ function buildRetryQueuedTabAction(metadata = null, record = null) {
     const retryAttempt = getQueuedTabRetryAttempt(metadata, record)
     const maxRetries = getQueuedTabMaxRetries(metadata, record)
     const loadPressureRequeue = metadata?.loadPressureRequeue === true
-    if(!loadPressureRequeue && retryAttempt >= maxRetries) return null
+    const forceRetryWhenExhausted = options.forceRetryWhenExhausted === true
+    if(!loadPressureRequeue && retryAttempt >= maxRetries && !forceRetryWhenExhausted) return null
+    const liveAdoptionLoadPressure = loadPressureRequeue &&
+        (Number.parseInt(metadata?.liveTabAdoptedAt, 10) || 0) > 0 &&
+        ((Number.parseInt(metadata?.lastNudgeFailedAt, 10) || 0) > 0 ||
+            (Number.parseInt(metadata?.contentScriptEnsureFailedAt, 10) || 0) > 0 ||
+            (Number.parseInt(metadata?.lastLoadPressureAt, 10) || 0) > 0)
     const sourceAttemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(record)
     const sourceAttemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(record)
     const attemptId = makeAttemptId()
     const attemptNumber = getNextAttemptNumberFromValue(metadata)
+    const nextRetryAttempt = loadPressureRequeue ? retryAttempt : retryAttempt + 1
+    const effectiveMaxRetries = forceRetryWhenExhausted
+        ? Math.max(maxRetries, nextRetryAttempt + 1)
+        : maxRetries
 
     return {
         url,
@@ -24970,13 +28194,16 @@ function buildRetryQueuedTabAction(metadata = null, record = null) {
         ownerTabId: metadata?.ownerTabId || null,
         ownerWindowId: metadata?.ownerWindowId || null,
         noForegroundFallback: !!metadata?.noForegroundFallback,
-        retryAttempt: loadPressureRequeue ? retryAttempt : retryAttempt + 1,
+        retryAttempt: nextRetryAttempt,
         sourceAttemptId,
         sourceAttemptNumber,
         attemptId,
         attemptNumber,
-        maxRetries,
-        loadPressureRequeue
+        maxRetries: effectiveMaxRetries,
+        loadPressureRequeue,
+        actionLeaseReleaseReason: liveAdoptionLoadPressure
+            ? 'queued-live-tab-adoption-load-pressure'
+            : metadata?.actionLeaseReleaseReason || ''
     }
 }
 
@@ -25030,7 +28257,7 @@ async function advanceCoordinatorQueueForStaleRetryAction(action = null, at = Da
         })
     }, {
         reason: 'advance-stale-retry-queued-tab',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
         .finally(() => {
             if(retryKey) staleRetryAdvancePromises.delete(retryKey)
@@ -25741,7 +28968,7 @@ async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
                 ? metadata.openedAt
                 : 0
         const lastUpdatedAt = Math.max(metadataUpdatedAt, getProgressHeartbeatAt(progressRecord))
-        const loadPressureCandidate = isQueuedTabLoadPressure(liveTab, progressRecord, metadata)
+        const loadPressureCandidate = isQueuedTabLoadPressure(liveTab, progressRecord, metadata, now)
         const staleTimeoutMs = loadPressureCandidate
             ? Math.min(getActiveQueuedTabStaleTimeoutMs(progressRecord, metadata), STALE_BACKGROUND_OPENING_QUEUED_TAB_MS)
             : getActiveQueuedTabStaleTimeoutMs(progressRecord, metadata)
@@ -25789,7 +29016,9 @@ async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
         let retryAction = buildRetryQueuedTabAction({
             ...metadata,
             loadPressureRequeue
-        }, progressRecord)
+        }, progressRecord, {
+            forceRetryWhenExhausted: !activeAgeExpired
+        })
         const closedAt = Date.now()
         const closeRequestedAtForStale = markQueuedTabClosing(tabId, 'stale-active-tab')
         if(retryAction) {
@@ -26082,7 +29311,7 @@ async function stopOwnerNukes(ownerTabId, options = {}) {
     return {canceledUrls, ownedTabIds}
 }
 
-async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = null, reason = 'queued-tab-release-missing-active-tab') {
+async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = null, reason = 'queued-tab-release-missing-active-tab', options = {}) {
     const href = normalizeQuoraProfileUrl(metadata?.profileHref || metadata?.targetProfileHref || metadata?.requestedUrl || '')
     const coordinatorKey = `${metadata?.coordinatorKey || href || ''}`.trim()
     if(!href && !coordinatorKey) return {changed: false, reason: 'missing-profile-href'}
@@ -26113,13 +29342,15 @@ async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = nu
     if(isTerminalProfileNukeRecord(record)) {
         return terminalizeDurableActiveCoordinatorItemFromTerminalProgress(itemKey, item, record, reason, {
             currentAuthorityState: state,
-            timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+            timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
         })
     }
 
     return requeueDurableActiveCoordinatorItemWithoutActor(itemKey, item, record, reason, {
         currentAuthorityState: state,
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
+        skipFreshContentReadiness: options.skipFreshContentReadiness === true,
+        skipFreshOpenDeferralAfterLeaseRelease: options.skipFreshOpenDeferralAfterLeaseRelease === true
     })
 }
 
@@ -26128,6 +29359,7 @@ async function releaseQueuedTab(tabId, options = {}) {
     const metadata = options.metadata || getQueuedTabMetadata(tabId)
     const hadPendingAction = pendingTabActions.has(tabId)
     const pendingAction = pendingTabActions.get(tabId) || null
+    const releaseReason = `${options.releaseReason || options.reason || 'queued-tab-slot-release'}`.trim()
     let followUpPromise = null
     let releaseContinuationScheduled = false
     let releaseRollbackDeferred = false
@@ -26156,9 +29388,9 @@ async function releaseQueuedTab(tabId, options = {}) {
         incrementQueueWakeupMetric('job.slotReleased')
         incrementQueueWakeupMetric('pump.changed.releasedSlot')
         if(options.foregroundLeaseReleased !== true) {
-            releaseQueuedForegroundLease(tabId, 'queued-tab-slot-release')
+            releaseQueuedForegroundLease(tabId, releaseReason)
         }
-        durableWrites.push(releaseCoordinatorActionLeaseForTab(tabId, 'queued-tab-slot-release'))
+        durableWrites.push(releaseCoordinatorActionLeaseForTab(tabId, releaseReason))
         if(metadata?.profileHref) {
             const normalizedHref = normalizeQuoraProfileUrl(metadata.profileHref)
             const progressRecord = normalizedHref ? profileNukeProgress?.[normalizedHref] || null : null
@@ -26175,7 +29407,7 @@ async function releaseQueuedTab(tabId, options = {}) {
                 void browser.tabs.remove(tabId).catch(() => {})
                 scheduleReleaseContinuation()
             }
-            else if(shouldDeferQueuedTabReleaseRollback(metadata)) {
+            else if(!runtimeDetached && shouldDeferQueuedTabReleaseRollback(metadata)) {
                 incrementQueueWakeupMetric('job.releaseRollbackDeferred')
                 releaseRollbackDeferred = true
                 activeQueuedTabs.add(tabId)
@@ -26202,7 +29434,8 @@ async function releaseQueuedTab(tabId, options = {}) {
                     attemptId: metadata?.attemptId || '',
                     attemptNumber: metadata?.attemptNumber || 0,
                     retryAttempt: metadata?.retryAttempt || 0,
-                    maxRetries: metadata?.maxRetries || 0
+                    maxRetries: metadata?.maxRetries || 0,
+                    releaseReason
                 }).catch(() => {
                     scheduleCoordinatorQueueResume(1000, 'release-queued-tab-durable-write-failed', {
                         allowBeforeQuora: true
@@ -26314,12 +29547,21 @@ function scheduleQueuedWorkContinuation(reason = 'queued-work-continuation') {
         requestPostStorageQueuedWorkContinuation(reason)
         return
     }
-    void kickCoordinatorQueueResume(reason, {
-        backgroundFastPath: true,
-        allowBeforeQuora: true,
-        skipAuthorityReconcile: true,
-        forceDurableQueueReload: true
-    }).catch(() => null)
+    void isCoordinatorPausedInStorage(`${reason || 'queued-work-continuation'}-paused-check`)
+        .then(paused => {
+            if(paused) {
+                incrementQueueWakeupMetric('pump.noop.continuationPaused')
+                void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
+                return null
+            }
+            return kickCoordinatorQueueResume(reason, {
+                backgroundFastPath: true,
+                allowBeforeQuora: true,
+                skipAuthorityReconcile: true,
+                forceDurableQueueReload: true
+            })
+        })
+        .catch(() => null)
     void closeTerminalOwnedProfileTabs().catch(() => {
         scheduleCoordinatorReconcile(1000, {
             reason: `${reason || 'queued-work-continuation'}-close-terminal-failed`,
@@ -26439,7 +29681,7 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
     const tab = sender.tab || {}
     const tabId = normalizeTabId(tab?.id)
     if(!tabId) return null
-    if(wasQueuedRuntimeTabRemoved(tabId)) return null
+    const runtimeWasDetached = wasQueuedRuntimeTabRemoved(tabId)
 
     let queue = {}
     let currentAuthorityState = null
@@ -26458,7 +29700,7 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
         const matchesActiveRow = await coordinatorItemMatchesTab(item, itemKey, tab)
         const matchesQueuedRow = matchesActiveRow
             ? false
-            : await queuedCoordinatorItemMatchesLiveProfileTabForRecovery(item, itemKey, tab)
+            : !runtimeWasDetached && await queuedCoordinatorItemMatchesLiveProfileTabForRecovery(item, itemKey, tab)
         if(!matchesActiveRow && !matchesQueuedRow) continue
 
         const profileHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -26478,6 +29720,11 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
         const retryAttempt = Number.parseInt(item?.retryAttempt, 10) || 0
         const maxRetries = Number.parseInt(item?.maxRetries, 10) || STALE_QUEUED_TAB_MAX_RETRIES
         const noForegroundFallback = getQueuedActionNoForegroundFallback(item)
+        const actionSurfaceMode = item?.actionSurfaceMode || (isQueuedWorkerActionSurfaceTab(tab, item) ? 'worker-window' : '')
+        const actionSurfaceWindowId = Number.parseInt(item?.actionSurfaceWindowId, 10) ||
+            (actionSurfaceMode === 'worker-window' ? tab?.windowId || null : null)
+        const actionSurfaceAnchorTabId = item?.actionSurfaceAnchorTabId || null
+        const actionSurfaceActivatedAt = Number.parseInt(item?.actionSurfaceActivatedAt, 10) || 0
         const metadata = {
             profileHref,
             coordinatorKey,
@@ -26488,7 +29735,7 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
             candidateConfidence: item?.candidateConfidence || '',
             candidateCollector: item?.candidateCollector || '',
             ownerTabId,
-            ownerWindowId: item?.ownerWindowId || null,
+            ownerWindowId: item?.ownerWindowId || tab?.windowId || null,
             runId: item?.runId || '',
             tabAction,
             actionKind,
@@ -26502,7 +29749,11 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
             attemptNumber,
             maxRetries,
             openedAt,
-            lastUrl: tab?.url || requestedUrl
+            lastUrl: tab?.url || requestedUrl,
+            actionSurfaceMode,
+            actionSurfaceWindowId,
+            actionSurfaceAnchorTabId,
+            actionSurfaceActivatedAt
         }
         const action = {
             action: tabAction,
@@ -26524,10 +29775,15 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
             ownerTabId,
             ownerWindowId: metadata.ownerWindowId,
             noForegroundFallback,
+            actionSurfaceMode,
+            actionSurfaceWindowId,
+            actionSurfaceAnchorTabId,
+            actionSurfaceActivatedAt,
             attemptId,
             attemptNumber
         }
 
+        removedQueuedRuntimeTabIds.delete(tabId)
         activeQueuedTabs.add(tabId)
         setQueuedTabMetadata(tabId, metadata)
         pendingTabActions.set(tabId, action)
@@ -26626,7 +29882,7 @@ async function claimPendingTabAction(sender = {}) {
                 coordinatorKey,
                 actionKind: durableClaimAction.actionKind || durableClaimAction.tabAction || durableClaimAction.action || ''
             }),
-            QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
+            QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
             'queued tab durable claim pre-confirmation'
         ).catch(() => false)
     }
@@ -26635,7 +29891,7 @@ async function claimPendingTabAction(sender = {}) {
         try {
             durableClaimed = await promiseWithTimeout(
                 transitionCoordinatorItemForQueuedTab(durableClaimAction, sender.tab || {id: tabId}, durableClaimDetails),
-                QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
+                QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
                 'queued tab durable claim'
             )
         }
@@ -26652,7 +29908,7 @@ async function claimPendingTabAction(sender = {}) {
                 coordinatorKey,
                 actionKind: durableClaimAction.actionKind || durableClaimAction.tabAction || durableClaimAction.action || ''
             }),
-            QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
+            QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
             'queued tab durable claim confirmation'
         ).catch(() => false)
     }
@@ -27370,7 +30626,7 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
         }
     }, {
         reason: 'resolver-unresolved',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -27412,13 +30668,74 @@ function buildCoordinatorRowEventsFromProgressRecords(progressRecords = {}, opti
         .filter(Boolean)
 }
 
+function shouldCloseRejectedStaleRowEventSenderTab(item = null, record = null, senderTabId = null) {
+    const normalizedTabId = normalizeTabId(senderTabId)
+    if(!normalizedTabId || !item || !record) return false
+
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const incomingAttemptId = getAttemptIdFromValue(record)
+    if(!currentAttemptId || !incomingAttemptId || currentAttemptId === incomingAttemptId) return false
+
+    const metadata = getQueuedTabMetadata(normalizedTabId)
+    if(!metadata) return false
+
+    const metadataAttemptId = getAttemptIdFromValue(metadata)
+    if(metadataAttemptId && metadataAttemptId !== incomingAttemptId) return false
+
+    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(record.profileHref || '')
+    const metadataHref = normalizeQuoraProfileUrl(metadata.profileHref || metadata.requestedUrl || '')
+    if(itemHref && metadataHref && itemHref !== metadataHref) return false
+
+    const itemKey = getCoordinatorItemQueueKey(item)
+    const metadataKey = `${metadata.coordinatorKey || ''}`.trim()
+    if(itemKey && metadataKey && itemKey !== metadataKey) return false
+
+    return true
+}
+
+async function closeRejectedStaleRowEventSenderTabs(candidates = [], reason = 'row-event-stale-attempt') {
+    const tabIds = Array.from(new Set((Array.isArray(candidates) ? candidates : [])
+        .map(candidate => normalizeTabId(candidate?.tabId))
+        .filter(Boolean)))
+    if(!tabIds.length) return {candidates: 0, closed: 0}
+
+    let closed = 0
+    for(const tabId of tabIds) {
+        markQueuedTabClosing(tabId, reason)
+        if(hasOwnedQueuedTabState(tabId)) {
+            await releaseQueuedTabAndCleanup(tabId, {awaitFill: false}).catch(() => {
+                cleanupQueuedTabMetadataOnly(tabId)
+            })
+        }
+        else {
+            cleanupQueuedTabMetadataOnly(tabId)
+        }
+        await browser.tabs.remove(tabId).catch(() => {})
+        closed += 1
+    }
+
+    if(closed > 0) {
+        incrementQueueWakeupMetric('rowEvent.staleAttemptSenderClosed', closed)
+        scheduleQueuedWorkContinuation(reason)
+    }
+
+    return {
+        candidates: tabIds.length,
+        closed
+    }
+}
+
 async function applyCoordinatorRowEvent(event = {}, options = {}) {
     const result = await applyCoordinatorRowEvents([event], options)
     const normalizedHref = normalizeQuoraProfileUrl(event?.profileHref || event?.href || event?.coordinatorKey || '')
-    return result?.results?.[normalizedHref] || {
+    const rowResult = result?.results?.[normalizedHref] || {
         recorded: false,
         terminal: false,
         reason: result?.reason || 'not-recorded'
+    }
+    return {
+        ...rowResult,
+        ...(result?.staleAttemptSenderClose ? {staleAttemptSenderClose: result.staleAttemptSenderClose} : {})
     }
 }
 
@@ -27439,7 +30756,7 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
         ? `rowEvent.${metricKinds[0]}`
         : 'rowEvent.batch'
 
-    return enqueueSpaceFeedStorageUpdate(async () => {
+    const rowEventResult = await enqueueSpaceFeedStorageUpdate(async () => {
         const state = await loadCoordinatorQueueRunsScopedProgressProjectionForMutation({
             metricPath: `${metricPath}.load`,
             residentMetricPath: `${metricPath}.usedResidentAuthority`,
@@ -27457,6 +30774,7 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
         const progressProjectionRecords = {}
         const progressProjectionPreviousRecords = {}
         const progressShadowWalRecords = {}
+        const staleAttemptSenderTabs = []
 
         for(const event of normalizedEvents) {
             const eventKind = event.eventKind
@@ -27521,6 +30839,12 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
                     senderTabId: event.senderTabId || null,
                     message: 'Ignored row event progress from stale attempt'
                 })
+                if(shouldCloseRejectedStaleRowEventSenderTab(item, record, event.senderTabId)) {
+                    staleAttemptSenderTabs.push({
+                        tabId: event.senderTabId,
+                        profileHref: normalizedHref
+                    })
+                }
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'stale-attempt'}
                 continue
             }
@@ -27839,6 +31163,7 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
                     .filter(result => result?.recorded === true)
                     .every(result => result.progressProjectionDurable === true),
                 progressShadowWal,
+                staleAttemptSenderTabs,
                 results
             }
         }
@@ -27849,12 +31174,23 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
             rowEvent: true,
             progressProjectionDurable: null,
             progressShadowWal: null,
+            staleAttemptSenderTabs,
             results
         }
     }, {
         reason: metricPath,
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
+
+    const staleAttemptSenderClose = await closeRejectedStaleRowEventSenderTabs(
+        rowEventResult?.staleAttemptSenderTabs || [],
+        'row-event-stale-attempt'
+    )
+
+    return {
+        ...rowEventResult,
+        staleAttemptSenderClose
+    }
 }
 
 function scheduleTerminalProgressSettlement(profileHrefs = []) {
@@ -28014,9 +31350,29 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
 
             if(item && shouldApplyProgressToCoordinatorItem(item, record) && !hasMismatchedCoordinatorAttempt(item, record)) {
                 accepted = true
-                const mapped = getCoordinatorStatusFromProgress(record)
+                let mapped = getCoordinatorStatusFromProgress(record)
+                if(shouldRecoverQueuedDirectBlockActionTerminalProgress(item, record, mapped, options)) {
+                    const retryRecord = buildQueuedDirectBlockActionRetryRecord(item, record, Date.now())
+                    if(retryRecord) {
+                        record = retryRecord
+                        mapped = getCoordinatorStatusFromProgress(record)
+                        incrementQueueWakeupMetric('terminalProgress.recoveredQueuedDirectBlockIncomplete')
+                        scheduleQueuedWorkContinuation('queued-direct-block-action-incomplete-recovered')
+                    }
+                }
+                else if(shouldRecoverQueuedProfileActionGateTerminalProgress(item, record, mapped, options)) {
+                    const retryRecord = buildQueuedProfileActionGateRetryRecord(item, record, Date.now())
+                    if(retryRecord) {
+                        record = retryRecord
+                        mapped = getCoordinatorStatusFromProgress(record)
+                        incrementQueueWakeupMetric('terminalProgress.recoveredQueuedProfileActionGateTimeout')
+                        scheduleQueuedWorkContinuation('queued-profile-action-gate-timeout-recovered')
+                    }
+                }
                 const mappedTerminal = isTerminalCoordinatorStatus(mapped.status)
                 const preferSuccessfulTerminal = shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)
+                const resetRetryFromTerminalProgress = record?.directBlockRetryRecovery === true ||
+                    record?.profileActionGateRetryRecovery === true
                 terminal = mappedTerminal
 
                 if(isTerminalCoordinatorStatus(item.status) && !mappedTerminal) {
@@ -28048,7 +31404,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                 }
                 else if((patchCanTransitionStatus || preferSuccessfulTerminal) &&
                     mapped.status &&
-                    !(item.status !== 'queued' && mapped.status === 'queued')) {
+                    !(item.status !== 'queued' && mapped.status === 'queued' && !resetRetryFromTerminalProgress)) {
                     const runtimeRejectionReason = getActiveCoordinatorDirectProgressRuntimeRejectionReason(item, patch, mapped, options)
                     if(runtimeRejectionReason) {
                         results[normalizedHref] = {
@@ -28059,7 +31415,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                         continue
                     }
                     const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-                        now: Date.now()
+                        now: Date.now(),
+                        resetRetry: resetRetryFromTerminalProgress
                     })
                     if(JSON.stringify(nextItem) !== JSON.stringify(item)) {
                         const queueOperationKind = mappedTerminal ? 'terminal-progress' : 'direct-progress'
@@ -28080,7 +31437,10 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                                 if(currentRuntimeRejectionReason) {
                                     return context.reject(currentRuntimeRejectionReason)
                                 }
-                                return nextItem
+                                return transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
+                                    now: Date.now(),
+                                    resetRetry: resetRetryFromTerminalProgress
+                                })
                             }
                         })
 
@@ -28230,7 +31590,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         }
     }, {
         reason: options.expectTerminal === true ? 'terminal-progress' : 'direct-progress',
-        timeoutMs: COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 
     if(updateResult?.terminalSettlementHrefs?.length) {
@@ -28722,6 +32082,42 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
             activeTransitionSettled = true
             throw error
         })
+    if(returnAfterDurableActive) {
+        try {
+            activeTransitionAccepted = await promiseWithTimeout(
+                activeTransitionPromise,
+                activeTransitionTimeoutMs,
+                'queued tab fast active transition'
+            )
+        }
+        catch(error) {
+            activeTransitionError = error?.message || `${error || ''}`
+        }
+        if(activeTransitionAccepted) {
+            markQueuedTabDurablyActive(tab.id, 'active-transition-fast-confirmed')
+        }
+        else {
+            setQueuedTabMetadata(tab.id, {
+                activeTransitionContinuedAt: Date.now(),
+                activeTransitionError,
+                activeTransitionUnconfirmedAt: Date.now(),
+                activeTransitionUnconfirmedReason: 'fast-path-storage-lane-detached'
+            })
+            markQueuedTabDurablyActive(tab.id, 'active-transition-fast-detached')
+            scheduleCoordinatorQueueResume(1000, 'active-transition-fast-detached', {
+                allowBeforeQuora: true
+            })
+            scheduleQueuedWorkContinuation('active-transition-fast-detached')
+        }
+        return {
+            activeTransitionAccepted,
+            activeTransitionError,
+            activeTransitionContinued: !activeTransitionAccepted,
+            activeTransitionFastUnconfirmed: !activeTransitionAccepted,
+            keepOpen: true,
+            rolledBack: false
+        }
+    }
     try {
         activeTransitionAccepted = await promiseWithTimeout(
             activeTransitionPromise,
@@ -28873,6 +32269,15 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
     }
     else {
         markQueuedTabDurablyActive(tab.id, 'active-transition')
+        if(returnAfterDurableActive) {
+            return {
+                activeTransitionAccepted,
+                activeTransitionError,
+                activeTransitionContinued,
+                keepOpen: true,
+                rolledBack: false
+            }
+        }
         await coordinatorAuthority.hydrate().catch(() => null)
         const liveTabStatus = await getQueuedExecutorTabStatusWithTimeout(tab?.id, 'active-transition-post-confirm')
         if(!liveTabStatus.tab && liveTabStatus.missing) {
@@ -28947,9 +32352,11 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
 
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
-    await sweepStaleQueuedTabs(null, {
-        queueOnlyAuthority: options.queueOnlyAuthority === true
-    })
+    let openedTabs = 0
+    let fillFailureReason = ''
+    let fillFailureError = ''
+    let prunedStaleAttemptActions = 0
+    let recoveredLiveTabs = 0
     const throttle = getQueueLoadThrottle()
     const getCapacityUsed = () => getSchedulerBlockingQueuedExecutorCount() + openedTabs
     const cycle = startQueueWakeupMetricCycle('pump', 'fillQueuedTabsOnce', 'fill-slots', {
@@ -28959,9 +32366,6 @@ async function fillQueuedTabsOnce(options = {}) {
         concurrency: getEffectiveQueuedTabConcurrency(),
         throttle
     })
-    let openedTabs = 0
-    let fillFailureReason = ''
-    let fillFailureError = ''
     recordFlightRecorderEvent({
         kind: 'fill-decision',
         source: 'fillQueuedTabsOnce',
@@ -28971,9 +32375,7 @@ async function fillQueuedTabsOnce(options = {}) {
         changed: false
     })
 
-    const pausedState = options.pauseAlreadyChecked === true
-        ? null
-        : await metricStorageGet({[COORDINATOR_PAUSED_KEY]: false}).catch(() => null)
+    const pausedState = await metricStorageGet({[COORDINATOR_PAUSED_KEY]: false}).catch(() => null)
     if(pausedState?.[COORDINATOR_PAUSED_KEY] === true) {
         incrementQueueWakeupMetric('pump.noop.paused')
         finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
@@ -28997,6 +32399,10 @@ async function fillQueuedTabsOnce(options = {}) {
             paused: true
         }
     }
+
+    await sweepStaleQueuedTabs(null, {
+        queueOnlyAuthority: options.queueOnlyAuthority === true
+    })
 
     await sweepProfileTabsWithoutActiveQueueAuthority({
         queueOnlyAuthority: options.queueOnlyAuthority === true
@@ -29091,9 +32497,57 @@ async function fillQueuedTabsOnce(options = {}) {
                         error: finalOpenDecision.error || ''
                     }
                 })
+                const finalOpenRecovery = await recoverQueuedActionLiveTabAfterFinalOpenDecline(
+                    next,
+                    finalOpenDecision,
+                    {
+                        queueOnlyAuthority: options.queueOnlyAuthority === true
+                    }
+                ).catch(error => ({
+                    changed: false,
+                    unresolved: false,
+                    reason: 'final-open-live-recovery-error',
+                    error: error?.message || `${error || ''}`
+                }))
+                if(finalOpenRecovery?.adopted === true) {
+                    recoveredLiveTabs += 1
+                    fillFailureReason = finalOpenRecovery.reason || 'queued-live-tab-adopted-after-final-open-decline'
+                    incrementQueueWakeupMetric('pump.changed.adoptedLiveTabAfterFinalOpenDecline')
+                    recordFlightRecorderEvent({
+                        kind: 'queued-tab-final-open-recovery',
+                        source: 'fillQueuedTabsOnce',
+                        rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+                        targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+                        attemptId: getAttemptIdFromValue(next),
+                        attemptNumber: getAttemptNumberFromValue(next),
+                        runId: next.runId || '',
+                        tabId: finalOpenRecovery.tabId || null,
+                        accepted: true,
+                        changed: true,
+                        reason: fillFailureReason
+                    })
+                    continue
+                }
+                if(finalOpenRecovery?.unresolved === true) {
+                    const recoveryReason = finalOpenRecovery.reason || 'queued-authority-live-profile-tab-unclassified'
+                    fillFailureReason = recoveryReason
+                    fillFailureError = finalOpenRecovery.error || finalOpenDecision.error || ''
+                    incrementQueueWakeupMetric('pump.noop.finalOpenLiveTabUnclassified')
+                    scheduleCoordinatorQueueResume(1000, recoveryReason, {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: recoveryReason,
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    break
+                }
                 if(finalOpenDecision.reason === 'stale-attempt' ||
                     finalOpenDecision.reason === 'stale-attempt-number') {
                     const pruneReason = 'queued-tab-stale-action-pruned'
+                    fillFailureReason = pruneReason
+                    prunedStaleAttemptActions += 1
                     incrementQueueWakeupMetric('pump.changed.prunedStaleAttemptQueuedAction')
                     recordFlightRecorderEvent({
                         kind: 'queued-tab-action-pruned',
@@ -29136,10 +32590,10 @@ async function fillQueuedTabsOnce(options = {}) {
                         queuedTabActions.unshift(next)
                         incrementQueueWakeupMetric('pump.changed.requeuedFinalOpenAuthorityUnavailable')
                     }
-                    scheduleCoordinatorQueueResume(1000, retryReason, {
+                    scheduleCoordinatorQueueResume(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, retryReason, {
                         allowBeforeQuora: true
                     })
-                    scheduleCoordinatorReconcile(1000, {
+                    scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, {
                         reason: retryReason,
                         edgeTriggered: true,
                         allowBeforeQuora: true
@@ -29152,12 +32606,97 @@ async function fillQueuedTabsOnce(options = {}) {
             }
             next.executorFinalOpenDecisionReason = finalOpenDecision.reason || ''
 
+            const preOpenRecovery = await recoverQueuedRuntimeActionBeforeOpen(next, {
+                currentAuthorityState: options.currentAuthorityState || null
+            }).catch(error => ({
+                changed: false,
+                adopted: false,
+                deferred: false,
+                reason: 'queued-runtime-action-pre-open-recovery-error',
+                error: error?.message || `${error || ''}`
+            }))
+            if(preOpenRecovery?.adopted === true) {
+                recoveredLiveTabs += 1
+                fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-before-open'
+                incrementQueueWakeupMetric('pump.changed.adoptedLiveTabBeforeDuplicateOpen')
+                recordFlightRecorderEvent({
+                    kind: 'queued-tab-pre-open-recovery',
+                    source: 'fillQueuedTabsOnce',
+                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+                    attemptId: getAttemptIdFromValue(next),
+                    attemptNumber: getAttemptNumberFromValue(next),
+                    runId: next.runId || '',
+                    tabId: preOpenRecovery.tabId || null,
+                    accepted: true,
+                    changed: true,
+                    reason: fillFailureReason
+                })
+                continue
+            }
+            if(preOpenRecovery?.deferred === true) {
+                queuedTabActions.unshift(next)
+                fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-needs-reconcile'
+                fillFailureError = preOpenRecovery.error || ''
+                incrementQueueWakeupMetric('pump.noop.deferredDuplicateLiveTabBeforeOpen')
+                scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+                    allowBeforeQuora: true
+                })
+                scheduleCoordinatorReconcile(1000, {
+                    reason: fillFailureReason,
+                    edgeTriggered: true,
+                    allowBeforeQuora: true
+                })
+                recordFlightRecorderEvent({
+                    kind: 'queued-tab-pre-open-recovery',
+                    source: 'fillQueuedTabsOnce',
+                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+                    attemptId: getAttemptIdFromValue(next),
+                    attemptNumber: getAttemptNumberFromValue(next),
+                    runId: next.runId || '',
+                    accepted: false,
+                    changed: false,
+                    reason: fillFailureReason
+                })
+                break
+            }
+
+            if(await isCoordinatorPausedInStorage('queued-tab-pre-open-paused-check')) {
+                queuedTabActions.unshift(next)
+                fillFailureReason = 'coordinator-paused'
+                incrementQueueWakeupMetric('pump.noop.pausedBeforeOpen')
+                finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
+                    active: activeQueuedTabs.size,
+                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+                    remainingActions: queuedTabActions.length
+                })
+                recordFlightRecorderEvent({
+                    kind: 'fill-decision',
+                    source: 'fillQueuedTabsOnce',
+                    reason: 'coordinator-paused',
+                    accepted: false,
+                    changed: false
+                })
+                return {
+                    openedTabs: 0,
+                    active: activeQueuedTabs.size,
+                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+                    remainingActions: queuedTabActions.length,
+                    reason: 'coordinator-paused',
+                    paused: true
+                }
+            }
+
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
             let tab = null
             try {
+                const tabCreateTimeoutMs = options.returnAfterDurableActive === true
+                    ? QUEUED_TAB_CREATE_TIMEOUT_MS * 2
+                    : QUEUED_TAB_CREATE_TIMEOUT_MS
                 tab = await promiseWithTimeout(
                     createOwnedTab(next),
-                    QUEUED_TAB_CREATE_TIMEOUT_MS,
+                    tabCreateTimeoutMs,
                     'queued owned tab create'
                 )
                 openedTabs += 1
@@ -29214,6 +32753,25 @@ async function fillQueuedTabsOnce(options = {}) {
                         requestedUrl: next.requestedUrl || ''
                     }
                 })
+                const postOpenRecovery = await recoverQueuedRuntimeActionBeforeOpen(next, {
+                    currentAuthorityState: coordinatorAuthority.current()
+                }).catch(recoveryError => ({
+                    changed: false,
+                    adopted: false,
+                    deferred: false,
+                    reason: 'queued-runtime-action-post-open-recovery-error',
+                    error: recoveryError?.message || `${recoveryError || ''}`
+                }))
+                if(postOpenRecovery?.adopted === true ||
+                    postOpenRecovery?.reason === 'queued-runtime-action-already-has-runtime-surface') {
+                    fillFailureReason = postOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-after-open-timeout'
+                    incrementQueueWakeupMetric('pump.changed.recoveredOpenTimeoutRuntimeSurface')
+                    scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+                        allowBeforeQuora: true
+                    })
+                    scheduleQueuedWorkContinuation(fillFailureReason)
+                    break
+                }
                 if(openFailureCount <= 3 && !pausedQueuedOwners.has(next.ownerTabId)) {
                     queuedTabActions.unshift({
                         ...next,
@@ -29229,6 +32787,25 @@ async function fillQueuedTabsOnce(options = {}) {
                 break
             }
             const openedAt = Date.now()
+            const preRuntimeTabStatus = await getQueuedExecutorTabStatusWithTimeout(
+                tab.id,
+                'queued-tab-open-pre-runtime-effect-confirm'
+            )
+            if(!preRuntimeTabStatus.tab && preRuntimeTabStatus.missing) {
+                await rollbackFailedQueuedTabOpen(next, tab, {
+                    activeTransitionError: 'tab-missing-before-runtime-effect',
+                    currentAuthorityState: coordinatorAuthority.current()
+                }).catch(() => false)
+                cleanupQueuedTabMetadataOnly(tab.id)
+                scheduleCoordinatorQueueResume(1000, 'queued-tab-open-pre-runtime-tab-missing', {
+                    allowBeforeQuora: true
+                })
+                scheduleQueuedWorkContinuation('queued-tab-open-pre-runtime-tab-missing')
+                continue
+            }
+            if(preRuntimeTabStatus.tab) {
+                tab = preRuntimeTabStatus.tab
+            }
             const openPlan = buildQueuedTabOpenEffectPlan(next, tab, openedAt)
             applyQueuedTabOpenRuntimeEffect(openPlan)
             const activeTransition = await confirmQueuedTabOpenDurableActiveEffect(next, tab, openPlan, {
@@ -29241,37 +32818,6 @@ async function fillQueuedTabsOnce(options = {}) {
                 activeTransitionContinued: activeTransition.activeTransitionContinued
             }) : null
             if(options.returnAfterDurableActive === true) {
-                const fastOpenTabStatus = await getQueuedExecutorTabStatusWithTimeout(tab.id, 'queued-tab-open-fast-post-transition-confirm')
-                if(!fastOpenTabStatus.tab && fastOpenTabStatus.missing) {
-                    const detached = detachQueuedTabRuntimeState(tab.id, 'queued-tab-open-fast-tab-missing')
-                    void releaseQueuedTab(tab.id, {
-                        runtimeDetached: true,
-                        metadata: detached.metadata,
-                        wasActive: detached.wasActive,
-                        foregroundLeaseReleased: detached.foregroundLeaseReleased
-                    })
-                    scheduleCoordinatorQueueResume(1000, 'queued-tab-open-fast-tab-missing', {
-                        allowBeforeQuora: true
-                    })
-                    scheduleCoordinatorReconcile(1000, {
-                        reason: 'queued-tab-open-fast-tab-missing',
-                        edgeTriggered: true,
-                        allowBeforeQuora: true
-                    })
-                    continue
-                }
-                if(!fastOpenTabStatus.tab) {
-                    setQueuedTabMetadata(tab.id, {
-                        queuedTabOpenFastPostTransitionLookupFailedAt: Date.now(),
-                        queuedTabOpenFastPostTransitionLookupReason: fastOpenTabStatus.timedOut
-                            ? 'queued-tab-open-fast-post-transition-timeout'
-                            : 'queued-tab-open-fast-post-transition-unknown',
-                        queuedTabOpenFastPostTransitionLookupError: fastOpenTabStatus.error || ''
-                    })
-                    scheduleCoordinatorQueueResume(1000, 'queued-tab-open-fast-lookup-deferred', {
-                        allowBeforeQuora: true
-                    })
-                }
                 if(openPlan.profileHref && openedProgressPatch) {
                     void recordCoordinatorJobProgress(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})
                         .catch(error => {
@@ -29289,8 +32835,14 @@ async function fillQueuedTabsOnce(options = {}) {
                     ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
                     QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
                     'queued tab content script ensure'
-                ).catch(() => null)
-                void contentEnsurePromise
+                ).catch(error => ({
+                    ensured: false,
+                    reason: 'content-script-ensure-failed',
+                    error: error?.message || `${error || ''}`
+                }))
+                void contentEnsurePromise.then(result =>
+                    handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened-return-after-durable-active')
+                )
                 void nudgeQueuedTabActionClaimWithRetries(tab.id, 'queued-tab-opened')
                 scheduleOwnedBlockedProfileSweep(next.ownerTabId, 4000)
                 void sweepOwnedBlockedProfileTabs(next.ownerTabId)
@@ -29338,8 +32890,14 @@ async function fillQueuedTabsOnce(options = {}) {
                 ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
                 QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
                 'queued tab content script ensure'
-            ).catch(() => null)
-            void contentEnsurePromise
+            ).catch(error => ({
+                ensured: false,
+                reason: 'content-script-ensure-failed',
+                error: error?.message || `${error || ''}`
+            }))
+            void contentEnsurePromise.then(result =>
+                handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened')
+            )
             void nudgeQueuedTabActionClaimWithRetries(tab.id, 'queued-tab-opened')
             scheduleOwnedBlockedProfileSweep(next.ownerTabId, 4000)
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
@@ -29353,10 +32911,16 @@ async function fillQueuedTabsOnce(options = {}) {
         }
     }
 
-    if(openedTabs > 0) {
-        incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
-        finishQueueWakeupMetricCycle(cycle, 'state-changed', 'opened-tab', {
+    if(openedTabs > 0 || recoveredLiveTabs > 0) {
+        if(openedTabs > 0) {
+            incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
+        }
+        const changedReason = openedTabs > 0
+            ? 'opened-tab'
+            : fillFailureReason || 'queued-live-tab-adopted-after-final-open-decline'
+        finishQueueWakeupMetricCycle(cycle, 'state-changed', changedReason, {
             openedTabs,
+            recoveredLiveTabs,
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length
@@ -29364,38 +32928,46 @@ async function fillQueuedTabsOnce(options = {}) {
         recordFlightRecorderEvent({
             kind: 'fill-decision',
             source: 'fillQueuedTabsOnce',
-            reason: 'opened-tab',
+            reason: changedReason,
             accepted: true,
             changed: true
         })
         return {
             openedTabs,
+            recoveredLiveTabs,
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length,
-            reason: 'opened-tab'
+            reason: changedReason
         }
     }
     else {
         incrementQueueWakeupMetric('pump.noop.noPendingItems')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'no-tab-opened', {
+        const noOpenReason = fillFailureReason || (prunedStaleAttemptActions > 0
+            ? 'queued-tab-stale-action-pruned'
+            : 'no-tab-opened')
+        finishQueueWakeupMetricCycle(cycle, 'no-op', noOpenReason, {
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queuedTabActions.length
+            remainingActions: queuedTabActions.length,
+            prunedStaleAttemptActions
         })
         recordFlightRecorderEvent({
             kind: 'fill-decision',
             source: 'fillQueuedTabsOnce',
-            reason: 'no-tab-opened',
+            reason: noOpenReason,
             accepted: false,
-            changed: false
+            changed: prunedStaleAttemptActions > 0,
+            prunedStaleAttemptActions
         })
         return {
             openedTabs: 0,
             active: activeQueuedTabs.size,
             schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
             remainingActions: queuedTabActions.length,
-            reason: fillFailureReason || 'no-tab-opened',
+            reason: noOpenReason,
+            prunedStaleAttemptActions,
+            authorityUnavailable: /authority-unavailable|final-open-decision-timeout/.test(noOpenReason),
             ...(fillFailureError ? {error: fillFailureError} : {})
         }
     }
@@ -29504,22 +33076,80 @@ browser.tabs.onRemoved.addListener(tabId => {
                 isTransientProfileNukeStatus(progressRecord.status) &&
                 !metadata?.closeRequestedAt &&
                 !metadata?.retryRequestedAt
+            let recoveredClosedTransient = null
+            if(shouldInterruptClosedTransient) {
+                recoveredClosedTransient = await reconcileReleasedActiveCoordinatorTab(
+                    metadata,
+                    tabId,
+                    'queued-tab-closed-before-terminal',
+                    {
+                        skipFreshContentReadiness: true,
+                        skipFreshOpenDeferralAfterLeaseRelease: true
+                    }
+                ).catch(error => ({
+                    changed: false,
+                    reason: 'queued-tab-closed-before-terminal-requeue-failed',
+                    error: error?.message || `${error || ''}`
+                }))
+                if(recoveredClosedTransient?.changed === true &&
+                    recoveredClosedTransient.status === 'queued') {
+                    incrementQueueWakeupMetric('pump.changed.requeuedClosedBeforeTerminal')
+                    recordFlightRecorderEvent({
+                        kind: 'closed-before-terminal-requeue',
+                        source: 'tabs.onRemoved',
+                        rowKey: metadata.coordinatorKey || metadata.profileHref || '',
+                        targetUrl: metadata.profileHref || metadata.requestedUrl || '',
+                        attemptId: getAttemptIdFromValue(metadata) || getAttemptIdFromValue(progressRecord),
+                        attemptNumber: getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(progressRecord),
+                        runId: metadata.runId || progressRecord?.runId || '',
+                        tabId,
+                        accepted: true,
+                        changed: true,
+                        statusAfter: 'queued',
+                        reason: 'queued-tab-closed-before-terminal'
+                    })
+                    scheduleCoordinatorQueueResume(1000, 'queued-tab-closed-before-terminal-requeued', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleQueuedWorkContinuation('queued-tab-closed-before-terminal-requeued')
+                }
+                else if(recoveredClosedTransient?.status !== 'failed') {
+                    incrementQueueWakeupMetric('pump.noop.deferredClosedBeforeTerminal')
+                    recordFlightRecorderEvent({
+                        kind: 'closed-before-terminal-requeue',
+                        source: 'tabs.onRemoved',
+                        rowKey: metadata.coordinatorKey || metadata.profileHref || '',
+                        targetUrl: metadata.profileHref || metadata.requestedUrl || '',
+                        attemptId: getAttemptIdFromValue(metadata) || getAttemptIdFromValue(progressRecord),
+                        attemptNumber: getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(progressRecord),
+                        runId: metadata.runId || progressRecord?.runId || '',
+                        tabId,
+                        accepted: false,
+                        changed: false,
+                        reason: recoveredClosedTransient?.reason || 'queued-tab-closed-before-terminal-deferred',
+                        ...(recoveredClosedTransient?.error ? {error: recoveredClosedTransient.error} : {})
+                    })
+                    scheduleCoordinatorQueueResume(1000, 'queued-tab-closed-before-terminal-deferred', {
+                        allowBeforeQuora: true
+                    })
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: 'queued-tab-closed-before-terminal-deferred',
+                        edgeTriggered: true,
+                        allowBeforeQuora: true
+                    })
+                    scheduleQueuedWorkContinuation('queued-tab-closed-before-terminal-deferred')
+                }
+            }
 
             const patch = {
-                ...(shouldInterruptClosedTransient ? {
-                    status: 'interrupted',
-                    finalError: progressRecord?.finalError || (
-                        metadata?.closeReason
-                            ? `Queued tab closed before reaching a terminal state (${metadata.closeReason})`
-                            : 'Queued tab closed before reaching a terminal state'
-                    )
-                } : {}),
                 tabClosedAt: Date.now(),
                 closedByExtension: !!metadata.closeRequestedAt,
                 closeReason: metadata.closeReason || '',
                 event: 'Queued tab closed'
             }
-            void recordCoordinatorJobProgress(metadata.profileHref, patch, {senderTabId: tabId})
+            if(!shouldInterruptClosedTransient) {
+                void recordCoordinatorJobProgress(metadata.profileHref, patch, {senderTabId: tabId})
+            }
         }
         else if(metadata?.coordinatorKey) {
             const closeReason = `${metadata.closeReason || ''}`.trim()
@@ -30084,15 +33714,18 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         })
     }
     else if(request.action === 'coordinator-page-ready') {
-        if(!quoraRuntimeActivated) return Promise.resolve({
-            displayOnly: true,
-            requiresQuoraVisit: true
-        })
+        return refreshStaleCompactQueueViewIfNeeded('dashboard-ready')
+            .then(() => {
+                if(!quoraRuntimeActivated) return {
+                    displayOnly: true,
+                    requiresQuoraVisit: true
+                }
 
-        return dedupeCoordinatorTabs(sender.tab?.id || null).then(coordinator => ({
-            ...(coordinator || {}),
-            displayOnly: true
-        }))
+                return dedupeCoordinatorTabs(sender.tab?.id || null).then(coordinator => ({
+                    ...(coordinator || {}),
+                    displayOnly: true
+                }))
+            })
     }
     else if(request.action === 'pause-coordinator-nukes') {
         return pauseCoordinatorNukes()

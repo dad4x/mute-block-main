@@ -55,6 +55,13 @@ Supporting notes:
 - [timeout-inventory-1.6.md](timeout-inventory-1.6.md): current timeout
   inventory, useful for auditing scheduler deadlines.
 
+Deferred cleanup reminder:
+
+- Once queue execution is stable and reliable, re-check whether the background
+  page / background executor surface is still necessary. If the reconciler and
+  WAL-backed scheduler can run reliably without it, remove that extra browser
+  surface rather than carrying it as permanent architecture.
+
 ### Storage Authority And WAL
 
 Status: active design and refactor lane.

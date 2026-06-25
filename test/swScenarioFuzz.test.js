@@ -144,7 +144,11 @@ function assertScenarioInvariants(env) {
 
     const activeTabIds = new Set(env.sw.state().activeQueuedTabs)
     for(const tabId of activeTabIds) {
-        assert.equal(env.browser.__tabs.has(tabId), true, `active queued tab ${tabId} is missing from fake browser`)
+        assert.equal(env.browser.__tabs.has(tabId), true, `active queued tab ${tabId} is missing from fake browser: ${JSON.stringify({
+            metadata: getMetadata(env, tabId),
+            tabs: listTabs(env).map(tab => ({id: tab.id, url: tab.url || '', windowId: tab.windowId || 0})),
+            removedTabs: env.browser.__removedTabs || []
+        })}`)
     }
 
     for(const [tabId, metadata] of env.sw.state().queuedTabMetadata) {
@@ -301,6 +305,10 @@ async function advanceTime(env) {
 
 async function sweepStale(env) {
     env.trace.push('sweep-stale')
+    if(process.env.SW_SCENARIO_FUZZ_TRACE === '1') {
+        const state = env.sw.state()
+        console.error(`trace sweep-stale active=${JSON.stringify(state.activeQueuedTabs)} queuedActions=${state.queuedTabActions.length} metadata=${JSON.stringify(state.queuedTabMetadata)}`)
+    }
     await settleWithFakeTimers(env.sw.sweepStaleQueuedTabs(), env)
 }
 
@@ -370,7 +378,13 @@ async function runScenario(seed, steps) {
     try {
         for(env.stepIndex = 0; env.stepIndex < steps; env.stepIndex += 1) {
             const action = ACTIONS[env.prng.int(ACTIONS.length)]
+            if(process.env.SW_SCENARIO_FUZZ_TRACE === '1') {
+                console.error(`trace seed=0x${seed.toString(16)} step=${env.stepIndex} action=${action.name || 'anonymous'}`)
+            }
             await action(env)
+            if(process.env.SW_SCENARIO_FUZZ_TRACE === '1') {
+                console.error(`trace seed=0x${seed.toString(16)} step=${env.stepIndex} action=${action.name || 'anonymous'} done`)
+            }
             assertScenarioInvariants(env)
         }
     }

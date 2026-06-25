@@ -5,11 +5,12 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     const needle = getOption('needle', process.env.MB_QUEUE_NEEDLE || '').toLowerCase()
     const targets = await getTargets(config)
     const serviceWorker = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))

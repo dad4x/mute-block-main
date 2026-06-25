@@ -5,11 +5,12 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
 
 runMain(async () => {
-    const config = getCdpConfig()
+    const config = await resolveCdpConfig(getCdpConfig())
     const needle = getOption('needle', process.env.MB_QUEUE_NEEDLE || '').toLowerCase()
     const limit = Number.parseInt(getOption('limit', '10'), 10) || 10
     const targets = await getTargets(config)

@@ -462,6 +462,7 @@ module.exports.__test = {
     applyCoordinatorRowEvent,
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
+    buildCoordinatorContentQueueIndex,
     buildQueueWakeupMetricsView,
     classifyCoordinatorExecutorState,
     coordinatorAuthority,
@@ -475,6 +476,7 @@ module.exports.__test = {
     metricStorageSet,
     recoverStoredCoordinatorWork,
     ensureQueuedTabContentScript,
+    handleQueuedTabContentScriptEnsureResult,
     nudgeQueuedTabActionClaim,
     nudgeQueuedTabActionClaimWithRetries,
     ensureProfileNukeProgressReady,
@@ -484,7 +486,9 @@ module.exports.__test = {
     getFlightRecorder,
     getFlightRecorderSnapshot,
     getCoordinatorWhyNotRunning,
+    recoverQueuedAuthorityLiveTabAfterMaterializationFailure,
     isQueuedTabRetryBudgetReleaseReason,
+    getExhaustedRolledBackQueuedTabTerminalError,
     shouldAdvanceRolledBackQueuedTabBeforeOpen,
     recordQueuedTabMetadataMilestone,
     getCoordinatorQueueAccounting,
@@ -496,6 +500,8 @@ module.exports.__test = {
     recordDeferredCoordinatorJobMilestone,
     resetQueueWakeupMetricsEpochAfterLoad,
     rollbackFailedQueuedTabOpen,
+    resolveQueuedStaleRuntimeExecutorCase,
+    shouldEscalateQueuedTabClaimNudgeTimeout,
     transitionCoordinatorItemForQueuedTab,
     requestCoordinatorActionLease,
     heartbeatCoordinatorActionLease,
@@ -512,11 +518,13 @@ module.exports.__test = {
     runCoordinatorQueueExecutorFastPath,
     runScheduledCoordinatorReconcileTick,
     saveCoordinatorState,
+    awaitCoordinatorResumeAlarmPersistence,
     scheduleCoordinatorQueueResume,
     scheduleCoordinatorReconcile,
     sendTabMessage,
     setCoordinatorRunsPaused,
     settleTerminalCoordinatorItems,
+    startUserInitiatedCoordinatorQueueResume,
     startQueueWakeupMetricsBackedStartupWork,
     sweepStaleQueuedTabs,
     switchCoordinatorAuthorityQueueWalCheckpoint,
@@ -554,6 +562,10 @@ module.exports.__test = {
             attemptNumber: metadata.attemptNumber || 0
         })
         registerOwnedTab(metadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, tabId)
+    },
+    __testAddActiveQueuedTabWithoutMetadata(tabId) {
+        activeQueuedTabs.add(tabId)
+        registerOwnedTab(SERVICE_WORKER_QUEUE_OWNER_ID, tabId)
     },
     __testAddQueuedAction(action = {}) {
         queuedTabActions.push({
@@ -622,6 +634,7 @@ module.exports.__test = {
             activeQueuedTabs: Array.from(activeQueuedTabs),
             pausedQueuedOwners: Array.from(pausedQueuedOwners),
             queuedTabActions: queuedTabActions.map(action => ({...action})),
+            pendingTabActions: Array.from(pendingTabActions.entries()).map(([tabId, action]) => [tabId, {...action}]),
             queuedTabMetadata: Array.from(queuedTabMetadata.entries()).map(([tabId, metadata]) => [tabId, {...metadata}]),
             queuedActionSurfaceWindowId,
             queuedActionSurfaceAnchorTabId,
@@ -636,6 +649,10 @@ module.exports.__test = {
                 STALE_CLOSE_REQUESTED_QUEUED_TAB_MS,
                 COORDINATOR_JOB_MILESTONE_FLUSH_MS,
                 SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS,
+                COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS,
+                QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
+                COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS,
+                QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
                 QUEUED_TAB_FILL_PROMISE_STALE_MS,
                 QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS,
                 COORDINATOR_RECONCILE_PROMISE_STALE_MS,

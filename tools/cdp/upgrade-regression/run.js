@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 
@@ -45,6 +46,14 @@ const SPACE_TARGET_URLS = [
 ]
 const DEFAULT_SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
 const PHASE10_SEARCH_FALLBACK_URLS = [
+    'https://www.quora.com/search?q=john%20smith&type=profile',
+    'https://www.quora.com/search?q=michael%20johnson&type=profile',
+    'https://www.quora.com/search?q=david%20smith&type=profile',
+    'https://www.quora.com/search?q=james%20smith&type=profile',
+    'https://www.quora.com/search?q=robert%20smith&type=profile',
+    'https://www.quora.com/search?q=william%20smith&type=profile',
+    'https://www.quora.com/search?q=michael%20brown&type=profile',
+    'https://www.quora.com/search?q=david%20johnson&type=profile',
     'https://www.quora.com/search?q=marie%20curie&type=profile',
     'https://www.quora.com/search?q=katherine%20johnson&type=profile',
     'https://www.quora.com/search?q=alan%20turing&type=profile',
@@ -67,6 +76,8 @@ const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
 const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = DEFAULT_REMOTE_CHROME_DEV_PATH
 const PHASE10_HARNESS_WATCHDOG_MS = 180000
+const PHASE10_TARGET_SELECTION_TIMEOUT_MS = 180000
+const PHASE10_FLIGHT_RECORDER_LIMIT = 2000
 const EXPECTED_EXTENSION_NAMES = new Set(['Mute Block', 'Mute Block Dev'])
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
@@ -237,6 +248,8 @@ function parseArgs(argv) {
         phase10TimeoutMs: 1200000,
         phase10Concurrency: 2,
         phase10IdleMs: 20000,
+        phase10SearchAttemptLimit: 20,
+        phase10WatchdogSelfTest: false,
         allowWorkProducing: false,
         includeFlightRecorder: false,
         verbose: false
@@ -306,6 +319,9 @@ function parseArgs(argv) {
         else if(arg.startsWith('--phase10-concurrency=')) options.phase10Concurrency = Number.parseInt(arg.slice('--phase10-concurrency='.length), 10) || options.phase10Concurrency
         else if(arg === '--phase10-idle-ms') options.phase10IdleMs = Number.parseInt(readValue(`${options.phase10IdleMs}`), 10) || options.phase10IdleMs
         else if(arg.startsWith('--phase10-idle-ms=')) options.phase10IdleMs = Number.parseInt(arg.slice('--phase10-idle-ms='.length), 10) || options.phase10IdleMs
+        else if(arg === '--phase10-search-attempt-limit') options.phase10SearchAttemptLimit = Number.parseInt(readValue(`${options.phase10SearchAttemptLimit}`), 10) || options.phase10SearchAttemptLimit
+        else if(arg.startsWith('--phase10-search-attempt-limit=')) options.phase10SearchAttemptLimit = Number.parseInt(arg.slice('--phase10-search-attempt-limit='.length), 10) || options.phase10SearchAttemptLimit
+        else if(arg === '--phase10-watchdog-self-test') options.phase10WatchdogSelfTest = true
         else if(arg === '--allow-work-producing') options.allowWorkProducing = true
         else if(arg === '--include-flight-recorder') options.includeFlightRecorder = true
         else if(arg === '--verbose') options.verbose = true
@@ -333,9 +349,10 @@ function parseArgs(argv) {
         options.phase9TargetCount = Math.max(3, Math.min(Number.parseInt(options.phase9TargetCount, 10) || 3, 5))
     }
     if(options.phase === PHASE10_MEDIUM_BATCH_QUEUE) {
-        options.phase10TargetCount = Math.max(8, Math.min(Number.parseInt(options.phase10TargetCount, 10) || 10, 12))
+        options.phase10TargetCount = Math.max(1, Math.min(Number.parseInt(options.phase10TargetCount, 10) || 10, 12))
         options.phase10Concurrency = Math.max(1, Math.min(Number.parseInt(options.phase10Concurrency, 10) || 2, 3))
         options.phase10IdleMs = Math.max(5000, Math.min(Number.parseInt(options.phase10IdleMs, 10) || 20000, 60000))
+        options.phase10SearchAttemptLimit = Math.max(1, Math.min(Number.parseInt(options.phase10SearchAttemptLimit, 10) || 20, 20))
     }
     options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
     options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
@@ -376,6 +393,8 @@ function printUsage() {
         '  --phase10-timeout-ms 1200000',
         '  --phase10-concurrency 2',
         '  --phase10-idle-ms 20000',
+        '  --phase10-search-attempt-limit 20',
+        '  --phase10-watchdog-self-test',
         '  --allow-work-producing',
         '  --write-baseline [path]',
         '  --compare-baseline path',
@@ -617,7 +636,7 @@ async function sendRuntimeMessage(target, payload, timeoutMs = 10000) {
 async function readFlightRecorder(target, request = {}) {
     const result = await sendRuntimeMessage(target, {
         action: "get-flight-recorder",
-        limit: 200,
+        limit: 2000,
         ...request
     }, 10000)
     return {
@@ -652,6 +671,36 @@ async function readExecutorClassification(target) {
         lastError: result.lastError || "",
         response: result.response?.executor || null
     }
+}
+
+async function readCoordinatorWhyNotRunning(target, reason = "phase10-diagnostic") {
+    const result = await sendRuntimeMessage(target, {
+        action: "get-coordinator-why-not-running",
+        reason
+    }, 15000)
+    return {
+        ok: !result.timedOut && !result.lastError && result.response?.readOnly === true,
+        timedOut: result.timedOut === true,
+        lastError: result.lastError || "",
+        response: result.response || null
+    }
+}
+
+function hasCoordinatorRecoverySignal(whyNotRunning = null) {
+    const response = whyNotRunning?.response || whyNotRunning || {}
+    const scheduler = response.scheduler || {}
+    const storage = response.storage || {}
+    const promises = response.promises || {}
+    if(Number.parseInt(scheduler.coordinatorQueueResumeDueAt, 10) > 0) return true
+    if(Number.parseInt(scheduler.coordinatorReconcileDueAt, 10) > 0) return true
+    if(scheduler.coordinatorQueueResumeTimeout === true) return true
+    if(scheduler.coordinatorReconcileTimeout === true) return true
+    if(promises.queuedTabFillPromise === true) return true
+    if(promises.coordinatorResumePromise === true) return true
+    if(promises.coordinatorReconcilePromise === true) return true
+    if(storage.active === true) return true
+    if(Number.parseInt(storage.depth, 10) > 0) return true
+    return false
 }
 
 function isBenignIdleFlightRecorderEntry(entry = null) {
@@ -769,7 +818,7 @@ async function readStorage(target) {
             }
             tryRead()
         })
-    }})()`, 15000)
+    }})()`, 60000)
 }
 
 async function readAlarms(target) {
@@ -837,6 +886,14 @@ function isWorkProducingPhase(phase = '') {
         phase === PHASE10_MEDIUM_BATCH_QUEUE
 }
 
+function summarizeStorageKeyList(keys = []) {
+    const sortedKeys = Array.isArray(keys) ? keys.slice().sort() : []
+    return {
+        count: sortedKeys.length,
+        digest: stableDigest(sortedKeys)
+    }
+}
+
 function diffStorageKeys(before = [], after = [], phase = PHASE1) {
     const beforeSet = new Set(before)
     const afterSet = new Set(after)
@@ -846,8 +903,8 @@ function diffStorageKeys(before = [], after = [], phase = PHASE1) {
     const unexpectedAdded = added.filter(key => !isAllowedAddedStorageKey(key, phase)).sort()
 
     return {
-        before,
-        after,
+        before: summarizeStorageKeyList(before),
+        after: summarizeStorageKeyList(after),
         added,
         removed,
         allowedAdded,
@@ -935,6 +992,25 @@ function stableJson(value) {
     return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
 }
 
+
+function stableDigest(value) {
+    return crypto.createHash('sha256').update(stableJson(value)).digest('hex')
+}
+
+function summarizeStorageKeys(keys = []) {
+    const sortedKeys = Array.isArray(keys) ? keys.slice().sort() : []
+    const prefixCounts = {}
+    for(const key of sortedKeys) {
+        const prefix = `${key || ''}`.split('.')[0] || ''
+        prefixCounts[prefix] = (prefixCounts[prefix] || 0) + 1
+    }
+    return {
+        count: sortedKeys.length,
+        digest: stableDigest(sortedKeys),
+        prefixCounts
+    }
+}
+
 function countRecordMap(value = null) {
     if(!value || typeof value !== 'object') return 0
     const records = value.records && typeof value.records === 'object' ? value.records : value
@@ -957,8 +1033,10 @@ function summarizeAuthorityState(storage) {
 
     return {
         work: summarizeWorkState(storage),
-        walKeys,
-        walSignature: stableJson(Object.fromEntries(walKeys.map(key => [key, data[key]]))),
+        walKeyCount: walKeys.length,
+        walKeyDigest: stableDigest(walKeys),
+        walSignature: stableDigest(Object.fromEntries(walKeys.map(key => [key, data[key]]))),
+        walKeys: walKeys.slice(-8),
         progressViewRecords: countRecordMap(data.mbProfileNukeProgressView),
         progressShardRecords,
         pendingSpacePostRecords: countRecordMap(data.mbSpacePendingNukedPosts),
@@ -1003,8 +1081,8 @@ function getSelectedProgressRecords(storage, targetProfileHrefs = [], selectedSu
             return {
                 record,
                 attemptMatchesAuthority: !!authorityRow &&
-                    (!authorityAttemptId || !recordAttemptId || recordAttemptId === authorityAttemptId) &&
-                    (!authorityAttemptNumber || !recordAttemptNumber || recordAttemptNumber === authorityAttemptNumber)
+                    (!authorityAttemptId ? !recordAttemptId : !recordAttemptId || recordAttemptId === authorityAttemptId) &&
+                    (!authorityAttemptNumber ? !recordAttemptNumber : !recordAttemptNumber || recordAttemptNumber === authorityAttemptNumber)
             }
         }
         return {
@@ -1130,15 +1208,18 @@ function summarizeQueueAuthority(storage, options = {}) {
     const recovered = recoverCoordinatorQueueFromWal(storage)
     const recoveredRows = getCoordinatorQueueRows({data: {[COORDINATOR_QUEUE_KEY]: recovered.queue || {}}})
     const preferRecovered = options.preferRecovered === true && recovered.recovered === true
+    const allowViewFallback = options.allowViewFallback !== false
     const rows = preferRecovered
         ? recoveredRows
         : rawRows.length
         ? rawRows
-        : viewRows.map(row => ({
+        : allowViewFallback
+        ? viewRows.map(row => ({
             ...row,
             raw: false,
             requestedUrl: row.targetProfileHref || row.key || ''
         }))
+        : []
     const terminalStatuses = new Set(['succeeded', 'success', 'skipped', 'failed', 'canceled', 'cancelled', 'terminal'])
     const isTerminal = row => terminalStatuses.has(`${row.status || ''}`.toLowerCase()) ||
         !!row.terminalAt ||
@@ -1171,7 +1252,7 @@ function summarizeQueueAuthority(storage, options = {}) {
     }
 }
 
-function filterQueueAuthoritySummary(summary = {}, targetProfileHref = '') {
+function filterQueueAuthoritySummary(summary = {}, targetProfileHref = '', options = {}) {
     const target = normalizeComparableUrl(targetProfileHref || '')
     const matches = row => {
         const candidates = [
@@ -1192,7 +1273,9 @@ function filterQueueAuthoritySummary(summary = {}, targetProfileHref = '') {
             }
         }
     }
-    const filtered = summarizeQueueAuthority(storageLike)
+    const filtered = summarizeQueueAuthority(storageLike, {
+        allowViewFallback: options.allowViewFallback !== false
+    })
     return {
         ...filtered,
         recovered: summary.recovered === true,
@@ -1306,8 +1389,482 @@ function buildTabAuthorityInvariant(visibleTabs = {}, fullSummary = {}, selected
     }
 }
 
+function isPhase10TerminalQueueRow(row = null) {
+    const status = `${row?.status || ''}`.toLowerCase()
+    if(row?.terminalAt) return true
+    return /^(succeeded|success|failed|skipped|canceled|cancelled|terminal)$/.test(status)
+}
+
+function getFirstSelectedNonterminalRow(selectedQueue = {}) {
+    for(const item of selectedQueue?.selected || []) {
+        for(const row of item.rows || []) {
+            if(!isPhase10TerminalQueueRow(row)) {
+                return {
+                    targetProfileHref: item.targetProfileHref || row.targetProfileHref || row.requestedUrl || row.key || '',
+                    key: row.key || '',
+                    status: row.status || '',
+                    outcome: row.outcome || '',
+                    error: row.error || '',
+                    tabId: row.tabId ?? null,
+                    attempt: row.attempt ?? null,
+                    runId: row.runId || '',
+                    executorTabAction: row.executorTabAction || '',
+                    updatedAt: row.updatedAt || 0,
+                    createdAt: row.createdAt || 0
+                }
+            }
+        }
+    }
+    return null
+}
+
+function selectedQueueFromAuthoritativeRows(sourceConsistency = null) {
+    const perTarget = Array.isArray(sourceConsistency?.targets)
+        ? sourceConsistency.targets
+        : []
+    const selected = perTarget.map(item => {
+        const row = item.authoritativeCurrentRow || null
+        const rows = row ? [row] : []
+        return {
+            targetProfileHref: item.targetProfileHref || row?.targetProfileHref || row?.requestedUrl || row?.key || '',
+            rowCount: rows.length,
+            rawRowCount: item.rawAuthorityRow ? 1 : 0,
+            recoveredRowCount: item.recoveredAuthorityRow ? 1 : 0,
+            viewRowCount: item.compactQueueViewRow ? 1 : 0,
+            queuedRows: rows.filter(candidate => /queued|retry|waiting/i.test(`${candidate?.status || ''}`)).length,
+            activeRows: rows.filter(candidate => /active|acting|opening|claim|running|pending/i.test(`${candidate?.status || ''}`)).length,
+            terminalRows: rows.filter(isPhase10TerminalQueueRow).length,
+            statuses: Array.from(new Set(rows.map(candidate => candidate?.status || 'unknown'))).sort(),
+            rows
+        }
+    })
+    return {
+        source: 'authoritative-source-consistency',
+        authoritativeSource: sourceConsistency?.authoritativeSource || '',
+        capturedAt: sourceConsistency?.capturedAt || '',
+        selectedCount: selected.length,
+        rowCount: selected.reduce((total, item) => total + item.rowCount, 0),
+        rawRowCount: selected.reduce((total, item) => total + item.rawRowCount, 0),
+        recoveredRowCount: selected.reduce((total, item) => total + item.recoveredRowCount, 0),
+        viewRowCount: selected.reduce((total, item) => total + item.viewRowCount, 0),
+        queuedRows: selected.reduce((total, item) => total + item.queuedRows, 0),
+        activeRows: selected.reduce((total, item) => total + item.activeRows, 0),
+        terminalRows: selected.reduce((total, item) => total + item.terminalRows, 0),
+        selected,
+        unrelatedActiveQueuedCount: 0,
+        unrelatedActiveQueued: []
+    }
+}
+
+function summarizeSelectedRowDistribution(selectedQueue = {}) {
+    const rows = (selectedQueue?.selected || []).flatMap(item => item.rows || [])
+    return rows.reduce((counts, row) => {
+        const status = `${row?.status || ''}`.toLowerCase()
+        if(/hard-fail|hardfail|fatal/i.test(`${row?.outcome || ''} ${row?.error || ''}`)) counts.hardFailed += 1
+        else if(/^(succeeded|success|skipped|canceled|cancelled)$/.test(status)) counts.succeeded += 1
+        else if(status === 'failed') counts.softFailed += 1
+        else if(/queued|retry|waiting/i.test(status)) counts.queued += 1
+        else if(/active|acting|opening|claim|running|pending/i.test(status)) counts.active += 1
+        else counts.other += 1
+        return counts
+    }, {
+        succeeded: 0,
+        softFailed: 0,
+        hardFailed: 0,
+        queued: 0,
+        active: 0,
+        other: 0
+    })
+}
+
+function rowMatchesTarget(row = null, targetProfileHref = '') {
+    const target = normalizeComparableUrl(targetProfileHref || '')
+    if(!target) return false
+    return [
+        row?.targetProfileHref,
+        row?.requestedUrl,
+        row?.key,
+        row?.rowKey,
+        row?.targetUrl,
+        row?.coordinatorKey,
+        row?.profileHref,
+        row?.url
+    ].map(value => normalizeComparableUrl(value || '')).filter(Boolean).includes(target)
+}
+
+function getRowsForTarget(rows = [], targetProfileHref = '') {
+    return (Array.isArray(rows) ? rows : []).filter(row => rowMatchesTarget(row, targetProfileHref))
+}
+
+function getSelectedSummaryRowForTarget(selectedQueue = {}, targetProfileHref = '') {
+    const target = normalizeComparableUrl(targetProfileHref || '')
+    const selected = (selectedQueue?.selected || []).find(item =>
+        normalizeComparableUrl(item?.targetProfileHref || '') === target)
+    return (selected?.rows || [])[0] || null
+}
+
+function summarizeRowSource(row = null, source = '', capturedAt = '', extra = {}) {
+    if(!row) return null
+    return {
+        source,
+        capturedAt,
+        key: row.key || row.targetProfileHref || row.requestedUrl || '',
+        status: row.status || '',
+        outcome: row.outcome || '',
+        error: row.error || '',
+        targetProfileHref: row.targetProfileHref || row.requestedUrl || row.key || '',
+        requestedUrl: row.requestedUrl || '',
+        tabId: row.tabId ?? null,
+        attemptId: getAttemptIdFromValue(row),
+        attemptNumber: getAttemptNumberFromValue(row),
+        runId: row.runId || '',
+        updatedAt: Number.parseInt(row.updatedAt, 10) || 0,
+        createdAt: Number.parseInt(row.createdAt, 10) || 0,
+        terminalAt: Number.parseInt(row.terminalAt, 10) || 0,
+        row,
+        ...extra
+    }
+}
+
+function runtimeSurfaceMatchesTarget(surface = null, targetProfileHref = '') {
+    const runtime = surface?.runtime || surface || {}
+    return rowMatchesTarget({
+        targetProfileHref: runtime.profileHref || runtime.targetProfileHref || runtime.targetUrl || '',
+        requestedUrl: runtime.requestedUrl || runtime.url || '',
+        key: runtime.coordinatorKey || ''
+    }, targetProfileHref)
+}
+
+function buildRuntimeSourceSummary(runtimeState = null, targetProfileHref = '') {
+    const response = runtimeState?.response || {}
+    return {
+        capturedAt: runtimeState?.generatedAt || '',
+        activeTabs: (response.activeTabs || []).filter(item => runtimeSurfaceMatchesTarget(item, targetProfileHref)),
+        queuedActions: (response.queuedActions || []).filter(item => runtimeSurfaceMatchesTarget(item, targetProfileHref)),
+        pendingActions: (response.pendingActions || []).filter(item => runtimeSurfaceMatchesTarget(item, targetProfileHref)),
+        matchedCounts: {
+            activeQueuedTabs: Number.parseInt(response.matchedActiveQueuedTabs, 10) || 0,
+            queuedTabActions: Number.parseInt(response.matchedQueuedTabActions, 10) || 0,
+            pendingTabActions: Number.parseInt(response.matchedPendingTabActions, 10) || 0
+        }
+    }
+}
+
+function buildSelectedSourceConsistencyReport(snapshot = {}) {
+    const capturedAt = snapshot.generatedAt || new Date().toISOString()
+    const selectedTargets = Array.isArray(snapshot.selectedTargets) ? snapshot.selectedTargets : []
+    const fullQueue = snapshot.fullQueue || {}
+    const executorResponse = snapshot.executorClassification?.response || snapshot.executorClassification || {}
+    const lastApplyResult = executorResponse.lastApplyResult || {}
+    const lastApplyCases = [
+        ...(lastApplyResult.consumedExecutorCases || []).map(item => ({...item, applyDisposition: 'consumed'})),
+        ...(lastApplyResult.unresolvedExecutorCases || []).map(item => ({...item, applyDisposition: 'unresolved'}))
+    ]
+    const currentCases = (executorResponse.cases || []).map(item => ({...item, classificationDisposition: 'current'}))
+    const targetReports = selectedTargets.map(target => {
+        const terminalSelectedRow = summarizeRowSource(
+            getSelectedSummaryRowForTarget(snapshot.queue, target),
+            'terminal-selected-summary',
+            capturedAt
+        )
+        const recoveredAuthorityRow = summarizeRowSource(
+            getRowsForTarget(fullQueue.recoveredRows, target)[0] || null,
+            'recovered-wal-authority',
+            capturedAt,
+            {wal: fullQueue.wal || null}
+        )
+        const rawAuthorityRow = summarizeRowSource(
+            getRowsForTarget(fullQueue.rawRows, target)[0] || null,
+            'raw-local-storage-authority',
+            capturedAt
+        )
+        const compactQueueViewRow = summarizeRowSource(
+            getRowsForTarget(fullQueue.viewRows, target)[0] || null,
+            'compact-queue-view',
+            capturedAt
+        )
+        const lastApplyGenerationCases = lastApplyCases.filter(item => rowMatchesTarget(item, target))
+        const currentClassificationCases = currentCases.filter(item => rowMatchesTarget(item, target))
+        const authoritativeCurrentRow = recoveredAuthorityRow ||
+            rawAuthorityRow ||
+            terminalSelectedRow ||
+            compactQueueViewRow ||
+            null
+        const statuses = [
+            terminalSelectedRow,
+            recoveredAuthorityRow,
+            rawAuthorityRow,
+            compactQueueViewRow,
+            ...(lastApplyGenerationCases || [])
+        ].filter(Boolean).map(item => `${item.source || item.applyDisposition || 'case'}:${item.status || ''}:${item.case || ''}`)
+        const distinctStates = Array.from(new Set([
+            terminalSelectedRow?.status ? `row-status:${terminalSelectedRow.status}` : '',
+            recoveredAuthorityRow?.status ? `row-status:${recoveredAuthorityRow.status}` : '',
+            rawAuthorityRow?.status ? `row-status:${rawAuthorityRow.status}` : '',
+            compactQueueViewRow?.status ? `row-status:${compactQueueViewRow.status}` : '',
+            ...lastApplyGenerationCases.map(item => `apply-status:${item.status || ''}:case:${item.case || ''}`)
+        ].filter(Boolean)))
+        return {
+            targetProfileHref: normalizeComparableUrl(target || ''),
+            capturedAt,
+            authoritativeSource: authoritativeCurrentRow?.source || '',
+            authoritativeCurrentRow,
+            terminalSelectedRow,
+            recoveredAuthorityRow,
+            rawAuthorityRow,
+            compactQueueViewRow,
+            residentAuthorityRow: null,
+            residentAuthoritySource: 'not-exposed',
+            currentClassificationCases,
+            lastApplyGeneration: {
+                executorClassificationId: lastApplyResult.executorClassificationId || '',
+                classificationGeneratedAt: lastApplyResult.classificationGeneratedAt || 0,
+                reason: lastApplyResult.reason || '',
+                changed: lastApplyResult.changed === true,
+                cases: lastApplyGenerationCases
+            },
+            runtime: buildRuntimeSourceSummary(snapshot.runtimeState, target),
+            visibleTabs: {
+                selectedProfileTabs: (snapshot.visibleTabs?.selectedProfileTabs || [])
+                    .filter(tab => normalizeComparableUrl(tab?.url || tab?.normalizedUrl || '') === normalizeComparableUrl(target || ''))
+            },
+            sourceStates: statuses,
+            sourceDisagreement: distinctStates.length > 1,
+            distinctStates
+        }
+    })
+    const firstAuthoritativeNonterminalTarget = targetReports.find(item =>
+        item.authoritativeCurrentRow && !isPhase10TerminalQueueRow(item.authoritativeCurrentRow.row || item.authoritativeCurrentRow)
+    ) || null
+    const report = {
+        capturedAt,
+        authoritativeSource: fullQueue.recovered === true
+            ? 'recovered-wal-authority'
+            : fullQueue.rawRowCount > 0
+            ? 'raw-local-storage-authority'
+            : 'terminal-selected-summary',
+        recoveredAuthorityAvailable: fullQueue.recovered === true,
+        wal: fullQueue.wal || null,
+        targets: targetReports,
+        firstAuthoritativeNonterminalRow: firstAuthoritativeNonterminalTarget?.authoritativeCurrentRow || null,
+        firstAuthoritativeNonterminalTarget: firstAuthoritativeNonterminalTarget?.targetProfileHref || ''
+    }
+    report.authoritativeSelectedQueueSummary = selectedQueueFromAuthoritativeRows(report)
+    return report
+}
+
+function buildPhase10ArtifactReport(snapshot = {}) {
+    const sourceConsistency = snapshot.sourceConsistency || buildSelectedSourceConsistencyReport(snapshot)
+    const authoritativeQueue = sourceConsistency.authoritativeSelectedQueueSummary || null
+    const queue = authoritativeQueue || snapshot.queue || {}
+    const selectedRowDistribution = summarizeSelectedRowDistribution(queue)
+    const primaryReducerCase = snapshot.executorClassification?.response?.primaryUnresolvedCase?.case ||
+        snapshot.executorClassification?.primaryUnresolvedCase?.case ||
+        snapshot.executorClassification?.response?.reason ||
+        ''
+    const firstSelectedNonterminalRow = sourceConsistency.firstAuthoritativeNonterminalRow ||
+        getFirstSelectedNonterminalRow(queue)
+    const runtimeResponse = snapshot.runtimeState?.response || {}
+    const runtimeCounts = {
+        matchedActiveQueuedTabs: Number.parseInt(runtimeResponse.matchedActiveQueuedTabs, 10) || 0,
+        matchedQueuedTabActions: Number.parseInt(runtimeResponse.matchedQueuedTabActions, 10) || 0,
+        matchedPendingTabActions: Number.parseInt(runtimeResponse.matchedPendingTabActions, 10) || 0
+    }
+    const flightEntries = Array.isArray(snapshot.flightRecorder?.response?.entries)
+        ? snapshot.flightRecorder.response.entries
+        : []
+    const drainPass = Number(queue.queuedRows || 0) === 0 &&
+        Number(queue.activeRows || 0) === 0 &&
+        runtimeCounts.matchedActiveQueuedTabs === 0 &&
+        runtimeCounts.matchedQueuedTabActions === 0 &&
+        runtimeCounts.matchedPendingTabActions === 0
+    const qualityPass = drainPass &&
+        Number(selectedRowDistribution.softFailed || 0) === 0 &&
+        Number(selectedRowDistribution.hardFailed || 0) === 0 &&
+        Number(selectedRowDistribution.other || 0) === 0
+    return {
+        loadedExtensionVersion: snapshot.loadedExtensionVersion || '',
+        drainPass,
+        qualityPass,
+        selectedRowDistribution,
+        selectedCounts: selectedRowDistribution,
+        queuedRows: Number(queue.queuedRows || 0) || 0,
+        activeRows: Number(queue.activeRows || 0) || 0,
+        terminalRows: Number(queue.terminalRows || 0) || 0,
+        runtimeCounts,
+        primaryReducerCase,
+        primaryUnresolvedCase: snapshot.executorClassification?.response?.primaryUnresolvedCase || null,
+        firstSelectedNonterminalRow,
+        authoritativeCurrentRowState: firstSelectedNonterminalRow,
+        sourceConsistency,
+        selectedTargets: snapshot.selectedTargets || [],
+        currentSelectedQueueSummary: queue,
+        terminalSelectedQueueSummary: snapshot.queue || null,
+        recoveredAuthoritySummary: snapshot.fullQueue || null,
+        runtimeState: snapshot.runtimeState || null,
+        executorClassification: snapshot.executorClassification || null,
+        flightRecorderTail: {
+            ok: snapshot.flightRecorder?.ok === true,
+            timedOut: snapshot.flightRecorder?.timedOut === true,
+            lastError: snapshot.flightRecorder?.lastError || '',
+            newestSeq: snapshot.flightRecorder?.response?.newestSeq || null,
+            entries: flightEntries.slice(-100)
+        },
+        visibleTabs: snapshot.visibleTabs || null
+    }
+}
+
+function runPhase10WatchdogSelfTest() {
+    const snapshot = {
+        loadedExtensionVersion: 'self-test',
+        selectedTargets: ['https://www.quora.com/profile/example'],
+        queue: {
+            selectedCount: 1,
+            rowCount: 1,
+            queuedRows: 0,
+            activeRows: 1,
+            terminalRows: 0,
+            selected: [{
+                targetProfileHref: 'https://www.quora.com/profile/example',
+                rows: [{
+                    key: 'https://www.quora.com/profile/example',
+                    status: 'active',
+                    tabId: 123,
+                    attempt: 1,
+                    runId: 'self-test-run',
+                    executorTabAction: 'nuke'
+                }]
+            }]
+        },
+        fullQueue: {
+            recovered: true,
+            rowCount: 1,
+            recoveredRows: [{
+                key: 'https://www.quora.com/profile/example',
+                status: 'queued',
+                tabId: null,
+                attemptId: 'attempt-self-test-recovered',
+                attemptNumber: 2,
+                updatedAt: 2000,
+                runId: 'self-test-run'
+            }],
+            rawRows: [],
+            viewRows: [{
+                key: 'https://www.quora.com/profile/example',
+                status: 'active',
+                tabId: 123,
+                updatedAt: 1000,
+                runId: 'self-test-run'
+            }],
+            wal: {
+                nextSeq: 2
+            }
+        },
+        runtimeState: {
+            ok: true,
+            response: {
+                matchedActiveQueuedTabs: 0,
+                matchedQueuedTabActions: 0,
+                matchedPendingTabActions: 0
+            }
+        },
+        executorClassification: {
+            ok: true,
+            response: {
+                cases: [{
+                    case: 'active-missing-tab',
+                    rowKey: 'https://www.quora.com/profile/example',
+                    status: 'active',
+                    tabId: 123,
+                    attemptId: 'attempt-self-test-terminal',
+                    attemptNumber: 1
+                }],
+                primaryUnresolvedCase: {
+                    case: 'active-missing-tab'
+                }
+            }
+        },
+        flightRecorder: {
+            ok: true,
+            response: {
+                newestSeq: 2,
+                entries: [{seq: 1}, {seq: 2}]
+            }
+        },
+        visibleTabs: {
+            profileTabs: [],
+            selectedProfileTabs: [],
+            extensionPages: [],
+            quoraPages: []
+        }
+    }
+    snapshot.watchdogReport = buildPhase10ArtifactReport(snapshot)
+    const report = snapshot.watchdogReport
+    const required = [
+        'loadedExtensionVersion',
+        'drainPass',
+        'qualityPass',
+        'selectedRowDistribution',
+        'selectedTargets',
+        'currentSelectedQueueSummary',
+        'recoveredAuthoritySummary',
+        'runtimeState',
+        'executorClassification',
+        'primaryReducerCase',
+        'firstSelectedNonterminalRow',
+        'flightRecorderTail',
+        'visibleTabs'
+    ]
+    const missing = required.filter(key => !(key in report))
+    if(missing.length) throw new Error(`phase10 watchdog self-test missing fields: ${missing.join(', ')}`)
+    if(report.primaryReducerCase !== 'active-missing-tab') {
+        throw new Error(`phase10 watchdog self-test primary reducer mismatch: ${report.primaryReducerCase}`)
+    }
+    if(report.firstSelectedNonterminalRow?.status !== 'queued' ||
+        report.firstSelectedNonterminalRow?.source !== 'recovered-wal-authority') {
+        throw new Error('phase10 watchdog self-test did not use recovered authority for first selected nonterminal row')
+    }
+    if(report.sourceConsistency?.targets?.[0]?.sourceDisagreement !== true) {
+        throw new Error('phase10 watchdog self-test did not retain source disagreement evidence')
+    }
+    if(report.sourceConsistency?.targets?.[0]?.currentClassificationCases?.[0]?.case !== 'active-missing-tab') {
+        throw new Error('phase10 watchdog self-test did not attach current classification case by rowKey')
+    }
+    return {
+        ok: true,
+        report
+    }
+}
+
+async function readLoadedExtensionManifest(context) {
+    try {
+        const result = await evaluate(context.webSocketDebuggerUrl, `(() => {
+            const manifest = chrome.runtime.getManifest()
+            return {
+                id: chrome.runtime.id || '',
+                name: manifest.name || '',
+                version: manifest.version || ''
+            }
+        })()`, 5000)
+        return {
+            ok: true,
+            ...result
+        }
+    }
+    catch(error) {
+        return {
+            ok: false,
+            id: '',
+            name: '',
+            version: '',
+            error: error.message
+        }
+    }
+}
+
 async function buildPhase10DiagnosticSnapshot(config, context, options, state = {}, reason = 'diagnostic', details = null) {
     const selectedTargets = Array.isArray(state.selectedTargets) ? state.selectedTargets : []
+    const generatedAt = new Date().toISOString()
     let storage = null
     let fullQueue = null
     let selectedQueue = null
@@ -1318,6 +1875,7 @@ async function buildPhase10DiagnosticSnapshot(config, context, options, state = 
     let visibleTabs = null
     let tabAuthorityInvariant = null
     let selectedProgressRecords = null
+    let loadedExtension = null
     let snapshotError = null
     try {
         storage = await readStorage(context)
@@ -1326,10 +1884,11 @@ async function buildPhase10DiagnosticSnapshot(config, context, options, state = 
         authority = summarizeAuthorityState(storage)
         runtimeState = await readQueueRuntimeState(context, selectedTargets)
         executorClassification = await readExecutorClassification(context)
-        flightRecorder = await readFlightRecorder(context, {limit: 200})
+        flightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
         visibleTabs = await readVisibleTargetTabs(config, selectedTargets)
         tabAuthorityInvariant = buildTabAuthorityInvariant(visibleTabs, fullQueue, selectedTargets)
         selectedProgressRecords = getSelectedProgressRecords(storage, selectedTargets, selectedQueue)
+        loadedExtension = await readLoadedExtensionManifest(context)
     }
     catch(error) {
         snapshotError = {
@@ -1341,7 +1900,7 @@ async function buildPhase10DiagnosticSnapshot(config, context, options, state = 
         kind: 'phase10-diagnostic-snapshot',
         reason,
         details,
-        generatedAt: new Date().toISOString(),
+        generatedAt,
         phase: options.phase,
         profileLabel: options.profileLabel,
         currentStep: state.currentStep || '',
@@ -1359,12 +1918,25 @@ async function buildPhase10DiagnosticSnapshot(config, context, options, state = 
         flightRecorder,
         visibleTabs,
         tabAuthorityInvariant,
+        loadedExtension,
+        loadedExtensionVersion: loadedExtension?.version || '',
+        sourceConsistency: buildSelectedSourceConsistencyReport({
+            generatedAt,
+            selectedTargets,
+            queue: selectedQueue,
+            fullQueue,
+            runtimeState,
+            executorClassification,
+            visibleTabs
+        }),
+        watchdogReport: null,
         snapshotError
     }
 }
 
 async function writePhase10DiagnosticArtifact(config, context, options, state, reason, details = null) {
     const snapshot = await buildPhase10DiagnosticSnapshot(config, context, options, state, reason, details)
+    snapshot.watchdogReport = buildPhase10ArtifactReport(snapshot)
     const artifactPath = getDiagnosticArtifactPath(options, reason)
     writeJson(artifactPath, snapshot)
     return {
@@ -1493,7 +2065,7 @@ function comparableReport(report) {
             runtimeWarnings: extension.runtimeWarnings || [],
             installWarnings: extension.installWarnings || []
         },
-        storageKeys: report.storageKeys,
+        storageKeySummary: report.storageKeySummary,
         storageKeyDelta: {
             unexpectedAdded: storageKeyDelta.unexpectedAdded || []
         },
@@ -1522,6 +2094,35 @@ function comparableReport(report) {
             ? {mediumBatchQueueSmoke: comparableSmallBatchQueueSmoke(report.mediumBatchQueueSmoke)}
             : {}),
         workStateAfter: report.workStateAfter
+    }
+}
+
+
+function consoleReport(report, comparable = comparableReport(report)) {
+    return {
+        pass: report.pass === true,
+        phase: report.phase,
+        profileLabel: report.profileLabel,
+        generatedAt: report.generatedAt || "",
+        reportArtifactPath: report.reportArtifactPath || "",
+        extension: comparable.extension,
+        storageKeySummary: comparable.storageKeySummary,
+        storageKeyDelta: comparable.storageKeyDelta,
+        alarms: comparable.alarms,
+        failures: (report.failures || []).map(failure => ({
+            message: failure?.message || String(failure || ""),
+            diagnosticArtifactPath: failure?.details?.diagnosticArtifactPath || failure?.diagnosticArtifactPath || "",
+            reason: failure?.details?.reason || failure?.reason || "",
+            requested: failure?.details?.requested || undefined,
+            selectedCount: Array.isArray(failure?.details?.selectedTargets)
+                ? failure.details.selectedTargets.length
+                : undefined
+        })),
+        warnings: (report.warnings || []).slice(0, 20),
+        ...(comparable.oneItemQueueSmoke ? {oneItemQueueSmoke: comparable.oneItemQueueSmoke} : {}),
+        ...(comparable.smallBatchQueueSmoke ? {smallBatchQueueSmoke: comparable.smallBatchQueueSmoke} : {}),
+        ...(comparable.mediumBatchQueueSmoke ? {mediumBatchQueueSmoke: comparable.mediumBatchQueueSmoke} : {}),
+        workStateAfter: comparable.workStateAfter
     }
 }
 
@@ -1967,6 +2568,42 @@ async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = 
     }})(${JSON.stringify(records)})`, 10000)
 }
 
+
+function getWebSocketState(ws) {
+    if(!ws) return -1
+    if(typeof ws.readyState === 'number') return ws.readyState
+    return -1
+}
+
+function safeCloseWebSocket(ws, reason = 'cleanup') {
+    if(!ws) return false
+    try {
+        const noop = () => {}
+        if(typeof ws.addEventListener === 'function') {
+            ws.addEventListener('error', noop)
+            ws.addEventListener('close', noop)
+        }
+        else if(typeof ws.on === 'function') {
+            ws.on('error', noop)
+            ws.on('close', noop)
+        }
+    }
+    catch {}
+
+    const state = getWebSocketState(ws)
+    const openState = typeof WebSocket !== 'undefined' ? WebSocket.OPEN : 1
+    const closingState = typeof WebSocket !== 'undefined' ? WebSocket.CLOSING : 2
+    if(state !== openState && state !== closingState) return false
+
+    try {
+        ws.close(1000, `${reason || 'cleanup'}`.slice(0, 120))
+        return true
+    }
+    catch {
+        return false
+    }
+}
+
 async function evaluateInExtensionIsolatedWorld(target, extensionId, expression, timeoutMs = 15000) {
     const ws = new WebSocket(target.webSocketDebuggerUrl)
     const contexts = []
@@ -1987,14 +2624,31 @@ async function evaluateInExtensionIsolatedWorld(target, extensionId, expression,
 
     try {
         await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error(`WebSocket timeout opening ${target.webSocketDebuggerUrl}`)), 5000)
+            let settled = false
+            const finishReject = error => {
+                if(settled) return
+                settled = true
+                clearTimeout(timeout)
+                reject(error)
+            }
+            const timeout = setTimeout(() => {
+                finishReject(new Error(`WebSocket timeout opening ${target.webSocketDebuggerUrl}`))
+                safeCloseWebSocket(ws, 'isolated-world-connect-timeout')
+            }, 5000)
             ws.addEventListener('open', () => {
+                if(settled) {
+                    safeCloseWebSocket(ws, 'isolated-world-late-open-after-timeout')
+                    return
+                }
+                settled = true
                 clearTimeout(timeout)
                 resolve()
             }, {once: true})
             ws.addEventListener('error', event => {
-                clearTimeout(timeout)
-                reject(event.error || new Error(`WebSocket error for ${target.webSocketDebuggerUrl}`))
+                finishReject(event.error || new Error(`WebSocket error for ${target.webSocketDebuggerUrl}`))
+            }, {once: true})
+            ws.addEventListener('close', () => {
+                finishReject(new Error(`WebSocket closed before opening ${target.webSocketDebuggerUrl}`))
             }, {once: true})
         })
 
@@ -2069,7 +2723,7 @@ async function evaluateInExtensionIsolatedWorld(target, extensionId, expression,
     }
     finally {
         for(const pendingCommand of pending.values()) clearTimeout(pendingCommand.timeout)
-        try { ws.close() } catch {}
+        safeCloseWebSocket(ws, 'isolated-world-cleanup')
     }
 }
 
@@ -2303,7 +2957,7 @@ async function sendContentPageCoordinatorState(target, extensionId, pageState) {
         profileHrefs: pageState.profileHrefs || [],
         sourcePageUrl: pageState.pageType === 'profile-search' ? pageState.url || '' : '',
         searchQuery: pageState.searchQuery || ''
-    })})`, 15000)
+    })})`, 60000)
 }
 
 async function runContentSmoke(config, options, warnings, fail) {
@@ -2546,14 +3200,51 @@ function getPhase10SearchCandidateUrls(options = {}) {
     ].filter(Boolean))
 }
 
+function withTimeoutValue(promise, timeoutMs, timeoutValue) {
+    const boundedTimeoutMs = Math.max(1, Number.parseInt(timeoutMs, 10) || 1)
+    return new Promise(resolve => {
+        let settled = false
+        const timer = setTimeout(() => {
+            if(settled) return
+            settled = true
+            resolve(typeof timeoutValue === 'function' ? timeoutValue() : timeoutValue)
+        }, boundedTimeoutMs)
+        Promise.resolve(promise).then(value => {
+            if(settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve(value)
+        }, error => {
+            if(settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve({timedOut: false, error: error?.message || `${error || ''}`})
+        })
+    })
+}
+
 async function inspectSearchTargetForQueueCandidates(config, options, url, warnings, phaseLabel, fail, existingQueueTargets, targetCount, attemptIndex = 0) {
+    const selectionRemainingMs = Number.parseInt(options.phase10TargetSelectionRemainingMs, 10) || 45000
     const target = await findOrOpenPage(config, url, warnings, `${phaseLabel} profile search batch queue${attemptIndex ? ` fallback ${attemptIndex}` : ''}`)
     await reloadPageTarget(target)
     const discovery = await inspectDiscoveryWithState(target, options, 'profile-search', fail, false, {
         allowProgressRows: true,
         allowQueueRows: true
     })
-    const selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets)
+    let selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets)
+    let collect = null
+    if((Number.parseInt(selection.enabledCount, 10) || 0) < targetCount) {
+        const collectTimeoutMs = Math.max(0, Math.min(15000, selectionRemainingMs))
+        if(collectTimeoutMs > 0) {
+            collect = await collectMoreProfileSearchCandidates(target, Math.max(targetCount, 8), collectTimeoutMs)
+            if(collect.clicked === true) {
+                selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets)
+            }
+        }
+        else {
+            collect = {clicked: false, reason: 'target-selection-timeout-before-collect'}
+        }
+    }
     const selectedTargets = (selection.selected || [])
         .map(entry => entry.href)
         .filter(Boolean)
@@ -2563,16 +3254,119 @@ async function inspectSearchTargetForQueueCandidates(config, options, url, warni
         target,
         discovery,
         selection,
+        collect,
         selectedTargets,
         pageShape: discovery.page
     }
 }
 
+async function collectMoreProfileSearchCandidates(target, desiredEnabledCount = 8, timeoutMs = 45000) {
+    const readState = async () => evaluate(target.webSocketDebuggerUrl, `(${function collectState() {
+        const clean = text => `${text || ''}`.replace(/\s+/g, ' ').trim()
+        const button = document.querySelector('.mb-ext_profile-search-collect-btn')
+        const rowButtons = Array.from(document.querySelectorAll('.mb-ext_profile-search-row-btn[data-mb-profile-search-href]'))
+        const enabledRowButtons = rowButtons.filter(rowButton => rowButton.disabled !== true)
+        const batchButton = document.querySelector('.mb-ext_profile-search-batch-btn')
+        return {
+            found: !!button,
+            text: button ? clean(button.innerText || button.textContent || '') : '',
+            disabled: button ? button.disabled === true : false,
+            rowButtonCount: rowButtons.length,
+            enabledRowButtonCount: enabledRowButtons.length,
+            batchText: batchButton ? clean(batchButton.innerText || batchButton.textContent || '') : '',
+            scrollY: Math.round(window.scrollY || document.documentElement.scrollTop || 0),
+            scrollHeight: Math.round(document.documentElement.scrollHeight || document.body?.scrollHeight || 0)
+        }
+    }})()`, 10000)
+
+    const before = await readState()
+    if(!before.found || before.disabled === true) {
+        return {
+            clicked: false,
+            reason: before.found ? 'collect-button-disabled' : 'collect-button-not-found',
+            before
+        }
+    }
+    if((Number.parseInt(before.enabledRowButtonCount, 10) || 0) >= desiredEnabledCount) {
+        return {
+            clicked: false,
+            reason: 'enough-candidates-before-collect',
+            before
+        }
+    }
+
+    const clicked = await evaluate(target.webSocketDebuggerUrl, `(${function clickCollectButton() {
+        const clean = text => `${text || ''}`.replace(/\s+/g, ' ').trim()
+        const button = document.querySelector('.mb-ext_profile-search-collect-btn')
+        if(!button) return {clicked: false, reason: 'collect-button-not-found'}
+        button.scrollIntoView({block: 'center', inline: 'nearest'})
+        const beforeClickText = clean(button.innerText || button.textContent || '')
+        button.click()
+        return {
+            clicked: true,
+            text: beforeClickText
+        }
+    }})()`, 10000)
+    if(clicked.clicked !== true) {
+        return {
+            clicked: false,
+            reason: clicked.reason || 'collect-click-failed',
+            before,
+            click: clicked
+        }
+    }
+
+    const startedAt = Date.now()
+    const samples = []
+    let finalState = null
+    let observedCollectionActivity = false
+    while(Date.now() - startedAt < timeoutMs) {
+        await sleep(1500)
+        const state = await readState()
+        samples.push({
+            text: state.text || '',
+            batchText: state.batchText || '',
+            rowButtonCount: state.rowButtonCount || 0,
+            enabledRowButtonCount: state.enabledRowButtonCount || 0,
+            scrollY: state.scrollY || 0,
+            scrollHeight: state.scrollHeight || 0
+        })
+        if(samples.length > 12) samples.shift()
+        const enabledCount = Number.parseInt(state.enabledRowButtonCount, 10) || 0
+        const text = state.text || ''
+        if(/Collecting|Collected/i.test(text)) observedCollectionActivity = true
+        if(enabledCount >= desiredEnabledCount ||
+                /No new candidates|Nothing queued|Stopped/i.test(text) ||
+                (observedCollectionActivity && /^Collect\s+\d+\s+More/i.test(text))) {
+            finalState = state
+            break
+        }
+    }
+    if(!finalState) finalState = await readState()
+    return {
+        clicked: true,
+        before,
+        click: clicked,
+        finalState,
+        samples,
+        observedCollectionActivity,
+        elapsedMs: Date.now() - startedAt,
+        timedOut: Date.now() - startedAt >= timeoutMs
+    }
+}
+
 async function selectProfileSearchTargetsWithFallback(config, options, warnings, fail, phaseLabel, existingQueueTargets, targetCount, initialTarget = null, initialDiscovery = null) {
     const urls = getPhase10SearchCandidateUrls(options)
+    const attemptLimit = Math.max(1, Number.parseInt(options.phase10SearchAttemptLimit, 10) || 20)
+    const selectionTimeoutMs = Math.max(30000, Number.parseInt(options.phase10TargetSelectionTimeoutMs, 10) || PHASE10_TARGET_SELECTION_TIMEOUT_MS)
+    const selectionStartedAt = Date.now()
+    const selectionDeadlineAt = selectionStartedAt + selectionTimeoutMs
     const attempts = []
     const accumulated = []
     const accumulatedHrefs = new Set()
+    const searchTabCleanups = []
+    let stoppedAfterSelectionTimeout = false
+    const remainingSelectionMs = () => Math.max(0, selectionDeadlineAt - Date.now())
     const recordAttemptSelections = attempt => {
         for(const entry of attempt?.selection?.selected || []) {
             const href = entry?.href || ''
@@ -2587,6 +3381,9 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
     }
     const buildAccumulatedResult = attempt => ({
         ...(attempt || attempts[attempts.length - 1] || {}),
+        selectionTimedOut: stoppedAfterSelectionTimeout,
+        selectionElapsedMs: Date.now() - selectionStartedAt,
+        selectionTimeoutMs,
         selection: {
             requestedCount: targetCount,
             selected: accumulated.slice(0, targetCount),
@@ -2603,11 +3400,25 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
             }))
         },
         selectedTargets: accumulated.slice(0, targetCount).map(entry => entry.href),
-        attempts
+        attempts,
+        searchTabCleanups
     })
 
     if(initialTarget && initialDiscovery) {
-        const selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
+        let selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
+        let collect = null
+        if((Number.parseInt(selection.enabledCount, 10) || 0) < targetCount) {
+            const collectTimeoutMs = Math.max(0, Math.min(15000, remainingSelectionMs()))
+            if(collectTimeoutMs > 0) {
+                collect = await collectMoreProfileSearchCandidates(initialTarget, Math.max(targetCount, 8), collectTimeoutMs)
+                if(collect.clicked === true) {
+                    selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
+                }
+            }
+            else {
+                collect = {clicked: false, reason: 'target-selection-timeout-before-collect'}
+            }
+        }
         const selectedTargets = (selection.selected || [])
             .map(entry => entry.href)
             .filter(Boolean)
@@ -2617,31 +3428,67 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
             target: initialTarget,
             discovery: initialDiscovery,
             selection,
+            collect,
             selectedTargets,
             pageShape: initialDiscovery.page
         })
         recordAttemptSelections(attempts[0])
         if(accumulated.length >= targetCount) return buildAccumulatedResult(attempts[0])
+        searchTabCleanups.push(await closeProfileSearchTarget(
+            config,
+            initialTarget,
+            'phase10-initial-search-attempt-cleanup'
+        ))
     }
 
     const attemptedUrls = new Set(attempts.map(attempt => attempt.url).filter(Boolean))
     for(const url of urls) {
+        if(attempts.length >= attemptLimit) break
+        if(remainingSelectionMs() <= 0) {
+            stoppedAfterSelectionTimeout = true
+            break
+        }
         if(attemptedUrls.has(url)) continue
-        const attempt = await inspectSearchTargetForQueueCandidates(
-            config,
-            options,
-            url,
-            warnings,
-            phaseLabel,
-            fail,
-            existingQueueTargets,
-            targetCount,
-            attempts.length
+        const attemptTimeoutMs = Math.max(5000, Math.min(25000, remainingSelectionMs()))
+        const attempt = await withTimeoutValue(
+            inspectSearchTargetForQueueCandidates(
+                config,
+                {
+                    ...options,
+                    phase10TargetSelectionRemainingMs: attemptTimeoutMs
+                },
+                url,
+                warnings,
+                phaseLabel,
+                fail,
+                existingQueueTargets,
+                targetCount,
+                attempts.length
+            ),
+            attemptTimeoutMs + 5000,
+            () => ({
+                url,
+                target: null,
+                discovery: null,
+                selection: {selected: [], enabledCount: 0, excludedCount: 0, allButtonCount: 0, buttons: []},
+                collect: {clicked: false, reason: 'target-selection-attempt-timeout'},
+                selectedTargets: [],
+                pageShape: null,
+                timedOut: true,
+                timeoutMs: attemptTimeoutMs + 5000
+            })
         )
         attempts.push(attempt)
         attemptedUrls.add(url)
         recordAttemptSelections(attempt)
         if(accumulated.length >= targetCount) return buildAccumulatedResult(attempt)
+        if(attempt.target) {
+            searchTabCleanups.push(await closeProfileSearchTarget(
+                config,
+                attempt.target,
+                `phase10-candidate-search-attempt-${attempts.length}-cleanup`
+            ))
+        }
     }
 
     const lastAttempt = attempts[attempts.length - 1] || null
@@ -2650,7 +3497,13 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
         discovery: lastAttempt?.discovery || initialDiscovery || null,
         selection: buildAccumulatedResult(lastAttempt).selection || lastAttempt?.selection || {selected: [], enabledCount: 0, buttons: []},
         selectedTargets: accumulated.map(entry => entry.href),
-        attempts
+        attempts,
+        searchTabCleanups,
+        stoppedAfterAttemptLimit: attempts.length >= attemptLimit && accumulated.length < targetCount,
+        stoppedAfterSelectionTimeout,
+        selectionElapsedMs: Date.now() - selectionStartedAt,
+        selectionTimeoutMs,
+        attemptLimit
     }
 }
 
@@ -2845,7 +3698,8 @@ async function enqueueProfileSearchTargetViaRuntime(context, options, targetProf
         execute: {
             tabAction: 'nuke',
             maxConcurrent: Math.max(1, Number.parseInt(concurrency, 10) || 1),
-            noForegroundFallback: true
+            noForegroundFallback: true,
+            maxRetries: 2
         },
         items: [{
             runId,
@@ -2950,6 +3804,71 @@ async function stopExtensionServiceWorker(config, extensionId) {
     }
 }
 
+function isProfileSearchTarget(target = {}) {
+    if(target.type !== 'page') return false
+    const url = target.url || ''
+    if(!/^https:\/\/www\.quora\.com\/search\?/i.test(url)) return false
+    try {
+        const parsed = new URL(url)
+        return (parsed.searchParams.get('type') || '').toLowerCase() === 'profile'
+    }
+    catch {
+        return false
+    }
+}
+
+async function closeProfileSearchTargets(config, reason = 'phase-profile-search-cleanup') {
+    const targets = await getTargets(config)
+    const versionInfo = await getJson('/json/version', config)
+    const matches = targets.filter(isProfileSearchTarget)
+    const closed = []
+    for(const target of matches) {
+        const result = await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.closeTarget', {
+            targetId: target.id
+        }, 10000).catch(error => ({error: error?.message || `${error || ''}`}))
+        closed.push({
+            id: target.id,
+            title: target.title || '',
+            url: target.url || '',
+            closed: result?.success !== false && !result?.error,
+            error: result?.error || ''
+        })
+    }
+    return {
+        reason,
+        matched: matches.length,
+        closed
+    }
+}
+
+async function closeProfileSearchTarget(config, target = null, reason = 'phase-profile-search-target-cleanup') {
+    if(!isProfileSearchTarget(target)) {
+        return {
+            reason,
+            closed: false,
+            skipped: true,
+            target: target ? {
+                id: target.id || '',
+                type: target.type || '',
+                title: target.title || '',
+                url: target.url || ''
+            } : null
+        }
+    }
+    const versionInfo = await getJson('/json/version', config)
+    const result = await cdpCommand(versionInfo.webSocketDebuggerUrl, 'Target.closeTarget', {
+        targetId: target.id
+    }, 10000).catch(error => ({error: error?.message || `${error || ''}`}))
+    return {
+        reason,
+        id: target.id || '',
+        title: target.title || '',
+        url: target.url || '',
+        closed: result?.success !== false && !result?.error,
+        error: result?.error || ''
+    }
+}
+
 async function wakeServiceWorkerWithAccounting(context) {
     const accounting = await sendRuntimeMessage(context, {
         action: 'get-coordinator-queue-accounting',
@@ -3046,19 +3965,21 @@ function queueRowMatchesTargets(row = {}, targetSet = new Set()) {
     return candidates.some(candidate => targetSet.has(candidate))
 }
 
-function getActiveQueuedRows(summary = {}) {
+function getActiveQueuedRows(summary = {}, options = {}) {
     const activeQueued = row => /active|acting|opening|claim|running|pending|queued|retry|waiting/i.test(`${row?.status || ''}`)
     const authorityRows = (summary.rows || []).map(row => ({...row, source: summary.recovered ? 'recovered' : row.source || 'raw'}))
     const viewRows = (summary.viewRows || []).map(row => ({...row, source: 'view'}))
-    const rows = authorityRows.length ? authorityRows : viewRows
+    const rows = authorityRows.length || options.allowViewFallback === false ? authorityRows : viewRows
     return rows.filter(activeQueued)
 }
 
-function summarizeSelectedQueueAuthority(summary = {}, targetProfileHrefs = []) {
+function summarizeSelectedQueueAuthority(summary = {}, targetProfileHrefs = [], options = {}) {
     const normalizedTargets = dedupeStrings(targetProfileHrefs.map(target => normalizeComparableUrl(target || '')))
     const targetSet = new Set(normalizedTargets)
     const selected = normalizedTargets.map(target => {
-        const targetSummary = filterQueueAuthoritySummary(summary, target)
+        const targetSummary = filterQueueAuthoritySummary(summary, target, {
+            allowViewFallback: options.allowViewFallback !== false
+        })
         return {
             targetProfileHref: target,
             rowCount: targetSummary.rowCount,
@@ -3071,7 +3992,9 @@ function summarizeSelectedQueueAuthority(summary = {}, targetProfileHrefs = []) 
             rows: targetSummary.rows
         }
     })
-    const unrelatedActiveQueued = getActiveQueuedRows(summary)
+    const unrelatedActiveQueued = getActiveQueuedRows(summary, {
+        allowViewFallback: options.allowViewFallback !== false
+    })
         .filter(row => !queueRowMatchesTargets(row, targetSet))
     return {
         selectedCount: normalizedTargets.length,
@@ -3112,11 +4035,15 @@ function assertSelectedCompactProjectionMaterialized(selectedSummary = {}, fail,
     }
 }
 
-async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [], label = 'selected queued rows', timeoutMs = 20000) {
+async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [], label = 'selected queued rows', timeoutMs = 20000, options = {}) {
     const deadline = Date.now() + Math.max(1000, Number.parseInt(timeoutMs, 10) || 20000)
+    const summaryOptions = {
+        preferRecovered: true,
+        allowViewFallback: options.allowViewFallback !== false
+    }
     let storage = await readStorage(context)
-    let fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
-    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    let fullSummary = summarizeQueueAuthority(storage, summaryOptions)
+    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     const ready = () =>
         selectedSummary.selected.length === targetProfileHrefs.length &&
         selectedSummary.selected.every(item => item.rowCount === 1 && item.viewRowCount === 1 && item.terminalRows === 0) &&
@@ -3126,8 +4053,8 @@ async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [],
     while(Date.now() < deadline && !ready()) {
         await sleep(500)
         storage = await readStorage(context)
-        fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
-        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+        fullSummary = summarizeQueueAuthority(storage, summaryOptions)
+        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     }
     if(!ready()) {
         fail(`${label} did not observe all selected targets queued before timeout`, {
@@ -3147,11 +4074,15 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
     const deadline = Date.now() + Math.max(5000, Number.parseInt(timeoutMs, 10) || 240000)
     const idleStallMs = Math.max(5000, Number.parseInt(options.idleStallMs, 10) || 30000)
     const failOnIdleStall = options.failOnIdleStall === true
+    const summaryOptions = {
+        preferRecovered: true,
+        allowViewFallback: options.allowViewFallback !== false
+    }
     let idleStallStartedAt = 0
     let idleStallRuntime = null
     let storage = await readStorage(context)
-    let fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
-    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+    let fullSummary = summarizeQueueAuthority(storage, summaryOptions)
+    let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     const terminalReady = () =>
         selectedSummary.selected.length === targetProfileHrefs.length &&
         selectedSummary.selected.every(item => item.rowCount === 1 && item.terminalRows === 1) &&
@@ -3168,24 +4099,41 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
                 (Number.parseInt(runtime.response?.matchedQueuedTabActions, 10) || 0) +
                 (Number.parseInt(runtime.response?.matchedPendingTabActions, 10) || 0)
             if(runtime.ok === true && runtimeSurfaceCount <= 0) {
-                if(!idleStallStartedAt) {
+                const whyNotRunning = await readCoordinatorWhyNotRunning(context, "phase10-idle-stall-check")
+                if(hasCoordinatorRecoverySignal(whyNotRunning)) {
+                    idleStallStartedAt = 0
+                    idleStallRuntime = null
+                }
+                else if(!idleStallStartedAt) {
                     idleStallStartedAt = Date.now()
                     idleStallRuntime = runtime
                 }
                 else if(Date.now() - idleStallStartedAt >= idleStallMs) {
                     const stallStorage = await readStorage(context)
-                    const stallSummary = summarizeQueueAuthority(stallStorage, {preferRecovered: true})
-                    const stallSelectedSummary = summarizeSelectedQueueAuthority(stallSummary, targetProfileHrefs)
+                    const stallSummary = summarizeQueueAuthority(stallStorage, summaryOptions)
+                    const stallSelectedSummary = summarizeSelectedQueueAuthority(stallSummary, targetProfileHrefs, summaryOptions)
                     const selectedProgressRecords = getSelectedProgressRecords(stallStorage, targetProfileHrefs, stallSelectedSummary)
-                    const flightRecorder = await readFlightRecorder(context, {limit: 200})
-                    const executorClassification = await readExecutorClassification(context)
+                    const flightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+                    const freshWhyNotRunning = await readCoordinatorWhyNotRunning(context, "phase10-idle-stall-failure")
+                    if(hasCoordinatorRecoverySignal(freshWhyNotRunning)) {
+                        idleStallStartedAt = 0
+                        idleStallRuntime = null
+                        continue
+                    }
+                    const executorClassification = {
+                        ok: freshWhyNotRunning.ok,
+                        timedOut: freshWhyNotRunning.timedOut,
+                        lastError: freshWhyNotRunning.lastError,
+                        response: freshWhyNotRunning.response?.executor || null
+                    }
                     const primaryUnresolvedCase = executorClassification.response?.primaryUnresolvedCase || null
-                    const stallReason = primaryUnresolvedCase?.case || 'authority-work-without-runtime-surface'
+                    const stallReason = primaryUnresolvedCase?.case || "authority-work-without-runtime-surface"
                     fail(`${label} stalled with queued/active authority but no runtime actor surface`, {
                         idleStallMs,
                         selectedSummary: stallSelectedSummary,
                         fullSummary: stallSummary,
                         runtimeState: runtime,
+                        whyNotRunning: freshWhyNotRunning,
                         executorClassification,
                         primaryUnresolvedCase,
                         firstIdleRuntimeState: idleStallRuntime,
@@ -3198,6 +4146,7 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
                         summary: stallSelectedSummary,
                         authority: summarizeAuthorityState(stallStorage),
                         runtimeState: runtime,
+                        whyNotRunning: freshWhyNotRunning,
                         executorClassification,
                         primaryUnresolvedCase,
                         selectedProgressRecords,
@@ -3215,12 +4164,12 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
         }
         await sleep(1000)
         storage = await readStorage(context)
-        fullSummary = summarizeQueueAuthority(storage, {preferRecovered: true})
-        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs)
+        fullSummary = summarizeQueueAuthority(storage, summaryOptions)
+        selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     }
     if(!terminalReady()) {
         const selectedProgressRecords = getSelectedProgressRecords(storage, targetProfileHrefs, selectedSummary)
-        const flightRecorder = await readFlightRecorder(context, {limit: 200})
+        const flightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
         const runtimeState = await readQueueRuntimeState(context, targetProfileHrefs)
         const executorClassification = await readExecutorClassification(context)
         const primaryUnresolvedCase = executorClassification.response?.primaryUnresolvedCase || null
@@ -3366,7 +4315,7 @@ async function runOneItemQueueAuthoritySmoke(config, options, context, warnings,
     if(terminalRow && !/succeeded|success|skipped|canceled|cancelled/i.test(terminalRow.status)) {
         fail('phase 8 terminal status is not an accepted one-item outcome', terminalRow)
     }
-    preRestartFlightRecorder = await readFlightRecorder(context, {limit: 200})
+    preRestartFlightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
 
     const restartAfterTerminal = await stopExtensionServiceWorker(config, options.extensionId)
     const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
@@ -3434,6 +4383,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         incrementalEnqueue: []
     }
     let phase10WatchdogTimer = null
+    let phase10WatchdogDeadlineAt = 0
     const phase10SignalHandlers = []
     const clearPhase10Diagnostics = () => {
         if(phase10WatchdogTimer) {
@@ -3457,6 +4407,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             PHASE10_HARNESS_WATCHDOG_MS,
             (Number.parseInt(timeoutMs, 10) || PHASE10_HARNESS_WATCHDOG_MS) + 60000
         )
+        phase10WatchdogDeadlineAt = Date.now() + phase10WatchdogMs
         const handleSignal = signal => {
             void writePhase10Artifact(`signal-${signal.toLowerCase()}`, {signal})
                 .then(result => {
@@ -3529,6 +4480,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     }
 
     phaseState.currentStep = 'opening-search-target'
+    let pauseBeforeQueue = null
+    if(mediumBatch) {
+        pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
+    }
     let searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, `${phaseLabel} profile search batch queue`)
     tracePhase(options, `${phaseLabel} search target ready`, {url: searchTarget.url || ''})
     await reloadPageTarget(searchTarget)
@@ -3538,7 +4493,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     })
     const beforeStorage = await readStorage(context)
     const beforeAuthority = summarizeAuthorityState(beforeStorage)
-    const beforeQueue = summarizeQueueAuthority(beforeStorage, {preferRecovered: true})
+    const beforeQueue = summarizeQueueAuthority(beforeStorage, {
+        preferRecovered: true,
+        allowViewFallback: false
+    })
     const beforeSelected = summarizeSelectedQueueAuthority(beforeQueue, [])
 
     if(beforeQueue.activeRows > 0 || beforeQueue.queuedRows > 0 ||
@@ -3572,12 +4530,14 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
 
     const existingQueueTargets = Array.from(new Set([
         ...(Array.isArray(beforeQueue.rows) ? beforeQueue.rows : []),
-        ...(Array.isArray(beforeQueue.viewRows) ? beforeQueue.viewRows : [])
+        ...(!mediumBatch && Array.isArray(beforeQueue.viewRows) ? beforeQueue.viewRows : [])
     ].flatMap(row => [row?.key, row?.targetProfileHref, row?.requestedUrl])
         .filter(Boolean)))
 
     phaseState.currentStep = 'selecting-targets'
-    const pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
+    if(!pauseBeforeQueue) {
+        pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
+    }
     const targetSelection = mediumBatch
         ? await selectProfileSearchTargetsWithFallback(
             config,
@@ -3598,6 +4558,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         }
     searchTarget = targetSelection.target || searchTarget
     discovery = targetSelection.discovery || discovery
+    const searchTabCleanupsDuringSelection = targetSelection.searchTabCleanups || []
     const selection = targetSelection.selection || {selected: []}
     tracePhase(options, `${phaseLabel} selected targets`, {
         requested: targetCount,
@@ -3611,6 +4572,9 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         .filter(Boolean)
         .slice(0, targetCount)
     phaseState.selectedTargets = selectedTargets
+    const searchTabCleanupAfterSelection = mediumBatch
+        ? await closeProfileSearchTargets(config, 'phase10-after-target-selection')
+        : null
     if(selectedTargets.length !== targetCount) {
         const diagnostic = mediumBatch
             ? await writePhase10Artifact('not-enough-enabled-profile-search-row-buttons', {
@@ -3623,6 +4587,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                     enabledCount: Number.parseInt(attempt.selection?.enabledCount, 10) || 0,
                     excludedCount: Number.parseInt(attempt.selection?.excludedCount, 10) || 0,
                     allButtonCount: Number.parseInt(attempt.selection?.allButtonCount, 10) || 0,
+                    collect: attempt.collect || null,
                     pageShape: attempt.pageShape || attempt.discovery?.page || null,
                     selection: attempt.selection || null
                 }))
@@ -3648,6 +4613,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             selectedTargets,
             searchAttempts: targetSelection.attempts || [],
             existingQueueTargets,
+            searchTabCleanupsDuringSelection,
+            searchTabCleanupAfterSelection,
             abortCleanup,
             discoveryFailureDiagnostic: diagnostic?.snapshot || null,
             discoveryFailureDiagnosticPath: diagnostic?.artifactPath || '',
@@ -3693,6 +4660,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 selection,
                 selectedTargets,
                 existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
                 queueClicks,
                 incrementalEnqueue,
                 abortCleanup,
@@ -3708,7 +4677,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             fail,
             selectedTargets.slice(0, queueClicks.length),
             `${phaseLabel} after queue click ${queueClicks.length}`,
-            15000
+            15000,
+            {allowViewFallback: !mediumBatch}
         )
         const runtimeStateAfterEnqueue = mediumBatch
             ? await readQueueRuntimeState(context, selectedTargets.slice(0, queueClicks.length))
@@ -3720,7 +4690,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             ? buildTabAuthorityInvariant(visibleTabsAfterEnqueue, queuedSoFar.fullSummary, selectedTargets.slice(0, queueClicks.length))
             : null
         const flightRecorderAfterEnqueue = mediumBatch
-            ? await readFlightRecorder(context, {limit: 200})
+            ? await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
             : null
         incrementalEnqueue.push({
             clickedTarget: href,
@@ -3755,6 +4725,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 selection,
                 selectedTargets,
                 existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
                 queueClicks,
                 incrementalEnqueue,
                 abortCleanup,
@@ -3782,6 +4754,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 selection,
                 selectedTargets,
                 existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
                 queueClicks,
                 incrementalEnqueue,
                 abortCleanup,
@@ -3800,7 +4774,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         fail,
         selectedTargets,
         `${phaseLabel} after enqueue`,
-        30000
+        30000,
+        {allowViewFallback: !mediumBatch}
     )
     assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, `${phaseLabel} after enqueue`)
     assertWalPresent(afterEnqueue.authority, fail, `${phaseLabel} after enqueue WAL`)
@@ -3815,7 +4790,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         fail,
         selectedTargets,
         `${phaseLabel} after pre-start service-worker restart`,
-        30000
+        30000,
+        {allowViewFallback: !mediumBatch}
     )
     assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, `${phaseLabel} after pre-start service-worker restart`)
     assertWalPresent(afterRestartBeforeStart.authority, fail, `${phaseLabel} after pre-start restart WAL`)
@@ -3838,11 +4814,12 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     tracePhase(options, `${phaseLabel} waiting for terminal rows`)
     const terminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, timeoutMs, `${phaseLabel} selected items`, {
         failOnIdleStall: mediumBatch,
-        idleStallMs: mediumBatch ? Math.max(15000, Math.min(idleMs || 30000, 60000)) : 0
+        idleStallMs: mediumBatch ? Math.max(15000, Math.min(idleMs || 30000, 60000)) : 0,
+        allowViewFallback: !mediumBatch
     })
     const terminalStorage = terminal.storage || await readStorage(context)
     const terminalSelectedProgressRecords = getSelectedProgressRecords(terminalStorage, selectedTargets, terminal.summary)
-    const preRestartFlightRecorder = await readFlightRecorder(context, {limit: 200})
+    const preRestartFlightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
     if(terminal.timedOut) {
         tracePhase(options, `${phaseLabel} terminal wait failed before restart`, {
             stalled: terminal.stalled === true,
@@ -3858,6 +4835,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 }
             })
             : null
+        const authoritativeTerminalSnapshot = diagnostic?.snapshot || null
+        const terminalQueue = authoritativeTerminalSnapshot?.queue || terminal.summary
+        const terminalFullQueue = authoritativeTerminalSnapshot?.fullQueue || terminal.fullSummary
+        const terminalAuthority = authoritativeTerminalSnapshot?.authority || terminal.authority
         return finishPhase({
             kind: batchKind,
             search: discovery,
@@ -3869,6 +4850,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             selection,
             selectedTargets,
             existingQueueTargets,
+            searchTabCleanupsDuringSelection,
+            searchTabCleanupAfterSelection,
             queueClicks,
             incrementalEnqueue,
             afterEnqueue: {
@@ -3887,9 +4870,17 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             start,
             startSummary: summarizeMessageResult(start),
             terminal: {
-                queue: terminal.summary,
-                fullQueue: terminal.fullSummary,
-                authority: terminal.authority,
+                queue: terminalQueue,
+                fullQueue: terminalFullQueue,
+                authority: terminalAuthority,
+                sourceConsistency: authoritativeTerminalSnapshot?.sourceConsistency || null,
+                authoritativeSource: authoritativeTerminalSnapshot?.sourceConsistency?.authoritativeSource || '',
+                terminalWaitSnapshot: {
+                    queue: terminal.summary,
+                    fullQueue: terminal.fullSummary,
+                    authority: terminal.authority,
+                    capturedBeforeDiagnostic: !!authoritativeTerminalSnapshot
+                },
                 runtimeState: terminal.runtimeState || null,
                 stalled: terminal.stalled === true,
                 stallReason: terminal.stallReason || '',
@@ -3928,7 +4919,9 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     const restartAfterTerminal = await stopExtensionServiceWorker(config, options.extensionId)
     tracePhase(options, `${phaseLabel} waking service worker after terminal`)
     const wakeAfterTerminal = await wakeServiceWorkerWithAccounting(context)
-    const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000, `${phaseLabel} selected items after terminal restart`)
+    const afterRestartAfterTerminal = await waitForSelectedTerminalRows(context, fail, selectedTargets, 30000, `${phaseLabel} selected items after terminal restart`, {
+        allowViewFallback: !mediumBatch
+    })
     tracePhase(options, `${phaseLabel} terminal rows preserved after restart`)
     assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal service-worker restart`, {
         requireCompactView: false
@@ -3973,6 +4966,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         selection,
         selectedTargets,
         existingQueueTargets,
+        searchTabCleanupsDuringSelection,
+        searchTabCleanupAfterSelection,
         queueClicks,
         incrementalEnqueue,
         afterEnqueue: {
@@ -4221,6 +5216,23 @@ function tracePhase(options = {}, message = '', details = null) {
 
 runMain(async () => {
     const options = parseArgs(process.argv)
+    if(options.phase10WatchdogSelfTest === true) {
+        const result = runPhase10WatchdogSelfTest()
+        const summary = result?.report
+            ? {
+                ok: result.ok === true,
+                drainPass: result.report.drainPass === true,
+                qualityPass: result.report.qualityPass === true,
+                selectedCounts: result.report.selectedCounts || {},
+                queuedRows: result.report.queuedRows || 0,
+                activeRows: result.report.activeRows || 0,
+                primaryReducerCase: result.report.primaryReducerCase || "",
+                firstSelectedNonterminalRow: result.report.firstSelectedNonterminalRow || null
+            }
+            : result
+        console.log(JSON.stringify(options.verbose ? result : summary, null, 2))
+        return
+    }
     const config = await resolveCdpConfig({
         host: options.host,
         port: options.port,
@@ -4261,9 +5273,9 @@ runMain(async () => {
             extension: null,
             extensionBefore: null,
             expectedVersion,
-            storageKeys: [],
-            storageKeysBefore: [],
-            storageKeysAfter: [],
+            storageKeySummary: summarizeStorageKeys([]),
+            storageKeySummaryBefore: summarizeStorageKeys([]),
+            storageKeySummaryAfter: summarizeStorageKeys([]),
             storageKeyDelta: {
                 before: [],
                 after: [],
@@ -4297,7 +5309,7 @@ runMain(async () => {
         const comparable = comparableReport(report)
         if(options.writeBaseline) writeJson(options.writeBaseline, {...report, comparable})
         printOperatorInterventions(operatorIntervention)
-        console.log(JSON.stringify(options.verbose ? {...report, comparable} : report, null, 2))
+        console.log(JSON.stringify(options.verbose ? {...report, comparable} : consoleReport(report, comparable), null, 2))
         process.exit(1)
     }
 
@@ -4466,7 +5478,7 @@ runMain(async () => {
         flightRecorder = smallBatchQueueSmoke?.preRestartFlightRecorder ||
             mediumBatchQueueSmoke?.preRestartFlightRecorder ||
             oneItemQueueSmoke?.preRestartFlightRecorder ||
-            await readFlightRecorder(context, {limit: 200})
+            await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
     }
 
     const legacyActionSummary = Object.fromEntries(Object.entries(legacyActions)
@@ -4493,9 +5505,9 @@ runMain(async () => {
             type: context.type || '',
             url: context.url || ''
         },
-        storageKeys: storageAfter.keys,
-        storageKeysBefore: storageBefore.keys,
-        storageKeysAfter: storageAfter.keys,
+        storageKeySummary: summarizeStorageKeys(storageAfter.keys),
+        storageKeySummaryBefore: summarizeStorageKeys(storageBefore.keys),
+        storageKeySummaryAfter: summarizeStorageKeys(storageAfter.keys),
         storageKeyDelta,
         allowedAddedStorageKeys: allowedAddedStorageKeySummary(options.phase),
         alarms,
@@ -4562,6 +5574,6 @@ runMain(async () => {
 
     report.pass = failures.length === 0
     printOperatorInterventions(operatorIntervention)
-    console.log(JSON.stringify(report, null, 2))
+    console.log(JSON.stringify(options.verbose ? report : consoleReport(report, comparable), null, 2))
     if(!report.pass) process.exitCode = 1
 })

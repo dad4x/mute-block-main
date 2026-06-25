@@ -14,10 +14,13 @@ const {
 } = require('./lib/cdp')
 
 runMain(async () => {
+    const requestedConfig = getCdpConfig()
+    const expectedVersion = getOption('extension-version', requestedConfig.extensionVersion || '')
     const config = await resolveCdpConfig({
-        ...getCdpConfig(),
+        ...requestedConfig,
         extensionId: getOption('extension-id', 'auto'),
-        extensionPath: getOption('extension-path', process.env.MB_EXTENSION_PATH || DEFAULT_REMOTE_CHROME_DEV_PATH)
+        extensionPath: getOption('extension-path', process.env.MB_EXTENSION_PATH || DEFAULT_REMOTE_CHROME_DEV_PATH),
+        extensionVersion: ''
     })
     const targets = await getTargets(config)
     const extensionsPage = await openChromeExtensionsPage(config, targets)
@@ -63,12 +66,19 @@ runMain(async () => {
     })`, 10000)
 
     console.log(JSON.stringify({
-        ok: reload?.ok === true && after?.state === 'ENABLED',
+        ok: reload?.ok === true &&
+            after?.state === 'ENABLED' &&
+            (!expectedVersion || after?.version === expectedVersion),
         extensionId: config.extensionId,
         extensionPath: config.extensionPath,
+        expectedVersion,
         before,
         reload,
         after
     }, null, 2))
-    if(!(reload?.ok === true && after?.state === 'ENABLED')) process.exitCode = 1
+    if(!(reload?.ok === true &&
+            after?.state === 'ENABLED' &&
+            (!expectedVersion || after?.version === expectedVersion))) {
+        process.exitCode = 1
+    }
 })

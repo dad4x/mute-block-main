@@ -9,6 +9,11 @@ Defaults:
 - CDP endpoint: `127.0.0.1:9223`
 - Extension id: use `--extension-id auto` for normal live iteration.
 - Dev unpacked path: `C:\Users\DBROWER\Documents\src\mute-block-main\chrome-dev`
+- Manual shell CDP probes must bypass proxy configuration:
+  `timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version`.
+  Plain `curl` can hang even when the tunnel and browser are healthy. The Node
+  CDP helpers use direct `http` calls and are not expected to need this curl
+  flag.
 - Override with `--host`, `--port`, `--extension-id`, `--extension-path`,
   `--extension-version`, or the matching `MB_CDP_HOST`, `MB_CDP_PORT`,
   `MB_EXTENSION_ID`, `MB_EXTENSION_PATH`, `MB_EXTENSION_VERSION` environment
@@ -98,7 +103,7 @@ ssh -N -L 9224:127.0.0.1:9224 USER@WINDOWS_HOST
 Check the local endpoint:
 
 ```bash
-curl http://127.0.0.1:9224/json/version
+timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9224/json/version
 ```
 
 To reuse an existing Windows profile, pass its user-data-dir:
@@ -175,7 +180,7 @@ ssh -F /home/dbrower/.ssh/config -p 10022 -o BatchMode=yes \
 Then verify CDP locally:
 
 ```bash
-curl --noproxy '*' http://127.0.0.1:9223/json/version
+timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version
 ```
 
 Command-line `--load-extension` may not register the unpacked Mute Block build
@@ -305,6 +310,12 @@ node tools/cdp/upgrade-regression/run.js \
 
 Run these only in a disposable or explicitly approved warmed logged-in profile.
 They intentionally create WAL-backed queue authority and profile terminal state.
+
+## Command Shapes Without Permission Prompts
+
+Keep live-regression and edit-loop commands in simple approved forms. Do not use inline heredocs, ad hoc Python snippets, command substitution, or large remote shell blobs for routine repo work. If a step needs logic, put it in a repo-local helper under tools/ and run that helper through a simple command such as bash -lc node-tools, npm run, rsync, or ssh with a known helper command.
+
+For small literal source edits where apply_patch is unavailable, use npm run dev:text-replace -- --file PATH --old OLD --new NEW, or pass --old-file and --new-file snippets. This keeps replacement logic inside the repo and avoids approval prompts caused by inline scripts.
 
 ## Dictionary
 

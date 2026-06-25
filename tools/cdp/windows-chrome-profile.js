@@ -206,9 +206,15 @@ function main() {
         commands,
         tunnelCommand: tunnelCommand(options),
         cdpVersionUrl: `http://127.0.0.1:${options.localPort}/json/version`,
+        cdpProbeCommand: `timeout 10 curl --noproxy '*' -sS http://127.0.0.1:${options.localPort}/json/version`,
         notes: options.newProfile
-            ? ['New disposable profile launched. Quora will require a fresh login before authenticated tests.']
-            : []
+            ? [
+                "Use curl --noproxy '*' for manual CDP probes; plain curl may hang behind proxy configuration.",
+                'New disposable profile launched. Quora will require a fresh login before authenticated tests.'
+            ]
+            : [
+                "Use curl --noproxy '*' for manual CDP probes; plain curl may hang behind proxy configuration."
+            ]
     }
     console.log(JSON.stringify(output, null, 2))
 }
