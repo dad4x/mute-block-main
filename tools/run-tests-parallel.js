@@ -3,10 +3,11 @@
 'use strict'
 
 const os = require('os')
-const { spawn } = require('child_process')
+const { spawn, spawnSync } = require('child_process')
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30000
 const KILL_GRACE_MS = 5000
+const DEFAULT_SYNTHETIC_SHARDS = 48
 
 const lanes = [
   {
@@ -39,10 +40,8 @@ const lanes = [
   },
   {
     name: 'synthetic',
-    commandTimeoutMs: 420000,
-    commands: [
-      ['node', 'test/swSynthetic.test.js']
-    ]
+    commandTimeoutMs: 1200000,
+    commands: []
   },
   {
     name: 'scenario',
@@ -60,6 +59,84 @@ const lanes = [
     ]
   }
 ]
+
+function getSyntheticShardCount() {
+  const raw = `${process.env.SW_SYNTHETIC_SHARDS || ''}`.trim()
+  if (!raw) {
+    return DEFAULT_SYNTHETIC_SHARDS
+  }
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    console.warn(`Ignoring invalid SW_SYNTHETIC_SHARDS=${JSON.stringify(raw)}; using ${DEFAULT_SYNTHETIC_SHARDS}`)
+    return DEFAULT_SYNTHETIC_SHARDS
+  }
+  return parsed
+}
+
+function getSyntheticTestInventory() {
+  const result = spawnSync(process.execPath, ['test/swSynthetic.test.js', '--list'], {
+    cwd: process.cwd(),
+    env: process.env,
+    encoding: 'utf8'
+  })
+  if (result.error) {
+    throw result.error
+  }
+  if (result.status !== 0) {
+    const stderr = result.stderr ? `\n${result.stderr}` : ''
+    const stdout = result.stdout ? `\n${result.stdout}` : ''
+    throw new Error(`Unable to list swSynthetic tests; exit=${result.status}${stderr}${stdout}`)
+  }
+  const inventory = result.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(line => {
+      const match = line.match(/^(\d+)\t(.+)$/)
+      if (!match) {
+        throw new Error(`Unexpected swSynthetic --list line: ${JSON.stringify(line)}`)
+      }
+      return {
+        index: Number.parseInt(match[1], 10),
+        name: match[2]
+      }
+    })
+  if (inventory.length === 0) {
+    throw new Error('swSynthetic --list returned no tests')
+  }
+  const lastIndex = inventory[inventory.length - 1].index
+  if (lastIndex !== inventory.length) {
+    throw new Error(`swSynthetic --list returned non-contiguous inventory; count=${inventory.length} lastIndex=${lastIndex}`)
+  }
+  return inventory
+}
+
+function buildSyntheticRangeCommands(totalTests, shardCount) {
+  const normalizedShardCount = Math.max(1, Math.min(totalTests, shardCount))
+  const shardSize = Math.ceil(totalTests / normalizedShardCount)
+  const commands = []
+  for (let start = 1; start <= totalTests; start += shardSize) {
+    const end = Math.min(totalTests, start + shardSize - 1)
+    commands.push(['node', 'test/swSynthetic.test.js', `--range=${start}:${end}`])
+  }
+  return commands
+}
+
+function prepareSyntheticLane() {
+  const syntheticLaneIndex = lanes.findIndex(lane => lane.name === 'synthetic')
+  if (syntheticLaneIndex < 0) {
+    return
+  }
+  const inventory = getSyntheticTestInventory()
+  const commands = buildSyntheticRangeCommands(inventory.length, getSyntheticShardCount())
+  const syntheticLanes = commands.map((command, index) => ({
+    name: `synthetic-${index + 1}`,
+    commandTimeoutMs: 1200000,
+    commands: [command],
+    testCount: inventory.length,
+    shardCount: commands.length
+  }))
+  lanes.splice(syntheticLaneIndex, 1, ...syntheticLanes)
+}
 
 function formatCommand(command) {
   return command.join(' ')
@@ -241,9 +318,13 @@ async function runLane(lane) {
 }
 
 async function main() {
+  prepareSyntheticLane()
+
   console.log('parallel test lanes:')
   for (const lane of lanes) {
-    console.log(`- ${lane.name}: ${lane.commands.map(formatCommand).join(' ; ')}`)
+    const count = lane.testCount ? ` tests=${lane.testCount}` : ''
+    const shard = lane.shardCount ? ` shards=${lane.shardCount}` : ''
+    console.log(`- ${lane.name}:${count}${shard} ${lane.commands.map(formatCommand).join(' ; ')}`)
   }
 
   const laneConcurrency = getLaneConcurrency()

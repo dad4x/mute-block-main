@@ -246,6 +246,7 @@ function parseArgs(argv) {
         phase9TimeoutMs: 600000,
         phase10TargetCount: 10,
         phase10TimeoutMs: 1200000,
+        phase10TargetSelectionTimeoutMs: PHASE10_TARGET_SELECTION_TIMEOUT_MS,
         phase10Concurrency: 2,
         phase10IdleMs: 20000,
         phase10SearchAttemptLimit: 20,
@@ -313,6 +314,8 @@ function parseArgs(argv) {
         else if(arg.startsWith('--phase9-timeout-ms=')) options.phase9TimeoutMs = Number.parseInt(arg.slice('--phase9-timeout-ms='.length), 10) || options.phase9TimeoutMs
         else if(arg === '--phase10-target-count') options.phase10TargetCount = Number.parseInt(readValue(`${options.phase10TargetCount}`), 10) || options.phase10TargetCount
         else if(arg.startsWith('--phase10-target-count=')) options.phase10TargetCount = Number.parseInt(arg.slice('--phase10-target-count='.length), 10) || options.phase10TargetCount
+        else if(arg === '--phase10-target-selection-timeout-ms') options.phase10TargetSelectionTimeoutMs = Number.parseInt(readValue(`${options.phase10TargetSelectionTimeoutMs}`), 10) || options.phase10TargetSelectionTimeoutMs
+        else if(arg.startsWith('--phase10-target-selection-timeout-ms=')) options.phase10TargetSelectionTimeoutMs = Number.parseInt(arg.slice('--phase10-target-selection-timeout-ms='.length), 10) || options.phase10TargetSelectionTimeoutMs
         else if(arg === '--phase10-timeout-ms') options.phase10TimeoutMs = Number.parseInt(readValue(`${options.phase10TimeoutMs}`), 10) || options.phase10TimeoutMs
         else if(arg.startsWith('--phase10-timeout-ms=')) options.phase10TimeoutMs = Number.parseInt(arg.slice('--phase10-timeout-ms='.length), 10) || options.phase10TimeoutMs
         else if(arg === '--phase10-concurrency') options.phase10Concurrency = Number.parseInt(readValue(`${options.phase10Concurrency}`), 10) || options.phase10Concurrency
@@ -349,10 +352,11 @@ function parseArgs(argv) {
         options.phase9TargetCount = Math.max(3, Math.min(Number.parseInt(options.phase9TargetCount, 10) || 3, 5))
     }
     if(options.phase === PHASE10_MEDIUM_BATCH_QUEUE) {
-        options.phase10TargetCount = Math.max(1, Math.min(Number.parseInt(options.phase10TargetCount, 10) || 10, 12))
+        options.phase10TargetCount = Math.max(1, Math.min(Number.parseInt(options.phase10TargetCount, 10) || 10, 300))
         options.phase10Concurrency = Math.max(1, Math.min(Number.parseInt(options.phase10Concurrency, 10) || 2, 3))
         options.phase10IdleMs = Math.max(5000, Math.min(Number.parseInt(options.phase10IdleMs, 10) || 20000, 60000))
         options.phase10SearchAttemptLimit = Math.max(1, Math.min(Number.parseInt(options.phase10SearchAttemptLimit, 10) || 20, 20))
+        options.phase10TargetSelectionTimeoutMs = Math.max(30000, Math.min(Number.parseInt(options.phase10TargetSelectionTimeoutMs, 10) || PHASE10_TARGET_SELECTION_TIMEOUT_MS, 900000))
     }
     options.spaceAssetUrls = dedupeStrings(options.spaceAssetUrls.filter(Boolean))
     options.spaceTargetUrls = dedupeStrings(options.spaceTargetUrls.filter(Boolean))
@@ -390,6 +394,7 @@ function printUsage() {
         '  --phase9-target-count 3',
         '  --phase9-timeout-ms 600000',
         '  --phase10-target-count 10',
+        '  --phase10-target-selection-timeout-ms 180000',
         '  --phase10-timeout-ms 1200000',
         '  --phase10-concurrency 2',
         '  --phase10-idle-ms 20000',
@@ -2333,7 +2338,7 @@ function comparableSmallBatchQueueSmoke(smallBatchQueueSmoke = null) {
     return {
         kind: smallBatchQueueSmoke.kind || '',
         selectedCount: Number(smallBatchQueueSmoke.selectedTargets?.length || 0) || 0,
-        queueClicksClicked: (smallBatchQueueSmoke.queueClicks || []).filter(click => click.clicked === true).length,
+        queueClicksClicked: (smallBatchQueueSmoke.queueClicks || []).filter(click => click.clicked === true || click.enqueued === true).length,
         lowConcurrencyPreference: {
             requestedValue: Number(smallBatchQueueSmoke.lowConcurrencyPreference?.requestedValue || 0) || 0,
             setOk: smallBatchQueueSmoke.lowConcurrencyPreference?.set?.ok === true,
@@ -3231,14 +3236,18 @@ async function inspectSearchTargetForQueueCandidates(config, options, url, warni
         allowProgressRows: true,
         allowQueueRows: true
     })
-    let selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets)
+    let selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets, {
+        includeDiscoveredProfileLinks: true
+    })
     let collect = null
     if((Number.parseInt(selection.enabledCount, 10) || 0) < targetCount) {
         const collectTimeoutMs = Math.max(0, Math.min(15000, selectionRemainingMs))
         if(collectTimeoutMs > 0) {
             collect = await collectMoreProfileSearchCandidates(target, Math.max(targetCount, 8), collectTimeoutMs)
             if(collect.clicked === true) {
-                selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets)
+                selection = await selectEnabledProfileSearchQueueTargets(target, targetCount, existingQueueTargets, {
+                    includeDiscoveredProfileLinks: true
+                })
             }
         }
         else {
@@ -3405,14 +3414,18 @@ async function selectProfileSearchTargetsWithFallback(config, options, warnings,
     })
 
     if(initialTarget && initialDiscovery) {
-        let selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
+        let selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets, {
+            includeDiscoveredProfileLinks: true
+        })
         let collect = null
         if((Number.parseInt(selection.enabledCount, 10) || 0) < targetCount) {
             const collectTimeoutMs = Math.max(0, Math.min(15000, remainingSelectionMs()))
             if(collectTimeoutMs > 0) {
                 collect = await collectMoreProfileSearchCandidates(initialTarget, Math.max(targetCount, 8), collectTimeoutMs)
                 if(collect.clicked === true) {
-                    selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets)
+                    selection = await selectEnabledProfileSearchQueueTargets(initialTarget, targetCount, existingQueueTargets, {
+                        includeDiscoveredProfileLinks: true
+                    })
                 }
             }
             else {
@@ -3664,24 +3677,30 @@ function getProfileSearchSourceFromUrl(searchUrl = '') {
     }
 }
 
-async function enqueueProfileSearchTargetViaRuntime(context, options, targetProfileHref = '', concurrency = 1) {
-    let href = ''
+function normalizeProfileSearchTargetHref(targetProfileHref = '', baseUrl = 'https://www.quora.com/') {
     try {
-        const url = new URL(targetProfileHref || '', options.searchUrl || 'https://www.quora.com/')
+        const url = new URL(targetProfileHref || '', baseUrl || 'https://www.quora.com/')
         if(/^https:$/.test(url.protocol) && /(^|\.)quora\.com$/i.test(url.hostname) && /^\/profile\//i.test(url.pathname)) {
             url.hash = ''
             url.search = ''
-            href = `https://www.quora.com${url.pathname.replace(/\/+$/, '')}`
+            return `https://www.quora.com${url.pathname.replace(/\/+$/, '')}`
         }
     }
     catch {
-        href = ''
+        return ''
     }
-    if(!href) {
+    return ''
+}
+
+async function enqueueProfileSearchTargetsViaRuntime(context, options, targetProfileHrefs = [], concurrency = 1) {
+    const hrefs = Array.from(new Set((Array.isArray(targetProfileHrefs) ? targetProfileHrefs : [targetProfileHrefs])
+        .map(href => normalizeProfileSearchTargetHref(href, options.searchUrl || 'https://www.quora.com/'))
+        .filter(Boolean)))
+    if(!hrefs.length) {
         return {
             enqueued: false,
-            reason: 'invalid-target-profile-href',
-            href: targetProfileHref || ''
+            reason: 'invalid-target-profile-hrefs',
+            hrefs: Array.isArray(targetProfileHrefs) ? targetProfileHrefs : [targetProfileHrefs]
         }
     }
 
@@ -3701,31 +3720,61 @@ async function enqueueProfileSearchTargetViaRuntime(context, options, targetProf
             noForegroundFallback: true,
             maxRetries: 2
         },
-        items: [{
+        items: hrefs.map(href => ({
             runId,
             dedupeKey: href,
             targetProfileHref: href,
             requestedUrl: href,
             source
-        }]
+        }))
     }
-    const result = await sendRuntimeMessage(context, message, 20000)
-    const queued = Number.parseInt(result.response?.queued || 0, 10) || 0
-    const merged = Number.parseInt(result.response?.merged || 0, 10) || 0
+    const attempts = []
+    let result = null
+    let queued = 0
+    let merged = 0
+    for(let attempt = 1; attempt <= 3; attempt += 1) {
+        result = await sendRuntimeMessage(context, message, 30000)
+        queued = Number.parseInt(result.response?.queued || 0, 10) || 0
+        merged = Number.parseInt(result.response?.merged || 0, 10) || 0
+        attempts.push({
+            attempt,
+            timedOut: result.timedOut === true,
+            lastError: result.lastError || '',
+            storageTimedOut: result.response?.storageTimedOut === true,
+            queued,
+            merged,
+            responseSummary: summarizeMessageResult(result)
+        })
+        if(queued + merged >= hrefs.length) break
+        if(result.response?.storageTimedOut !== true) break
+        await sleep(1000 * attempt)
+    }
     return {
-        enqueued: queued + merged > 0,
-        href,
+        enqueued: queued + merged >= hrefs.length,
+        hrefs,
         runId,
         request: message,
         timedOut: result.timedOut === true,
         lastError: result.lastError || '',
         response: result.response || null,
+        queued,
+        merged,
+        acceptedCount: queued + merged,
+        attempts,
         responseSummary: summarizeMessageResult(result)
     }
 }
 
-async function selectEnabledProfileSearchQueueTargets(target, count = 3, excludedHrefs = []) {
-    return evaluate(target.webSocketDebuggerUrl, `(${function selectTargets(targetCount, excludedList) {
+async function enqueueProfileSearchTargetViaRuntime(context, options, targetProfileHref = '', concurrency = 1) {
+    const result = await enqueueProfileSearchTargetsViaRuntime(context, options, [targetProfileHref], concurrency)
+    return {
+        ...result,
+        href: result.hrefs?.[0] || targetProfileHref || ''
+    }
+}
+
+async function selectEnabledProfileSearchQueueTargets(target, count = 3, excludedHrefs = [], options = {}) {
+    return evaluate(target.webSocketDebuggerUrl, `(${function selectTargets(targetCount, excludedList, selectorOptions) {
         const normalize = href => {
             try {
                 const url = new URL(href || '', location.href)
@@ -3759,15 +3808,36 @@ async function selectEnabledProfileSearchQueueTargets(target, count = 3, exclude
             if(excluded.has(entry.href)) continue
             enabled.push(entry)
         }
+        const includeDiscoveredProfileLinks = selectorOptions?.includeDiscoveredProfileLinks === true
+        const discovered = []
+        if(includeDiscoveredProfileLinks && enabled.length < targetCount) {
+            const links = Array.from(document.querySelectorAll('a[href*="/profile/"]'))
+                .map((link, index) => ({
+                    index,
+                    href: normalize(link.href || link.getAttribute('href') || ''),
+                    disabled: false,
+                    text: `${link.innerText || link.textContent || ''}`.replace(/\s+/g, ' ').trim(),
+                    discovered: true
+                }))
+                .filter(entry => entry.href)
+            for(const entry of links) {
+                if(seen.has(entry.href) || excluded.has(entry.href)) continue
+                seen.add(entry.href)
+                discovered.push(entry)
+                enabled.push(entry)
+                if(enabled.length >= targetCount) break
+            }
+        }
         return {
             requestedCount: targetCount,
             selected: enabled.slice(0, Math.max(0, targetCount)),
             enabledCount: enabled.length,
             excludedCount: excluded.size,
             allButtonCount: buttons.length,
+            discoveredProfileLinkCount: discovered.length,
             buttons: buttons.slice(0, 30)
         }
-    }})(${JSON.stringify(Math.max(1, Number.parseInt(count, 10) || 3))}, ${JSON.stringify(excludedHrefs || [])})`, 10000)
+    }})(${JSON.stringify(Math.max(1, Number.parseInt(count, 10) || 3))}, ${JSON.stringify(excludedHrefs || [])}, ${JSON.stringify(options || {})})`, 10000)
 }
 
 async function stopExtensionServiceWorker(config, extensionId) {
@@ -4627,7 +4697,132 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     const incrementalEnqueue = []
     phaseState.queueClicks = queueClicks
     phaseState.incrementalEnqueue = incrementalEnqueue
-    for(const href of selectedTargets) {
+    if(mediumBatch) {
+        phaseState.currentStep = 'enqueue-batch'
+        tracePhase(options, `${phaseLabel} batch enqueue`, {count: selectedTargets.length})
+        const click = await enqueueProfileSearchTargetsViaRuntime(context, options, selectedTargets, concurrency)
+        queueClicks.push(click)
+        if(click.enqueued !== true) {
+            const diagnostic = await writePhase10Artifact('enqueue-rpc-not-accepted', {hrefs: selectedTargets, click})
+            fail(`${phaseLabel} enqueue RPC did not accept selected profile-search batch`, {
+                hrefs: selectedTargets,
+                click,
+                diagnosticArtifactPath: diagnostic?.artifactPath || ''
+            })
+            const abortCleanup = await restorePreferenceAndResumePause()
+            return finishPhase({
+                kind: batchKind,
+                search: discovery,
+                lowConcurrencyPreference,
+                beforeQueue,
+                beforeSelected,
+                beforeAuthority,
+                pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+                selection,
+                selectedTargets,
+                existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
+                queueClicks,
+                incrementalEnqueue,
+                abortCleanup,
+                enqueueFailureDiagnostic: diagnostic?.snapshot || null,
+                enqueueFailureDiagnosticPath: diagnostic?.artifactPath || '',
+                aborted: true,
+                abortReason: 'enqueue-rpc-not-accepted'
+            })
+        }
+
+        phaseState.currentStep = 'materializing-enqueue-batch'
+        const queuedSoFar = await waitForSelectedQueuedRows(
+            context,
+            fail,
+            selectedTargets,
+            `${phaseLabel} after batch enqueue`,
+            120000,
+            {allowViewFallback: false}
+        )
+        const runtimeStateAfterEnqueue = await readQueueRuntimeState(context, selectedTargets)
+        const visibleTabsAfterEnqueue = await readVisibleTargetTabs(config, selectedTargets)
+        const tabAuthorityInvariantAfterEnqueue = buildTabAuthorityInvariant(visibleTabsAfterEnqueue, queuedSoFar.fullSummary, selectedTargets)
+        const flightRecorderAfterEnqueue = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+        incrementalEnqueue.push({
+            clickedTarget: '',
+            clickedTargets: selectedTargets,
+            enqueueResponse: click,
+            queue: queuedSoFar.summary,
+            fullQueue: queuedSoFar.fullSummary,
+            authority: queuedSoFar.authority,
+            runtimeState: runtimeStateAfterEnqueue,
+            visibleTabs: visibleTabsAfterEnqueue,
+            tabAuthorityInvariant: tabAuthorityInvariantAfterEnqueue,
+            flightRecorder: flightRecorderAfterEnqueue
+        })
+        if(tabAuthorityInvariantAfterEnqueue?.ok === false) {
+            const diagnostic = await writePhase10Artifact('tab-open-without-authority-evidence', {
+                hrefs: selectedTargets,
+                invariant: tabAuthorityInvariantAfterEnqueue
+            })
+            fail(`${phaseLabel} opened a profile tab without matching authority evidence`, {
+                hrefs: selectedTargets,
+                invariant: tabAuthorityInvariantAfterEnqueue,
+                diagnosticArtifactPath: diagnostic?.artifactPath || ''
+            })
+            const abortCleanup = await restorePreferenceAndResumePause()
+            return finishPhase({
+                kind: batchKind,
+                search: discovery,
+                lowConcurrencyPreference,
+                beforeQueue,
+                beforeSelected,
+                beforeAuthority,
+                pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+                selection,
+                selectedTargets,
+                existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
+                queueClicks,
+                incrementalEnqueue,
+                abortCleanup,
+                invariantFailureDiagnostic: diagnostic?.snapshot || null,
+                invariantFailureDiagnosticPath: diagnostic?.artifactPath || '',
+                aborted: true,
+                abortReason: 'tab-open-without-authority-evidence'
+            })
+        }
+        const missing = selectedTargets.filter(href => {
+            const latest = (queuedSoFar.summary.selected || [])
+                .find(item => item.targetProfileHref === href)
+            return !latest || latest.rowCount !== 1 || latest.viewRowCount !== 1
+        })
+        if(missing.length) {
+            const diagnostic = await writePhase10Artifact('selected-row-did-not-materialize-after-click', {missing})
+            const abortCleanup = await restorePreferenceAndResumePause()
+            return finishPhase({
+                kind: batchKind,
+                search: discovery,
+                lowConcurrencyPreference,
+                beforeQueue,
+                beforeSelected,
+                beforeAuthority,
+                pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+                selection,
+                selectedTargets,
+                existingQueueTargets,
+                searchTabCleanupsDuringSelection,
+                searchTabCleanupAfterSelection,
+                queueClicks,
+                incrementalEnqueue,
+                abortCleanup,
+                materializationFailureDiagnostic: diagnostic?.snapshot || null,
+                materializationFailureDiagnosticPath: diagnostic?.artifactPath || '',
+                aborted: true,
+                abortReason: 'selected-row-did-not-materialize-after-click'
+            })
+        }
+    }
+    else for(const href of selectedTargets) {
         phaseState.currentStep = `enqueue-${queueClicks.length + 1}`
         tracePhase(options, `${phaseLabel} queue click`, {href})
         const click = mediumBatch
