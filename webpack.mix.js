@@ -1,4 +1,12 @@
+const fs = require('fs')
 const mix = require('laravel-mix')
+const path = require('path')
+
+const sharedJsBuildDir = path.resolve(__dirname, 'tmp/mix-shared/js')
+const browserJsBuildDirs = [
+    path.resolve(__dirname, 'chrome/js'),
+    path.resolve(__dirname, 'firefox/js')
+]
 
 mix.options({
     terser: {
@@ -12,17 +20,20 @@ mix.options({
 })
 .setPublicPath('./')
 
-.js('./shared/js/content.js', 'chrome/js')
-.js('./shared/js/content.js', 'firefox/js')
+.js('./shared/js/content.js', 'tmp/mix-shared/js')
 
-.js('./shared/js/popup.js', 'chrome/js')
-.js('./shared/js/popup.js', 'firefox/js')
+.js('./shared/js/popup.js', 'tmp/mix-shared/js')
 
-.js('./shared/js/coordinator.js', 'chrome/js')
-.js('./shared/js/coordinator.js', 'firefox/js')
+.js('./shared/js/coordinator.js', 'tmp/mix-shared/js')
 
-.js('./shared/js/sw.js', 'chrome/js')
-.js('./shared/js/sw.js', 'firefox/js')
+.js('./shared/js/sw.js', 'tmp/mix-shared/js')
+
+.then(() => {
+    for(const browserJsBuildDir of browserJsBuildDirs) {
+        fs.rmSync(browserJsBuildDir, {recursive: true, force: true})
+        fs.cpSync(sharedJsBuildDir, browserJsBuildDir, {recursive: true})
+    }
+})
 
 .copy('./shared/css', 'chrome/css')
 .copy('./shared/css', 'firefox/css')

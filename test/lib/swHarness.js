@@ -443,8 +443,8 @@ function loadServiceWorkerHarness(options = {}) {
             )
     }
     source = source.replace(
-        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise',
-        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    coordinatorExecutorStartPromise = coordinatorExecutorStartPromise'
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    clearStaleCoordinatorExecutorStartPromise',
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    clearStaleCoordinatorExecutorStartPromise'
     )
     if(options.suppressBackgroundWorkAfterDeactivate === true) {
         source = source.replace(
@@ -639,8 +639,8 @@ module.exports.__test = {
             coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.current().stored?.mbCoordinatorQueueWal || null)),
             spaceFeedStorageUpdateDepth,
             abandonedSpaceFeedStorageUpdates: abandonedSpaceFeedStorageUpdates.size,
-            queuedTabFillPromise: !!queuedTabFillPromise,
-            queuedTabFillPromiseAgeMs: queuedTabFillPromise ? getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) : 0,
+            queuedTabFillPromise: hasVisibleQueuedTabFillPromise(),
+            queuedTabFillPromiseAgeMs: hasVisibleQueuedTabFillPromise() ? getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) : 0,
             coordinatorReconcilePromise: !!coordinatorReconcilePromise,
             coordinatorReconcilePromiseAgeMs: coordinatorReconcilePromise ? getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) : 0,
             activeQueuedTabs: Array.from(activeQueuedTabs),

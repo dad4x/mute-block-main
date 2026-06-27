@@ -49,6 +49,14 @@ const PROFILE_SEARCH_PROFILES_PER_BATCH = 3
 const PROFILE_SEARCH_COLLECT_LIMIT = 100
 const PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES = 120
 const PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000
+const PROFILE_SEARCH_MATCH_IGNORED_TOKENS = new Set([
+    'a',
+    'an',
+    'and',
+    'for',
+    'of',
+    'the'
+])
 const CONTENT_SCRIPT_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS = 2500
 const QUEUED_TERMINAL_PROGRESS_MESSAGE_TIMEOUT_MS = 5000
@@ -9561,6 +9569,49 @@ function getProfileSearchQueryLabel() {
     return query ? `Search: ${query}` : 'Profile Search'
 }
 
+function normalizeProfileSearchMatchTokens(value = '') {
+    return `${value || ''}`
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .map(token => token.trim())
+        .filter(token =>
+            token.length > 1 &&
+            !/^\d+$/.test(token) &&
+            !PROFILE_SEARCH_MATCH_IGNORED_TOKENS.has(token))
+}
+
+function getProfileSearchQueryTokens() {
+    const query = `${new URLSearchParams(location.search).get('q') || ''}`.trim()
+    return normalizeProfileSearchMatchTokens(query)
+}
+
+function getProfileSearchHrefSlugTokens(href = '') {
+    try {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref) return []
+        const slug = new URL(normalizedHref).pathname.split('/').filter(Boolean).pop() || ''
+        return normalizeProfileSearchMatchTokens(decodeURIComponent(slug))
+    }
+    catch {
+        return []
+    }
+}
+
+function isProfileSearchHrefMatchForCurrentQuery(href = '') {
+    const queryTokens = getProfileSearchQueryTokens()
+    if(!queryTokens.length) return false
+
+    const hrefTokens = new Set(getProfileSearchHrefSlugTokens(href))
+    if(!hrefTokens.size) return false
+    return queryTokens.every(token => hrefTokens.has(token))
+}
+
+function isProfileSearchRowMatchForCurrentQuery(row = {}) {
+    return isProfileSearchHrefMatchForCurrentQuery(row?.href || '')
+}
+
 function getProfileSearchCollectionKey() {
     return `${location.origin}${location.pathname}?${new URLSearchParams(location.search).toString()}`
 }
@@ -9619,6 +9670,7 @@ function getProfileSearchStagedHrefs() {
         if(!isProfileSearchProfileNukeable(normalizedHref, {
             ignoreStaleCurrentProfileSearchPending: true
         })) continue
+        if(!isProfileSearchHrefMatchForCurrentQuery(normalizedHref)) continue
 
         seen.add(normalizedHref)
         next.push(normalizedHref)
@@ -9640,6 +9692,7 @@ function stageProfileSearchHrefs(hrefs = []) {
         if(!isProfileSearchProfileNukeable(normalizedHref, {
             ignoreStaleCurrentProfileSearchPending: true
         })) continue
+        if(!isProfileSearchHrefMatchForCurrentQuery(normalizedHref)) continue
 
         profileSearchStagedHrefSet.add(normalizedHref)
         profileSearchStagedHrefs.push(normalizedHref)
@@ -9801,10 +9854,13 @@ function isProfileSearchProfileNukeable(href, options = {}) {
 }
 
 function getProfileSearchQueueableRows(rows = getProfileSearchRows(), options = {}) {
-    return rows.filter(row => isProfileSearchProfileNukeable(row.href, {
-        ignoreStaleCurrentProfileSearchPending: true,
-        ...options
-    }))
+    return rows.filter(row => {
+        if(!isProfileSearchRowMatchForCurrentQuery(row)) return false
+        return isProfileSearchProfileNukeable(row.href, {
+            ignoreStaleCurrentProfileSearchPending: true,
+            ...options
+        })
+    })
 }
 
 function getProfileSearchToolbar() {
@@ -9872,6 +9928,10 @@ function syncProfileSearchRowButtons(rows = getProfileSearchRows()) {
         button = ensureCurrentInstanceClickHandler(button, 'profile-search-row', event => {
             const activeButton = event.currentTarget
             const profileHref = activeButton.dataset.mbProfileSearchHref || ''
+            if(!isProfileSearchHrefMatchForCurrentQuery(profileHref)) {
+                syncProfileSearchControls()
+                return
+            }
             if(!isProfileSearchProfileNukeable(profileHref, {allowRetry: true})) {
                 syncProfileSearchControls()
                 return
@@ -9884,7 +9944,12 @@ function syncProfileSearchRowButtons(rows = getProfileSearchRows()) {
         })
 
         const record = getProfileNukeProgressRecord(href)
-        if(isPendingCoordinatorProfileHref(href)) {
+        if(!isProfileSearchRowMatchForCurrentQuery(entry)) {
+            setNukeButtonNotice(button, 'Not Match', 'Not Match')
+            button.disabled = true
+            setMuteBlockHelp(button, `Search result does not match ${getProfileSearchQueryLabel()}`)
+        }
+        else if(isPendingCoordinatorProfileHref(href)) {
             setNukeButtonWorking(button, 'Nuking...')
             button.disabled = true
         }
@@ -9991,6 +10056,7 @@ function syncProfileSearchControls() {
 
 async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
     const profileHrefs = getNormalizedProfileHrefList(hrefs)
+        .filter(href => isProfileSearchHrefMatchForCurrentQuery(href))
         .filter(href => isProfileSearchProfileNukeable(href, {
             allowRetry: !!options.allowRetry,
             ignoreStaleCurrentProfileSearchPending: true
