@@ -179,6 +179,7 @@ rg -n "metricStorageSet\(" shared/js/sw.js
 | recoverPendingTabActionFromCoordinatorQueue | Recovers runtime pending action from durable queue. | keep | Low risk: read-only recovery. | Keep as projection read helper. |
 | validateProgressAttempt queue read | Uses durable queue to reject stale attempt progress. | keep | Low risk: read-only validation. | Keep as projection read helper. |
 | clearProfileNukeState | User clears progress, queue, runs, pending/nuked post maps. | keepWALBackedWithDerivedCleanup | Medium risk: user action intentionally deletes authority rows. | Queue deletion is WAL-backed; keep derived cleanup materialization coverage until compatibility maps are deleted. |
+| settleDurableCoordinatorItemFromTerminalProgress | Settles queued service-worker authority from same-attempt terminal progress during terminal-progress settlement. | keepWALBackedSettlement | Medium risk: terminal progress can race ahead of durable authority and must win without reopening the same profile. | Keep WAL-backed operation `terminal-progress-settlement`; do not route through generic repair/import paths. |
 
 ## Guardrails Added In This Slice
 

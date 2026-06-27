@@ -36,7 +36,14 @@ const PHASE8_ONE_ITEM_QUEUE = 'phase8-one-item-queue-authority-smoke'
 const PHASE9_SMALL_BATCH_QUEUE = 'phase9-small-batch-queue-authority-smoke'
 const PHASE10_MEDIUM_BATCH_QUEUE = 'phase10-medium-batch-queue-authority-smoke'
 const ACTION_REASON = 'upgrade-regression-non-work-starting'
+const QUORA_REPORTING_ASSETS_PATH = path.resolve(__dirname, '..', '..', '..', 'tmp', 'quora-reporting-assets.json')
 const SPACE_ASSET_URLS = [
+    'https://trollsgalore.quora.com/',
+    'https://theobvioustrollshootinggallery.quora.com/',
+    'https://spamdetectives.quora.com/',
+    'https://ummno.quora.com/',
+    'https://takingoutthetrash.quora.com/',
+    'https://letsplaywhackatroll.quora.com/',
     'https://theqdefensecrew.quora.com/',
     'https://instantblock.quora.com/'
 ]
@@ -420,6 +427,76 @@ function defaultBaselinePath(profileLabel, phase = PHASE1) {
 function readCurrentVersion() {
     const packagePath = path.resolve(__dirname, '..', '..', '..', 'package.json')
     return JSON.parse(fs.readFileSync(packagePath, 'utf8')).version
+}
+
+function loadQuoraReportingAssetFixture() {
+    if(!fs.existsSync(QUORA_REPORTING_ASSETS_PATH)) {
+        throw new Error(`QuoraReporting asset fixture not found: ${QUORA_REPORTING_ASSETS_PATH}`)
+    }
+    const fixture = JSON.parse(fs.readFileSync(QUORA_REPORTING_ASSETS_PATH, 'utf8'))
+    const sourceCandidateUrls = dedupeStrings(fixture.sourceCandidateUrls || [])
+    const records = []
+    const seen = new Set()
+    for(const record of fixture.records || []) {
+        if(`${record?.kind || ''}` !== 'asset') continue
+        const href = normalizeProfileSearchTargetHref(record.profileUrl || '')
+        if(!href || seen.has(href)) continue
+        seen.add(href)
+        records.push({
+            href,
+            sourceSpaceUrl: normalizeSpaceUrl(record.sourceSpaceUrl || ''),
+            sourceSpaceTitle: `${record.sourceSpaceTitle || ''}`.trim(),
+            snippet: `${record.snippet || ''}`.replace(/\s+/g, ' ').trim(),
+            collectionIndex: Number.parseInt(record.collectionIndex, 10) || records.length + 1
+        })
+    }
+    return {
+        path: QUORA_REPORTING_ASSETS_PATH,
+        generatedAt: fixture.generatedAt || '',
+        sourceCandidateUrls,
+        records,
+        uniqueCandidateCount: records.length
+    }
+}
+
+function selectQuoraReportingAssetTargets(options = {}, existingQueueTargets = [], targetCount = 10) {
+    const fixture = loadQuoraReportingAssetFixture()
+    const excluded = new Set((existingQueueTargets || [])
+        .map(value => normalizeComparableUrl(value || ''))
+        .filter(Boolean))
+    const selected = []
+    for(const record of fixture.records) {
+        const comparable = normalizeComparableUrl(record.href)
+        if(!comparable || excluded.has(comparable)) continue
+        selected.push({
+            href: record.href,
+            text: record.sourceSpaceTitle || record.snippet || 'QuoraReporting asset',
+            sourceSpaceUrl: record.sourceSpaceUrl || '',
+            sourceSpaceTitle: record.sourceSpaceTitle || '',
+            snippet: record.snippet || '',
+            collectionIndex: record.collectionIndex,
+            assetFixture: true
+        })
+        if(selected.length >= targetCount) break
+    }
+    return {
+        fixture: {
+            path: fixture.path,
+            generatedAt: fixture.generatedAt,
+            sourceCandidateUrls: fixture.sourceCandidateUrls,
+            uniqueCandidateCount: fixture.uniqueCandidateCount
+        },
+        selection: {
+            requestedCount: targetCount,
+            selected,
+            enabledCount: selected.length,
+            excludedCount: excluded.size,
+            allButtonCount: fixture.records.length,
+            source: 'quora-reporting-assets'
+        },
+        selectedTargets: selected.map(entry => entry.href),
+        attempts: []
+    }
 }
 
 function validateExtensionInfo(extension, options, expectedVersion, fail, label = 'extension') {
@@ -2371,7 +2448,24 @@ function comparableSmallBatchQueueSmoke(smallBatchQueueSmoke = null) {
             ok: smallBatchQueueSmoke.idleFlightRecorder?.ok === true,
             entryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.entryCount || 0) || 0,
             noisyEntryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.noisyEntryCount || 0) || 0
-        }
+        },
+        timings: (smallBatchQueueSmoke.timings || []).map(entry => ({
+            name: entry.name || '',
+            offsetMs: Number(entry.offsetMs || 0) || 0,
+            sincePreviousMs: Number(entry.sincePreviousMs || 0) || 0,
+            ...(entry.selectedCount !== undefined ? {selectedCount: Number(entry.selectedCount || 0) || 0} : {}),
+            ...(entry.searchAttemptCount !== undefined ? {searchAttemptCount: Number(entry.searchAttemptCount || 0) || 0} : {}),
+            ...(entry.queuedRows !== undefined ? {queuedRows: Number(entry.queuedRows || 0) || 0} : {}),
+            ...(entry.activeRows !== undefined ? {activeRows: Number(entry.activeRows || 0) || 0} : {}),
+            ...(entry.terminalRows !== undefined ? {terminalRows: Number(entry.terminalRows || 0) || 0} : {}),
+            ...(entry.idleMs !== undefined ? {idleMs: Number(entry.idleMs || 0) || 0} : {}),
+            ...(entry.entryCount !== undefined ? {entryCount: Number(entry.entryCount || 0) || 0} : {}),
+            ...(entry.noisyEntryCount !== undefined ? {noisyEntryCount: Number(entry.noisyEntryCount || 0) || 0} : {}),
+            ...(entry.ok !== undefined ? {ok: entry.ok === true} : {}),
+            ...(entry.enqueued !== undefined ? {enqueued: entry.enqueued === true} : {}),
+            ...(entry.timedOut !== undefined ? {timedOut: entry.timedOut === true} : {}),
+            ...(entry.stalled !== undefined ? {stalled: entry.stalled === true} : {})
+        }))
     }
 }
 
@@ -3765,6 +3859,85 @@ async function enqueueProfileSearchTargetsViaRuntime(context, options, targetPro
     }
 }
 
+async function enqueueQuoraReportingAssetTargetsViaRuntime(context, options, targetProfileHrefs = [], concurrency = 1, assetSelection = {}) {
+    const hrefs = Array.from(new Set((Array.isArray(targetProfileHrefs) ? targetProfileHrefs : [targetProfileHrefs])
+        .map(href => normalizeProfileSearchTargetHref(href, 'https://www.quora.com/'))
+        .filter(Boolean)))
+    if(!hrefs.length) {
+        return {
+            enqueued: false,
+            reason: 'invalid-target-profile-hrefs',
+            hrefs: Array.isArray(targetProfileHrefs) ? targetProfileHrefs : [targetProfileHrefs]
+        }
+    }
+
+    const runId = `space-asset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const source = {
+        type: 'space-asset',
+        pageUrl: (assetSelection.fixture?.sourceCandidateUrls || [])[0] || '',
+        sourceLabel: 'QuoraReporting assets',
+        assetFixturePath: assetSelection.fixture?.path || QUORA_REPORTING_ASSETS_PATH,
+        generatedAt: assetSelection.fixture?.generatedAt || ''
+    }
+    const message = {
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: runId,
+            sourceType: 'space-asset',
+            sourcePageUrl: source.pageUrl
+        },
+        source,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent: Math.max(1, Number.parseInt(concurrency, 10) || 1),
+            noForegroundFallback: true,
+            maxRetries: 2
+        },
+        items: hrefs.map(href => ({
+            runId,
+            dedupeKey: href,
+            targetProfileHref: href,
+            requestedUrl: href,
+            source
+        }))
+    }
+    const attempts = []
+    let result = null
+    let queued = 0
+    let merged = 0
+    for(let attempt = 1; attempt <= 3; attempt += 1) {
+        result = await sendRuntimeMessage(context, message, 30000)
+        queued = Number.parseInt(result.response?.queued || 0, 10) || 0
+        merged = Number.parseInt(result.response?.merged || 0, 10) || 0
+        attempts.push({
+            attempt,
+            timedOut: result.timedOut === true,
+            lastError: result.lastError || '',
+            storageTimedOut: result.response?.storageTimedOut === true,
+            queued,
+            merged,
+            responseSummary: summarizeMessageResult(result)
+        })
+        if(queued + merged >= hrefs.length) break
+        if(result.response?.storageTimedOut !== true) break
+        await sleep(1000 * attempt)
+    }
+    return {
+        enqueued: queued + merged >= hrefs.length,
+        hrefs,
+        runId,
+        request: message,
+        timedOut: result.timedOut === true,
+        lastError: result.lastError || '',
+        response: result.response || null,
+        queued,
+        merged,
+        acceptedCount: queued + merged,
+        attempts,
+        responseSummary: summarizeMessageResult(result)
+    }
+}
+
 async function enqueueProfileSearchTargetViaRuntime(context, options, targetProfileHref = '', concurrency = 1) {
     const result = await enqueueProfileSearchTargetsViaRuntime(context, options, [targetProfileHref], concurrency)
     return {
@@ -4450,7 +4623,22 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         currentStep: 'initializing',
         selectedTargets: [],
         queueClicks: [],
-        incrementalEnqueue: []
+        incrementalEnqueue: [],
+        timings: []
+    }
+    const phaseStartedAt = Date.now()
+    let previousTimingAt = phaseStartedAt
+    const markTiming = (name, extra = {}) => {
+        const now = Date.now()
+        const entry = {
+            name,
+            offsetMs: now - phaseStartedAt,
+            sincePreviousMs: now - previousTimingAt,
+            ...extra
+        }
+        previousTimingAt = now
+        phaseState.timings.push(entry)
+        return entry
     }
     let phase10WatchdogTimer = null
     let phase10WatchdogDeadlineAt = 0
@@ -4525,6 +4713,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     }
 
     phaseState.currentStep = 'starting'
+    markTiming('starting')
     tracePhase(options, `${phaseLabel} starting`)
     const preferenceBefore = await readStorage(context)
     const previousProfilesPerBatch = preferenceBefore?.data?.profilesPerBatch
@@ -4538,6 +4727,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     if(lowConcurrencyPreference.set?.ok !== true) {
         fail(`${phaseLabel} failed to set low-concurrency profile-search preference`, lowConcurrencyPreference.set)
     }
+    markTiming('preference-set')
     const restorePreferenceAndResumePause = async (resumePause = true) => {
         lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
         const resumeAfterAbort = resumePause
@@ -4549,18 +4739,46 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         }
     }
 
-    phaseState.currentStep = 'opening-search-target'
+    phaseState.currentStep = mediumBatch ? 'loading-asset-targets' : 'opening-search-target'
     let pauseBeforeQueue = null
     if(mediumBatch) {
         pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
     }
-    let searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, `${phaseLabel} profile search batch queue`)
-    tracePhase(options, `${phaseLabel} search target ready`, {url: searchTarget.url || ''})
-    await reloadPageTarget(searchTarget)
-    let discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, false, {
-        allowProgressRows: true,
-        allowQueueRows: true
-    })
+    const assetFixture = mediumBatch ? loadQuoraReportingAssetFixture() : null
+    const classifiedAssets = mediumBatch
+        ? await classifySpacesForDiscovery(context, dedupeStrings([
+            ...options.spaceAssetUrls,
+            ...(assetFixture?.sourceCandidateUrls || [])
+        ]), [])
+        : null
+    let searchTarget = null
+    let discovery = mediumBatch
+        ? {
+            target: null,
+            page: {
+                pageType: 'space-asset-fixture',
+                url: assetFixture?.path || QUORA_REPORTING_ASSETS_PATH,
+                discoveryCandidateCount: assetFixture?.uniqueCandidateCount || 0
+            },
+            coordinatorState: null
+        }
+        : null
+    if(!mediumBatch) {
+        searchTarget = await findOrOpenPage(config, options.searchUrl, warnings, `${phaseLabel} profile search batch queue`)
+        tracePhase(options, `${phaseLabel} search target ready`, {url: searchTarget.url || ''})
+        await reloadPageTarget(searchTarget)
+        discovery = await inspectDiscoveryWithState(searchTarget, options, 'profile-search', fail, false, {
+            allowProgressRows: true,
+            allowQueueRows: true
+        })
+    }
+    else {
+        tracePhase(options, `${phaseLabel} asset fixture ready`, {
+            path: assetFixture?.path || '',
+            candidates: assetFixture?.uniqueCandidateCount || 0,
+            spacesMarked: classifiedAssets?.updated || 0
+        })
+    }
     const beforeStorage = await readStorage(context)
     const beforeAuthority = summarizeAuthorityState(beforeStorage)
     const beforeQueue = summarizeQueueAuthority(beforeStorage, {
@@ -4568,6 +4786,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         allowViewFallback: false
     })
     const beforeSelected = summarizeSelectedQueueAuthority(beforeQueue, [])
+    markTiming(mediumBatch ? 'asset-fixture-ready-and-before-state-read' : 'search-ready-and-before-state-read')
 
     if(beforeQueue.activeRows > 0 || beforeQueue.queuedRows > 0 ||
             (Number.parseInt(beforeAuthority.queuedActionSurfaceRecords, 10) || 0) > 0) {
@@ -4609,16 +4828,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         pauseBeforeQueue = await sendRuntimeMessage(context, {action: 'pause-coordinator-nukes'}, 10000)
     }
     const targetSelection = mediumBatch
-        ? await selectProfileSearchTargetsWithFallback(
-            config,
+        ? selectQuoraReportingAssetTargets(
             options,
-            warnings,
-            fail,
-            phaseLabel,
             existingQueueTargets,
-            targetCount,
-            searchTarget,
-            discovery
+            targetCount
         )
         : {
             target: searchTarget,
@@ -4634,7 +4847,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         requested: targetCount,
         selected: (selection.selected || []).map(entry => entry.href),
         excludedExistingQueueTargets: existingQueueTargets.length,
-        searchUrl: discovery?.page?.url || searchTarget?.url || '',
+        sourceUrl: discovery?.page?.url || searchTarget?.url || '',
         searchAttemptCount: targetSelection.attempts?.length || 0
     })
     const selectedTargets = (selection.selected || [])
@@ -4642,15 +4855,20 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         .filter(Boolean)
         .slice(0, targetCount)
     phaseState.selectedTargets = selectedTargets
+    markTiming('targets-selected', {
+        selectedCount: selectedTargets.length,
+        searchAttemptCount: targetSelection.attempts?.length || 0
+    })
     const searchTabCleanupAfterSelection = mediumBatch
         ? await closeProfileSearchTargets(config, 'phase10-after-target-selection')
         : null
     if(selectedTargets.length !== targetCount) {
         const diagnostic = mediumBatch
-            ? await writePhase10Artifact('not-enough-enabled-profile-search-row-buttons', {
+            ? await writePhase10Artifact('not-enough-quora-reporting-asset-targets', {
                 requested: targetCount,
                 selectedTargets,
                 selection,
+                assetFixture: targetSelection.fixture || null,
                 searchAttempts: (targetSelection.attempts || []).map(attempt => ({
                     url: attempt.url || attempt.discovery?.page?.url || '',
                     selectedCount: attempt.selectedTargets?.length || 0,
@@ -4663,10 +4881,13 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 }))
             })
             : null
-        fail(`${phaseLabel} did not find enough enabled profile-search row buttons`, {
+        fail(mediumBatch
+            ? `${phaseLabel} did not find enough QuoraReporting asset targets`
+            : `${phaseLabel} did not find enough enabled profile-search row buttons`, {
             requested: targetCount,
             selectedTargets,
             selection,
+            assetFixture: targetSelection.fixture || null,
             searchAttempts: targetSelection.attempts || [],
             diagnosticArtifactPath: diagnostic?.artifactPath || ''
         })
@@ -4681,6 +4902,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
             selection,
             selectedTargets,
+            assetFixture: targetSelection.fixture || null,
             searchAttempts: targetSelection.attempts || [],
             existingQueueTargets,
             searchTabCleanupsDuringSelection,
@@ -4689,7 +4911,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             discoveryFailureDiagnostic: diagnostic?.snapshot || null,
             discoveryFailureDiagnosticPath: diagnostic?.artifactPath || '',
             aborted: true,
-            abortReason: 'not-enough-enabled-profile-search-row-buttons'
+            abortReason: mediumBatch ? 'not-enough-quora-reporting-asset-targets' : 'not-enough-enabled-profile-search-row-buttons'
         })
     }
 
@@ -4700,11 +4922,12 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     if(mediumBatch) {
         phaseState.currentStep = 'enqueue-batch'
         tracePhase(options, `${phaseLabel} batch enqueue`, {count: selectedTargets.length})
-        const click = await enqueueProfileSearchTargetsViaRuntime(context, options, selectedTargets, concurrency)
+        const click = await enqueueQuoraReportingAssetTargetsViaRuntime(context, options, selectedTargets, concurrency, targetSelection)
         queueClicks.push(click)
+        markTiming('batch-enqueue-rpc-returned', {enqueued: click.enqueued === true})
         if(click.enqueued !== true) {
             const diagnostic = await writePhase10Artifact('enqueue-rpc-not-accepted', {hrefs: selectedTargets, click})
-            fail(`${phaseLabel} enqueue RPC did not accept selected profile-search batch`, {
+            fail(`${phaseLabel} enqueue RPC did not accept selected QuoraReporting asset batch`, {
                 hrefs: selectedTargets,
                 click,
                 diagnosticArtifactPath: diagnostic?.artifactPath || ''
@@ -4720,6 +4943,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
                 selection,
                 selectedTargets,
+                assetFixture: targetSelection.fixture || null,
                 existingQueueTargets,
                 searchTabCleanupsDuringSelection,
                 searchTabCleanupAfterSelection,
@@ -4746,6 +4970,11 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         const visibleTabsAfterEnqueue = await readVisibleTargetTabs(config, selectedTargets)
         const tabAuthorityInvariantAfterEnqueue = buildTabAuthorityInvariant(visibleTabsAfterEnqueue, queuedSoFar.fullSummary, selectedTargets)
         const flightRecorderAfterEnqueue = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+        markTiming('batch-enqueue-materialized', {
+            queuedRows: Number(queuedSoFar.summary?.queuedRows || 0) || 0,
+            activeRows: Number(queuedSoFar.summary?.activeRows || 0) || 0,
+            terminalRows: Number(queuedSoFar.summary?.terminalRows || 0) || 0
+        })
         incrementalEnqueue.push({
             clickedTarget: '',
             clickedTargets: selectedTargets,
@@ -4974,6 +5203,11 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     )
     assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, `${phaseLabel} after enqueue`)
     assertWalPresent(afterEnqueue.authority, fail, `${phaseLabel} after enqueue WAL`)
+    markTiming('after-enqueue-observed', {
+        queuedRows: Number(afterEnqueue.summary?.queuedRows || 0) || 0,
+        activeRows: Number(afterEnqueue.summary?.activeRows || 0) || 0,
+        terminalRows: Number(afterEnqueue.summary?.terminalRows || 0) || 0
+    })
 
     phaseState.currentStep = 'restart-before-start'
     tracePhase(options, `${phaseLabel} stopping service worker before start`)
@@ -4990,9 +5224,15 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     )
     assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, `${phaseLabel} after pre-start service-worker restart`)
     assertWalPresent(afterRestartBeforeStart.authority, fail, `${phaseLabel} after pre-start restart WAL`)
+    markTiming('after-restart-before-start-observed', {
+        queuedRows: Number(afterRestartBeforeStart.summary?.queuedRows || 0) || 0,
+        activeRows: Number(afterRestartBeforeStart.summary?.activeRows || 0) || 0,
+        terminalRows: Number(afterRestartBeforeStart.summary?.terminalRows || 0) || 0
+    })
 
     phaseState.currentStep = 'start'
     const resumePaused = await sendRuntimeMessage(context, {action: 'resume-paused-coordinator-nukes'}, 10000)
+    markTiming('resume-paused-returned', {ok: !resumePaused.timedOut && !resumePaused.lastError})
     tracePhase(options, `${phaseLabel} starting queue`)
     const start = await sendRuntimeMessage(context, {
         action: 'resume-coordinator-queue',
@@ -5004,6 +5244,11 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     if(start.timedOut || start.lastError) {
         fail(`${phaseLabel} user-equivalent Start failed`, start)
     }
+    markTiming('start-returned', {
+        ok: !start.timedOut && !start.lastError,
+        active: Number(start.response?.currentWork?.active || start.response?.durable?.durableActiveRows || 0) || 0,
+        queued: Number(start.response?.currentWork?.ready || start.response?.durable?.durableQueuedRows || 0) || 0
+    })
 
     phaseState.currentStep = 'waiting-for-terminal'
     tracePhase(options, `${phaseLabel} waiting for terminal rows`)
@@ -5012,9 +5257,17 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         idleStallMs: mediumBatch ? Math.max(15000, Math.min(idleMs || 30000, 60000)) : 0,
         allowViewFallback: !mediumBatch
     })
+    markTiming('terminal-wait-returned', {
+        timedOut: terminal.timedOut === true,
+        stalled: terminal.stalled === true,
+        queuedRows: Number(terminal.summary?.queuedRows || 0) || 0,
+        activeRows: Number(terminal.summary?.activeRows || 0) || 0,
+        terminalRows: Number(terminal.summary?.terminalRows || 0) || 0
+    })
     const terminalStorage = terminal.storage || await readStorage(context)
     const terminalSelectedProgressRecords = getSelectedProgressRecords(terminalStorage, selectedTargets, terminal.summary)
     const preRestartFlightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+    markTiming('terminal-diagnostics-read')
     if(terminal.timedOut) {
         tracePhase(options, `${phaseLabel} terminal wait failed before restart`, {
             stalled: terminal.stalled === true,
@@ -5044,6 +5297,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
             selection,
             selectedTargets,
+            assetFixture: targetSelection.fixture || null,
+            classifiedAssets,
             existingQueueTargets,
             searchTabCleanupsDuringSelection,
             searchTabCleanupAfterSelection,
@@ -5082,6 +5337,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 timedOut: terminal.timedOut === true
             },
             terminalSelectedProgressRecords,
+            timings: phaseState.timings,
             preRestartFlightRecorder,
             terminalFailureDiagnostic: diagnostic?.snapshot || null,
             terminalFailureDiagnosticPath: diagnostic?.artifactPath || '',
@@ -5118,6 +5374,11 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         allowViewFallback: !mediumBatch
     })
     tracePhase(options, `${phaseLabel} terminal rows preserved after restart`)
+    markTiming('after-restart-after-terminal-observed', {
+        queuedRows: Number(afterRestartAfterTerminal.summary?.queuedRows || 0) || 0,
+        activeRows: Number(afterRestartAfterTerminal.summary?.activeRows || 0) || 0,
+        terminalRows: Number(afterRestartAfterTerminal.summary?.terminalRows || 0) || 0
+    })
     assertSelectedQueueRowsConsistent(afterRestartAfterTerminal.summary, fail, `${phaseLabel} after terminal service-worker restart`, {
         requireCompactView: false
     })
@@ -5133,6 +5394,12 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         phaseState.currentStep = 'idle-recorder-check'
         tracePhase(options, `${phaseLabel} waiting for idle flight recorder delta`, {idleMs})
         idleFlightRecorder = await readIdleFlightRecorderDelta(context, idleMs)
+        markTiming('idle-flight-recorder-read', {
+            idleMs,
+            ok: idleFlightRecorder.ok === true,
+            entryCount: Number(idleFlightRecorder.entryCount || 0) || 0,
+            noisyEntryCount: Number(idleFlightRecorder.noisyEntryCount || 0) || 0
+        })
         if(idleFlightRecorder.ok !== true || idleFlightRecorder.noisyEntryCount > 0) {
             fail(`${phaseLabel} observed flight-recorder activity while idle after completion`, {
                 ok: idleFlightRecorder.ok,
@@ -5149,6 +5416,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     if(lowConcurrencyPreference.restored?.ok !== true) {
         fail(`${phaseLabel} failed to restore profile-search batch preference`, lowConcurrencyPreference.restored)
     }
+    markTiming('preference-restored')
 
     return finishPhase({
         kind: batchKind,
@@ -5160,6 +5428,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
         selection,
         selectedTargets,
+        assetFixture: targetSelection.fixture || null,
+        classifiedAssets,
         existingQueueTargets,
         searchTabCleanupsDuringSelection,
         searchTabCleanupAfterSelection,
@@ -5187,6 +5457,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             authority: terminal.authority
         },
         terminalSelectedProgressRecords,
+        timings: phaseState.timings,
         preRestartFlightRecorder,
         restartAfterTerminal,
         wakeAfterTerminal,

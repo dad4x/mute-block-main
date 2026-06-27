@@ -1056,6 +1056,7 @@ function isActiveQueueItem(item = {}) {
 
 function isActualBlockSuccess(item = {}) {
     if(`${item?.status || ''}` !== 'succeeded') return false
+    if(`${item?.outcome || ''}` === 'already-blocked') return false
     if(`${item?.outcome || ''}` === 'blocked') return true
 
     const milestones = item?.milestones || {}

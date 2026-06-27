@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.6.1037",
+  "version": "1.6.1063",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -20,7 +20,8 @@
     "test:wal-fuzz": "node test/walSnapshotStoreFuzz.test.js",
     "test:wal-fuzz:long": "WAL_FUZZ_PROFILE=long WAL_FUZZ_SEEDS=200 WAL_FUZZ_ROUNDS=300 WAL_FUZZ_ACTORS_MAX=8 node test/walSnapshotStoreFuzz.test.js",
     "test:sw-fuzz": "node test/swScenarioFuzz.test.js",
-    "lint:correctness": "node tools/lint-correctness.js"
+    "lint:correctness": "node tools/lint-correctness.js",
+    "lint:queue-boundary": "node tools/lint-sw-queue-boundary.js"
   },
   "keywords": [],
   "author": "",
