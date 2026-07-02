@@ -18730,6 +18730,7 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
                 reason: 'queued-stale-runtime-pruned-before-authority-fill',
                 item: currentItem || item,
                 itemKey,
+                reprimeQueuedAuthority: true,
                 pruned
             }
         }
@@ -20376,7 +20377,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             reason: 'executor-cases-unresolved'
         })
     }
-    if(resolvedStaleRuntime > 0) {
+    if(resolvedStaleRuntime > 0 && pendingItems.length <= 0) {
         const resolutionReason = consumedExecutorCases.some(item =>
             item?.reason === 'queued-stale-runtime-action-drained-before-authority')
             ? 'resolved-stale-runtime-drained-before-authority'
@@ -36483,6 +36484,9 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
         .then(result => {
             activeTransitionSettled = true
             if(result === true) {
+                if(releaseQueuedActivationGuardForTab(tab.id, action)) {
+                    incrementQueueWakeupMetric('pump.changed.releasedActivationGuardAfterDurableActive')
+                }
                 markQueuedTabDurablyActive(tab.id, 'active-transition-deferred-settled')
                 scheduleCoordinatorQueueResume(1000, 'active-transition-deferred-settled', {
                     allowBeforeQuora: true

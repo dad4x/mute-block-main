@@ -4474,13 +4474,18 @@ async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [],
         preferRecovered: true,
         allowViewFallback: options.allowViewFallback !== false
     }
+    const allowTerminalRows = options.allowTerminalRows === true
     let storage = await readStorage(context)
     let fullSummary = summarizeQueueAuthority(storage, summaryOptions)
     let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     const ready = () =>
         selectedSummary.selected.length === targetProfileHrefs.length &&
-        selectedSummary.selected.every(item => item.rowCount === 1 && item.viewRowCount === 1 && item.terminalRows === 0) &&
-        selectedSummary.queuedRows + selectedSummary.activeRows === targetProfileHrefs.length &&
+        selectedSummary.selected.every(item =>
+            item.rowCount === 1 &&
+            item.viewRowCount === 1 &&
+            (allowTerminalRows || item.terminalRows === 0)) &&
+        selectedSummary.queuedRows + selectedSummary.activeRows +
+            (allowTerminalRows ? selectedSummary.terminalRows : 0) === targetProfileHrefs.length &&
         selectedSummary.unrelatedActiveQueuedCount === 0
 
     while(Date.now() < deadline && !ready()) {
@@ -4490,7 +4495,7 @@ async function waitForSelectedQueuedRows(context, fail, targetProfileHrefs = [],
         selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
     }
     if(!ready()) {
-        fail(`${label} did not observe all selected targets queued before timeout`, {
+        fail(`${label} did not observe all selected targets ${allowTerminalRows ? 'queued or terminal' : 'queued'} before timeout`, {
             selectedSummary,
             fullSummary
         })
@@ -5167,7 +5172,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             selectedTargets,
             `${phaseLabel} after batch enqueue`,
             120000,
-            {allowViewFallback: false}
+            {
+                allowViewFallback: false,
+                allowTerminalRows: options.phase10ReuseProcessedAssets === true
+            }
         )
         const runtimeStateAfterEnqueue = await readQueueRuntimeState(context, selectedTargets)
         const visibleTabsAfterEnqueue = await readVisibleTargetTabs(config, selectedTargets)
@@ -5307,7 +5315,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             selectedTargets.slice(0, queueClicks.length),
             `${phaseLabel} after queue click ${queueClicks.length}`,
             15000,
-            {allowViewFallback: !mediumBatch}
+            {
+                allowViewFallback: !mediumBatch,
+                allowTerminalRows: mediumBatch && options.phase10ReuseProcessedAssets === true
+            }
         )
         const runtimeStateAfterEnqueue = mediumBatch
             ? await readQueueRuntimeState(context, selectedTargets.slice(0, queueClicks.length))
@@ -5404,7 +5415,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         selectedTargets,
         `${phaseLabel} after enqueue`,
         30000,
-        {allowViewFallback: !mediumBatch}
+        {
+            allowViewFallback: !mediumBatch,
+            allowTerminalRows: mediumBatch && options.phase10ReuseProcessedAssets === true
+        }
     )
     assertSelectedQueueRowsConsistent(afterEnqueue.summary, fail, `${phaseLabel} after enqueue`)
     assertWalPresent(afterEnqueue.authority, fail, `${phaseLabel} after enqueue WAL`)
@@ -5425,7 +5439,10 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         selectedTargets,
         `${phaseLabel} after pre-start service-worker restart`,
         30000,
-        {allowViewFallback: !mediumBatch}
+        {
+            allowViewFallback: !mediumBatch,
+            allowTerminalRows: mediumBatch && options.phase10ReuseProcessedAssets === true
+        }
     )
     assertSelectedQueueRowsConsistent(afterRestartBeforeStart.summary, fail, `${phaseLabel} after pre-start service-worker restart`)
     assertWalPresent(afterRestartBeforeStart.authority, fail, `${phaseLabel} after pre-start restart WAL`)
