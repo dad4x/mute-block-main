@@ -521,6 +521,14 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
 
     const inactiveCheckpoint = getInactiveCheckpointId(activeCheckpoint)
     const inactiveStored = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, inactiveCheckpoint)] || null)
+    const activeSnapshotSeq = Math.max(
+        normalizeSeq(meta?.generations?.[activeCheckpoint]?.snapshotSeq),
+        normalizeSeq(checkpoint.snapshotSeq)
+    )
+    const inactiveSnapshotSeq = Math.max(
+        normalizeSeq(meta?.generations?.[inactiveCheckpoint]?.snapshotSeq),
+        normalizeSeq(inactiveStored?.snapshotSeq)
+    )
     const store = {
         meta,
         checkpoints: {
@@ -529,11 +537,11 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
         },
         wal: {
             [activeCheckpoint]: makeWalGeneration({
-                snapshotSeq: meta?.generations?.[activeCheckpoint]?.snapshotSeq || checkpoint.snapshotSeq,
+                snapshotSeq: activeSnapshotSeq,
                 segments
             }),
             [inactiveCheckpoint]: makeWalGeneration({
-                snapshotSeq: meta?.generations?.[inactiveCheckpoint]?.snapshotSeq || inactiveStored?.snapshotSeq || 0,
+                snapshotSeq: inactiveSnapshotSeq,
                 segments: []
             })
         }

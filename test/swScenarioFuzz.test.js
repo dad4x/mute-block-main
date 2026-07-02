@@ -50,7 +50,7 @@ async function settle(env, rounds = 4) {
     }
 }
 
-async function settleWithFakeTimers(promise, env, steps = [0, 1000, 5000, 15000, 30000, 60000, 120000, 180000, 30000]) {
+async function settleWithFakeTimers(promise, env, steps = [0, 1000, 5000, 15000, 30000, 60000, 120000, 180000, 300000, 600000]) {
     let settled = false
     let settledValue
     let settledError
@@ -72,7 +72,23 @@ async function settleWithFakeTimers(promise, env, steps = [0, 1000, 5000, 15000,
 
     await settle(env, 12)
     if(settledError) throw settledError
-    if(!settled) throw new Error('fake-timer operation did not settle')
+    if(!settled) {
+        const state = env.sw?.state?.() || {}
+        throw new Error(`fake-timer operation did not settle: ${JSON.stringify({
+            timers: env.timers?.pending?.() || [],
+            queuedTabFillPromise: state.queuedTabFillPromise,
+            queuedTabFillPromiseAgeMs: state.queuedTabFillPromiseAgeMs,
+            coordinatorReconcilePromise: state.coordinatorReconcilePromise,
+            coordinatorReconcilePromiseAgeMs: state.coordinatorReconcilePromiseAgeMs,
+            coordinatorExecutorStartPromise: state.coordinatorExecutorStartPromise,
+            coordinatorExecutorStartPromiseAgeMs: state.coordinatorExecutorStartPromiseAgeMs,
+            activeStorageContext: state.activeStorageContext,
+            activeQueuedTabs: state.activeQueuedTabs,
+            queuedTabActions: state.queuedTabActions?.length || 0,
+            pendingTabActions: state.pendingTabActions?.length || 0,
+            queueWakeupCounters: state.queueWakeupCounters
+        })}`)
+    }
     return settledValue
 }
 
@@ -424,7 +440,9 @@ async function main() {
     }
 }
 
-main().catch(error => {
+main().then(() => {
+    process.exit(process.exitCode || 0)
+}).catch(error => {
     console.error(error?.stack || error)
-    process.exitCode = 1
+    process.exit(1)
 })

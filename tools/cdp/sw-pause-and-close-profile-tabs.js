@@ -34,42 +34,53 @@ runMain(async () => {
         })
 
         const pauseResult = await withTimeout(
-            chrome.storage.local.set({mbCoordinatorPaused: true}),
-            10000,
-            {__timedOut: true, __error: 'storage pause timed out'}
+            new Promise(resolve => {
+                chrome.runtime.sendMessage({action: 'pause-coordinator-nukes'}, response => resolve({
+                    response: response || null,
+                    lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+                }))
+            }),
+            15000,
+            {__timedOut: true, __error: 'pause message timed out'}
         )
-        const tabs = await withTimeout(
-            chrome.tabs.query({url: 'https://www.quora.com/profile/*'}),
-            10000,
-            {__timedOut: true, __error: 'tab query timed out'}
+
+        const tabsResult = await withTimeout(
+            new Promise(resolve => {
+                chrome.tabs.query({url: 'https://www.quora.com/profile/*'}, tabs => resolve({
+                    tabs: Array.isArray(tabs) ? tabs : [],
+                    lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+                }))
+            }),
+            15000,
+            {__timedOut: true, __error: 'profile tab query timed out', tabs: []}
         )
-        const closed = []
-        if(Array.isArray(tabs)) {
-            for(const tab of tabs) {
-                const removed = await withTimeout(
-                    chrome.tabs.remove(tab.id),
-                    5000,
-                    {__timedOut: true, __error: 'tab remove timed out'}
-                )
-                closed.push({
-                    id: tab.id,
-                    title: tab.title || '',
-                    url: tab.url || '',
-                    ok: !(removed?.__timedOut || removed?.__error),
-                    timedOut: removed?.__timedOut === true,
-                    error: removed?.__error || ''
-                })
-            }
-        }
+        const tabIds = Array.isArray(tabsResult?.tabs)
+            ? tabsResult.tabs
+                .map(tab => tab && tab.id)
+                .filter(id => Number.isInteger(id))
+            : []
+        const closeResult = tabIds.length
+            ? await withTimeout(
+                new Promise(resolve => {
+                    chrome.tabs.remove(tabIds, () => resolve({
+                        closed: chrome.runtime.lastError ? 0 : tabIds.length,
+                        lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
+                    }))
+                }),
+                15000,
+                {__timedOut: true, __error: 'profile tab close timed out', closed: 0}
+            )
+            : {closed: 0, lastError: ''}
 
         return {
-            paused: !(pauseResult?.__timedOut || pauseResult?.__error),
+            paused: pauseResult?.response?.paused === true,
             pauseTimedOut: pauseResult?.__timedOut === true,
-            pauseError: pauseResult?.__error || '',
-            tabQueryTimedOut: tabs?.__timedOut === true,
-            tabQueryError: tabs?.__error || '',
-            tabCount: Array.isArray(tabs) ? tabs.length : 0,
-            closed
+            pauseError: pauseResult?.__error || pauseResult?.lastError || '',
+            profileTabsMatched: tabIds.length,
+            profileTabsClosed: closeResult?.closed || 0,
+            closeTimedOut: closeResult?.__timedOut === true,
+            closeError: closeResult?.__error || closeResult?.lastError || tabsResult?.__error || tabsResult?.lastError || '',
+            response: pauseResult?.response || null
         }
     }})()`, 30000)
 

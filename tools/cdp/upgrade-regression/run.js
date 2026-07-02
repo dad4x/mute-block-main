@@ -257,6 +257,8 @@ function parseArgs(argv) {
         phase10Concurrency: 2,
         phase10IdleMs: 20000,
         phase10SearchAttemptLimit: 20,
+        phase10ReuseProcessedAssets: false,
+        phase10SkipPostTerminalChecks: false,
         phase10WatchdogSelfTest: false,
         allowWorkProducing: false,
         includeFlightRecorder: false,
@@ -331,6 +333,8 @@ function parseArgs(argv) {
         else if(arg.startsWith('--phase10-idle-ms=')) options.phase10IdleMs = Number.parseInt(arg.slice('--phase10-idle-ms='.length), 10) || options.phase10IdleMs
         else if(arg === '--phase10-search-attempt-limit') options.phase10SearchAttemptLimit = Number.parseInt(readValue(`${options.phase10SearchAttemptLimit}`), 10) || options.phase10SearchAttemptLimit
         else if(arg.startsWith('--phase10-search-attempt-limit=')) options.phase10SearchAttemptLimit = Number.parseInt(arg.slice('--phase10-search-attempt-limit='.length), 10) || options.phase10SearchAttemptLimit
+        else if(arg === '--phase10-reuse-processed-assets') options.phase10ReuseProcessedAssets = true
+        else if(arg === '--phase10-skip-post-terminal-checks') options.phase10SkipPostTerminalChecks = true
         else if(arg === '--phase10-watchdog-self-test') options.phase10WatchdogSelfTest = true
         else if(arg === '--allow-work-producing') options.allowWorkProducing = true
         else if(arg === '--include-flight-recorder') options.includeFlightRecorder = true
@@ -406,6 +410,8 @@ function printUsage() {
         '  --phase10-concurrency 2',
         '  --phase10-idle-ms 20000',
         '  --phase10-search-attempt-limit 20',
+        '  --phase10-reuse-processed-assets',
+        '  --phase10-skip-post-terminal-checks',
         '  --phase10-watchdog-self-test',
         '  --allow-work-producing',
         '  --write-baseline [path]',
@@ -436,18 +442,36 @@ function loadQuoraReportingAssetFixture() {
     const fixture = JSON.parse(fs.readFileSync(QUORA_REPORTING_ASSETS_PATH, 'utf8'))
     const sourceCandidateUrls = dedupeStrings(fixture.sourceCandidateUrls || [])
     const records = []
+    const rejectedRecords = []
     const seen = new Set()
     for(const record of fixture.records || []) {
         if(`${record?.kind || ''}` !== 'asset') continue
         const href = normalizeProfileSearchTargetHref(record.profileUrl || '')
+        const snippet = `${record.snippet || ''}`.replace(/\s+/g, ' ').trim()
+        const evidenceProfileUrls = dedupeStrings(Array.from(snippet.matchAll(/https?:\/\/[^\s"'<>]+/g))
+            .map(match => normalizeProfileSearchTargetHref(match[0] || ''))
+            .filter(Boolean))
+        const hasTargetUrlEvidence = evidenceProfileUrls.includes(href)
         if(!href || seen.has(href)) continue
+        if(!hasTargetUrlEvidence) {
+            rejectedRecords.push({
+                href,
+                sourceSpaceUrl: normalizeSpaceUrl(record.sourceSpaceUrl || ''),
+                sourceSpaceTitle: `${record.sourceSpaceTitle || ''}`.trim(),
+                snippet,
+                collectionIndex: Number.parseInt(record.collectionIndex, 10) || rejectedRecords.length + 1,
+                reason: 'missing-explicit-target-profile-url-evidence'
+            })
+            continue
+        }
         seen.add(href)
         records.push({
             href,
             sourceSpaceUrl: normalizeSpaceUrl(record.sourceSpaceUrl || ''),
             sourceSpaceTitle: `${record.sourceSpaceTitle || ''}`.trim(),
-            snippet: `${record.snippet || ''}`.replace(/\s+/g, ' ').trim(),
-            collectionIndex: Number.parseInt(record.collectionIndex, 10) || records.length + 1
+            snippet,
+            collectionIndex: Number.parseInt(record.collectionIndex, 10) || records.length + 1,
+            evidenceProfileUrls
         })
     }
     return {
@@ -455,13 +479,16 @@ function loadQuoraReportingAssetFixture() {
         generatedAt: fixture.generatedAt || '',
         sourceCandidateUrls,
         records,
-        uniqueCandidateCount: records.length
+        rejectedRecords,
+        uniqueCandidateCount: records.length,
+        rejectedCandidateCount: rejectedRecords.length
     }
 }
 
 function selectQuoraReportingAssetTargets(options = {}, existingQueueTargets = [], targetCount = 10) {
     const fixture = loadQuoraReportingAssetFixture()
-    const excluded = new Set((existingQueueTargets || [])
+    const allowProcessedAssetReuse = options.phase10ReuseProcessedAssets === true
+    const excluded = new Set((allowProcessedAssetReuse ? [] : (existingQueueTargets || []))
         .map(value => normalizeComparableUrl(value || ''))
         .filter(Boolean))
     const selected = []
@@ -475,6 +502,7 @@ function selectQuoraReportingAssetTargets(options = {}, existingQueueTargets = [
             sourceSpaceTitle: record.sourceSpaceTitle || '',
             snippet: record.snippet || '',
             collectionIndex: record.collectionIndex,
+            evidenceProfileUrls: record.evidenceProfileUrls || [],
             assetFixture: true
         })
         if(selected.length >= targetCount) break
@@ -484,7 +512,9 @@ function selectQuoraReportingAssetTargets(options = {}, existingQueueTargets = [
             path: fixture.path,
             generatedAt: fixture.generatedAt,
             sourceCandidateUrls: fixture.sourceCandidateUrls,
-            uniqueCandidateCount: fixture.uniqueCandidateCount
+            uniqueCandidateCount: fixture.uniqueCandidateCount,
+            rejectedCandidateCount: fixture.rejectedCandidateCount,
+            rejectedRecords: fixture.rejectedRecords.slice(0, 25)
         },
         selection: {
             requestedCount: targetCount,
@@ -492,7 +522,8 @@ function selectQuoraReportingAssetTargets(options = {}, existingQueueTargets = [
             enabledCount: selected.length,
             excludedCount: excluded.size,
             allButtonCount: fixture.records.length,
-            source: 'quora-reporting-assets'
+            source: 'quora-reporting-assets',
+            reuseProcessedAssets: allowProcessedAssetReuse
         },
         selectedTargets: selected.map(entry => entry.href),
         attempts: []
@@ -556,10 +587,15 @@ async function getExtensionInfo(extensionsPage, extensionId) {
 async function ensureExtensionContext(config, warnings) {
     const extensionPrefix = `chrome-extension://${config.extensionId}/`
     const dashboardUrl = `${extensionPrefix}coordinator.html`
+    const workerWindowUrl = `${dashboardUrl}#worker-window`
     let targets = await getTargets(config)
     const candidates = [
         ...targets.filter(item => item.type === 'page' && item.url === dashboardUrl),
-        ...targets.filter(item => item.type === 'page' && (item.url || '').startsWith(extensionPrefix) && item.url !== dashboardUrl)
+        ...targets.filter(item =>
+            item.type === 'page' &&
+            (item.url || '').startsWith(extensionPrefix) &&
+            item.url !== dashboardUrl &&
+            item.url !== workerWindowUrl)
     ]
 
     for(const candidate of candidates) {
@@ -793,6 +829,20 @@ function isBenignIdleFlightRecorderEntry(entry = null) {
             reason === 'dashboard-resume' &&
             entry?.accepted === true &&
             entry?.durable !== true) {
+        return true
+    }
+    if(kind === 'start-resume' &&
+            reason === 'profile-tabs-without-active-authority' &&
+            entry?.accepted === true &&
+            entry?.durable === true &&
+            entry?.changed === true) {
+        return true
+    }
+    if(kind === 'tab-action-release' &&
+            reason === 'queued-tab-slot-release' &&
+            entry?.accepted === false &&
+            entry?.durable === false &&
+            entry?.changed === false) {
         return true
     }
     return false
@@ -1183,6 +1233,64 @@ function getSelectedProgressRecords(storage, targetProfileHrefs = [], selectedSu
             }))
         }
     })
+}
+
+function isTerminalSelectedProgressRecord(entry = null) {
+    const records = [
+        entry?.view?.record,
+        ...(entry?.shards || []).map(shard => shard.record)
+    ].filter(Boolean)
+    return records.some(record => {
+        const status = `${record?.status || record?.state || ''}`.toLowerCase()
+        if(/^(already-blocked|succeeded|success|skipped|failed|canceled|cancelled|terminal)$/.test(status)) return true
+        if(record?.terminalAt || record?.completedAt || record?.blockedAt) return true
+        return record?.blockSucceeded === true || record?.foundBlockedBeforeQueue === true
+    })
+}
+
+function summarizeSelectedTerminalProgressRecords(progressRecords = []) {
+    const selected = progressRecords.map(entry => {
+        const row = {
+            key: entry.targetProfileHref || '',
+            status: 'succeeded',
+            outcome: 'progress-terminal',
+            error: '',
+            targetProfileHref: entry.targetProfileHref || '',
+            requestedUrl: entry.targetProfileHref || '',
+            actionKind: '',
+            executorTabAction: '',
+            runId: '',
+            tabId: null,
+            attempt: 0,
+            createdAt: 0,
+            updatedAt: 0,
+            terminalAt: Date.now()
+        }
+        return {
+            targetProfileHref: entry.targetProfileHref || '',
+            rowCount: 1,
+            rawRowCount: 0,
+            viewRowCount: 0,
+            queuedRows: 0,
+            activeRows: 0,
+            terminalRows: 1,
+            statuses: ['succeeded'],
+            rows: [row]
+        }
+    })
+    return {
+        selectedCount: selected.length,
+        rowCount: selected.length,
+        rawRowCount: 0,
+        viewRowCount: 0,
+        queuedRows: 0,
+        activeRows: 0,
+        terminalRows: selected.length,
+        selected,
+        unrelatedActiveQueuedCount: 0,
+        unrelatedActiveQueued: [],
+        source: 'terminal-progress-records'
+    }
 }
 
 function getAttemptIdFromValue(value = null) {
@@ -3871,6 +3979,22 @@ async function enqueueQuoraReportingAssetTargetsViaRuntime(context, options, tar
         }
     }
 
+    const selectedByHref = new Map((assetSelection.selection?.selected || [])
+        .map(record => [normalizeProfileSearchTargetHref(record.href || '', 'https://www.quora.com/'), record])
+        .filter(([href]) => href))
+    const makeTargetProvenance = href => {
+        const selected = selectedByHref.get(href) || {}
+        return {
+            kind: 'quora-reporting-asset',
+            source: 'quora-reporting-assets',
+            sourceSpaceUrl: selected.sourceSpaceUrl || '',
+            sourceSpaceTitle: selected.sourceSpaceTitle || '',
+            snippet: selected.snippet || '',
+            collectionIndex: Number.parseInt(selected.collectionIndex, 10) || 0,
+            assetFixturePath: assetSelection.fixture?.path || QUORA_REPORTING_ASSETS_PATH,
+            assetFixtureGeneratedAt: assetSelection.fixture?.generatedAt || ''
+        }
+    }
     const runId = `space-asset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const source = {
         type: 'space-asset',
@@ -3898,7 +4022,8 @@ async function enqueueQuoraReportingAssetTargetsViaRuntime(context, options, tar
             dedupeKey: href,
             targetProfileHref: href,
             requestedUrl: href,
-            source
+            source,
+            provenance: makeTargetProvenance(href)
         }))
     }
     const attempts = []
@@ -4326,12 +4451,25 @@ async function waitForSelectedTerminalRows(context, fail, targetProfileHrefs = [
     let storage = await readStorage(context)
     let fullSummary = summarizeQueueAuthority(storage, summaryOptions)
     let selectedSummary = summarizeSelectedQueueAuthority(fullSummary, targetProfileHrefs, summaryOptions)
-    const terminalReady = () =>
-        selectedSummary.selected.length === targetProfileHrefs.length &&
-        selectedSummary.selected.every(item => item.rowCount === 1 && item.terminalRows === 1) &&
-        selectedSummary.activeRows === 0 &&
-        selectedSummary.queuedRows === 0 &&
-        selectedSummary.unrelatedActiveQueuedCount === 0
+    const terminalReady = () => {
+        if(selectedSummary.selected.length === targetProfileHrefs.length &&
+                selectedSummary.selected.every(item => item.rowCount === 1 && item.terminalRows === 1) &&
+                selectedSummary.activeRows === 0 &&
+                selectedSummary.queuedRows === 0 &&
+                selectedSummary.unrelatedActiveQueuedCount === 0) {
+            return true
+        }
+        if((Number(fullSummary.rawRowCount || 0) || Number(fullSummary.recoveredRowCount || 0)) > 0) {
+            return false
+        }
+        const progressRecords = getSelectedProgressRecords(storage, targetProfileHrefs, selectedSummary)
+        if(progressRecords.length !== targetProfileHrefs.length ||
+                !progressRecords.every(isTerminalSelectedProgressRecord)) {
+            return false
+        }
+        selectedSummary = summarizeSelectedTerminalProgressRecords(progressRecords)
+        return true
+    }
 
     while(Date.now() < deadline && !terminalReady()) {
         if(failOnIdleStall &&
@@ -4969,7 +5107,9 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         const runtimeStateAfterEnqueue = await readQueueRuntimeState(context, selectedTargets)
         const visibleTabsAfterEnqueue = await readVisibleTargetTabs(config, selectedTargets)
         const tabAuthorityInvariantAfterEnqueue = buildTabAuthorityInvariant(visibleTabsAfterEnqueue, queuedSoFar.fullSummary, selectedTargets)
-        const flightRecorderAfterEnqueue = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+        const flightRecorderAfterEnqueue = options.includeFlightRecorder === true
+            ? await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+            : null
         markTiming('batch-enqueue-materialized', {
             queuedRows: Number(queuedSoFar.summary?.queuedRows || 0) || 0,
             activeRows: Number(queuedSoFar.summary?.activeRows || 0) || 0,
@@ -5113,7 +5253,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
         const tabAuthorityInvariantAfterEnqueue = mediumBatch
             ? buildTabAuthorityInvariant(visibleTabsAfterEnqueue, queuedSoFar.fullSummary, selectedTargets.slice(0, queueClicks.length))
             : null
-        const flightRecorderAfterEnqueue = mediumBatch
+        const flightRecorderAfterEnqueue = mediumBatch && options.includeFlightRecorder === true
             ? await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
             : null
         incrementalEnqueue.push({
@@ -5266,7 +5406,9 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     })
     const terminalStorage = terminal.storage || await readStorage(context)
     const terminalSelectedProgressRecords = getSelectedProgressRecords(terminalStorage, selectedTargets, terminal.summary)
-    const preRestartFlightRecorder = await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+    const preRestartFlightRecorder = options.includeFlightRecorder === true
+        ? await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
+        : null
     markTiming('terminal-diagnostics-read')
     if(terminal.timedOut) {
         tracePhase(options, `${phaseLabel} terminal wait failed before restart`, {
@@ -5364,6 +5506,64 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     })
     assertWalPresent(terminal.authority, fail, `${phaseLabel} terminal WAL`)
     assertNoRuntimeActionSurfaceLeak(terminal.authority, fail, `${phaseLabel} terminal`)
+
+    if(mediumBatch && options.phase10SkipPostTerminalChecks === true) {
+        phaseState.currentStep = 'restoring-preference'
+        tracePhase(options, `${phaseLabel} restoring low-concurrency preference`)
+        lowConcurrencyPreference.restored = await setStorageValues(context, {profilesPerBatch: previousProfilesPerBatch})
+        if(lowConcurrencyPreference.restored?.ok !== true) {
+            fail(`${phaseLabel} failed to restore profile-search batch preference`, lowConcurrencyPreference.restored)
+        }
+        markTiming('preference-restored')
+
+        return finishPhase({
+            kind: batchKind,
+            search: discovery,
+            lowConcurrencyPreference,
+            beforeQueue,
+            beforeSelected,
+            beforeAuthority,
+            pauseBeforeQueue: summarizeMessageResult(pauseBeforeQueue),
+            selection,
+            selectedTargets,
+            assetFixture: targetSelection.fixture || null,
+            classifiedAssets,
+            existingQueueTargets,
+            searchTabCleanupsDuringSelection,
+            searchTabCleanupAfterSelection,
+            queueClicks,
+            incrementalEnqueue,
+            afterEnqueue: {
+                queue: afterEnqueue.summary,
+                fullQueue: afterEnqueue.fullSummary,
+                authority: afterEnqueue.authority
+            },
+            restartBeforeStart,
+            wakeBeforeStart,
+            afterRestartBeforeStart: {
+                queue: afterRestartBeforeStart.summary,
+                fullQueue: afterRestartBeforeStart.fullSummary,
+                authority: afterRestartBeforeStart.authority
+            },
+            resumePaused: summarizeMessageResult(resumePaused),
+            start: summarizeMessageResult(start),
+            startFull: start,
+            terminal: {
+                timedOut: terminal.timedOut,
+                queue: terminal.summary,
+                fullQueue: terminal.fullSummary,
+                authority: terminal.authority
+            },
+            terminalSelectedProgressRecords,
+            timings: phaseState.timings,
+            preRestartFlightRecorder,
+            restartAfterTerminal: null,
+            wakeAfterTerminal: null,
+            afterRestartAfterTerminal: null,
+            idleFlightRecorder: null,
+            skippedPostTerminalChecks: true
+        })
+    }
 
     phaseState.currentStep = 'restart-after-terminal'
     tracePhase(options, `${phaseLabel} stopping service worker after terminal`)

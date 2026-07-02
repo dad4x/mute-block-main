@@ -419,8 +419,8 @@ function loadServiceWorkerHarness(options = {}) {
     }
     if(options.disableQueueWalCheckpointSwitch === true) {
         source = source.replace(
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    if(coordinatorQueueWalCheckpointSwitchPromise) {",
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    return null\n    if(coordinatorQueueWalCheckpointSwitchPromise) {"
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)",
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
         )
     }
     if(options.fastExecutorResumeTimeoutMs) {
@@ -446,28 +446,26 @@ function loadServiceWorkerHarness(options = {}) {
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    clearStaleCoordinatorExecutorStartPromise',
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    clearStaleCoordinatorExecutorStartPromise'
     )
-    if(options.suppressBackgroundWorkAfterDeactivate === true) {
-        source = source.replace(
-            'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
-            'async function metricStorageGet(defaults = {}, options = {}) {\n    if(__testHarnessDeactivated) return cloneCoordinatorAuthorityValue(defaults || {})\n    incrementQueueWakeupMetric'
-        )
-        source = source.replace(
-            'async function metricStorageSet(payload = {}, options = {}) {\n    if(payload &&',
-            'async function metricStorageSet(payload = {}, options = {}) {\n    if(__testHarnessDeactivated) return false\n    if(payload &&'
-        )
-        source = source.replace(
-            'async function metricStorageRemove(keys = [], options = {}) {\n    const normalizedKeys',
-            'async function metricStorageRemove(keys = [], options = {}) {\n    if(__testHarnessDeactivated) return false\n    const normalizedKeys'
-        )
-        source = source.replace(
-            'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot',
-            'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot'
-        )
-        source = source.replace(
-            '    if(!walStore || typeof walStore !== \'object\') {\n        return {',
-            '    if(__testHarnessDeactivated) {\n        return {\n            queue: normalizedSnapshot,\n            recovered: false,\n            reason: \'test-harness-deactivated\'\n        }\n    }\n\n    if(!walStore || typeof walStore !== \'object\') {\n        return {'
-        )
-    }
+    source = source.replace(
+        'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
+        'async function metricStorageGet(defaults = {}, options = {}) {\n    if(__testHarnessDeactivated) return cloneCoordinatorAuthorityValue(defaults || {})\n    incrementQueueWakeupMetric'
+    )
+    source = source.replace(
+        'async function metricStorageSet(payload = {}, options = {}) {\n    if(payload &&',
+        'async function metricStorageSet(payload = {}, options = {}) {\n    if(__testHarnessDeactivated) return false\n    if(payload &&'
+    )
+    source = source.replace(
+        'async function metricStorageRemove(keys = [], options = {}) {\n    const normalizedKeys',
+        'async function metricStorageRemove(keys = [], options = {}) {\n    if(__testHarnessDeactivated) return false\n    const normalizedKeys'
+    )
+    source = source.replace(
+        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot',
+        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot'
+    )
+    source = source.replace(
+        '    if(!walStore || typeof walStore !== \'object\') {\n        return {',
+        '    if(__testHarnessDeactivated) {\n        return {\n            queue: normalizedSnapshot,\n            recovered: false,\n            reason: \'test-harness-deactivated\'\n        }\n    }\n\n    if(!walStore || typeof walStore !== \'object\') {\n        return {'
+    )
     source += `
 
 module.exports.__test = {
@@ -494,6 +492,7 @@ module.exports.__test = {
     ensureProfileNukeProgressReady,
     reconcileCoordinatorStorage,
     recordCoordinatorJobProgress,
+    recordCoordinatorJobProgressRecords,
     recordFlightRecorderEvent,
     getFlightRecorder,
     getFlightRecorderSnapshot,
@@ -534,6 +533,7 @@ module.exports.__test = {
     scheduleCoordinatorQueueResume,
     scheduleCoordinatorReconcile,
     sendTabMessage,
+    setCoordinatorPauseControlState,
     setCoordinatorRunsPaused,
     settleTerminalCoordinatorItems,
     startUserInitiatedCoordinatorQueueResume,
@@ -544,24 +544,24 @@ module.exports.__test = {
     terminalizeActiveCoordinatorNonProfileLanding,
     terminalizeExhaustedRolledBackQueuedCoordinatorItem,
     terminalizeExhaustedRolledBackQueuedCoordinatorItems,
-    __testResetFlightRecorder() {
-        flightRecorderSeq = 0
-        flightRecorderDroppedCount = 0
-        flightRecorderEntries.fill(undefined)
-    },
+    __testResetFlightRecorder,
     __testDeactivateHarness() {
         __testHarnessDeactivated = true
-        if(activeSpaceFeedStorageUpdateToken) {
-            abandonedSpaceFeedStorageUpdates.add(activeSpaceFeedStorageUpdateToken)
+        if(storageUpdateState.getActiveRawToken()) {
+            storageUpdateState.abandon(storageUpdateState.getActiveRawToken())
         }
         queueWakeupMetricsLoaded = false
         queueWakeupMetricsDirty = false
         queueWakeupMetricsFlushPromise = null
+        coordinatorQueueResumeScheduler.clearSchedule()
+        coordinatorQueueResumeScheduler.clearAlarmTracking()
+        coordinatorReconcileScheduler.clearSchedule()
+        coordinatorReconcileScheduler.resetBackoff()
     },
     __testAddProvisionalQueuedTab(tabId, metadata = {}, action = null) {
-        activeQueuedTabs.add(tabId)
+        queueRuntime.addActiveQueuedTab(tabId)
         setQueuedTabMetadata(tabId, metadata)
-        pendingTabActions.set(tabId, action || {
+        queueRuntime.setPendingTabAction(tabId, action || {
             action: metadata.tabAction || 'nuke',
             targetUrl: metadata.profileHref || '',
             coordinatorKey: metadata.coordinatorKey || '',
@@ -576,11 +576,11 @@ module.exports.__test = {
         registerOwnedTab(metadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, tabId)
     },
     __testAddActiveQueuedTabWithoutMetadata(tabId) {
-        activeQueuedTabs.add(tabId)
+        queueRuntime.addActiveQueuedTab(tabId)
         registerOwnedTab(SERVICE_WORKER_QUEUE_OWNER_ID, tabId)
     },
     __testAddQueuedAction(action = {}) {
-        queuedTabActions.push({
+        queueRuntime.enqueueActivationIntent({
             url: action.url || action.profileHref || '',
             profileHref: action.profileHref || action.url || '',
             coordinatorKey: action.coordinatorKey || action.profileHref || action.url || '',
@@ -593,10 +593,12 @@ module.exports.__test = {
             attemptNumber: action.attemptNumber || 0,
             runId: action.runId || '',
             ...action
+        }, {
+            source: action.activationIntentSource || 'machine-intent'
         })
     },
     __testClearQueuedActions() {
-        queuedTabActions.splice(0, queuedTabActions.length)
+        queueRuntime.replaceActivationIntents([])
     },
     __testSetCoordinatorAuthorityShadowWalStore(value) {
         coordinatorAuthorityShadowWalStore = value
@@ -605,14 +607,15 @@ module.exports.__test = {
         progressShadowWalStore = value
     },
     __testPauseQueuedOwner(ownerTabId) {
-        pausedQueuedOwners.add(ownerTabId)
+        queueRuntime.pauseQueuedOwner(ownerTabId)
     },
     __testSetQueuedTabFillPromise(promise, startedAt = Date.now()) {
         queuedTabFillPromise = promise
         queuedTabFillPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
     },
-    __testSetCoordinatorExecutorStartPromise(promise) {
+    __testSetCoordinatorExecutorStartPromise(promise, startedAt = Date.now()) {
         coordinatorExecutorStartPromise = promise
+        coordinatorExecutorStartPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
     },
     __testSetCoordinatorExecutorStartThrow(error) {
         __testCoordinatorExecutorStartThrow = error
@@ -624,31 +627,39 @@ module.exports.__test = {
     __testClearStaleCoordinatorReconcilePromise(reason = 'test') {
         return clearStaleCoordinatorReconcilePromise(reason)
     },
+    __testClearStaleCoordinatorExecutorStartPromise(reason = 'test') {
+        return clearStaleCoordinatorExecutorStartPromise(reason)
+    },
     state() {
         return {
-            coordinatorReconcileDueAt,
-            hasCoordinatorReconcileTimeout: !!coordinatorReconcileTimeout,
-            coordinatorReconcileBackoffLevel,
-            coordinatorReconcileBackoffUntil,
-            coordinatorQueueResumeDueAt,
-            hasCoordinatorQueueResumeTimeout: !!coordinatorQueueResumeTimeout,
+            coordinatorReconcileDueAt: coordinatorReconcileScheduler.getDueAt(),
+            hasCoordinatorReconcileTimeout: coordinatorReconcileScheduler.hasTimeout(),
+            coordinatorReconcileBackoffLevel: coordinatorReconcileScheduler.getBackoffLevel(),
+            coordinatorReconcileBackoffUntil: coordinatorReconcileScheduler.getBackoffUntil(),
+            coordinatorQueueResumeDueAt: coordinatorQueueResumeScheduler.getDueAt(),
+            hasCoordinatorQueueResumeTimeout: coordinatorQueueResumeScheduler.hasTimeout(),
             queueWakeupCounters: {...getQueueWakeupMetricEpoch().counters},
             profileNukeProgress: {...profileNukeProgress},
             coordinatorAuthorityShadowWalStore: JSON.parse(JSON.stringify(coordinatorAuthorityShadowWalStore)),
             progressShadowWalStore: JSON.parse(JSON.stringify(progressShadowWalStore)),
             coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.current().stored?.mbCoordinatorQueueWal || null)),
-            spaceFeedStorageUpdateDepth,
-            abandonedSpaceFeedStorageUpdates: abandonedSpaceFeedStorageUpdates.size,
+            spaceFeedStorageUpdateDepth: storageUpdateState.getDepth(),
+            abandonedSpaceFeedStorageUpdates: storageUpdateState.getAbandonedCount(),
             queuedTabFillPromise: hasVisibleQueuedTabFillPromise(),
             queuedTabFillPromiseAgeMs: hasVisibleQueuedTabFillPromise() ? getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) : 0,
             coordinatorReconcilePromise: !!coordinatorReconcilePromise,
             coordinatorReconcilePromiseAgeMs: coordinatorReconcilePromise ? getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) : 0,
-            activeQueuedTabs: Array.from(activeQueuedTabs),
+            coordinatorExecutorStartPromise: !!coordinatorExecutorStartPromiseStartedAt,
+            coordinatorExecutorStartPromiseAgeMs: coordinatorExecutorStartPromiseStartedAt ? getPromiseLatchAgeMs(coordinatorExecutorStartPromiseStartedAt) : 0,
+            activeStorageContext: getActiveStorageContext()
+                ? getStorageContextJournalDetails(getActiveStorageContext())
+                : null,
+            activeQueuedTabs: queueRuntime.listActiveQueuedTabIds(),
             schedulerBlockingQueuedExecutors: getSchedulerBlockingQueuedExecutorCount(),
-            pausedQueuedOwners: Array.from(pausedQueuedOwners),
-            queuedTabActions: queuedTabActions.map(action => ({...action})),
-            pendingTabActions: Array.from(pendingTabActions.entries()).map(([tabId, action]) => [tabId, {...action}]),
-            queuedTabMetadata: Array.from(queuedTabMetadata.entries()).map(([tabId, metadata]) => [tabId, {...metadata}]),
+            pausedQueuedOwners: queueRuntime.listPausedQueuedOwners(),
+            queuedTabActions: queueRuntime.mapActivationIntents(action => ({...action})),
+            pendingTabActions: queueRuntime.listPendingTabActionEntries().map(([tabId, action]) => [tabId, {...action}]),
+            queuedTabMetadata: queueRuntime.listQueuedTabMetadataEntries().map(([tabId, metadata]) => [tabId, {...metadata}]),
             queuedActionSurfaceWindowId,
             queuedActionSurfaceAnchorTabId,
             queueLoadThrottle: {...queueLoadThrottle},
@@ -670,6 +681,8 @@ module.exports.__test = {
                 QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS,
                 COORDINATOR_RECONCILE_PROMISE_STALE_MS,
                 COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS,
+                COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS,
+                COORDINATOR_DETACHED_EXECUTOR_START_PROMISE_STALE_MS,
                 COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
                 COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
                 COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS

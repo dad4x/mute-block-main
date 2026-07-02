@@ -495,6 +495,7 @@ function render() {
         getQueueStatusCount('settling', queueItems)
     const terminalCount = getQueueTerminalCount(queueItems)
     const secondsPerBlock = getSecondsPerActualBlock(queueItems, getCurrentMetricsEpochStartedAt())
+    const activationHandoff = getActivationHandoffSeconds(queueItems, getCurrentMetricsEpochStartedAt())
     const failedCount = getQueueStatusCount('failed', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
     const retryableFailureShapeCount = queueItems.filter(isRetryableFailedQueueItem).length
@@ -511,6 +512,7 @@ function render() {
     }))
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
+    setText('activationHandoffSeconds', formatSecondsPerBlock(activationHandoff))
     setText('terminalCount', terminalCount)
     setText('eventCount', state.events.length)
     setText('eventListCount', `${state.events.length} event${state.events.length === 1 ? '' : 's'}`)
@@ -1213,6 +1215,72 @@ function getQueueViewSecondsPerActualBlock(epochStartedAt = 0) {
     return {
         seconds,
         blocks,
+        elapsedMs
+    }
+}
+
+function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
+    const viewResult = getQueueViewActivationHandoffSeconds(epochStartedAt)
+    if(viewResult) return viewResult
+
+    const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
+    const activations = queueItems
+        .map(item => ({
+            item,
+            key: item?.storageKey || item?.targetProfileHref || item?.requestedUrl || '',
+            runId: `${item?.runId || ''}`.trim(),
+            activeAt: Number.parseInt(item?.activeAt, 10) || 0
+        }))
+        .filter(sample => sample.activeAt > 0 && sample.runId)
+        .sort((left, right) => left.activeAt - right.activeAt)
+    const terminals = queueItems
+        .map(item => ({
+            item,
+            key: item?.storageKey || item?.targetProfileHref || item?.requestedUrl || '',
+            runId: `${item?.runId || ''}`.trim(),
+            terminalAt: getQueueItemTerminalTime(item)
+        }))
+        .filter(sample => {
+            if(!isTerminalQueueItem(sample.item)) return false
+            return sample.runId && sample.terminalAt > 0 && (!minimumTerminalAt || sample.terminalAt >= minimumTerminalAt)
+        })
+        .sort((left, right) => left.terminalAt - right.terminalAt)
+    const gaps = []
+    for(const terminal of terminals) {
+        const nextActivation = activations.find(candidate =>
+            candidate.key !== terminal.key &&
+            candidate.runId === terminal.runId &&
+            candidate.activeAt > terminal.terminalAt
+        )
+        if(nextActivation) gaps.push(nextActivation.activeAt - terminal.terminalAt)
+        if(gaps.length >= SECONDS_PER_BLOCK_SAMPLE_LIMIT) break
+    }
+    if(!gaps.length) return null
+
+    const elapsedMs = gaps.reduce((total, gap) => total + gap, 0)
+    return {
+        seconds: (elapsedMs / 1000) / gaps.length,
+        blocks: gaps.length,
+        elapsedMs
+    }
+}
+
+function getQueueViewActivationHandoffSeconds(epochStartedAt = 0) {
+    const summary = state.queueView?.activationHandoffTiming || null
+    if(!summary || typeof summary !== 'object') return null
+
+    const requestedEpochStartedAt = Number.parseInt(epochStartedAt, 10) || 0
+    const summaryEpochStartedAt = Number.parseInt(summary.epochStartedAt, 10) || 0
+    if(requestedEpochStartedAt && summaryEpochStartedAt && summaryEpochStartedAt !== requestedEpochStartedAt) return null
+
+    const handoffs = Number.parseInt(summary.handoffs, 10) || 0
+    const elapsedMs = Number.parseInt(summary.elapsedMs, 10) || 0
+    const seconds = Number(summary.seconds)
+    if(handoffs <= 0 || elapsedMs <= 0 || !Number.isFinite(seconds) || seconds <= 0) return null
+
+    return {
+        seconds,
+        blocks: handoffs,
         elapsedMs
     }
 }
