@@ -27,14 +27,12 @@ runMain(async () => {
             settled = true
             resolve(value)
         }
-        const forceStoragePause = lastError => {
-            chrome.storage.local.set({mbCoordinatorPaused: true}, () => finish({
-                action: 'pause-coordinator-nukes',
-                response: {paused: true, forcedStoragePause: true},
-                lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : lastError || ''
-            }))
-        }
-        setTimeout(() => forceStoragePause('pause message did not receive a callback'), 5000)
+        setTimeout(() => finish({
+            action: 'pause-coordinator-nukes',
+            response: null,
+            timedOut: true,
+            lastError: 'pause message did not receive a callback'
+        }), 5000)
         chrome.runtime.sendMessage({action: 'pause-coordinator-nukes'}, response => finish({
             action: 'pause-coordinator-nukes',
             response: response || null,

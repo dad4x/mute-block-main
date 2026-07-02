@@ -8,6 +8,32 @@ const browserJsBuildDirs = [
     path.resolve(__dirname, 'firefox/js')
 ]
 
+class StripArchitectureCommentsPlugin {
+    apply(compiler) {
+        compiler.hooks.compilation.tap('StripArchitectureCommentsPlugin', compilation => {
+            compilation.hooks.processAssets.tap(
+                {
+                    name: 'StripArchitectureCommentsPlugin',
+                    stage: compiler.webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE
+                },
+                assets => {
+                    for(const assetName of Object.keys(assets)) {
+                        if(!assetName.endsWith('.js')) continue
+                        const source = assets[assetName].source().toString()
+                        const stripped = source.replace(/\/\*\s*(?:\*\s*)?ARCHITECTURE:[\s\S]*?\*\//g, '')
+                        if(stripped !== source) {
+                            compilation.updateAsset(
+                                assetName,
+                                new compiler.webpack.sources.RawSource(stripped)
+                            )
+                        }
+                    }
+                }
+            )
+        })
+    }
+}
+
 mix.options({
     terser: {
         extractComments: false,
@@ -19,6 +45,9 @@ mix.options({
     }
 })
 .setPublicPath('./')
+.webpackConfig({
+    plugins: mix.inProduction() ? [new StripArchitectureCommentsPlugin()] : []
+})
 
 .js('./shared/js/content.js', 'tmp/mix-shared/js')
 

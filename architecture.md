@@ -70,11 +70,84 @@ Important fixed-point cases:
 Confirmation requires row id plus attempt/claim token, and tab id where
 applicable. Row id alone is not enough under delayed storage writes.
 
-## Runtime Caches
+## Runtime Queue Boundary
 
 Runtime structures such as `queuedTabActions`, `queuedTabMetadata`, and
 `activeQueuedTabs` are caches derived from durable rows and live observations.
 They must not block scheduling unless they match durable active authority.
+
+The volatile queue runtime should be split from the service-worker monolith the
+same way durable storage, machine reducers, dashboard projections, preferences,
+and the flight recorder have been split. The split exists to hide capability:
+ordinary code should not mutate raw runtime arrays/maps directly.
+
+`swqueueRuntime` owns volatile executor state:
+
+- queued activation intents;
+- active and pending tab attachments;
+- queued-tab metadata;
+- owned-tab parent/child maps;
+- profile-open reservations;
+- canceled or paused runtime owner state;
+- removed/stale runtime tab markers.
+
+The module does not own durable queue state. It exposes operations such as
+`enqueueActivationIntent`, `consumeActivationIntent`,
+`requeueActivationIntent`, `dropRuntimeActionAt`,
+`patchQueuedTabMetadata`, `setPendingTabAction`, `deleteActiveQueuedTab`,
+owned-tab helpers, and profile-open reservation helpers. Those operations may
+attach browser effects to a machine attempt, but they must not decide queue
+status or reconstruct durable work from storage.
+
+The current split hides its volatile collections behind named methods; `sw.js`
+does not destructure raw runtime maps/arrays. New code should use the named
+runtime methods, and follow-up slices should keep moving queue policy out of
+the service-worker monolith without re-exposing those collections.
+
+Runtime-surface matching now goes through `swqueueRuntime.getRuntimeSurface`.
+`sw.js` still supplies durable row matching policy, but the runtime module owns
+enumeration of active tab handles, pending actions, and activation intents for
+that query.
+
+`swquoraTabs` owns Quora tab/window URL classification and live profile-tab
+indexing. `sw.js` still decides what a candidate tab means for durable queue
+authority, but raw Quora URL, challenge, non-profile landing, and profile-tab
+map logic is no longer embedded in the machine file.
+
+`swprojections` owns rebuildable shard-key mechanics for compact read models.
+Authority writes still flow through the storage/machine path; projection helpers
+only name deterministic shard keys and default payload shapes.
+
+`swmessages` owns runtime-message action normalization and labeling. Message
+handlers still live in `sw.js` while they touch queue authority, but the message
+boundary now normalizes inputs before dispatch.
+
+`swexecutor` owns browser-tab executor effects that do not decide queue
+authority: timed tab creation and target-URL commit verification/retry. The
+service worker passes browser, timing, metric, recorder, and normalization
+capabilities into that module; durable activation, rollback, retry, and
+terminal decisions remain in the machine/service-worker layer.
+
+## Scheduler Boundary
+
+Scheduler timers and browser alarms are non-persistent runtime effects. They
+are not durable queue authority, but their state must still be hidden behind a
+single capability boundary so callers cannot independently mutate timeout
+handles, due times, alarm bookkeeping, or reconcile backoff counters.
+
+`swscheduler` owns volatile scheduler slot bookkeeping. `sw.js` still owns the
+current scheduling policy and browser alarm names, but resume/reconcile due
+times, timeout handles, alarm persistence state, stale alarm suppression, and
+reconcile backoff now move through scheduler-slot operations. In tests, the
+slot receives the service-worker clock/timer functions so fake timer behavior
+matches production scheduling semantics.
+
+Every activation intent should carry machine identity: `attemptId`,
+`attemptNumber`, `coordinatorKey`, `profileHref`, `ownerTabId`, and an intent
+source category. Repair/reconcile code may delete stale runtime state; if it
+needs new work, it submits a machine event or requests a fresh activation
+intent from current authority instead of rebuilding `queuedTabActions`
+privately.
 
 Use separate concepts for:
 
@@ -105,6 +178,14 @@ Current progress storage is compact projection state only. Queue authority is
 the queue WAL and its checkpoints; reconciliation may materialize projections
 from authority, but compatibility progress state must not write, retry,
 schedule, throttle, import queued work, or influence queue drain.
+
+The browser-local storage adapter factory lives in `swstorage`, alongside the
+WAL/checkpoint helpers. `swstorage` also owns the serialized storage update
+queue and its non-persistent state: active storage context, tail promise, depth,
+abandoned update tokens, timeout bookkeeping, and storage-update serialization.
+`sw.js` injects browser timers plus queue-specific hooks for metrics,
+diagnostics, timeout recovery, and post-storage continuations, but it no longer
+mutates those queue internals directly.
 
 Current cleanup requirements:
 

@@ -947,3 +947,440 @@ serialized, then decouple every rebuildable storage projection from that
 commit." Shared storage queues are acceptable only if they preserve this
 ordering: authoritative commit work first, derived read-model materialization
 later.
+
+## Current To-Do: Live 8/1 Follow-Up
+
+Status 2026-06-27: `1.6.1089` passed the live 8/1 gate. The run selected
+eight asset-backed entries, restored concurrency 1 afterward, reached eight
+succeeded rows, and had no extension errors. Manual CDP/dashboard samples
+during the run never showed more than one live profile tab. The tail transition
+also cleared: the previous `7 succeeded / 1 queued / no profile tab` stall was
+fixed by letting executor apply continue into queued-tail materialization after
+terminal runtime cleanup when the same pass already discovered runnable pending
+work.
+
+The latest 8/1 live validation on `1.6.1086` reached eight succeeded rows with
+no queued, active, or live profile tabs remaining, but it is not a clean gate.
+During the run, concurrency 1 was transiently violated: two live profile tabs
+were visible at once before the run recovered and completed.
+
+Resolve that before treating 8/1 as good:
+
+- Finish the stale-runtime/fresh-open sequencing fix. Resolving stale or
+  terminal runtime state must end the current executor apply pass and schedule
+  the next pass; it must not immediately open a fresh profile tab while the old
+  browser tab may still be closing.
+- Align the local stale-runtime synthetic assertions with that barrier:
+  follow-up queued actions may remain for the next pass, but no fresh open
+  should occur in the same transition.
+- Fix the `queued fill does not open second worker profile tab while surface
+  profile is in flight` synthetic failure/hang so it proves the concurrency
+  guard instead of depending on an obsolete result reason.
+- Rebuild and sync the next package version after the source/tests are aligned.
+- Rerun 8/1 and require both terminal success and no sampled profile-tab count
+  above the requested concurrency.
+
+## Current To-Do: Visibility/Module Reduction
+
+Continue the same direction as the queue-machine split: reduce service-worker
+sprawl by hiding implementation details behind narrow modules, without moving
+authority decisions out of the machine.
+
+Recommended order:
+
+- `swqueueRuntime.js`: isolate volatile executor state and helpers such as
+  pending tab actions, queued tab actions, active queued tabs, queued tab
+  metadata, owned-tab maps, and foreground/background leases. This should make
+  the non-persistent state boundary explicit.
+- `swscheduler.js`: isolate timers, alarms, resume/reconcile scheduling,
+  backoff, stale-promise checks, and work-continuation nudges. Timers remain
+  non-persistent effects, but their inputs should still be machine events or
+  machine-facing continuation requests.
+- `swexecutor.js`: isolate browser tab executor effects: fill/open/adopt,
+  release, content-script ensure/nudge, worker-window handling, and duplicate
+  live-tab cleanup. The module should perform effects, not decide durable queue
+  status.
+- `swprojections.js`: isolate rebuildable read models such as queue view,
+  progress view, metrics view, and content/source indexes. These are derived
+  projections and must stay behind authoritative storage commits.
+- `swmessages.js`: isolate `browser.runtime.onMessage` routing so messages are
+  translated into machine events/effects rather than containing transition
+  logic inline.
+- `swquoraTabs.js`: isolate Quora tab/window detection and normalization:
+  profile tab scans, worker-window recognition, challenge-page checks, and
+  target URL checks.
+
+Treat each as a bounded mechanical slice with local syntax/boundary validation
+before attempting live gates.
+
+## Design Note: Activation Ownership Reset
+
+Status 2026-06-30: repeated live `32/1` iterations have shown that the
+activation delay is no longer a narrow timeout bug. The repeated pattern of
+patching final-open timeouts, stale executor latches, reconcile continuation,
+pause races, and claim-nudge throttles means the activation boundary is still
+too distributed.
+
+The higher-level correction is to make "activate the next queued item" one
+machine-owned operation instead of emergent behavior from reconcile, resume,
+fill, fast executor, volatile queued actions, live-tab discovery, pause timers,
+and claim nudges.
+
+Target architecture:
+
+- The queue machine owns the activation decision: selected row, attempt
+  identity, capacity slot, tab-open/adopt intent, and expected runtime actor.
+- Volatile tab state remains non-persistent, but it is only an attachment to a
+  specific machine attempt. A tab without matching attempt identity is either
+  adopted by one explicit transition or discarded/released.
+- `queuedTabActions` must become an effect-intent surface produced from machine
+  authority, not a second queue that can independently preserve, recreate, or
+  delay durable work.
+- Reconcile, resume, fill, and fast executor should collapse into fewer phases:
+  authority repair must either complete and immediately drive the next
+  machine-owned activation command, or explicitly return a machine event
+  explaining why activation cannot proceed.
+- Timers are only non-persistent wakeups. They may submit events or request a
+  machine continuation, but they must not be the primary owner of row
+  transitions.
+- Claim/content-script failures are activation failures for one attempt, not
+  queue-wide load pressure. They should cause an explicit bounded retry,
+  adoption, requeue, or terminalization transition. They should not throttle the
+  whole queue for 30-60 seconds.
+- For concurrency 1, the machine should make multiple active/pending runtime
+  surfaces structurally exceptional. A second live profile tab must be adopted
+  or closed promptly under the active attempt identity.
+
+Execution order:
+
+1. Remove queue-wide throttle from `claim-nudge-failed` and
+   `claim-nudge-timeout` paths. Convert them to explicit per-attempt
+   activation failure/retry handling.
+2. Inventory all `queuedTabActions` producers and consumers. Classify each as
+   machine activation intent, runtime effect bookkeeping, or stale repair.
+3. Introduce a single machine-facing activation-intent shape for
+   queued/open/adopt effects, with attempt identity required.
+4. Move fill/open/adopt paths to consume only activation intents derived from
+   current authority; remove ad hoc queued-action reconstruction from unrelated
+   repair paths.
+5. Change reconcile/resume/fill continuations so an authority repair that leaves
+   capacity available synchronously requests the next activation command instead
+   of scheduling a timer-first path.
+6. Add local tests for the invariants before returning to live gates:
+   - claim-nudge failure does not set queue-load throttle,
+   - concurrency 1 never opens two durable active profile tabs for queued work,
+   - terminal-to-next-active handoff does not depend on scheduled reconcile,
+   - live-tab adoption either attaches to the current attempt or closes/releases
+     the tab.
+
+Stop condition for this slice: do not advance the live ladder until the local
+activation model rejects the known bad shapes directly rather than recovering
+from them after timer delays.
+
+## Queued Tab Action Inventory
+
+Status 2026-06-30: `queuedTabActions` is still doing too many jobs. A source
+inventory found 178 service-worker references, with direct mutation from
+executor enqueue, recovered-work reprime, live-tab adoption, stale/runtime
+repair, durable-resume fallback, fill retry, and tests.
+
+Classify the current uses this way:
+
+- Machine activation intent:
+  - `enqueueExistingExecutorForCoordinatorOnce` plans fresh queued work from
+    durable authority and pushes `plannedAction`.
+  - `reprimeRecoveredServiceWorkerQueuedAction` rebuilds a planned action from
+    a current authority row.
+  - raw/projection fallback paths re-enqueue durable queued rows after resident
+    authority is empty or stale.
+- Runtime effect bookkeeping:
+  - `fillQueuedTabsOnce` consumes actions, may restore them when capacity,
+    authority, tab-open, or content-script readiness does not complete.
+  - active/pending tab maps and queued metadata attach browser state to the
+    planned action.
+  - live-tab adoption can synthesize or reprime an action when an existing tab
+    appears to match durable authority.
+- Stale repair:
+  - `pruneQueuedTabActions`, `dropVolatileQueuedActionsForDurableResume`,
+    `dropVolatileQueuedActionsForCoordinatorItem`, runtime-missing cleanup,
+    terminal-runtime cleanup, and attempt-mismatch cleanup remove or rebuild
+    actions after authority changes.
+  - reconcile and fast-executor paths currently mix this repair work with
+    immediate activation decisions.
+
+The next refactor target is therefore not another timeout. It is a visibility
+split around a single activation-intent shape:
+
+- Create a narrow queue-runtime module API that owns raw `queuedTabActions`
+  mutation.
+- Require every queued action to carry attempt identity and source kind:
+  `machine-intent`, `runtime-effect`, or `repair-reprime`.
+- Make fill/open/adopt consume only current machine activation intents.
+- Keep stale repair allowed to delete volatile actions, but require it to ask
+  the machine for a new activation intent instead of reconstructing durable
+  queue work ad hoc.
+- Add tests at the module boundary that reject claim-nudge throttle,
+  un-attempted queued actions, duplicate active surfaces at concurrency 1, and
+  repair paths that preserve stale volatile work without a matching authority
+  row.
+
+## Model Reset: Backtrack From Tactical Delay Fixes
+
+Status 2026-06-30: the `1.6.1186` claim-nudge slice is useful as a negative
+invariant, but it should not be treated as the path out of the activation-delay
+problem. It proves one thing only: claim/content-script nudge failure must not
+be modeled as queue-wide load pressure. The broader live behavior still points
+at a misplaced ownership boundary.
+
+Recent work to keep:
+
+- The storage, prefs, dashboard, and flight-recorder splits are directionally
+  right because they hide implementation capability behind narrow modules.
+- The claim-nudge no-throttle assertion is worth keeping as a regression guard:
+  activation failure belongs to one attempt, not the whole queue.
+- The queued-action inventory is the right diagnostic result: the volatile
+  runtime queue is mixing activation intent, browser-effect bookkeeping, and
+  stale repair.
+
+Recent work to stop extending:
+
+- Do not keep adding resume, reconcile, fill, or timeout special cases to
+  compensate for delayed activation.
+- Do not make tests pass by relaxing intermediate return flags unless the test
+  is being moved to a clearer architectural boundary.
+- Do not let `queuedTabActions` remain a second queue that can reconstruct work
+  independently of machine authority.
+
+Backtracked target:
+
+- Treat the machine as the only owner of "activate next item."
+- Treat volatile runtime state as an attachment to a specific machine attempt.
+- Treat browser tab operations as effects consuming a machine activation
+  intent, not as producers of durable queue meaning.
+- Treat repair/reconcile as either deleting stale runtime state or submitting a
+  machine event; repair code must not privately rebuild durable work.
+
+Next executable slices:
+
+1. Add `swqueueRuntime.js` as the runtime visibility boundary. Initially it
+   should expose a small store API for queued actions and active/pending tab
+   attachments, while preserving behavior.
+2. Move all direct `queuedTabActions` mutation behind named operations:
+   `enqueueActivationIntent`, `requeueActivationIntent`,
+   `consumeActivationIntent`, `dropRuntimeAction`, and
+   `restoreActivationIntentForCurrentAuthority`.
+3. Require an activation intent to carry `attemptId`, `attemptNumber`,
+   `coordinatorKey`, `profileHref`, `ownerTabId`, and a source category.
+4. Make repair paths delete stale runtime state and ask the machine for a fresh
+   intent instead of unshifting reconstructed actions themselves.
+5. Only after those boundaries exist, revisit handoff timing and live `32/1`.
+
+## Next Architectural/File Refactor Slice
+
+Capture the next pass as five bounded work items:
+
+1. Make `swqueueRuntime` hide raw runtime structures behind named methods
+   instead of exporting maps and arrays as the preferred interface.
+2. Move more queue executor, reconcile, and scheduler behavior out of `sw.js`
+   into queue-focused modules once the runtime boundary is strong enough.
+3. Move real storage adapter and update-queue logic into `swstorage.js`, not
+   only WAL/checkpoint exports.
+4. Keep pushing state transitions into the machine; leave tabs, timers, and
+   active promises as non-persistent runtime effects reported back as events.
+5. Refresh the docs after each split so `architecture.md`, this plan, and the
+   code agree about the current boundary.
+
+Execution order for this slice: start with the runtime visibility boundary,
+because it is the lowest-risk way to reduce direct `sw.js` access to volatile
+maps while preserving behavior for local tests.
+
+Status update:
+
+- `swqueueRuntime` now hides the volatile queue collections behind named
+  methods. `sw.js` no longer destructures raw runtime maps/arrays for activation
+  intents, active/pending tabs, metadata, ownership, profile-open reservations,
+  removed-tab markers, paused owners, or canceled-owner URL queues.
+- The test harness observes runtime state through the runtime API, preserving
+  diagnostic field names without re-opening mutation access.
+- `swscheduler` now owns volatile scheduler-slot state for resume/reconcile
+  timeout handles, due times, alarm persistence, stale-alarm suppression, and
+  reconcile backoff. `sw.js` still owns scheduling policy and alarm names, but
+  mutates those non-persistent effects through the slot API.
+- Scheduler slots receive the service-worker clock/timer functions so synthetic
+  fake timers and production timers use the same scheduling semantics.
+- `swstorage` now owns the browser-local storage adapter factory as well as the
+  WAL/checkpoint helpers. `sw.js` constructs the adapter by passing the browser
+  storage area capability instead of defining the adapter inline.
+- `swstorage` now owns the serialized storage update state and queue runner as
+  one coherent capability boundary. It hides the active storage context, tail
+  promise, update depth, abandoned update tokens, and timeout serialization.
+  `sw.js` injects metrics, diagnostics, timeout-recovery, and post-storage
+  continuation hooks instead of mutating those internals directly.
+- Local validation after the runtime/scheduler/storage split: `npm test`
+  passed. The synthetic no-open/capacity expectations now allow durable queued
+  authority to remain the source of truth when volatile activation intents are
+  deferred or reprioritized behind a requeued active row.
+- Follow-up runtime visibility slice: `swqueueRuntime.getRuntimeSurface`
+  now owns enumeration of active tab handles, pending actions, and activation
+  intents for runtime-surface matching. `sw.js` still supplies the durable row
+  matching predicate, but no longer manually walks those volatile collections
+  for that query. Validation: syntax checks, `p1-contract`, and full
+  `swSynthetic` passed.
+- Follow-up file-boundary slice: `swquoraTabs` now owns Quora URL/challenge/
+  non-profile landing classification plus live profile-tab indexing;
+  `swprojections` owns deterministic projection shard key/default helpers;
+  `swmessages` owns runtime-message action normalization/labeling; and
+  `swexecutor` owns dependency-injected browser-tab executor effects for timed
+  tab creation and target-URL commit verification/retry. `sw.js` still owns
+  durable authority decisions, reducer/machine events, rollback, retry, and
+  terminalization. Validation: syntax checks, `p1-contract`, full
+  `swSynthetic`, and full `npm test` passed after the slice. Production build
+  and Chrome/Firefox packages were regenerated at `1.6.1188`.
+
+## Queue Operations Into The Single Machine
+
+Status 2026-07-01: live timing and bounce debugging show that the file splits
+reduced visibility problems, but the queue is still not fully one state
+machine. Queue operations are still distributed across the service-worker
+entrypoint, executor effects, runtime projection helpers, scheduler/reconcile
+paths, and storage continuations. That leaves several places able to activate,
+requeue, release, pause, cancel, retry, or terminalize work.
+
+The next correction is to move queue operations into a single event-driven
+machine. Runtime modules may still own non-persistent handles, but they must
+report facts. They must not decide durable queue meaning.
+
+### Target Boundary
+
+- The machine owns queue lifecycle transitions: admit, activate, observe,
+  terminalize, release, retry, requeue, pause, resume, cancel, recover, and
+  materialize-next.
+- Storage is the machine's commit capability. Outside clients submit storage
+  records, changes, or events to the storage boundary; they do not talk about
+  WAL implementation details.
+- A queue transition is complete only after the storage commit and resident
+  authority projection have completed. The machine may delay further event
+  processing to keep durable storage and internal authority projection
+  consistent.
+- Non-persistent state remains valid: tab ids, timer ids, in-flight effect
+  promises, content-script claims, profile-open reservations, runtime metadata,
+  and scheduler slots. These are effect handles or observations, not authority.
+- Effects are one-way commands from the machine to runtime modules. The result
+  of each effect comes back as a reported event.
+- Reconcile is a cold or bounded recovery input to the machine, not a parallel
+  queue processor.
+
+### Event Vocabulary To Normalize First
+
+Use explicit event names and payload identity. Every event that touches a row
+must carry `coordinatorKey`, `attemptId`, `attemptNumber`, `runId` where
+available, and the source module that reported it.
+
+- Intake/control: `QUEUE_ITEMS_ADMITTED`, `RUN_REQUESTED`,
+  `PAUSE_REQUESTED`, `RESUME_REQUESTED`, `CANCEL_REQUESTED`.
+- Activation: `SLOT_AVAILABLE`, `ACTIVATION_REQUESTED`,
+  `TAB_OPEN_EFFECT_REQUESTED`, `TAB_OPENED`, `TAB_OPEN_FAILED`,
+  `TAB_OPEN_TIMED_OUT`.
+- Content/action: `CONTENT_READY`, `ACTION_CLAIM_ACCEPTED`,
+  `ACTION_CLAIM_REJECTED`, `ACTION_HEARTBEAT_REPORTED`,
+  `PROFILE_OBSERVED_ALREADY_BLOCKED`, `BLOCK_ACTION_REQUESTED`,
+  `BLOCK_ACTION_SUCCEEDED`, `BLOCK_ACTION_FAILED`.
+- Release/settlement: `TAB_RELEASE_REQUESTED`, `TAB_RELEASED`,
+  `TAB_RELEASE_FAILED`, `TERMINAL_PROGRESS_REPORTED`,
+  `DERIVED_MATERIALIZATION_DONE`, `DERIVED_MATERIALIZATION_FAILED`.
+- Recovery: `TIMER_FIRED`, `BROWSER_RESTARTED`, `RUNTIME_SURFACE_OBSERVED`,
+  `RUNTIME_SURFACE_MISSING`, `STORAGE_AUTHORITY_RECOVERED`,
+  `STALE_RUNTIME_DETACHED`.
+
+Existing names do not need to be renamed in one large edit. Add aliases or
+normalizers first, then migrate call sites slice by slice.
+
+### Machine Effects
+
+The reducer may emit effects, but effect modules must not perform queue
+transitions directly.
+
+- `OPEN_PROFILE_TAB`
+- `NUDGE_CONTENT_ACTION`
+- `REQUEST_ACTION_CLAIM`
+- `CLOSE_OR_DETACH_TAB`
+- `SCHEDULE_QUEUE_TIMER`
+- `CANCEL_QUEUE_TIMER`
+- `READ_RUNTIME_SURFACE`
+- `MATERIALIZE_DERIVED_VIEWS`
+
+Each effect gets an effect id and attempt identity. Completion, failure, and
+timeout are reported back as events and applied by the machine.
+
+### Refactor Slices
+
+1. Inventory queue operation call sites and classify each as machine transition,
+   effect command, observation reporter, projection update, or recovery input.
+   Do not change behavior in this slice.
+2. Define the queue-machine command/result contract. Add contract tests for
+   event normalization, required attempt identity, storage commit ordering, and
+   effect result reporting.
+3. Move the already-blocked terminal path first. The hot path should be:
+   `PROFILE_OBSERVED_ALREADY_BLOCKED` -> storage commit plus resident projection
+   -> terminal row -> release/close effect -> `SLOT_AVAILABLE`. This path
+   should not wait for reconcile or broad storage fallback.
+4. Move activation selection into the machine. `SLOT_AVAILABLE` should choose
+   the next durable queued row, commit the active attempt, update resident
+   authority, and emit `OPEN_PROFILE_TAB`. `swqueueRuntime` only stores the
+   resulting activation intent/effect handle.
+5. Move tab-open, content-ready, claim, heartbeat, block-result, and release
+   callbacks to event reporters. Remove direct durable mutation from executor
+   and tab helpers as each event path lands.
+6. Move pause, resume, and cancel to machine events with one ordering rule:
+   once pause/cancel commits, later effect completions may only report facts;
+   they cannot reactivate canceled or paused work outside the machine.
+7. Demote reconcile/resume fallback to recovery events. Reconcile may observe
+   durable authority and runtime surfaces, detach stale runtime handles, and
+   report `RUNTIME_SURFACE_*` or `STORAGE_AUTHORITY_RECOVERED`; it must not
+   privately rebuild queue work or force active/queued transitions.
+8. Tighten lint boundaries. `swexecutor`, `swqueueRuntime`, `swscheduler`,
+   `swquoraTabs`, and message handlers should be unable to import or call
+   durable queue mutation helpers except through the machine event API.
+9. Retire transitional direct-call allowances from `lint:queue-boundary` once
+   the corresponding call sites have event paths.
+
+### Local Gates Before Live Gates
+
+- `node --check` for touched service-worker modules.
+- `npm run lint:queue-boundary` after each slice that moves call sites.
+- `npm run lint:correctness` after each machine-contract change.
+- Focused synthetic sequences for:
+  - already-blocked terminalization under concurrency 1;
+  - activation handoff after terminal release;
+  - pause/cancel while effects are in flight;
+  - browser restart recovery with stale runtime handles;
+  - no direct executor durable mutation.
+- Full local test run only after a slice has a coherent machine boundary. Do
+  not chase old assumptions in broad tests until the relevant behavior has been
+  moved to the machine.
+
+### Live Gate Re-entry
+
+Return to live gates only after the local already-blocked and activation
+handoff sequences show the intended critical path.
+
+- Start at `4/1`.
+- For already-blocked rows, target about one second per terminal row once the
+  profile observation is reported.
+- Report elapsed time and activation handoff time for every run.
+- Audit the flight recorder for repeated active/queued/succeeded/queued
+  bouncing before scaling.
+- Scale only when the smaller run has no bounce cases and no broad fallback
+  wait in the hot path: `8/1`, `16/1`, `16/2`, then larger gates.
+
+### Stop Rules
+
+- Do not add another timeout or skip-list patch to improve live timing unless
+  the patch is explicitly part of the machine event contract.
+- Do not preserve a runtime helper because a synthetic test assumes old split
+  ownership; reclassify the test against the new boundary.
+- Do not allow compatibility projection or dual-write paths to become a second
+  source of queue truth.
+- Do not treat storage as a background optimization for queue transitions. The
+  commit plus resident projection is the serialization point for machine
+  correctness.

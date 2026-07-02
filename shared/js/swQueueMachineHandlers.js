@@ -63,6 +63,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const terminateActiveCoordinatorProfileRedirectMismatch = requireQueueMachineCapability('durable', durable, 'terminateActiveCoordinatorProfileRedirectMismatch')
     const terminateQueuedAuthorityEnqueueFailureCoordinatorItems = requireQueueMachineCapability('durable', durable, 'terminateQueuedAuthorityEnqueueFailureCoordinatorItems')
     const settleTerminalCoordinatorItems = requireQueueMachineCapability('durable', durable, 'settleTerminalCoordinatorItems')
+    const planQueuedActivationIntentForSlotEvent = requireQueueMachineCapability('projection', projection, 'planQueuedActivationIntentForSlotEvent')
     const reprimeQueuedTabActionsForNoOpenEvent = requireQueueMachineCapability('projection', projection, 'reprimeQueuedTabActionsForNoOpenEvent')
     const recoverPendingTabActionFromCoordinatorQueue = requireQueueMachineCapability('runtime', runtime, 'recoverPendingTabActionFromCoordinatorQueue')
     const recoverQueuedAuthorityLiveTabAfterMaterializationFailure = requireQueueMachineCapability('runtime', runtime, 'recoverQueuedAuthorityLiveTabAfterMaterializationFailure')
@@ -148,15 +149,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 residentState?.queue?.[event.href || ''] ||
                 residentState?.queue?.[event.coordinatorKey || ''] ||
                 null
-            const activeLease = normalizeCoordinatorActionLease(residentItem?.actionLease || event.item?.actionLease || null)
-            if(activeLease && !isCoordinatorActionLeaseExpired(activeLease) && isActiveCoordinatorStatus(residentItem?.status || event.item?.status)) {
-                return {
-                    changed: false,
-                    reason: 'active-action-lease-live',
-                    itemKey,
-                    tabId: activeLease.tabId || null
-                }
-            }
             return requeueDurableActiveCoordinatorItemWithoutActor(
                 itemKey,
                 event.item || null,
@@ -165,7 +157,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 {
                     currentAuthorityState: event.currentAuthorityState || null,
                     timeoutMs: event.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
-                    skipFreshOpenDeferralAfterLeaseRelease: event.skipFreshOpenDeferralAfterLeaseRelease !== false,
+                    skipFreshOpenDeferralAfterLeaseRelease: event.skipFreshOpenDeferralAfterLeaseRelease === true,
                     skipActionPhaseProtection: event.skipActionPhaseProtection === true,
                     skipFreshContentReadiness: event.skipFreshContentReadiness === true,
                     skipLiveReclaimAdoption: event.skipLiveReclaimAdoption === true,
@@ -314,6 +306,9 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
         },
         [QUEUE_MACHINE_EVENT_TYPES.QUEUED_NO_OPEN_REPRIME]: async (event = {}) => {
             return reprimeQueuedTabActionsForNoOpenEvent(event)
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.SLOT_AVAILABLE]: async (event = {}) => {
+            return planQueuedActivationIntentForSlotEvent(event)
         },
         [QUEUE_MACHINE_EVENT_TYPES.TAB_OPENED]: async (event = {}, operation = {}) => {
             const type = normalizeQueueMachineEventType(event?.type || '')

@@ -33,9 +33,9 @@ runMain(async () => {
     })
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     let targets = await getTargets(config)
-    let target = targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl) ||
-        targets.find(candidate => candidate.type === 'service_worker' &&
-            `${candidate.url || ''}`.includes(config.extensionId))
+    let target = targets.find(candidate => candidate.type === 'service_worker' &&
+            `${candidate.url || ''}`.includes(config.extensionId)) ||
+        targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl)
 
     if(!target) {
         const versionInfo = await getJson('/json/version', config)
@@ -44,9 +44,9 @@ runMain(async () => {
         }, 10000)
         await sleep(1500)
         targets = await getTargets(config)
-        target = targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl) ||
-            targets.find(candidate => candidate.type === 'service_worker' &&
-                `${candidate.url || ''}`.includes(config.extensionId))
+        target = targets.find(candidate => candidate.type === 'service_worker' &&
+                `${candidate.url || ''}`.includes(config.extensionId)) ||
+            targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl)
     }
 
     if(!target) throw new Error('extension context not found for coordinator cleanup')

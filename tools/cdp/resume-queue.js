@@ -50,18 +50,6 @@ runMain(async () => {
                     done()
                 }
             }
-            if(options.clearPause && typeof chrome?.storage?.local?.set === 'function') {
-                try {
-                    const result = chrome.storage.local.set({mbCoordinatorPaused: false}, schedule)
-                    if(result && typeof result.then === 'function') {
-                        result.then(schedule).catch(schedule)
-                    }
-                }
-                catch {
-                    schedule()
-                }
-                return true
-            }
             schedule()
             return true
         }
