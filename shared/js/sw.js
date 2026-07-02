@@ -275,6 +275,7 @@ let queuedTabFillPromise = null
 let queuedTabFillPromiseStartedAt = 0
 let queuedTabFillAuthorityState = null
 let queuedTabFillPromiseClearRequested = false
+let queuedTabFillOpeningActionKey = ''
 let queuedTabNudgeAttemptedAtByTabId = new Map()
 let profileNukeProgress = {}
 let coordinatorAuthorityShadowWalStore = makePairedCheckpointStore({queue: {}}, {
@@ -2327,6 +2328,22 @@ function getQueuedActivationGuardKey(value = null) {
     const attemptNumber = getAttemptNumberFromValue(value)
     if(!ownerId || !subjectKey || !actionKind || !attemptId || !attemptNumber) return ''
     return [ownerId, subjectKey, actionKind, attemptId, attemptNumber].join('|')
+}
+
+function getQueuedRuntimeActionFillKey(action = null, targetItem = null) {
+    if(!action && !targetItem) return ''
+    const subject = action?.profileHref ||
+        action?.targetProfileHref ||
+        action?.coordinatorKey ||
+        action?.requestedUrl ||
+        action?.url ||
+        getCoordinatorItemHref(targetItem) ||
+        ''
+    return getQueuedTabActionKey(
+        action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+        subject,
+        action?.tabAction || getCoordinatorItemExecutorTabAction(targetItem)
+    )
 }
 
 function pruneQueuedActivationGuards(now = Date.now()) {
@@ -5360,6 +5377,7 @@ function clearStaleQueuedTabFillPromise(reason = 'queued-tab-fill') {
 
     queuedTabFillPromise = null
     queuedTabFillPromiseStartedAt = 0
+    queuedTabFillOpeningActionKey = ''
     incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
     if(idleLatch) incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
     pushQueueWakeupJournalEntry({
@@ -5442,6 +5460,7 @@ function clearStorageTimeoutPromiseLatches(reason = 'storage-timeout', timeoutMs
     if(queuedTabFillPromise && getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) >= effectiveRecoveryStaleMs) {
         queuedTabFillPromise = null
         queuedTabFillPromiseStartedAt = 0
+        queuedTabFillOpeningActionKey = ''
         cleared = true
         incrementQueueWakeupMetric('storageUpdate.clearedTimedOutFillPromise')
     }
@@ -13503,6 +13522,7 @@ async function recoverQueuedRuntimeActionsAfterExecutorEnqueueTimeout(ownerTabId
         if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
             queuedTabFillPromise = null
             queuedTabFillPromiseStartedAt = 0
+            queuedTabFillOpeningActionKey = ''
             fillPromiseCleared = true
             incrementQueueWakeupMetric('pump.changed.clearedExecutorTimeoutIdleFillPromise')
             recordCoordinatorDiagnosticEvent(
@@ -13586,6 +13606,7 @@ async function recoverQueuedRuntimeActionsAfterExecutorEnqueueTimeout(ownerTabId
         if(queuedTabFillPromise) {
             queuedTabFillPromise = null
             queuedTabFillPromiseStartedAt = 0
+            queuedTabFillOpeningActionKey = ''
             fillPromiseCleared = true
             incrementQueueWakeupMetric('pump.changed.clearedExecutorTimeoutFillPromise')
         }
@@ -18581,7 +18602,12 @@ async function resolveQueuedStaleRuntimeExecutorCase(classified = null, options 
             }
             return pruned
         }
-        if(options.awaitFill === true && queuedTabFillPromise) {
+        const queuedActionFillKey = getQueuedRuntimeActionFillKey(queuedAction, item)
+        const shouldAwaitCurrentFillForQueuedAction = queuedTabFillPromise &&
+            queuedActionFillKey &&
+            queuedTabFillOpeningActionKey &&
+            queuedActionFillKey === queuedTabFillOpeningActionKey
+        if(options.awaitFill === true && shouldAwaitCurrentFillForQueuedAction) {
             const fillResult = await promiseWithTimeout(
                 queuedTabFillPromise,
                 QUEUED_TAB_CREATE_TIMEOUT_MS * 2,
@@ -23439,6 +23465,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         queuedTabFillPromise = null
         queuedTabFillPromiseStartedAt = 0
         queuedTabFillAuthorityState = null
+        queuedTabFillOpeningActionKey = ''
         incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
         incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
     }
@@ -23637,6 +23664,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         queuedTabFillPromise = null
         queuedTabFillPromiseStartedAt = 0
         queuedTabFillAuthorityState = null
+        queuedTabFillOpeningActionKey = ''
         incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
         if(isRuntimeAndStorageIdleForPromiseLatch()) {
             incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
@@ -29285,12 +29313,43 @@ function hasQueuedWorkerActionSurfaceRuntimeWork(windowId = queuedActionSurfaceW
     return false
 }
 
-async function closeQueuedWorkerActionSurfaceIfIdle(reason = 'idle') {
-    const windowId = Number.parseInt(queuedActionSurfaceWindowId, 10) || 0
+function hasDurableQueuedBacklogForActionSurface(queue = {}, windowId = null) {
+    const queuedItems = Object.values(queue || {})
+        .filter(item => `${item?.status || ''}`.trim() === 'queued')
+    if(!queuedItems.length) return false
+
+    const normalizedWindowId = Number.parseInt(windowId, 10) || 0
+    if(normalizedWindowId && queuedItems.every(item =>
+        `${item?.actionSurfaceMode || ''}`.trim() === 'worker-window' &&
+        Number.parseInt(item?.actionSurfaceWindowId, 10) === normalizedWindowId)) {
+        return false
+    }
+    return true
+}
+
+async function hasDurableQueuedCoordinatorWorkForActionSurface(reason = 'worker-surface-cleanup', windowId = null) {
+    const authorityState = await loadCoordinatorCurrentAuthorityState({
+        [COORDINATOR_PAUSED_KEY]: false
+    }).catch(() => null)
+    if(hasDurableQueuedBacklogForActionSurface(authorityState?.queue || {}, windowId)) {
+        incrementQueueWakeupMetric(`actionSurface.workerWindow.cleanupBusyDurableQueued.${normalizeStorageMetricPathName(reason || 'worker-surface-cleanup')}`)
+        return true
+    }
+
+    if(authorityState?.queue) return false
+    return hasDurableQueuedBacklogForActionSurface(coordinatorAuthority.current()?.queue || {}, windowId)
+}
+
+async function closeQueuedWorkerActionSurfaceIfIdle(reason = 'idle', options = {}) {
+    const windowId = Number.parseInt(options.windowId || queuedActionSurfaceWindowId, 10) || 0
     if(!windowId) {
         const closed = await closeIdleQueuedWorkerActionSurfaceWindows(reason)
         if(closed) return true
         incrementQueueWakeupMetric('actionSurface.workerWindow.cleanupNoWindow')
+        return false
+    }
+    if(await hasDurableQueuedCoordinatorWorkForActionSurface(reason, windowId)) {
+        incrementQueueWakeupMetric('actionSurface.workerWindow.cleanupBusy.durableQueued')
         return false
     }
     const win = await browser.windows?.get?.(windowId, {populate: true}).catch(() => null)
@@ -36167,6 +36226,7 @@ async function fillQueuedTabs(options = {}) {
 
     queuedTabFillPromiseStartedAt = Date.now()
     queuedTabFillPromiseClearRequested = false
+    queuedTabFillOpeningActionKey = ''
     queuedTabFillAuthorityState = options.currentAuthorityState?.queue
         ? options.currentAuthorityState
         : getHydratedCoordinatorAuthorityState('pump.fill.usedResidentAuthority')
@@ -36232,6 +36292,7 @@ async function fillQueuedTabs(options = {}) {
                 queuedTabFillPromise = null
                 queuedTabFillPromiseStartedAt = 0
                 queuedTabFillAuthorityState = null
+                queuedTabFillOpeningActionKey = ''
                 queuedTabFillPromiseClearRequested = false
             }
         })
@@ -36240,6 +36301,7 @@ async function fillQueuedTabs(options = {}) {
         queuedTabFillPromise = null
         queuedTabFillPromiseStartedAt = 0
         queuedTabFillAuthorityState = null
+        queuedTabFillOpeningActionKey = ''
         queuedTabFillPromiseClearRequested = false
         incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
         incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
@@ -37305,12 +37367,14 @@ async function fillQueuedTabsOnce(options = {}) {
                 })
                 break
             }
+            queuedTabFillOpeningActionKey = getQueuedRuntimeActionFillKey(next) || ''
 
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
             openReservationHref = reserveQueuedProfileOpen(next, 'queued-tab-create')
             if(!openReservationHref) {
                 releaseQueuedActivationGuard(next)
                 activationGuardKey = ''
+                queuedTabFillOpeningActionKey = ''
                 queueRuntime.requeueActivationIntent(next, {
                     source: 'runtime-effect'
                 })
@@ -37419,6 +37483,7 @@ async function fillQueuedTabsOnce(options = {}) {
                 }
                 else {
                     releaseQueuedActivationGuard(next)
+                    queuedTabFillOpeningActionKey = ''
                     fillFailureReason = 'queued-tab-open-failed'
                     fillFailureError = openFailure
                     recordFlightRecorderEvent({
@@ -37499,6 +37564,7 @@ async function fillQueuedTabsOnce(options = {}) {
                     currentAuthorityState: coordinatorAuthority.current()
                 }).catch(() => false)
                 releaseQueuedActivationGuard(next)
+                queuedTabFillOpeningActionKey = ''
                 cleanupQueuedTabMetadataOnly(tab.id)
                 releaseQueuedProfileOpenReservation(openReservationHref)
                 openReservationHref = ''
@@ -37541,6 +37607,7 @@ async function fillQueuedTabsOnce(options = {}) {
                     queuedTabFillPromise = null
                     queuedTabFillPromiseStartedAt = 0
                     queuedTabFillAuthorityState = null
+                    queuedTabFillOpeningActionKey = ''
                     incrementQueueWakeupMetric('pump.changed.clearedFillPromiseAfterDurableActive')
                     incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
                     incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
@@ -37658,6 +37725,7 @@ async function fillQueuedTabsOnce(options = {}) {
         }
         catch(error) {
             if(activationGuardKey) queuedActivationGuards.delete(activationGuardKey)
+            queuedTabFillOpeningActionKey = ''
             releaseQueuedProfileOpenReservation(openReservationHref)
             scheduleCoordinatorQueueResume(1000, 'queued-tab-fill-error', {
                 allowBeforeQuora: true
@@ -38701,15 +38769,13 @@ browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     return browser.tabs.remove(tabId)
                         .then(async () => {
                             if(shouldCleanupWorkerSurface) {
-                                const workerWindowId = Number.parseInt(sender.tab?.windowId, 10) || 0
-                                if(workerWindowId) {
-                                    await closeQueuedWorkerActionSurfaceWindow(workerWindowId, 'idle-after-release').catch(() => false)
-                                }
-                                else {
-                                    await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release').catch(() => false)
-                                }
+                                await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
+                                    windowId: sender.tab?.windowId || null
+                                }).catch(() => false)
                             }
-                            await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
+                            else {
+                                await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
+                            }
                             return {closed: true}
                         })
                         .catch(() => ({closed: false}))

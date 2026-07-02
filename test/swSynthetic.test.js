@@ -16005,6 +16005,92 @@ test('service-worker worker window closes after queued worker surface becomes id
     assert.ok(browser.__removedTabs.includes(profileTab.id))
 })
 
+test('service-worker worker window stays open while durable queued work remains', async () => {
+    const firstHref = 'https://www.quora.com/profile/Synthetic-Worker-Surface-Batch-First'
+    const secondHref = 'https://www.quora.com/profile/Synthetic-Worker-Surface-Batch-Second'
+    const runId = 'run-worker-surface-batch'
+    const firstAttemptId = 'attempt-worker-surface-batch-first'
+    const secondAttemptId = 'attempt-worker-surface-batch-second'
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 2089,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [firstHref]: {
+                    ...makeQueuedCoordinatorRow({href: firstHref, runId, attemptId: firstAttemptId, now: 2000}),
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                },
+                [secondHref]: {
+                    ...makeQueuedCoordinatorRow({href: secondHref, runId, attemptId: secondAttemptId, now: 2001}),
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: firstHref, runId, targetProfileHrefs: [firstHref, secondHref]})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await browser.tabs.create({url: 'https://www.quora.com/search?q=elon', active: true})
+
+    await settleWithFakeTimers(sw.resumeCoordinatorQueueExecution({
+        tabId: 'service-worker-queue-owner',
+        windowId: null
+    }, {
+        serviceWorkerOwned: true,
+        skipAuthorityReconcile: true,
+        awaitFill: true
+    }), timers)
+
+    const profileTab = listTabs(browser).find(tab => tab.url === firstHref)
+    assert.ok(profileTab?.id)
+    const workerWindowId = profileTab.windowId
+    assert.ok(browser.__windows.has(workerWindowId))
+    await waitFor(
+        () => sw.coordinatorAuthority.current().queue[firstHref]?.status === 'active',
+        'first worker-window profile tab did not become durable active before close',
+        {timers, attempts: 20, tickMs: 100}
+    )
+
+    await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'record-job-terminal',
+        profileHref: firstHref,
+        patch: {
+            status: 'blocked',
+            blockSucceeded: true,
+            blockedAt: 2100,
+            terminalAt: 2100,
+            actionKind: 'mute-block',
+            runId,
+            attemptId: firstAttemptId,
+            attemptNumber: 1
+        },
+        attemptId: firstAttemptId,
+        attemptNumber: 1
+    }, {
+        tab: {id: profileTab.id, url: firstHref, windowId: workerWindowId}
+    }), timers)
+
+    await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'close-tab',
+        attemptId: firstAttemptId,
+        attemptNumber: 1
+    }, {
+        tab: {id: profileTab.id, url: firstHref, windowId: workerWindowId}
+    }), timers)
+    await timers.tick(2000)
+    await flushAsync(20)
+
+    const recoveredQueue = getRecoveredCoordinatorQueue(storage)
+    assert.equal(recoveredQueue[secondHref].status, 'queued')
+    assert.equal(browser.__tabs.has(profileTab.id), false)
+    assert.equal(browser.__windows.has(workerWindowId), true)
+    assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy.durableQueued'] > 0, true)
+})
+
 test('confirmation promotion in no-foreground worker window briefly focuses and restores caller window', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Worker-Surface-Promote'
     const runId = 'run-worker-surface-promote'
@@ -24485,6 +24571,90 @@ test('executor apply consumes queued-with-stale-runtime-surface by pruning volat
     assert.notEqual(after.executor.primaryCase, 'queued-with-stale-runtime-surface')
 })
 
+test('executor apply does not wait on unrelated fill promise for queued stale runtime', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Stale-Runtime-Unrelated-Fill'
+    const runId = 'run-stale-runtime-unrelated-fill'
+    const attemptId = 'attempt-stale-runtime-unrelated-fill'
+    const unrelatedHref = 'https://www.quora.com/profile/Synthetic-Unrelated-Opening'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 100000}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddQueuedAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        noForegroundFallback: true,
+        executorPlanKind: 'open-tab',
+        executorPlanReason: 'synthetic-preplanned-open',
+        executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillOpeningAction({
+        url: unrelatedHref,
+        profileHref: unrelatedHref,
+        coordinatorKey: unrelatedHref,
+        requestedUrl: unrelatedHref,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId: 'attempt-unrelated-opening',
+        attemptNumber: 1
+    })
+    sw.__testSetQueuedTabFillPromise(Promise.resolve({
+        openedTabs: 1,
+        active: 0,
+        schedulerBlockingActive: 0,
+        remainingActions: 1,
+        reason: 'opened-unrelated-tab'
+    }), 100000)
+
+    const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-stale-runtime-unrelated-fill', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500]
+    )
+
+    assert.equal(result.consumedExecutorCases.some(item =>
+        item.case === 'queued-with-stale-runtime-surface' &&
+        item.reason === 'queued-stale-runtime-pruned-before-authority-fill'), true)
+    assert.equal(result.unresolvedExecutorCases.some(item => item.case === 'queued-with-stale-runtime-surface'), false)
+    assert.equal(sw.state().queuedTabActions.length <= 1, true)
+    if(sw.state().queuedTabActions.length) {
+        assert.equal(sw.state().queuedTabActions[0].profileHref, href)
+    }
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
+})
+
 test('executor apply blocks fresh enqueue while queued stale runtime is unresolved', async () => {
     const staleHref = 'https://www.quora.com/profile/Synthetic-Stale-Runtime-Blocks-Fresh'
     const freshHref = 'https://www.quora.com/profile/Synthetic-Fresh-Blocked-By-Stale-Runtime'
@@ -25042,6 +25212,18 @@ test('executor apply prunes queued stale runtime action after fill timeout', asy
         executorPlanReason: 'synthetic-preplanned-open',
         executorPlanAuthorityValidated: true
     })
+    sw.__testSetQueuedTabFillOpeningAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1
+    })
     sw.__testSetQueuedTabFillPromise(new Promise((resolve, reject) => {
         timers.setTimeout(() => reject(new Error('synthetic queued stale runtime fill timeout')), 0)
     }), 100000)
@@ -25109,6 +25291,18 @@ test('executor apply prunes queued stale runtime action opened without authority
         executorPlanKind: 'open-tab',
         executorPlanReason: 'synthetic-preplanned-open',
         executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillOpeningAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1
     })
     sw.__testSetQueuedTabFillPromise(Promise.resolve({
         openedTabs: 1,
@@ -25204,6 +25398,18 @@ test('executor apply classifies stale queued runtime from an older attempt as st
         executorPlanReason: 'synthetic-stale-attempt-runtime',
         executorPlanAuthorityValidated: true
     })
+    sw.__testSetQueuedTabFillOpeningAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId: staleAttemptId,
+        attemptNumber: 2
+    })
     sw.__testSetQueuedTabFillPromise(Promise.resolve({
         openedTabs: 1,
         active: 0,
@@ -25283,6 +25489,18 @@ test('executor apply consumes queued stale runtime action drained before authori
         executorPlanKind: 'open-tab',
         executorPlanReason: 'synthetic-preplanned-open',
         executorPlanAuthorityValidated: true
+    })
+    sw.__testSetQueuedTabFillOpeningAction({
+        url: href,
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        ownerTabId: 'service-worker-queue-owner',
+        runId,
+        attemptId,
+        attemptNumber: 1
     })
     sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
         timers.setTimeout(() => {
