@@ -25598,6 +25598,7 @@ test('executor apply prunes queued stale runtime action deferred before open by 
     assert.equal(result.consumed, true)
     assert.equal(result.unresolved, false)
     assert.equal(result.reason, 'queued-stale-runtime-pruned-before-authority-fill')
+    assert.equal(result.reprimeQueuedAuthority, true)
     assert.equal(sw.state().queuedTabActions.length, 0)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
 })
@@ -28462,6 +28463,7 @@ test('queued tab active transition does not carry executor authority state acros
     }
 
     sw.applyQueuedTabOpenRuntimeEffect(plan)
+    assert.notEqual(sw.__testClaimQueuedActivationGuard(action, tab, 'synthetic-active-transition'), '')
     const result = await sw.confirmQueuedTabOpenDurableActiveEffect(action, tab, plan)
     browser.storage.local.get = originalGet
 
@@ -28472,6 +28474,13 @@ test('queued tab active transition does not carry executor authority state acros
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
+    assert.equal(sw.state().queueWakeupCounters['pump.changed.releasedActivationGuardAfterDurableActive'] || 0, 1)
+    const afterWhyNotRunning = await sw.getCoordinatorWhyNotRunning({
+        reason: 'synthetic-active-transition-current-authority-after'
+    })
+    assert.equal(afterWhyNotRunning.executor.cases.some(item =>
+        item.case === 'queued-activation-in-flight' &&
+        item.rowKey === href), false)
     assert.ok(getStoredCoordinatorQueueWal(storage))
 })
 

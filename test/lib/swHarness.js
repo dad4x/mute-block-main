@@ -600,6 +600,9 @@ module.exports.__test = {
     __testClearQueuedActions() {
         queueRuntime.replaceActivationIntents([])
     },
+    __testClaimQueuedActivationGuard(action = {}, tab = null, reason = 'test') {
+        return claimQueuedActivationGuard(action, tab, reason)
+    },
     __testSetCoordinatorAuthorityShadowWalStore(value) {
         coordinatorAuthorityShadowWalStore = value
     },
