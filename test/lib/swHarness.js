@@ -613,6 +613,9 @@ module.exports.__test = {
         queuedTabFillPromise = promise
         queuedTabFillPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
     },
+    __testSetQueuedTabFillOpeningAction(action = null) {
+        queuedTabFillOpeningActionKey = getQueuedRuntimeActionFillKey(action) || ''
+    },
     __testSetCoordinatorExecutorStartPromise(promise, startedAt = Date.now()) {
         coordinatorExecutorStartPromise = promise
         coordinatorExecutorStartPromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
