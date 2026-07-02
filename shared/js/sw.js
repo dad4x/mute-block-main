@@ -336,6 +336,7 @@ let coordinatorStoredWorkRestorePromise = null
 let lastUserStartQueueResult = null
 let lastCoordinatorExecutorApplyResult = null
 let coordinatorExecutorClassificationSeq = 0
+let queueDrainedFlightRecorderArmed = true
 let queuedForegroundLeaseTabId = null
 let queueWakeupMetrics = makeEmptyQueueWakeupMetrics()
 let queueWakeupMetricsFlushPromise = null
@@ -17298,10 +17299,31 @@ async function classifyCoordinatorExecutorState(options = {}) {
     const executorClassificationId = 'executor-classification-' + (++coordinatorExecutorClassificationSeq) + '-' + generatedAt
 
     const runtimeCounts = queueRuntime.getRuntimeCounts()
-    if(!workRows &&
+    const queueCounts = getCoordinatorQueueWorkCounts(queue)
+    const queueAndRuntimeDrained = !workRows &&
         runtimeCounts.activeQueuedTabs <= 0 &&
         runtimeCounts.queuedTabActions <= 0 &&
-        runtimeCounts.pendingTabActions <= 0) {
+        runtimeCounts.pendingTabActions <= 0
+    if(!queueAndRuntimeDrained) {
+        queueDrainedFlightRecorderArmed = true
+    }
+    else if(queueDrainedFlightRecorderArmed) {
+        queueDrainedFlightRecorderArmed = false
+        recordFlightRecorderEvent({
+            kind: 'queue-drained',
+            source: 'classifyCoordinatorExecutorState',
+            reason: 'queue-empty-runtime-idle',
+            accepted: true,
+            durable: true,
+            durableActiveRows: queueCounts.durableActiveRows,
+            durableQueuedRows: queueCounts.durableQueuedRows,
+            durableTerminalRows: queueCounts.durableTerminalRows,
+            activeQueuedTabsCount: runtimeCounts.activeQueuedTabs,
+            queuedTabActionsCount: runtimeCounts.queuedTabActions,
+            pendingTabActionsCount: runtimeCounts.pendingTabActions
+        })
+    }
+    if(queueAndRuntimeDrained) {
         cases.push({
             case: 'idle-no-work',
             rowKey: '',
