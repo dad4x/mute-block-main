@@ -824,6 +824,7 @@ function hasCoordinatorRecoverySignal(whyNotRunning = null) {
 function isBenignIdleFlightRecorderEntry(entry = null) {
     const kind = `${entry?.kind || ''}`
     const reason = `${entry?.reason || ''}`
+    if(kind === 'queue-drained' && reason === 'queue-empty-runtime-idle') return true
     if(kind === 'executor-classification' && reason === 'idle-no-work') return true
     if(kind === 'start-resume' &&
             reason === 'dashboard-resume' &&
@@ -846,6 +847,55 @@ function isBenignIdleFlightRecorderEntry(entry = null) {
         return true
     }
     return false
+}
+
+function summarizeRecorderRunCompletion(flightRecorder = null) {
+    const entries = Array.isArray(flightRecorder?.response?.entries)
+        ? flightRecorder.response.entries
+        : []
+    const acceptedEntries = entries.filter(entry => Number.parseInt(entry?.at, 10) > 0)
+    const firstRunEvent = acceptedEntries.find(entry =>
+        entry.kind === 'start-resume' &&
+        entry.accepted === true) ||
+        acceptedEntries[0] ||
+        null
+    const firstActiveTransition = acceptedEntries.find(entry =>
+        entry.kind === 'active-transition' &&
+        entry.accepted === true) ||
+        null
+    const terminalMutations = acceptedEntries.filter(entry =>
+        entry.kind === 'authority-mutation' &&
+        entry.accepted === true &&
+        /succeeded|success|skipped|canceled|cancelled|failed|failure|blocked|terminal/i.test(`${entry.statusAfter || ''}`))
+    const lastTerminalMutation = terminalMutations[terminalMutations.length - 1] || null
+    const queueDrainedEvent = acceptedEntries.find(entry =>
+        entry.kind === 'queue-drained' &&
+        entry.reason === 'queue-empty-runtime-idle') ||
+        null
+    const idleNoWorkEvent = acceptedEntries.find(entry =>
+        entry.kind === 'executor-classification' &&
+        entry.reason === 'idle-no-work') ||
+        null
+    const drainEvent = queueDrainedEvent || idleNoWorkEvent || null
+    const startAt = Number.parseInt(firstRunEvent?.at, 10) || 0
+    const firstActiveAt = Number.parseInt(firstActiveTransition?.at, 10) || 0
+    const lastTerminalAt = Number.parseInt(lastTerminalMutation?.at, 10) || 0
+    const drainAt = Number.parseInt(drainEvent?.at, 10) || 0
+    return {
+        ok: !!startAt && !!drainAt,
+        source: queueDrainedEvent ? 'queue-drained' : idleNoWorkEvent ? 'idle-no-work-fallback' : '',
+        entryCount: entries.length,
+        newestSeq: Number.parseInt(flightRecorder?.response?.newestSeq, 10) || 0,
+        startSeq: Number.parseInt(firstRunEvent?.seq, 10) || 0,
+        firstActiveSeq: Number.parseInt(firstActiveTransition?.seq, 10) || 0,
+        lastTerminalSeq: Number.parseInt(lastTerminalMutation?.seq, 10) || 0,
+        drainSeq: Number.parseInt(drainEvent?.seq, 10) || 0,
+        runElapsedMs: startAt && drainAt ? Math.max(0, drainAt - startAt) : 0,
+        startToFirstActiveMs: startAt && firstActiveAt ? Math.max(0, firstActiveAt - startAt) : 0,
+        firstActiveToDrainMs: firstActiveAt && drainAt ? Math.max(0, drainAt - firstActiveAt) : 0,
+        terminalToDrainMs: lastTerminalAt && drainAt ? Math.max(0, drainAt - lastTerminalAt) : 0,
+        terminalMutationCount: terminalMutations.length
+    }
 }
 
 async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
@@ -2556,6 +2606,21 @@ function comparableSmallBatchQueueSmoke(smallBatchQueueSmoke = null) {
             ok: smallBatchQueueSmoke.idleFlightRecorder?.ok === true,
             entryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.entryCount || 0) || 0,
             noisyEntryCount: Number(smallBatchQueueSmoke.idleFlightRecorder?.noisyEntryCount || 0) || 0
+        },
+        recorderRunCompletion: {
+            ok: smallBatchQueueSmoke.recorderRunCompletion?.ok === true,
+            source: smallBatchQueueSmoke.recorderRunCompletion?.source || '',
+            entryCount: Number(smallBatchQueueSmoke.recorderRunCompletion?.entryCount || 0) || 0,
+            newestSeq: Number(smallBatchQueueSmoke.recorderRunCompletion?.newestSeq || 0) || 0,
+            startSeq: Number(smallBatchQueueSmoke.recorderRunCompletion?.startSeq || 0) || 0,
+            firstActiveSeq: Number(smallBatchQueueSmoke.recorderRunCompletion?.firstActiveSeq || 0) || 0,
+            lastTerminalSeq: Number(smallBatchQueueSmoke.recorderRunCompletion?.lastTerminalSeq || 0) || 0,
+            drainSeq: Number(smallBatchQueueSmoke.recorderRunCompletion?.drainSeq || 0) || 0,
+            runElapsedMs: Number(smallBatchQueueSmoke.recorderRunCompletion?.runElapsedMs || 0) || 0,
+            startToFirstActiveMs: Number(smallBatchQueueSmoke.recorderRunCompletion?.startToFirstActiveMs || 0) || 0,
+            firstActiveToDrainMs: Number(smallBatchQueueSmoke.recorderRunCompletion?.firstActiveToDrainMs || 0) || 0,
+            terminalToDrainMs: Number(smallBatchQueueSmoke.recorderRunCompletion?.terminalToDrainMs || 0) || 0,
+            terminalMutationCount: Number(smallBatchQueueSmoke.recorderRunCompletion?.terminalMutationCount || 0) || 0
         },
         timings: (smallBatchQueueSmoke.timings || []).map(entry => ({
             name: entry.name || '',
@@ -5409,6 +5474,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
     const preRestartFlightRecorder = options.includeFlightRecorder === true
         ? await readFlightRecorder(context, {limit: PHASE10_FLIGHT_RECORDER_LIMIT})
         : null
+    const recorderRunCompletion = summarizeRecorderRunCompletion(preRestartFlightRecorder)
     markTiming('terminal-diagnostics-read')
     if(terminal.timedOut) {
         tracePhase(options, `${phaseLabel} terminal wait failed before restart`, {
@@ -5479,6 +5545,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 timedOut: terminal.timedOut === true
             },
             terminalSelectedProgressRecords,
+            recorderRunCompletion,
             timings: phaseState.timings,
             preRestartFlightRecorder,
             terminalFailureDiagnostic: diagnostic?.snapshot || null,
@@ -5555,6 +5622,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
                 authority: terminal.authority
             },
             terminalSelectedProgressRecords,
+            recorderRunCompletion,
             timings: phaseState.timings,
             preRestartFlightRecorder,
             restartAfterTerminal: null,
@@ -5657,6 +5725,7 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             authority: terminal.authority
         },
         terminalSelectedProgressRecords,
+        recorderRunCompletion,
         timings: phaseState.timings,
         preRestartFlightRecorder,
         restartAfterTerminal,
@@ -5665,7 +5734,8 @@ async function runSmallBatchQueueAuthoritySmoke(config, options, context, warnin
             queue: afterRestartAfterTerminal.summary,
             fullQueue: afterRestartAfterTerminal.fullSummary,
             authority: afterRestartAfterTerminal.authority
-        }
+        },
+        idleFlightRecorder
     })
 }
 

@@ -12881,6 +12881,35 @@ test("flight recorder filters by kind rowKey and targetUrl", async () => {
     assert.equal(since.entries.every(entry => entry.seq > byTarget.entries[0].seq), true)
 })
 
+test("flight recorder records queue drained counters", async () => {
+    const {sw} = loadServiceWorkerHarness({now: 2500})
+    sw.__testResetFlightRecorder()
+
+    sw.recordFlightRecorderEvent({
+        kind: "queue-drained",
+        source: "synthetic",
+        reason: "queue-empty-runtime-idle",
+        accepted: true,
+        durable: true,
+        durableActiveRows: 0,
+        durableQueuedRows: 0,
+        durableTerminalRows: 4,
+        activeQueuedTabsCount: 0,
+        queuedTabActionsCount: 0,
+        pendingTabActionsCount: 0
+    })
+
+    const snapshot = sw.getFlightRecorderSnapshot({kind: "queue-drained"})
+    assert.equal(snapshot.entries.length, 1)
+    assert.equal(snapshot.entries[0].reason, "queue-empty-runtime-idle")
+    assert.equal(snapshot.entries[0].durableActiveRows, 0)
+    assert.equal(snapshot.entries[0].durableQueuedRows, 0)
+    assert.equal(snapshot.entries[0].durableTerminalRows, 4)
+    assert.equal(snapshot.entries[0].activeQueuedTabsCount, 0)
+    assert.equal(snapshot.entries[0].queuedTabActionsCount, 0)
+    assert.equal(snapshot.entries[0].pendingTabActionsCount, 0)
+})
+
 test("flight recorder read action does not write storage or schedule work", async () => {
     const {browser, sw, storage} = loadServiceWorkerHarness({now: 3000})
     sw.__testResetFlightRecorder()

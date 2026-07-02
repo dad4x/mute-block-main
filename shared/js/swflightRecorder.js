@@ -19,6 +19,7 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "fill-decision",
     "fill-recovery",
     "executor-classification",
+    "queue-drained",
     "authority-mutation",
     "compact-view-materialized",
     "dashboard-refresh",
@@ -119,7 +120,10 @@ function sanitizeFlightRecorderEntry(entry = {}) {
         "queuedTabActionsCount",
         "activeQueuedTabsCount",
         "pendingTabActionsCount",
-        "durablyActiveQueuedTabsCount"
+        "durablyActiveQueuedTabsCount",
+        "durableActiveRows",
+        "durableQueuedRows",
+        "durableTerminalRows"
     ]) {
         const value = sanitizeFlightRecorderInteger(entry?.[field])
         if(value !== undefined) sanitized[field] = value
