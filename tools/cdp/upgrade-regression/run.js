@@ -261,7 +261,7 @@ function parseArgs(argv) {
         phase10SkipPostTerminalChecks: false,
         phase10WatchdogSelfTest: false,
         allowWorkProducing: false,
-        includeFlightRecorder: false,
+        includeFlightRecorder: true,
         verbose: false
     }
 

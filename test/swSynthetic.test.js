@@ -9112,6 +9112,111 @@ test('queued profile tab redirecting to a different profile is skipped and close
     assert.deepEqual(sw.state().activeQueuedTabs, [])
 })
 
+test('late successful terminal progress does not overwrite profile redirect mismatch skip', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Redirect-Source'
+    const redirectedHref = 'https://www.quora.com/profile/Synthetic-Redirect-Destination'
+    const runId = 'run-profile-redirect-mismatch-late-progress'
+    const attemptId = 'attempt-profile-redirect-mismatch-late-progress'
+    const tabId = 507
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
+        now: 411500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 411500})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'tab-opening',
+                    runId,
+                    tabId,
+                    tabOpenedAt: 411500,
+                    updatedAt: 411500,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1
+                }
+            }
+        }
+    })
+    browser.__tabs.set(tabId, {
+        id: tabId,
+        windowId: 1,
+        url: redirectedHref,
+        active: true,
+        status: 'complete'
+    })
+    sw.__testAddProvisionalQueuedTab(tabId, {
+        profileHref: href,
+        coordinatorKey: href,
+        requestedUrl: href,
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        runId,
+        ownerTabId: 'service-worker-queue-owner',
+        attemptId,
+        attemptNumber: 1,
+        openedAt: 411500
+    })
+
+    await browser.tabs.onUpdated.emit(tabId, {
+        status: 'complete',
+        url: redirectedHref
+    }, {
+        id: tabId,
+        windowId: 1,
+        url: redirectedHref,
+        status: 'complete'
+    })
+    await flushAsync(20)
+    await timers.tick(1000)
+    await flushAsync(20)
+
+    await waitFor(
+        () => sw.coordinatorAuthority.current().queue[href]?.status === 'skipped' ||
+            getRecoveredCoordinatorQueue(storage)[href]?.status === 'skipped',
+        'profile redirect mismatch authority row was not terminalized before late progress',
+        {timers, attempts: 20, tickMs: 100}
+    )
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'profile-redirect-mismatch')
+
+    const lateResult = await browser.runtime.sendMessage({
+        action: 'record-job-terminal',
+        profileHref: href,
+        patch: {
+            status: 'already-blocked',
+            blockSucceeded: true,
+            foundBlockedBeforeQueue: true,
+            blockedAt: 411700,
+            terminalAt: 411700,
+            updatedAt: 411700,
+            actionKind: 'mute-block',
+            runId,
+            tabId,
+            attemptId,
+            attemptNumber: 1
+        },
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {id: tabId, url: redirectedHref, windowId: 1}
+    })
+
+    assert.equal(lateResult.terminal, true)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'profile-redirect-mismatch')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'skipped')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].outcome, 'profile-redirect-mismatch')
+    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
+    assert.equal(getProgressShardRecord(storage, href).resolvedProfileHref, redirectedHref)
+})
+
 test('authority reconcile skips durable active profile row that landed on a non-profile Quora URL', async () => {
     const href = 'https://www.quora.com/profile/Top-10'
     const topicUrl = 'https://www.quora.com/topic/TOP-10'
@@ -19714,10 +19819,16 @@ test('executor apply requeues actorless active row and re-primes queued no-open 
         item.rowKey === queuedHref &&
         item.reason === 'queued-live-tab-adopted-after-materialization-timeout' &&
         item.fillResultReason === 'queued-tab-fill-timeout')
+    const queuedNoOpenTimeoutBeforeAttempt = result.unresolvedExecutorCases.some(item =>
+        item.case === 'queued-authority-without-executor-surface' &&
+        item.rowKey === queuedHref &&
+        item.reason === 'queued-tab-fill-timeout-before-open-attempt' &&
+        item.fillResultReason === 'queued-tab-fill-timeout')
     const queuedRuntimeAccepted = queuedRuntimeMaterialized ||
         queuedRuntimeMaterializing ||
         queuedRuntimeMaterializingUnresolved ||
-        queuedLiveTabAdoptedAfterTimeout
+        queuedLiveTabAdoptedAfterTimeout ||
+        queuedNoOpenTimeoutBeforeAttempt
     assert.equal(queuedNoOpenUnresolved || queuedRuntimeAccepted, true, JSON.stringify({
         result,
         queuedActions: sw.state().queuedTabActions,

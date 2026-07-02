@@ -8128,7 +8128,10 @@ function makeTerminalProgressRecordFromCoordinatorItem(href = '', item = {}, pre
     else if(item.status === 'skipped') {
         Object.assign(patch, {
             status: 'profile-unavailable',
-            unavailableReason: item.error || previousRecord.unavailableReason || 'Profile unavailable'
+            unavailableReason: item.error || previousRecord.unavailableReason || 'Profile unavailable',
+            lastUrl: previousRecord.lastUrl || '',
+            resolvedProfileHref: previousRecord.resolvedProfileHref || '',
+            remappedFromRequested: previousRecord.remappedFromRequested === true
         })
     }
     else {
@@ -8190,6 +8193,13 @@ function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = 
 function shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item = null, record = null, mapped = null) {
     const itemStatus = `${item?.status || ''}`.trim()
     if(!item || !record || !isTerminalCoordinatorStatus(itemStatus) || itemStatus === 'succeeded') return false
+    const itemOutcome = `${item.outcome || ''}`.trim()
+    if(itemStatus === 'skipped' && (
+        itemOutcome === 'profile-redirect-mismatch' ||
+        itemOutcome === 'non-profile-target'
+    )) {
+        return false
+    }
 
     const effectiveMapped = mapped || getCoordinatorStatusFromProgress(record)
     if(effectiveMapped.status !== 'succeeded') return false
@@ -16172,6 +16182,9 @@ async function shouldOpenQueuedTabAction(action = null, options = {}) {
     const normalizedHref = normalizeQuoraProfileUrl(action?.profileHref || action?.url || '')
     const coordinatorKey = action?.coordinatorKey || (normalizedHref ? normalizedHref : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
     if(!normalizedHref && !coordinatorKey) return {open: false, reason: 'invalid-target', decisionBranch: 'invalid-target'}
+    if(hasQueuedActivationGuard(action)) {
+        return {open: false, reason: 'queued-activation-in-flight', decisionBranch: 'queued-activation-in-flight'}
+    }
 
     let queue = {}
     let progress = {}
@@ -17219,9 +17232,20 @@ async function classifyCoordinatorExecutorState(options = {}) {
             const liveTab = getLiveTabForCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord) ||
                 getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item, effectiveRecord, itemKey, liveProfileTabsByHref) ||
                 await getWorkerSurfaceLiveTabForQueuedCoordinatorItem(item, itemKey, liveProfileTabsByHref, effectiveRecord)
+            const guardedAction = buildCoordinatorExecutorActionForQueuedItem(
+                item,
+                SERVICE_WORKER_QUEUE_OWNER_ID,
+                null,
+                {fallbackKey: itemKey}
+            )
+            const activationInFlight = guardedAction && hasQueuedActivationGuard(guardedAction)
             let caseName = ''
             let reason = ''
-            if(runtimeSurface.hasSurface) {
+            if(activationInFlight) {
+                caseName = 'queued-activation-in-flight'
+                reason = 'queued-authority-activation-in-flight'
+            }
+            else if(runtimeSurface.hasSurface) {
                 caseName = 'queued-with-stale-runtime-surface'
                 reason = 'queued-authority-has-runtime-surface'
             }
@@ -35402,6 +35426,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         let progressChanged = false
         let progressChangedRows = 0
         let terminalProgressRows = 0
+        let restoredTerminalProgressRows = 0
 
         for(const [normalizedHref, patch] of Object.entries(normalizedRecords)) {
             const item = queue[normalizedHref] || null
@@ -35485,11 +35510,13 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                         normalizedHref,
                         item,
                         record,
-                        'Restored terminal profile progress from authoritative queue row'
+                        'Restored terminal profile progress from authoritative queue row',
+                        {replaceProgressRecord: true}
                     )
                     if(restoredRecord) {
                         record = restoredRecord
                         terminal = true
+                        restoredTerminalProgressRows += 1
                     }
                 }
                 else if(shouldRestoreTerminalProgressFromCoordinatorItem(item, record)) {
@@ -35497,11 +35524,13 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                         normalizedHref,
                         item,
                         record,
-                        'Restored terminal profile progress from authoritative queue row'
+                        'Restored terminal profile progress from authoritative queue row',
+                        {replaceProgressRecord: true}
                     )
                     if(restoredRecord) {
                         record = restoredRecord
                         terminal = true
+                        restoredTerminalProgressRows += 1
                     }
                 }
                 else if(isRedundantTerminalProgressForCoordinatorItem(item, record, mapped)) {
@@ -35628,10 +35657,34 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
             let inlineDerivedSaved = true
             if(progressChanged) {
                 if(inlineQueueOperation === 'terminal-progress') {
-                    saveTerminalProgressProjectionAfterAuthority(
-                        inlineProgressProjectionRecords,
-                        `${inlineMetricPrefix}.inline.progressProjection`
-                    )
+                    if(restoredTerminalProgressRows > 0) {
+                        let progressProjectionSaved = false
+                        try {
+                            progressProjectionSaved = await saveProfileNukeProgressRowProjection(
+                                inlineProgressProjectionRecords,
+                                {
+                                    metricPath: `${inlineMetricPrefix}.inline.progressProjection`,
+                                    view: true
+                                }
+                            )
+                        }
+                        catch(error) {
+                            progressProjectionSaved = false
+                            recordCoordinatorDiagnosticEvent(
+                                'terminal-progress-restored-inline-progress-projection-save-failed',
+                                error?.message || 'Restored terminal progress projection save failed'
+                            )
+                        }
+                        if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
+                            inlineDerivedSaved = false
+                        }
+                    }
+                    else {
+                        saveTerminalProgressProjectionAfterAuthority(
+                            inlineProgressProjectionRecords,
+                            `${inlineMetricPrefix}.inline.progressProjection`
+                        )
+                    }
                 }
                 else {
                     let progressProjectionSaved = false
