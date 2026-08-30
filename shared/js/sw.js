@@ -10337,11 +10337,13 @@ function createCoordinatorAuthority() {
         const next = makeCoordinatorAuthorityProjection(projection)
         let changed = false
 
+        let queueSeededFromPayload = false
         if(options.allowRecoveredAuthorityQueueSeed === true &&
             Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY)) {
             next.queue = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_KEY] || {}))
             next.stored[COORDINATOR_QUEUE_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_KEY] || {})
             changed = true
+            queueSeededFromPayload = true
         }
         let physicalWalKeys = Object.keys(payload || {}).filter(isCoordinatorQueueWalPhysicalStorageKey)
         let hasLegacyWalPayload = payload[COORDINATOR_QUEUE_WAL_KEY] &&
@@ -10387,13 +10389,24 @@ function createCoordinatorAuthority() {
             next.stored[COORDINATOR_QUEUE_WAL_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_WAL_KEY] || null)
         }
         if(hasLegacyWalPayload || physicalWalKeys.length) {
-            const recovered = recoverCoordinatorQueueFromWal(
-                {},
-                next.stored[COORDINATOR_QUEUE_WAL_KEY]
-            )
-            next.queue = recovered.queue
-            closeRuntimeTabsReclaimedByAuthority(next.queue, 'authority-observer-reclaimed-runtime')
-            changed = true
+            const hasUsableWalStore = next.stored[COORDINATOR_QUEUE_WAL_KEY] &&
+                typeof next.stored[COORDINATOR_QUEUE_WAL_KEY] === 'object'
+            // A payload can legitimately carry a present-but-null/unusable WAL key alongside
+            // an already-correct raw queue seed from payload[COORDINATOR_QUEUE_KEY] above (e.g.
+            // the fast-executor's own storage-projection fallback repairing a stale resident
+            // view). Recovering from a WAL store that isn't actually there just reproduces
+            // recoverCoordinatorQueueFromWal's own "missing-wal" empty-queue fallback, which
+            // would silently clobber the correct seed this same call already applied. Only
+            // fall back to that empty-reset when nothing else in this payload set the queue.
+            if(hasUsableWalStore || !queueSeededFromPayload) {
+                const recovered = recoverCoordinatorQueueFromWal(
+                    {},
+                    next.stored[COORDINATOR_QUEUE_WAL_KEY]
+                )
+                next.queue = recovered.queue
+                closeRuntimeTabsReclaimedByAuthority(next.queue, 'authority-observer-reclaimed-runtime')
+                changed = true
+            }
         }
         if(Object.prototype.hasOwnProperty.call(payload, COORDINATOR_RUNS_KEY)) {
             next.runs = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(payload[COORDINATOR_RUNS_KEY] || {}))
