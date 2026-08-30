@@ -18232,6 +18232,40 @@ test('scheduled queue wakeup opens durable queue instead of stale resident autho
     assert.equal((sw.state().queueWakeupCounters['job.nextSlotFilled'] || 0) > 0, true)
 })
 
+test('absorbed snapshot with a null legacy WAL key does not clobber a same-call raw queue seed', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Absorb-Null-Wal-Seed'
+    const runId = 'run-absorb-null-wal-seed'
+    const attemptId = 'attempt-absorb-null-wal-seed'
+    const {sw} = loadServiceWorkerHarness({now: 4000, storage: {}})
+    const queue = {
+        [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 4000})
+    }
+    const runs = {
+        [runId]: makeCoordinatorRun({href, runId})
+    }
+
+    // Seed the resident authority with just a queue/runs snapshot -- no segmented WAL physical
+    // keys resident in .stored -- matching a repair path (e.g. the fast executor's
+    // storageProjectionFallback) that hands the authority a fresh projection built from a
+    // durable storage read rather than from coordinatorAuthority's own prior WAL hydrate.
+    assert.equal(sw.coordinatorAuthority.seedResidentProjection({queue, runs}), true)
+    assert.deepEqual(Object.keys(sw.coordinatorAuthority.current().queue || {}), [href])
+
+    // Reproduces the exact payload shape that repair path can produce: a correct raw queue
+    // seed alongside a legacy WAL key that is present but null (no usable WAL data, no
+    // segmented meta to hydrate from, and no resident WAL to fall back on either). Absorbing
+    // this must not silently reset the queue that was just correctly seeded in the same call.
+    const changed = sw.coordinatorAuthority.absorbPersistedSnapshot({
+        mbCoordinatorQueue: queue,
+        mbCoordinatorQueueWal: null,
+        mbCoordinatorRuns: runs
+    }, {allowRecoveredAuthorityQueueSeed: true})
+
+    assert.equal(changed, true)
+    assert.deepEqual(Object.keys(sw.coordinatorAuthority.current().queue || {}), [href])
+    assert.equal(sw.coordinatorAuthority.current().queue[href]?.status, 'queued')
+})
+
 test('fast executor durable reloads when stale resident plan leaves no runtime surface', async () => {
     const staleHref = 'https://www.quora.com/profile/Synthetic-Empty-Runtime-Stale-Resident'
     const durableHref = 'https://www.quora.com/profile/Synthetic-Empty-Runtime-Durable-Reload'
