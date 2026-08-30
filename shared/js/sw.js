@@ -8290,8 +8290,21 @@ function promoteTerminalCoordinatorItemFromSuccessfulProgress(item = {}, record 
 }
 
 function cloneCoordinatorAuthorityValue(value) {
-    if(value === undefined) return undefined
-    return JSON.parse(JSON.stringify(value))
+    if(value === null || typeof value !== 'object') return value
+    if(Array.isArray(value)) {
+        const cloned = new Array(value.length)
+        for(let index = 0; index < value.length; index += 1) {
+            cloned[index] = cloneCoordinatorAuthorityValue(value[index])
+        }
+        return cloned
+    }
+    const cloned = {}
+    for(const key in value) {
+        if(Object.prototype.hasOwnProperty.call(value, key)) {
+            cloned[key] = cloneCoordinatorAuthorityValue(value[key])
+        }
+    }
+    return cloned
 }
 
 function makeCoordinatorAuthorityProjection(state = {}) {
@@ -12728,7 +12741,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         }))
 
         if(settlementResult?.changed === true) {
-            currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+            currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
             queue = currentAuthorityState.queue || queue
             currentAuthorityState.progress = progress
             queueChanged = true
@@ -13592,7 +13605,7 @@ async function recoverQueuedRuntimeActionsAfterExecutorEnqueueTimeout(ownerTabId
                 queueRuntime.dropRuntimeActionAt(index)
                 adopted += 1
                 keys.push(entry.href || entry.key)
-                currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                 continue
             }
         }
@@ -19205,6 +19218,16 @@ async function requeueStalledActivePendingAction(classified = null, itemKey = ''
     }
 }
 
+// Re-fetching coordinatorAuthority.current() clones the entire resident
+// queue/runs/stored state, so callers only do it after an operation actually
+// reports a change -- never unconditionally. Centralizing that gate here
+// keeps future call sites from accidentally dropping it and re-triggering a
+// full re-clone on every iteration regardless of whether anything changed.
+function refreshAuthorityStateIfChanged(currentAuthorityState, shouldRefresh) {
+    if(shouldRefresh !== true) return currentAuthorityState
+    return coordinatorAuthority.current() || currentAuthorityState
+}
+
 async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-apply', options = {}) {
     const serviceWorkerOwned = options.serviceWorkerOwned === true
     const ownerTabId = options.ownerTabId || (serviceWorkerOwned ? SERVICE_WORKER_QUEUE_OWNER_ID : null)
@@ -19441,7 +19464,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     error: error?.message || `${error || ''}`
                 }))
                 if(terminalProgressResult?.changed === true) {
-                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                     preprocessedActiveMissingKeys.add(itemKey)
                     resolvedTerminalRuntime += 1
                     consumedExecutorCases.push({
@@ -19514,7 +19537,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             }))
             preprocessedActiveMissingKeys.add(itemKey)
             if(requeueResult?.changed === true) {
-                currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                 consumedExecutorCases.push({
                     ...(classified.contract || {}),
                     reason: requeueResult.reason || 'active-missing-tab-prepass-requeued'
@@ -19847,7 +19870,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     error: error?.message || `${error || ''}`
                 }))
                 if(profileMismatchRecovery?.changed === true) {
-                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                     consumedExecutorCases.push({
                         ...(classified.contract || {}),
                         reason: profileMismatchRecovery.reason || 'active-pending-action-profile-mismatch-recovered',
@@ -19909,7 +19932,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     error: error?.message || `${error || ''}`
                 }))
                 if(stalledPendingActionRecovery?.changed === true) {
-                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                     consumedExecutorCases.push({
                         ...(classified.contract || {}),
                         reason: stalledPendingActionRecovery.reason || 'active-pending-action-stale-claim-recovered',
@@ -19962,7 +19985,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                     !isActiveCoordinatorStatus(latestAuthorityItem.status) ||
                     getAttemptIdFromValue(latestAuthorityItem) !== getAttemptIdFromValue(item) ||
                     getAttemptNumberFromValue(latestAuthorityItem) !== getAttemptNumberFromValue(item)) {
-                    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                    currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                     consumedExecutorCases.push({
                         ...(classified.contract || {}),
                         reason: 'active-missing-tab-authority-already-moved'
@@ -19988,7 +20011,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         error: error?.message || `${error || ''}`
                     }))
                     if(terminalized?.changed === true) {
-                        currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                        currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                         consumedExecutorCases.push({
                             ...(classified.contract || {}),
                             reason: terminalized.reason || 'active-missing-tab-terminal-progress'
@@ -20654,7 +20677,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                 currentAuthorityState,
                 reason: enqueueErrorReason
             })
-            currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+            currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
         }
         const consumedTimeoutKeys = new Set()
         let activeRuntimeMaterializedAfterTimeout = 0
@@ -20837,7 +20860,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
     }
     let queued = enqueueResult.queued || 0
     terminalizedExhausted += enqueueResult.terminalizedExhausted || 0
-    currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+    currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
     if(enqueueResult?.fillResult?.reason === 'queued-tab-stale-action-pruned' &&
         queued <= 0 &&
         adopted <= 0 &&
@@ -21243,7 +21266,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             }))
             if(!terminalizeResult?.changed) continue
             terminalizedExhausted += terminalizeResult.terminalized || 0
-            currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+            currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
             await pruneQueuedTabActions(ownerTabId, {
                 queueOnlyAuthority: options.queueOnlyAuthority === true,
                 currentAuthorityState,
@@ -21513,7 +21536,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             }))
             if(terminalizeResult?.changed) {
                 terminalizedExhausted += terminalizeResult.terminalized || 0
-                currentAuthorityState = coordinatorAuthority.current() || currentAuthorityState
+                currentAuthorityState = refreshAuthorityStateIfChanged(currentAuthorityState, true)
                 await pruneQueuedTabActions(ownerTabId, {
                     queueOnlyAuthority: options.queueOnlyAuthority === true,
                     currentAuthorityState,
