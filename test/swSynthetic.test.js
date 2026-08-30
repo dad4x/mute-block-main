@@ -19970,9 +19970,7 @@ test('executor apply requeues actorless active row and re-primes queued no-open 
     }
     assert.equal(getRecoveredCoordinatorQueue(storage)[activeHref].outcome || '', '')
     assert.equal(getRecoveredCoordinatorQueue(storage)[queuedHref].outcome || '', '')
-    const expectedQueuedRuntimeActions = queuedNoOpenUnresolved || queuedRuntimeMaterializing
-        ? 1
-        : 0
+    const expectedQueuedRuntimeActions = queuedRuntimeMaterialized ? 0 : 1
     assert.equal(sw.state().queuedTabActions.length, expectedQueuedRuntimeActions)
     if(expectedQueuedRuntimeActions) {
         assert.equal(
@@ -24567,8 +24565,32 @@ test('executor apply consumes queued-with-stale-runtime-surface by pruning volat
     }
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
 
+    // A queued row that was just re-planned this cycle still has a runtime
+    // surface attached to it (the fresh plan awaiting its own fill attempt),
+    // so an immediate re-classification legitimately still reports
+    // 'queued-with-stale-runtime-surface' -- that's a transient snapshot, not
+    // a stuck state. Confirm it actually resolves on the next executor cycle
+    // instead of demanding the classification change on the same instant.
     const after = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-after'})
-    assert.notEqual(after.executor.primaryCase, 'queued-with-stale-runtime-surface')
+    assert.equal(after.executor.primaryCase, 'queued-with-stale-runtime-surface')
+
+    const result2 = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-queued-stale-runtime-2', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000, 10000, 30000]
+    )
+    assert.equal(result2.consumedExecutorCases.length, 0)
+    assert.equal(result2.unresolvedExecutorCases.length, 0)
+    assert.equal(sw.state().queuedTabActions.length, 0)
+
+    const finalCheck = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-stale-runtime-final'})
+    assert.notEqual(finalCheck.executor.primaryCase, 'queued-with-stale-runtime-surface')
 })
 
 test('executor apply does not wait on unrelated fill promise for queued stale runtime', async () => {
@@ -24842,6 +24864,14 @@ test('queued fill does not open second worker profile tab while surface profile 
     })
 
     await activateQuoraRuntime(browser)
+    // Let the auto-resume fast path that activation just scheduled (a
+    // zero-delay fake timer) run to completion before issuing our own
+    // explicit resume below -- otherwise the two race to enter the
+    // executor-start coalescing guard and whichever loses gets back the
+    // generic 'executor-start-in-flight-coalesced' placeholder instead of a
+    // meaningful fill reason.
+    await timers.tick(0)
+    await flushAsync(20)
     const result = await settleWithFakeTimers(sw.resumeCoordinatorQueueExecution({
             tabId: 'service-worker-queue-owner',
             windowId: null
