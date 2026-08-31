@@ -187,6 +187,14 @@ abandoned update tokens, timeout bookkeeping, and storage-update serialization.
 diagnostics, timeout recovery, and post-storage continuations, but it no longer
 mutates those queue internals directly.
 
+`swCoordinatorQueueWal` owns the coordinator queue WAL's synchronous
+storage-shape helpers: physical-key classification, WAL store defaults and
+normalization, and WAL remove-record construction. It exists to keep those
+details out of reach of ordinary reconcile code. The queue WAL's `async`
+load/persist/checkpoint-switch operations stay in `sw.js` rather than moving
+into that module -- see "Module Extraction And The Test Harness Realm
+Boundary" below for why that split is not just a style choice.
+
 Current cleanup requirements:
 
 - reason-tag all snapshot writes;
@@ -247,6 +255,40 @@ See
 Terminology: older code, metrics, and notes may still say `compaction`. In the
 architecture, read that as checkpoint generation switching plus later
 old-generation cleanup, not as a garbage-collection model.
+
+## Module Extraction And The Test Harness Realm Boundary
+
+`sw.js` runs inside a `vm.createContext` sandbox in tests, with `Date` and
+timers injected so fake-timer control works. A module loaded into the
+surrounding test process via a plain `require()` lives in a different V8
+realm from that sandboxed `sw.js` source.
+
+A same-realm `await` chain costs one microtask tick. The identical chain
+crossing a vm/real-Node realm boundary costs two, in either direction. This
+is not a fake-timer bug and injecting the clock correctly into an extracted
+module is necessary but not sufficient to avoid it: the extra tick changes
+when a promise settles relative to other concurrent promises, which can
+silently reorder operations that a reconcile tick is racing, with no
+difference in the moved code's logic.
+
+Confirmed while attempting to extract the coordinator queue WAL's async
+persist/load/checkpoint-switch path into its own module (2026-09): the moved
+code was byte-identical to what it replaced and the fake clock was correctly
+injected, but two test ranges failed reliably with the extraction in place
+and passed reliably without it. The cause was repeated, bidirectional realm
+crossings in that path -- vm-sandboxed code awaiting the extracted module's
+async functions, and the module awaiting vm-injected async capabilities --
+each crossing doubling its tick cost and compounding across the reconcile
+tick's concurrent work.
+
+Constraint for future extraction: a purely synchronous helper can be pulled
+into its own module freely; it carries no realm penalty either way. An
+`async` function that participates in ordering within a reconcile tick
+(queue WAL persist, checkpoint switching, and similar) must stay in `sw.js`
+unless the test harness's module-loading strategy changes to put an
+extracted module in the same realm as the vm-sandboxed source. Do not
+re-attempt an async WAL/coordinator-authority extraction without addressing
+that first.
 
 ## Dashboard And UI Surfaces
 
