@@ -115,6 +115,9 @@ const {
 const {
     createStorageMetrics
 } = require('./swStorageMetrics')
+const {
+    createActivationGuardRuntime
+} = require('./swActivationGuardRuntime')
 const queueRuntime = createQueueRuntimeState()
 const schedulerClock = {
     setTimeout,
@@ -330,7 +333,6 @@ const staleRetryAdvancedWakeKeys = new Map()
 const coordinatorProgressInFlightPromises = new Map()
 const terminalProgressSettlementPromises = new Map()
 const terminalProgressProjectionSaveBatches = new Map()
-const queuedActivationGuards = new Map()
 let terminalProgressProjectionSaveScheduled = false
 let terminalProgressProjectionSavePromise = null
 let coordinatorJobMilestoneFlushTimeout = null
@@ -1468,222 +1470,54 @@ async function getLiveQueuedProfileTabCount() {
     return (tabs || []).filter(tab => normalizeQuoraProfileUrl(tab?.url || '')).length
 }
 
-function pruneQueuedProfileOpenReservations(now = Date.now()) {
-    queueRuntime.pruneProfileOpenReservations(now, QUEUED_PROFILE_OPEN_RESERVATION_TTL_MS)
-}
-
-function getQueuedProfileOpenReservationCount() {
-    pruneQueuedProfileOpenReservations()
-    return queueRuntime.getProfileOpenReservationCount()
-}
-
-function clearDetachedQueuedProfileOpenReservations(reason = 'detached-profile-open-reservations') {
-    pruneQueuedProfileOpenReservations()
-    if(!queueRuntime.getProfileOpenReservationCount()) return 0
-    if(queueRuntime.hasActiveOrPendingQueuedTabs()) return 0
-    const cleared = queueRuntime.clearProfileOpenReservations()
-    incrementQueueWakeupMetric('pump.changed.clearedDetachedProfileOpenReservations', cleared)
-    pushQueueWakeupJournalEntry({
-        kind: 'state-change',
-        name: 'queued-profile-open-reservations-cleared',
-        reason,
-        result: 'state-changed',
-        resultReason: 'detached-profile-open-reservations',
-        details: {
-            cleared
-        }
-    })
-    return cleared
-}
-
-function getQueuedProfileOpenReservationKey(value = null) {
-    if(value && typeof value === 'object') {
-        const profileHref = normalizeQuoraProfileUrl(
-            value.profileHref ||
-                value.targetProfileHref ||
-                value.requestedUrl ||
-                value.url ||
-                ''
-        )
-        if(profileHref) return profileHref
-
-        return getCoordinatorItemQueueKey(
-            value,
-            value.coordinatorKey || value.requestedUrl || value.url || ''
-        ) || `${value.coordinatorKey || value.requestedUrl || value.url || ''}`.trim()
+const activationGuardRuntime = createActivationGuardRuntime({
+    now: () => Date.now(),
+    constants: {
+        QUEUED_PROFILE_OPEN_RESERVATION_TTL_MS,
+        QUEUED_ACTIVATION_GUARD_TTL_MS,
+        SERVICE_WORKER_QUEUE_OWNER_ID
+    },
+    handlers: {
+        queueRuntime,
+        incrementQueueWakeupMetric,
+        pushQueueWakeupJournalEntry,
+        recordFlightRecorderEvent,
+        normalizeQuoraProfileUrl,
+        normalizeTabId,
+        getCoordinatorItemQueueKey,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorActionKindForRequestedAction,
+        getCoordinatorItemHref,
+        getQueuedTabActionKey,
+        getCoordinatorItemExecutorTabAction,
+        queuedRuntimeActionHasActiveOrPendingSurface,
+        shouldDropQueuedActionForCurrentAuthority
+    },
+    state: {
+        getCoordinatorAuthority: () => coordinatorAuthority
     }
-
-    return normalizeQuoraProfileUrl(value || '') || `${value || ''}`.trim()
-}
-
-function reserveQueuedProfileOpen(action = null, reason = 'queued-profile-open') {
-    const reservationKey = getQueuedProfileOpenReservationKey(action)
-    if(!reservationKey) return ''
-    pruneQueuedProfileOpenReservations()
-    const existing = queueRuntime.getProfileOpenReservation(reservationKey)
-    if(existing) return ''
-    queueRuntime.setProfileOpenReservation(reservationKey, {
-        reservedAt: Date.now(),
-        reason,
-        attemptId: getAttemptIdFromValue(action),
-        attemptNumber: getAttemptNumberFromValue(action),
-        runId: action?.runId || ''
-    })
-    return reservationKey
-}
-
-function releaseQueuedProfileOpenReservation(value = '') {
-    const reservationKey = getQueuedProfileOpenReservationKey(value)
-    if(reservationKey) queueRuntime.deleteProfileOpenReservation(reservationKey)
-}
-
-function getQueuedActivationGuardKey(value = null) {
-    if(!value || typeof value !== 'object') return ''
-
-    const subjectKey = getQueuedProfileOpenReservationKey(value)
-    const ownerId = value.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID
-    const actionKind = getCoordinatorActionKindForRequestedAction(
-        value.actionKind ||
-            value.tabAction ||
-            value.action ||
-            ''
-    )
-    const attemptId = getAttemptIdFromValue(value)
-    const attemptNumber = getAttemptNumberFromValue(value)
-    if(!ownerId || !subjectKey || !actionKind || !attemptId || !attemptNumber) return ''
-    return [ownerId, subjectKey, actionKind, attemptId, attemptNumber].join('|')
-}
-
-function getQueuedRuntimeActionSubjectHref(action = null, targetItem = null) {
-    return action?.profileHref ||
-        action?.targetProfileHref ||
-        action?.coordinatorKey ||
-        action?.requestedUrl ||
-        action?.url ||
-        getCoordinatorItemHref(targetItem) ||
-        ''
-}
-
-function getQueuedRuntimeActionFillKey(action = null, targetItem = null) {
-    if(!action && !targetItem) return ''
-    const subject = getQueuedRuntimeActionSubjectHref(action, targetItem)
-    return getQueuedTabActionKey(
-        action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-        subject,
-        action?.tabAction || getCoordinatorItemExecutorTabAction(targetItem)
-    )
-}
-
-function pruneQueuedActivationGuards(now = Date.now()) {
-    let pruned = 0
-    for(const [key, guard] of queuedActivationGuards.entries()) {
-        const guardedAt = Number.parseInt(guard?.guardedAt, 10) || 0
-        if(!guardedAt || now - guardedAt > QUEUED_ACTIVATION_GUARD_TTL_MS) {
-            queuedActivationGuards.delete(key)
-            pruned += 1
-        }
-    }
-    if(pruned > 0) {
-        incrementQueueWakeupMetric('pump.changed.prunedActivationGuards', pruned)
-    }
-    return pruned
-}
-
-function hasQueuedActivationGuard(value = null) {
-    const key = getQueuedActivationGuardKey(value)
-    if(!key) return false
-    pruneQueuedActivationGuards()
-    return queuedActivationGuards.has(key)
-}
-
-function claimQueuedActivationGuard(value = null, tab = null, reason = 'queued-activation') {
-    const key = getQueuedActivationGuardKey(value)
-    if(!key) return ''
-    pruneQueuedActivationGuards()
-    if(queuedActivationGuards.has(key)) return ''
-    queuedActivationGuards.set(key, {
-        guardedAt: Date.now(),
-        reason,
-        tabId: normalizeTabId(tab?.id || value?.tabId || value?.activeTabId || null),
-        runId: value?.runId || '',
-        attemptId: getAttemptIdFromValue(value),
-        attemptNumber: getAttemptNumberFromValue(value)
-    })
-    return key
-}
-
-function releaseQueuedActivationGuard(value = null) {
-    const key = getQueuedActivationGuardKey(value)
-    return key ? queuedActivationGuards.delete(key) : false
-}
-
-function releaseQueuedActivationGuardForTab(tabId = null, metadata = null) {
-    if(metadata && releaseQueuedActivationGuard(metadata)) return true
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) return false
-    let released = false
-    for(const [key, guard] of queuedActivationGuards.entries()) {
-        if(normalizeTabId(guard?.tabId) !== normalizedTabId) continue
-        queuedActivationGuards.delete(key)
-        released = true
-    }
-    return released
-}
-
-function filterRestorableActivationIntents(actions = [], options = {}) {
-    if(!Array.isArray(actions) || !actions.length) return []
-    pruneQueuedActivationGuards()
-    const queue = options.currentAuthorityState?.queue ||
-        coordinatorAuthority.current()?.queue ||
-        null
-    return actions.filter(action => {
-        if(!action) return false
-        if(hasQueuedActivationGuard(action)) return false
-        if(queuedRuntimeActionHasActiveOrPendingSurface(action)) return false
-        if(queue && shouldDropQueuedActionForCurrentAuthority(action, queue)) return false
-        return true
-    })
-}
-
-function pruneDuplicateQueuedTabActions(reason = 'queued-tab-action-dedupe') {
-    const seen = new Set()
-    let pruned = 0
-    for(let index = 0; index < queueRuntime.getActivationIntentCount();) {
-        const action = queueRuntime.getActivationIntentAt(index)
-        const subject = normalizeQuoraProfileUrl(
-            action?.profileHref ||
-                action?.targetProfileHref ||
-                action?.requestedUrl ||
-                action?.coordinatorKey ||
-                action?.url ||
-                ''
-        ) || `${action?.coordinatorKey || action?.url || ''}`.trim()
-        const key = getQueuedTabActionKey(
-            action?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-            subject,
-            action?.tabAction || ''
-        )
-        if(key && seen.has(key)) {
-            queueRuntime.dropRuntimeActionAt(index)
-            pruned += 1
-            continue
-        }
-        if(key) seen.add(key)
-        index += 1
-    }
-    if(pruned > 0) {
-        incrementQueueWakeupMetric('pump.changed.prunedDuplicateQueuedActions', pruned)
-        recordFlightRecorderEvent({
-            kind: 'queued-tab-action-pruned',
-            source: 'pruneDuplicateQueuedTabActions',
-            accepted: false,
-            changed: true,
-            reason,
-            count: pruned
-        })
-    }
-    return pruned
-}
+})
+const {
+    pruneQueuedProfileOpenReservations,
+    getQueuedProfileOpenReservationCount,
+    clearDetachedQueuedProfileOpenReservations,
+    getQueuedProfileOpenReservationKey,
+    reserveQueuedProfileOpen,
+    releaseQueuedProfileOpenReservation,
+    getQueuedActivationGuardKey,
+    getQueuedRuntimeActionSubjectHref,
+    getQueuedRuntimeActionFillKey,
+    pruneQueuedActivationGuards,
+    hasQueuedActivationGuard,
+    claimQueuedActivationGuard,
+    releaseQueuedActivationGuard,
+    releaseQueuedActivationGuardForTab,
+    filterRestorableActivationIntents,
+    pruneDuplicateQueuedTabActions,
+    mergeActivationGuardTabInfo,
+    deleteActivationGuardByKey
+} = activationGuardRuntime
 
 function markQueuedTabDurablyActive(tabId, reason = '') {
     const metadata = getQueuedTabMetadata(tabId)
@@ -36442,8 +36276,7 @@ async function fillQueuedTabsOnce(options = {}) {
                 incrementQueueWakeupMetric('pump.changed.openedTab')
                 incrementQueueWakeupMetric('job.tabOpened')
                 if(activationGuardKey) {
-                    queuedActivationGuards.set(activationGuardKey, {
-                        ...(queuedActivationGuards.get(activationGuardKey) || {}),
+                    mergeActivationGuardTabInfo(activationGuardKey, {
                         tabId: normalizeTabId(tab?.id),
                         openedAt: Date.now(),
                         reason: 'queued-tab-opened'
@@ -36497,8 +36330,7 @@ async function fillQueuedTabsOnce(options = {}) {
                     incrementQueueWakeupMetric('pump.changed.recoveredTimedOutTabCreate')
                     incrementQueueWakeupMetric('job.tabOpened')
                     if(activationGuardKey) {
-                        queuedActivationGuards.set(activationGuardKey, {
-                            ...(queuedActivationGuards.get(activationGuardKey) || {}),
+                        mergeActivationGuardTabInfo(activationGuardKey, {
                             tabId: normalizeTabId(tab?.id),
                             openedAt: Date.now(),
                             reason: 'recovered-timed-out-tab-create'
@@ -36759,7 +36591,7 @@ async function fillQueuedTabsOnce(options = {}) {
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
         }
         catch(error) {
-            if(activationGuardKey) queuedActivationGuards.delete(activationGuardKey)
+            if(activationGuardKey) deleteActivationGuardByKey(activationGuardKey)
             if(openingActionKey) queuedTabFillOpeningActionKeys.delete(openingActionKey)
             releaseQueuedProfileOpenReservation(openReservationHref)
             scheduleCoordinatorQueueResume(1000, 'queued-tab-fill-error', {
