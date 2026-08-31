@@ -453,7 +453,8 @@ test('raw queue snapshot saves are rejected without a physical write branch', ()
 
 test('resident authority observer ignores raw queue snapshots', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const notifyBody = extractFunction(source, 'function notifyCoordinatorAuthorityPersistedSnapshot(payload = {})')
+    const storageMetrics = readRepoFile('shared/js/swStorageMetrics.js')
+    const notifyBody = extractFunction(storageMetrics, 'function notifyCoordinatorAuthorityPersistedSnapshot(payload = {})')
     const absorbBody = extractFunction(source, 'function absorbPersistedSnapshot(payload = {}, options = {})')
     const refreshBody = extractFunction(source, "function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')")
 
@@ -493,13 +494,14 @@ test('storage get records read payload metrics', () => {
 
 test('storage payload metrics are attributed by call path', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const storageMetrics = readRepoFile('shared/js/swStorageMetrics.js')
     const getBody = extractFunction(source, 'async function metricStorageGet(defaults = {}, options = {})')
     const setBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
     const saveBody = extractFunction(source, 'async function saveCoordinatorState(state = {}, changes = {})')
 
-    assert.match(source, /function getStorageMetricPathName/)
-    assert.match(source, /function recordStoragePathPayloadMetrics/)
-    assert.match(source, /function recordStoragePathLatencyMetrics/)
+    assert.match(storageMetrics, /function getStorageMetricPathName/)
+    assert.match(storageMetrics, /function recordStoragePathPayloadMetrics/)
+    assert.match(storageMetrics, /function recordStoragePathLatencyMetrics/)
     assert.match(getBody, /recordStorageReadPayloadMetrics\(result, pathName\)/)
     assert.match(setBody, /recordStoragePayloadMetrics\(payload, pathName\)/)
     assert.match(setBody, /recordQueueWriteOperationMetrics\(payload, options\)/)
@@ -1599,6 +1601,7 @@ test('dashboard resume loop does not kick on every render while timer is armed',
 
 test('snapshot state writes carry inventoried authority reasons', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const storageMetrics = readRepoFile('shared/js/swStorageMetrics.js')
     const inventory = readRepoFile('storage-authority-callsite-inventory-2026-05-20.md')
     const allowedReasons = new Set([
         'ordinaryMutation',
@@ -1611,8 +1614,8 @@ test('snapshot state writes carry inventoried authority reasons', () => {
     const callSites = collectCallSites(source, 'saveCoordinatorState')
 
     assert.ok(callSites.length > 0)
-    assert.match(source, /SNAPSHOT_WRITE_REASONS/)
-    assert.match(source, /snapshot\.write\.reason\.\$\{normalizedReason\}/)
+    assert.match(storageMetrics, /SNAPSHOT_WRITE_REASONS/)
+    assert.match(storageMetrics, /snapshot\.write\.reason\.\$\{normalizedReason\}/)
 
     for(const callSite of callSites) {
         const reason = callSite.text.match(/reason:\s*'([^']+)'/)?.[1] || ''
