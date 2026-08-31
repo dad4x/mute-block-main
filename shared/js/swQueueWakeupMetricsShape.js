@@ -1,24 +1,27 @@
 // Queue-wakeup metric "shape" helpers extracted from sw.js (decomposition
-// Slice 2). These are the normalize/build/get functions that operate on
-// the queue-wakeup-metrics epoch/throttle/journal shapes -- pure or
+// Slice 2), plus the metric-recording/journal functions (decomposition
+// Slice 3). These are the normalize/build/get functions that operate on
+// the queue-wakeup-metrics epoch/throttle/journal shapes, and the
+// increment/record/push primitives that write into those shapes -- pure or
 // near-pure functions with no async work of their own.
 //
 // The metrics themselves (queueWakeupMetrics, queueLoadThrottle, and the
-// small set of loaded/dirty/generation/ready-promise flags around them)
-// stay as module-level `let` state in sw.js, because they're also read and
-// written well outside this slice's scope (the storage load/persist path
-// and other far-away coordinator code, both still in sw.js). They're
-// threaded through here as live get/set accessors, following the same
-// pattern swBootstrap.js uses for state it doesn't own.
+// small set of loaded/dirty/generation/cycle-serial/ready-promise flags
+// around them) stay as module-level `let` state in sw.js, because they're
+// also read and written well outside this slice's scope (the storage
+// load/persist path and other far-away coordinator code, both still in
+// sw.js). They're threaded through here as live get/set accessors,
+// following the same pattern swBootstrap.js uses for state it doesn't own.
 //
-// Slice 2 and Slice 3 (the queue-wakeup metric *recording*/journal
-// functions -- incrementQueueWakeupMetric and friends) are the same
-// subsystem split only for slice-size reasons. This module intentionally
-// takes recording/journal functions (incrementQueueWakeupMetric,
-// pushQueueWakeupJournalEntry, sanitizeQueueWakeupMetricDetails) as deps
-// rather than defining them, so Slice 3 can either fold into this module
-// or land as its own sibling -- that decision is left to whoever runs
-// Slice 3.
+// Slice 2 and Slice 3 are the same subsystem split only for slice-size
+// reasons, and were folded into one module here: Slice 2's shape helpers
+// (rememberQueueLoadPressure, resetQueueWakeupMetricsEpoch, etc.) call
+// Slice 3's recording primitives (incrementQueueWakeupMetric,
+// pushQueueWakeupJournalEntry) internally, and Slice 3's primitives in turn
+// call Slice 2's getQueueWakeupMetricEpoch -- a genuine circular dependency
+// between the two halves that a single shared closure sidesteps cleanly
+// (two separate factories would need one to inject a not-yet-constructed
+// function into the other).
 
 function createQueueWakeupMetricsShape(deps = {}) {
     const {
@@ -47,17 +50,19 @@ function createQueueWakeupMetricsShape(deps = {}) {
         setQueueWakeupMetricsLoaded,
         setQueueWakeupMetricsDirty,
         getQueueWakeupMetricsReadyPromise,
-        setQueueWakeupMetricsReadyPromise
+        setQueueWakeupMetricsReadyPromise,
+        getQueueWakeupMetricCycleSerial,
+        setQueueWakeupMetricCycleSerial
     } = deps.state || {}
     const {
-        incrementQueueWakeupMetric,
-        pushQueueWakeupJournalEntry,
         scheduleCoordinatorQueueResume,
-        sanitizeQueueWakeupMetricDetails,
         scheduleQueueWakeupMetricsFlush,
         loadQueueWakeupMetrics,
         normalizeObjectNumberMap,
-        normalizeQueueWakeupPhaseMap
+        normalizeQueueWakeupPhaseMap,
+        getActiveStorageContext,
+        getDurablyActiveQueuedTabCount,
+        getQueueRuntimeCounts
     } = deps.handlers || {}
 
     function getExtensionVersion() {
@@ -528,6 +533,262 @@ function createQueueWakeupMetricsShape(deps = {}) {
         return getQueueWakeupMetricsReadyPromise()
     }
 
+    // -- Slice 3: metric recording/journal functions --------------------
+
+    function incrementQueueWakeupMetric(name = '', amount = 1) {
+        const key = `${name || ''}`.trim()
+        const delta = Number(amount) || 0
+        if(!key || !Number.isFinite(delta)) return
+
+        const epoch = getQueueWakeupMetricEpoch()
+        epoch.counters[key] = (epoch.counters[key] || 0) + delta
+        epoch.updatedAt = getNow()
+        scheduleQueueWakeupMetricsFlush()
+    }
+
+    function getQueueWakeupMetricCounter(name = '') {
+        return getQueueWakeupMetricEpoch().counters?.[`${name || ''}`.trim()] || 0
+    }
+
+    function recordQueueWakeupPhase(name = '', durationMs = 0) {
+        const key = `${name || ''}`.trim()
+        const elapsed = Math.max(0, Number(durationMs) || 0)
+        if(!key || !Number.isFinite(elapsed)) return
+
+        const epoch = getQueueWakeupMetricEpoch()
+        const previous = epoch.phases[key] || {
+            count: 0,
+            totalMs: 0,
+            lastMs: 0,
+            maxMs: 0,
+            lastAt: 0
+        }
+        epoch.phases[key] = {
+            count: previous.count + 1,
+            totalMs: previous.totalMs + elapsed,
+            lastMs: elapsed,
+            maxMs: Math.max(previous.maxMs || 0, elapsed),
+            lastAt: getNow()
+        }
+        epoch.updatedAt = getNow()
+        scheduleQueueWakeupMetricsFlush()
+    }
+
+    function recordQueueWakeupMetricMax(name = '', value = 0) {
+        const key = `${name || ''}`.trim()
+        const number = Number(value) || 0
+        if(!key || !Number.isFinite(number)) return
+
+        const epoch = getQueueWakeupMetricEpoch()
+        epoch.counters[key] = Math.max(epoch.counters[key] || 0, number)
+        epoch.updatedAt = getNow()
+        scheduleQueueWakeupMetricsFlush()
+    }
+
+    function incrementActiveStorageMetricDetail(name = '', amount = 1) {
+        const key = `${name || ''}`.trim()
+        const delta = Number(amount) || 0
+        const context = getActiveStorageContext()
+        if(!key || !Number.isFinite(delta) || !context) return
+
+        context[key] = (Number(context[key]) || 0) + delta
+    }
+
+    function setActiveStorageMetricDetail(name = '', value = 0) {
+        const key = `${name || ''}`.trim()
+        const context = getActiveStorageContext()
+        if(!key || !context) return
+        context[key] = value
+    }
+
+    function getPhaseWallMs(context = {}, phase = '') {
+        const intervals = context?.phaseIntervals?.[phase] || []
+        if(!intervals.length) return 0
+
+        const sorted = intervals
+            .map(interval => ({
+                start: Number.parseInt(interval.start, 10) || 0,
+                end: Number.parseInt(interval.end, 10) || 0
+            }))
+            .filter(interval => interval.start > 0 && interval.end >= interval.start)
+            .sort((left, right) => left.start - right.start || left.end - right.end)
+        let total = 0
+        let currentStart = 0
+        let currentEnd = 0
+
+        for(const interval of sorted) {
+            if(!currentStart) {
+                currentStart = interval.start
+                currentEnd = interval.end
+                continue
+            }
+            if(interval.start <= currentEnd) {
+                currentEnd = Math.max(currentEnd, interval.end)
+                continue
+            }
+            total += currentEnd - currentStart
+            currentStart = interval.start
+            currentEnd = interval.end
+        }
+
+        if(currentStart) total += currentEnd - currentStart
+        return total
+    }
+
+    function recordActiveStorageMetricPhaseInterval(phase = '', startedAt = 0, endedAt = 0) {
+        const context = getActiveStorageContext()
+        if(!context) return
+        const start = Number.parseInt(startedAt, 10) || 0
+        const end = Number.parseInt(endedAt, 10) || 0
+        if(!phase || !start || end < start) return
+
+        if(!context.phaseIntervals) {
+            context.phaseIntervals = {}
+        }
+        const intervals = context.phaseIntervals[phase] || []
+        intervals.push({start, end})
+        context.phaseIntervals[phase] = intervals.slice(-100)
+    }
+
+    function noteActiveStorageMetricPhase(name = '', durationMs = 0, startedAt = 0, endedAt = 0) {
+        const phase = `${name || ''}`.trim()
+        const elapsed = Math.max(0, Number(durationMs) || 0)
+        if(!phase) return
+
+        recordQueueWakeupPhase(phase, elapsed)
+        const context = getActiveStorageContext()
+        if(!context) return
+
+        const msKey = `${phase}Ms`
+        context[msKey] = (Number(context[msKey]) || 0) + elapsed
+        recordActiveStorageMetricPhaseInterval(phase, startedAt, endedAt)
+    }
+
+    function runQueueWakeupMetricPhase(name = '', callback = () => undefined) {
+        const phase = `${name || ''}`.trim() || 'unknown'
+        const context = getActiveStorageContext()
+        const previousPhase = context?.currentPhase || ''
+        if(context) context.currentPhase = phase
+        const startedAt = getNow()
+        const finish = () => {
+            const endedAt = getNow()
+            noteActiveStorageMetricPhase(phase, endedAt - startedAt, startedAt, endedAt)
+            if(context) context.currentPhase = previousPhase
+        }
+
+        try {
+            const result = callback()
+            if(result && typeof result.then === 'function') {
+                return result.finally(finish)
+            }
+            finish()
+            return result
+        }
+        catch(error) {
+            finish()
+            throw error
+        }
+    }
+
+    function sanitizeQueueWakeupMetricDetails(details = {}) {
+        const result = {}
+        for(const [key, value] of Object.entries(details || {})) {
+            if(value === undefined || value === null || value === '') continue
+            if(typeof value === 'number' || typeof value === 'boolean') {
+                result[key] = value
+            }
+            else if(typeof value === 'string') {
+                result[key] = value.slice(0, 240)
+            }
+        }
+        return result
+    }
+
+    function pushQueueWakeupJournalEntry(entry = {}) {
+        const now = getNow()
+        const epoch = getQueueWakeupMetricEpoch()
+        epoch.journal.push({
+            kind: `${entry.kind || 'cycle'}`.trim(),
+            name: `${entry.name || ''}`.trim(),
+            reason: `${entry.reason || ''}`.trim(),
+            result: `${entry.result || ''}`.trim(),
+            resultReason: `${entry.resultReason || ''}`.trim(),
+            at: Number.parseInt(entry.at, 10) || now,
+            durationMs: Math.max(0, Number(entry.durationMs) || 0),
+            counters: sanitizeQueueWakeupMetricDetails(entry.counters || {}),
+            details: sanitizeQueueWakeupMetricDetails(entry.details || {})
+        })
+        if(epoch.journal.length > MAX_QUEUE_WAKEUP_METRIC_JOURNAL) {
+            epoch.journal = epoch.journal.slice(-MAX_QUEUE_WAKEUP_METRIC_JOURNAL)
+        }
+        epoch.updatedAt = now
+        scheduleQueueWakeupMetricsFlush()
+    }
+
+    function startQueueWakeupMetricCycle(kind = 'cycle', name = '', reason = '', details = {}) {
+        const nextSerial = (getQueueWakeupMetricCycleSerial() || 0) + 1
+        setQueueWakeupMetricCycleSerial(nextSerial)
+        return {
+            id: nextSerial,
+            kind,
+            name,
+            reason,
+            startedAt: getNow(),
+            generation: getQueueWakeupMetricGeneration(),
+            counters: {...getQueueWakeupMetricEpoch().counters},
+            details
+        }
+    }
+
+    function getQueueWakeupMetricCounterDelta(before = {}) {
+        const delta = {}
+        const keys = new Set([
+            ...Object.keys(before || {}),
+            ...Object.keys(getQueueWakeupMetricEpoch().counters || {})
+        ])
+        for(const key of keys) {
+            const value = (getQueueWakeupMetricEpoch().counters[key] || 0) - (before[key] || 0)
+            if(value > 0) delta[key] = value
+        }
+        return delta
+    }
+
+    function getQueueWakeupMetricRuntimeSnapshot() {
+        const durablyActiveQueuedTabs = getDurablyActiveQueuedTabCount()
+        const runtimeCounts = getQueueRuntimeCounts()
+        return {
+            activeQueuedTabs: runtimeCounts.activeQueuedTabs,
+            durablyActiveQueuedTabs,
+            provisionalActiveQueuedTabs: Math.max(0, runtimeCounts.activeQueuedTabs - durablyActiveQueuedTabs),
+            queuedTabActions: runtimeCounts.queuedTabActions,
+            pendingTabActions: runtimeCounts.pendingTabActions
+        }
+    }
+
+    function finishQueueWakeupMetricCycle(cycle = null, result = '', resultReason = '', details = {}) {
+        if(!cycle) return
+        if(cycle.finished) return
+        cycle.finished = true
+        pushQueueWakeupJournalEntry({
+            kind: cycle.kind,
+            name: cycle.name,
+            reason: cycle.reason,
+            result,
+            resultReason,
+            at: cycle.startedAt,
+            durationMs: getNow() - cycle.startedAt,
+            counters: cycle.generation === getQueueWakeupMetricGeneration()
+                ? getQueueWakeupMetricCounterDelta(cycle.counters)
+                : {},
+            details: {
+                ...getQueueWakeupMetricRuntimeSnapshot(),
+                ...(cycle.details || {}),
+                ...(details || {}),
+                ...(cycle.generation === getQueueWakeupMetricGeneration() ? {} : {metricsReloadedDuringCycle: true})
+            }
+        })
+    }
+
     return {
         getExtensionVersion,
         makeQueueWakeupMetricEpoch,
@@ -556,7 +817,23 @@ function createQueueWakeupMetricsShape(deps = {}) {
         addQueueWakeupLifetimeCounters,
         resetQueueWakeupMetricsEpoch,
         isFreshQueueWakeupMetricsEpoch,
-        ensureQueueWakeupMetricsLoaded
+        ensureQueueWakeupMetricsLoaded,
+        incrementQueueWakeupMetric,
+        getQueueWakeupMetricCounter,
+        recordQueueWakeupPhase,
+        recordQueueWakeupMetricMax,
+        incrementActiveStorageMetricDetail,
+        setActiveStorageMetricDetail,
+        getPhaseWallMs,
+        recordActiveStorageMetricPhaseInterval,
+        noteActiveStorageMetricPhase,
+        runQueueWakeupMetricPhase,
+        sanitizeQueueWakeupMetricDetails,
+        pushQueueWakeupJournalEntry,
+        startQueueWakeupMetricCycle,
+        getQueueWakeupMetricCounterDelta,
+        getQueueWakeupMetricRuntimeSnapshot,
+        finishQueueWakeupMetricCycle
     }
 }
 
