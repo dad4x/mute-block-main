@@ -392,3 +392,7 @@ Tests should exercise state snapshots directly:
   shared moderation design.
 - [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable
   job model that informed the current line.
+- [sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md):
+  proposed plan for splitting the remaining `sw.js` reconcile core into
+  sync policy/builder modules now and an async orchestration layer once the
+  test harness realm boundary is addressed.
