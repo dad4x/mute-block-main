@@ -954,6 +954,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     const dashboard = readRepoFile('shared/js/coordinator.js')
     const worker = readRepoFile('shared/js/sw.js')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const wakeupMetricsShape = readRepoFile('shared/js/swQueueWakeupMetricsShape.js')
     const html = readRepoFile('shared/coordinator.html')
 
     assert.match(helper, /chrome\.storage\.local\.get\(\{\[key\]: null\}, storage =>/)
@@ -975,8 +976,8 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(helper, /ownStorageGetMs is merged wall time/)
 
     assert.match(worker, /currentEpoch/)
-    assert.match(worker, /previousEpochs/)
-    assert.match(worker, /lifetime/)
+    assert.match(wakeupMetricsShape, /previousEpochs/)
+    assert.match(wakeupMetricsShape, /lifetime/)
     assert.match(worker, /QUEUE_WAKEUP_METRICS_VIEW_KEY/)
     assert.match(worker, /buildQueueWakeupMetricsView/)
     assert.match(worker, /MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL/)
@@ -991,7 +992,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(bootstrap, /reset-queue-wakeup-metrics/)
     assert.match(worker, /firstServiceWorkerStartedAt/)
     assert.match(worker, /lastServiceWorkerStartedAt/)
-    assert.match(worker, /epoch\.counters\['serviceWorker\.started'\] = 1/)
+    assert.match(wakeupMetricsShape, /epoch\.counters\['serviceWorker\.started'\] = 1/)
     assert.match(worker, /summarizeQueueWakeupMetricEpoch/)
     assert.match(worker, /MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY/)
     assert.match(bootstrap, /if\(!hasBrowserSessionStorage\(\)\) \{[\s\S]*browser\.runtime\.onStartup\.addListener/)
