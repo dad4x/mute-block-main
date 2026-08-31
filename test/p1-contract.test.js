@@ -681,8 +681,8 @@ test('reconcile preserves expected live tabs for resume adoption', () => {
         'function hasConfirmedRuntimeActorForCoordinatorItem(item = null, record = null)'
     )
     const releaseDeferBody = extractFunction(
-        source,
-        'function shouldDeferQueuedTabReleaseRollback(metadata = null, now = Date.now())'
+        readRepoFile('shared/js/swQueuedTabRuntimeStatus.js'),
+        'function shouldDeferQueuedTabReleaseRollback(metadata = null, now = getNow())'
     )
 
     assert.match(body, /getOwnedOrExpectedLiveTabsForProfileHref/)
@@ -773,21 +773,22 @@ test('stale active reconcile ignores queued mirror records as liveness', () => {
 
 test('stale active reconcile does not let timed out tab lookup wedge actorless rows', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const queuedTabRuntimeStatusSource = readRepoFile('shared/js/swQueuedTabRuntimeStatus.js')
     const timeoutHelperBody = extractFunction(
-        source,
-        'function shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(item = null, record = null, status = null, now = Date.now())'
+        queuedTabRuntimeStatusSource,
+        'function shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(item = null, record = null, status = null, now = getNow())'
     )
     const tabStatusBody = extractFunction(
         source,
         'async function getQueuedExecutorTabStatusWithTimeout(tabId = null, reason = \'queued-executor-tab-get\')'
     )
     const deferHelperBody = extractFunction(
-        source,
-        'function shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(status = null, item = null, record = null, now = Date.now())'
+        queuedTabRuntimeStatusSource,
+        'function shouldDeferActiveWithoutActorReconcileForPersistedTabStatus(status = null, item = null, record = null, now = getNow())'
     )
     const expiredJobBody = extractFunction(
-        source,
-        'function isActorlessActiveCoordinatorJobExpired(item = null, record = null, now = Date.now())'
+        queuedTabRuntimeStatusSource,
+        'function isActorlessActiveCoordinatorJobExpired(item = null, record = null, now = getNow())'
     )
     const releaseLeaseBody = extractFunction(
         source,
@@ -3209,9 +3210,10 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     assert.doesNotMatch(body, /options\.forceDurableQueueReload === true \|\| options\.queueOnlyAuthority === true/)
     assert.doesNotMatch(body, /const activeAfterFill = getSchedulerBlockingQueuedExecutorCount\(\)/)
     assert.doesNotMatch(body, /dropVolatileQueuedActionsForDurableResume/)
-    assert.match(source, /function getSchedulerBlockingQueuedExecutorCount\(\)/)
-    assert.match(source, /function getDurablyActiveCoordinatorAuthorityRowCount\(\)/)
-    assert.match(source, /return Math\.max\(\s*getDurablyActiveQueuedTabCount\(\),\s*getDurablyActiveCoordinatorAuthorityRowCount\(\)\s*\)/)
+    const queuedTabRuntimeStatusSourceForExecutorApply = readRepoFile('shared/js/swQueuedTabRuntimeStatus.js')
+    assert.match(queuedTabRuntimeStatusSourceForExecutorApply, /function getSchedulerBlockingQueuedExecutorCount\(\)/)
+    assert.match(queuedTabRuntimeStatusSourceForExecutorApply, /function getDurablyActiveCoordinatorAuthorityRowCount\(\)/)
+    assert.match(queuedTabRuntimeStatusSourceForExecutorApply, /return Math\.max\(\s*getDurablyActiveQueuedTabCount\(\),\s*getDurablyActiveCoordinatorAuthorityRowCount\(\)\s*\)/)
     assert.match(dropBody, /getSchedulerBlockingQueuedExecutorCount\(\) > 0/)
     assert.doesNotMatch(dropBody, /activeQueuedTabs\.size > 0|pendingTabActions\.size > 0/)
     assert.match(resumeBody, /runCoordinatorExecutorApplyPhase\(options\.reason \|\| 'resume'/)
