@@ -82,6 +82,21 @@ Per-slice workflow:
 6. **Commit.** One commit per slice, so a regression is bisectable to one
    small move.
 
+## Clock/environment-global note (applies even to sync slices)
+
+The realm-boundary issue documented in architecture.md isn't only an
+`async`/timer problem. Slice 2 found that a plain `Date.now()` call inside
+an extracted **synchronous** function resolves to the real Node clock
+instead of the test harness's injected `FakeDate`, because `Date` itself is
+a different object identity across the vm/Node realm boundary, not just
+timers and promises. Any moved function that reads `Date.now()` (or any
+other environment global the harness fakes) needs that dependency threaded
+in explicitly -- e.g. `now: () => Date.now()` passed through the module's
+`deps`, matching the existing `schedulerClock`-style convention already
+used elsewhere in this codebase -- even when the function has no `await` in
+it at all. Check every moved function for this, not just the ones that look
+timing-related by name.
+
 ## Sizing note: external-ref count is a cost signal, not a risk signal
 
 Some candidates have very high external-reference counts --
