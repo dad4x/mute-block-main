@@ -118,6 +118,9 @@ const {
 const {
     createActivationGuardRuntime
 } = require('./swActivationGuardRuntime')
+const {
+    createCoordinatorReclaimEvidence
+} = require('./swCoordinatorReclaimEvidence')
 const queueRuntime = createQueueRuntimeState()
 const schedulerClock = {
     setTimeout,
@@ -1603,39 +1606,20 @@ function getTokenMatchedLiveTabForCoordinatorItem(item = null, record = null, it
     return candidates.find(tab => normalizeTabId(tab?.id) === tabId) || null
 }
 
-function hasActiveCoordinatorMilestoneEvidence(item = null) {
-    const milestones = item?.milestones || {}
-    return getFirstPositiveNumber(
-        milestones.actionClaimedAt,
-        milestones.contentOpenedAt,
-        milestones.navigationStartedAt,
-        milestones.profileReadyAt,
-        milestones.muteAttemptedAt,
-        milestones.blockAttemptedAt,
-        item?.activeAt
-    ) > 0
-}
-
-function hasStrongActiveCoordinatorReclaimEvidence(item = null, record = null) {
-    const milestones = item?.milestones || {}
-    return getFirstPositiveNumber(
-        milestones.actionClaimedAt,
-        milestones.contentOpenedAt,
-        milestones.profileReadyAt,
-        milestones.muteAttemptedAt,
-        milestones.blockAttemptedAt,
-        item?.actionClaimedAt,
-        item?.contentOpenedAt,
-        item?.profileReadyAt,
-        item?.muteAttemptedAt,
-        item?.blockAttemptedAt,
-        record?.actionReadyAt,
-        record?.contentOpenedAt,
-        record?.profileReadyAt,
-        record?.muteAttemptedAt,
-        record?.blockAttemptedAt
-    ) > 0
-}
+const coordinatorReclaimEvidence = createCoordinatorReclaimEvidence({
+    handlers: {
+        getFirstPositiveNumber,
+        normalizeTabId,
+        hasOwnedQueuedTabState
+    }
+})
+const {
+    hasActiveCoordinatorMilestoneEvidence,
+    hasStrongActiveCoordinatorReclaimEvidence,
+    chooseCoordinatorReclaimProfileTab,
+    mergeLiveTabsById,
+    isQueuedCoordinatorLiveTabReclaimReason
+} = coordinatorReclaimEvidence
 
 function getLiveProfileTabForActiveCoordinatorReclaim(item = null, record = null, itemKey = '', liveProfileTabsByHref = new Map()) {
     if(!item || !isActiveCoordinatorStatus(item.status)) return null
@@ -1662,43 +1646,6 @@ function getLiveProfileTabForActiveCoordinatorReclaim(item = null, record = null
     if(!candidateTabId || hasOwnedQueuedTabState(candidateTabId)) return null
 
     return candidate
-}
-
-function chooseCoordinatorReclaimProfileTab(candidates = []) {
-    return [...(candidates || [])]
-        .filter(tab => normalizeTabId(tab?.id) && !hasOwnedQueuedTabState(tab.id))
-        .sort((left, right) => {
-            const activeDelta = (right?.active === true ? 1 : 0) - (left?.active === true ? 1 : 0)
-            if(activeDelta) return activeDelta
-
-            const accessedDelta = (Number.parseInt(right?.lastAccessed, 10) || 0) -
-                (Number.parseInt(left?.lastAccessed, 10) || 0)
-            if(accessedDelta) return accessedDelta
-
-            return normalizeTabId(right?.id) - normalizeTabId(left?.id)
-        })[0] || null
-}
-
-function mergeLiveTabsById(...lists) {
-    const merged = []
-    const seen = new Set()
-    for(const list of lists) {
-        for(const tab of list || []) {
-            const tabId = normalizeTabId(tab?.id)
-            if(!tabId || seen.has(tabId)) continue
-            seen.add(tabId)
-            merged.push(tab)
-        }
-    }
-    return merged
-}
-
-function isQueuedCoordinatorLiveTabReclaimReason(reason = '') {
-    const normalizedReason = `${reason || ''}`.trim()
-    return normalizedReason === 'active-transition-failed' ||
-        /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalizedReason) ||
-        /(?:^|-)active-transition-retry-budget-recovered(?:-|$)/.test(normalizedReason) ||
-        /active-missing-tab$/.test(normalizedReason)
 }
 
 function getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item = null, record = null, itemKey = '', liveProfileTabsByHref = new Map()) {

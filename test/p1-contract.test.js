@@ -2168,7 +2168,8 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     const recordBatchBody = extractFunction(swSource, 'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})')
     const activeWithoutActorBody = extractFunction(swSource, 'async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = \'\', expectedItem = null, expectedRecord = null, reason = \'reconcile-active-without-actor\', options = {})')
     const actionLeaseBody = extractFunction(swSource, 'async function releaseMissingActionLeaseForActiveCoordinatorItem(itemKey = \'\', expectedItem = null, reason = \'reconcile-action-lease-missing-tab\', options = {})')
-    const queuedReclaimReasonBody = extractFunction(swSource, 'function isQueuedCoordinatorLiveTabReclaimReason(reason = \'\')')
+    const coordinatorReclaimEvidenceSource = readRepoFile('shared/js/swCoordinatorReclaimEvidence.js')
+    const queuedReclaimReasonBody = extractFunction(coordinatorReclaimEvidenceSource, 'function isQueuedCoordinatorLiveTabReclaimReason(reason = \'\')')
     const queuedActionBody = extractFunction(contentSource, 'async function maybeRunAutoProfileAction()')
     const alreadyBlockedRepairBody = extractFunction(contentSource, 'async function maybeRecordAlreadyBlockedCoordinatorProfile()')
 
