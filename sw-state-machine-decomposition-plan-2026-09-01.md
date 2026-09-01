@@ -2,9 +2,11 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-6 are landed and independently verified
+Status: in progress. Slices 1-10 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
-`3df5b6a`); Slices 7-10 are defined below and queued to execute next. See
+`3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`); Slices 11-13 are
+defined below and queued to execute next. `shared/js/sw.js` is down to
+35,997 lines from 38,953 at the start of this effort. See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
@@ -324,20 +326,68 @@ the middle of this range, but is a consumer of the already-extracted
 `swQueueWakeupMetricsShape.js` module, not part of this domain -- leave it
 in `sw.js`).
 
-### Slices 11+ -- everything else, via the chaining protocol
+### Slice 11 -- Attempt-identity & diagnostic-event primitives (~25 functions, lines 3776-4168)
 
-The remaining sync functions past Slice 10 (predicates, builders, getters,
+`makeCoordinatorJobKey`, `makeCoordinatorAttemptEnvelope`,
+`makeCoordinatorJobEnvelope`, `applyCoordinatorJobEnvelope`,
+`getFailedItemQuestionResolutionUrl`, `getFailedItemProfileResolutionRetryUrl`,
+`buildQueuedCoordinatorProgressResetPatch`, `getStoredSpaceFeedRecordUrls`,
+`getPendingSpaceFeedJobKeyPatch`, `makeId`, `makeAttemptId`,
+`normalizeAttemptId`, `getAttemptIdFromValue` (251 external refs --
+sizing-note candidate, expect the destructure-back-to-bare-name trick to
+work as it has every time so far, but double-check none of the ~251 sites
+are inside an already-extracted module needing dep threading instead),
+`getAttemptNumberFromValue` (221 refs, same caveat),
+`makeCoordinatorInFlightMutationKey`, `getNextAttemptNumberFromValue`,
+`isAttemptTrackedCoordinatorItem`, `isNewerTerminalProgressForCoordinatorItem`,
+`normalizeCoordinatorMap`, `normalizeCoordinatorEvents`,
+`hasMismatchedCoordinatorAttempt` (57 refs), `getResolvedDestinationConflict`,
+`makeStaleAttemptDiagnosticEvent`, `recordCoordinatorDiagnosticEvent` (89
+refs), `drainPendingCoordinatorDiagnosticEvents`,
+`shouldFlushPendingCoordinatorDiagnosticEventsNow`.
+
+### Slice 12 -- Coordinator status-classification rulebook (~21 functions, lines 4202-4441)
+
+`mergeCoordinatorSources`, `mergeCoordinatorEvidence`,
+`getCoordinatorStatusFromProgress`, `progressPatchHasExplicitStatus`,
+`shouldApplyExplicitProgressStatusToCoordinatorItem`,
+`getActiveCoordinatorProgressSenderTabMismatchReason`,
+`getActiveCoordinatorDirectProgressRuntimeRejectionReason`,
+`getCoordinatorActionKindForProgress`, `getCoordinatorActionKindForItem`,
+`shouldApplyProgressToCoordinatorItem`, `isCoordinatorQueueAuthoritativeItem`,
+`getCoordinatorMilestonesFromProgress`, `isTerminalCoordinatorStatus` (133
+refs), `isActiveCoordinatorStatus` (71 refs), `isPendingCoordinatorStatus`,
+`isRetryableCoordinatorFailure`, `isRetryableCoordinatorFailureFromProgress`,
+`getCoordinatorCurrentWorkAnchor`, `hasUnsettledCoordinatorSource`,
+`shouldKeepCoordinatorCurrentWorkItem`, `pruneCoordinatorCurrentWork`. This
+is the single highest-value slice yet -- the literal terminal/active/
+retryable-status rulebook the whole reconcile loop consults.
+
+### Slice 13 -- Queue-view / accounting summarization (~19 functions, lines 4453-4808)
+
+`getCoordinatorQueueViewSortRank`, `getCoordinatorQueueViewTime`,
+`getCoordinatorQueueViewEpochStartedAt`, `isCoordinatorActualBlockSuccess`,
+`getCoordinatorActualBlockTerminalTime`, `getCoordinatorActualBlockActiveStartTime`,
+`summarizeCoordinatorActualBlockTiming`, `getCoordinatorActivationHandoffTerminalTime`,
+`getCoordinatorActivationHandoffActiveTime`, `summarizeCoordinatorActivationHandoffTiming`,
+`summarizeCoordinatorQueueViewItem`, `filterCoordinatorQueueForCompactView`,
+`buildCoordinatorQueueView`, `makeCoordinatorQueueAccountingCounts`,
+`normalizeCoordinatorQueueViewAccounting`, `areCoordinatorAccountingCountsEqual`,
+`makeCoordinatorQueueAccountingComparison`, `summarizeCoordinatorQueueWalAccounting`,
+`makeCoordinatorCurrentWorkAccounting`.
+
+### Slices 14+ -- everything else, via the chaining protocol
+
+The remaining sync functions past Slice 13 (predicates, builders, getters,
 and "other"-bucket functions not yet claimed) are not hand-enumerated here
 -- that would make this document large and guaranteed to drift out of date
 as each slice shifts every line number after it. Use the claim workflow
 above: regenerate the inventory, find the next line-adjacent same-bucket
 (or obviously-related-across-bucket) cluster, size it, propose it, execute
-it. Remaining big named domains visible in the inventory as of Slice 6,
-worth claiming roughly in this order: coordinator-run/view/accounting
-helpers, terminal-progress-record helpers, and coordinator
-diagnostic-event helpers -- re-survey the inventory once Slices 7-10 land,
-since their line numbers and possibly their exact membership will have
-shifted.
+it. A large coordinator-content-queue-index-sharding cluster starts around
+line 4869 (as of the Slice 10 snapshot) and is worth claiming next, followed
+by whatever else the inventory shows once Slices 11-13 land and shift
+everything after them.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
