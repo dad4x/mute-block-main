@@ -130,6 +130,12 @@ const {
 const {
     createCoordinatorReconcileInputs
 } = require('./swCoordinatorReconcileInputs')
+const {
+    createStorageIdlePromiseLatch
+} = require('./swStorageIdlePromiseLatch')
+const {
+    createQueuedWorkFastResume
+} = require('./swQueuedWorkFastResume')
 const queueRuntime = createQueueRuntimeState()
 const schedulerClock = {
     setTimeout,
@@ -3517,429 +3523,84 @@ async function observeCoordinatorReconcileSnapshot(reason = 'reconcile-observe',
     }
 }
 
-function recordActiveStorageWorkSnapshot(queue = {}, options = {}) {
-    const context = getActiveStorageContext()
-    if(!context) return
-
-    const counts = getCoordinatorQueueWorkCounts(queue)
-    context.durableActiveRows = counts.durableActiveRows
-    context.durableQueuedRows = counts.durableQueuedRows
-    context.durableTerminalRows = counts.durableTerminalRows
-    if(options.paused !== undefined) context.paused = options.paused === true
-}
-
-function getStorageContextJournalDetails(context = {}) {
-    const now = Date.now()
-    const startedAt = Number.parseInt(context.startedAt, 10) || 0
-    const finishedAt = Number.parseInt(context.finishedAt, 10) || 0
-    const timedOutAt = Number.parseInt(context.timedOutAt, 10) || 0
-    const effectiveEndAt = finishedAt || timedOutAt || now
-    const queueWaitMs = startedAt
-        ? Math.max(0, startedAt - (Number.parseInt(context.enqueuedAt, 10) || startedAt))
-        : Math.max(0, effectiveEndAt - (Number.parseInt(context.enqueuedAt, 10) || effectiveEndAt))
-    const runMs = startedAt ? Math.max(0, effectiveEndAt - startedAt) : 0
-    const totalMs = Math.max(0, effectiveEndAt - (Number.parseInt(context.enqueuedAt, 10) || effectiveEndAt))
-
-    return {
-        updateToken: Number.parseInt(context.updateToken, 10) || 0,
-        reason: context.reason || '',
-        enqueuedAt: Number.parseInt(context.enqueuedAt, 10) || 0,
-        startedAt,
-        finishedAt,
-        timedOutAt,
-        queueWaitMs,
-        runMs,
-        totalMs,
-        timedOut: context.didTimeout === true,
-        timeoutMs: Number.parseInt(context.timeoutMs, 10) || 0,
-        deadlineMissed: context.deadlineMissed === true,
-        fallbackReturned: context.fallbackReturned === true,
-        abandoned: context.abandoned === true,
-        tailWedged: context.tailWedged === true,
-        serializedTailRecovered: context.serializedTailRecovered === true,
-        lateWriteSuppressed: context.lateWriteSuppressed === true,
-        abortedOperation: context.abortedOperation || '',
-        depth: Number.parseInt(context.depth, 10) || 0,
-        maxNestedDepth: Number.parseInt(context.maxNestedDepth, 10) || 0,
-        nestedUpdateCount: Number.parseInt(context.nestedUpdateCount, 10) || 0,
-        timeoutPhase: context.timeoutPhase || '',
-        currentPhase: context.currentPhase || '',
-        storageGetCalls: Number.parseInt(context.storageGetCalls, 10) || 0,
-        storageSetCalls: Number.parseInt(context.storageSetCalls, 10) || 0,
-        saveCoordinatorStateCalls: Number.parseInt(context.saveCoordinatorStateCalls, 10) || 0,
-        storageGetMs: Math.round(Number(context.storageGetMs) || 0),
-        storageSetMs: Math.round(Number(context.storageSetMs) || 0),
-        storageGetCumulativeMs: Math.round(Number(context.storageGetMs) || 0),
-        storageSetCumulativeMs: Math.round(Number(context.storageSetMs) || 0),
-        ownStorageGetMs: Math.round(getPhaseWallMs(context, 'storageGet')),
-        ownStorageSetMs: Math.round(getPhaseWallMs(context, 'storageSet')),
-        loadCoordinatorStateMs: Math.round(Number(context.loadCoordinatorStateMs) || 0),
-        saveCoordinatorStateMs: Math.round(Number(context.saveCoordinatorStateMs) || 0),
-        normalizeQueueMs: Math.round(Number(context.normalizeQueueMs) || 0),
-        normalizeRunsMs: Math.round(Number(context.normalizeRunsMs) || 0),
-        normalizeEventsMs: Math.round(Number(context.normalizeEventsMs) || 0),
-        normalizeProgressMs: Math.round(Number(context.normalizeProgressMs) || 0),
-        recomputeRunsMs: Math.round(Number(context.recomputeRunsMs) || 0),
-        flushDiagnosticEventsMs: Math.round(Number(context.flushDiagnosticEventsMs) || 0),
-        flushMilestonesMs: Math.round(Number(context.flushMilestonesMs) || 0),
-        queueWalSegmentStorageGetMs: Math.round(Number(context.queueWalSegmentStorageGetMs) || 0),
-        queueWalHydrateMs: Math.round(Number(context.queueWalHydrateMs) || 0),
-        queueWalAppendPrepareMs: Math.round(Number(context.queueWalAppendPrepareMs) || 0),
-        queueWalPhysicalPayloadMs: Math.round(Number(context.queueWalPhysicalPayloadMs) || 0),
-        queueWalStorageSetMs: Math.round(Number(context.queueWalStorageSetMs) || 0),
-        queueWalReplayVerifyMs: Math.round(Number(context.queueWalReplayVerifyMs) || 0),
-        queueProjectionBuildMs: Math.round(Number(context.queueProjectionBuildMs) || 0),
-        queueProjectionStorageSetMs: Math.round(Number(context.queueProjectionStorageSetMs) || 0),
-        payloadBytes: Number.parseInt(context.payloadBytes, 10) || 0,
-        payloadKeys: context.payloadKeys || '',
-        durableActiveRows: Number.parseInt(context.durableActiveRows, 10) || 0,
-        durableQueuedRows: Number.parseInt(context.durableQueuedRows, 10) || 0,
-        durableTerminalRows: Number.parseInt(context.durableTerminalRows, 10) || 0,
-        paused: context.paused === true
+const queuedWorkFastResume = createQueuedWorkFastResume({
+    now: () => Date.now(),
+    state: {
+        getQueuedTabFillPromise: () => queuedTabFillPromise,
+        getCoordinatorFastExecutorActiveUntil: () => coordinatorFastExecutorActiveUntil
+    },
+    handlers: {
+        queueRuntime,
+        storageUpdateState,
+        incrementQueueWakeupMetric,
+        scheduleCoordinatorQueueResume,
+        scheduleCoordinatorReconcile,
+        scheduleQueuedWorkContinuation,
+        runCoordinatorReconcileTick,
+        runCoordinatorQueueExecutorFastPath
     }
-}
+})
+const {
+    scheduleDurableQueueResumeFromIdleStorage,
+    scheduleQueuedOnlyDurableWorkContinuation,
+    kickQueuedWorkAfterSlotFreed
+} = queuedWorkFastResume
 
-function getStorageTimeoutBucket(context = {}) {
-    const phase = `${context.currentPhase || ''}`.trim()
-    if(!context.startedAt && (!phase || phase === 'beforeStart')) return 'timeout.beforeStart'
-    if(phase === 'storageGet') return 'timeout.duringStorageGet'
-    if(phase === 'storageSet') return 'timeout.duringStorageSet'
-    if(phase === 'recomputeRuns') return 'timeout.duringRecomputeRuns'
-    if(phase === 'flushDiagnosticEvents') return 'timeout.duringDiagnosticFlush'
-    if(phase === 'flushMilestones') return 'timeout.duringMilestoneFlush'
-    if(/^normalize/.test(phase)) return 'timeout.duringNormalize'
-    return 'timeout.unknown'
-}
-
-function recordStorageIdleChurnCounters(context = {}) {
-    const runtimeCounts = queueRuntime.getRuntimeCounts()
-    const runtimeHasWork = runtimeCounts.activeQueuedTabs > 0 ||
-        runtimeCounts.queuedTabActions > 0 ||
-        runtimeCounts.pendingTabActions > 0
-    const durableActiveRows = Number.parseInt(context.durableActiveRows, 10) || 0
-    const durableQueuedRows = Number.parseInt(context.durableQueuedRows, 10) || 0
-    const durableHasWork = durableActiveRows > 0 || durableQueuedRows > 0
-    const progressProjectionOnlyWrite = (Number.parseInt(context.profileProgressProjectionOnlyWrites, 10) || 0) > 0 &&
-        context.nonProgressProjectionWrite !== true &&
-        !context.queueWriteOperation
-
-    if(!runtimeHasWork) incrementQueueWakeupMetric('storageUpdate.noRuntimeWork')
-    if(!durableHasWork) incrementQueueWakeupMetric('storageUpdate.noDurableWork')
-    if(durableHasWork &&
-        !runtimeHasWork &&
-        context.paused !== true &&
-        (durableActiveRows > 0 || !progressProjectionOnlyWrite) &&
-        context.suppressDurableIdleResume !== true) {
-        scheduleDurableQueueResumeFromIdleStorage(context)
+const storageIdlePromiseLatch = createStorageIdlePromiseLatch({
+    now: () => Date.now(),
+    constants: {
+        SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS,
+        QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS,
+        QUEUED_TAB_FILL_PROMISE_STALE_MS,
+        COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS,
+        COORDINATOR_RECONCILE_PROMISE_STALE_MS
+    },
+    state: {
+        getQueuedTabFillPromise: () => queuedTabFillPromise,
+        getQueuedTabFillPromiseStartedAt: () => queuedTabFillPromiseStartedAt,
+        getCoordinatorReconcilePromise: () => coordinatorReconcilePromise,
+        setCoordinatorReconcilePromise: value => { coordinatorReconcilePromise = value },
+        getCoordinatorReconcilePromiseStartedAt: () => coordinatorReconcilePromiseStartedAt,
+        setCoordinatorReconcilePromiseStartedAt: value => { coordinatorReconcilePromiseStartedAt = value },
+        getCoordinatorFastExecutorActiveUntil: () => coordinatorFastExecutorActiveUntil,
+        getCoordinatorResumePromise: () => coordinatorResumePromise
+    },
+    handlers: {
+        queueRuntime,
+        storageUpdateState,
+        getActiveStorageContext,
+        getCoordinatorQueueWorkCounts,
+        getPhaseWallMs,
+        getSchedulerBlockingQueuedExecutorCount,
+        incrementQueueWakeupMetric,
+        pushQueueWakeupJournalEntry,
+        scheduleCoordinatorQueueResume,
+        scheduleCoordinatorReconcile,
+        resetQueuedTabFillState,
+        flushPostStorageQueuedWorkContinuation,
+        requestPostStorageQueuedWorkContinuation,
+        scheduleQueueWakeupMetricsFlush,
+        scheduleDurableQueueResumeFromIdleStorage
     }
-}
-
-function scheduleDurableQueueResumeFromIdleStorage(context = {}) {
-    const durableActiveRows = Number.parseInt(context.durableActiveRows, 10) || 0
-    const durableQueuedRows = Number.parseInt(context.durableQueuedRows, 10) || 0
-    if(context.paused === true) return false
-    if(durableActiveRows <= 0 && durableQueuedRows <= 0) return false
-
-    const reason = durableActiveRows > 0
-        ? 'storage-idle-durable-active-work'
-        : 'storage-idle-durable-queued-work'
-    incrementQueueWakeupMetric('storageUpdate.durableWorkNoRuntime')
-    scheduleCoordinatorQueueResume(1000, reason, {
-        allowBeforeQuora: true
-    })
-    if(durableActiveRows > 0) {
-        void runCoordinatorReconcileTick(reason, {
-            allowBeforeQuora: true,
-            skipStoredWorkCheck: true,
-            awaitFill: true
-        }).catch(() => null)
-    }
-    else if(durableQueuedRows > 0) {
-        if(queuedTabFillPromise || coordinatorFastExecutorActiveUntil > Date.now()) {
-            incrementQueueWakeupMetric('storageUpdate.durableQueuedWorkDeferredDuringFill')
-        }
-        else {
-            void runCoordinatorQueueExecutorFastPath(reason, {
-                awaitFill: true,
-                returnAfterDurableActive: true,
-                allowBeforeQuora: true,
-                skipAuthorityReconcile: true,
-                forceDurableQueueReload: true
-            }).catch(() => null)
-        }
-    }
-    return true
-}
-
-function scheduleQueuedOnlyDurableWorkContinuation(reason = 'queued-only-durable-work', options = {}) {
-    const normalizedReason = `${reason || 'queued-only-durable-work'}`.trim() || 'queued-only-durable-work'
-    incrementQueueWakeupMetric('reconcile.queuedOnlyFastResumeScheduled')
-    scheduleCoordinatorQueueResume(1000, normalizedReason, {
-        allowBeforeQuora: options.allowBeforeQuora === true
-    })
-    const runtimeCounts = queueRuntime.getRuntimeCounts()
-    const detachedQueuedActions = runtimeCounts.queuedTabActions > 0 &&
-        runtimeCounts.activeQueuedTabs <= 0 &&
-        runtimeCounts.pendingTabActions <= 0
-    if(coordinatorFastExecutorActiveUntil > Date.now() && !detachedQueuedActions) {
-        incrementQueueWakeupMetric('reconcile.queuedOnlyFastResumeDeferredDuringFastExecutor')
-        return true
-    }
-    if(detachedQueuedActions) incrementQueueWakeupMetric('reconcile.detachedQueuedActionsFastResumed')
-    void runCoordinatorQueueExecutorFastPath(normalizedReason, {
-        awaitFill: options.awaitFill !== false,
-        returnAfterDurableActive: true,
-        allowBeforeQuora: options.allowBeforeQuora === true,
-        skipAuthorityReconcile: true,
-        forceDurableQueueReload: false
-    }).catch(() => null)
-    return true
-}
-
-function kickQueuedWorkAfterSlotFreed(reason = 'queued-tab-slot-freed', options = {}) {
-    const normalizedReason = `${reason || 'queued-tab-slot-freed'}`.trim() || 'queued-tab-slot-freed'
-    scheduleQueuedWorkContinuation(normalizedReason)
-    scheduleCoordinatorQueueResume(100, normalizedReason, {
-        allowBeforeQuora: true
-    })
-    scheduleCoordinatorReconcile(100, {
-        reason: normalizedReason,
-        edgeTriggered: true,
-        allowBeforeQuora: true
-    })
-    if(storageUpdateState.getDepth() > 0 || queuedTabFillPromise) {
-        incrementQueueWakeupMetric('pump.slotFreed.fastKickDeferred')
-        return false
-    }
-    incrementQueueWakeupMetric('pump.slotFreed.fastKick')
-    void runCoordinatorQueueExecutorFastPath(normalizedReason, {
-        awaitFill: options.awaitFill !== false,
-        returnAfterDurableActive: true,
-        allowBeforeQuora: true,
-        skipAuthorityReconcile: true,
-        forceDurableQueueReload: false
-    }).catch(() => null)
-    return true
-}
-
-function getPromiseLatchAgeMs(startedAt = 0) {
-    const normalizedStartedAt = Number.parseInt(startedAt, 10) || 0
-    return normalizedStartedAt ? Math.max(0, Date.now() - normalizedStartedAt) : 0
-}
-
-function isRuntimeAndStorageIdleForPromiseLatch() {
-    return storageUpdateState.getDepth() <= 0 &&
-        getSchedulerBlockingQueuedExecutorCount() <= 0 &&
-        queueRuntime.getActiveQueuedTabCount() <= 0 &&
-        queueRuntime.getPendingTabActionCount() <= 0
-}
-
-function hasVisibleQueuedTabFillPromise() {
-    if(!queuedTabFillPromise) return false
-    const pendingOnlyActiveTabs = queueRuntime.listPendingTabActionTabIds()
-        .every(tabId => queueRuntime.hasActiveQueuedTab(tabId))
-    return !(queueRuntime.getActiveQueuedTabCount() > 0 &&
-        queueRuntime.getActivationIntentCount() <= 0 &&
-        pendingOnlyActiveTabs)
-}
-
-function isExecutorRuntimeIdleForPromiseLatch() {
-    return getSchedulerBlockingQueuedExecutorCount() <= 0 &&
-        queueRuntime.getActiveQueuedTabCount() <= 0 &&
-        queueRuntime.getPendingTabActionCount() <= 0
-}
-
-function isExecutorRuntimeDetachedForPromiseLatch() {
-    return queueRuntime.getActiveQueuedTabCount() <= 0 &&
-        queueRuntime.getPendingTabActionCount() <= 0 &&
-        !hasVisibleQueuedTabFillPromise()
-}
-
-function shouldDeferScheduledResumeDuringFastExecutor(reason = '') {
-    const normalizedReason = `${reason || ''}`.trim()
-    if(/terminal-progress|active-transition|durable-(?:active|queued)-work|storage-idle-durable|queued-tab-release|active-missing-tab|runtime-authority-missing-active-row/.test(normalizedReason)) {
-        incrementQueueWakeupMetric('pump.fastExecutor.deferredBypassProgressReason')
-        return false
-    }
-    return coordinatorFastExecutorActiveUntil > Date.now() &&
-        (coordinatorResumePromise ||
-            queuedTabFillPromise ||
-            getSchedulerBlockingQueuedExecutorCount() > 0 ||
-            queueRuntime.getPendingTabActionCount() > 0)
-}
-
-function clearStaleQueuedTabFillPromise(reason = 'queued-tab-fill') {
-    if(!queuedTabFillPromise) return false
-
-    const ageMs = getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt)
-    const idleLatch = isRuntimeAndStorageIdleForPromiseLatch()
-    const staleMs = idleLatch
-        ? Math.min(QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS, QUEUED_TAB_FILL_PROMISE_STALE_MS)
-        : QUEUED_TAB_FILL_PROMISE_STALE_MS
-    if(ageMs < staleMs) return false
-
-    resetQueuedTabFillState()
-    incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
-    if(idleLatch) incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
-    pushQueueWakeupJournalEntry({
-        kind: 'state-change',
-        name: 'queued-tab-fill-promise-stale-cleared',
-        reason,
-        result: 'state-changed',
-        resultReason: 'stale-fill-promise-cleared',
-        details: {
-            ageMs,
-            staleMs,
-            idleLatch
-        }
-    })
-    scheduleCoordinatorQueueResume(1000, `${reason || 'queued-tab-fill'}-stale-fill-promise`, {
-        allowBeforeQuora: true
-    })
-    scheduleCoordinatorReconcile(1000, {
-        reason: `${reason || 'queued-tab-fill'}-stale-fill-promise`,
-        edgeTriggered: true,
-        allowBeforeQuora: true
-    })
-    return true
-}
-
-function clearStaleCoordinatorReconcilePromise(reason = 'coordinator-reconcile') {
-    if(!coordinatorReconcilePromise) return false
-
-    const ageMs = getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt)
-    const idleLatch = isRuntimeAndStorageIdleForPromiseLatch()
-    const executorIdle = isExecutorRuntimeIdleForPromiseLatch()
-    const detachedExecutor = isExecutorRuntimeDetachedForPromiseLatch()
-    const staleMs = idleLatch || executorIdle || detachedExecutor
-        ? COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS
-        : COORDINATOR_RECONCILE_PROMISE_STALE_MS
-    if(ageMs < staleMs) return false
-
-    coordinatorReconcilePromise = null
-    coordinatorReconcilePromiseStartedAt = 0
-    incrementQueueWakeupMetric('reconcile.stalePromiseCleared')
-    if(idleLatch) incrementQueueWakeupMetric('reconcile.idleStalePromiseCleared')
-    else if(executorIdle) incrementQueueWakeupMetric('reconcile.executorIdleStalePromiseCleared')
-    else if(detachedExecutor) incrementQueueWakeupMetric('reconcile.detachedExecutorStalePromiseCleared')
-    pushQueueWakeupJournalEntry({
-        kind: 'state-change',
-        name: 'coordinator-reconcile-promise-stale-cleared',
-        reason,
-        result: 'state-changed',
-        resultReason: 'stale-reconcile-promise-cleared',
-        details: {
-            ageMs,
-            staleMs,
-            idleLatch,
-            executorIdle,
-            detachedExecutor
-        }
-    })
-    scheduleCoordinatorReconcile(1000, {
-        reason: `${reason || 'coordinator-reconcile'}-stale-reconcile-promise`,
-        edgeTriggered: true,
-        allowBeforeQuora: true
-    })
-    return true
-}
-
-function clearStorageTimeoutPromiseLatches(reason = 'storage-timeout', timeoutMs = SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS) {
-    const normalizedReason = `${reason || 'storage-timeout'}`.trim() || 'storage-timeout'
-    const executorIdle = isExecutorRuntimeIdleForPromiseLatch()
-    const recoveryStaleMs = Math.max(
-        executorIdle
-            ? QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS
-            : QUEUED_TAB_FILL_PROMISE_STALE_MS,
-        Number.parseInt(timeoutMs, 10) || SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS
-    )
-    const effectiveRecoveryStaleMs = executorIdle
-        ? Math.min(recoveryStaleMs, QUEUED_TAB_IDLE_FILL_PROMISE_STALE_MS)
-        : recoveryStaleMs
-    let cleared = false
-
-    if(queuedTabFillPromise && getPromiseLatchAgeMs(queuedTabFillPromiseStartedAt) >= effectiveRecoveryStaleMs) {
-        resetQueuedTabFillState()
-        cleared = true
-        incrementQueueWakeupMetric('storageUpdate.clearedTimedOutFillPromise')
-    }
-
-    if(coordinatorReconcilePromise && getPromiseLatchAgeMs(coordinatorReconcilePromiseStartedAt) >= effectiveRecoveryStaleMs) {
-        coordinatorReconcilePromise = null
-        coordinatorReconcilePromiseStartedAt = 0
-        cleared = true
-        incrementQueueWakeupMetric('storageUpdate.clearedTimedOutReconcilePromise')
-    }
-
-    if(cleared) {
-        pushQueueWakeupJournalEntry({
-            kind: 'state-change',
-            name: 'storage-timeout-promise-latches-cleared',
-            reason: normalizedReason,
-            result: 'state-changed',
-            resultReason: 'storage-timeout-recovery',
-            details: {
-                recoveryStaleMs: effectiveRecoveryStaleMs,
-                executorIdle
-            }
-        })
-    }
-
-    return cleared
-}
-
-function recoverStorageGetTimeoutSerializedTail(context = {}, reason = 'storage-timeout', serializedTailPromise = null) {
-    if(!context || context.serializedTailRecovered === true) return false
-    if(`${context.currentPhase || ''}`.trim() !== 'storageGet') return false
-
-    const updateToken = Number.parseInt(context.updateToken, 10) || 0
-    if(!updateToken) return false
-    if(!storageUpdateState.canRecoverSerializedTail(context, serializedTailPromise)) return false
-
-    context.serializedTailRecovered = true
-    context.lateWriteSuppressed = true
-    context.abortedOperation = 'storageGet'
-    storageUpdateState.recoverSerializedTail(context)
-    incrementQueueWakeupMetric('storageUpdate.serializedTailRecovered')
-    incrementQueueWakeupMetric('storageUpdate.storageGetTailRecovered')
-    pushQueueWakeupJournalEntry({
-        kind: 'state-change',
-        name: 'storage-get-timeout-serialized-tail-recovered',
-        reason,
-        result: 'state-changed',
-        resultReason: 'storage-get-timeout-tail-recovered',
-        details: getStorageContextJournalDetails(context)
-    })
-    flushPostStorageQueuedWorkContinuation()
-    scheduleQueueWakeupMetricsFlush()
-    return true
-}
-
-function requestStorageTimeoutRecoveryContinuation(context = {}, reason = 'storage-timeout') {
-    if(context.timeoutRecoveryRequested === true) return false
-    context.timeoutRecoveryRequested = true
-
-    const normalizedReason = `${reason || context.reason || 'storage-timeout'}`.trim() || 'storage-timeout'
-    const followupReason = `${normalizedReason}-recovery`
-    incrementQueueWakeupMetric('storageUpdate.timeoutRecoveryRequested')
-    clearStorageTimeoutPromiseLatches(followupReason, context.timeoutMs)
-    requestPostStorageQueuedWorkContinuation(followupReason)
-    scheduleCoordinatorQueueResume(1000, followupReason, {
-        allowBeforeQuora: true
-    })
-    return true
-}
-
-function shouldContinueQueuedOnlyWorkWithFastExecutor(snapshot = {}) {
-    if(!snapshot || snapshot.paused === true) return false
-    if((Number.parseInt(snapshot.durableActiveRows, 10) || 0) > 0) return false
-    if((Number.parseInt(snapshot.durableQueuedRows, 10) || 0) <= 0) return false
-    if((Number.parseInt(snapshot.activeQueuedTabs, 10) || 0) > 0) return false
-    if((Number.parseInt(snapshot.durablyActiveQueuedTabs, 10) || 0) > 0) return false
-    if((Number.parseInt(snapshot.provisionalActiveQueuedTabs, 10) || 0) > 0) return false
-    if((Number.parseInt(snapshot.pendingTabActions, 10) || 0) > 0) return false
-    return true
-}
+})
+const {
+    recordActiveStorageWorkSnapshot,
+    getStorageContextJournalDetails,
+    getStorageTimeoutBucket,
+    recordStorageIdleChurnCounters,
+    getPromiseLatchAgeMs,
+    isRuntimeAndStorageIdleForPromiseLatch,
+    hasVisibleQueuedTabFillPromise,
+    isExecutorRuntimeIdleForPromiseLatch,
+    isExecutorRuntimeDetachedForPromiseLatch,
+    shouldDeferScheduledResumeDuringFastExecutor,
+    clearStaleQueuedTabFillPromise,
+    clearStaleCoordinatorReconcilePromise,
+    clearStorageTimeoutPromiseLatches,
+    recoverStorageGetTimeoutSerializedTail,
+    requestStorageTimeoutRecoveryContinuation,
+    shouldContinueQueuedOnlyWorkWithFastExecutor
+} = storageIdlePromiseLatch
 
 function scheduleQueueWakeupMetricsFlush() {
     queueWakeupMetricsDirty = true
