@@ -160,6 +160,9 @@ const {
 const {
     createProfileNukeProgress
 } = require('./swProfileNukeProgress')
+const {
+    createCoordinatorRuns
+} = require('./swCoordinatorRuns')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -583,6 +586,45 @@ const {
     makeCoordinatorResolutionSubject,
     getCoordinatorSubjectKey
 } = profileResolution
+// coordinatorRuns is constructed here, well before this cluster's old
+// source-text location, rather than in place like Slice 14/15 -- see
+// swCoordinatorRuns.js's header comment: queuedTabRuntimeStatus's deps
+// object literal (constructed further below) eagerly references
+// makeEmptyCoordinatorMilestones, so this module must construct before
+// that reference, not merely before its own former definition point.
+// Every other handler this module needs (coordinatorStatusRules's
+// exports, profileResolution's exports, queueWakeupMetricsShape's
+// runQueueWakeupMetricPhase) is already a bare name in scope by this
+// point; isTransientProfileNukeStatus and getCoordinatorItemHref are
+// still plain hoisted function declarations further below and work from
+// any point in this scope either way.
+const coordinatorRuns = createCoordinatorRuns({
+    now: () => Date.now(),
+    handlers: {
+        makeEmptyJobMilestones,
+        isRetryableCoordinatorFailureFromProgress,
+        isTerminalCoordinatorStatus,
+        isActiveCoordinatorStatus,
+        isPendingCoordinatorStatus,
+        isTransientProfileNukeStatus,
+        getNormalizedProfileHrefList,
+        normalizeQuoraProfileUrl,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey,
+        runQueueWakeupMetricPhase
+    }
+})
+const {
+    makeEmptyCoordinatorMilestones,
+    shouldResetCoordinatorFailureFromProgress,
+    getCoordinatorRunStatus,
+    materializeCoordinatorRunsPausedStateFromControl,
+    getCoordinatorRunTargetHrefs,
+    isCoordinatorRunWorkKeyForProfileHref,
+    getCoordinatorRunItems,
+    getCoordinatorRunIdsForHref,
+    recomputeCoordinatorRuns
+} = coordinatorRuns
 const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     browser,
     getQueuedExecutorTabStatusWithTimeout,
@@ -4446,169 +4488,6 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
         truncated: view.truncated,
         view
     }
-}
-
-function makeEmptyCoordinatorMilestones() {
-    return makeEmptyJobMilestones()
-}
-
-function shouldResetCoordinatorFailureFromProgress(item = null, record = null, mapped = null) {
-    if(!isRetryableCoordinatorFailureFromProgress(item, record)) return false
-    if(!mapped || isTerminalCoordinatorStatus(mapped.status)) return false
-    if(!isTransientProfileNukeStatus(record?.status)) return false
-
-    const recordRunId = `${record?.runId || ''}`.trim()
-    const itemRunId = `${item?.runId || ''}`.trim()
-    if(recordRunId && recordRunId !== itemRunId) return true
-
-    const recordUpdatedAt = Number.parseInt(record?.updatedAt, 10) || 0
-    const itemTerminalAt = Number.parseInt(item?.terminalAt, 10) || 0
-    return recordUpdatedAt > 0 && itemTerminalAt > 0 && recordUpdatedAt >= itemTerminalAt
-}
-
-function getCoordinatorRunStatus(runItems = [], existingRun = {}) {
-    if(!runItems.length) return existingRun?.paused ? 'paused' : 'complete'
-
-    const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
-    if(terminalCount === runItems.length) return 'complete'
-    if(existingRun?.paused) return 'paused'
-    return 'active'
-}
-
-function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, now = Date.now()) {
-    const nextRuns = {...(runs || {})}
-    const targetRunIds = new Set(Object.keys(nextRuns))
-    const affectedRunIds = []
-
-    for(const item of Object.values(queue || {})) {
-        const runId = `${item?.runId || ''}`.trim()
-        if(runId) targetRunIds.add(runId)
-    }
-
-    for(const runId of targetRunIds) {
-        const run = nextRuns[runId]
-        if(!run || typeof run !== 'object') continue
-
-        const runItems = getCoordinatorRunItems(queue, runId, run)
-        if(!runItems.some(item => isPendingCoordinatorStatus(item?.status))) continue
-
-        const status = paused ? 'paused' : 'active'
-        if(run.paused === paused && `${run.status || ''}` === status) continue
-
-        nextRuns[runId] = {
-            ...run,
-            paused,
-            status,
-            updatedAt: Math.max(Number.parseInt(run.updatedAt, 10) || 0, now)
-        }
-        affectedRunIds.push(runId)
-    }
-
-    return {
-        changed: affectedRunIds.length > 0,
-        runs: affectedRunIds.length ? nextRuns : runs,
-        affectedRunIds
-    }
-}
-
-function getCoordinatorRunTargetHrefs(run = {}) {
-    return getNormalizedProfileHrefList(run?.targetProfileHrefs || [])
-}
-
-function isCoordinatorRunWorkKeyForProfileHref(workKey = '', normalizedHref = '') {
-    const key = `${workKey || ''}`.trim()
-    if(!key || !normalizedHref) return false
-    if(key === normalizedHref) return true
-
-    return normalizeQuoraProfileUrl(key) === normalizedHref
-}
-
-function getCoordinatorRunItems(queue = {}, runId = '', existingRun = {}) {
-    const targetHrefs = new Set(getCoordinatorRunTargetHrefs(existingRun))
-
-    return Object.entries(queue || {})
-        .filter(([itemKey, item]) => {
-            if(item?.runId === runId) return true
-            if(!targetHrefs.size) return false
-
-            const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-            return !!href && targetHrefs.has(href)
-        })
-        .map(([, item]) => item)
-}
-
-function getCoordinatorRunIdsForHref(runs = {}, href = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(href)
-    if(!normalizedHref) return []
-
-    return Object.values(runs || {})
-        .filter(run => {
-            if(getCoordinatorRunTargetHrefs(run).includes(normalizedHref)) return true
-
-            return (Array.isArray(run?.targetWorkKeys) ? run.targetWorkKeys : [])
-                .some(key => isCoordinatorRunWorkKeyForProfileHref(key, normalizedHref))
-        })
-        .map(run => run?.id || run?.runId || '')
-        .filter(Boolean)
-}
-
-function recomputeCoordinatorRuns(queue = {}, runs = {}, runIds = null) {
-    return runQueueWakeupMetricPhase('recomputeRuns', () => {
-        const nextRuns = {
-            ...runs
-        }
-        const targetRunIds = new Set(runIds || Object.keys(nextRuns))
-
-        for(const item of Object.values(queue || {})) {
-            if(item?.runId && (!runIds || targetRunIds.has(item.runId))) {
-                targetRunIds.add(item.runId)
-            }
-        }
-
-        for(const runId of targetRunIds) {
-            const existing = nextRuns[runId] || {
-                id: runId,
-                sourcePages: []
-            }
-            const runItems = getCoordinatorRunItems(queue, runId, existing)
-            const targetHrefs = new Set(getCoordinatorRunTargetHrefs(existing))
-            const targetWorkKeys = new Set(Array.isArray(existing.targetWorkKeys) ? existing.targetWorkKeys : [])
-            const sourcePages = new Set(Array.isArray(existing.sourcePages) ? existing.sourcePages : [])
-            for(const item of runItems) {
-                const href = getCoordinatorItemHref(item)
-                const workKey = getCoordinatorItemQueueKey(item) || href
-                const sourcePageUrl = `${item?.source?.pageUrl || item?.source?.sourcePageUrl || ''}`.trim()
-                if(href) targetHrefs.add(href)
-                if(workKey) targetWorkKeys.add(workKey)
-                if(sourcePageUrl) sourcePages.add(sourcePageUrl)
-            }
-            const targetProfileHrefs = Array.from(targetHrefs)
-            const targetWorkKeyList = Array.from(targetWorkKeys)
-            const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
-            const activeCount = runItems.filter(item => isActiveCoordinatorStatus(item?.status)).length
-            const latestItemUpdatedAt = runItems.reduce((latest, item) => {
-                const updatedAt = Number.parseInt(item?.updatedAt || item?.terminalAt || item?.createdAt, 10) || 0
-                return Math.max(latest, updatedAt)
-            }, 0)
-
-            nextRuns[runId] = {
-                ...existing,
-                id: runId,
-                sourceType: existing.sourceType || runItems[0]?.source?.type || 'space-feed',
-                createdAt: existing.createdAt || runItems[0]?.createdAt || Date.now(),
-                sourcePages: Array.from(sourcePages),
-                targetProfileHrefs,
-                targetWorkKeys: targetWorkKeyList,
-                itemCount: targetProfileHrefs.length || runItems.length || targetWorkKeyList.length || 0,
-                activeCount,
-                terminalCount,
-                status: getCoordinatorRunStatus(runItems, existing),
-                updatedAt: Math.max(Number.parseInt(existing.updatedAt, 10) || 0, latestItemUpdatedAt)
-            }
-        }
-
-        return nextRuns
-    })
 }
 
 function getCoordinatorTransitionTerminalAt(item = {}, record = {}, now = Date.now(), options = {}) {
