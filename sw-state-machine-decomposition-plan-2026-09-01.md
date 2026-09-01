@@ -443,15 +443,60 @@ resume on the other side of that region (roughly line 8148 onward as of the
 Slice 13 snapshot -- `getChangedProfileProgressRecords`,
 `getCoordinatorProgressRecordForItem`, and beyond), not inside it.
 
-### Slices 18+ -- everything else, via the chaining protocol
+### Slice 18 -- Coordinator source/provenance materialization (~14 functions, lines 7317-7512)
 
-The remaining sync functions past Slice 17 (skipping the excluded
-createCoordinatorAuthority-adjacent region above) are not hand-enumerated
-here -- that would make this document large and guaranteed to drift out of
-date as each slice shifts every line number after it. Use the claim
-workflow above: regenerate the inventory, find the next line-adjacent
-same-bucket (or obviously-related-across-bucket) cluster past the excluded
-region, size it, propose it, execute it.
+`getChangedProfileProgressRecords`, `getCoordinatorProgressRecordForItem`,
+`inferSourceTypeFromRunId`, `getCoordinatorRunSourcePageFromEvents`,
+`getProfileSearchQueryFromPageUrl`, `makeCoordinatorSourceFromRunMetadata`,
+`mergeCoordinatorSourceMetadata`, `normalizeCoordinatorProvenanceSpaceUrl`,
+`normalizeCoordinatorItemProvenance`, `applyCoordinatorSourceMetadataMaterialization`,
+`getCoordinatorQueueProfileHrefSet`, `getClearProfileWalRemovedProfileHrefs`,
+`removeProfileHrefFromProgressRecords`, `materializeRemovedProfileDerivedStateFromAuthority`.
+
+Note: this is immediately past the excluded region -- `getHydratedCoordinatorAuthorityState`
+and `refreshResidentCoordinatorAuthorityState` (lines ~6857-6885) are also
+excluded even though they sit between the boundary and this slice, since
+they're direct accessors on `coordinatorAuthority` itself.
+
+### Slice 19 -- Coordinator reconcile-operation locked materialization (~14 functions, lines 7623-8158)
+
+`getCoordinatorReconcileOperationTabIdsToClose`,
+`matchesCoordinatorReconcileOperationAttempt`,
+`applyInvalidProfileResolutionReconcileActionLocked`,
+`applyStaleProfileResolutionTabReconcileActionLocked`,
+`applyProgressRecordCoordinatorReconcileActionLocked`,
+`buildCoordinatorReconcileQueueAuthorityDiff`, `hasTerminalKeyOnlyCoordinatorEvent`,
+`materializeTerminalKeyOnlyDerivedStateLocked`,
+`settleTerminalResolverPendingSourceRecordsLocked`,
+`settleResolvedResolverPendingSourceRecordsLocked`,
+`materializeQueuedCoordinatorDerivedStateLocked`,
+`addCoordinatorReconcileAffectedRunIds`, `markCoordinatorReconcileRunAffected`,
+`materializeCoordinatorReconcileDerivedProjectionPhase`.
+
+Caution: the `Locked` suffix and proximity to the reconcile tick's critical
+section makes this the deepest-into-the-async-core sync cluster claimed so
+far. Extra Promise-chain scrutiny per the realm-crossing note; prefer
+static analysis over live-fire experimentation, and leave any function
+behind that doesn't check out cleanly rather than force it.
+
+### Slice 20 -- Coordinator terminal-settlement helpers (~5 functions, lines 8575-8702)
+
+`getCoordinatorItemSettlementKey`, `getCoordinatorTerminalItemEntries`,
+`settleConfirmedSpaceFeedProfiles`, `scheduleTerminalOwnedProfileTabCleanup`,
+`buildTerminalCoordinatorSettlementDerivedPayload`.
+
+Caution: `scheduleTerminalOwnedProfileTabCleanup` sounds Promise-chain-shaped
+despite not being declared `async` -- check per the realm-crossing note
+before moving.
+
+### Slices 21+ -- everything else, via the chaining protocol
+
+The remaining sync functions past Slice 20 are not hand-enumerated here --
+that would make this document large and guaranteed to drift out of date as
+each slice shifts every line number after it. Use the claim workflow
+above: regenerate the inventory, find the next line-adjacent same-bucket
+(or obviously-related-across-bucket) cluster past the excluded region,
+size it, propose it, execute it.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
