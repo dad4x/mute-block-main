@@ -2,11 +2,12 @@
 
 Date: 2026-09-01
 
-Status: proposed, not started. This is a plan for consideration, not an
-in-flight refactor. See [architecture.md](architecture.md) for the durable
-model this plan works within, and its "Module Extraction And The Test
-Harness Realm Boundary" section for the constraint this plan is built
-around.
+Status: in progress. Slices 1-6 are landed and independently verified
+(commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
+`3df5b6a`); Slices 7-10 are defined below and queued to execute next. See
+[architecture.md](architecture.md) for the durable model this plan works
+within, and its "Module Extraction And The Test Harness Realm Boundary"
+section for the constraint this plan is built around.
 
 ## Why this is hard, and why previous splits stalled
 
@@ -226,19 +227,101 @@ it further at claim time if a fresh read shows natural sub-clusters (tab-URL
 classification vs. reclaim-evidence vs. budget-exhaustion look like three
 candidates from the names alone).
 
-### Slices 7+ -- everything else, via the chaining protocol
+### Slice 7 -- Browser-session / Quora-runtime-activation tracking (~15 functions, lines 488-1025)
 
-The remaining ~550 sync functions (roughly 120 more predicates, 90 more
-builders, 140 more getters, 180 more miscellaneous "other"-bucket functions)
-are not hand-enumerated here -- that would make this document large and
-guaranteed to drift out of date after Slice 1 alone shifts every line
-number. Use the claim workflow above: regenerate the inventory, find the
-next line-adjacent same-bucket cluster, size it, execute it. The remaining
-big named domains visible in the current inventory (worth claiming roughly
-in this order, each independently): profile-nuke-progress helpers,
-coordinator-run/view/accounting helpers, terminal-progress-record helpers,
-coordinator diagnostic-event helpers, and the profile-resolution predicates
-around line 5780-5830.
+`getBrowserSessionStorageArea`, `hasBrowserSessionStorage`,
+`rememberBrowserSessionMarker`, `rememberQuoraRuntimeActivation`,
+`forgetQuoraRuntimeActivation`, `ensureBrowserSessionStartupMetricsReset`,
+`clearSchedulerAlarms`, `startQueueWakeupMetricsBackedStartupWork`,
+`markQuoraRuntimeActivated`, `markQuoraRuntimeActivatedFromRequest`,
+`makeQuoraRuntimeNotActivatedResult`,
+`scheduleStoredWorkRearmAfterExtensionReload`,
+`scheduleStoredWorkRearmAfterServiceWorkerReload`, `normalizeObjectNumberMap`,
+`normalizeQueueWakeupPhaseMap`.
+
+Caution: `startQueueWakeupMetricsBackedStartupWork` and
+`scheduleStoredWorkRearmAfterServiceWorkerReload` are the two functions
+Slice 1 deliberately left as literal top-level *call* statements in `sw.js`
+because `test/lib/swHarness.js` regex-suppresses those calls by source text
+during tests. Moving their *definitions* may be fine as long as the call
+site stays a literal `functionName()` statement in `sw.js` -- verify the
+harness's regex still matches before committing, don't assume it does.
+
+### Slice 8 -- Coordinator reconcile-decision inputs (~13 functions, lines 1399-1901)
+
+`markQueuedTabDurablyActive`, `getCoordinatorQueueWorkCounts`,
+`getCoordinatorAuthorityMismatchCounts`, `getCoordinatorReconcileActionBudget`,
+`getTokenMatchedLiveTabForCoordinatorItem`,
+`getLiveProfileTabForActiveCoordinatorReclaim`,
+`getLiveProfileTabForRolledBackQueuedCoordinatorReclaim`,
+`getCoordinatorItemExpectedExecutorHref`, `getCoordinatorItemExpectedExecutorUrl`,
+`getTabObservedUrls`, `getPersistedExecutorObservedAgeMs`,
+`getQueuedTabActorReadinessAnchor`, `summarizeQueuedTabStatusForRecorder`,
+`getFreshWorkerWindowStartupProgressAnchor`.
+
+Note: a small cluster just before this range (`getActiveStorageUpdateToken`,
+`getActiveStorageContext`, `isStorageUpdateAbandoned`,
+`suppressAbandonedStorageOperation`, lines ~1122-1134) looks like it belongs
+to `swstorage.js`'s serialized-update-queue concern per architecture.md's
+"Storage Authority" section, but is apparently still in `sw.js`. Check at
+claim time whether that's a leftover that should fold into `swstorage.js`
+directly rather than become part of this slice or a new module.
+
+### Slice 9 -- Storage-idle / promise-latch recovery bookkeeping (~19 functions, lines 3813-4329)
+
+`recordActiveStorageWorkSnapshot`, `getStorageContextJournalDetails`,
+`getStorageTimeoutBucket`, `recordStorageIdleChurnCounters`,
+`scheduleDurableQueueResumeFromIdleStorage`,
+`scheduleQueuedOnlyDurableWorkContinuation`, `kickQueuedWorkAfterSlotFreed`,
+`getPromiseLatchAgeMs`, `isRuntimeAndStorageIdleForPromiseLatch`,
+`hasVisibleQueuedTabFillPromise`, `isExecutorRuntimeIdleForPromiseLatch`,
+`isExecutorRuntimeDetachedForPromiseLatch`,
+`shouldDeferScheduledResumeDuringFastExecutor`, `clearStaleQueuedTabFillPromise`,
+`clearStaleCoordinatorReconcilePromise`, `clearStorageTimeoutPromiseLatches`,
+`recoverStorageGetTimeoutSerializedTail`,
+`requestStorageTimeoutRecoveryContinuation`,
+`shouldContinueQueuedOnlyWorkWithFastExecutor`, `scheduleQueueWakeupMetricsFlush`.
+
+Note: a couple of these call `resetQueuedTabFillState` (still bare in
+`sw.js`, line ~302) -- thread it in as a dep, it's out of scope for this
+slice (touches state well beyond this cluster).
+
+### Slice 10 -- Profile-resolution / coordinator subject-key predicates (~22 functions, lines 4321-4587)
+
+`getFirstPositiveNumber`, `pruneProfileNukeProgress`,
+`mergeProfileProgressEvents`, `mergeUniqueStringList`,
+`getNormalizedProfileHrefList`, `normalizeCoordinatorRequestedUrl`,
+`isProfileResolutionMode`, `isProfileResolutionItem`,
+`stripProfileResolutionQueueKey`, `makeProfileResolutionQueueKey`,
+`getProfileResolutionRequestedUrl`, `getEncodedQuoraPathRootToken`,
+`isEncodedProfilePathOrTruncatedProfilePath`,
+`isLowConfidenceEncodedQuestionPath`,
+`getQuestionResolutionUrlFromEvidencePostUrl`,
+`getInvalidProfileResolutionFailure`, `getCoordinatorItemQueueKey` (74
+external refs -- sizing-note candidate, use the destructure-back-to-bare-name
+trick from Slice 3/6 if it applies here, otherwise a scripted rename),
+`getCoordinatorItemOpenUrl`, `makeCoordinatorScope`,
+`makeCoordinatorResolutionSubject`, `getCoordinatorSubjectKey`.
+
+Excludes `recordQueueWakeupPhaseSamplesFromProgress` (sits at line ~4329, in
+the middle of this range, but is a consumer of the already-extracted
+`swQueueWakeupMetricsShape.js` module, not part of this domain -- leave it
+in `sw.js`).
+
+### Slices 11+ -- everything else, via the chaining protocol
+
+The remaining sync functions past Slice 10 (predicates, builders, getters,
+and "other"-bucket functions not yet claimed) are not hand-enumerated here
+-- that would make this document large and guaranteed to drift out of date
+as each slice shifts every line number after it. Use the claim workflow
+above: regenerate the inventory, find the next line-adjacent same-bucket
+(or obviously-related-across-bucket) cluster, size it, propose it, execute
+it. Remaining big named domains visible in the inventory as of Slice 6,
+worth claiming roughly in this order: coordinator-run/view/accounting
+helpers, terminal-progress-record helpers, and coordinator
+diagnostic-event helpers -- re-survey the inventory once Slices 7-10 land,
+since their line numbers and possibly their exact membership will have
+shifted.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
