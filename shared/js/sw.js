@@ -151,6 +151,9 @@ const {
 const {
     createCoordinatorProgressRules
 } = require('./swCoordinatorProgressRules')
+const {
+    createCoordinatorQueueView
+} = require('./swCoordinatorQueueView')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -4038,379 +4041,44 @@ async function recordStaleAttemptDiagnostic(details = {}) {
     return true
 }
 
-function getCoordinatorQueueViewSortRank(item = {}) {
-    const status = `${item?.status || ''}`.trim()
-    if(isActiveCoordinatorStatus(status)) return 0
-    if(status === 'queued') return 1
-    if(isRetryableCoordinatorFailure(item)) return 2
-    if(status === 'failed') return 3
-    if(!isTerminalCoordinatorStatus(status)) return 4
-    return 5
-}
-
-function getCoordinatorQueueViewTime(item = {}) {
-    return Number.parseInt(
-        item?.terminalAt ||
-        item?.updatedAt ||
-        item?.activeAt ||
-        item?.queuedAt ||
-        item?.createdAt,
-        10
-    ) || 0
-}
-
-function getCoordinatorQueueViewEpochStartedAt() {
-    return Number.parseInt(queueWakeupMetrics?.currentEpoch?.startedAt, 10) || 0
-}
-
-function isCoordinatorActualBlockSuccess(item = {}) {
-    if(`${item?.status || ''}` !== 'succeeded') return false
-    if(`${item?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) return false
-    if(`${item?.outcome || ''}` === 'already-blocked') return false
-    if(`${item?.outcome || ''}` === 'blocked') return true
-
-    const milestones = item?.milestones || {}
-    return getFirstPositiveNumber(
-        item?.blockAttemptedAt,
-        milestones.blockAttemptedAt
-    ) > 0
-}
-
-function getCoordinatorActualBlockTerminalTime(item = {}) {
-    return getFirstPositiveNumber(item?.terminalAt, item?.blockedAt, item?.updatedAt, item?.createdAt)
-}
-
-function getCoordinatorActualBlockActiveStartTime(item = {}) {
-    const milestones = item?.milestones || {}
-    return getFirstPositiveNumber(
-        item?.activeAt,
-        item?.actionReadyAt,
-        milestones.actionReadyAt,
-        item?.blockAttemptedAt,
-        milestones.blockAttemptedAt,
-        item?.tabOpenedAt,
-        milestones.tabOpenedAt,
-        item?.contentOpenedAt,
-        milestones.contentOpenedAt
-    )
-}
-
-function summarizeCoordinatorActualBlockTiming(queue = {}, epochStartedAt = 0) {
-    const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
-    const samples = Object.values(queue || {})
-        .filter(item => {
-            if(!isCoordinatorActualBlockSuccess(item)) return false
-            const terminalAt = getCoordinatorActualBlockTerminalTime(item)
-            return terminalAt > 0 && (!minimumTerminalAt || terminalAt >= minimumTerminalAt)
-        })
-        .sort((left, right) => getCoordinatorActualBlockTerminalTime(right) - getCoordinatorActualBlockTerminalTime(left))
-        .slice(0, 100)
-
-    const durations = samples
-        .map(item => {
-            const startedAt = getCoordinatorActualBlockActiveStartTime(item)
-            const terminalAt = getCoordinatorActualBlockTerminalTime(item)
-            return startedAt > 0 && terminalAt > startedAt ? terminalAt - startedAt : 0
-        })
-        .filter(duration => duration > 0)
-    const elapsedMs = durations.reduce((total, duration) => total + duration, 0)
-    const blocks = durations.length
-
-    return {
-        epochStartedAt: minimumTerminalAt,
-        sampleLimit: 100,
-        blocks,
-        elapsedMs,
-        seconds: blocks ? (elapsedMs / 1000) / blocks : 0
+const coordinatorQueueView = createCoordinatorQueueView({
+    now: () => Date.now(),
+    constants: {
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
+    handlers: {
+        isActiveCoordinatorStatus,
+        isRetryableCoordinatorFailure,
+        isTerminalCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        getFirstPositiveNumber,
+        normalizeObjectNumberMap,
+        normalizeCoordinatorItemProvenance,
+        getWalRecordsForGeneration,
+        getQueueWakeupMetrics: () => queueWakeupMetrics
     }
-}
-
-function getCoordinatorActivationHandoffTerminalTime(item = {}) {
-    return getFirstPositiveNumber(item?.terminalAt, item?.updatedAt, item?.createdAt)
-}
-
-function getCoordinatorActivationHandoffActiveTime(item = {}) {
-    return getFirstPositiveNumber(item?.activeAt)
-}
-
-function summarizeCoordinatorActivationHandoffTiming(queue = {}, epochStartedAt = 0) {
-    const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
-    const entries = Object.entries(queue || {})
-    const activations = entries
-        .map(([key, item]) => ({
-            key,
-            item,
-            runId: `${item?.runId || ''}`.trim(),
-            activeAt: getCoordinatorActivationHandoffActiveTime(item)
-        }))
-        .filter(sample => sample.activeAt > 0 && sample.runId)
-        .sort((left, right) => left.activeAt - right.activeAt)
-    const terminals = entries
-        .map(([key, item]) => ({
-            key,
-            item,
-            runId: `${item?.runId || ''}`.trim(),
-            terminalAt: getCoordinatorActivationHandoffTerminalTime(item)
-        }))
-        .filter(sample => {
-            if(!isTerminalCoordinatorStatus(sample.item?.status)) return false
-            return sample.runId && sample.terminalAt > 0 && (!minimumTerminalAt || sample.terminalAt >= minimumTerminalAt)
-        })
-        .sort((left, right) => left.terminalAt - right.terminalAt)
-
-    const samples = []
-    for(const terminal of terminals) {
-        const nextActivation = activations.find(candidate =>
-            candidate.key !== terminal.key &&
-            candidate.runId === terminal.runId &&
-            candidate.activeAt > terminal.terminalAt
-        )
-        if(!nextActivation) continue
-        samples.push({
-            terminalKey: terminal.key,
-            runId: terminal.runId,
-            terminalStatus: terminal.item?.status || '',
-            terminalOutcome: terminal.item?.outcome || '',
-            terminalAt: terminal.terminalAt,
-            nextActiveKey: nextActivation.key,
-            nextActiveStatus: nextActivation.item?.status || '',
-            nextActiveAt: nextActivation.activeAt,
-            gapMs: nextActivation.activeAt - terminal.terminalAt
-        })
-        if(samples.length >= 100) break
-    }
-
-    const gaps = samples
-        .map(sample => Number.parseInt(sample.gapMs, 10) || 0)
-        .filter(gap => gap > 0)
-        .sort((left, right) => left - right)
-    const elapsedMs = gaps.reduce((total, gap) => total + gap, 0)
-    const handoffs = gaps.length
-    const p95Index = handoffs ? Math.min(handoffs - 1, Math.ceil(handoffs * 0.95) - 1) : 0
-
-    return {
-        epochStartedAt: minimumTerminalAt,
-        sampleLimit: 100,
-        handoffs,
-        elapsedMs,
-        seconds: handoffs ? (elapsedMs / 1000) / handoffs : 0,
-        maxMs: handoffs ? gaps[handoffs - 1] : 0,
-        p95Ms: handoffs ? gaps[p95Index] : 0,
-        samples
-    }
-}
-
-function summarizeCoordinatorQueueViewItem(key = '', item = {}) {
-    const source = item && typeof item === 'object' ? item : {}
-    return {
-        storageKey: key,
-        id: source.id || '',
-        runId: source.runId || '',
-        status: source.status || '',
-        outcome: source.outcome || '',
-        error: source.error || source.finalError || '',
-        actionKind: source.actionKind || '',
-        executorTabAction: source.executorTabAction || '',
-        executorOwner: source.executorOwner || '',
-        serviceWorkerOwned: source.serviceWorkerOwned === true,
-        targetProfileHref: source.targetProfileHref || '',
-        requestedUrl: source.requestedUrl || '',
-        dedupeKey: source.dedupeKey || '',
-        tabId: Number.parseInt(source.tabId || source.activeTabId, 10) || 0,
-        activeTabId: Number.parseInt(source.activeTabId || source.tabId, 10) || 0,
-        attemptId: source.attemptId || source.attempt?.id || '',
-        attemptNumber: Number.parseInt(source.attemptNumber || source.attempt?.number, 10) || 0,
-        maxAttempts: Number.parseInt(source.maxAttempts || source.attempt?.max, 10) || 0,
-        resolveProfileFromPage: source.resolveProfileFromPage === true,
-        resolutionMode: source.resolutionMode || '',
-        queuedAt: Number.parseInt(source.queuedAt || source.createdAt, 10) || 0,
-        createdAt: Number.parseInt(source.createdAt || source.queuedAt, 10) || 0,
-        activeAt: Number.parseInt(source.activeAt, 10) || 0,
-        terminalAt: Number.parseInt(source.terminalAt, 10) || 0,
-        updatedAt: Number.parseInt(source.updatedAt || source.createdAt || source.queuedAt, 10) || 0,
-        retryCount: Number.parseInt(source.retryCount, 10) || 0,
-        provenance: normalizeCoordinatorItemProvenance(source.provenance) || null,
-        source: {
-            type: source.source?.type || source.sourceType || '',
-            pageUrl: source.source?.pageUrl || source.sourcePage || '',
-            searchQuery: source.source?.searchQuery || '',
-            sourceLabel: source.source?.sourceLabel || source.sourceLabel || ''
-        }
-    }
-}
-
-function filterCoordinatorQueueForCompactView(queue = {}, runs = {}) {
-    const knownRunIds = new Set(
-        Object.keys(runs && typeof runs === 'object' ? runs : {})
-            .map(runId => `${runId || ''}`.trim())
-            .filter(Boolean)
-    )
-    if(!knownRunIds.size) return queue
-
-    const filteredQueue = {}
-    for(const [key, item] of Object.entries(queue || {})) {
-        const runId = `${item?.runId || ''}`.trim()
-        if(runId && !knownRunIds.has(runId) && isTerminalCoordinatorStatus(item?.status)) continue
-        filteredQueue[key] = item
-    }
-    return filteredQueue
-}
-
-function buildCoordinatorQueueView(queue = {}, now = Date.now(), options = {}) {
-    const compactQueue = filterCoordinatorQueueForCompactView(queue, options.runs || {})
-    const entries = Object.entries(compactQueue || {})
-    const epochStartedAt = getCoordinatorQueueViewEpochStartedAt()
-    const counts = {}
-    const authoritativeCounts = {}
-    for(const [, item] of entries) {
-        const status = `${item?.status || ''}`.trim() || 'unknown'
-        counts[status] = (counts[status] || 0) + 1
-        if(isCoordinatorQueueAuthoritativeItem(item)) {
-            authoritativeCounts[status] = (authoritativeCounts[status] || 0) + 1
-        }
-    }
-    const hasAuthoritativeStoredWork = ['queued', 'opening', 'active', 'acting', 'settling']
-        .some(status => (Number.parseInt(authoritativeCounts[status], 10) || 0) > 0)
-
-    const items = entries
-        .sort((left, right) => {
-            const leftItem = left[1] || {}
-            const rightItem = right[1] || {}
-            return getCoordinatorQueueViewSortRank(leftItem) - getCoordinatorQueueViewSortRank(rightItem) ||
-                getCoordinatorQueueViewTime(rightItem) - getCoordinatorQueueViewTime(leftItem) ||
-                `${left[0]}`.localeCompare(`${right[0]}`)
-        })
-        .map(([key, item]) => summarizeCoordinatorQueueViewItem(key, item))
-
-    return {
-        version: 1,
-        updatedAt: now,
-        total: entries.length,
-        counts,
-        authoritativeCounts,
-        hasAuthoritativeStoredWork,
-        actualBlockTiming: summarizeCoordinatorActualBlockTiming(compactQueue, epochStartedAt),
-        activationHandoffTiming: summarizeCoordinatorActivationHandoffTiming(compactQueue, epochStartedAt),
-        itemLimit: items.length,
-        truncated: false,
-        items
-    }
-}
-
-function makeCoordinatorQueueAccountingCounts(queue = {}) {
-    const counts = {}
-    const authoritativeCounts = {}
-    for(const item of Object.values(queue || {})) {
-        const status = `${item?.status || ''}`.trim() || 'unknown'
-        counts[status] = (counts[status] || 0) + 1
-        if(isCoordinatorQueueAuthoritativeItem(item)) {
-            authoritativeCounts[status] = (authoritativeCounts[status] || 0) + 1
-        }
-    }
-
-    return {
-        total: Object.keys(queue || {}).length,
-        counts,
-        authoritativeCounts
-    }
-}
-
-function normalizeCoordinatorQueueViewAccounting(view = null) {
-    if(!view || typeof view !== 'object') {
-        return {
-            present: false,
-            total: 0,
-            counts: {},
-            authoritativeCounts: {},
-            itemCount: 0,
-            itemLimit: 0,
-            truncated: false,
-            updatedAt: 0
-        }
-    }
-
-    const items = Array.isArray(view.items) ? view.items : []
-    return {
-        present: true,
-        total: Number.parseInt(view.total, 10) || items.length,
-        counts: normalizeObjectNumberMap(view.counts || {}),
-        authoritativeCounts: normalizeObjectNumberMap(view.authoritativeCounts || {}),
-        itemCount: items.length,
-        itemLimit: Number.parseInt(view.itemLimit, 10) || 0,
-        truncated: view.truncated === true,
-        updatedAt: Number.parseInt(view.updatedAt, 10) || 0
-    }
-}
-
-function areCoordinatorAccountingCountsEqual(left = {}, right = {}) {
-    const keys = new Set([
-        ...Object.keys(left || {}),
-        ...Object.keys(right || {})
-    ])
-    for(const key of keys) {
-        if((Number(left?.[key]) || 0) !== (Number(right?.[key]) || 0)) return false
-    }
-    return true
-}
-
-function makeCoordinatorQueueAccountingComparison(source = {}, target = {}, prefix = '') {
-    const mismatches = []
-    if((Number(source.total) || 0) !== (Number(target.total) || 0)) {
-        mismatches.push(`${prefix}total`)
-    }
-    if(!areCoordinatorAccountingCountsEqual(source.counts, target.counts)) {
-        mismatches.push(`${prefix}counts`)
-    }
-    if(!areCoordinatorAccountingCountsEqual(source.authoritativeCounts, target.authoritativeCounts)) {
-        mismatches.push(`${prefix}authoritative-counts`)
-    }
-    return mismatches
-}
-
-function summarizeCoordinatorQueueWalAccounting(walStore = null, recovery = {}) {
-    const activeGenerationId = walStore?.meta?.activeCheckpoint || recovery?.wal?.generationId || ''
-    const records = activeGenerationId ? getWalRecordsForGeneration(walStore, activeGenerationId) : []
-    const checkpoints = walStore && typeof walStore === 'object' && walStore.checkpoints && typeof walStore.checkpoints === 'object'
-        ? Object.keys(walStore.checkpoints)
-        : []
-    const generations = walStore && typeof walStore === 'object' && walStore.wal && typeof walStore.wal === 'object'
-        ? Object.keys(walStore.wal)
-        : []
-    const ignored = Array.isArray(recovery?.wal?.projected?.ignored) ? recovery.wal.projected.ignored : []
-    const applied = Array.isArray(recovery?.wal?.projected?.applied) ? recovery.wal.projected.applied : []
-
-    return {
-        present: !!walStore,
-        recovered: recovery?.recovered === true,
-        recoveryReason: recovery?.reason || '',
-        activeGenerationId,
-        checkpointCount: checkpoints.length,
-        generationCount: generations.length,
-        activeTailRecords: records.length,
-        appliedRecords: applied.length,
-        ignoredRecords: ignored.length,
-        nextSeq: Number.parseInt(walStore?.meta?.nextSeq, 10) || 0
-    }
-}
-
-function makeCoordinatorCurrentWorkAccounting(queue = {}) {
-    const counts = makeCoordinatorQueueAccountingCounts(queue).counts
-    const ready = Number(counts.queued) || 0
-    const active = ['opening', 'active', 'acting', 'settling']
-        .reduce((total, status) => total + (Number(counts[status]) || 0), 0)
-    const succeeded = Number(counts.succeeded) || 0
-    const failed = Number(counts.failed) || 0
-
-    return {
-        ready,
-        active,
-        succeeded,
-        failed,
-        terminal: Object.entries(counts)
-            .filter(([status]) => isTerminalCoordinatorStatus(status))
-            .reduce((total, [, count]) => total + (Number(count) || 0), 0)
-    }
-}
+})
+const {
+    getCoordinatorQueueViewSortRank,
+    getCoordinatorQueueViewTime,
+    getCoordinatorQueueViewEpochStartedAt,
+    isCoordinatorActualBlockSuccess,
+    getCoordinatorActualBlockTerminalTime,
+    getCoordinatorActualBlockActiveStartTime,
+    summarizeCoordinatorActualBlockTiming,
+    getCoordinatorActivationHandoffTerminalTime,
+    getCoordinatorActivationHandoffActiveTime,
+    summarizeCoordinatorActivationHandoffTiming,
+    summarizeCoordinatorQueueViewItem,
+    filterCoordinatorQueueForCompactView,
+    buildCoordinatorQueueView,
+    makeCoordinatorQueueAccountingCounts,
+    normalizeCoordinatorQueueViewAccounting,
+    areCoordinatorAccountingCountsEqual,
+    makeCoordinatorQueueAccountingComparison,
+    summarizeCoordinatorQueueWalAccounting,
+    makeCoordinatorCurrentWorkAccounting
+} = coordinatorQueueView
 
 async function getCoordinatorQueueAccounting(request = {}) {
     const stored = await metricStorageGet({
