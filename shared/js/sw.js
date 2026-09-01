@@ -154,6 +154,9 @@ const {
 const {
     createCoordinatorQueueView
 } = require('./swCoordinatorQueueView')
+const {
+    createCoordinatorContentQueueIndex
+} = require('./swCoordinatorContentQueueIndex')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -4122,156 +4125,51 @@ async function getCoordinatorQueueAccounting(request = {}) {
     }
 }
 
-function summarizeCoordinatorContentQueueItem(key = '', item = {}) {
-    const source = item && typeof item === 'object' ? item : {}
-    const profileHref = getCoordinatorItemHref(source) || normalizeQuoraProfileUrl(key)
-    return {
-        ...summarizeCoordinatorQueueViewItem(key, source),
-        profileHref,
-        tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
-        attemptId: getAttemptIdFromValue(source),
-        attemptNumber: getAttemptNumberFromValue(source),
-        maxAttempts: Number.parseInt(source.maxAttempts, 10) || 0
-    }
-}
-
-function shouldIncludeCoordinatorItemInContentQueueIndex(item = null) {
-    if(!item || typeof item !== 'object') return false
-    return !isTerminalCoordinatorStatus(item.status)
-}
-
-function buildCoordinatorContentQueueIndex(queue = {}, now = Date.now()) {
-    const entries = Object.entries(queue || {})
-        .filter(([, item]) => shouldIncludeCoordinatorItemInContentQueueIndex(item))
-        .sort((left, right) => {
-            const leftItem = left[1] || {}
-            const rightItem = right[1] || {}
-            return getCoordinatorQueueViewSortRank(leftItem) - getCoordinatorQueueViewSortRank(rightItem) ||
-                getCoordinatorQueueViewTime(rightItem) - getCoordinatorQueueViewTime(leftItem) ||
-                `${left[0]}`.localeCompare(`${right[0]}`)
-        })
-    const items = entries
-        .slice(0, MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS)
-        .map(([key, item]) => summarizeCoordinatorContentQueueItem(key, item))
-
-    return {
-        version: 2,
-        updatedAt: now,
-        total: Object.keys(queue || {}).length,
-        indexed: entries.length,
-        itemLimit: MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS,
-        truncated: entries.length > items.length,
-        items
-    }
-}
-
-function hashCoordinatorContentIndexKey(value = '', bucketCount = COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT) {
-    return hashProjectionShardKey(value, bucketCount)
-}
-
-function getCoordinatorContentSourceIndexShardKeyByIndex(index = 0) {
-    return getProjectionShardKeyByIndex(
+const coordinatorContentQueueIndex = createCoordinatorContentQueueIndex({
+    now: () => Date.now(),
+    constants: {
+        COORDINATOR_QUEUE_VIEW_KEY,
+        COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
         COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
         COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
-        index
-    )
-}
-
-function getCoordinatorContentSourceIndexShardKey(sourceKey = '') {
-    return getProjectionShardKey(
-        COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
-        COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
-        sourceKey
-    )
-}
-
-function getCoordinatorContentSourceKeysFromValues(pageUrl = '', searchQuery = '', sourceType = '') {
-    const keys = []
-    const normalizedPageUrl = normalizeContentPageStateUrl(pageUrl || '')
-    if(normalizedPageUrl) keys.push(`url:${normalizedPageUrl}`)
-
-    const normalizedQuery = `${searchQuery || ''}`.trim().toLowerCase()
-    if(normalizedQuery && (!sourceType || `${sourceType || ''}` === 'profile-search')) {
-        keys.push(`profile-search:${normalizedQuery}`)
+        MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS
+    },
+    handlers: {
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        normalizeContentPageStateUrl,
+        getCoordinatorItemStateSources,
+        isTerminalCoordinatorStatus,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        summarizeCoordinatorQueueViewItem,
+        getCoordinatorQueueViewSortRank,
+        getCoordinatorQueueViewTime,
+        buildCoordinatorQueueView,
+        normalizeCoordinatorMap,
+        cloneCoordinatorAuthorityValue,
+        hashProjectionShardKey,
+        getProjectionShardKeyByIndex,
+        getProjectionShardKey,
+        makeProjectionShardDefaults,
+        makePairedCheckpointStore
     }
-
-    return Array.from(new Set(keys))
-}
-
-function getCoordinatorContentSourceKeysForItem(item = null) {
-    const keys = []
-    for(const source of getCoordinatorItemStateSources(item)) {
-        keys.push(...getCoordinatorContentSourceKeysFromValues(
-            source?.pageUrl || source?.sourcePageUrl || '',
-            source?.searchQuery || '',
-            source?.type || ''
-        ))
-    }
-    return Array.from(new Set(keys))
-}
-
-function getCoordinatorContentSourceKeysForRequest(request = {}) {
-    return getCoordinatorContentSourceKeysFromValues(
-        request.sourcePageUrl || request.url || '',
-        request.searchQuery || '',
-        'profile-search'
-    )
-}
-
-function getCoordinatorContentSourceIndexShardDefaults(request = {}) {
-    const defaults = {}
-    for(const sourceKey of getCoordinatorContentSourceKeysForRequest(request)) {
-        const shardKey = getCoordinatorContentSourceIndexShardKey(sourceKey)
-        if(shardKey) defaults[shardKey] = {}
-    }
-    return defaults
-}
-
-function buildCoordinatorContentSourceIndexShardPayload(queue = {}, now = Date.now()) {
-    const shards = makeProjectionShardDefaults(
-        COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
-        COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
-        () => ({
-            version: 1,
-            updatedAt: now,
-            records: {}
-        })
-    )
-
-    for(const [itemKey, item] of Object.entries(queue || {})) {
-        if(!shouldIncludeCoordinatorItemInContentQueueIndex(item)) continue
-        const summary = summarizeCoordinatorContentQueueItem(itemKey, item)
-        const sourceKeys = getCoordinatorContentSourceKeysForItem(item)
-        for(const sourceKey of sourceKeys) {
-            const shardKey = getCoordinatorContentSourceIndexShardKey(sourceKey)
-            if(!shardKey) continue
-            if(!shards[shardKey].records[sourceKey]) {
-                shards[shardKey].records[sourceKey] = {
-                    items: []
-                }
-            }
-            shards[shardKey].records[sourceKey].items.push(summary)
-        }
-    }
-
-    return shards
-}
-
-function buildCoordinatorQueueDerivedProjectionPayload(queue = {}, now = Date.now()) {
-    return {
-        [COORDINATOR_QUEUE_VIEW_KEY]: buildCoordinatorQueueView(queue, now),
-        [COORDINATOR_CONTENT_QUEUE_INDEX_KEY]: buildCoordinatorContentQueueIndex(queue, now),
-        ...buildCoordinatorContentSourceIndexShardPayload(queue, now)
-    }
-}
-
-function makeCoordinatorQueueWalCheckpoint(queue = {}, options = {}) {
-    return makePairedCheckpointStore({queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(queue || {}))}, {
-        snapshotSeq: Number.parseInt(options.snapshotSeq, 10) || 0,
-        nextSeq: Number.parseInt(options.nextSeq, 10) || 1,
-        createdAt: Number.parseInt(options.createdAt, 10) || Date.now()
-    })
-}
+})
+const {
+    summarizeCoordinatorContentQueueItem,
+    shouldIncludeCoordinatorItemInContentQueueIndex,
+    buildCoordinatorContentQueueIndex,
+    hashCoordinatorContentIndexKey,
+    getCoordinatorContentSourceIndexShardKeyByIndex,
+    getCoordinatorContentSourceIndexShardKey,
+    getCoordinatorContentSourceKeysFromValues,
+    getCoordinatorContentSourceKeysForItem,
+    getCoordinatorContentSourceKeysForRequest,
+    getCoordinatorContentSourceIndexShardDefaults,
+    buildCoordinatorContentSourceIndexShardPayload,
+    buildCoordinatorQueueDerivedProjectionPayload,
+    makeCoordinatorQueueWalCheckpoint
+} = coordinatorContentQueueIndex
 
 function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
     const href = normalizeQuoraProfileUrl(record?.profileHref || profileHref || '')
