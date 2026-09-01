@@ -2,13 +2,15 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-17 are landed and independently verified
+Status: in progress. Slices 1-20 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
 `3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
-`73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`). `shared/js/sw.js` is
-down to 34,422 lines from 38,953 at the start of this effort, with 18 new
-modules landed. The next slices resume past the excluded
-`createCoordinatorAuthority`-adjacent region (see "Boundary after Slice
+`73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`, `5691a15`, `98d681d`,
+`c1413e5`). `shared/js/sw.js` is down to 33,750 lines from 38,953 at the
+start of this effort (~13.4% reduction), with 20 new modules landed. The
+next slices resume past `swCoordinatorTerminalSettlement.js`'s claimed
+range, still within the region after the excluded
+`createCoordinatorAuthority`-adjacent boundary (see "Boundary after Slice
 17"). See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
