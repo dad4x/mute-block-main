@@ -157,6 +157,9 @@ const {
 const {
     createCoordinatorContentQueueIndex
 } = require('./swCoordinatorContentQueueIndex')
+const {
+    createProfileNukeProgress
+} = require('./swProfileNukeProgress')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -4171,264 +4174,59 @@ const {
     makeCoordinatorQueueWalCheckpoint
 } = coordinatorContentQueueIndex
 
-function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
-    const href = normalizeQuoraProfileUrl(record?.profileHref || profileHref || '')
-    if(!href) return null
-
-    const source = record && typeof record === 'object' ? record : {}
-    return {
-        profileHref: href,
-        status: source.status || '',
-        actionKind: source.actionKind || '',
-        attemptId: getAttemptIdFromValue(source),
-        attemptNumber: getAttemptNumberFromValue(source),
-        runId: source.runId || '',
-        tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
-        lastUrl: source.lastUrl || '',
-        queuedAt: Number.parseInt(source.queuedAt, 10) || 0,
-        tabCreatedAt: Number.parseInt(source.tabCreatedAt, 10) || 0,
-        tabOpenedAt: Number.parseInt(source.tabOpenedAt, 10) || 0,
-        contentOpenedAt: Number.parseInt(source.contentOpenedAt, 10) || 0,
-        actionReadyAt: Number.parseInt(source.actionReadyAt, 10) || 0,
-        waitingForForegroundAt: Number.parseInt(source.waitingForForegroundAt, 10) || 0,
-        foregroundLeaseAcquiredAt: Number.parseInt(source.foregroundLeaseAcquiredAt, 10) || 0,
-        foregroundPromotedAt: Number.parseInt(source.foregroundPromotedAt, 10) || 0,
-        muteAttemptedAt: Number.parseInt(source.muteAttemptedAt, 10) || 0,
-        blockAttemptedAt: Number.parseInt(source.blockAttemptedAt, 10) || 0,
-        unmuteAttemptedAt: Number.parseInt(source.unmuteAttemptedAt, 10) || 0,
-        unblockAttemptedAt: Number.parseInt(source.unblockAttemptedAt, 10) || 0,
-        terminalAt: Number.parseInt(source.terminalAt, 10) || 0,
-        updatedAt: Number.parseInt(source.updatedAt, 10) || 0,
-        actionSurfaceMode: source.actionSurfaceMode || '',
-        actionSurfaceWindowId: source.actionSurfaceWindowId || null,
-        actionSurfaceAnchorTabId: source.actionSurfaceAnchorTabId || null,
-        actionSurfaceActivatedAt: Number.parseInt(source.actionSurfaceActivatedAt, 10) || 0,
-        muteSucceeded: source.muteSucceeded === true,
-        blockSucceeded: source.blockSucceeded === true,
-        unblockSucceeded: source.unblockSucceeded === true,
-        unmuteSucceeded: source.unmuteSucceeded === true,
-        foundBlockedBeforeQueue: source.foundBlockedBeforeQueue === true,
-        finalError: source.finalError || '',
-        muteError: source.muteError || '',
-        blockError: source.blockError || '',
-        directBlockFailureDetail: source.directBlockFailureDetail &&
-            typeof source.directBlockFailureDetail === 'object'
-            ? source.directBlockFailureDetail
-            : null,
-        unblockReason: source.unblockReason || '',
-        unmuteReason: source.unmuteReason || '',
-        unavailableReason: source.unavailableReason || '',
-        resolvedProfileHref: source.resolvedProfileHref || '',
-        remappedFromRequested: source.remappedFromRequested === true,
-        closeReason: source.closeReason || '',
-        errorPageUrl: source.errorPageUrl || '',
-        securityVerificationUrl: source.securityVerificationUrl || ''
-    }
-}
-
-function buildProfileNukeProgressView(progress = {}, now = Date.now()) {
-    const normalized = normalizeStoredProfileNukeProgress(progress || {})
-    const entries = Object.entries(normalized)
-        .sort((left, right) => {
-            const leftUpdatedAt = Number.parseInt(left[1]?.updatedAt, 10) || 0
-            const rightUpdatedAt = Number.parseInt(right[1]?.updatedAt, 10) || 0
-            return rightUpdatedAt - leftUpdatedAt || left[0].localeCompare(right[0])
-        })
-    const records = {}
-    for(const [profileHref, record] of entries.slice(0, MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS)) {
-        const summary = summarizeProfileNukeProgressRecord(profileHref, record)
-        if(summary) records[summary.profileHref] = summary
-    }
-
-    return {
-        version: 2,
-        updatedAt: now,
-        total: entries.length,
-        recordLimit: MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS,
-        truncated: entries.length > Object.keys(records).length,
-        records
-    }
-}
-
-function getProfileNukeProgressShardIndex(profileHref = '') {
-    const href = normalizeQuoraProfileUrl(profileHref)
-    return hashProjectionShardKey(href, PROFILE_NUKE_PROGRESS_SHARD_COUNT)
-}
-
-function getProfileNukeProgressShardKeyByIndex(index = 0) {
-    return getProjectionShardKeyByIndex(
-        PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
+const profileNukeProgressShape = createProfileNukeProgress({
+    now: () => Date.now(),
+    constants: {
+        MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS,
         PROFILE_NUKE_PROGRESS_SHARD_COUNT,
-        index
-    )
-}
-
-function getProfileNukeProgressShardKey(profileHref = '') {
-    return getProjectionShardKey(
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
-        PROFILE_NUKE_PROGRESS_SHARD_COUNT,
-        normalizeQuoraProfileUrl(profileHref)
-    )
-}
-
-function getProfileNukeProgressShardDefaults(profileHrefs = []) {
-    const defaults = {}
-    for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
-        const key = getProfileNukeProgressShardKey(href)
-        if(key) defaults[key] = {}
+        PROFILE_NUKE_PROGRESS_VIEW_KEY,
+        COORDINATOR_QUEUE_KEY,
+        COORDINATOR_QUEUE_WAL_KEY,
+        COORDINATOR_QUEUE_VIEW_KEY,
+        COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
+        COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX
+    },
+    handlers: {
+        normalizeQuoraProfileUrl,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        normalizeStoredProfileNukeProgress,
+        hashProjectionShardKey,
+        getProjectionShardKeyByIndex,
+        getProjectionShardKey,
+        getNormalizedProfileHrefList,
+        makeProjectionShardDefaults,
+        isTerminalCoordinatorStatus,
+        getCoordinatorItemHref,
+        normalizeProfileNukeProgressView,
+        normalizeCoordinatorMap,
+        makeCoordinatorQueueWalCheckpoint,
+        buildCoordinatorQueueView,
+        buildCoordinatorContentQueueIndex,
+        buildCoordinatorContentSourceIndexShardPayload
     }
-    return defaults
-}
-
-function getAllProfileNukeProgressShardDefaults() {
-    return makeProjectionShardDefaults(
-        PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
-        PROFILE_NUKE_PROGRESS_SHARD_COUNT
-    )
-}
-
-function getProfileNukeProgressProjectionDefaults(profileHrefs = [], options = {}) {
-    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
-    const includeView = options.includeView !== false
-    return {
-        ...(includeView ? {[PROFILE_NUKE_PROGRESS_VIEW_KEY]: null} : {}),
-        ...(hrefs.length
-            ? getProfileNukeProgressShardDefaults(hrefs)
-            : getAllProfileNukeProgressShardDefaults())
-    }
-}
-
-function buildProfileNukeProgressShardPayload(progress = {}, now = Date.now()) {
-    const normalized = normalizeStoredProfileNukeProgress(progress || {})
-    const shards = {}
-    for(let index = 0; index < PROFILE_NUKE_PROGRESS_SHARD_COUNT; index += 1) {
-        shards[getProfileNukeProgressShardKeyByIndex(index)] = {
-            version: 1,
-            updatedAt: now,
-            records: {}
-        }
-    }
-
-    for(const [profileHref, record] of Object.entries(normalized)) {
-        const key = getProfileNukeProgressShardKey(profileHref)
-        if(!key) continue
-        const summary = summarizeProfileNukeProgressRecord(profileHref, record)
-        if(summary) shards[key].records[summary.profileHref] = summary
-    }
-
-    return shards
-}
-
-function hasNonterminalCoordinatorAuthorityForProfile(queue = {}, profileHref = '') {
-    const href = normalizeQuoraProfileUrl(profileHref)
-    if(!href) return false
-
-    return Object.entries(queue || {}).some(([itemKey, item]) => {
-        if(!item || typeof item !== 'object') return false
-        if(isTerminalCoordinatorStatus(item.status)) return false
-        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        return itemHref === href
-    })
-}
-
-function filterProfileNukeProgressForContentProjection(progress = {}, queue = {}) {
-    const normalized = normalizeStoredProfileNukeProgress(progress || {})
-    const filtered = {}
-    for(const [profileHref, record] of Object.entries(normalized)) {
-        if(hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref)) continue
-        filtered[profileHref] = record
-    }
-    return filtered
-}
-
-function updateProfileNukeProgressViewRecords(view = null, progressRecords = {}, now = Date.now()) {
-    const current = normalizeProfileNukeProgressView(view)
-    const records = {
-        ...current.records
-    }
-    const previousCount = Object.keys(records).length
-
-    for(const [profileHref, record] of Object.entries(progressRecords || {})) {
-        const summary = summarizeProfileNukeProgressRecord(profileHref, record)
-        if(summary) records[summary.profileHref] = summary
-    }
-
-    const recordLimit = Number.parseInt(current.recordLimit, 10) || MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS
-    const entries = Object.entries(records)
-        .sort((left, right) => {
-            const leftUpdatedAt = Number.parseInt(left[1]?.updatedAt, 10) || 0
-            const rightUpdatedAt = Number.parseInt(right[1]?.updatedAt, 10) || 0
-            return rightUpdatedAt - leftUpdatedAt || left[0].localeCompare(right[0])
-        })
-    const capped = Object.fromEntries(entries.slice(0, recordLimit))
-    const knownTotal = Number.parseInt(current.total, 10) || previousCount
-    const total = Math.max(knownTotal, Object.keys(records).length)
-
-    return {
-        version: 2,
-        updatedAt: now,
-        total,
-        recordLimit,
-        truncated: total > Object.keys(capped).length || entries.length > Object.keys(capped).length,
-        records: capped
-    }
-}
-
-function updateProfileNukeProgressShardRecord(shard = null, profileHref = '', record = null, now = Date.now()) {
-    const href = normalizeQuoraProfileUrl(record?.profileHref || profileHref || '')
-    const summary = summarizeProfileNukeProgressRecord(href, record)
-    const records = normalizeProfileNukeProgressShardRecords({current: shard})
-    if(summary) records[summary.profileHref] = summary
-
-    return {
-        version: 1,
-        updatedAt: now,
-        records
-    }
-}
-
-function removeProfileNukeProgressViewRecords(view = null, profileHrefs = [], knownRemovedCount = 0, now = Date.now()) {
-    const current = normalizeProfileNukeProgressView(view)
-    const records = {
-        ...current.records
-    }
-    for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
-        delete records[href]
-    }
-
-    const recordLimit = Number.parseInt(current.recordLimit, 10) || MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS
-    const entries = Object.entries(records)
-        .sort((left, right) => {
-            const leftUpdatedAt = Number.parseInt(left[1]?.updatedAt, 10) || 0
-            const rightUpdatedAt = Number.parseInt(right[1]?.updatedAt, 10) || 0
-            return rightUpdatedAt - leftUpdatedAt || left[0].localeCompare(`${right[0]}`)
-        })
-    const capped = Object.fromEntries(entries.slice(0, recordLimit))
-    const currentTotal = Number.parseInt(current.total, 10) || Object.keys(current.records).length
-    const total = Math.max(0, currentTotal - Math.max(0, Number.parseInt(knownRemovedCount, 10) || 0))
-
-    return {
-        version: 2,
-        updatedAt: now,
-        total,
-        recordLimit,
-        truncated: total > Object.keys(capped).length || entries.length > Object.keys(capped).length,
-        records: capped
-    }
-}
-
-function removeProfileNukeProgressShardRecords(shard = null, profileHrefs = [], now = Date.now()) {
-    const records = normalizeProfileNukeProgressShardRecords({current: shard})
-    for(const href of getNormalizedProfileHrefList(profileHrefs || [])) {
-        delete records[href]
-    }
-
-    return {
-        version: 1,
-        updatedAt: now,
-        records
-    }
-}
+})
+const {
+    summarizeProfileNukeProgressRecord,
+    buildProfileNukeProgressView,
+    getProfileNukeProgressShardIndex,
+    getProfileNukeProgressShardKeyByIndex,
+    getProfileNukeProgressShardKey,
+    getProfileNukeProgressShardDefaults,
+    getAllProfileNukeProgressShardDefaults,
+    getProfileNukeProgressProjectionDefaults,
+    buildProfileNukeProgressShardPayload,
+    hasNonterminalCoordinatorAuthorityForProfile,
+    filterProfileNukeProgressForContentProjection,
+    updateProfileNukeProgressViewRecords,
+    updateProfileNukeProgressShardRecord,
+    removeProfileNukeProgressViewRecords,
+    removeProfileNukeProgressShardRecords,
+    normalizeProfileNukeProgressShardRecords,
+    getProfileNukeProgressRecordsFromProjection,
+    addContentPageStateProjectionPayload
+} = profileNukeProgressShape
 
 async function saveProfileNukeProgressRowProjection(progressRecords = {}, options = {}) {
     const normalizedRecords = normalizeStoredProfileNukeProgress(progressRecords || {})
@@ -4615,67 +4413,6 @@ async function deleteProfileNukeProgressRowProjection(profileHrefs = [], options
         rows: removedHrefs.size,
         profileHrefs: Array.from(removedHrefs)
     }
-}
-
-function normalizeProfileNukeProgressShardRecords(shards = {}) {
-    const records = {}
-    for(const shard of Object.values(shards || {})) {
-        const shardRecords = shard && typeof shard === 'object' && shard.records && typeof shard.records === 'object'
-            ? shard.records
-            : {}
-        Object.assign(records, normalizeStoredProfileNukeProgress(shardRecords))
-    }
-    return records
-}
-
-function getProfileNukeProgressRecordsFromProjection(stored = {}, profileHrefs = [], options = {}) {
-    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
-    const requested = hrefs.length ? new Set(hrefs) : null
-    const viewRecords = options.includeView === false
-        ? {}
-        : normalizeProfileNukeProgressView(stored?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]).records
-    const shardDefaults = requested
-        ? getProfileNukeProgressShardDefaults(hrefs)
-        : getAllProfileNukeProgressShardDefaults()
-    const shardRecords = normalizeProfileNukeProgressShardRecords(
-        Object.fromEntries(Object.keys(shardDefaults).map(key => [key, stored?.[key]]))
-    )
-    const progress = {}
-    for(const [profileHref, record] of Object.entries({
-        ...viewRecords,
-        ...shardRecords
-    })) {
-        if(!requested || requested.has(profileHref)) progress[profileHref] = record
-    }
-    return progress
-}
-
-function addContentPageStateProjectionPayload(payload = {}) {
-    if(!payload || typeof payload !== 'object') return payload
-    const next = {
-        ...payload
-    }
-    const now = Date.now()
-    if(
-        Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_KEY) &&
-        next[COORDINATOR_QUEUE_KEY] &&
-        typeof next[COORDINATOR_QUEUE_KEY] === 'object'
-    ) {
-        const queue = normalizeCoordinatorMap(next[COORDINATOR_QUEUE_KEY])
-        if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_WAL_KEY)) {
-            next[COORDINATOR_QUEUE_WAL_KEY] = makeCoordinatorQueueWalCheckpoint(queue, {createdAt: now})
-        }
-        if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_VIEW_KEY)) {
-            next[COORDINATOR_QUEUE_VIEW_KEY] = buildCoordinatorQueueView(queue, now)
-        }
-        if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_CONTENT_QUEUE_INDEX_KEY)) {
-            next[COORDINATOR_CONTENT_QUEUE_INDEX_KEY] = buildCoordinatorContentQueueIndex(queue, now)
-        }
-        if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX))) {
-            Object.assign(next, buildCoordinatorContentSourceIndexShardPayload(queue, now))
-        }
-    }
-    return next
 }
 
 async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refresh') {

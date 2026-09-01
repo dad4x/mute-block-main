@@ -290,7 +290,8 @@ test('current storage write payloads cannot include the full legacy progress key
     const source = readRepoFile('shared/js/sw.js')
     const storageSource = readRepoFile('shared/js/swstorage.js')
     const metricStorageSetBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
-    const projectionPayloadBody = extractFunction(source, 'function addContentPageStateProjectionPayload(payload = {})')
+    const profileNukeProgressSource = readRepoFile('shared/js/swProfileNukeProgress.js')
+    const projectionPayloadBody = extractFunction(profileNukeProgressSource, 'function addContentPageStateProjectionPayload(payload = {})')
     const storageAdapterSetBody = extractFunction(storageSource, 'function createChromeLocalStorageAdapter(getStorageArea)')
     const storageWriteSource = [
         metricStorageSetBody,
@@ -1512,15 +1513,16 @@ test('profile-search content uses scoped runtime state instead of full storage c
 test('content-page scoped state projections are maintained beside full queue and progress writes', () => {
     const sw = readRepoFile('shared/js/sw.js')
     const metricSetBody = extractFunction(sw, 'async function metricStorageSet(payload = {}, options = {})')
-    const projectionBody = extractFunction(sw, 'function addContentPageStateProjectionPayload(payload = {})')
+    const profileNukeProgressSource = readRepoFile('shared/js/swProfileNukeProgress.js')
+    const projectionBody = extractFunction(profileNukeProgressSource, 'function addContentPageStateProjectionPayload(payload = {})')
     const coordinatorContentQueueIndexSource = readRepoFile('shared/js/swCoordinatorContentQueueIndex.js')
     const queueIndexBody = extractFunction(coordinatorContentQueueIndexSource, 'function buildCoordinatorContentQueueIndex(queue = {}, nowMs = now())')
     const sourceIndexBody = extractFunction(coordinatorContentQueueIndexSource, 'function buildCoordinatorContentSourceIndexShardPayload(queue = {}, nowMs = now())')
     const coordinatorQueueViewSource = readRepoFile('shared/js/swCoordinatorQueueView.js')
     const queueViewBody = extractFunction(coordinatorQueueViewSource, 'function buildCoordinatorQueueView(queue = {}, nowMs = now(), options = {})')
-    const progressViewBody = extractFunction(sw, 'function buildProfileNukeProgressView(progress = {}, now = Date.now())')
-    const progressSummaryBody = extractFunction(sw, 'function summarizeProfileNukeProgressRecord(profileHref = \'\', record = {})')
-    const progressFilterBody = extractFunction(sw, 'function filterProfileNukeProgressForContentProjection(progress = {}, queue = {})')
+    const progressViewBody = extractFunction(profileNukeProgressSource, 'function buildProfileNukeProgressView(progress = {}, nowMs = now())')
+    const progressSummaryBody = extractFunction(profileNukeProgressSource, 'function summarizeProfileNukeProgressRecord(profileHref = \'\', record = {})')
+    const progressFilterBody = extractFunction(profileNukeProgressSource, 'function filterProfileNukeProgressForContentProjection(progress = {}, queue = {})')
     const missingBody = extractFunction(sw, 'function isContentPageStateProjectionMissing(queueIndex = null, progressView = null, shardDefaults = {}, stored = {}, sourceShardDefaults = {})')
     const rebuildBody = extractFunction(sw, "async function rebuildContentPageStateProjectionFromCurrentState(reason = 'missing')")
 
