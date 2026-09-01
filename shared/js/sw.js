@@ -169,6 +169,9 @@ const {
 const {
     createCoordinatorSourceProvenance
 } = require('./swCoordinatorSourceProvenance')
+const {
+    createCoordinatorReconcileLockedMaterialization
+} = require('./swCoordinatorReconcileLockedMaterialization')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -7405,219 +7408,74 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
     }))
 }
 
-function getCoordinatorReconcileOperationTabIdsToClose(operation = {}, item = null, record = null) {
-    const tabIds = new Set()
-    const persistedTabId = normalizeTabId(operation.persistedTabId || getPersistedQueuedTabId(item, record))
-    if(operation.closePersistedTab === true && persistedTabId) {
-        tabIds.add(persistedTabId)
+// coordinatorReconcileLockedMaterialization is constructed here, in place
+// at this cluster's old source-text position (decomposition Slice 19): no
+// already-extracted module eagerly references any of its 14 exports at its
+// own construction-call site (checked via grep across shared/js/*.js), and
+// every call site of these 14 functions is at or after this point (the two
+// async reconcile-tick functions immediately below/further down in this
+// file, both out of scope for this sync-only decomposition). See the
+// module's own header comment for the realm-crossing scrutiny, clock-dep,
+// and profileNukeProgress state-ownership notes.
+const coordinatorReconcileLockedMaterialization = createCoordinatorReconcileLockedMaterialization({
+    now: () => Date.now(),
+    constants: {
+        JOB_EVENT_TAB_REMOVED,
+        JOB_EVENT_TERMINAL
+    },
+    handlers: {
+        normalizeTabId,
+        getPersistedQueuedTabId,
+        normalizeAttemptId,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getInvalidProfileResolutionFailure,
+        isTerminalCoordinatorStatus,
+        getCoordinatorCurrentWorkAnchor,
+        buildTerminalCoordinatorQueueItem,
+        getCoordinatorItemSettlementKey,
+        clearResolverPendingSpaceRecords,
+        getProfileResolutionRequestedUrl,
+        hasMismatchedCoordinatorAttempt,
+        transitionCoordinatorItemFromProgress,
+        makeCoordinatorAuthorityApplyResult,
+        getCoordinatorItemQueueKey,
+        normalizeCoordinatorEvents,
+        getCoordinatorItemHref,
+        makeId,
+        isProfileResolutionItem,
+        normalizeQuoraProfileUrl,
+        normalizeCoordinatorRequestedUrl,
+        addResolvedProfileToPendingSpaceRecords,
+        inferSourceTypeFromRunId,
+        getCoordinatorRunTargetHrefs,
+        getCoordinatorProgressRecordForItem,
+        isCoordinatorQueueAuthoritativeItem,
+        normalizeProgressPatch,
+        buildQueuedCoordinatorProgressResetPatch,
+        materializeRemovedProfileDerivedStateFromAuthority
+    },
+    state: {
+        getProfileNukeProgress: () => profileNukeProgress,
+        setProfileNukeProgress: value => { profileNukeProgress = value }
     }
-    for(const tabId of operation.tabIdsToClose || []) {
-        const normalizedTabId = normalizeTabId(tabId)
-        if(normalizedTabId) tabIds.add(normalizedTabId)
-    }
-    return Array.from(tabIds)
-}
-
-function matchesCoordinatorReconcileOperationAttempt(item = null, operation = {}) {
-    const expectedAttemptId = normalizeAttemptId(operation.expectedAttemptId || '')
-    const expectedAttemptNumber = Number.parseInt(operation.expectedAttemptNumber, 10) || 0
-    if(expectedAttemptId && getAttemptIdFromValue(item) !== expectedAttemptId) return false
-    if(expectedAttemptNumber && getAttemptNumberFromValue(item) !== expectedAttemptNumber) return false
-    return true
-}
-
-function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'reconcileInvalidProfileResolution') {
-        return {changed: false, reason: 'wrong-kind'}
-    }
-
-    const queue = state.queue || {}
-    const itemKey = `${operation.itemKey || ''}`.trim()
-    if(!itemKey) return {changed: false, reason: 'missing-item-key'}
-
-    const item = queue[itemKey] || null
-    if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
-        return {changed: false, reason: 'attempt-changed'}
-    }
-
-    const failure = `${operation.failure || getInvalidProfileResolutionFailure(item, itemKey) || ''}`.trim()
-    const invalidTerminalResolutionNeedsReconcile = isTerminalCoordinatorStatus(item.status) &&
-        item.status === 'failed' &&
-        item.outcome === 'action-error'
-    if(!failure || (isTerminalCoordinatorStatus(item.status) && !invalidTerminalResolutionNeedsReconcile)) {
-        return {changed: false, reason: 'not-invalid-profile-resolution'}
-    }
-
-    const now = Number.parseInt(operation.now, 10) || Date.now()
-    const terminalNow = isTerminalCoordinatorStatus(item.status)
-        ? getCoordinatorCurrentWorkAnchor(item) || now
-        : now
-    const terminalItem = buildTerminalCoordinatorQueueItem(item, {
-        status: 'skipped',
-        outcome: 'unresolved-target',
-        error: failure,
-        reason: 'invalid-profile-resolution',
-        eventType: JOB_EVENT_TERMINAL,
-        now: terminalNow
-    })
-    const settlementKey = getCoordinatorItemSettlementKey(terminalItem)
-    const nextItem = settlementKey ? {
-        ...terminalItem,
-        sourceSettledAt: terminalNow,
-        sourceSettlementKey: settlementKey,
-        sourceSettlementOutcome: 'cleared'
-    } : terminalItem
-
-    queue[itemKey] = nextItem
-
-    let pendingPostsChanged = false
-    let pendingPosts = state.pendingPosts || {}
-    const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, nextItem, {
-        requestedUrl: operation.requestedUrl || getProfileResolutionRequestedUrl(item, itemKey),
-        evidence: item.evidence || []
-    })
-    if(pendingResult.changed) {
-        pendingPosts = pendingResult.pendingPosts
-        state.pendingPosts = pendingPosts
-        pendingPostsChanged = true
-    }
-
-    return {
-        changed: true,
-        queueChanged: true,
-        pendingPostsChanged,
-        pendingPosts,
-        materialized: 1,
-        affectedRunIds: item.runId ? [item.runId] : [],
-        tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
-        item: nextItem
-    }
-}
-
-function applyStaleProfileResolutionTabReconcileActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'reconcileStaleProfileResolutionTab') {
-        return {changed: false, reason: 'wrong-kind'}
-    }
-
-    const queue = state.queue || {}
-    const itemKey = `${operation.itemKey || ''}`.trim()
-    if(!itemKey) return {changed: false, reason: 'missing-item-key'}
-
-    const item = queue[itemKey] || null
-    if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
-        return {changed: false, reason: 'attempt-changed'}
-    }
-
-    const now = Number.parseInt(operation.now, 10) || Date.now()
-    const nextItem = buildTerminalCoordinatorQueueItem(item, {
-        status: 'failed',
-        outcome: 'timeout',
-        error: 'Queued profile-resolution tab timed out after disappearing before resolving a profile',
-        reason: 'stale-profile-resolution-tab',
-        eventType: JOB_EVENT_TAB_REMOVED,
-        now
-    })
-
-    queue[itemKey] = nextItem
-
-    return {
-        changed: true,
-        queueChanged: true,
-        materialized: 1,
-        affectedRunIds: item.runId ? [item.runId] : [],
-        tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
-        item: nextItem
-    }
-}
-
-function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {}) {
-    if(`${operation.kind || ''}`.trim() !== 'reconcileFromProgressRecord') {
-        return {changed: false, reason: 'wrong-kind'}
-    }
-
-    const queue = state.queue || {}
-    const itemKey = `${operation.itemKey || ''}`.trim()
-    if(!itemKey) return {changed: false, reason: 'missing-item-key'}
-
-    const item = queue[itemKey] || null
-    if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(!matchesCoordinatorReconcileOperationAttempt(item, operation)) {
-        return {changed: false, reason: 'attempt-changed'}
-    }
-
-    const record = operation.record || null
-    if(record && hasMismatchedCoordinatorAttempt(item, record)) {
-        return {changed: false, reason: 'progress-attempt-mismatch'}
-    }
-
-    const mapped = operation.mapped || {}
-    if(!mapped.status) return {changed: false, reason: 'missing-mapped-status'}
-
-    const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-        now: Number.parseInt(operation.now, 10) || Date.now(),
-        resetRetry: operation.resetRetry === true,
-        terminalAtFallback: operation.terminalAtFallback || 'record'
-    })
-
-    if(JSON.stringify(nextItem) === JSON.stringify(item)) {
-        return {changed: false, reason: 'unchanged'}
-    }
-
-    queue[itemKey] = nextItem
-
-    return {
-        changed: true,
-        queueChanged: true,
-        materialized: 1,
-        previousItem: item,
-        item: nextItem,
-        mappedTerminal: isTerminalCoordinatorStatus(mapped.status),
-        affectedRunIds: nextItem.runId ? [nextItem.runId] : []
-    }
-}
-
-function buildCoordinatorReconcileQueueAuthorityDiff(originalQueue = {}, nextQueue = {}, operationKind = 'reconcile-progress') {
-    const results = []
-    const removedRows = []
-    const keys = new Set([
-        ...Object.keys(originalQueue || {}),
-        ...Object.keys(nextQueue || {})
-    ])
-
-    for(const key of keys) {
-        const previousRow = originalQueue?.[key] || null
-        const nextRow = nextQueue?.[key] || null
-        if(JSON.stringify(previousRow || null) === JSON.stringify(nextRow || null)) continue
-
-        if(nextRow) {
-            results.push(makeCoordinatorAuthorityApplyResult({
-                operationKind,
-                rowKey: key,
-                reason: 'reconcile'
-            }, {
-                accepted: true,
-                changed: true,
-                durable: true,
-                reason: 'reconcile',
-                previousRow,
-                nextRow,
-                terminal: isTerminalCoordinatorStatus(nextRow.status)
-            }))
-        }
-        else if(previousRow) {
-            removedRows.push({
-                rowKey: key,
-                previousRow,
-                operationKind,
-                reason: 'reconcile'
-            })
-        }
-    }
-
-    return {results, removedRows}
-}
+})
+const {
+    getCoordinatorReconcileOperationTabIdsToClose,
+    matchesCoordinatorReconcileOperationAttempt,
+    applyInvalidProfileResolutionReconcileActionLocked,
+    applyStaleProfileResolutionTabReconcileActionLocked,
+    applyProgressRecordCoordinatorReconcileActionLocked,
+    buildCoordinatorReconcileQueueAuthorityDiff,
+    hasTerminalKeyOnlyCoordinatorEvent,
+    materializeTerminalKeyOnlyDerivedStateLocked,
+    settleTerminalResolverPendingSourceRecordsLocked,
+    settleResolvedResolverPendingSourceRecordsLocked,
+    materializeQueuedCoordinatorDerivedStateLocked,
+    addCoordinatorReconcileAffectedRunIds,
+    markCoordinatorReconcileRunAffected,
+    materializeCoordinatorReconcileDerivedProjectionPhase
+} = coordinatorReconcileLockedMaterialization
 
 async function persistCoordinatorReconcileQueueAuthorityMutation(originalQueue = {}, nextState = {}, options = {}) {
     const operationKind = normalizeQueueWriteOperationName(options.operationKind || 'reconcile-progress')
@@ -7662,245 +7520,6 @@ async function persistCoordinatorReconcileQueueAuthorityMutation(originalQueue =
     }
 }
 
-function hasTerminalKeyOnlyCoordinatorEvent(events = [], itemKey = '', item = {}) {
-    const runId = `${item?.runId || ''}`.trim()
-    const status = `${item?.status || ''}`.trim()
-    const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-
-    return normalizeCoordinatorEvents(events).some(event => {
-        if(`${event?.itemId || ''}` !== `${itemKey || ''}`) return false
-        if(runId && `${event?.runId || ''}` !== runId) return false
-        if(status && `${event?.type || ''}` !== status) return false
-        if(coordinatorKey && `${event?.details?.coordinatorKey || ''}` && `${event.details.coordinatorKey}` !== coordinatorKey) return false
-        return true
-    })
-}
-
-function materializeTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
-    if(!item || typeof item !== 'object') return {changed: false}
-    if(getCoordinatorItemHref(item) || !isTerminalCoordinatorStatus(item.status)) return {changed: false}
-
-    const events = state.events || []
-    const affectedRunIds = []
-    const runId = `${item.runId || ''}`.trim()
-    if(runId) affectedRunIds.push(runId)
-
-    if(hasTerminalKeyOnlyCoordinatorEvent(events, itemKey, item)) {
-        return {
-            changed: false,
-            affectedRunIds
-        }
-    }
-
-    const eventAt = Number.parseInt(item.terminalAt || item.updatedAt, 10) || now
-    events.push({
-        id: makeId('event'),
-        runId,
-        itemId: itemKey,
-        type: item.status,
-        message: item.error || `Terminal key-only coordinator item ${item.status}`,
-        at: eventAt,
-        details: {
-            coordinatorKey: getCoordinatorItemQueueKey(item, itemKey),
-            reason: item.actionLeaseReleaseReason || item.outcome || 'terminal-key-only-derived-materialization'
-        }
-    })
-
-    return {
-        changed: true,
-        eventsChanged: true,
-        affectedRunIds,
-        materialized: 1
-    }
-}
-
-function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
-    if(!item || typeof item !== 'object') return {changed: false}
-    if(!isTerminalCoordinatorStatus(item.status) || !isProfileResolutionItem(item)) return {changed: false}
-    if(item.status !== 'skipped' || `${item.outcome || ''}`.trim() !== 'unresolved-target') return {changed: false}
-
-    const pendingPosts = state.pendingPosts || {}
-    const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, item, {
-        requestedUrl: getProfileResolutionRequestedUrl(item, itemKey),
-        evidence: item.evidence || []
-    })
-    if(!pendingResult.changed) return {changed: false}
-
-    state.pendingPosts = pendingResult.pendingPosts
-    return {
-        changed: true,
-        pendingPostsChanged: true,
-        pendingPosts: pendingResult.pendingPosts,
-        materialized: 1
-    }
-}
-
-function settleResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
-    if(!item || typeof item !== 'object') return {changed: false}
-    const resolvedHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    if(!resolvedHref || isProfileResolutionItem(item)) return {changed: false}
-
-    const evidenceList = Array.isArray(item.evidence) ? item.evidence : []
-    if(!evidenceList.some(evidence => evidence?.postKey || evidence?.postUrl)) return {changed: false}
-
-    const pendingPosts = state.pendingPosts || {}
-    const hasMatchingPendingResolver = Object.values(pendingPosts || {}).some(record => {
-        if(record?.resolverPending !== true) return false
-
-        const recordPostKey = `${record?.postKey || ''}`.trim()
-        const recordUrls = new Set([
-            normalizeCoordinatorRequestedUrl(record?.resolverUrl || ''),
-            normalizeCoordinatorRequestedUrl(record?.postUrl || '')
-        ].filter(Boolean))
-        return evidenceList.some(evidence => {
-            const evidencePostKey = `${evidence?.postKey || ''}`.trim()
-            const evidencePostUrl = normalizeCoordinatorRequestedUrl(evidence?.postUrl || '')
-            return (evidencePostKey && evidencePostKey === recordPostKey) ||
-                (evidencePostUrl && recordUrls.has(evidencePostUrl))
-        })
-    })
-    if(!hasMatchingPendingResolver) return {changed: false}
-
-    const pendingResult = addResolvedProfileToPendingSpaceRecords(pendingPosts, item, resolvedHref)
-    if(!pendingResult.changed) return {changed: false}
-
-    state.pendingPosts = pendingResult.pendingPosts
-    return {
-        changed: true,
-        pendingPostsChanged: true,
-        pendingPosts: pendingResult.pendingPosts,
-        materialized: 1
-    }
-}
-
-function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', item = {}, now = Date.now()) {
-    if(!item || typeof item !== 'object') return {changed: false}
-    if(`${item.status || ''}` !== 'queued') return {changed: false}
-
-    const runId = `${item.runId || ''}`.trim()
-    if(!runId) return {changed: false}
-
-    const runs = state.runs || {}
-    const events = state.events || []
-    const progress = state.progress || {}
-    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey) || href || itemKey
-    const sourcePageUrl = `${item?.source?.pageUrl || item?.source?.sourcePageUrl || ''}`.trim()
-    const run = runs[runId] || {}
-    const sourceType = run.sourceType || item?.source?.type || inferSourceTypeFromRunId(runId) || 'space-feed'
-    let runsChanged = false
-    let progressChanged = false
-    let eventsChanged = false
-    let materialized = 0
-
-    const targetProfileHrefs = new Set(getCoordinatorRunTargetHrefs(run))
-    const targetWorkKeys = new Set(Array.isArray(run.targetWorkKeys) ? run.targetWorkKeys : [])
-    const sourcePages = new Set(Array.isArray(run.sourcePages) ? run.sourcePages : [])
-    if(href && !targetProfileHrefs.has(href)) {
-        targetProfileHrefs.add(href)
-        runsChanged = true
-    }
-    if(coordinatorKey && !targetWorkKeys.has(coordinatorKey)) {
-        targetWorkKeys.add(coordinatorKey)
-        runsChanged = true
-    }
-    if(sourcePageUrl && !sourcePages.has(sourcePageUrl)) {
-        sourcePages.add(sourcePageUrl)
-        runsChanged = true
-    }
-    if(!runs[runId]) runsChanged = true
-
-    if(runsChanged) {
-        runs[runId] = {
-            ...run,
-            id: runId,
-            sourceType,
-            createdAt: run.createdAt || item.createdAt || item.queuedAt || now,
-            updatedAt: Math.max(Number.parseInt(run.updatedAt, 10) || 0, Number.parseInt(item.updatedAt || item.queuedAt, 10) || now),
-            status: run.status || 'active',
-            paused: run.paused === true ? true : false,
-            sourcePages: Array.from(sourcePages),
-            targetProfileHrefs: Array.from(targetProfileHrefs),
-            targetWorkKeys: Array.from(targetWorkKeys)
-        }
-        materialized += 1
-    }
-
-    const existingProgressRecord = href ? getCoordinatorProgressRecordForItem(itemKey, item, progress) : null
-    const itemAttemptId = getAttemptIdFromValue(item)
-    const itemAttemptNumber = getAttemptNumberFromValue(item)
-    const recordAttemptId = getAttemptIdFromValue(existingProgressRecord)
-    const recordAttemptNumber = getAttemptNumberFromValue(existingProgressRecord)
-    const staleProgressAttempt = existingProgressRecord && (
-        hasMismatchedCoordinatorAttempt(item, existingProgressRecord) ||
-        (itemAttemptId && !recordAttemptId) ||
-        (itemAttemptNumber && !recordAttemptNumber)
-    )
-
-    if(href && isCoordinatorQueueAuthoritativeItem(item) && (!existingProgressRecord || staleProgressAttempt)) {
-        const resetRecord = normalizeProgressPatch(
-            href,
-            buildQueuedCoordinatorProgressResetPatch(item, {
-                now: Number.parseInt(item.queuedAt || item.updatedAt, 10) || now,
-                runId,
-                actionKind: item.actionKind || ''
-            }),
-            null
-        )
-        if(resetRecord) {
-            progress[href] = resetRecord
-            profileNukeProgress = {
-                ...profileNukeProgress,
-                [href]: resetRecord
-            }
-            progressChanged = true
-            materialized += 1
-        }
-    }
-
-    if((runsChanged || progressChanged) && !events.some(event =>
-        `${event?.runId || ''}` === runId &&
-        `${event?.type || ''}` === 'materialize' &&
-        `${event?.details?.reason || ''}` === 'enqueue-derived-materialization'
-    )) {
-        events.push({
-            id: makeId('event'),
-            runId,
-            itemId: coordinatorKey || itemKey,
-            type: 'materialize',
-            message: 'Materialized derived enqueue state',
-            at: now,
-            details: {
-                reason: 'enqueue-derived-materialization',
-                coordinatorKey,
-                targetProfileHref: href,
-                sourcePageUrl
-            }
-        })
-        eventsChanged = true
-    }
-
-    return {
-        changed: runsChanged || progressChanged || eventsChanged,
-        runsChanged,
-        progressChanged,
-        eventsChanged,
-        affectedRunIds: runsChanged || progressChanged || eventsChanged ? [runId] : [],
-        materialized
-    }
-}
-
-function addCoordinatorReconcileAffectedRunIds(ctx = {}, runIds = []) {
-    for(const runId of runIds || []) {
-        if(runId) ctx.affectedRunIds.add(runId)
-    }
-}
-
-function markCoordinatorReconcileRunAffected(ctx = {}, item = null) {
-    const runId = `${item?.runId || ''}`.trim()
-    if(runId) ctx.affectedRunIds.add(runId)
-}
-
 async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
     const state = await loadCoordinatorReconcileProjection({
         metricPath: 'reconcile.load'
@@ -7937,24 +7556,6 @@ async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
         affectedRunIds: new Set(),
         terminalSettlementHrefs: new Set(),
         tabsToCloseAfterReconcile: new Set()
-    }
-}
-
-function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {}) {
-    const clearProfileMaterialized = materializeRemovedProfileDerivedStateFromAuthority(ctx.state)
-    if(clearProfileMaterialized.changed) {
-        ctx.runs = clearProfileMaterialized.runs || ctx.runs
-        ctx.pendingPosts = clearProfileMaterialized.pendingPosts || ctx.pendingPosts
-        ctx.nukedPosts = clearProfileMaterialized.nukedPosts || ctx.nukedPosts
-        ctx.state.runs = ctx.runs
-        ctx.state.pendingPosts = ctx.pendingPosts
-        ctx.state.nukedPosts = ctx.nukedPosts
-        ctx.progressChanged = ctx.progressChanged || clearProfileMaterialized.progressChanged
-        ctx.runsMetadataChanged = ctx.runsMetadataChanged || clearProfileMaterialized.runsChanged
-        ctx.pendingPostsChanged = ctx.pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
-        ctx.nukedPostsChanged = ctx.nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
-        ctx.materialized += clearProfileMaterialized.materialized || 0
-        addCoordinatorReconcileAffectedRunIds(ctx, clearProfileMaterialized.affectedRunIds)
     }
 }
 

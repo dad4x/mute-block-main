@@ -2329,7 +2329,7 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
     const unresolvedBody = extractFunction(source, 'async function markQueuedProfileResolutionUnresolved(request = {}, sender = {})')
-    const settlementHelperBody = extractFunction(source, 'function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
+    const settlementHelperBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
     const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
 
     assert.match(helperBody, /resolverPending !== true/)
@@ -2440,7 +2440,7 @@ test('invalid resolver reconcile rows are non-retryable and source-settled', () 
     const source = readRepoFile('shared/js/sw.js')
     const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
-    const operationBody = extractFunction(source, 'function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operation = {})')
+    const operationBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function applyInvalidProfileResolutionReconcileActionLocked(state = {}, operation = {})')
 
     assert.match(transitionBody, /getInvalidProfileResolutionFailure\(item, itemKey\)/)
     assert.match(transitionBody, /invalidTerminalResolutionNeedsReconcile/)
@@ -2645,7 +2645,7 @@ test('coordinator reconcile loop is split into ordered authority phases', () => 
     const source = readRepoFile('shared/js/sw.js')
     const lockedBody = extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})')
     const loadBody = extractFunction(source, 'async function loadCoordinatorReconcileAuthorityPhase(options = {})')
-    const materializeBody = extractFunction(source, 'function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {})')
+    const materializeBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {})')
     const runtimeBody = extractFunction(source, 'async function reconcileCoordinatorRuntimeActorsPhase(ctx = {})')
     const authorityBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
@@ -2682,7 +2682,7 @@ test('current reconcile authority paths do not introduce repair operation kinds 
     const currentAuthorityBodies = [
         extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})'),
         extractFunction(source, 'async function loadCoordinatorReconcileAuthorityPhase(options = {})'),
-        extractFunction(source, 'function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {})'),
+        extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function materializeCoordinatorReconcileDerivedProjectionPhase(ctx = {})'),
         extractFunction(source, 'async function reconcileCoordinatorRuntimeActorsPhase(ctx = {})'),
         extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})'),
         extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})'),
@@ -4094,7 +4094,7 @@ test('same-attempt terminal success reconciles stale failed coordinator rows', (
     const source = readRepoFile('shared/js/sw.js')
     const reducerSource = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
     const authorityTransitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
-    const progressReconcileBody = extractFunction(source, 'function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {})')
+    const progressReconcileBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {})')
     const preferBody = extractFunction(
         reducerSource,
         'function shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item = null, record = null, mapped = null)'
