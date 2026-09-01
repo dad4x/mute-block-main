@@ -648,8 +648,11 @@ test('metadata-only progress does not drive Current Work status transitions', ()
     const tabUpdatedIndex = bootstrap.indexOf('browser.tabs.onUpdated.addListener')
     const tabUpdatedBody = bootstrap.slice(tabUpdatedIndex, tabUpdatedIndex + 1800)
 
-    assert.match(source, /function progressPatchHasExplicitStatus\(patch = \{\}\)/)
-    assert.match(source, /function shouldApplyExplicitProgressStatusToCoordinatorItem\(item = \{\}, patch = \{\}, options = \{\}\)/)
+    // progressPatchHasExplicitStatus/shouldApplyExplicitProgressStatusToCoordinatorItem
+    // moved to swCoordinatorProgressRules.js in decomposition Slice 12.
+    const progressRulesSource = readRepoFile('shared/js/swCoordinatorProgressRules.js')
+    assert.match(progressRulesSource, /function progressPatchHasExplicitStatus\(patch = \{\}\)/)
+    assert.match(progressRulesSource, /function shouldApplyExplicitProgressStatusToCoordinatorItem\(item = \{\}, patch = \{\}, options = \{\}\)/)
     assert.match(body, /const patchHasStatus = progressPatchHasExplicitStatus\(patch\)/)
     assert.match(body, /const patchCanTransitionStatus = item/)
     assert.match(body, /patchCanTransitionStatus \|\| preferSuccessfulTerminal/)
@@ -658,9 +661,10 @@ test('metadata-only progress does not drive Current Work status transitions', ()
 })
 
 test('stale tab close cannot fail a requeued Current Work row', () => {
-    const source = readRepoFile('shared/js/sw.js')
+    // shouldApplyExplicitProgressStatusToCoordinatorItem moved to
+    // swCoordinatorProgressRules.js in decomposition Slice 12.
     const guardBody = extractFunction(
-        source,
+        readRepoFile('shared/js/swCoordinatorProgressRules.js'),
         'function shouldApplyExplicitProgressStatusToCoordinatorItem(item = {}, patch = {}, options = {})'
     )
 
@@ -2171,8 +2175,12 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     const recordSweepBody = extractFunction(swSource, 'async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response = {})')
     const scheduleSweepBody = extractFunction(swSource, 'function scheduleOwnedBlockedProfileSweep(parentTabId, delayMs = 3000)')
     const activeBlockedLiveBody = extractFunction(swSource, 'async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = \'\', expectedItem = null, expectedRecord = null, liveProfileTabsByHref = new Map(), reason = \'active-blocked-live-tab\')')
-    const statusGateBody = extractFunction(swSource, 'function shouldApplyExplicitProgressStatusToCoordinatorItem(item = {}, patch = {}, options = {})')
-    const senderGateBody = extractFunction(swSource, 'function getActiveCoordinatorProgressSenderTabMismatchReason(item = {}, patch = {}, options = {})')
+    // shouldApplyExplicitProgressStatusToCoordinatorItem/
+    // getActiveCoordinatorProgressSenderTabMismatchReason moved to
+    // swCoordinatorProgressRules.js in decomposition Slice 12.
+    const progressRulesSource = readRepoFile('shared/js/swCoordinatorProgressRules.js')
+    const statusGateBody = extractFunction(progressRulesSource, 'function shouldApplyExplicitProgressStatusToCoordinatorItem(item = {}, patch = {}, options = {})')
+    const senderGateBody = extractFunction(progressRulesSource, 'function getActiveCoordinatorProgressSenderTabMismatchReason(item = {}, patch = {}, options = {})')
     const recordBatchBody = extractFunction(swSource, 'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})')
     const activeWithoutActorBody = extractFunction(swSource, 'async function requeueDurableActiveCoordinatorItemWithoutActor(itemKey = \'\', expectedItem = null, expectedRecord = null, reason = \'reconcile-active-without-actor\', options = {})')
     const actionLeaseBody = extractFunction(swSource, 'async function releaseMissingActionLeaseForActiveCoordinatorItem(itemKey = \'\', expectedItem = null, reason = \'reconcile-action-lease-missing-tab\', options = {})')
@@ -2974,7 +2982,9 @@ test('queued tab open lets durable queued authority outrank stale successful pro
 test('queued progress keeps sender tab id in persisted records', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null)')
-    const runtimeGuardBody = extractFunction(source, 'function getActiveCoordinatorDirectProgressRuntimeRejectionReason(item = {}, patch = {}, mapped = {}, options = {})')
+    // getActiveCoordinatorDirectProgressRuntimeRejectionReason moved to
+    // swCoordinatorProgressRules.js in decomposition Slice 12.
+    const runtimeGuardBody = extractFunction(readRepoFile('shared/js/swCoordinatorProgressRules.js'), 'function getActiveCoordinatorDirectProgressRuntimeRejectionReason(item = {}, patch = {}, mapped = {}, options = {})')
     const batchBody = extractFunction(source, 'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})')
     const deferredBody = extractFunction(source, 'async function recordDeferredCoordinatorJobMilestone(profileHref = \'\', patch = {}, options = {})')
     const requestBody = extractFunction(source, 'async function recordJobProgressFromRequest(request = {}, sender = {}, options = {})')
