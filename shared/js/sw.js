@@ -145,7 +145,45 @@ const {
 const {
     createQueuedWorkFastResume
 } = require('./swQueuedWorkFastResume')
+const {
+    createCoordinatorStatusRules
+} = require('./swCoordinatorStatusRules')
+const {
+    createCoordinatorProgressRules
+} = require('./swCoordinatorProgressRules')
 const queueRuntime = createQueueRuntimeState()
+// coordinatorStatusRules is constructed here, immediately after the
+// requires, rather than in place like prior slices: three already-
+// extracted modules -- coordinatorAttemptIdentity, coordinatorJobEnvelope,
+// and coordinatorReconcileInputs/queuedTabRuntimeStatus further below --
+// eagerly reference isTerminalCoordinatorStatus, isActiveCoordinatorStatus,
+// and/or isCoordinatorQueueAuthoritativeItem in their own construction-call
+// object literals (decomposition Slice 12). A hoisted `function`
+// declaration is visible throughout its enclosing scope; a `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes -- so this module must construct before all of those eager
+// references, which means before coordinatorAttemptIdentity, the earliest
+// of them. It has no dependency on anything else in the file besides the
+// already-required jobState.js exports, so it can go anywhere before that
+// point. See swCoordinatorStatusRules.js's header comment for the full
+// writeup, including why the rest of Slice 12's cluster had to move into a
+// second module (swCoordinatorProgressRules.js, constructed further below)
+// instead of this same one.
+const coordinatorStatusRules = createCoordinatorStatusRules({
+    handlers: {
+        isTerminalJobStatus,
+        isRetryableJobFailure,
+        isRetryableJobFailureFromProgress
+    }
+})
+const {
+    isTerminalCoordinatorStatus,
+    isActiveCoordinatorStatus,
+    isPendingCoordinatorStatus,
+    isRetryableCoordinatorFailure,
+    isRetryableCoordinatorFailureFromProgress,
+    isCoordinatorQueueAuthoritativeItem
+} = coordinatorStatusRules
 const schedulerClock = {
     setTimeout,
     clearTimeout,
@@ -592,6 +630,68 @@ const {
     hasMismatchedCoordinatorAttempt,
     getResolvedDestinationConflict
 } = coordinatorAttemptIdentity
+
+// coordinatorProgressRules is constructed here, right after
+// coordinatorAttemptIdentity's destructure, rather than in place like prior
+// slices: getActiveCoordinatorDirectProgressRuntimeRejectionReason needs
+// coordinatorAttemptIdentity's getAttemptIdFromValue/getAttemptNumberFromValue
+// exports (decomposition Slice 12) -- the opposite construction-order
+// constraint from coordinatorStatusRules above, which is why this is a
+// second module rather than folded into that one. incrementQueueWakeupMetric
+// (from queueWakeupMetricsShape, constructed well above this point) and
+// coordinatorStatusRules's own exports are also already available here.
+// getCoordinatorItemHref, normalizeCoordinatorActionLease,
+// wasQueuedRuntimeTabRemoved, setQueuedTabMetadata, getQueuedTabMetadata,
+// and getCoordinatorItemSettlementKey (all still plain hoisted function
+// declarations far below, untouched by this slice) are threaded through as
+// handler deps and work from any point in this scope either way.
+// mapProgressToCoordinatorState and getJobMilestonesFromProgress come
+// straight from the jobState.js require at the top of the file.
+const coordinatorProgressRules = createCoordinatorProgressRules({
+    now: () => Date.now(),
+    constants: {
+        CURRENT_WORK_RETENTION_MS
+    },
+    handlers: {
+        mapProgressToCoordinatorState,
+        normalizeTabId,
+        isActiveCoordinatorStatus,
+        isTerminalCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        isPendingCoordinatorStatus,
+        isRetryableCoordinatorFailure,
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        normalizeCoordinatorActionLease,
+        queueRuntime,
+        wasQueuedRuntimeTabRemoved,
+        setQueuedTabMetadata,
+        getQueuedTabMetadata,
+        getCoordinatorItemQueueKey,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        incrementQueueWakeupMetric,
+        getJobMilestonesFromProgress,
+        getCoordinatorItemSettlementKey
+    }
+})
+const {
+    mergeCoordinatorSources,
+    mergeCoordinatorEvidence,
+    getCoordinatorStatusFromProgress,
+    progressPatchHasExplicitStatus,
+    shouldApplyExplicitProgressStatusToCoordinatorItem,
+    getActiveCoordinatorProgressSenderTabMismatchReason,
+    getActiveCoordinatorDirectProgressRuntimeRejectionReason,
+    getCoordinatorActionKindForProgress,
+    getCoordinatorActionKindForItem,
+    shouldApplyProgressToCoordinatorItem,
+    getCoordinatorMilestonesFromProgress,
+    getCoordinatorCurrentWorkAnchor,
+    hasUnsettledCoordinatorSource,
+    shouldKeepCoordinatorCurrentWorkItem,
+    pruneCoordinatorCurrentWork
+} = coordinatorProgressRules
 
 let quoraRuntimeActivated = false
 let queueLoadThrottle = makeEmptyQueueLoadThrottle()
@@ -3936,257 +4036,6 @@ async function recordStaleAttemptDiagnostic(details = {}) {
         incrementQueueWakeupMetric('diagnosticEvent.persistDeferred')
     }
     return true
-}
-
-function mergeCoordinatorSources(existingSources = [], incomingSources = []) {
-    const seen = new Set()
-    const merged = []
-
-    for(const source of [...existingSources, ...incomingSources]) {
-        if(!source || typeof source !== 'object') continue
-        const key = [
-            source.type || '',
-            source.pageUrl || '',
-            source.spaceKey || '',
-            source.spaceCategory || ''
-        ].join('|')
-        if(seen.has(key)) continue
-        seen.add(key)
-        merged.push({
-            type: source.type || '',
-            pageUrl: source.pageUrl || '',
-            spaceKey: source.spaceKey || '',
-            spaceCategory: source.spaceCategory || ''
-        })
-    }
-
-    return merged
-}
-
-function mergeCoordinatorEvidence(existingEvidence = [], incomingEvidence = []) {
-    const seen = new Set()
-    const merged = []
-
-    for(const evidence of [...existingEvidence, ...incomingEvidence]) {
-        if(!evidence || typeof evidence !== 'object') continue
-        const key = [
-            evidence.postKey || '',
-            evidence.postUrl || '',
-            evidence.collector || '',
-            evidence.sourcePageUrl || ''
-        ].join('|')
-        if(seen.has(key)) continue
-        seen.add(key)
-        merged.push({
-            postKey: evidence.postKey || '',
-            postUrl: evidence.postUrl || '',
-            collector: evidence.collector || '',
-            confidence: evidence.confidence || '',
-            source: evidence.source || '',
-            rawSlug: evidence.rawSlug || '',
-            resolutionReason: evidence.resolutionReason || '',
-            sourcePageUrl: evidence.sourcePageUrl || ''
-        })
-    }
-
-    return merged
-}
-
-function getCoordinatorStatusFromProgress(record = null) {
-    const mapped = mapProgressToCoordinatorState(record)
-    return {
-        status: mapped.status || '',
-        outcome: mapped.outcome || '',
-        error: mapped.error || ''
-    }
-}
-
-function progressPatchHasExplicitStatus(patch = {}) {
-    return Object.prototype.hasOwnProperty.call(patch || {}, 'status') &&
-        `${patch?.status || ''}`.trim() !== ''
-}
-
-function shouldApplyExplicitProgressStatusToCoordinatorItem(item = {}, patch = {}, options = {}) {
-    if(!progressPatchHasExplicitStatus(patch)) return false
-
-    const status = `${patch?.status || ''}`.trim()
-    const senderTabId = normalizeTabId(options.senderTabId)
-    if(options.requireActiveSenderTab === true) {
-        const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-        return !!senderTabId && isActiveCoordinatorStatus(item?.status || '') && itemTabId === senderTabId
-    }
-
-    if(status === 'interrupted' && senderTabId) {
-        const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-        return isActiveCoordinatorStatus(item?.status || '') && itemTabId === senderTabId
-    }
-
-    return true
-}
-
-function getActiveCoordinatorProgressSenderTabMismatchReason(item = {}, patch = {}, options = {}) {
-    if(!item || !isActiveCoordinatorStatus(item?.status || '')) return ''
-
-    const senderTabId = normalizeTabId(options.senderTabId || patch?.tabId || null)
-    if(!senderTabId) return ''
-
-    if(options.allowBlockedLiveTabSender === true &&
-        patch?.blockSucceeded === true &&
-        `${patch?.status || ''}`.trim() === 'already-blocked') {
-        const itemHref = getCoordinatorItemHref(item)
-        const patchHref = normalizeQuoraProfileUrl(patch?.resolvedProfileHref || patch?.profileHref || '')
-        if(itemHref && patchHref === itemHref) return ''
-    }
-
-    const lease = normalizeCoordinatorActionLease(item?.actionLease)
-    const leaseTabId = normalizeTabId(lease?.tabId || null)
-    if(leaseTabId && senderTabId !== leaseTabId) {
-        return 'active-action-lease-sender-tab-mismatch'
-    }
-
-    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-    if(itemTabId && senderTabId !== itemTabId) {
-        return 'active-sender-tab-mismatch'
-    }
-
-    return ''
-}
-
-function getActiveCoordinatorDirectProgressRuntimeRejectionReason(item = {}, patch = {}, mapped = {}, options = {}) {
-    if(isTerminalCoordinatorStatus(mapped?.status)) return ''
-    if(!item) return ''
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return ''
-
-    const itemStatus = `${item?.status || ''}`.trim()
-    if(itemStatus === 'queued' && isActiveCoordinatorStatus(mapped?.status || '')) {
-        const releaseReason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-        const releaseAt = Number.parseInt(item?.actionLeaseReleasedAt, 10) || 0
-        const milestones = item?.milestones || {}
-        const closeAt = Math.max(
-            Number.parseInt(milestones.closeRequestedAt, 10) || 0,
-            Number.parseInt(milestones.tabClosedAt, 10) || 0
-        )
-        if(releaseReason || releaseAt || closeAt) {
-            return 'queued-direct-progress-after-runtime-release'
-        }
-        return ''
-    }
-    if(!isActiveCoordinatorStatus(itemStatus)) return ''
-
-    const senderTabId = normalizeTabId(options.senderTabId || patch?.tabId || null)
-    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-    const tabId = senderTabId || itemTabId
-    if(!tabId) return 'active-direct-progress-missing-runtime-tab'
-    if(!queueRuntime.hasActiveQueuedTab(tabId)) {
-        if(senderTabId && itemTabId && senderTabId === itemTabId &&
-            !queueRuntime.hasPendingTabAction(tabId) &&
-            !queueRuntime.hasQueuedTabMetadata(tabId)) {
-            if(wasQueuedRuntimeTabRemoved(tabId)) return 'queued-tab-runtime-detached'
-            queueRuntime.addActiveQueuedTab(tabId)
-            setQueuedTabMetadata(tabId, {
-                profileHref: getCoordinatorItemHref(item) || item.profileHref || item.targetProfileHref || '',
-                coordinatorKey: getCoordinatorItemQueueKey(item),
-                requestedUrl: item.requestedUrl || item.targetProfileHref || '',
-                tabAction: item.executorTabAction || item.tabAction || 'nuke',
-                actionKind: item.actionKind || 'mute-block',
-                runId: item.runId || '',
-                attemptId: getAttemptIdFromValue(item),
-                attemptNumber: getAttemptNumberFromValue(item),
-                durableActiveAt: item.activeAt || Date.now(),
-                durableActiveReason: 'direct-progress-runtime-restored'
-            })
-            incrementQueueWakeupMetric('directProgress.runtimeRestoredFromAuthority')
-        }
-        else {
-            return 'queued-tab-runtime-detached'
-        }
-    }
-
-    const metadata = getQueuedTabMetadata(tabId)
-    if(!metadata) return 'queued-tab-metadata-missing'
-    if(metadata?.closeRequestedAt || metadata?.closeReason) return 'queued-tab-closing'
-
-    const metadataHref = normalizeQuoraProfileUrl(metadata.profileHref || metadata.targetProfileHref || '')
-    const itemHref = normalizeQuoraProfileUrl(getCoordinatorItemHref(item) || item.profileHref || item.targetProfileHref || '')
-    if(metadataHref && itemHref && metadataHref !== itemHref) {
-        return 'queued-tab-metadata-profile-mismatch'
-    }
-
-    return ''
-}
-
-function getCoordinatorActionKindForProgress(record = null) {
-    return record?.actionKind || 'mute-block'
-}
-
-function getCoordinatorActionKindForItem(item = null) {
-    return item?.actionKind || 'mute-block'
-}
-
-function shouldApplyProgressToCoordinatorItem(item = null, record = null) {
-    if(!item || !record) return false
-    return getCoordinatorActionKindForItem(item) === getCoordinatorActionKindForProgress(record)
-}
-
-function isCoordinatorQueueAuthoritativeItem(item = null) {
-    return item?.serviceWorkerOwned === true ||
-        `${item?.executorOwner || ''}` === 'service-worker'
-}
-
-function getCoordinatorMilestonesFromProgress(record = {}) {
-    return getJobMilestonesFromProgress(record)
-}
-
-function isTerminalCoordinatorStatus(status) {
-    return isTerminalJobStatus(status)
-}
-
-function isActiveCoordinatorStatus(status = '') {
-    return ['opening', 'active', 'acting', 'settling'].includes(`${status || ''}`.trim())
-}
-
-function isPendingCoordinatorStatus(status = '') {
-    return status === 'queued' || isActiveCoordinatorStatus(status)
-}
-
-function isRetryableCoordinatorFailure(item = null) {
-    return isRetryableJobFailure(item)
-}
-
-function isRetryableCoordinatorFailureFromProgress(item = null, record = null) {
-    return isRetryableJobFailureFromProgress(item, record)
-}
-
-function getCoordinatorCurrentWorkAnchor(item = {}) {
-    return Number.parseInt(item?.terminalAt || item?.updatedAt || item?.createdAt, 10) || 0
-}
-
-function hasUnsettledCoordinatorSource(item = null) {
-    const settlementKey = getCoordinatorItemSettlementKey(item)
-    return !!settlementKey && item?.sourceSettlementKey !== settlementKey
-}
-
-function shouldKeepCoordinatorCurrentWorkItem(item = null, now = Date.now()) {
-    if(!item || typeof item !== 'object') return false
-    if(isPendingCoordinatorStatus(item.status)) return true
-    if(isRetryableCoordinatorFailure(item)) return true
-    if(!isTerminalCoordinatorStatus(item.status)) return true
-    if(hasUnsettledCoordinatorSource(item)) return true
-
-    const anchor = getCoordinatorCurrentWorkAnchor(item)
-    return !anchor || now - anchor <= CURRENT_WORK_RETENTION_MS
-}
-
-function pruneCoordinatorCurrentWork(queue = {}, now = Date.now()) {
-    let changed = false
-
-    for(const [key, item] of Object.entries(queue || {})) {
-        if(shouldKeepCoordinatorCurrentWorkItem(item, now)) continue
-        delete queue[key]
-        changed = true
-    }
-
-    return changed
 }
 
 function getCoordinatorQueueViewSortRank(item = {}) {
