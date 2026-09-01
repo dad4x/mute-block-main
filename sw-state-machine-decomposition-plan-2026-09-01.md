@@ -2,12 +2,14 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-13 are landed and independently verified
+Status: in progress. Slices 1-17 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
 `3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
-`73a4dbe`). `shared/js/sw.js` is down to 35,253 lines from 38,953 at the
-start of this effort, with 15 new modules landed. Slices 14-17 are defined
-below and queued to execute next. See
+`73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`). `shared/js/sw.js` is
+down to 34,422 lines from 38,953 at the start of this effort, with 18 new
+modules landed. The next slices resume past the excluded
+`createCoordinatorAuthority`-adjacent region (see "Boundary after Slice
+17"). See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
