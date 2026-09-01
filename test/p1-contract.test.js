@@ -869,9 +869,10 @@ test('action lease tab release reloads authority before mutating rows', () => {
 
 test('reconcile returns after saving stale-active cleanup', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const coordinatorRunsSource = readRepoFile('shared/js/swCoordinatorRuns.js')
     const body = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
     const lockedBody = extractFunction(source, 'async function reconcileCoordinatorStorageLocked(options = {})')
-    const pauseMaterializerBody = extractFunction(source, 'function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, now = Date.now())')
+    const pauseMaterializerBody = extractFunction(coordinatorRunsSource, 'function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, nowMs = now())')
     const saveIndex = body.indexOf('await saveCoordinatorState')
     const settleIndex = body.indexOf('await settleTerminalCoordinatorItemsLocked')
 
