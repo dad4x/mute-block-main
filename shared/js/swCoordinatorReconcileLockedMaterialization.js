@@ -68,17 +68,25 @@
 // quoraRuntimeActivated precedent from Slice 7.
 //
 // makeCoordinatorAuthorityApplyResult, getCoordinatorItemHref,
-// buildTerminalCoordinatorQueueItem, getCoordinatorItemSettlementKey,
-// clearResolverPendingSpaceRecords, addResolvedProfileToPendingSpaceRecords,
-// and normalizeProgressPatch are all still plain hoisted function
-// declarations in sw.js -- makeCoordinatorAuthorityApplyResult is part of
-// the excluded createCoordinatorAuthority-adjacent region per the plan's
-// "Boundary after Slice 17" section (matching the
-// cloneCoordinatorAuthorityValue-as-threaded-dep precedent from Slice 14),
-// getCoordinatorItemSettlementKey is a later slice's claim (Slice 20), and
-// the rest are simply out of range for this slice -- all are threaded
-// through as handler deps rather than moved. Hoisted declarations work from
-// any point in this scope either way, so this carries no TDZ risk.
+// buildTerminalCoordinatorQueueItem, clearResolverPendingSpaceRecords,
+// addResolvedProfileToPendingSpaceRecords, and normalizeProgressPatch are
+// all still plain hoisted function declarations in sw.js --
+// makeCoordinatorAuthorityApplyResult is part of the excluded
+// createCoordinatorAuthority-adjacent region per the plan's "Boundary after
+// Slice 17" section (matching the cloneCoordinatorAuthorityValue-as-
+// threaded-dep precedent from Slice 14), and the rest are simply out of
+// range for this slice -- all are threaded through as handler deps rather
+// than moved. Hoisted declarations work from any point in this scope
+// either way, so this carries no TDZ risk.
+//
+// getCoordinatorItemSettlementKey (referenced at line 108 of this module's
+// deps.handlers object) moved in decomposition Slice 20, into
+// swCoordinatorTerminalSettlement.js, which now constructs earlier in sw.js
+// than this module does. sw.js destructures that module's exports back
+// onto their original bare names, so this module's own construction-call
+// site did not need to change: the bare `getCoordinatorItemSettlementKey`
+// reference below now resolves to Slice 20's export instead of the old
+// hoisted declaration.
 //
 // JOB_EVENT_TAB_REMOVED and JOB_EVENT_TERMINAL come from the top-of-file
 // `require('./jobState')` and are threaded through as constants.
