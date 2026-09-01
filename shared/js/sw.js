@@ -127,6 +127,9 @@ const {
 const {
     createBrowserSessionRuntime
 } = require('./swBrowserSessionRuntime')
+const {
+    createCoordinatorReconcileInputs
+} = require('./swCoordinatorReconcileInputs')
 const queueRuntime = createQueueRuntimeState()
 const schedulerClock = {
     setTimeout,
@@ -473,7 +476,10 @@ let pendingQueueWakeupMetricsReset = null
 const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     browser,
     getQueuedExecutorTabStatusWithTimeout,
-    getTabObservedUrls,
+    // getTabObservedUrls is threaded as a thunk (defers name resolution to
+    // call time) because it's defined later, via coordinatorReconcileInputs
+    // -- see the ordering note above that module's construction.
+    getTabObservedUrls: (...args) => getTabObservedUrls(...args),
     incrementQueueWakeupMetric,
     normalizeCoordinatorRequestedUrl,
     normalizeQuoraProfileUrl,
@@ -1237,90 +1243,6 @@ const {
     deleteActivationGuardByKey
 } = activationGuardRuntime
 
-function markQueuedTabDurablyActive(tabId, reason = '') {
-    const metadata = getQueuedTabMetadata(tabId)
-    const durableActiveAt = Number.isFinite(metadata?.durableActiveAt) && metadata.durableActiveAt > 0
-        ? metadata.durableActiveAt
-        : Date.now()
-    setQueuedTabMetadata(tabId, {
-        durableActiveAt,
-        durableActiveReason: `${reason || ''}`.trim()
-    })
-}
-
-function getCoordinatorQueueWorkCounts(queue = {}) {
-    const counts = {
-        durableActiveRows: 0,
-        durableQueuedRows: 0,
-        durableTerminalRows: 0
-    }
-
-    for(const item of Object.values(queue || {})) {
-        if(isTerminalCoordinatorStatus(item?.status)) counts.durableTerminalRows += 1
-        else if(isActiveCoordinatorStatus(item?.status)) counts.durableActiveRows += 1
-        else if(`${item?.status || ''}` === 'queued') counts.durableQueuedRows += 1
-    }
-
-    return counts
-}
-
-function getCoordinatorAuthorityMismatchCounts(queue = {}, progress = {}, liveProfileTabsByHref = new Map(), options = {}) {
-    const rowBudget = Math.max(1, Number.parseInt(options.rowBudget, 10) || COORDINATOR_RECONCILE_OBSERVE_ROW_BUDGET)
-    const counts = {
-        durableActiveWithoutActor: 0,
-        durableActiveObserved: 0,
-        provisionalActorWithoutDurable: 0,
-        runtimeActorsObserved: queueRuntime.getActiveQueuedTabCount(),
-        rowBudgetExceeded: false
-    }
-    const activeEntries = []
-
-    for(const [itemKey, item] of Object.entries(queue || {})) {
-        if(!isActiveCoordinatorStatus(item?.status)) continue
-        if(activeEntries.length >= rowBudget) {
-            counts.rowBudgetExceeded = true
-            break
-        }
-
-        const record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
-        activeEntries.push({itemKey, item, record})
-        counts.durableActiveObserved += 1
-        if(!hasConfirmedLiveRuntimeActorForCoordinatorItem(item, record, liveProfileTabsByHref)) {
-            counts.durableActiveWithoutActor += 1
-        }
-    }
-
-    for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
-        if(!isDurablyActiveQueuedTab(tabId)) {
-            counts.provisionalActorWithoutDurable += 1
-            continue
-        }
-
-        const matched = activeEntries.some(({item, record}) => {
-            const persistedTabId = getPersistedQueuedTabId(item, record)
-            return persistedTabId === tabId && hasConfirmedRuntimeActorForCoordinatorItem(item, record)
-        })
-        if(!matched) counts.provisionalActorWithoutDurable += 1
-    }
-
-    return counts
-}
-
-function getCoordinatorReconcileActionBudget(options = {}) {
-    return Math.max(1, Number.parseInt(options.actionBudget, 10) || COORDINATOR_RECONCILE_ACTION_BUDGET)
-}
-
-function getTokenMatchedLiveTabForCoordinatorItem(item = null, record = null, itemKey = '', liveProfileTabsByHref = new Map()) {
-    const tabId = getPersistedQueuedTabId(item, record)
-    const expectedAttemptId = getAttemptIdFromValue(item) || getAttemptIdFromValue(record)
-    const expectedAttemptNumber = getAttemptNumberFromValue(item) || getAttemptNumberFromValue(record)
-    if(!tabId || !expectedAttemptId || !expectedAttemptNumber) return null
-
-    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
-    const candidates = href ? getLiveTabsForProfileHref(liveProfileTabsByHref, href) : []
-    return candidates.find(tab => normalizeTabId(tab?.id) === tabId) || null
-}
-
 const coordinatorReclaimEvidence = createCoordinatorReclaimEvidence({
     handlers: {
         getFirstPositiveNumber,
@@ -1336,47 +1258,68 @@ const {
     isQueuedCoordinatorLiveTabReclaimReason
 } = coordinatorReclaimEvidence
 
-function getLiveProfileTabForActiveCoordinatorReclaim(item = null, record = null, itemKey = '', liveProfileTabsByHref = new Map()) {
-    if(!item || !isActiveCoordinatorStatus(item.status)) return null
-    if(isTerminalProfileNukeRecord(record)) return null
-    if(hasConfirmedRuntimeActorForCoordinatorItem(item, record)) return null
-    if(normalizeCoordinatorActionLease(item.actionLease)) return null
-    if(!hasActiveCoordinatorMilestoneEvidence(item)) return null
-    const actionPhaseActive = hasActiveQueuedTabActionPhaseProgress(record, item)
-    if((actionPhaseActive || getPersistedQueuedTabId(item, record)) &&
-        !hasStrongActiveCoordinatorReclaimEvidence(item, record)) {
-        return null
+// coordinatorReconcileInputs is constructed here (rather than nearer the
+// top of the file with the other already-extracted modules) because
+// getCoordinatorAuthorityMismatchCounts needs isDurablyActiveQueuedTab,
+// which only becomes available once queuedTabRuntimeStatus is constructed
+// further down -- threaded through as a thunk below so the reference
+// resolves at call time, not at construction time (TDZ-avoidance, matching
+// the normalizeObjectNumberMap/normalizeQueueWakeupPhaseMap precedent from
+// Slice 7). Everything else this module needs (coordinatorReclaimEvidence's
+// exports above, queueRuntime, and the many still-bare sw.js function
+// declarations) is already bound by this point.
+const coordinatorReconcileInputs = createCoordinatorReconcileInputs({
+    now: () => Date.now(),
+    constants: {
+        COORDINATOR_RECONCILE_OBSERVE_ROW_BUDGET,
+        COORDINATOR_RECONCILE_ACTION_BUDGET
+    },
+    handlers: {
+        queueRuntime,
+        getQueuedTabMetadata,
+        setQueuedTabMetadata,
+        isTerminalCoordinatorStatus,
+        isActiveCoordinatorStatus,
+        getCoordinatorProgressRecordForItem,
+        hasConfirmedLiveRuntimeActorForCoordinatorItem,
+        hasConfirmedRuntimeActorForCoordinatorItem,
+        getPersistedQueuedTabId,
+        isDurablyActiveQueuedTab: (...args) => isDurablyActiveQueuedTab(...args),
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        getLiveTabsForProfileHref,
+        normalizeTabId,
+        isTerminalProfileNukeRecord,
+        normalizeCoordinatorActionLease,
+        hasActiveCoordinatorMilestoneEvidence,
+        hasActiveQueuedTabActionPhaseProgress,
+        hasStrongActiveCoordinatorReclaimEvidence,
+        hasOwnedQueuedTabState,
+        isQueuedCoordinatorLiveTabReclaimReason,
+        chooseCoordinatorReclaimProfileTab,
+        normalizeCoordinatorRequestedUrl,
+        getCoordinatorItemOpenUrl,
+        getPersistedActiveCoordinatorStaleAnchor
     }
-
-    const expectedAttemptId = getAttemptIdFromValue(item)
-    const expectedAttemptNumber = getAttemptNumberFromValue(item)
-    if(!expectedAttemptId || !expectedAttemptNumber) return null
-
-    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
-    const candidates = href ? getLiveTabsForProfileHref(liveProfileTabsByHref, href) : []
-    if(candidates.length !== 1) return null
-
-    const candidate = candidates[0]
-    const candidateTabId = normalizeTabId(candidate?.id)
-    if(!candidateTabId || hasOwnedQueuedTabState(candidateTabId)) return null
-
-    return candidate
-}
-
-function getLiveProfileTabForRolledBackQueuedCoordinatorReclaim(item = null, record = null, itemKey = '', liveProfileTabsByHref = new Map()) {
-    if(!item || `${item.status || ''}`.trim() !== 'queued') return null
-    if(!isQueuedCoordinatorLiveTabReclaimReason(item.actionLeaseReleaseReason)) return null
-    if(isTerminalProfileNukeRecord(record)) return null
-    if(hasActiveQueuedTabActionPhaseProgress(record, item)) return null
-
-    const expectedAttemptId = getAttemptIdFromValue(item)
-    const expectedAttemptNumber = getAttemptNumberFromValue(item)
-    if(!expectedAttemptId || !expectedAttemptNumber) return null
-
-    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey) || normalizeQuoraProfileUrl(record?.profileHref || '')
-    const candidates = href ? getLiveTabsForProfileHref(liveProfileTabsByHref, href) : []
-    return chooseCoordinatorReclaimProfileTab(candidates)
-}
+})
+const {
+    markQueuedTabDurablyActive,
+    getCoordinatorQueueWorkCounts,
+    getCoordinatorAuthorityMismatchCounts,
+    getCoordinatorReconcileActionBudget,
+    getTokenMatchedLiveTabForCoordinatorItem,
+    getLiveProfileTabForActiveCoordinatorReclaim,
+    getLiveProfileTabForRolledBackQueuedCoordinatorReclaim,
+    getCoordinatorItemExpectedExecutorHref,
+    getCoordinatorItemExpectedExecutorUrl,
+    getTabObservedUrls,
+    getPersistedExecutorObservedAgeMs,
+    getQueuedTabActorReadinessAnchor,
+    summarizeQueuedTabStatusForRecorder,
+    getFreshWorkerWindowStartupProgressAnchor
+} = coordinatorReconcileInputs
 
 async function getQueuedExecutorTabStatusWithTimeout(tabId = null, reason = 'queued-executor-tab-get') {
     const normalizedTabId = normalizeTabId(tabId)
@@ -1475,38 +1418,6 @@ async function getQueuedExecutorTabWithTimeout(tabId = null, reason = 'queued-ex
     return result.tab || null
 }
 
-function getCoordinatorItemExpectedExecutorHref(item = null, record = null, itemKey = '') {
-    return getCoordinatorItemHref(item) ||
-        normalizeQuoraProfileUrl(itemKey) ||
-        normalizeQuoraProfileUrl(record?.profileHref || '')
-}
-
-function getCoordinatorItemExpectedExecutorUrl(item = null, record = null, itemKey = '') {
-    return normalizeCoordinatorRequestedUrl(
-        item?.requestedUrl ||
-        getCoordinatorItemOpenUrl(item) ||
-        getCoordinatorItemExpectedExecutorHref(item, record, itemKey) ||
-        record?.requestedUrl ||
-        record?.profileHref ||
-        ''
-    )
-}
-
-function getTabObservedUrls(tab = null) {
-    return [
-        tab?.url,
-        tab?.pendingUrl
-    ]
-        .map(value => `${value || ''}`.trim())
-        .filter(Boolean)
-}
-
-function getPersistedExecutorObservedAgeMs(item = null, record = null, now = Date.now()) {
-    const anchor = getPersistedActiveCoordinatorStaleAnchor(item, record)
-    if(!anchor || anchor > now) return Number.POSITIVE_INFINITY
-    return now - anchor
-}
-
 async function getPersistedLiveTabForCoordinatorItem(item = null, record = null, itemKey = '') {
     const result = await getPersistedLiveTabStatusForCoordinatorItem(item, record, itemKey)
     return result.tab || null
@@ -1588,41 +1499,6 @@ async function getActionPhaseLiveTabProtectionForCoordinatorItem(item = null, re
             ? 'action-phase-progress-tab-missing'
             : persistedTabStatus.error || 'action-phase-progress-tab-not-live',
         tabStatus: persistedTabStatus
-    }
-}
-
-function getQueuedTabActorReadinessAnchor(item = null, record = null, metadata = null) {
-    return Math.max(
-        Number.parseInt(metadata?.contentScriptPresentAt, 10) || 0,
-        Number.parseInt(metadata?.contentScriptInjectedAt, 10) || 0,
-        Number.parseInt(metadata?.contentScriptEnsureStartedAt, 10) || 0,
-        Number.parseInt(metadata?.durableActiveAt, 10) || 0,
-        Number.parseInt(metadata?.activeTransitionContinuedAt, 10) || 0,
-        Number.parseInt(metadata?.activeTransitionUnconfirmedAt, 10) || 0,
-        Number.parseInt(metadata?.activeTransitionPendingAt, 10) || 0,
-        Number.parseInt(metadata?.openedAt, 10) || 0,
-        Number.parseInt(metadata?.tabOpenedAt, 10) || 0,
-        Number.parseInt(metadata?.tabCreatedAt, 10) || 0,
-        Number.parseInt(record?.contentOpenedAt, 10) || 0,
-        Number.parseInt(record?.tabOpenedAt, 10) || 0,
-        Number.parseInt(record?.tabCreatedAt, 10) || 0,
-        Number.parseInt(item?.activeAt, 10) || 0
-    )
-}
-
-function summarizeQueuedTabStatusForRecorder(status = null) {
-    const tab = status?.tab || null
-    return {
-        found: status?.found === true,
-        missing: status?.missing === true,
-        timedOut: status?.timedOut === true,
-        implausible: status?.implausible === true,
-        error: status?.error || '',
-        tabUrl: tab?.url || '',
-        tabPendingUrl: tab?.pendingUrl || '',
-        tabStatus: tab?.status || '',
-        tabTitle: tab?.title || '',
-        tabWindowId: tab?.windowId || null
     }
 }
 
@@ -1737,16 +1613,6 @@ async function deferActiveWithoutActorForFreshContentReadiness(itemKey = '', exp
         ensureResult,
         tabStatus
     }
-}
-
-function getFreshWorkerWindowStartupProgressAnchor(item = null, record = null) {
-    return Math.max(
-        Number.parseInt(record?.actionSurfaceActivatedAt, 10) || 0,
-        Number.parseInt(record?.tabOpenedAt, 10) || 0,
-        Number.parseInt(record?.tabCreatedAt, 10) || 0,
-        Number.parseInt(item?.activeAt, 10) || 0,
-        Number.parseInt(item?.updatedAt, 10) || 0
-    )
 }
 
 const queuedTabRuntimeStatus = createQueuedTabRuntimeStatus({
