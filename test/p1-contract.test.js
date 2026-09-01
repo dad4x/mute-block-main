@@ -1720,6 +1720,11 @@ test('fill loop obtains activation intent through queue-machine slot event', () 
 
 test('stale-attempt diagnostics are serialized with coordinator updates', () => {
     const source = readRepoFile('shared/js/sw.js')
+    // shouldFlushPendingCoordinatorDiagnosticEventsNow moved to
+    // swCoordinatorJobEnvelope.js in decomposition Slice 11; its internal
+    // queueRuntime.getRuntimeCounts() call became a threaded
+    // getQueueRuntimeCounts() dep call in the move.
+    const jobEnvelopeSource = readRepoFile('shared/js/swCoordinatorJobEnvelope.js')
     const diagnosticBody = extractFunction(source, 'async function recordStaleAttemptDiagnostic(details = {})')
     const saveBody = extractFunction(source, 'async function saveCoordinatorState(state = {}, changes = {})')
 
@@ -1727,7 +1732,7 @@ test('stale-attempt diagnostics are serialized with coordinator updates', () => 
     assert.match(diagnosticBody, /pendingCoordinatorDiagnosticEvents\.push\(event\)/)
     assert.match(diagnosticBody, /diagnosticEvent\.persistDeferred/)
     assert.doesNotMatch(diagnosticBody, /enqueueSpaceFeedStorageUpdate\(async \(\) =>/)
-    assert.match(source, /function shouldFlushPendingCoordinatorDiagnosticEventsNow\(context = \{\}\) \{[\s\S]*const runtimeCounts = queueRuntime\.getRuntimeCounts\(\)[\s\S]*runtimeCounts\.activeQueuedTabs <= 0[\s\S]*runtimeCounts\.queuedTabActions <= 0[\s\S]*runtimeCounts\.pendingTabActions <= 0[\s\S]*durableActiveRows <= 0[\s\S]*durableQueuedRows <= 0/)
+    assert.match(jobEnvelopeSource, /function shouldFlushPendingCoordinatorDiagnosticEventsNow\(context = \{\}\) \{[\s\S]*const runtimeCounts = getQueueRuntimeCounts\(\)[\s\S]*runtimeCounts\.activeQueuedTabs <= 0[\s\S]*runtimeCounts\.queuedTabActions <= 0[\s\S]*runtimeCounts\.pendingTabActions <= 0[\s\S]*durableActiveRows <= 0[\s\S]*durableQueuedRows <= 0/)
     assert.match(source, /function flushPendingCoordinatorDiagnosticEventsIfIdle\(context = \{\}\) \{[\s\S]*diagnosticEvent\.flushDeferredForQueueWork/)
     assert.match(saveBody, /drainPendingCoordinatorDiagnosticEvents\(\)/)
     assert.match(saveBody, /concat\(diagnosticEvents\)/)
@@ -2251,13 +2256,16 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
 })
 
 test('coordinator rows expose canonical job envelope fields', () => {
-    const source = readRepoFile('shared/js/sw.js')
+    // makeCoordinatorJobEnvelope/applyCoordinatorJobEnvelope/
+    // makeCoordinatorAttemptEnvelope moved to swCoordinatorJobEnvelope.js in
+    // decomposition Slice 11.
+    const jobEnvelopeSource = readRepoFile('shared/js/swCoordinatorJobEnvelope.js')
 
-    assert.match(source, /function makeCoordinatorJobEnvelope/)
-    assert.match(source, /function applyCoordinatorJobEnvelope/)
-    assert.match(source, /jobKey:/)
-    assert.match(source, /canonicalSubject:/)
-    assert.match(source, /attempt: makeCoordinatorAttemptEnvelope/)
+    assert.match(jobEnvelopeSource, /function makeCoordinatorJobEnvelope/)
+    assert.match(jobEnvelopeSource, /function applyCoordinatorJobEnvelope/)
+    assert.match(jobEnvelopeSource, /jobKey:/)
+    assert.match(jobEnvelopeSource, /canonicalSubject:/)
+    assert.match(jobEnvelopeSource, /attempt: makeCoordinatorAttemptEnvelope/)
 })
 
 test('aggregate space-feed buttons preserve resolver-only entries', () => {
@@ -2349,7 +2357,9 @@ test('failed resolver requeue preserves source-post resolution mode', () => {
     const retryMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRetry(operation = {})')
     const requeueMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRequeue(operation = {})')
 
-    assert.match(source, /function getFailedItemProfileResolutionRetryUrl/)
+    // getFailedItemProfileResolutionRetryUrl moved to
+    // swCoordinatorJobEnvelope.js in decomposition Slice 11.
+    assert.match(readRepoFile('shared/js/swCoordinatorJobEnvelope.js'), /function getFailedItemProfileResolutionRetryUrl/)
     assert.match(candidateBody, /resolutionRetryUrl/)
     assert.match(candidateBody, /!href && !candidate\.resolutionRetryUrl/)
     assert.match(resetBody, /getFailedItemProfileResolutionRetryUrl\(item, itemKey\)/)

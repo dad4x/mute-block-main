@@ -13,6 +13,12 @@ const {
     createProfileResolution
 } = require('./swProfileResolution')
 const {
+    createCoordinatorAttemptIdentity
+} = require('./swCoordinatorAttemptIdentity')
+const {
+    createCoordinatorJobEnvelope
+} = require('./swCoordinatorJobEnvelope')
+const {
     getJobMilestonesFromProgress,
     getActionKindForRequestedAction,
     getExecutorTabActionForActionKind,
@@ -546,6 +552,47 @@ const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     setTimeoutFn: setTimeout,
     now: () => Date.now()
 })
+
+// coordinatorAttemptIdentity is constructed here, before browserSessionRuntime
+// (below), rather than at this cluster's old source-text location much further
+// down the file: browserSessionRuntime's handlers eagerly reference makeId (see
+// its construction below) at sw.js module-eval time, and activationGuardRuntime
+// and coordinatorReconcileInputs (further below still) eagerly reference
+// getAttemptIdFromValue/getAttemptNumberFromValue, and queuedTabRuntimeStatus
+// eagerly references hasMismatchedCoordinatorAttempt/makeAttemptId. A hoisted
+// `function` declaration is visible throughout its enclosing scope; a `const`
+// destructured from a factory call is in the temporal dead zone until that line
+// executes -- so this module must be constructed before all of those eager
+// references, which means before browserSessionRuntime, the earliest of them
+// (Slice 11). isCoordinatorQueueAuthoritativeItem, isTerminalCoordinatorStatus,
+// and isTerminalProfileNukeRecord (all still plain hoisted function
+// declarations far below, untouched by this slice) are threaded through as
+// handler deps and work from any point in this scope either way.
+const coordinatorAttemptIdentity = createCoordinatorAttemptIdentity({
+    now: () => Date.now(),
+    handlers: {
+        normalizeQuoraProfileUrl,
+        isCoordinatorQueueAuthoritativeItem,
+        isTerminalCoordinatorStatus,
+        isTerminalProfileNukeRecord
+    }
+})
+const {
+    makeId,
+    makeAttemptId,
+    normalizeAttemptId,
+    getAttemptIdFromValue,
+    getAttemptNumberFromValue,
+    getNextAttemptNumberFromValue,
+    makeCoordinatorInFlightMutationKey,
+    normalizeCoordinatorMap,
+    normalizeCoordinatorEvents,
+    isAttemptTrackedCoordinatorItem,
+    isNewerTerminalProgressForCoordinatorItem,
+    hasMismatchedCoordinatorAttempt,
+    getResolvedDestinationConflict
+} = coordinatorAttemptIdentity
+
 let quoraRuntimeActivated = false
 let queueLoadThrottle = makeEmptyQueueLoadThrottle()
 
@@ -1250,6 +1297,82 @@ async function getLiveQueuedProfileTabCount() {
     const tabs = await browser.tabs.query({}).catch(() => [])
     return (tabs || []).filter(tab => normalizeQuoraProfileUrl(tab?.url || '')).length
 }
+
+// coordinatorJobEnvelope is constructed here, before activationGuardRuntime
+// (below), rather than at this cluster's old source-text location much
+// further down the file: queuedTabRuntimeStatus (further below still)
+// eagerly references applyCoordinatorJobEnvelope at sw.js module-eval time,
+// well before this cluster's old position. A hoisted `function` declaration
+// is visible throughout its enclosing scope; a `const` destructured from a
+// factory call is in the temporal dead zone until that line executes -- so
+// this module must be constructed before that eager reference (Slice 11).
+// It's placed here rather than any earlier because it needs storageUpdateState
+// (just constructed above) for recordCoordinatorDiagnosticEvent's depth
+// check; it also needs coordinatorAttemptIdentity's makeId/normalizeAttemptId/
+// getAttemptIdFromValue/getAttemptNumberFromValue and profileResolution's
+// exports, both already available well before this point.
+// getCoordinatorActionKindForRequestedAction, getCoordinatorItemHref,
+// isTerminalCoordinatorStatus, and cloneCoordinatorAuthorityValue (all still
+// plain hoisted function declarations far below, untouched by this slice)
+// are threaded through as handler deps and work from any point in this
+// scope either way. pendingCoordinatorDiagnosticEvents and
+// coordinatorDiagnosticBatchDepth are module-level mutable state also read/
+// written directly by recordStaleAttemptDiagnostic (an async function
+// staying in sw.js, out of this slice's scope) -- threaded through as get/
+// set state accessors here rather than moved, matching the
+// swQueueWakeupMetricsShape.js convention.
+const coordinatorJobEnvelope = createCoordinatorJobEnvelope({
+    now: () => Date.now(),
+    constants: {
+        MAX_COORDINATOR_EVENTS,
+        STALE_QUEUED_TAB_MAX_RETRIES,
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
+    handlers: {
+        normalizeQuoraProfileUrl,
+        makeCanonicalSubject,
+        getCoordinatorActionKindForRequestedAction,
+        getCoordinatorItemHref,
+        isTerminalCoordinatorStatus,
+        cloneCoordinatorAuthorityValue,
+        isProfileResolutionItem,
+        getProfileResolutionRequestedUrl,
+        normalizeCoordinatorRequestedUrl,
+        getQuestionResolutionUrlFromEvidencePostUrl,
+        getNormalizedProfileHrefList,
+        makeCoordinatorScope,
+        makeCoordinatorResolutionSubject,
+        getCoordinatorSubjectKey,
+        makeId,
+        normalizeAttemptId,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        incrementQueueWakeupMetric,
+        recordQueueWakeupMetricMax,
+        getStorageUpdateDepth: () => storageUpdateState.getDepth(),
+        getQueueRuntimeCounts: () => queueRuntime.getRuntimeCounts()
+    },
+    state: {
+        getPendingCoordinatorDiagnosticEvents: () => pendingCoordinatorDiagnosticEvents,
+        setPendingCoordinatorDiagnosticEvents: value => { pendingCoordinatorDiagnosticEvents = value },
+        getCoordinatorDiagnosticBatchDepth: () => coordinatorDiagnosticBatchDepth
+    }
+})
+const {
+    makeCoordinatorJobKey,
+    makeCoordinatorAttemptEnvelope,
+    makeCoordinatorJobEnvelope,
+    applyCoordinatorJobEnvelope,
+    getFailedItemQuestionResolutionUrl,
+    getFailedItemProfileResolutionRetryUrl,
+    buildQueuedCoordinatorProgressResetPatch,
+    getStoredSpaceFeedRecordUrls,
+    getPendingSpaceFeedJobKeyPatch,
+    makeStaleAttemptDiagnosticEvent,
+    recordCoordinatorDiagnosticEvent,
+    drainPendingCoordinatorDiagnosticEvents,
+    shouldFlushPendingCoordinatorDiagnosticEventsNow
+} = coordinatorJobEnvelope
 
 const activationGuardRuntime = createActivationGuardRuntime({
     now: () => Date.now(),
@@ -3773,379 +3896,6 @@ function recordQueueWakeupPhaseSamplesFromProgress(record = {}) {
     }
 }
 
-function makeCoordinatorJobKey(scope = {}, actionKind = '', subject = null) {
-    const scopeKey = scope.runId ||
-        [scope.type || 'global', scope.sourcePageUrl || scope.spaceKey || ''].filter(Boolean).join(':') ||
-        'global'
-    const subjectKey = getCoordinatorSubjectKey(subject)
-    if(!subjectKey) return ''
-
-    return `${scopeKey}|${getCoordinatorActionKindForRequestedAction(actionKind)}|${subjectKey}`
-}
-
-function makeCoordinatorAttemptEnvelope(existing = null, attemptId = '', attemptNumber = 0, maxAttempts = 1) {
-    const previous = existing?.attempt && typeof existing.attempt === 'object' ? existing.attempt : {}
-    return {
-        ...previous,
-        id: normalizeAttemptId(attemptId || previous.id || ''),
-        number: Number.parseInt(attemptNumber || previous.number, 10) || 0,
-        max: Number.parseInt(maxAttempts || previous.max, 10) || 1,
-        claimedTabId: previous.claimedTabId ?? existing?.tabId ?? null,
-        claimedAt: Number.parseInt(previous.claimedAt, 10) || 0,
-        leaseExpiresAt: Number.parseInt(previous.leaseExpiresAt, 10) || 0,
-        heartbeatAt: Number.parseInt(previous.heartbeatAt, 10) || 0
-    }
-}
-
-function makeCoordinatorJobEnvelope(details = {}) {
-    const targetProfileHref = normalizeQuoraProfileUrl(details.targetProfileHref || '')
-    const coordinatorKey = `${details.coordinatorKey || targetProfileHref || ''}`.trim()
-    const requestedUrl = isProfileResolutionItem({
-            requestedUrl: details.requestedUrl || '',
-            coordinatorKey
-        })
-        ? getProfileResolutionRequestedUrl({
-            requestedUrl: details.requestedUrl || '',
-            coordinatorKey
-        }, coordinatorKey)
-        : normalizeCoordinatorRequestedUrl(details.requestedUrl || targetProfileHref || coordinatorKey)
-    const actionKind = getCoordinatorActionKindForRequestedAction(details.actionKind || '')
-    const scope = makeCoordinatorScope(details.runInput || {}, details.source || {}, details.runId || '')
-    const canonicalSubject = targetProfileHref
-        ? makeCanonicalSubject(targetProfileHref)
-        : makeCoordinatorResolutionSubject(requestedUrl, coordinatorKey)
-    const jobKey = makeCoordinatorJobKey(scope, actionKind, canonicalSubject)
-
-    return {
-        jobKey,
-        scope,
-        canonicalSubject
-    }
-}
-
-function applyCoordinatorJobEnvelope(item = {}, details = {}) {
-    const envelope = makeCoordinatorJobEnvelope({
-        targetProfileHref: item.targetProfileHref || details.targetProfileHref || '',
-        requestedUrl: item.requestedUrl || details.requestedUrl || '',
-        coordinatorKey: item.coordinatorKey || details.coordinatorKey || '',
-        actionKind: item.actionKind || details.actionKind || '',
-        runInput: details.runInput || {},
-        source: item.source || details.source || {},
-        runId: item.runId || details.runId || ''
-    })
-
-    return {
-        ...item,
-        jobKey: envelope.jobKey || item.jobKey || '',
-        scope: envelope.scope || item.scope,
-        canonicalSubject: envelope.canonicalSubject || item.canonicalSubject,
-        attempt: makeCoordinatorAttemptEnvelope(
-            item,
-            getAttemptIdFromValue(item),
-            getAttemptNumberFromValue(item),
-            item.maxAttempts || item.attempt?.max || 1
-        )
-    }
-}
-
-function getFailedItemQuestionResolutionUrl(item = {}) {
-    const errorText = `${item?.error || ''}`
-    const questionPathMatch = errorText.match(/\bquestion:\s*(\/[^)\s]+)/i)
-    if(questionPathMatch?.[1]) {
-        return normalizeCoordinatorRequestedUrl(`https://www.quora.com${questionPathMatch[1]}`)
-    }
-
-    const evidence = Array.isArray(item?.evidence) ? item.evidence : []
-    for(const entry of evidence) {
-        try {
-            const requestedUrl = getQuestionResolutionUrlFromEvidencePostUrl(entry?.postUrl || '')
-            if(requestedUrl) return requestedUrl
-        }
-        catch {}
-    }
-
-    if(/\bdid not land on a profile page\b/i.test(errorText)) {
-        for(const entry of evidence) {
-            const postUrl = normalizeCoordinatorRequestedUrl(entry?.postUrl || '')
-            if(postUrl) return postUrl
-        }
-    }
-
-    return ''
-}
-
-function getFailedItemProfileResolutionRetryUrl(item = {}, fallbackKey = '') {
-    const fallbackResolutionUrl = getFailedItemQuestionResolutionUrl(item)
-    if(fallbackResolutionUrl) return fallbackResolutionUrl
-
-    if(!isProfileResolutionItem(item)) return ''
-    if(getCoordinatorItemHref(item)) return ''
-
-    return getProfileResolutionRequestedUrl(item, fallbackKey)
-}
-
-function buildQueuedCoordinatorProgressResetPatch(item = {}, options = {}) {
-    const actionKind = getCoordinatorActionKindForRequestedAction(item?.actionKind || options.actionKind || '')
-    const now = Number.parseInt(options.now, 10) || Date.now()
-
-    return {
-        replaceProgressRecord: true,
-        actionKind,
-        runId: item?.runId || options.runId || '',
-        attemptId: getAttemptIdFromValue(item),
-        attemptNumber: getAttemptNumberFromValue(item),
-        status: 'queued',
-        queuedAt: now,
-        queueIndex: 0,
-        retryAttempt: 0,
-        maxRetries: Number.parseInt(item?.maxRetries, 10) || STALE_QUEUED_TAB_MAX_RETRIES,
-        tabId: null,
-        tabCreatedAt: 0,
-        tabOpenedAt: 0,
-        contentOpenedAt: 0,
-        actionReadyAt: 0,
-        openedViablePage: false,
-        terminalAt: 0,
-        slotReleasedAt: 0,
-        closeRequestedAt: 0,
-        tabClosedAt: 0,
-        closedByExtension: false,
-        closeReason: '',
-        ownerTabId: null,
-        ownerWindowId: null,
-        waitingForForegroundAt: 0,
-        foregroundWaitReason: '',
-        foregroundWaitLastEventAt: 0,
-        foregroundLeaseAcquiredAt: 0,
-        foregroundPromotedAt: 0,
-        foregroundPromotionReason: '',
-        muteAttempted: false,
-        muteSucceeded: false,
-        muteAttemptedAt: 0,
-        mutedAt: 0,
-        muteError: '',
-        blockAttempted: false,
-        blockSucceeded: false,
-        blockAttemptedAt: 0,
-        blockedAt: 0,
-        blockError: '',
-        directBlockFailureDetail: null,
-        unblockOk: false,
-        unblockSucceeded: false,
-        unblockReason: '',
-        unmuteOk: false,
-        unmuteReason: '',
-        foundBlockedBeforeQueue: false,
-        profileBlocked: false,
-        profileMenuOpen: false,
-        selectedActionLabel: '',
-        selectedActionRect: null,
-        menuActionLabels: [],
-        visibleProfileMenuLabels: [],
-        finalError: '',
-        errorPageUrl: '',
-        lastUrl: '',
-        unavailableReason: '',
-        resolvedProfileHref: '',
-        remappedFromRequested: false,
-        securityVerification: false,
-        event: actionKind === UNBLOCK_UNMUTE_ACTION_KIND
-            ? 'Added Unblock Unmute to Current Work'
-            : 'Added Mute Block to Current Work'
-    }
-}
-
-function getStoredSpaceFeedRecordUrls(record, key = 'remainingUrls') {
-    if(!record || typeof record !== 'object') return []
-
-    const urls = key && Array.isArray(record[key])
-        ? record[key]
-        : key === 'remainingUrls'
-            ? Array.isArray(record.remainingUrls)
-                ? record.remainingUrls
-                : Array.isArray(record.allUrls)
-                    ? record.allUrls
-                    : Array.isArray(record.urls)
-                        ? record.urls
-                        : []
-            : []
-
-    return getNormalizedProfileHrefList(urls)
-}
-
-function getPendingSpaceFeedJobKeyPatch(record = {}, remainingUrls = []) {
-    const remaining = getNormalizedProfileHrefList(remainingUrls)
-    const existingByHref = record?.jobKeysByProfileHref && typeof record.jobKeysByProfileHref === 'object'
-        ? record.jobKeysByProfileHref
-        : {}
-    const jobKeysByProfileHref = {}
-
-    for(const href of remaining) {
-        jobKeysByProfileHref[href] = normalizeQuoraProfileUrl(existingByHref[href] || href) || href
-    }
-
-    return {
-        jobKeys: getNormalizedProfileHrefList(Object.values(jobKeysByProfileHref)),
-        jobKeysByProfileHref
-    }
-}
-
-function makeId(prefix) {
-    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-}
-
-function makeAttemptId() {
-    return makeId('attempt')
-}
-
-function normalizeAttemptId(value = '') {
-    return `${value || ''}`.trim()
-}
-
-function getAttemptIdFromValue(value = null) {
-    if(!value || typeof value !== 'object') return ''
-    return normalizeAttemptId(value.attemptId || value.attempt?.id || '')
-}
-
-function getAttemptNumberFromValue(value = null) {
-    if(!value || typeof value !== 'object') return 0
-    return Number.parseInt(value.attemptNumber ?? value.attempt?.number, 10) || 0
-}
-
-function makeCoordinatorInFlightMutationKey(prefix = '', itemKey = '', item = null, extra = '') {
-    return [
-        `${prefix || 'coordinator-mutation'}`.trim(),
-        normalizeQuoraProfileUrl(itemKey) || `${itemKey || ''}`.trim(),
-        getAttemptIdFromValue(item),
-        getAttemptNumberFromValue(item),
-        `${extra || ''}`.trim()
-    ].join('|')
-}
-
-function getNextAttemptNumberFromValue(value = null) {
-    return Math.max(1, getAttemptNumberFromValue(value) + 1)
-}
-
-function isAttemptTrackedCoordinatorItem(item = null) {
-    return !!item &&
-        isCoordinatorQueueAuthoritativeItem(item) &&
-        (getAttemptIdFromValue(item) || getAttemptNumberFromValue(item))
-}
-
-function isNewerTerminalProgressForCoordinatorItem(item = null, record = null) {
-    if(!item || !record) return false
-    if(isTerminalCoordinatorStatus(item?.status)) return false
-    if(!isTerminalProfileNukeRecord(record)) return false
-
-    const expectedAttemptNumber = getAttemptNumberFromValue(item)
-    const incomingAttemptNumber = getAttemptNumberFromValue(record)
-    if(!expectedAttemptNumber || !incomingAttemptNumber) return false
-    if(incomingAttemptNumber <= expectedAttemptNumber) return false
-
-    const itemRunId = `${item?.runId || ''}`.trim()
-    const recordRunId = `${record?.runId || ''}`.trim()
-    if(itemRunId && recordRunId && itemRunId !== recordRunId) return false
-
-    const itemQueuedAt = Number.parseInt(item?.queuedAt || item?.createdAt || 0, 10) || 0
-    const recordTerminalAt = Number.parseInt(record?.terminalAt || record?.tabClosedAt || record?.updatedAt || 0, 10) || 0
-    if(itemQueuedAt && recordTerminalAt && recordTerminalAt < itemQueuedAt) return false
-
-    return true
-}
-
-function normalizeCoordinatorMap(value) {
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
-}
-
-function normalizeCoordinatorEvents(value) {
-    if(Array.isArray(value)) return value.filter(event => event && typeof event === 'object')
-    return Object.values(normalizeCoordinatorMap(value)).filter(event => event && typeof event === 'object')
-}
-
-function hasMismatchedCoordinatorAttempt(item = null, record = null) {
-    if(!isTerminalCoordinatorStatus(item?.status) && isTerminalProfileNukeRecord(record)) {
-        const itemQueuedAt = Number.parseInt(item?.queuedAt || item?.createdAt || 0, 10) || 0
-        const recordTerminalAt = Number.parseInt(record?.terminalAt || record?.tabClosedAt || record?.updatedAt || 0, 10) || 0
-        if(itemQueuedAt && recordTerminalAt && recordTerminalAt < itemQueuedAt) return true
-    }
-
-    if(isNewerTerminalProgressForCoordinatorItem(item, record)) return false
-
-    const expectedAttemptId = getAttemptIdFromValue(item)
-    const incomingAttemptId = getAttemptIdFromValue(record)
-    if(expectedAttemptId && incomingAttemptId && expectedAttemptId !== incomingAttemptId) return true
-
-    const expectedAttemptNumber = getAttemptNumberFromValue(item)
-    const incomingAttemptNumber = getAttemptNumberFromValue(record)
-    if(expectedAttemptNumber && incomingAttemptNumber && expectedAttemptNumber !== incomingAttemptNumber) return true
-
-    if(!isTerminalCoordinatorStatus(item?.status) && isAttemptTrackedCoordinatorItem(item)) {
-        if(expectedAttemptId && !incomingAttemptId) return true
-        if(expectedAttemptNumber && !incomingAttemptNumber) return true
-    }
-
-    return !isTerminalCoordinatorStatus(item?.status) &&
-        !!expectedAttemptId &&
-        !incomingAttemptId &&
-        isTerminalProfileNukeRecord(record)
-}
-
-function getResolvedDestinationConflict(existingResolvedItem = null, sourceItem = null) {
-    if(!existingResolvedItem) return ''
-    if(existingResolvedItem.status === 'succeeded') return ''
-    if(isTerminalCoordinatorStatus(existingResolvedItem.status)) return 'terminal-resolved-coordinator-item'
-    if(hasMismatchedCoordinatorAttempt(existingResolvedItem, sourceItem)) return 'resolved-coordinator-conflict'
-    return ''
-}
-
-function makeStaleAttemptDiagnosticEvent(details = {}) {
-    return {
-        id: makeId('event'),
-        runId: details.runId || '',
-        itemId: details.itemId || '',
-        type: 'stale-attempt',
-        message: details.message || 'Ignored stale worker attempt',
-        at: Date.now(),
-        details: {
-            profileHref: details.profileHref || '',
-            incomingAttemptId: details.incomingAttemptId || '',
-            expectedAttemptId: details.expectedAttemptId || '',
-            senderTabId: details.senderTabId || null
-        }
-    }
-}
-
-function recordCoordinatorDiagnosticEvent(type = 'coordinator-diagnostic', message = '', details = {}) {
-    const event = {
-        id: makeId('event'),
-        runId: details?.runId || '',
-        itemId: details?.itemId || '',
-        type: `${type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic',
-        message: `${message || 'Coordinator diagnostic event'}`.slice(0, 500),
-        at: Date.now(),
-        details: details && typeof details === 'object'
-            ? cloneCoordinatorAuthorityValue(details)
-            : {}
-    }
-    incrementQueueWakeupMetric('diagnosticEvent.received')
-    pendingCoordinatorDiagnosticEvents.push(event)
-    if(pendingCoordinatorDiagnosticEvents.length > MAX_COORDINATOR_EVENTS) {
-        pendingCoordinatorDiagnosticEvents = pendingCoordinatorDiagnosticEvents.slice(-MAX_COORDINATOR_EVENTS)
-        incrementQueueWakeupMetric('diagnosticEvent.pendingPruned')
-    }
-    recordQueueWakeupMetricMax('diagnosticEvent.pendingMax', pendingCoordinatorDiagnosticEvents.length)
-    if(storageUpdateState.getDepth() <= 0 && coordinatorDiagnosticBatchDepth <= 0) {
-        incrementQueueWakeupMetric('diagnosticEvent.persistDeferred')
-    }
-    return true
-}
-
-function drainPendingCoordinatorDiagnosticEvents() {
-    const events = pendingCoordinatorDiagnosticEvents
-    pendingCoordinatorDiagnosticEvents = []
-    return events
-}
-
 async function flushPendingCoordinatorDiagnosticEvents() {
     return runQueueWakeupMetricPhase('flushDiagnosticEvents', async () => {
         const pending = drainPendingCoordinatorDiagnosticEvents()
@@ -4163,17 +3913,6 @@ async function flushPendingCoordinatorDiagnosticEvents() {
         incrementQueueWakeupMetric('diagnosticEvent.storageWrites')
         return true
     })
-}
-
-function shouldFlushPendingCoordinatorDiagnosticEventsNow(context = {}) {
-    const durableActiveRows = Number.parseInt(context?.durableActiveRows, 10) || 0
-    const durableQueuedRows = Number.parseInt(context?.durableQueuedRows, 10) || 0
-    const runtimeCounts = queueRuntime.getRuntimeCounts()
-    return runtimeCounts.activeQueuedTabs <= 0 &&
-        runtimeCounts.queuedTabActions <= 0 &&
-        runtimeCounts.pendingTabActions <= 0 &&
-        durableActiveRows <= 0 &&
-        durableQueuedRows <= 0
 }
 
 async function flushPendingCoordinatorDiagnosticEventsIfIdle(context = {}) {
