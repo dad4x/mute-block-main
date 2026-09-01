@@ -3609,11 +3609,12 @@ test('visible worker-window queued tabs can proceed locally without a durable ac
 
 test('resume reattaches live active tabs after service worker restart', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const reducerSource = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
     const resumeBody = extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
     const applyBody = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
     const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
-    const activeAtHelperBody = extractFunction(source, 'function getCoordinatorProgressRecordActiveAt(record = {})')
-    const projectedBody = extractFunction(source, 'function buildProjectedCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})')
+    const activeAtHelperBody = extractFunction(reducerSource, 'function getCoordinatorProgressRecordActiveAt(record = {})')
+    const projectedBody = extractFunction(reducerSource, 'function buildProjectedCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})')
 
     assert.match(resumeBody, /runCoordinatorExecutorApplyPhase\(options\.reason \|\| 'resume'/)
     assert.doesNotMatch(resumeBody, /getLiveProfileTabsByHref\(\)/)
@@ -4091,26 +4092,27 @@ test('modal contributor nuking uses small tab batches', () => {
 
 test('same-attempt terminal success reconciles stale failed coordinator rows', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const reducerSource = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
     const authorityTransitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const progressReconcileBody = extractFunction(source, 'function applyProgressRecordCoordinatorReconcileActionLocked(state = {}, operation = {})')
     const preferBody = extractFunction(
-        source,
+        reducerSource,
         'function shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item = null, record = null, mapped = null)'
     )
     const restoreBody = extractFunction(
-        source,
+        reducerSource,
         'function shouldRestoreTerminalProgressFromCoordinatorItem(item = null, record = null)'
     )
     const progressTransitionBody = extractFunction(
-        source,
+        reducerSource,
         'function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})'
     )
     const projectedBody = extractFunction(
-        source,
+        reducerSource,
         'function buildProjectedCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})'
     )
     const mergeBody = extractFunction(
-        source,
+        reducerSource,
         'function mergeReducedCoordinatorProgressItem(item = {}, reducedItem = {}, projectedItem = {}, mapped = {}, record = {}, options = {})'
     )
     const directBody = extractFunction(
