@@ -124,6 +124,9 @@ const {
 const {
     createQueuedTabRuntimeStatus
 } = require('./swQueuedTabRuntimeStatus')
+const {
+    createBrowserSessionRuntime
+} = require('./swBrowserSessionRuntime')
 const queueRuntime = createQueueRuntimeState()
 const schedulerClock = {
     setTimeout,
@@ -412,8 +415,8 @@ const queueWakeupMetricsShape = createQueueWakeupMetricsShape({
         scheduleCoordinatorQueueResume,
         scheduleQueueWakeupMetricsFlush,
         loadQueueWakeupMetrics,
-        normalizeObjectNumberMap,
-        normalizeQueueWakeupPhaseMap,
+        normalizeObjectNumberMap: (...args) => normalizeObjectNumberMap(...args),
+        normalizeQueueWakeupPhaseMap: (...args) => normalizeQueueWakeupPhaseMap(...args),
         getActiveStorageContext,
         getDurablyActiveQueuedTabCount: (...args) => getDurablyActiveQueuedTabCount(...args),
         getQueueRuntimeCounts: queueRuntime.getRuntimeCounts
@@ -480,115 +483,82 @@ const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     setTimeoutFn: setTimeout,
     now: () => Date.now()
 })
-let browserSessionStartupResetChecked = false
-let browserSessionStartupResetPromise = null
 let quoraRuntimeActivated = false
 let queueLoadThrottle = makeEmptyQueueLoadThrottle()
 
-function getBrowserSessionStorageArea() {
-    if(browser.storage?.session) return browser.storage.session
+// ensureBrowserSessionStartupMetricsReset and startQueueWakeupMetricsBackedStartupWork
+// are defined below (after the browserSessionRuntime destructure) rather than moved into
+// swBrowserSessionRuntime.js with the rest of this slice's functions. Both are nominally
+// "sync" (no `async` keyword) but their bodies construct/chain Promises, and
+// startQueueWakeupMetricsBackedStartupWork's chain calls into
+// swQueueWakeupMetricsShape.js's ensureQueueWakeupMetricsLoaded -- itself a plain
+// `require()`'d module (not vm-sandboxed) sharing the same realm swBrowserSessionRuntime.js
+// would live in. Under the test harness's vm sandbox, sw.js runs in its own realm and every
+// `require()`'d module (this one included) shares a *different*, common realm; a promise
+// chain that stays inside sw.js crosses that boundary once when it calls into another
+// module, but a chain that starts inside another module and calls into a second module
+// doesn't cross at all (both already share the common realm). Moving these two functions
+// here collapsed that one real crossing (and its one extra microtask tick versus a same-
+// realm chain) to zero, which silently changed which of two `pump.changed.clearedStaleFillPromise`
+// increments landed in which queue-wakeup-metrics epoch in
+// test/swSynthetic.test.js's "stale queued fill promise is cleared so durable queue can
+// resume" test (confirmed via a minimal repro instrumenting the epoch id at each
+// increment). Production is unaffected (webpack bundles every module into one realm), but
+// the test-visible reordering was real, so these two -- and the
+// browserSessionStartupResetChecked/browserSessionStartupResetPromise state only they
+// touch -- stay here. See swBrowserSessionRuntime.js's file-header comment for the full
+// writeup. markQuoraRuntimeActivated (moved) calls startQueueWakeupMetricsBackedStartupWork
+// as a plain `void`-discarded function call, not a `.then()` link, so threading it through
+// as a handler dep doesn't reintroduce the issue.
+let browserSessionStartupResetChecked = false
+let browserSessionStartupResetPromise = null
 
-    const chromeSession = globalThis.chrome?.storage?.session || null
-    if(!chromeSession) return null
-
-    return {
-        get(defaults = {}) {
-            return new Promise((resolve, reject) => {
-                chromeSession.get(defaults, result => {
-                    const error = globalThis.chrome?.runtime?.lastError
-                    if(error) {
-                        reject(new Error(error.message || `${error}`))
-                        return
-                    }
-                    resolve(result || {})
-                })
-            })
-        },
-        set(payload = {}) {
-            return new Promise((resolve, reject) => {
-                chromeSession.set(payload, () => {
-                    const error = globalThis.chrome?.runtime?.lastError
-                    if(error) {
-                        reject(new Error(error.message || `${error}`))
-                        return
-                    }
-                    resolve()
-                })
-            })
-        }
+const browserSessionRuntime = createBrowserSessionRuntime({
+    browser,
+    now: () => Date.now(),
+    setTimeoutFn: setTimeout,
+    constants: {
+        BROWSER_SESSION_MARKER_KEY,
+        QUORA_RUNTIME_ACTIVATED_SESSION_KEY,
+        COORDINATOR_RESUME_ALARM_NAME,
+        COORDINATOR_RECONCILE_ALARM_NAME,
+        PERSISTENT_FAILED_RETRY_ALARM_NAME
+    },
+    handlers: {
+        promiseWithTimeout,
+        makeId,
+        getExtensionVersion,
+        pushQueueWakeupJournalEntry,
+        incrementQueueWakeupMetric,
+        scheduleQueuedWorkerActionSurfaceCleanup,
+        resumeStoredWorkAfterQuoraActivation,
+        startQueueWakeupMetricsBackedStartupWork,
+        isQuoraRuntimeUrl,
+        rearmStoredWorkAfterExtensionReload,
+        rearmStoredWorkAfterServiceWorkerReload
+    },
+    state: {
+        getQuoraRuntimeActivated: () => quoraRuntimeActivated,
+        setQuoraRuntimeActivated: value => { quoraRuntimeActivated = value },
+        getCoordinatorResumePromise: () => coordinatorResumePromise,
+        getQueuedTabFillPromise: () => queuedTabFillPromise
     }
-}
-
-function hasBrowserSessionStorage() {
-    const area = getBrowserSessionStorageArea()
-    return !!(
-        area &&
-        typeof area.get === 'function' &&
-        typeof area.set === 'function'
-    )
-}
-
-function rememberBrowserSessionMarker(reason = 'observed') {
-    const area = getBrowserSessionStorageArea()
-    if(!area || typeof area.set !== 'function') return Promise.resolve(false)
-
-    return promiseWithTimeout(
-        area.set({
-            [BROWSER_SESSION_MARKER_KEY]: {
-                id: makeId('browser-session'),
-                reason,
-                extensionVersion: getExtensionVersion(),
-                observedAt: Date.now()
-            }
-        }),
-        1000,
-        'browser session marker write'
-    )
-        .then(() => true)
-        .catch(() => false)
-}
-
-function rememberQuoraRuntimeActivation(reason = 'quora-observed') {
-    const area = getBrowserSessionStorageArea()
-    if(!area || typeof area.set !== 'function') return Promise.resolve(false)
-
-    return promiseWithTimeout(
-        area.set({
-            [QUORA_RUNTIME_ACTIVATED_SESSION_KEY]: {
-                active: true,
-                reason,
-                extensionVersion: getExtensionVersion(),
-                observedAt: Date.now()
-            }
-        }),
-        1000,
-        'quora runtime activation marker write'
-    )
-        .then(() => true)
-        .catch(() => false)
-}
-
-function forgetQuoraRuntimeActivation(reason = 'quora-runtime-reset') {
-    quoraRuntimeActivated = false
-    const area = getBrowserSessionStorageArea()
-    if(!area || typeof area.set !== 'function') return Promise.resolve(false)
-
-    return promiseWithTimeout(
-        area.set({[QUORA_RUNTIME_ACTIVATED_SESSION_KEY]: null}),
-        1000,
-        'quora runtime activation marker clear'
-    )
-        .then(() => {
-            pushQueueWakeupJournalEntry({
-                kind: 'state-change',
-                name: 'quora-runtime-activation-cleared',
-                reason,
-                result: 'state-changed'
-            })
-            return true
-        })
-        .catch(() => false)
-}
+})
+const {
+    getBrowserSessionStorageArea,
+    hasBrowserSessionStorage,
+    rememberBrowserSessionMarker,
+    rememberQuoraRuntimeActivation,
+    forgetQuoraRuntimeActivation,
+    clearSchedulerAlarms,
+    markQuoraRuntimeActivated,
+    markQuoraRuntimeActivatedFromRequest,
+    makeQuoraRuntimeNotActivatedResult,
+    scheduleStoredWorkRearmAfterExtensionReload,
+    scheduleStoredWorkRearmAfterServiceWorkerReload,
+    normalizeObjectNumberMap,
+    normalizeQueueWakeupPhaseMap
+} = browserSessionRuntime
 
 function ensureBrowserSessionStartupMetricsReset() {
     if(browserSessionStartupResetChecked) return Promise.resolve(false)
@@ -623,24 +593,25 @@ function ensureBrowserSessionStartupMetricsReset() {
     return browserSessionStartupResetPromise
 }
 
-function clearSchedulerAlarms(reason = 'clear-scheduler-alarms') {
-    if(!browser.alarms?.clear) return Promise.resolve(false)
+function startQueueWakeupMetricsBackedStartupWork(options = {}) {
+    if(!quoraRuntimeActivated && options.force !== true) {
+        return Promise.resolve(null)
+    }
 
-    return Promise.all([
-        browser.alarms.clear(COORDINATOR_RESUME_ALARM_NAME).catch(() => false),
-        browser.alarms.clear(COORDINATOR_RECONCILE_ALARM_NAME).catch(() => false),
-        browser.alarms.clear(PERSISTENT_FAILED_RETRY_ALARM_NAME).catch(() => false)
-    ])
-        .then(results => {
-            pushQueueWakeupJournalEntry({
-                kind: 'state-change',
-                name: 'scheduler-alarms-cleared',
-                reason,
-                result: results.some(Boolean) ? 'state-changed' : 'no-op'
-            })
-            return results.some(Boolean)
+    const metricsReady = ensureBrowserSessionStartupMetricsReset()
+        .then(() => ensureQueueWakeupMetricsLoaded())
+        .then(async () => {
+            if(pendingQueueWakeupMetricsReset) {
+                const reset = pendingQueueWakeupMetricsReset
+                pendingQueueWakeupMetricsReset = null
+                resetQueueWakeupMetricsEpoch(reset.reason || 'browser-startup')
+                await flushQueueWakeupMetrics()
+            }
         })
-        .catch(() => false)
+        .catch(() => null)
+
+    void metricsReady
+    return metricsReady
 }
 
 async function resetQueueWakeupMetricsEpochAfterLoad(reason = 'manual', options = {}) {
@@ -671,51 +642,6 @@ async function resetQueueWakeupMetricsEpochAfterLoad(reason = 'manual', options 
         epochId: getQueueWakeupMetricEpoch().epochId,
         startedAt: getQueueWakeupMetricEpoch().startedAt
     }
-}
-
-function startQueueWakeupMetricsBackedStartupWork(options = {}) {
-    if(!quoraRuntimeActivated && options.force !== true) {
-        return Promise.resolve(null)
-    }
-
-    const metricsReady = ensureBrowserSessionStartupMetricsReset()
-        .then(() => ensureQueueWakeupMetricsLoaded())
-        .then(async () => {
-            if(pendingQueueWakeupMetricsReset) {
-                const reset = pendingQueueWakeupMetricsReset
-                pendingQueueWakeupMetricsReset = null
-                resetQueueWakeupMetricsEpoch(reset.reason || 'browser-startup')
-                await flushQueueWakeupMetrics()
-            }
-        })
-        .catch(() => null)
-
-    void metricsReady
-    return metricsReady
-}
-
-function markQuoraRuntimeActivated(reason = 'quora-observed') {
-    if(quoraRuntimeActivated) {
-        void rememberQuoraRuntimeActivation(reason)
-        return false
-    }
-    quoraRuntimeActivated = true
-    incrementQueueWakeupMetric('runtime.quoraActivated')
-    pushQueueWakeupJournalEntry({
-        kind: 'state-change',
-        name: 'quora-runtime-activated',
-        reason,
-        result: 'state-changed'
-    })
-    void rememberQuoraRuntimeActivation(reason)
-    void startQueueWakeupMetricsBackedStartupWork({force: true})
-    scheduleQueuedWorkerActionSurfaceCleanup('quora-runtime-activated-idle', 5000)
-    if(coordinatorResumePromise || queuedTabFillPromise) {
-        incrementQueueWakeupMetric('runtime.quoraActivatedResumeAlreadyActive')
-        return true
-    }
-    void resumeStoredWorkAfterQuoraActivation(reason).catch(() => null)
-    return true
 }
 
 async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
@@ -771,38 +697,6 @@ async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
         forceDurableQueueReload: false,
         skipPauseStorageCheck: wasPaused
     })
-}
-
-function markQuoraRuntimeActivatedFromRequest(request = {}, sender = {}, reason = 'message') {
-    const urls = [
-        sender?.tab?.url,
-        request?.url,
-        request?.profileHref,
-        request?.href,
-        request?.targetProfileHref,
-        request?.requestedUrl,
-        request?.sourcePageUrl,
-        request?.source?.pageUrl,
-        request?.run?.sourcePageUrl
-    ]
-    if(Array.isArray(request?.items)) {
-        for(const item of request.items) {
-            urls.push(
-                item?.url,
-                item?.href,
-                item?.profileHref,
-                item?.targetProfileHref,
-                item?.requestedUrl,
-                item?.sourcePageUrl
-            )
-        }
-    }
-    if(Array.isArray(request?.urls)) urls.push(...request.urls)
-    if(Array.isArray(request?.profileHrefs)) urls.push(...request.profileHrefs)
-    if(urls.some(isQuoraRuntimeUrl)) {
-        return markQuoraRuntimeActivated(reason)
-    }
-    return false
 }
 
 async function observeExistingQuoraRuntimeTabs(reason = 'existing-quora-tab') {
@@ -869,19 +763,6 @@ async function ensureQuoraRuntimeActivatedForScheduler(reason = 'scheduler') {
     if(quoraRuntimeActivated) return true
     if(await restoreQuoraRuntimeActivationFromSession(reason)) return true
     return observeExistingQuoraRuntimeTabs(reason)
-}
-
-function makeQuoraRuntimeNotActivatedResult(reason = 'quora-runtime-not-activated') {
-    return {
-        recovered: false,
-        reason,
-        requiresQuoraVisit: true,
-        alarmCreated: false,
-        fallbackScheduled: false,
-        resumeScheduled: false,
-        reconcileScheduled: false,
-        scheduledOnly: true
-    }
 }
 
 async function isCoordinatorAutoStartOnBrowserStartEnabled() {
@@ -998,46 +879,6 @@ async function rearmStoredWorkAfterServiceWorkerReload(reason = 'service-worker-
     if(!stored?.[BROWSER_SESSION_MARKER_KEY]) return {rearmed: false, reason: 'new-browser-session'}
 
     return rearmStoredWorkAfterExtensionReload(reason)
-}
-
-function scheduleStoredWorkRearmAfterExtensionReload(reason = 'extension-updated') {
-    setTimeout(() => {
-        void rearmStoredWorkAfterExtensionReload(reason).catch(() => null)
-    }, 1000)
-}
-
-function scheduleStoredWorkRearmAfterServiceWorkerReload(reason = 'service-worker-reload') {
-    setTimeout(() => {
-        void rearmStoredWorkAfterServiceWorkerReload(reason).catch(() => null)
-    }, 1000)
-}
-
-function normalizeObjectNumberMap(value = null) {
-    const result = {}
-    for(const [key, raw] of Object.entries(value && typeof value === 'object' ? value : {})) {
-        const normalizedKey = `${key || ''}`.trim()
-        const number = Number(raw) || 0
-        if(normalizedKey && Number.isFinite(number)) result[normalizedKey] = number
-    }
-    return result
-}
-
-function normalizeQueueWakeupPhaseMap(value = null) {
-    const result = {}
-    for(const [key, raw] of Object.entries(value && typeof value === 'object' ? value : {})) {
-        const name = `${key || ''}`.trim()
-        if(!name || !raw || typeof raw !== 'object') continue
-        const count = Math.max(0, Number.parseInt(raw.count, 10) || 0)
-        const totalMs = Math.max(0, Number(raw.totalMs) || 0)
-        result[name] = {
-            count,
-            totalMs,
-            lastMs: Math.max(0, Number(raw.lastMs) || 0),
-            maxMs: Math.max(0, Number(raw.maxMs) || 0),
-            lastAt: Number.parseInt(raw.lastAt, 10) || 0
-        }
-    }
-    return result
 }
 
 const storageMetrics = createStorageMetrics({

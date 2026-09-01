@@ -958,6 +958,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     const worker = readRepoFile('shared/js/sw.js')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const wakeupMetricsShape = readRepoFile('shared/js/swQueueWakeupMetricsShape.js')
+    const browserSessionRuntime = readRepoFile('shared/js/swBrowserSessionRuntime.js')
     const html = readRepoFile('shared/coordinator.html')
 
     assert.match(helper, /chrome\.storage\.local\.get\(\{\[key\]: null\}, storage =>/)
@@ -986,10 +987,10 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(worker, /MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL/)
     assert.match(worker, /refreshQueueWakeupMetricsViewForDashboard/)
     assert.match(worker, /BROWSER_SESSION_MARKER_KEY/)
-    assert.match(worker, /globalThis\.chrome\?\.storage\?\.session/)
+    assert.match(browserSessionRuntime, /globalThis\.chrome\?\.storage\?\.session/)
     assert.match(worker, /ensureBrowserSessionStartupMetricsReset/)
     assert.match(worker, /clearSchedulerAlarms/)
-    assert.match(worker, /scheduler-alarms-cleared/)
+    assert.match(browserSessionRuntime, /scheduler-alarms-cleared/)
     assert.match(worker, /pendingQueueWakeupMetricsReset = \{[\s\S]*reason: 'browser-startup'/)
     assert.match(bootstrap, /resetQueueWakeupMetricsEpochAfterLoad\(resetReason, \{deferUntilQuora: true\}\)/)
     assert.match(bootstrap, /reset-queue-wakeup-metrics/)
@@ -2691,7 +2692,8 @@ test('queue WAL migrated operations do not include current repair operation alia
 
 test('dashboard ready is display-only until explicit resume', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const activateBody = extractFunction(source, 'function markQuoraRuntimeActivated(reason = \'quora-observed\')')
+    const browserSessionRuntime = readRepoFile('shared/js/swBrowserSessionRuntime.js')
+    const activateBody = extractFunction(browserSessionRuntime, 'function markQuoraRuntimeActivated(reason = \'quora-observed\')')
     const restoreBody = extractFunction(source, 'async function restoreCoordinatorPageForStoredWorkOnce(options = {})')
     const reconcileTickBody = extractFunction(source, 'async function runScheduledCoordinatorReconcileTick(reason = \'coordinator-reconcile-tick\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
@@ -3737,9 +3739,10 @@ test('preferences expose browser-start auto-start as opt-in', () => {
 
 test('extension update rearms stored work from compact queue view', () => {
     const worker = readRepoFile('shared/js/sw.js')
+    const browserSessionRuntime = readRepoFile('shared/js/swBrowserSessionRuntime.js')
     const rearmBody = extractFunction(worker, 'async function rearmStoredWorkAfterExtensionReload(reason = \'extension-updated\')')
     const serviceWorkerReloadBody = extractFunction(worker, 'async function rearmStoredWorkAfterServiceWorkerReload(reason = \'service-worker-reload\')')
-    const scheduleBody = extractFunction(worker, 'function scheduleStoredWorkRearmAfterExtensionReload(reason = \'extension-updated\')')
+    const scheduleBody = extractFunction(browserSessionRuntime, 'function scheduleStoredWorkRearmAfterExtensionReload(reason = \'extension-updated\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const installedIndex = bootstrap.indexOf('browser.runtime.onInstalled.addListener')
     const installedBody = bootstrap.slice(installedIndex, bootstrap.indexOf('if(!hasBrowserSessionStorage())', installedIndex))
@@ -3756,7 +3759,7 @@ test('extension update rearms stored work from compact queue view', () => {
     assert.match(serviceWorkerReloadBody, /hasBrowserSessionStorage\(\)/)
     assert.match(serviceWorkerReloadBody, /area\.get\(\{\[BROWSER_SESSION_MARKER_KEY\]: null\}\)/)
     assert.match(serviceWorkerReloadBody, /rearmStoredWorkAfterExtensionReload\(reason\)/)
-    assert.match(scheduleBody, /setTimeout\(\(\) => \{[\s\S]*rearmStoredWorkAfterExtensionReload\(reason\)/)
+    assert.match(scheduleBody, /setTimeoutFn\(\(\) => \{[\s\S]*rearmStoredWorkAfterExtensionReload\(reason\)/)
     assert.match(installedBody, /scheduleStoredWorkRearmAfterExtensionReload\(resetReason\)/)
     assert.match(worker, /scheduleStoredWorkRearmAfterServiceWorkerReload\(\)/)
 })
@@ -4743,10 +4746,11 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
 
 test('stored-work recovery is queue-authority-only and uses alarm-backed earliest scheduling', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const browserSessionRuntime = readRepoFile('shared/js/swBrowserSessionRuntime.js')
     const scheduleBody = extractFunction(source, 'function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_MS, options = {})')
     const recoverBody = extractFunction(source, 'async function recoverStoredCoordinatorWorkOnce(reason = \'stored-work-recovery\', options = {})')
     const restoreBody = extractFunction(source, 'async function restoreCoordinatorPageForStoredWorkOnce(options = {})')
-    const clearBody = extractFunction(source, 'function clearSchedulerAlarms(reason = \'clear-scheduler-alarms\')')
+    const clearBody = extractFunction(browserSessionRuntime, 'function clearSchedulerAlarms(reason = \'clear-scheduler-alarms\')')
     const suppressBody = extractFunction(source, 'function suppressStaleCoordinatorReconcileAlarm(dueAt = 0)')
     const alarmNameBody = extractFunction(source, 'function isCoordinatorReconcileAlarmName(name = \'\')')
     const noWorkIndex = recoverBody.indexOf("reason: 'no-stored-work'")
