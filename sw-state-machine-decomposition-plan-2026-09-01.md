@@ -98,6 +98,22 @@ used elsewhere in this codebase -- even when the function has no `await` in
 it at all. Check every moved function for this, not just the ones that look
 timing-related by name.
 
+## Promise-chain realm-crossing note (applies even to non-`async` slices)
+
+Slice 7 found a second, sharper version of the same realm issue: a function
+with no `async` keyword that builds or returns a `.then()`/Promise chain
+reaching into another already-extracted module is still exposed to
+realm-crossing effects, and moving it can *remove* a crossing as easily as
+add one -- both directions can silently break test ordering with zero
+logic difference in the moved code. Full writeup in architecture.md's
+"Module Extraction And The Test Harness Realm Boundary" section (see the
+"Refinement found during ... Slice 7" paragraph). Before claiming or moving
+any function, grep its body for `.then(`, `Promise.`, and calls into
+already-extracted modules -- not just `async`/`await` -- and treat a hit
+the same way an `async` function is treated: move it only after confirming
+`npm run test:parallel` stays green, and if it breaks, don't assume it's
+safe just because the function itself has no `await`.
+
 ## Sizing note: external-ref count is a cost signal, not a risk signal
 
 Some candidates have very high external-reference counts --

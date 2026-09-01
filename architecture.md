@@ -281,14 +281,40 @@ async functions, and the module awaiting vm-injected async capabilities --
 each crossing doubling its tick cost and compounding across the reconcile
 tick's concurrent work.
 
-Constraint for future extraction: a purely synchronous helper can be pulled
-into its own module freely; it carries no realm penalty either way. An
-`async` function that participates in ordering within a reconcile tick
-(queue WAL persist, checkpoint switching, and similar) must stay in `sw.js`
-unless the test harness's module-loading strategy changes to put an
-extracted module in the same realm as the vm-sandboxed source. Do not
-re-attempt an async WAL/coordinator-authority extraction without addressing
-that first.
+Constraint for future extraction: a function with no `async` keyword and no
+Promise chain in its body can be pulled into its own module freely; it
+carries no realm penalty either way. An `async` function that participates
+in ordering within a reconcile tick (queue WAL persist, checkpoint
+switching, and similar) must stay in `sw.js` unless the test harness's
+module-loading strategy changes to put an extracted module in the same
+realm as the vm-sandboxed source. Do not re-attempt an async
+WAL/coordinator-authority extraction without addressing that first.
+
+Refinement found during the sw.js decomposition plan's Slice 7 (2026-09):
+"no `async` keyword" is not the same test as "no realm penalty." A
+non-`async` function that *builds or returns a Promise chain reaching into
+another already-extracted module* is still exposed to this, and the effect
+can run in either direction, not just add cost. All `require()`'d modules
+share one common realm with each other, separate from `sw.js`'s vm-sandboxed
+realm. A chain that starts in `sw.js` and calls into one extracted module
+crosses the boundary once. Moving the *starting* function into a second
+extracted module changes nothing about where the call lands (still the same
+target module, still one shared non-`sw.js` realm) but removes the crossing
+that used to happen leaving `sw.js` -- collapsing a chain that used to cost
+one crossing down to zero. That changed which of two same-named metric
+increments landed in which epoch, deterministically breaking a test, with
+no logic difference in the moved code. Confirmed by instrumenting and
+comparing tick counts before and after the move.
+
+Practical effect: before extracting a function -- sync-declared or not --
+check whether it constructs, chains, or returns a `Promise`/`.then()` that
+reaches into any other `require()`'d module (including one being extracted
+in the same slice). If it does, treat it with the same caution as an
+`async` function: moving it can shift realm-crossing parity in the
+extracted direction, the removed direction, or both at once if the slice
+also touches the target module, and any of those can silently reorder
+concurrent reconcile-tick work. Grep for `.then(`, `Promise.`, and calls
+into already-extracted modules, not just the `async` keyword.
 
 ## Dashboard And UI Surfaces
 
