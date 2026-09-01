@@ -1188,7 +1188,7 @@ test('dashboard secs per block excludes already-blocked terminal successes', () 
 })
 
 test('service worker secs per block aggregate can use progress milestone timing', () => {
-    const source = readRepoFile('shared/js/sw.js')
+    const source = readRepoFile('shared/js/swCoordinatorQueueView.js')
     const successBody = extractFunction(source, 'function isCoordinatorActualBlockSuccess(item = {})')
     const activeStartBody = extractFunction(source, 'function getCoordinatorActualBlockActiveStartTime(item = {})')
     assert.match(successBody, /=== 'already-blocked'\) return false/)
@@ -1515,7 +1515,8 @@ test('content-page scoped state projections are maintained beside full queue and
     const projectionBody = extractFunction(sw, 'function addContentPageStateProjectionPayload(payload = {})')
     const queueIndexBody = extractFunction(sw, 'function buildCoordinatorContentQueueIndex(queue = {}, now = Date.now())')
     const sourceIndexBody = extractFunction(sw, 'function buildCoordinatorContentSourceIndexShardPayload(queue = {}, now = Date.now())')
-    const queueViewBody = extractFunction(sw, 'function buildCoordinatorQueueView(queue = {}, now = Date.now(), options = {})')
+    const coordinatorQueueViewSource = readRepoFile('shared/js/swCoordinatorQueueView.js')
+    const queueViewBody = extractFunction(coordinatorQueueViewSource, 'function buildCoordinatorQueueView(queue = {}, nowMs = now(), options = {})')
     const progressViewBody = extractFunction(sw, 'function buildProfileNukeProgressView(progress = {}, now = Date.now())')
     const progressSummaryBody = extractFunction(sw, 'function summarizeProfileNukeProgressRecord(profileHref = \'\', record = {})')
     const progressFilterBody = extractFunction(sw, 'function filterProfileNukeProgressForContentProjection(progress = {}, queue = {})')
@@ -1869,7 +1870,7 @@ test('scheduler hygiene coalesces reconcile and backs off no-op reconcile ticks'
 test('storage change queue trigger uses compact queue view instead of full queue blob', () => {
     const source = readRepoFile('shared/js/sw.js')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
-    const queueViewBody = extractFunction(source, 'function buildCoordinatorQueueView(queue = {}, now = Date.now(), options = {})')
+    const queueViewBody = extractFunction(readRepoFile('shared/js/swCoordinatorQueueView.js'), 'function buildCoordinatorQueueView(queue = {}, nowMs = now(), options = {})')
     const triggerBody = extractFunction(source, 'function hasStoredCoordinatorWorkInQueueView(view = null)')
 
     assert.match(source, /function hasStoredCoordinatorWorkInQueueView/)
