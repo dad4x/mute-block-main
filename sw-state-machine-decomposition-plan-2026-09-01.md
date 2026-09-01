@@ -2,11 +2,12 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-10 are landed and independently verified
+Status: in progress. Slices 1-13 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
-`3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`); Slices 11-13 are
-defined below and queued to execute next. `shared/js/sw.js` is down to
-35,997 lines from 38,953 at the start of this effort. See
+`3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
+`73a4dbe`). `shared/js/sw.js` is down to 35,253 lines from 38,953 at the
+start of this effort, with 15 new modules landed. Slices 14-17 are defined
+below and queued to execute next. See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
@@ -376,18 +377,79 @@ retryable-status rulebook the whole reconcile loop consults.
 `makeCoordinatorQueueAccountingComparison`, `summarizeCoordinatorQueueWalAccounting`,
 `makeCoordinatorCurrentWorkAccounting`.
 
-### Slices 14+ -- everything else, via the chaining protocol
+### Slice 14 -- Coordinator content-queue-index sharding (~12 functions, lines 4125-4260)
 
-The remaining sync functions past Slice 13 (predicates, builders, getters,
-and "other"-bucket functions not yet claimed) are not hand-enumerated here
--- that would make this document large and guaranteed to drift out of date
-as each slice shifts every line number after it. Use the claim workflow
-above: regenerate the inventory, find the next line-adjacent same-bucket
-(or obviously-related-across-bucket) cluster, size it, propose it, execute
-it. A large coordinator-content-queue-index-sharding cluster starts around
-line 4869 (as of the Slice 10 snapshot) and is worth claiming next, followed
-by whatever else the inventory shows once Slices 11-13 land and shift
-everything after them.
+`summarizeCoordinatorContentQueueItem`, `shouldIncludeCoordinatorItemInContentQueueIndex`,
+`buildCoordinatorContentQueueIndex`, `hashCoordinatorContentIndexKey`,
+`getCoordinatorContentSourceIndexShardKeyByIndex`, `getCoordinatorContentSourceIndexShardKey`,
+`getCoordinatorContentSourceKeysFromValues`, `getCoordinatorContentSourceKeysForItem`,
+`getCoordinatorContentSourceKeysForRequest`, `getCoordinatorContentSourceIndexShardDefaults`,
+`buildCoordinatorContentSourceIndexShardPayload`, `buildCoordinatorQueueDerivedProjectionPayload`,
+`makeCoordinatorQueueWalCheckpoint`.
+
+### Slice 15 -- Profile-nuke-progress sharding/view (~21 functions, lines 4276-4755)
+
+`summarizeProfileNukeProgressRecord`, `buildProfileNukeProgressView`,
+`getProfileNukeProgressShardIndex`, `getProfileNukeProgressShardKeyByIndex`,
+`getProfileNukeProgressShardKey`, `getProfileNukeProgressShardDefaults`,
+`getAllProfileNukeProgressShardDefaults`, `getProfileNukeProgressProjectionDefaults`,
+`buildProfileNukeProgressShardPayload`, `hasNonterminalCoordinatorAuthorityForProfile`,
+`filterProfileNukeProgressForContentProjection`, `updateProfileNukeProgressViewRecords`,
+`updateProfileNukeProgressShardRecord`, `removeProfileNukeProgressViewRecords`,
+`removeProfileNukeProgressShardRecords`, `scheduleTerminalProgressProjectionFlush`,
+`saveTerminalProgressProjectionAfterAuthority`, `normalizeProfileNukeProgressShardRecords`,
+`getProfileNukeProgressRecordsFromProjection`, `addContentPageStateProjectionPayload`.
+
+Caution: `scheduleTerminalProgressProjectionFlush` and
+`saveTerminalProgressProjectionAfterAuthority` sound schedule/save-shaped
+despite being non-`async` -- check them against the Promise-chain
+realm-crossing note before moving.
+
+### Slice 16 -- Coordinator-runs materialization (~9 functions, lines 4816-4979)
+
+`makeEmptyCoordinatorMilestones`, `shouldResetCoordinatorFailureFromProgress`,
+`getCoordinatorRunStatus`, `materializeCoordinatorRunsPausedStateFromControl`,
+`getCoordinatorRunTargetHrefs`, `isCoordinatorRunWorkKeyForProfileHref`,
+`getCoordinatorRunItems`, `getCoordinatorRunIdsForHref`, `recomputeCoordinatorRuns`.
+
+### Slice 17 -- Progress-to-coordinator-item transition/terminal-record reducer (~14 functions, lines 4979-5391)
+
+`getCoordinatorTransitionTerminalAt`, `getCoordinatorProgressReducerEventType`,
+`getCoordinatorProgressRecordActiveAt`, `getCoordinatorProgressActiveAt`,
+`buildProjectedCoordinatorItemFromProgress`, `mergeReducedCoordinatorProgressItem`,
+`transitionCoordinatorItemFromProgress`, `shouldPersistCoordinatorRowEventQueueItemChange`,
+`makeTerminalProgressRecordFromCoordinatorItem`, `hasTerminalProgressDriftFromCoordinatorItem`,
+`shouldRestoreTerminalProgressFromCoordinatorItem`,
+`shouldPreferSuccessfulProgressOverTerminalCoordinatorItem`,
+`isRedundantTerminalProgressForCoordinatorItem`,
+`promoteTerminalCoordinatorItemFromSuccessfulProgress`. This is the
+progress-to-coordinator-item reducer itself -- real state-machine core,
+high value.
+
+### Boundary after Slice 17: the createCoordinatorAuthority-adjacent region
+
+Immediately after Slice 17's range (from `cloneCoordinatorAuthorityValue` at
+line ~5391 onward) is `createCoordinatorAuthority` and its tightly-coupled
+value builders (`makeCoordinatorAuthorityProjection`,
+`normalizeCoordinatorAuthorityStateInput`, `makeCoordinatorAuthorityApplyResult`,
+and similar, 16-62 external refs each), plus the queue-WAL and shadow-WAL
+async cluster already documented as staying in `sw.js` (see
+`swCoordinatorQueueWal.js`'s "kept in sw.js" list and architecture.md's
+realm-boundary section). None of that is in scope for Part 1 -- it's
+pervasively used and/or async-orchestration-adjacent. Slices past 17 should
+resume on the other side of that region (roughly line 8148 onward as of the
+Slice 13 snapshot -- `getChangedProfileProgressRecords`,
+`getCoordinatorProgressRecordForItem`, and beyond), not inside it.
+
+### Slices 18+ -- everything else, via the chaining protocol
+
+The remaining sync functions past Slice 17 (skipping the excluded
+createCoordinatorAuthority-adjacent region above) are not hand-enumerated
+here -- that would make this document large and guaranteed to drift out of
+date as each slice shifts every line number after it. Use the claim
+workflow above: regenerate the inventory, find the next line-adjacent
+same-bucket (or obviously-related-across-bucket) cluster past the excluded
+region, size it, propose it, execute it.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
