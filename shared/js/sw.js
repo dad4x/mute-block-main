@@ -172,6 +172,9 @@ const {
 const {
     createCoordinatorReconcileLockedMaterialization
 } = require('./swCoordinatorReconcileLockedMaterialization')
+const {
+    createCoordinatorTerminalSettlement
+} = require('./swCoordinatorTerminalSettlement')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -691,6 +694,62 @@ const {
     getResolvedDestinationConflict
 } = coordinatorAttemptIdentity
 
+// coordinatorTerminalSettlement is constructed here, well before this
+// cluster's old source-text location, rather than in place like most prior
+// slices (decomposition Slice 20): coordinatorProgressRules (immediately
+// below) and coordinatorReconcileLockedMaterialization (much further down,
+// Slice 19) both eagerly reference getCoordinatorItemSettlementKey in their
+// own construction-call object literals. A hoisted `function` declaration
+// is visible throughout its enclosing scope; a `const` destructured from a
+// factory call is in the temporal dead zone until that line executes -- so
+// this module must construct before both of those eager references, which
+// means before coordinatorProgressRules, the earlier of the two. Two of
+// this module's own deps -- getStoredSpaceFeedRecordUrls and
+// getPendingSpaceFeedJobKeyPatch, from coordinatorJobEnvelope (Slice 11,
+// constructed well after this point) -- aren't available as bare consts yet,
+// so each is threaded through as a thunk, matching the
+// queuedTabOpenUrlCommitHelpers/getTabObservedUrls precedent above.
+// isTerminalCoordinatorStatus, getNormalizedProfileHrefList, and
+// normalizeQuoraProfileUrl are already bare names in scope by this point.
+// getCoordinatorItemHref, closeTerminalOwnedProfileTabs,
+// scheduleCoordinatorReconcile, removeProfileHrefFromPendingSpaceRecords,
+// and normalizeStoredProfileNukeProgress are all still plain hoisted
+// function declarations far below and work from any point in this scope
+// either way. See swCoordinatorTerminalSettlement.js's header comment for
+// the clock/setTimeout-dep and Promise-chain realm-crossing scrutiny notes
+// (scheduleTerminalOwnedProfileTabCleanup's setTimeout callback chains
+// `.catch()` onto a Promise from closeTerminalOwnedProfileTabs, still in
+// sw.js).
+const coordinatorTerminalSettlement = createCoordinatorTerminalSettlement({
+    now: () => Date.now(),
+    setTimeoutFn: setTimeout,
+    constants: {
+        SPACE_PENDING_NUKED_POSTS_KEY,
+        SPACE_NUKED_POSTS_KEY,
+        defaults
+    },
+    handlers: {
+        isTerminalCoordinatorStatus,
+        getNormalizedProfileHrefList,
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        getStoredSpaceFeedRecordUrls: (...args) => getStoredSpaceFeedRecordUrls(...args),
+        getPendingSpaceFeedJobKeyPatch: (...args) => getPendingSpaceFeedJobKeyPatch(...args),
+        getPrunedNukedPosts,
+        removeProfileHrefFromPendingSpaceRecords,
+        normalizeStoredProfileNukeProgress,
+        closeTerminalOwnedProfileTabs,
+        scheduleCoordinatorReconcile
+    }
+})
+const {
+    getCoordinatorItemSettlementKey,
+    getCoordinatorTerminalItemEntries,
+    settleConfirmedSpaceFeedProfiles,
+    scheduleTerminalOwnedProfileTabCleanup,
+    buildTerminalCoordinatorSettlementDerivedPayload
+} = coordinatorTerminalSettlement
+
 // coordinatorProgressRules is constructed here, right after
 // coordinatorAttemptIdentity's destructure, rather than in place like prior
 // slices: getActiveCoordinatorDirectProgressRuntimeRejectionReason needs
@@ -701,9 +760,9 @@ const {
 // (from queueWakeupMetricsShape, constructed well above this point) and
 // coordinatorStatusRules's own exports are also already available here.
 // getCoordinatorItemHref, normalizeCoordinatorActionLease,
-// wasQueuedRuntimeTabRemoved, setQueuedTabMetadata, getQueuedTabMetadata,
-// and getCoordinatorItemSettlementKey (all still plain hoisted function
-// declarations far below, untouched by this slice) are threaded through as
+// wasQueuedRuntimeTabRemoved, setQueuedTabMetadata, and getQueuedTabMetadata
+// (all still plain hoisted function declarations far below, untouched by
+// this slice) are threaded through as
 // handler deps and work from any point in this scope either way.
 // mapProgressToCoordinatorState and getJobMilestonesFromProgress come
 // straight from the jobState.js require at the top of the file.
@@ -7958,94 +8017,11 @@ async function reconcileCoordinatorStorageLocked(options = {}) {
     }
 }
 
-function getCoordinatorItemSettlementKey(item = {}) {
-    if(!isTerminalCoordinatorStatus(item?.status)) return ''
-
-    return [
-        item.status || '',
-        item.outcome || '',
-        item.error || '',
-        item.terminalAt || item.updatedAt || 0
-    ].join('|')
-}
-
-function getCoordinatorTerminalItemEntries(queue = {}, profileHrefs = []) {
-    const hrefFilter = new Set(getNormalizedProfileHrefList(profileHrefs || []))
-    const entries = []
-
-    for(const [itemKey, item] of Object.entries(queue || {})) {
-        if(!item || typeof item !== 'object') continue
-        if(!isTerminalCoordinatorStatus(item.status)) continue
-
-        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        if(!href) continue
-        if(hrefFilter.size && !hrefFilter.has(href)) continue
-
-        entries.push({itemKey, href, item})
-    }
-
-    return entries
-}
-
-function settleConfirmedSpaceFeedProfiles(currentPending = {}, currentNuked = {}, confirmedHrefs = new Set()) {
-    const nextPending = {
-        ...currentPending
-    }
-    const nextNuked = {
-        ...currentNuked
-    }
-    let changedPending = false
-    let changedNuked = false
-
-    for(const [postKey, record] of Object.entries(currentPending || {})) {
-        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        const nextRemainingUrls = remainingUrls.filter(url => !confirmedHrefs.has(url))
-
-        if(nextRemainingUrls.length === remainingUrls.length) continue
-
-        changedPending = true
-
-        if(nextRemainingUrls.length > 0) {
-            nextPending[postKey] = {
-                ...record,
-                remainingUrls: nextRemainingUrls,
-                ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
-                updatedAt: Date.now()
-            }
-            continue
-        }
-
-        delete nextPending[postKey]
-        nextNuked[postKey] = {
-            ...(currentNuked?.[postKey] || {}),
-            postKey,
-            postUrl: record.postUrl || currentNuked?.[postKey]?.postUrl || '',
-            spaceKey: record.spaceKey || currentNuked?.[postKey]?.spaceKey || '',
-            spaceUrl: record.spaceUrl || currentNuked?.[postKey]?.spaceUrl || '',
-            urls: getNormalizedProfileHrefList(allUrls.length ? allUrls : remainingUrls),
-            updatedAt: Date.now()
-        }
-        changedNuked = true
-    }
-
-    return {nextPending, nextNuked, changedPending, changedNuked}
-}
-
 async function settleTerminalCoordinatorItems(options = {}) {
     return enqueueSpaceFeedStorageUpdate(() => settleTerminalCoordinatorItemsLocked(options), {
         reason: options.storageReason || 'settle-terminal-coordinator-items',
         timeoutMs: options.timeoutMs || QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
-}
-
-function scheduleTerminalOwnedProfileTabCleanup(profileHrefs = [], delayMs = 0) {
-    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
-    setTimeout(() => {
-        void closeTerminalOwnedProfileTabs(hrefs).catch(() => {
-            scheduleCoordinatorReconcile(1000, {reason: 'terminal-tab-cleanup-failed'})
-        })
-    }, Math.max(0, Number.parseInt(delayMs, 10) || 0))
 }
 
 async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {}) {
@@ -8083,40 +8059,6 @@ async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {}) {
             }
         }
     })
-}
-
-function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {}) {
-    const confirmedHrefs = options.confirmedHrefs || new Set()
-    const clearedHrefs = options.clearedHrefs || new Set()
-    const progressChanged = options.progressChanged === true
-    const progressRecords = progressChanged
-        ? normalizeStoredProfileNukeProgress(options.progressRecords || {})
-        : {}
-    const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-    const currentNuked = stored?.[SPACE_NUKED_POSTS_KEY] || {}
-    const confirmedResult = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
-    const clearedResult = removeProfileHrefFromPendingSpaceRecords(confirmedResult.nextPending, Array.from(clearedHrefs))
-    const prunedNuked = confirmedResult.changedNuked
-        ? getPrunedNukedPosts(confirmedResult.nextNuked, {
-            retentionDays: defaults.nukedPostRetentionDays,
-            maxEntries: defaults.maxRememberedNukedPosts
-        })
-        : confirmedResult.nextNuked
-    const payload = {}
-
-    if(confirmedResult.changedPending || clearedResult.changed) {
-        payload[SPACE_PENDING_NUKED_POSTS_KEY] = clearedResult.records
-    }
-    if(confirmedResult.changedNuked) {
-        payload[SPACE_NUKED_POSTS_KEY] = prunedNuked
-    }
-
-    return {
-        payload,
-        progressRecords,
-        pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || null,
-        nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || null
-    }
 }
 
 async function settleTerminalCoordinatorItemsLocked(options = {}) {

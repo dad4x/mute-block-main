@@ -4604,7 +4604,7 @@ test('terminal settlement separates authority stamping from derived materializat
     const source = readRepoFile('shared/js/sw.js')
     const settlementBody = extractFunction(source, 'async function settleTerminalCoordinatorItemsLocked(options = {})')
     const authorityBody = extractFunction(source, 'async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {})')
-    const derivedBody = extractFunction(source, 'function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {})')
+    const derivedBody = extractFunction(readRepoFile('shared/js/swCoordinatorTerminalSettlement.js'), 'function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {})')
 
     assert.match(settlementBody, /applyTerminalCoordinatorAuthoritySettlementLocked\(\{[\s\S]*settlementKey,[\s\S]*sourceSettlementOutcome,[\s\S]*currentAuthorityState/)
     assert.match(settlementBody, /buildTerminalCoordinatorSettlementDerivedPayload\(stored, progress, \{[\s\S]*confirmedHrefs,[\s\S]*clearedHrefs,[\s\S]*progressChanged/)
