@@ -2346,7 +2346,7 @@ test('space-feed enqueue rollback clears resolver-only pending rows', () => {
 
 test('unresolved resolver rows clear resolver-pending source records', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const helperBody = extractFunction(source, 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
+    const helperBody = extractFunction(readRepoFile('shared/js/swResolvedProfilePendingSpaceRecords.js'), 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
     const unresolvedBody = extractFunction(source, 'async function markQueuedProfileResolutionUnresolved(request = {}, sender = {})')
     const settlementHelperBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
     const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
