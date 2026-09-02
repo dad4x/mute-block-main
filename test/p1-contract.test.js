@@ -3942,7 +3942,11 @@ test('source-post resolver waits for durable remap before navigating', () => {
 
 test('resolved profile handoff remaps queued tab metadata and pending action', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const remapBody = extractFunction(source, 'function remapQueuedTabToResolvedProfile(tabId, item = {}, resolvedHref = \'\', requestedUrl = \'\')')
+    const queuedTabMetadataAndActionLeaseSource = readRepoFile('shared/js/swQueuedTabMetadataAndActionLease.js')
+    const remapBody = extractFunction(
+        queuedTabMetadataAndActionLeaseSource,
+        'function remapQueuedTabToResolvedProfile(tabId, item = {}, resolvedHref = \'\', requestedUrl = \'\')'
+    )
     const resolveBody = extractFunction(source, 'async function resolveQueuedProfileTarget(request = {}, sender = {})')
     const resolveMutationBody = extractFunction(source, 'async function mutateCoordinatorQueuedProfileTargetResolve(operation = {})')
 
