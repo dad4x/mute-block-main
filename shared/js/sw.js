@@ -217,6 +217,9 @@ const {
 const {
     createQueuedWorkerActionSurfaceState
 } = require('./swQueuedWorkerActionSurfaceState')
+const {
+    createQueuedTabContentScriptEnsureScheduling
+} = require('./swQueuedTabContentScriptEnsureScheduling')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -23425,9 +23428,33 @@ async function createQueuedExecutorBrowserTab(options = {}, label = 'queued exec
     }, options, label)
 }
 
-function queuedTabMatchesExpectedOpenUrl(tab = null, expectedUrl = '') {
-    return queuedTabOpenUrlCommitHelpers.queuedTabMatchesExpectedOpenUrl(tab, expectedUrl)
-}
+// queuedTabContentScriptEnsureScheduling is constructed here, in place,
+// since none of its five exports are eagerly referenced before this point
+// in the file (decomposition Slice 32, part 3 of 3) -- see
+// swQueuedTabContentScriptEnsureScheduling.js's header comment for the
+// Promise-chain-scrutiny writeup.
+const queuedTabContentScriptEnsureScheduling = createQueuedTabContentScriptEnsureScheduling({
+    setTimeoutFn: setTimeout,
+    constants: {
+        QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS
+    },
+    handlers: {
+        browser,
+        queueRuntime,
+        normalizeTabId,
+        isDurablyActiveQueuedTab,
+        isQueuedWorkerActionSurfaceTab,
+        queuedTabOpenUrlCommitHelpers,
+        ensureQueuedTabContentScript
+    }
+})
+const {
+    queuedTabMatchesExpectedOpenUrl,
+    hasScriptingInjectionApi,
+    getExpectedContentScriptVersion,
+    scheduleQueuedTabContentScriptEnsure,
+    shouldDeferQueuedWorkerContentScriptEnsureRelease
+} = queuedTabContentScriptEnsureScheduling
 
 async function waitForQueuedTabExpectedOpenUrl(tabId = null, expectedUrl = '', timeoutMs = QUEUED_TAB_OPEN_URL_COMMIT_TIMEOUT_MS) {
     return queuedTabOpenUrlCommitHelpers.waitForQueuedTabExpectedOpenUrl(tabId, expectedUrl, timeoutMs)
@@ -23468,10 +23495,6 @@ async function restoreBackgroundQueuedTabFocus(tab = null, previousActiveTab = n
         }, {senderTabId: tab.id}).catch(() => {})
     }
     return !!restored
-}
-
-function hasScriptingInjectionApi() {
-    return !!browser.scripting?.executeScript
 }
 
 async function activateConfirmationElementInPageWorld(request = {}, sender = {}) {
@@ -23589,24 +23612,6 @@ async function activateConfirmationElementInPageWorld(request = {}, sender = {})
 
     const result = Array.isArray(results) ? results[0]?.result || null : null
     return result || {clicked: false, reason: 'no-result'}
-}
-
-function getExpectedContentScriptVersion() {
-    try {
-        return `${browser.runtime?.getManifest?.()?.version || ''}`.trim()
-    }
-    catch {
-        return ''
-    }
-}
-
-function scheduleQueuedTabContentScriptEnsure(tabId, reason = '', delayMs = QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) return
-
-    setTimeout(() => {
-        void ensureQueuedTabContentScript(normalizedTabId, reason)
-    }, Math.max(0, Number.parseInt(delayMs, 10) || 0))
 }
 
 async function probeQueuedTabContentScript(tabId) {
@@ -23799,16 +23804,6 @@ async function ensureQueuedTabContentScript(tabId, reason = '') {
         }
         return {ensured: false, reason: 'inject-failed', error: error?.message || `${error || ''}`}
     }
-}
-
-function shouldDeferQueuedWorkerContentScriptEnsureRelease(tabId, metadata = null) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId || !metadata) return false
-    if(!queueRuntime.hasActiveQueuedTab(normalizedTabId) || !queueRuntime.hasPendingTabAction(normalizedTabId)) return false
-    if(!isDurablyActiveQueuedTab(normalizedTabId)) return false
-    if(metadata.closeRequestedAt || metadata.closeReason) return false
-    if(metadata.noForegroundFallback !== true) return false
-    return isQueuedWorkerActionSurfaceTab({id: normalizedTabId, windowId: metadata.actionSurfaceWindowId}, metadata)
 }
 
 async function handleQueuedTabContentScriptEnsureResult(tabId, ensureResult = null, sourceReason = '') {
