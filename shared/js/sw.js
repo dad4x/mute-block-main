@@ -235,6 +235,9 @@ const {
 const {
     createQueuedTabDetachSurfaceDedupe
 } = require('./swQueuedTabDetachSurfaceDedupe')
+const {
+    createQueuedTabActionAuthorityMatching
+} = require('./swQueuedTabActionAuthorityMatching')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -2249,6 +2252,77 @@ const {
     queuedRuntimeActionHasActiveOrPendingSurface,
     getQueuedRuntimeActionAuthorityEntry
 } = queuedRuntimeActionMatching
+
+// queuedTabActionAuthorityMatching is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 37):
+// activationGuardRuntime (immediately below) eagerly references bare
+// `getQueuedTabActionKey` and `shouldDropQueuedActionForCurrentAuthority`
+// in its own construction-call `handlers` object literal, and
+// queuedForegroundLeaseRuntime (further below) eagerly references bare
+// `coordinatorItemMatchesQueuedTabRuntime` the same way. A `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes, so this module must construct before the earlier of
+// those two references, i.e. right here, before activationGuardRuntime.
+// getFreshQueuedTabRuntimeStartupAnchor isn't available as a bare const
+// yet at this point (the tab-status/reclaim/budget predicate module
+// constructs later), so it's threaded through as a thunk that defers name
+// resolution to call time. coordinatorAuthority isn't assigned until much
+// later, so it's threaded through as a `getCoordinatorAuthority` state
+// thunk, matching existing precedent, and queuedTabConcurrency (a
+// module-level `let` mutated elsewhere in sw.js) as a
+// `getQueuedTabConcurrency` state thunk the same way. See
+// swQueuedTabActionAuthorityMatching.js's header comment for the full
+// writeup, including why scheduleQueuedTabReleaseReconcile -- textually
+// interleaved in this cluster's old source-text position -- is left
+// resident instead.
+const queuedTabActionAuthorityMatching = createQueuedTabActionAuthorityMatching({
+    constants: {
+        UNBLOCK_UNMUTE_ACTION_KIND,
+        QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS
+    },
+    handlers: {
+        queueRuntime,
+        getQueuedTabMetadata,
+        normalizeQuoraProfileUrl,
+        makeProfileResolutionQueueKey,
+        hasMismatchedCoordinatorAttempt,
+        getCoordinatorActionKindForRequestedAction,
+        shouldApplyProgressToCoordinatorItem,
+        getQueueLoadThrottle,
+        isTerminalProfileNukeRecord,
+        isRetryableTerminalProfileNukeRecord,
+        getCoordinatorActionKindForProgress,
+        getAttemptIdFromValue,
+        findCoordinatorQueueEntryForHref,
+        getCoordinatorActionKindForItem,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey,
+        getAttemptNumberFromValue,
+        normalizeTabId,
+        incrementQueueWakeupMetric,
+        getFreshQueuedTabRuntimeStartupAnchor: (...args) => getFreshQueuedTabRuntimeStartupAnchor(...args)
+    },
+    state: {
+        getCoordinatorAuthority: () => coordinatorAuthority,
+        getQueuedTabConcurrency: () => queuedTabConcurrency,
+        now: () => Date.now()
+    }
+})
+const {
+    recordResidentAuthorityStaleQueuedActions,
+    getQueuedTabActionKey,
+    shouldDropQueuedActionForCurrentAuthority,
+    getQueuedTabActionKind,
+    hasQueuedUnblockUnmuteWork,
+    getEffectiveQueuedTabConcurrency,
+    shouldDropQueuedActionForTerminalProgress,
+    queuedTabActionMatchesProfile,
+    queuedTabMetadataMatchesProfile,
+    getQueuedTabUnconfirmedActiveTransitionAt,
+    coordinatorItemMatchesQueuedTabRuntime,
+    coordinatorQueuedItemMatchesRuntimeCandidate,
+    shouldCheckQueuedTabRuntimeAuthority
+} = queuedTabActionAuthorityMatching
 
 const activationGuardRuntime = createActivationGuardRuntime({
     now: () => Date.now(),
@@ -25792,185 +25866,6 @@ async function pruneQueuedTabActions(ownerTabId = null, options = {}) {
     }
 }
 
-function recordResidentAuthorityStaleQueuedActions(ownerTabId = null) {
-    if(!queueRuntime.getActivationIntentCount()) return 0
-
-    const currentAuthorityState = coordinatorAuthority.current()
-    const queue = currentAuthorityState?.queue || null
-    if(!queue) return 0
-
-    let counted = 0
-    for(const action of queueRuntime.listActivationIntents()) {
-        const actionOwnerTabId = action?.ownerTabId || null
-        if(ownerTabId && actionOwnerTabId !== ownerTabId) continue
-        if(action?.authorityStaleDropCounted === true) continue
-        if(!shouldDropQueuedActionForCurrentAuthority(action, queue)) continue
-
-        action.authorityStaleDropCounted = true
-        counted += 1
-    }
-    if(counted > 0) {
-        incrementQueueWakeupMetric('pump.changed.droppedAuthorityStaleQueuedAction', counted)
-    }
-    return counted
-}
-
-function getQueuedTabActionKey(ownerTabId, href, tabAction = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
-    const subjectKey = normalizedHref || `${href || ''}`.trim()
-    if(!ownerTabId || !subjectKey) return ''
-    return `${ownerTabId}|${subjectKey}|${tabAction || ''}`
-}
-
-function shouldDropQueuedActionForCurrentAuthority(action = null, queue = {}) {
-    if(!action || !queue || typeof queue !== 'object') return false
-
-    const normalizedHref = normalizeQuoraProfileUrl(action.profileHref || action.url || '')
-    const coordinatorKey = action.coordinatorKey || (normalizedHref
-        ? normalizedHref
-        : makeProfileResolutionQueueKey(action.requestedUrl || action.url || ''))
-    const item = normalizedHref
-        ? queue[normalizedHref] || queue[coordinatorKey] || null
-        : queue[coordinatorKey] || null
-
-    if(!item) return true
-    if(`${item.status || ''}`.trim() !== 'queued') return true
-    if(hasMismatchedCoordinatorAttempt(item, action)) return true
-
-    const actionKind = getCoordinatorActionKindForRequestedAction(action.actionKind || action.tabAction || '')
-    if(actionKind && !shouldApplyProgressToCoordinatorItem(item, {actionKind})) return true
-
-    return false
-}
-
-function getQueuedTabActionKind(action = null) {
-    return getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || '')
-}
-
-function hasQueuedUnblockUnmuteWork() {
-    if(queueRuntime.someActivationIntent(action => getQueuedTabActionKind(action) === UNBLOCK_UNMUTE_ACTION_KIND)) return true
-
-    for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
-        const metadata = getQueuedTabMetadata(tabId)
-        if(getQueuedTabActionKind(metadata) === UNBLOCK_UNMUTE_ACTION_KIND) return true
-    }
-
-    return false
-}
-
-function getEffectiveQueuedTabConcurrency() {
-    if(getQueueLoadThrottle().active) return 1
-    return hasQueuedUnblockUnmuteWork()
-        ? 1
-        : queuedTabConcurrency
-}
-
-function shouldDropQueuedActionForTerminalProgress(action = null, record = null, queue = {}) {
-    if(!action || !record) return false
-    if(!isTerminalProfileNukeRecord(record) || isRetryableTerminalProfileNukeRecord(record)) return false
-
-    const normalizedHref = normalizeQuoraProfileUrl(action.url || '')
-    if(!normalizedHref) return false
-
-    const actionKind = getQueuedTabActionKind(action)
-    const recordActionKind = getCoordinatorActionKindForProgress(record)
-    if(actionKind !== recordActionKind) return false
-
-    const actionAttemptId = getAttemptIdFromValue(action)
-    const recordAttemptId = getAttemptIdFromValue(record)
-    if(actionAttemptId && recordAttemptId && actionAttemptId !== recordAttemptId) return false
-
-    const queueEntry = findCoordinatorQueueEntryForHref(queue, normalizedHref)
-    const item = queueEntry?.item || null
-    if(!item) return !actionAttemptId || (!!recordAttemptId && actionAttemptId === recordAttemptId)
-    if(`${item.status || ''}`.trim() === 'queued') return false
-    if(getCoordinatorActionKindForItem(item) !== recordActionKind) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) return false
-
-    const itemAttemptId = getAttemptIdFromValue(item)
-    if(itemAttemptId && recordAttemptId !== itemAttemptId) return false
-
-    return true
-}
-
-function queuedTabActionMatchesProfile(action = null, href = '', actionKind = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
-    if(!action || !normalizedHref) return false
-    if(normalizeQuoraProfileUrl(action.url || '') !== normalizedHref) return false
-    if(!actionKind) return true
-
-    const candidateActionKind = getCoordinatorActionKindForRequestedAction(action.actionKind || action.tabAction || '')
-    return candidateActionKind === actionKind
-}
-
-function queuedTabMetadataMatchesProfile(metadata = null, href = '', actionKind = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
-    if(!metadata || !normalizedHref) return false
-    if(normalizeQuoraProfileUrl(metadata.profileHref || '') !== normalizedHref) return false
-    if(!actionKind) return true
-
-    const candidateActionKind = getCoordinatorActionKindForRequestedAction(metadata.actionKind || metadata.tabAction || '')
-    return candidateActionKind === actionKind
-}
-
-function getQueuedTabUnconfirmedActiveTransitionAt(metadata = null) {
-    return Math.max(
-        Number.parseInt(metadata?.activeTransitionPendingAt, 10) || 0,
-        Number.parseInt(metadata?.activeTransitionUnconfirmedAt, 10) || 0
-    )
-}
-
-function coordinatorItemMatchesQueuedTabRuntime(item = null, itemKey = '', metadata = null, tabId = null) {
-    if(!item || !metadata) return false
-    const expectedHref = normalizeQuoraProfileUrl(metadata.profileHref || '')
-    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    if(expectedHref && itemHref && expectedHref !== itemHref) return false
-
-    const expectedCoordinatorKey = `${metadata.coordinatorKey || ''}`.trim()
-    if(expectedCoordinatorKey &&
-        itemKey &&
-        itemKey !== expectedCoordinatorKey &&
-        getCoordinatorItemQueueKey(item, itemKey) !== expectedCoordinatorKey) {
-        return false
-    }
-
-    const expectedAttemptId = getAttemptIdFromValue(metadata)
-    const expectedAttemptNumber = getAttemptNumberFromValue(metadata)
-    if(expectedAttemptId && getAttemptIdFromValue(item) !== expectedAttemptId) return false
-    if(expectedAttemptNumber && getAttemptNumberFromValue(item) !== expectedAttemptNumber) return false
-
-    const activeTabId = normalizeTabId(item.tabId || item.activeTabId)
-    return !!activeTabId && activeTabId === normalizeTabId(tabId)
-}
-
-function coordinatorQueuedItemMatchesRuntimeCandidate(item = null, itemKey = '', metadata = null, action = null) {
-    if(!item || `${item.status || ''}`.trim() !== 'queued') return false
-    const expectedHref = normalizeQuoraProfileUrl(
-        metadata?.profileHref ||
-        action?.profileHref ||
-        action?.targetUrl ||
-        action?.requestedUrl ||
-        ''
-    )
-    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    if(expectedHref && itemHref && expectedHref !== itemHref) return false
-
-    const expectedCoordinatorKey = `${metadata?.coordinatorKey || action?.coordinatorKey || ''}`.trim()
-    if(expectedCoordinatorKey &&
-        itemKey &&
-        itemKey !== expectedCoordinatorKey &&
-        getCoordinatorItemQueueKey(item, itemKey) !== expectedCoordinatorKey) {
-        return false
-    }
-
-    const expectedAttemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(action)
-    const expectedAttemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(action)
-    if(expectedAttemptId && getAttemptIdFromValue(item) !== expectedAttemptId) return false
-    if(expectedAttemptNumber && getAttemptNumberFromValue(item) !== expectedAttemptNumber) return false
-
-    return true
-}
-
 async function releaseUnconfirmedQueuedTabIfAuthorityNotActive(tabId = null, metadata = null, options = {}) {
     const unconfirmedAt = getQueuedTabUnconfirmedActiveTransitionAt(metadata)
     if(!unconfirmedAt || Date.now() - unconfirmedAt < QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS) return false
@@ -26041,13 +25936,6 @@ async function releaseUnconfirmedQueuedTabIfAuthorityNotActive(tabId = null, met
         }
     })
     return true
-}
-
-function shouldCheckQueuedTabRuntimeAuthority(metadata = null, now = Date.now()) {
-    if(metadata?.closeRequestedAt || metadata?.closeReason) return false
-
-    const startupAnchor = getFreshQueuedTabRuntimeStartupAnchor(metadata)
-    return !startupAnchor || now - startupAnchor >= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS
 }
 
 async function releaseQueuedTabRuntimeIfAuthorityNotActive(tabId = null, metadata = null, options = {}) {
