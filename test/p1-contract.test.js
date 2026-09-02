@@ -3711,8 +3711,11 @@ test('terminal queued progress schedules stored work continuation', () => {
     const releaseFollowUpBody = extractFunction(readRepoFile('shared/js/swQueuedTabActionBookkeeping.js'), 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
     const postStorageContinuationBody = extractFunction(source, 'function flushPostStorageQueuedWorkContinuation()')
-    const terminalContinuationBody = extractFunction(source, 'function scheduleTerminalProgressContinuation(reason = \'terminal-progress-continuation\')')
-    const terminalSettlementBody = extractFunction(source, 'function scheduleTerminalProgressSettlement(profileHrefs = [])')
+    // scheduleTerminalProgressContinuation/scheduleTerminalProgressSettlement
+    // moved to swCoordinatorJobMilestoneBookkeeping.js in decomposition Slice 40.
+    const milestoneBookkeepingSource = readRepoFile('shared/js/swCoordinatorJobMilestoneBookkeeping.js')
+    const terminalContinuationBody = extractFunction(milestoneBookkeepingSource, 'function scheduleTerminalProgressContinuation(reason = \'terminal-progress-continuation\')')
+    const terminalSettlementBody = extractFunction(milestoneBookkeepingSource, 'function scheduleTerminalProgressSettlement(profileHrefs = [])')
     const progressRecordsBody = extractFunction(source, 'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})')
     const progressBody = extractFunction(source, 'async function recordJobProgressFromRequest(request = {}, sender = {}, options = {})')
     const authorityContinuationIndex = progressRecordsBody.indexOf("scheduleTerminalProgressContinuation('terminal-progress-authority-continuation')")

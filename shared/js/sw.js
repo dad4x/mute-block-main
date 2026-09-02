@@ -247,6 +247,9 @@ const {
 const {
     createCoordinatorRowEventMetrics
 } = require('./swCoordinatorRowEventMetrics')
+const {
+    createCoordinatorJobMilestoneBookkeeping
+} = require('./swCoordinatorJobMilestoneBookkeeping')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -490,7 +493,6 @@ const blockedLiveTabTerminalizationPromises = new Map()
 const staleRetryAdvancePromises = new Map()
 const staleRetryAdvancedWakeKeys = new Map()
 const coordinatorProgressInFlightPromises = new Map()
-const terminalProgressSettlementPromises = new Map()
 const terminalProgressProjectionSaveBatches = new Map()
 let terminalProgressProjectionSaveScheduled = false
 let terminalProgressProjectionSavePromise = null
@@ -28418,65 +28420,72 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
     }
 }
 
-function scheduleTerminalProgressSettlement(profileHrefs = []) {
-    const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
-    if(!hrefs.length) return false
-
-    const pendingHrefs = hrefs.filter(href => !terminalProgressSettlementPromises.has(href))
-    if(!pendingHrefs.length) {
-        incrementQueueWakeupMetric('terminalProgress.settlementCoalescedInFlight')
-        return true
+// coordinatorJobMilestoneBookkeeping (decomposition Slice 40) is constructed
+// in place at this cluster's old source-text position -- no already-
+// extracted module eagerly references any of its nine exports at its own
+// construction call site in sw.js, so there's no early-construction
+// ordering constraint here (unlike swCoordinatorTerminalSettlement.js).
+// coordinatorJobMilestoneFlushTimeout, coordinatorJobMilestoneFlushPromise,
+// and coordinatorJobMilestonePendingRecords stay as `let` bindings here
+// (below) because flushCoordinatorJobMilestones and
+// recordDeferredCoordinatorJobMilestone, both still resident `async`
+// functions further down, also read and/or reassign them -- threaded
+// through as deps.state accessors instead of moving the bindings
+// themselves. See swCoordinatorJobMilestoneBookkeeping.js's header comment
+// for the full Promise-chain realm-crossing scrutiny on the three
+// schedule-shaped exports.
+const coordinatorJobMilestoneBookkeeping = createCoordinatorJobMilestoneBookkeeping({
+    now: () => Date.now(),
+    setTimeoutFn: setTimeout,
+    constants: {
+        TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS,
+        COORDINATOR_JOB_MILESTONE_FLUSH_MS
+    },
+    handlers: {
+        getNormalizedProfileHrefList,
+        incrementQueueWakeupMetric,
+        applyCoordinatorQueueMachineEvent,
+        scheduleCoordinatorQueueResume,
+        runCoordinatorQueueExecutorFastPath,
+        recordCoordinatorDiagnosticEvent,
+        scheduleQueuedWorkContinuation,
+        closeTerminalOwnedProfileTabs,
+        normalizeQuoraProfileUrl,
+        getHydratedCoordinatorAuthorityState,
+        getCoordinatorQueueWorkCounts,
+        progressPatchHasExplicitStatus,
+        getCoordinatorStatusFromProgress,
+        isTerminalCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        hasMismatchedCoordinatorAttempt,
+        shouldApplyExplicitProgressStatusToCoordinatorItem,
+        transitionCoordinatorItemFromProgress,
+        shouldPersistCoordinatorRowEventQueueItemChange,
+        normalizeTabId,
+        setQueuedTabMetadata,
+        flushCoordinatorJobMilestones
+    },
+    state: {
+        getQueueRuntimeCounts: () => queueRuntime.getRuntimeCounts(),
+        getCoordinatorJobMilestoneFlushTimeout: () => coordinatorJobMilestoneFlushTimeout,
+        setCoordinatorJobMilestoneFlushTimeout: value => {
+            coordinatorJobMilestoneFlushTimeout = value
+        },
+        getCoordinatorJobMilestoneFlushPromise: () => coordinatorJobMilestoneFlushPromise,
+        getCoordinatorJobMilestonePendingRecords: () => coordinatorJobMilestonePendingRecords
     }
-
-    incrementQueueWakeupMetric('terminalProgress.settlementDeferred')
-    const settlementPromise = new Promise(resolve => {
-        setTimeout(resolve, TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS)
-    }).then(() => applyCoordinatorQueueMachineEvent({
-        type: 'TERMINAL_COORDINATOR_ITEMS_SETTLE',
-        options: {
-            profileHrefs: pendingHrefs,
-            deferAuthorityProjectionSave: true
-        }
-    })).then(result => {
-        if(result !== false) {
-            incrementQueueWakeupMetric('terminalProgress.settlementCompleted')
-            scheduleCoordinatorQueueResume(1000, 'terminal-progress-settlement-continuation', {
-                allowBeforeQuora: true
-            })
-            void runCoordinatorQueueExecutorFastPath('terminal-progress-settlement-continuation', {
-                awaitFill: true,
-                returnAfterDurableActive: true,
-                allowBeforeQuora: true,
-                forceDurableQueueReload: true
-            }).catch(error => {
-                recordCoordinatorDiagnosticEvent(
-                    'terminal-progress-settlement-continuation-failed',
-                    error?.message || 'Terminal progress settlement continuation failed'
-                )
-            })
-            return
-        }
-        incrementQueueWakeupMetric('terminalProgress.settlementFailed')
-    }).catch(error => {
-        incrementQueueWakeupMetric('terminalProgress.settlementFailed')
-        recordCoordinatorDiagnosticEvent(
-            'terminal-progress-settlement-failed',
-            error?.message || 'Terminal progress settlement follow-up failed'
-        )
-    }).finally(() => {
-        for(const href of pendingHrefs) {
-            if(terminalProgressSettlementPromises.get(href) === settlementPromise) {
-                terminalProgressSettlementPromises.delete(href)
-            }
-        }
-    })
-    for(const href of pendingHrefs) {
-        terminalProgressSettlementPromises.set(href, settlementPromise)
-    }
-    void settlementPromise
-
-    return true
-}
+})
+const {
+    scheduleTerminalProgressSettlement,
+    scheduleTerminalProgressContinuation,
+    clearPendingCoordinatorJobMilestone,
+    consumePendingCoordinatorJobMilestone,
+    getCoordinatorMilestoneWorkCounts,
+    hasActiveCoordinatorMilestoneWork,
+    shouldPersistExplicitCoordinatorMilestoneNow,
+    updateQueuedTabMetadataFromMilestoneRecord,
+    scheduleCoordinatorJobMilestoneFlush
+} = coordinatorJobMilestoneBookkeeping
 
 async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {}) {
     let normalizedRecords = {}
@@ -28899,28 +28908,6 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
     return updateResult
 }
 
-function scheduleTerminalProgressContinuation(reason = 'terminal-progress-continuation') {
-    scheduleQueuedWorkContinuation(reason, {
-        forceDurableQueueReload: false
-    })
-    scheduleCoordinatorQueueResume(1000, reason, {
-        allowBeforeQuora: true
-    })
-    void closeTerminalOwnedProfileTabs().catch(() => null)
-    void runCoordinatorQueueExecutorFastPath(reason, {
-        awaitFill: true,
-        returnAfterDurableActive: true,
-        allowBeforeQuora: true,
-        skipAuthorityReconcile: true,
-        forceDurableQueueReload: false
-    }).catch(error => {
-        recordCoordinatorDiagnosticEvent(
-            'terminal-progress-continuation-fast-executor-failed',
-            error?.message || 'Terminal progress continuation fast executor failed'
-        )
-    })
-}
-
 async function recordCoordinatorJobProgress(profileHref = '', patch = {}, options = {}) {
     const normalizedHref = normalizeQuoraProfileUrl(profileHref)
     if(!normalizedHref) return {recorded: false, terminal: false, reason: 'invalid-profile-href'}
@@ -28934,103 +28921,6 @@ async function recordCoordinatorJobProgress(profileHref = '', patch = {}, option
         terminal: false,
         reason: batchResult?.reason || 'not-recorded'
     }
-}
-
-function clearPendingCoordinatorJobMilestone(profileHref = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
-    if(!normalizedHref) return false
-
-    const hadPending = !!coordinatorJobMilestonePendingRecords[normalizedHref]
-    delete coordinatorJobMilestonePendingRecords[normalizedHref]
-    return hadPending
-}
-
-function consumePendingCoordinatorJobMilestone(profileHref = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
-    if(!normalizedHref) return null
-
-    const pending = coordinatorJobMilestonePendingRecords[normalizedHref] || null
-    delete coordinatorJobMilestonePendingRecords[normalizedHref]
-    return pending
-}
-
-function getCoordinatorMilestoneWorkCounts() {
-    const authorityState = getHydratedCoordinatorAuthorityState('milestone.flush.usedResidentAuthority')
-    const durableCounts = getCoordinatorQueueWorkCounts(authorityState?.queue || {})
-    const runtimeCounts = queueRuntime.getRuntimeCounts()
-    return {
-        activeQueuedTabs: runtimeCounts.activeQueuedTabs,
-        queuedTabActions: runtimeCounts.queuedTabActions,
-        pendingTabActions: runtimeCounts.pendingTabActions,
-        durableActiveRows: durableCounts.active || 0,
-        durableQueuedRows: durableCounts.queued || 0
-    }
-}
-
-function hasActiveCoordinatorMilestoneWork() {
-    const counts = getCoordinatorMilestoneWorkCounts()
-    return counts.activeQueuedTabs > 0 ||
-        counts.queuedTabActions > 0 ||
-        counts.pendingTabActions > 0
-}
-
-function shouldPersistExplicitCoordinatorMilestoneNow(profileHref = '', record = {}, patch = {}, options = {}) {
-    const normalizedHref = normalizeQuoraProfileUrl(profileHref)
-    if(!normalizedHref || !progressPatchHasExplicitStatus(patch)) return false
-
-    const mapped = getCoordinatorStatusFromProgress(record)
-    if(isTerminalCoordinatorStatus(mapped.status)) return true
-
-    const authorityState = getHydratedCoordinatorAuthorityState('milestone.explicit.usedResidentAuthority')
-    const queue = authorityState?.queue || null
-    if(!queue) return true
-
-    const item = queue[normalizedHref] || queue[options.coordinatorKey || normalizedHref] || null
-    if(!item) return true
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) return true
-    if(!shouldApplyExplicitProgressStatusToCoordinatorItem(item, patch, {
-        ...options,
-        senderTabId: options.senderTabId || record.senderTabId || null
-    })) {
-        return true
-    }
-
-    const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-        now: Date.now()
-    })
-    return shouldPersistCoordinatorRowEventQueueItemChange(item, nextItem, mapped)
-}
-
-function updateQueuedTabMetadataFromMilestoneRecord(tabId = null, record = {}) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) return false
-
-    const metadataPatch = {
-        lastProgressAt: Number.isFinite(record.updatedAt) ? record.updatedAt : Date.now(),
-        contentOpenedAt: Number.isFinite(record.contentOpenedAt) ? record.contentOpenedAt : undefined,
-        actionReadyAt: Number.isFinite(record.actionReadyAt) ? record.actionReadyAt : undefined,
-        waitingForForegroundAt: Number.isFinite(record.waitingForForegroundAt) ? record.waitingForForegroundAt : undefined,
-        foregroundLeaseAcquiredAt: Number.isFinite(record.foregroundLeaseAcquiredAt) ? record.foregroundLeaseAcquiredAt : undefined,
-        foregroundPromotedAt: Number.isFinite(record.foregroundPromotedAt) ? record.foregroundPromotedAt : undefined
-    }
-    if(record.lastUrl) metadataPatch.lastUrl = record.lastUrl
-    for(const key of Object.keys(metadataPatch)) {
-        if(metadataPatch[key] === undefined) delete metadataPatch[key]
-    }
-    setQueuedTabMetadata(normalizedTabId, metadataPatch)
-    return true
-}
-
-function scheduleCoordinatorJobMilestoneFlush() {
-    if(coordinatorJobMilestoneFlushTimeout || coordinatorJobMilestoneFlushPromise) return
-
-    incrementQueueWakeupMetric('milestone.flushRequested')
-    incrementQueueWakeupMetric('milestone.flushDeferred')
-    coordinatorJobMilestoneFlushTimeout = setTimeout(() => {
-        coordinatorJobMilestoneFlushTimeout = null
-        void flushCoordinatorJobMilestones()
-    }, COORDINATOR_JOB_MILESTONE_FLUSH_MS)
 }
 
 async function flushCoordinatorJobMilestones() {
