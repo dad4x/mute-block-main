@@ -241,6 +241,12 @@ const {
 const {
     createQueuedTabActionBookkeeping
 } = require('./swQueuedTabActionBookkeeping')
+const {
+    createResolvedProfilePendingSpaceRecords
+} = require('./swResolvedProfilePendingSpaceRecords')
+const {
+    createCoordinatorRowEventMetrics
+} = require('./swCoordinatorRowEventMetrics')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -8276,6 +8282,31 @@ async function reconcileCoordinatorStorageBestEffort(options = {}) {
     }))
 }
 
+// resolvedProfilePendingSpaceRecords is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 39, part 1 of 2),
+// immediately before coordinatorReconcileLockedMaterialization:
+// coordinatorReconcileLockedMaterialization (immediately below) eagerly
+// references bare `addResolvedProfileToPendingSpaceRecords` and
+// `clearResolverPendingSpaceRecords` in its own construction-call `handlers`
+// object literal. A `const` destructured from a factory call is in the
+// temporal dead zone until that line executes, so this module must
+// construct before that reference. See swResolvedProfilePendingSpaceRecords.js's
+// header comment for the full writeup.
+const resolvedProfilePendingSpaceRecords = createResolvedProfilePendingSpaceRecords({
+    now: () => Date.now(),
+    handlers: {
+        normalizeQuoraProfileUrl,
+        getNormalizedProfileHrefList,
+        getStoredSpaceFeedRecordUrls,
+        getPendingSpaceFeedJobKeyPatch,
+        stripProfileResolutionQueueKey,
+        normalizeCoordinatorRequestedUrl
+    }
+})
+const {
+    addResolvedProfileToPendingSpaceRecords,
+    clearResolverPendingSpaceRecords
+} = resolvedProfilePendingSpaceRecords
 // coordinatorReconcileLockedMaterialization is constructed here, in place
 // at this cluster's old source-text position (decomposition Slice 19): no
 // already-extracted module eagerly references any of its 14 exports at its
@@ -27354,106 +27385,6 @@ async function validateProgressAttempt(profileHref = '', patch = {}, sender = {}
     return true
 }
 
-function addResolvedProfileToPendingSpaceRecords(pendingPosts = {}, item = {}, resolvedHref = '') {
-    const href = normalizeQuoraProfileUrl(resolvedHref)
-    if(!href) return {pendingPosts, changed: false}
-
-    const nextPending = {
-        ...pendingPosts
-    }
-    let changed = false
-    const evidenceList = Array.isArray(item?.evidence) ? item.evidence : []
-
-    for(const evidence of evidenceList) {
-        const postKey = evidence?.postKey || ''
-        if(!postKey) continue
-
-        const existing = nextPending[postKey] || {}
-        const allUrls = getNormalizedProfileHrefList([
-            ...getStoredSpaceFeedRecordUrls(existing, 'allUrls'),
-            href
-        ])
-        const remainingUrls = getNormalizedProfileHrefList([
-            ...getStoredSpaceFeedRecordUrls(existing, 'remainingUrls'),
-            href
-        ])
-
-        nextPending[postKey] = {
-            ...existing,
-            postKey,
-            postUrl: evidence.postUrl || existing.postUrl || '',
-            spaceKey: item?.source?.spaceKey || existing.spaceKey || '',
-            spaceUrl: item?.source?.pageUrl || existing.spaceUrl || '',
-            allUrls,
-            remainingUrls,
-            resolverPending: false,
-            resolverUrl: evidence.postUrl || existing.resolverUrl || '',
-            ...getPendingSpaceFeedJobKeyPatch(existing, remainingUrls),
-            updatedAt: Date.now()
-        }
-        changed = true
-    }
-
-    return {pendingPosts: nextPending, changed}
-}
-
-function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {}) {
-    const nextPending = {
-        ...pendingPosts
-    }
-    const evidenceList = Array.isArray(item?.evidence) ? item.evidence : []
-    const requestEvidence = Array.isArray(options.evidence) ? options.evidence : []
-    const postKeys = new Set([options.postKey, item?.postKey]
-        .concat(evidenceList.map(evidence => evidence?.postKey))
-        .concat(requestEvidence.map(evidence => evidence?.postKey))
-        .map(value => `${value || ''}`.trim())
-        .filter(Boolean))
-    const resolverUrls = new Set([
-        options.requestedUrl,
-        item?.requestedUrl,
-        stripProfileResolutionQueueKey(item?.coordinatorKey || item?.dedupeKey || '')
-    ]
-        .concat(evidenceList.map(evidence => evidence?.postUrl))
-        .concat(requestEvidence.map(evidence => evidence?.postUrl))
-        .map(value => normalizeCoordinatorRequestedUrl(value || ''))
-        .filter(Boolean))
-    let changed = false
-
-    for(const [recordKey, record] of Object.entries(pendingPosts || {})) {
-        if(record?.resolverPending !== true) continue
-
-        const recordPostKey = `${record?.postKey || recordKey || ''}`.trim()
-        const recordUrls = [
-            normalizeCoordinatorRequestedUrl(record?.resolverUrl || ''),
-            normalizeCoordinatorRequestedUrl(record?.postUrl || '')
-        ].filter(Boolean)
-        const matches = (recordPostKey && postKeys.has(recordPostKey)) ||
-            recordUrls.some(url => resolverUrls.has(url))
-        if(!matches) continue
-
-        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        changed = true
-
-        if(!allUrls.length && !remainingUrls.length) {
-            delete nextPending[recordKey]
-            continue
-        }
-
-        nextPending[recordKey] = {
-            ...record,
-            allUrls,
-            remainingUrls,
-            resolverPending: false,
-            resolverUrl: '',
-            ...getPendingSpaceFeedJobKeyPatch(record, remainingUrls),
-            updatedAt: Date.now()
-        }
-    }
-
-    return {pendingPosts: nextPending, changed}
-}
-
 async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
     const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
     if(snapshotReason !== 'ordinaryMutation') {
@@ -27953,66 +27884,35 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
 
 const COORDINATOR_ROW_EVENT_QUEUED_PROGRESS_MILESTONE = 'queued-progress-milestone'
 
-function getCoordinatorRowEventMetricKind(eventKind = '') {
-    return normalizeStorageMetricPathName(eventKind || 'unknown')
-}
-
-function incrementCoordinatorRowEventMetric(eventKind = '', suffix = '', amount = 1) {
-    const kind = getCoordinatorRowEventMetricKind(eventKind)
-    const name = `${suffix || ''}`.trim()
-    if(!name) return
-    incrementQueueWakeupMetric(`rowEvent.${kind}.${name}`, amount)
-}
-
-function normalizeCoordinatorRowProgressEvent(event = {}) {
-    const eventKind = `${event?.eventKind || ''}`.trim()
-    const profileHref = normalizeQuoraProfileUrl(event?.profileHref || event?.href || event?.coordinatorKey || '')
-    if(!profileHref) return null
-    return {
-        eventKind,
-        profileHref,
-        coordinatorKey: normalizeQuoraProfileUrl(event?.coordinatorKey || profileHref) || profileHref,
-        patch: event?.patch && typeof event.patch === 'object' ? event.patch : {},
-        senderTabId: normalizeTabId(event?.senderTabId || event?.tabId || event?.patch?.tabId || null)
+// coordinatorRowEventMetrics is constructed here, in place at this
+// cluster's old source-text position (decomposition Slice 39, part 2 of 2):
+// no already-extracted module eagerly references any of its 5 exports at
+// its own construction-call site (checked via grep across shared/js/sw.js),
+// and every call site of these 5 functions is inside another function's
+// body, evaluated lazily at call time rather than at module-eval time. See
+// swCoordinatorRowEventMetrics.js's header comment for the full writeup.
+const coordinatorRowEventMetrics = createCoordinatorRowEventMetrics({
+    constants: {
+        coordinatorRowEventQueuedProgressMilestone: COORDINATOR_ROW_EVENT_QUEUED_PROGRESS_MILESTONE
+    },
+    handlers: {
+        normalizeStorageMetricPathName,
+        incrementQueueWakeupMetric,
+        normalizeQuoraProfileUrl,
+        normalizeTabId,
+        getAttemptIdFromValue,
+        getQueuedTabMetadata,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey
     }
-}
-
-function buildCoordinatorRowEventsFromProgressRecords(progressRecords = {}, options = {}) {
-    return Object.entries(progressRecords || {})
-        .map(([profileHref, patch]) => normalizeCoordinatorRowProgressEvent({
-            eventKind: COORDINATOR_ROW_EVENT_QUEUED_PROGRESS_MILESTONE,
-            profileHref,
-            coordinatorKey: profileHref,
-            patch,
-            senderTabId: options.senderTabId || null
-        }))
-        .filter(Boolean)
-}
-
-function shouldCloseRejectedStaleRowEventSenderTab(item = null, record = null, senderTabId = null) {
-    const normalizedTabId = normalizeTabId(senderTabId)
-    if(!normalizedTabId || !item || !record) return false
-
-    const currentAttemptId = getAttemptIdFromValue(item)
-    const incomingAttemptId = getAttemptIdFromValue(record)
-    if(!currentAttemptId || !incomingAttemptId || currentAttemptId === incomingAttemptId) return false
-
-    const metadata = getQueuedTabMetadata(normalizedTabId)
-    if(!metadata) return false
-
-    const metadataAttemptId = getAttemptIdFromValue(metadata)
-    if(metadataAttemptId && metadataAttemptId !== incomingAttemptId) return false
-
-    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(record.profileHref || '')
-    const metadataHref = normalizeQuoraProfileUrl(metadata.profileHref || metadata.requestedUrl || '')
-    if(itemHref && metadataHref && itemHref !== metadataHref) return false
-
-    const itemKey = getCoordinatorItemQueueKey(item)
-    const metadataKey = `${metadata.coordinatorKey || ''}`.trim()
-    if(itemKey && metadataKey && itemKey !== metadataKey) return false
-
-    return true
-}
+})
+const {
+    getCoordinatorRowEventMetricKind,
+    incrementCoordinatorRowEventMetric,
+    normalizeCoordinatorRowProgressEvent,
+    buildCoordinatorRowEventsFromProgressRecords,
+    shouldCloseRejectedStaleRowEventSenderTab
+} = coordinatorRowEventMetrics
 
 async function closeRejectedStaleRowEventSenderTabs(candidates = [], reason = 'row-event-stale-attempt') {
     const tabIds = Array.from(new Set((Array.isArray(candidates) ? candidates : [])
