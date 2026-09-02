@@ -208,6 +208,9 @@ const {
 const {
     createProfileProgressMerge
 } = require('./swProfileProgressMerge')
+const {
+    createQueuedTabMetadataAndActionLease
+} = require('./swQueuedTabMetadataAndActionLease')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -581,6 +584,58 @@ const {
 } = queueWakeupMetricsShape
 queueWakeupMetrics = makeEmptyQueueWakeupMetrics()
 let pendingQueueWakeupMetricsReset = null
+// queuedTabMetadataAndActionLease is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 31) -- see
+// swQueuedTabMetadataAndActionLease.js's header comment for the full
+// ordering writeup: coordinatorExecutorClassification (immediately below)
+// eagerly references bare `getQueuedTabMetadata` in its own
+// construction-call handlers object literal, the earliest of several such
+// eager references across already-extracted modules. normalizeTabId,
+// normalizeAttemptId, getAttemptIdFromValue, getAttemptNumberFromValue,
+// getCoordinatorActionKindForRequestedAction, getCoordinatorItemHref, and
+// normalizeCoordinatorRequestedUrl/getCoordinatorItemQueueKey aren't
+// available as bare consts yet at this point, so each is threaded through
+// as a thunk that defers name resolution to call time. coordinatorAuthority
+// isn't constructed until much later, so it's threaded through as a
+// `state.getCoordinatorAuthority` getter instead, matching the
+// activationGuardRuntime/queuedRuntimeActionMatching precedent.
+const queuedTabMetadataAndActionLease = createQueuedTabMetadataAndActionLease({
+    now: () => Date.now(),
+    constants: {
+        ACTION_LEASE_MS
+    },
+    handlers: {
+        queueRuntime,
+        isActiveCoordinatorStatus,
+        isTerminalCoordinatorStatus,
+        normalizeQuoraProfileUrl,
+        normalizeTabId: (...args) => normalizeTabId(...args),
+        normalizeAttemptId: (...args) => normalizeAttemptId(...args),
+        getCoordinatorActionKindForRequestedAction: (...args) => getCoordinatorActionKindForRequestedAction(...args),
+        getAttemptIdFromValue: (...args) => getAttemptIdFromValue(...args),
+        getAttemptNumberFromValue: (...args) => getAttemptNumberFromValue(...args),
+        normalizeCoordinatorRequestedUrl: (...args) => normalizeCoordinatorRequestedUrl(...args),
+        getCoordinatorItemHref: (...args) => getCoordinatorItemHref(...args),
+        getCoordinatorItemQueueKey: (...args) => getCoordinatorItemQueueKey(...args)
+    },
+    state: {
+        getCoordinatorAuthority: () => coordinatorAuthority
+    }
+})
+const {
+    getQueuedTabMetadata,
+    wasQueuedRuntimeTabRemoved,
+    setQueuedTabMetadata,
+    remapQueuedTabToResolvedProfile,
+    clearQueuedTabMetadata,
+    normalizeCoordinatorActionLease,
+    isCoordinatorActionLeaseExpired,
+    isCoordinatorActionLeaseHolder,
+    clearExpiredCoordinatorActionLeases,
+    findActiveCoordinatorActionLease,
+    makeCoordinatorActionLease,
+    findCoordinatorStoredWorkCancelTarget
+} = queuedTabMetadataAndActionLease
 // coordinatorExecutorClassification is constructed here, well before this
 // cluster's old source-text location (decomposition Slice 26) -- see
 // swCoordinatorExecutorClassification.js's header comment for the full
@@ -20824,187 +20879,6 @@ async function syncSuccessfulCoordinatorProgress(profileHref = '') {
     }
 }
 
-function getQueuedTabMetadata(tabId) {
-    return queueRuntime.getQueuedTabMetadata(tabId)
-}
-
-function wasQueuedRuntimeTabRemoved(tabId) {
-    return queueRuntime.hasRemovedQueuedRuntimeTab(tabId)
-}
-
-function setQueuedTabMetadata(tabId, metadata = {}) {
-    if(!tabId) return
-    if(wasQueuedRuntimeTabRemoved(tabId)) return
-    if(
-        !queueRuntime.hasActiveQueuedTab(tabId) &&
-        !queueRuntime.hasQueuedTabMetadata(tabId) &&
-        !queueRuntime.hasPendingTabAction(tabId)
-    ) {
-        const currentQueue = coordinatorAuthority.current()?.queue || {}
-        const matchesActiveAuthority = Object.values(currentQueue).some(item =>
-            isActiveCoordinatorStatus(item?.status) &&
-            normalizeTabId(item?.tabId || item?.activeTabId || null) === normalizeTabId(tabId)
-        )
-        if(!matchesActiveAuthority) return
-    }
-    queueRuntime.patchQueuedTabMetadata(tabId, metadata)
-}
-
-function remapQueuedTabToResolvedProfile(tabId, item = {}, resolvedHref = '', requestedUrl = '') {
-    if(!tabId || !resolvedHref) return
-
-    const metadata = getQueuedTabMetadata(tabId) || {}
-    const action = queueRuntime.getPendingTabAction(tabId)
-    const nextRequestedUrl = normalizeCoordinatorRequestedUrl(
-        requestedUrl || item.requestedUrl || metadata.requestedUrl || action?.requestedUrl || resolvedHref
-    )
-    const tabAction = metadata.tabAction || action?.action || item.tabAction || item.executorTabAction || 'nuke'
-    const actionKind = metadata.actionKind ||
-        action?.actionKind ||
-        item.actionKind ||
-        getCoordinatorActionKindForRequestedAction(tabAction)
-    const attemptId = getAttemptIdFromValue(metadata) ||
-        getAttemptIdFromValue(action) ||
-        getAttemptIdFromValue(item)
-    const attemptNumber = getAttemptNumberFromValue(metadata) ||
-        getAttemptNumberFromValue(action) ||
-        getAttemptNumberFromValue(item)
-
-    setQueuedTabMetadata(tabId, {
-        profileHref: resolvedHref,
-        coordinatorKey: resolvedHref,
-        requestedUrl: nextRequestedUrl,
-        resolveProfileFromPage: false,
-        resolutionMode: '',
-        resolutionReason: '',
-        tabAction,
-        actionKind,
-        attemptId,
-        attemptNumber,
-        lastUrl: resolvedHref
-    })
-
-    if(action) {
-        queueRuntime.setPendingTabAction(tabId, {
-            ...action,
-            action: tabAction,
-            targetUrl: resolvedHref,
-            profileHref: resolvedHref,
-            coordinatorKey: resolvedHref,
-            requestedUrl: nextRequestedUrl,
-            resolveProfileFromPage: false,
-            resolutionMode: '',
-            resolutionReason: '',
-            actionKind,
-            attemptId,
-            attemptNumber
-        })
-    }
-}
-
-function clearQueuedTabMetadata(tabId) {
-    if(!tabId) return
-    queueRuntime.deleteQueuedTabMetadata(tabId)
-}
-
-function normalizeCoordinatorActionLease(lease = null) {
-    if(!lease || typeof lease !== 'object') return null
-
-    const tabId = normalizeTabId(lease.tabId || null)
-    const attemptId = normalizeAttemptId(lease.attemptId || '')
-    if(!tabId || !attemptId) return null
-
-    const grantedAt = Number.parseInt(lease.grantedAt, 10) || 0
-    const heartbeatAt = Number.parseInt(lease.heartbeatAt, 10) || grantedAt
-    const expiresAt = Number.parseInt(lease.expiresAt, 10) || 0
-
-    return {
-        kind: `${lease.kind || 'profile-menu'}`.trim() || 'profile-menu',
-        actionKind: getCoordinatorActionKindForRequestedAction(lease.actionKind || ''),
-        profileHref: normalizeQuoraProfileUrl(lease.profileHref || ''),
-        tabId,
-        attemptId,
-        attemptNumber: Number.parseInt(lease.attemptNumber, 10) || 0,
-        grantedAt,
-        heartbeatAt,
-        expiresAt,
-        reason: `${lease.reason || ''}`.trim()
-    }
-}
-
-function isCoordinatorActionLeaseExpired(lease = null, now = Date.now()) {
-    const normalizedLease = normalizeCoordinatorActionLease(lease)
-    if(!normalizedLease) return true
-    return normalizedLease.expiresAt > 0 && now >= normalizedLease.expiresAt
-}
-
-function isCoordinatorActionLeaseHolder(lease = null, tabId = null, attemptId = '') {
-    const normalizedLease = normalizeCoordinatorActionLease(lease)
-    const normalizedTabId = normalizeTabId(tabId)
-    const normalizedAttemptId = normalizeAttemptId(attemptId)
-
-    return !!normalizedLease &&
-        !!normalizedTabId &&
-        !!normalizedAttemptId &&
-        normalizedLease.tabId === normalizedTabId &&
-        normalizedLease.attemptId === normalizedAttemptId
-}
-
-function clearExpiredCoordinatorActionLeases(queue = {}, now = Date.now()) {
-    let changed = false
-    for(const [key, item] of Object.entries(queue || {})) {
-        if(!item?.actionLease) continue
-        if(!isTerminalCoordinatorStatus(item.status) && !isCoordinatorActionLeaseExpired(item.actionLease, now)) continue
-
-        queue[key] = {
-            ...item,
-            actionLease: null,
-            actionLeaseReleasedAt: now,
-            actionLeaseReleaseReason: isTerminalCoordinatorStatus(item.status)
-                ? 'terminal-row'
-                : 'expired'
-        }
-        changed = true
-    }
-
-    return changed
-}
-
-function findActiveCoordinatorActionLease(queue = {}, now = Date.now()) {
-    for(const [key, item] of Object.entries(queue || {})) {
-        if(!item || isTerminalCoordinatorStatus(item.status)) continue
-        const lease = normalizeCoordinatorActionLease(item.actionLease)
-        if(!lease || isCoordinatorActionLeaseExpired(lease, now)) continue
-
-        return {
-            key,
-            item,
-            lease
-        }
-    }
-
-    return null
-}
-
-function makeCoordinatorActionLease(item = {}, request = {}, sender = {}, now = Date.now()) {
-    const tabId = normalizeTabId(sender.tab?.id || request.tabId || item.tabId || null)
-    const attemptId = normalizeAttemptId(request.attemptId || getAttemptIdFromValue(item))
-    if(!tabId || !attemptId) return null
-
-    return {
-        kind: 'profile-menu',
-        actionKind: getCoordinatorActionKindForRequestedAction(request.actionKind || item.actionKind || ''),
-        profileHref: getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(request.profileHref || ''),
-        tabId,
-        attemptId,
-        attemptNumber: Number.parseInt(request.attemptNumber || getAttemptNumberFromValue(item), 10) || 0,
-        grantedAt: now,
-        heartbeatAt: now,
-        expiresAt: now + ACTION_LEASE_MS,
-        reason: `${request.reason || ''}`.trim()
-    }
-}
-
 async function mutateCoordinatorQueuedTabActiveTransition(operation = {}) {
     const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
     if(snapshotReason !== 'ordinaryMutation') return false
@@ -21293,39 +21167,6 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
         persistence,
         derivedSaved
     }
-}
-
-function findCoordinatorStoredWorkCancelTarget(queue = {}, operation = {}) {
-    const targetStorageKey = `${operation.storageKey || ''}`.trim()
-    const targetCoordinatorKey = `${operation.coordinatorKey || ''}`.trim()
-    const targetHref = normalizeQuoraProfileUrl(operation.profileHref || '')
-    if(!targetStorageKey && !targetCoordinatorKey && !targetHref) {
-        return {entry: null, matches: [], reason: 'missing-current-work-item-target'}
-    }
-
-    const matches = []
-    for(const [itemKey, item] of Object.entries(queue || {})) {
-        if(!item || typeof item !== 'object') continue
-        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-        if(itemKey !== targetStorageKey &&
-            itemKey !== targetCoordinatorKey &&
-            href !== targetHref &&
-            coordinatorKey !== targetCoordinatorKey &&
-            coordinatorKey !== targetStorageKey) {
-            continue
-        }
-        matches.push({itemKey, item, href, coordinatorKey})
-    }
-
-    if(matches.length !== 1) {
-        return {
-            entry: null,
-            matches,
-            reason: matches.length ? 'ambiguous-current-work-item-target' : 'missing-current-work-item-target'
-        }
-    }
-    return {entry: matches[0], matches, reason: ''}
 }
 
 async function mutateCoordinatorStoredWorkItemCancel(operation = {}) {
