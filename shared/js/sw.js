@@ -229,6 +229,9 @@ const {
 const {
     createActiveQueuedTabStaleness
 } = require('./swActiveQueuedTabStaleness')
+const {
+    createQueuedTabRetryStaleReconcile
+} = require('./swQueuedTabRetryStaleReconcile')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -2053,6 +2056,97 @@ const {
     drainPendingCoordinatorDiagnosticEvents,
     shouldFlushPendingCoordinatorDiagnosticEventsNow
 } = coordinatorJobEnvelope
+
+// queuedTabRetryStaleReconcile is constructed here, immediately after
+// coordinatorJobEnvelope's destructure and before coordinatorRetryCandidates
+// (decomposition Slice 35): coordinatorRetryCandidates (right below)
+// eagerly references bare `getQueuedTabMaxRetries` in its own
+// construction-call `handlers` object literal -- the earliest of several
+// such eager references across already-extracted modules
+// (queuedTabRuntimeStatus and rolledBackQueuedTabRetryClassification, both
+// constructed further down, also reference `getQueuedTabMaxRetries`/
+// `getQueuedTabRetryAttempt` bare the same way). A `const` destructured
+// from a factory call is in the temporal dead zone until that line
+// executes -- so this module must construct before coordinatorRetryCandidates,
+// the earliest of them. `hasOwnedQueuedTabState` (queuedForegroundLeaseRuntime,
+// Slice 32) and `getCoordinatorProgressRecordForItem`
+// (coordinatorSourceProvenance, Slice 18) aren't available as bare consts
+// yet at this point -- both construct later in this file -- so each is
+// threaded through as a thunk that defers name resolution to call time.
+// Every other handler (coordinatorStatusRules, activeQueuedTabStaleness,
+// coordinatorExecutorClassification, profileResolution, tabIdUtils,
+// profileNukeRecordClassification, coordinatorRuns, coordinatorAttemptIdentity,
+// profileProgressMerge, plus queueRuntime and the top-of-file subject.js
+// require) is already a bare name or already-constructed instance by this
+// point. `staleRetryAdvancedWakeKeys` (a module-level `const` Map) and
+// `queueWakeupMetricCycleSerial` (a module-level `let`) are threaded
+// through as state -- the Map by direct reference (mutating it in place is
+// visible to sw.js's own resident code, e.g.
+// advanceCoordinatorQueueForStaleRetryAction, which still reads/writes the
+// same Map bare), the serial via a `getQueueWakeupMetricCycleSerial`
+// getter, matching the queueWakeupMetricsShape precedent for the same
+// variable. `profileNukeProgress` is threaded through as a get/set
+// accessor pair, matching the coordinatorReconcileLockedMaterialization
+// (Slice 19) precedent. See swQueuedTabRetryStaleReconcile.js's header
+// comment for the full writeup.
+const queuedTabRetryStaleReconcile = createQueuedTabRetryStaleReconcile({
+    now: () => Date.now(),
+    constants: {
+        STALE_QUEUED_TAB_MAX_RETRIES,
+        QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS,
+        QUEUED_TAB_CLAIM_NUDGE_TIMEOUT_ESCALATION_MS,
+        COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS,
+        COORDINATOR_ACTIVE_JOB_MAX_MS,
+        STALE_BACKGROUND_OPENING_QUEUED_TAB_MS
+    },
+    handlers: {
+        queueRuntime,
+        normalizeTabTargetUrl,
+        normalizeQuoraProfileUrl,
+        normalizeTabId,
+        normalizeProgressPatch,
+        makeProfileResolutionQueueKey,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        normalizeAttemptId,
+        getNextAttemptNumberFromValue,
+        makeAttemptId,
+        hasMismatchedCoordinatorAttempt,
+        isTerminalCoordinatorStatus,
+        isTerminalProfileNukeRecord,
+        isTransientProfileNukeStatus,
+        hasActiveQueuedTabActionPhaseProgress,
+        hasConfirmedRuntimeActorForCoordinatorItem,
+        hasConfirmedLiveRuntimeActorForCoordinatorItem,
+        getActiveQueuedTabAgeAnchor,
+        getOwnedOrExpectedLiveTabsForProfileHref,
+        getPersistedActiveCoordinatorStaleAnchor,
+        getActiveQueuedTabStaleTimeoutMs,
+        getPersistedQueuedTabId,
+        getCoordinatorItemHref,
+        getCoordinatorRunIdsForHref,
+        hasOwnedQueuedTabState: (...args) => hasOwnedQueuedTabState(...args),
+        getCoordinatorProgressRecordForItem: (...args) => getCoordinatorProgressRecordForItem(...args)
+    },
+    state: {
+        getProfileNukeProgress: () => profileNukeProgress,
+        setProfileNukeProgress: value => { profileNukeProgress = value },
+        getQueueWakeupMetricCycleSerial: () => queueWakeupMetricCycleSerial,
+        staleRetryAdvancedWakeKeys
+    }
+})
+const {
+    applyMissingActiveCoordinatorEvidenceReconcileActionLocked,
+    shouldReconcileMissingActiveCoordinatorTab,
+    makeMissingActiveCoordinatorProgressRecord,
+    getQueuedTabRetryAttempt,
+    getQueuedTabMaxRetries,
+    hasStaleAcceptedQueuedTabNudge,
+    isQueuedTabLoadPressure,
+    buildRetryQueuedTabAction,
+    getStaleRetryAdvanceKey,
+    pruneStaleRetryAdvancedWakeKeys
+} = queuedTabRetryStaleReconcile
 
 // coordinatorRetryCandidates is constructed here, well before this cluster's
 // old source-text location (decomposition Slice 29): rolledBackQueuedTabRetryClassification
@@ -25351,132 +25445,6 @@ async function getMissingActiveCoordinatorReconcileDecision(
     }
 }
 
-function applyMissingActiveCoordinatorEvidenceReconcileActionLocked(state = {}, operation = {}) {
-    const queue = state.queue || {}
-    const runs = state.runs || {}
-    const progress = state.progress || {}
-    const itemKey = `${operation.itemKey || ''}`.trim()
-    if(!itemKey) return {changed: false, reason: 'missing-item-key'}
-
-    const item = queue[itemKey] || null
-    if(!item || typeof item !== 'object') return {changed: false, reason: 'row-changed'}
-    if(isTerminalCoordinatorStatus(item.status)) return {changed: false, reason: 'terminal-row'}
-
-    const expectedAttemptId = normalizeAttemptId(operation.expectedAttemptId || '')
-    const expectedAttemptNumber = Number.parseInt(operation.expectedAttemptNumber, 10) || 0
-    if(expectedAttemptId && getAttemptIdFromValue(item) !== expectedAttemptId) {
-        return {changed: false, reason: 'attempt-changed'}
-    }
-    if(expectedAttemptNumber && getAttemptNumberFromValue(item) !== expectedAttemptNumber) {
-        return {changed: false, reason: 'attempt-changed'}
-    }
-
-    const href = getCoordinatorItemHref(item) ||
-        normalizeQuoraProfileUrl(operation.href || '') ||
-        normalizeQuoraProfileUrl(itemKey)
-    if(!href) return {changed: false, reason: 'missing-href'}
-
-    const record = getCoordinatorProgressRecordForItem(itemKey, item, progress)
-    if(record && hasMismatchedCoordinatorAttempt(item, record)) {
-        return {changed: false, reason: 'progress-attempt-mismatch'}
-    }
-
-    const now = Number.parseInt(operation.now, 10) || Date.now()
-    const nextRecord = makeMissingActiveCoordinatorProgressRecord(href, record, now, item)
-    if(!nextRecord) return {changed: false, reason: 'missing-progress-record'}
-
-    const recordHref = normalizeQuoraProfileUrl(href || nextRecord.profileHref || '')
-    if(!recordHref) return {changed: false, reason: 'missing-record-href'}
-    if(JSON.stringify(progress[recordHref] || null) === JSON.stringify(nextRecord)) {
-        return {changed: false, reason: 'unchanged'}
-    }
-
-    progress[recordHref] = nextRecord
-    profileNukeProgress = {
-        ...profileNukeProgress,
-        [recordHref]: nextRecord
-    }
-
-    const affectedRunIds = new Set()
-    if(item.runId) affectedRunIds.add(item.runId)
-    for(const runId of getCoordinatorRunIdsForHref(runs, href)) {
-        affectedRunIds.add(runId)
-    }
-
-    const tabIdsToClose = new Set()
-    const persistedTabId = normalizeTabId(operation.persistedTabId || getPersistedQueuedTabId(item, record))
-    if(operation.closePersistedTab === true && persistedTabId) tabIdsToClose.add(persistedTabId)
-    for(const tabId of operation.expectedLiveTabIds || []) {
-        const normalizedTabId = normalizeTabId(tabId)
-        if(normalizedTabId && normalizedTabId !== persistedTabId) tabIdsToClose.add(normalizedTabId)
-    }
-
-    return {
-        changed: true,
-        progressChanged: true,
-        materialized: 1,
-        affectedRunIds: Array.from(affectedRunIds),
-        tabIdsToClose: Array.from(tabIdsToClose),
-        href: recordHref
-    }
-}
-
-function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = '', liveProfileTabsByHref = new Map(), now = Date.now()) {
-    if(!item || typeof item !== 'object') return false
-    if(isTerminalCoordinatorStatus(item.status)) return false
-    if(isTerminalProfileNukeRecord(record)) return false
-
-    const itemStatus = `${item.status || ''}`.trim()
-    const recordStatus = `${record?.status || ''}`.trim()
-    const rowIsClaimed = itemStatus === 'active' || itemStatus === 'settling'
-    const recordIsActiveEvidence = !!record &&
-        !!recordStatus &&
-        recordStatus !== 'queued' &&
-        isTransientProfileNukeStatus(recordStatus)
-    if(record && !rowIsClaimed && !recordIsActiveEvidence) return false
-
-    const queuedRowHasClaimedProgress = itemStatus === 'queued' && recordIsActiveEvidence
-    if(!rowIsClaimed && !queuedRowHasClaimedProgress) return false
-
-    const actionPhaseActive = hasActiveQueuedTabActionPhaseProgress(record, item)
-    const confirmedRuntimeActor = hasConfirmedRuntimeActorForCoordinatorItem(item, record)
-    const confirmedLiveRuntimeActor = confirmedRuntimeActor &&
-        hasConfirmedLiveRuntimeActorForCoordinatorItem(item, record, liveProfileTabsByHref)
-    const activeStartedAt = actionPhaseActive
-        ? getActiveQueuedTabAgeAnchor(item, record)
-        : Number.isFinite(item?.activeAt) ? item.activeAt : 0
-    const activeJobMaxMs = actionPhaseActive
-        ? COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS
-        : COORDINATOR_ACTIVE_JOB_MAX_MS
-    const activeAgeExpired = rowIsClaimed &&
-        activeStartedAt > 0 &&
-        now - activeStartedAt >= activeJobMaxMs
-    if(rowIsClaimed &&
-        !actionPhaseActive &&
-        !confirmedLiveRuntimeActor &&
-        !getOwnedOrExpectedLiveTabsForProfileHref(item, record, href, liveProfileTabsByHref).length) {
-        return true
-    }
-
-    const staleRecord = recordIsActiveEvidence ? record : null
-    const staleAnchor = getPersistedActiveCoordinatorStaleAnchor(item, staleRecord)
-    const staleTimeoutMs = staleRecord ? getActiveQueuedTabStaleTimeoutMs(staleRecord, {
-        noForegroundFallback: true
-    }) : STALE_BACKGROUND_OPENING_QUEUED_TAB_MS
-    if(!activeAgeExpired && (!staleAnchor || now - staleAnchor < staleTimeoutMs)) return false
-
-    if(rowIsClaimed && !actionPhaseActive && !confirmedLiveRuntimeActor) {
-        return true
-    }
-
-    if(getOwnedOrExpectedLiveTabsForProfileHref(item, record, href, liveProfileTabsByHref).length) return false
-
-    const tabId = getPersistedQueuedTabId(item, record)
-    if(tabId) return !hasOwnedQueuedTabState(tabId)
-
-    return !getOwnedOrExpectedLiveTabsForProfileHref(item, record, href, liveProfileTabsByHref).length
-}
-
 async function shouldReconcileMissingActiveCoordinatorKeyOnlyItem(item = null, record = null, now = Date.now()) {
     if(!item || typeof item !== 'object') return false
     if(!isProfileResolutionItem(item)) return false
@@ -25501,153 +25469,6 @@ async function shouldReconcileMissingActiveCoordinatorKeyOnlyItem(item = null, r
         return false
     }
     return true
-}
-
-function makeMissingActiveCoordinatorProgressRecord(href = '', record = null, now = Date.now(), item = null) {
-    const normalizedHref = normalizeQuoraProfileUrl(href || record?.profileHref || '')
-    if(!normalizedHref) return null
-
-    return normalizeProgressPatch(normalizedHref, {
-        actionKind: record?.actionKind || item?.actionKind || 'mute-block',
-        attemptId: getAttemptIdFromValue(record) || getAttemptIdFromValue(item),
-        attemptNumber: getAttemptNumberFromValue(record) || getAttemptNumberFromValue(item),
-        runId: record?.runId || item?.runId || '',
-        tabId: getPersistedQueuedTabId(item, record) || null,
-        status: 'interrupted',
-        finalError: 'Queued tab timed out after disappearing before completion',
-        tabClosedAt: now,
-        slotReleasedAt: now,
-        closedByExtension: true,
-        closeReason: 'stale-active-tab',
-        event: 'Reconciled stale active queued tab after timeout'
-    }, record)
-}
-
-function getQueuedTabRetryAttempt(metadata = null, record = null) {
-    const metadataAttempt = Number.parseInt(metadata?.retryAttempt, 10)
-    const recordAttempt = Number.parseInt(record?.retryAttempt, 10)
-    return Math.max(
-        Number.isFinite(metadataAttempt) && metadataAttempt > 0 ? metadataAttempt : 0,
-        Number.isFinite(recordAttempt) && recordAttempt > 0 ? recordAttempt : 0
-    )
-}
-
-function getQueuedTabMaxRetries(metadata = null, record = null) {
-    const metadataMax = Number.parseInt(metadata?.maxRetries, 10)
-    const recordMax = Number.parseInt(record?.maxRetries, 10)
-    const fallback = STALE_QUEUED_TAB_MAX_RETRIES
-    const maxRetries = Number.isFinite(metadataMax) && metadataMax >= 0
-        ? metadataMax
-        : Number.isFinite(recordMax) && recordMax >= 0
-            ? recordMax
-            : fallback
-
-    return Math.max(0, maxRetries)
-}
-
-function hasStaleAcceptedQueuedTabNudge(metadata = null, record = null, now = Date.now()) {
-    if(hasActiveQueuedTabActionPhaseProgress(record, metadata)) return false
-    const acceptedAt = Math.max(
-        Number.parseInt(metadata?.lastNudgeAcceptedAt, 10) || 0,
-        Number.parseInt(metadata?.lastNudgedAt, 10) || 0
-    )
-    if(!acceptedAt) return false
-    const restoredAt = Number.parseInt(metadata?.liveTabRestoredAt, 10) || 0
-    if(restoredAt > 0 &&
-        acceptedAt >= restoredAt &&
-        now - restoredAt <= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS * 3) {
-        return false
-    }
-
-    const failedAt = Number.parseInt(metadata?.lastNudgeFailedAt, 10) || 0
-    if(failedAt >= acceptedAt) {
-        return now - failedAt >= QUEUED_TAB_CLAIM_NUDGE_TIMEOUT_ESCALATION_MS
-    }
-
-    return now - acceptedAt >= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS
-}
-
-function isQueuedTabLoadPressure(liveTab = null, record = null, metadata = null, now = Date.now()) {
-    if(hasActiveQueuedTabActionPhaseProgress(record, metadata)) return false
-    if(`${liveTab?.status || ''}`.trim() === 'loading') return true
-    if(Number.isFinite(metadata?.contentScriptEnsureFailedAt) && metadata.contentScriptEnsureFailedAt > 0) return true
-    if(Number.isFinite(metadata?.lastNudgeFailedAt) && metadata.lastNudgeFailedAt > 0) return true
-    if(hasStaleAcceptedQueuedTabNudge(metadata, record, now)) return true
-    return false
-}
-
-function buildRetryQueuedTabAction(metadata = null, record = null, options = {}) {
-    const url = normalizeTabTargetUrl(metadata?.profileHref || metadata?.requestedUrl || '')
-    if(!url) return null
-    if(metadata?.ownerTabId && queueRuntime.hasPausedQueuedOwner(metadata.ownerTabId)) return null
-
-    const retryAttempt = getQueuedTabRetryAttempt(metadata, record)
-    const maxRetries = getQueuedTabMaxRetries(metadata, record)
-    const loadPressureRequeue = metadata?.loadPressureRequeue === true
-    const forceRetryWhenExhausted = options.forceRetryWhenExhausted === true
-    if(!loadPressureRequeue && retryAttempt >= maxRetries && !forceRetryWhenExhausted) return null
-    const liveAdoptionLoadPressure = loadPressureRequeue &&
-        (Number.parseInt(metadata?.liveTabAdoptedAt, 10) || 0) > 0 &&
-        ((Number.parseInt(metadata?.lastNudgeFailedAt, 10) || 0) > 0 ||
-            (Number.parseInt(metadata?.contentScriptEnsureFailedAt, 10) || 0) > 0 ||
-            (Number.parseInt(metadata?.lastLoadPressureAt, 10) || 0) > 0)
-    const sourceAttemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(record)
-    const sourceAttemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(record)
-    const attemptId = makeAttemptId()
-    const attemptNumber = getNextAttemptNumberFromValue(metadata)
-    const nextRetryAttempt = loadPressureRequeue ? retryAttempt : retryAttempt + 1
-    const effectiveMaxRetries = forceRetryWhenExhausted
-        ? Math.max(maxRetries, nextRetryAttempt + 1)
-        : maxRetries
-
-    return {
-        url,
-        profileHref: normalizeQuoraProfileUrl(metadata?.profileHref || '') || '',
-        coordinatorKey: metadata?.coordinatorKey || '',
-        requestedUrl: metadata?.requestedUrl || '',
-        resolutionMode: metadata?.resolutionMode || '',
-        resolveProfileFromPage: metadata?.resolveProfileFromPage === true,
-        resolutionReason: metadata?.resolutionReason || '',
-        candidateConfidence: metadata?.candidateConfidence || '',
-        candidateCollector: metadata?.candidateCollector || '',
-        tabAction: metadata?.tabAction || 'nuke',
-        actionKind: metadata?.actionKind || '',
-        runId: metadata?.runId || '',
-        ownerTabId: metadata?.ownerTabId || null,
-        ownerWindowId: metadata?.ownerWindowId || null,
-        noForegroundFallback: !!metadata?.noForegroundFallback,
-        retryAttempt: nextRetryAttempt,
-        sourceAttemptId,
-        sourceAttemptNumber,
-        attemptId,
-        attemptNumber,
-        maxRetries: effectiveMaxRetries,
-        loadPressureRequeue,
-        actionLeaseReleaseReason: liveAdoptionLoadPressure
-            ? 'queued-live-tab-adoption-load-pressure'
-            : metadata?.actionLeaseReleaseReason || ''
-    }
-}
-
-function getStaleRetryAdvanceKey(action = null) {
-    const href = normalizeQuoraProfileUrl(action?.profileHref || action?.url || '')
-    const coordinatorKey = action?.coordinatorKey || (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
-    const sourceAttemptId = getAttemptIdFromValue({
-        attemptId: action?.sourceAttemptId || ''
-    }) || getAttemptIdFromValue(action)
-    const sourceAttemptNumber = Number.parseInt(action?.sourceAttemptNumber, 10) || getAttemptNumberFromValue(action)
-    if(!href && !coordinatorKey) return ''
-    return [
-        href || coordinatorKey,
-        sourceAttemptId || '',
-        sourceAttemptNumber || 0
-    ].join('|')
-}
-
-function pruneStaleRetryAdvancedWakeKeys(currentWakeSerial = queueWakeupMetricCycleSerial) {
-    for(const [key, wakeSerial] of staleRetryAdvancedWakeKeys.entries()) {
-        if(wakeSerial !== currentWakeSerial) staleRetryAdvancedWakeKeys.delete(key)
-    }
 }
 
 async function advanceCoordinatorQueueForStaleRetryAction(action = null, at = Date.now()) {

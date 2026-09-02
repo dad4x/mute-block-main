@@ -682,10 +682,11 @@ test('stale tab close cannot fail a requeued Current Work row', () => {
 })
 
 test('reconcile preserves expected live tabs for resume adoption', () => {
-    const source = readRepoFile('shared/js/sw.js')
+    // shouldReconcileMissingActiveCoordinatorTab moved to
+    // swQueuedTabRetryStaleReconcile.js in decomposition Slice 35.
     const body = extractFunction(
-        source,
-        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
+        readRepoFile('shared/js/swQueuedTabRetryStaleReconcile.js'),
+        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = getNow())'
     )
     const runtimeActorBody = extractFunction(
         readRepoFile('shared/js/swActiveQueuedTabStaleness.js'),
@@ -775,8 +776,8 @@ test('legacy progress mirror sync bridge is deleted', () => {
 
 test('stale active reconcile ignores queued mirror records as liveness', () => {
     const body = extractFunction(
-        readRepoFile('shared/js/sw.js'),
-        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
+        readRepoFile('shared/js/swQueuedTabRetryStaleReconcile.js'),
+        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = getNow())'
     )
 
     assert.match(body, /recordStatus !== 'queued'/)
@@ -1926,8 +1927,8 @@ test('active queued jobs have a wall-clock cap', () => {
     const contentSource = readRepoFile('shared/js/content.js')
     const sweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
     const reconcileDecisionBody = extractFunction(
-        source,
-        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
+        readRepoFile('shared/js/swQueuedTabRetryStaleReconcile.js'),
+        'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = getNow())'
     )
 
     assert.match(source, /COORDINATOR_ACTIVE_JOB_MAX_MS = 45000/)
@@ -2924,7 +2925,7 @@ test('background tab opening updates authoritative Current Work', () => {
 test('stale queued tab retry gets a fresh attempt identity', () => {
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(
-        source,
+        readRepoFile('shared/js/swQueuedTabRetryStaleReconcile.js'),
         'function buildRetryQueuedTabAction(metadata = null, record = null, options = {})'
     )
     const advanceBody = extractFunction(
@@ -3669,7 +3670,7 @@ test('resume reattaches live active tabs after service worker restart', () => {
 test('storage reconcile immediately reconciles active rows whose persisted tab is gone', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(source, 'async function shouldImmediatelyReconcileMissingPersistedActiveTab(item = null, record = null)')
-    const timeoutHelperBody = extractFunction(source, 'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())')
+    const timeoutHelperBody = extractFunction(readRepoFile('shared/js/swQueuedTabRetryStaleReconcile.js'), 'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = getNow())')
     const decisionBody = extractFunction(source, 'async function getMissingActiveCoordinatorReconcileDecision(')
     const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
