@@ -2,16 +2,15 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-23 are landed and independently verified
+Status: in progress. Slices 1-30 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
 `3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
 `73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`, `5691a15`, `98d681d`,
-`c1413e5`, `82212ce`, `156a68d`, `8c4c7e4`). `shared/js/sw.js` is down to
-33,444 lines from 38,953 at the start of this effort (~14.1% reduction),
-with 23 new modules landed. The next slices resume past
-`swRolledBackQueuedTabRetryClassification.js`'s claimed range, still
-within the region after the excluded `createCoordinatorAuthority`-adjacent
-boundary (see "Boundary after Slice 17"). See
+`c1413e5`, `82212ce`, `156a68d`, `8c4c7e4`, `710b182`, `66c389c`, `442a060`,
+`80ab511`, `b0771e4`, `612c527`, `67998ae`). `shared/js/sw.js` is down to
+32,425 lines from 38,953 at the start of this effort (~16.7% reduction),
+with 30 new modules landed. The next slices resume with Slices 31-33 as
+defined below. See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
@@ -120,6 +119,18 @@ already-extracted modules -- not just `async`/`await` -- and treat a hit
 the same way an `async` function is treated: move it only after confirming
 `npm run test:parallel` stays green, and if it breaks, don't assume it's
 safe just because the function itself has no `await`.
+
+Refinement from Slice 30: merely *relaying* an unchained Promise reference
+is not the same as touching it. A function that calls another (resident)
+async function and returns its Promise directly -- no `await`, no
+`.then()`/`.catch()` of its own -- doesn't add a new crossing, because the
+tick cost is paid at the point something actually `await`s or chains a
+foreign-realm Promise, not at a plain pass-through return. The caller still
+awaits the same underlying Promise from the same originating realm either
+way. Verified with two full `test:parallel` runs. This is narrower than it
+sounds: the moment a function adds its own `.then()`, `.catch()`, or
+`await` on top of what it's relaying, it's back to a real crossing and
+needs the full scrutiny above.
 
 ## Sizing note: external-ref count is a cost signal, not a risk signal
 
