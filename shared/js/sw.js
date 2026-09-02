@@ -238,6 +238,9 @@ const {
 const {
     createQueuedTabActionAuthorityMatching
 } = require('./swQueuedTabActionAuthorityMatching')
+const {
+    createQueuedTabActionBookkeeping
+} = require('./swQueuedTabActionBookkeeping')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -433,7 +436,6 @@ let persistOwnedTabIdsTimeout = null
 let postStorageQueuedWorkContinuationReason = ''
 let postStorageQueuedWorkContinuationForceDurableQueueReload = false
 let persistentRetryFailedPromise = null
-let queuedTabReleaseFollowUpTimeout = null
 let coordinatorPauseGeneration = 0
 let coordinatorPauseRequested = false
 let queuedTabConcurrency = 1
@@ -2411,6 +2413,48 @@ const {
     registerOwnedTab,
     unregisterOwnedTab
 } = ownedTabLifecycle
+
+// queuedTabActionBookkeeping is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 38) -- see
+// swQueuedTabActionBookkeeping.js's header comment for the full ordering
+// writeup: queuedForegroundLeaseRuntime (immediately below) eagerly
+// references bare `makeClaimableQueuedTabAction` in its own
+// construction-call `handlers` object literal, and queuedTabReclaimResume
+// (constructed further down still) eagerly references bare
+// `rememberCanceledOwnerUrls` the same way. A `const` destructured from a
+// factory call is in the temporal dead zone until that line executes, so
+// this module must construct before the earlier of those two references,
+// i.e. right here, before queuedForegroundLeaseRuntime. queueRuntime,
+// getQueuedTabMetadata, getQueuedTabActionKey, normalizeQuoraProfileUrl,
+// normalizeAttemptId, getAttemptIdFromValue, and getAttemptNumberFromValue
+// are all already bare consts by this point; scheduleQueuedWorkContinuation
+// and scheduleCoordinatorQueueResume are still plain hoisted `function`
+// declarations far below in sw.js -- hoisted declarations are visible
+// throughout their enclosing scope regardless of textual position, so no
+// thunk is needed for either.
+const queuedTabActionBookkeeping = createQueuedTabActionBookkeeping({
+    setTimeoutFn: setTimeout,
+    handlers: {
+        queueRuntime,
+        getQueuedTabMetadata,
+        getQueuedTabActionKey,
+        normalizeQuoraProfileUrl,
+        normalizeAttemptId,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        scheduleQueuedWorkContinuation,
+        scheduleCoordinatorQueueResume
+    }
+})
+const {
+    collectQueuedTabActionKeys,
+    rememberCanceledOwnerUrls,
+    cancelQueuedOwnerActions,
+    consumeCanceledOwnerUrls,
+    scheduleQueuedTabReleaseFollowUp,
+    getQueuedTabExpectedAttemptId,
+    makeClaimableQueuedTabAction
+} = queuedTabActionBookkeeping
 
 // queuedForegroundLeaseRuntime is constructed here, rather than in place
 // like a plain-in-order slice, because hasOwnedQueuedTabState and
@@ -26125,27 +26169,6 @@ async function cancelCoordinatorExecutorsForReset(href = '', existing = null, re
     return {queued, active}
 }
 
-function collectQueuedTabActionKeys(ownerTabId = null) {
-    const keys = new Set()
-
-    for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
-        const metadata = getQueuedTabMetadata(tabId)
-        const ownerId = metadata?.ownerTabId || queueRuntime.getOwningParentForChild(tabId) || null
-        if(ownerTabId && ownerId !== ownerTabId) continue
-        const key = getQueuedTabActionKey(ownerId, metadata?.profileHref || metadata?.coordinatorKey || '', metadata?.tabAction || '')
-        if(key) keys.add(key)
-    }
-
-    for(const action of queueRuntime.listActivationIntents()) {
-        const ownerId = action?.ownerTabId || null
-        if(ownerTabId && ownerId !== ownerTabId) continue
-        const key = getQueuedTabActionKey(ownerId, action?.profileHref || action?.coordinatorKey || action?.url || '', action?.tabAction || '')
-        if(key) keys.add(key)
-    }
-
-    return keys
-}
-
 async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
     await pruneQueuedTabActions(parentTabId, options)
     const now = Date.now()
@@ -26505,35 +26528,6 @@ async function getCoordinatorQueueRuntimeState(request = {}) {
     }
 }
 
-function rememberCanceledOwnerUrls(ownerTabId, urls) {
-    if(!ownerTabId || !Array.isArray(urls) || !urls.length) return
-
-    queueRuntime.rememberCanceledQueuedOwnerUrls(ownerTabId, urls)
-}
-
-function cancelQueuedOwnerActions(ownerTabId, tabAction = null) {
-    if(!ownerTabId) return []
-
-    const canceledUrls = []
-
-    for(let index = queueRuntime.getActivationIntentCount() - 1; index >= 0; index -= 1) {
-        const action = queueRuntime.getActivationIntentAt(index)
-        if(action.ownerTabId !== ownerTabId) continue
-        if(tabAction && action.tabAction !== tabAction) continue
-
-        if(action.url) {
-            canceledUrls.push(action.url)
-        }
-        queueRuntime.dropRuntimeActionAt(index)
-    }
-
-    return canceledUrls
-}
-
-function consumeCanceledOwnerUrls(ownerTabId) {
-    return queueRuntime.consumeCanceledQueuedOwnerUrls(ownerTabId)
-}
-
 async function stopOwnerNukes(ownerTabId, options = {}) {
     if(!ownerTabId) return {canceledUrls: [], ownedTabIds: []}
 
@@ -26855,19 +26849,6 @@ async function releaseQueuedTab(tabId, options = {}) {
     }))
 }
 
-function scheduleQueuedTabReleaseFollowUp(delayMs = 500) {
-    scheduleQueuedWorkContinuation('queued-tab-release')
-
-    if(queuedTabReleaseFollowUpTimeout) return
-
-    queuedTabReleaseFollowUpTimeout = setTimeout(() => {
-        queuedTabReleaseFollowUpTimeout = null
-        scheduleCoordinatorQueueResume(1000, 'queued-tab-release-follow-up', {
-            allowBeforeQuora: true
-        })
-    }, Math.max(100, Number.parseInt(delayMs, 10) || 500))
-}
-
 function scheduleQueuedWorkContinuation(reason = 'queued-work-continuation') {
     const options = arguments[1] && typeof arguments[1] === 'object' ? arguments[1] : {}
     const normalizedReason = `${reason || 'queued-work-continuation'}`.trim() || 'queued-work-continuation'
@@ -26931,50 +26912,6 @@ function scheduleQueuedWorkContinuation(reason = 'queued-work-continuation') {
             edgeTriggered: true
         })
     })
-}
-
-function getQueuedTabExpectedAttemptId(tabId = null) {
-    if(!tabId) return ''
-    const metadata = getQueuedTabMetadata(tabId)
-    const action = queueRuntime.getPendingTabAction(tabId)
-    return normalizeAttemptId(metadata?.attemptId || action?.attemptId || '')
-}
-
-function makeClaimableQueuedTabAction(action = null, metadata = null) {
-    if(!action && !metadata) return null
-
-    const sourceAction = action || {}
-    const tabAction = sourceAction.action || metadata?.tabAction || null
-    const actionKind = sourceAction.actionKind || metadata?.actionKind || (
-        tabAction === 'nuke' ? 'mute-block' : tabAction || null
-    )
-
-    return {
-        ...sourceAction,
-        action: tabAction,
-        profileHref: normalizeQuoraProfileUrl(sourceAction.profileHref || sourceAction.targetUrl || metadata?.profileHref || metadata?.requestedUrl || ''),
-        targetUrl: sourceAction.targetUrl || sourceAction.profileHref || metadata?.profileHref || '',
-        coordinatorKey: sourceAction.coordinatorKey || metadata?.coordinatorKey || '',
-        requestedUrl: sourceAction.requestedUrl || metadata?.requestedUrl || '',
-        resolutionMode: sourceAction.resolutionMode || metadata?.resolutionMode || '',
-        resolveProfileFromPage: sourceAction.resolveProfileFromPage === true || metadata?.resolveProfileFromPage === true,
-        resolutionReason: sourceAction.resolutionReason || metadata?.resolutionReason || '',
-        candidateConfidence: sourceAction.candidateConfidence || metadata?.candidateConfidence || '',
-        candidateCollector: sourceAction.candidateCollector || metadata?.candidateCollector || '',
-        actionKind,
-        jobKey: sourceAction.jobKey || metadata?.jobKey || '',
-        scope: sourceAction.scope || metadata?.scope || null,
-        canonicalSubject: sourceAction.canonicalSubject || metadata?.canonicalSubject || null,
-        attempt: sourceAction.attempt || metadata?.attempt || null,
-        runId: sourceAction.runId || metadata?.runId || '',
-        noForegroundFallback: !!(sourceAction.noForegroundFallback || metadata?.noForegroundFallback),
-        actionSurfaceMode: sourceAction.actionSurfaceMode || metadata?.actionSurfaceMode || '',
-        actionSurfaceWindowId: sourceAction.actionSurfaceWindowId || metadata?.actionSurfaceWindowId || null,
-        actionSurfaceAnchorTabId: sourceAction.actionSurfaceAnchorTabId || metadata?.actionSurfaceAnchorTabId || null,
-        actionSurfaceActivatedAt: sourceAction.actionSurfaceActivatedAt || metadata?.actionSurfaceActivatedAt || 0,
-        attemptId: getAttemptIdFromValue(sourceAction) || getAttemptIdFromValue(metadata) || '',
-        attemptNumber: getAttemptNumberFromValue(sourceAction) || getAttemptNumberFromValue(metadata) || 0
-    }
 }
 
 async function isPersistedCoordinatorTabClaimableBySameProfileTab(item = null, record = null, itemKey = '', tab = {}) {
