@@ -655,19 +655,109 @@ names present -- apply the Promise-chain check carefully.
 `shouldRecoverQueuedProfileActionGateTerminalProgress`,
 `isExplicitSecurityVerificationRecord`, `isTransientProfileNukeStatus`.
 
-### Slices 34+ -- everything else, via the chaining protocol
+### Slice 34 -- Active-queued-tab staleness/confirmed-actor classification (~13 functions, lines 25133-25309)
 
-Beyond Slice 33, roughly another 150 sync functions remain from ~line
-27000 to 33184+ (queued-tab retry/action-key bookkeeping, coordinator-row-
-event metrics, milestone scheduling, content-page-state normalizers) --
-not hand-enumerated here, that would make this document large and
-guaranteed to drift out of date. Use the claim workflow above: regenerate
-the inventory, find the next line-adjacent same-bucket (or
-obviously-related-across-bucket) cluster past the excluded region, size
-it, propose it, execute it. After that region clears, what remains in
-`sw.js` is almost entirely the 298 `async` orchestration functions -- Part
-2 territory below, either blocked on Phase 0 or addressable piece-by-piece
-via the decide/act splitting idea.
+`getProgressHeartbeatAt`, `hasProgressTimestamp`, `getActiveQueuedTabStaleTimeoutMs`,
+`getActiveQueuedTabStartedAt`, `getActiveQueuedTabActionPhaseStartedAt`,
+`getActiveQueuedTabAgeAnchor`, `hasActiveQueuedTabActionPhaseProgress`,
+`getPersistedQueuedTabId` (37 refs), `getPersistedActiveProgressStaleAnchor`,
+`getPersistedActiveCoordinatorStaleAnchor`, `getOwnedOrExpectedLiveTabsForProfileHref`,
+`hasConfirmedRuntimeActorForCoordinatorItem`, `hasConfirmedLiveRuntimeActorForCoordinatorItem`.
+
+### Slice 35 -- Queued-tab retry-attempt/stale-nudge + missing-active-evidence reconcile (~10 functions, lines 25468-25761)
+
+`applyMissingActiveCoordinatorEvidenceReconcileActionLocked`,
+`shouldReconcileMissingActiveCoordinatorTab`, `makeMissingActiveCoordinatorProgressRecord`,
+`getQueuedTabRetryAttempt`, `getQueuedTabMaxRetries`, `hasStaleAcceptedQueuedTabNudge`,
+`isQueuedTabLoadPressure`, `buildRetryQueuedTabAction`, `getStaleRetryAdvanceKey`,
+`pruneStaleRetryAdvancedWakeKeys`.
+
+### Slice 36 -- Queued-tab detach/cleanup + runtime-surface dedupe (~5 functions, lines 25804-25936)
+
+`cleanupQueuedTabMetadataOnly`, `detachQueuedTabRuntimeState`,
+`getQueuedRuntimeSurfaceDedupeKey`, `findAuthorityTabIdForRuntimeSurface`,
+`scoreQueuedRuntimeSurfaceForKeep`.
+
+### Slice 37 -- Queued-tab action-key/authority matching (~14 functions, lines 26023-26393)
+
+`scheduleQueuedTabReleaseReconcile` (schedule-shaped, check per the
+Promise-chain note), `recordResidentAuthorityStaleQueuedActions`,
+`getQueuedTabActionKey` (23 refs), `shouldDropQueuedActionForCurrentAuthority`,
+`getQueuedTabActionKind`, `hasQueuedUnblockUnmuteWork`,
+`getEffectiveQueuedTabConcurrency`, `shouldDropQueuedActionForTerminalProgress`,
+`queuedTabActionMatchesProfile`, `queuedTabMetadataMatchesProfile`,
+`getQueuedTabUnconfirmedActiveTransitionAt`, `coordinatorItemMatchesQueuedTabRuntime`,
+`coordinatorQueuedItemMatchesRuntimeCandidate`, `shouldCheckQueuedTabRuntimeAuthority`.
+
+### Slice 38 -- Queued-tab action bookkeeping + canceled-owner-url tracking (~7 functions, lines 26587-27402)
+
+`collectQueuedTabActionKeys`, `rememberCanceledOwnerUrls`, `cancelQueuedOwnerActions`,
+`consumeCanceledOwnerUrls`, `scheduleQueuedTabReleaseFollowUp`,
+`getQueuedTabExpectedAttemptId`, `makeClaimableQueuedTabAction`.
+
+Caution: **exclude** `scheduleQueuedWorkContinuation` (65 external refs)
+sitting in this range -- same profile as `scheduleCoordinatorReconcile`/
+`scheduleCoordinatorQueueResume` (already excluded elsewhere), likely
+resident scheduling core.
+
+### Slice 39 -- Resolved-profile pending-space-record cleanup + coordinator row-event metrics (~7 functions, lines 27879-28514)
+
+`addResolvedProfileToPendingSpaceRecords`, `clearResolverPendingSpaceRecords`,
+`getCoordinatorRowEventMetricKind`, `incrementCoordinatorRowEventMetric`,
+`normalizeCoordinatorRowProgressEvent`, `buildCoordinatorRowEventsFromProgressRecords`,
+`shouldCloseRejectedStaleRowEventSenderTab`.
+
+### Slice 40 -- Coordinator job-milestone bookkeeping (~9 functions, lines 29043-29647)
+
+`scheduleTerminalProgressSettlement`, `scheduleTerminalProgressContinuation`,
+`clearPendingCoordinatorJobMilestone`, `consumePendingCoordinatorJobMilestone`,
+`getCoordinatorMilestoneWorkCounts`, `hasActiveCoordinatorMilestoneWork`,
+`shouldPersistExplicitCoordinatorMilestoneNow`, `updateQueuedTabMetadataFromMilestoneRecord`,
+`scheduleCoordinatorJobMilestoneFlush`.
+
+Caution: three schedule-shaped names present (`scheduleTerminalProgressSettlement`,
+`scheduleTerminalProgressContinuation`, `scheduleCoordinatorJobMilestoneFlush`)
+-- check each per the Promise-chain realm-crossing note, expect some to
+stay resident.
+
+### Slice 41 -- Queued-tab-open effect plan/patch builders (~3 functions, lines 29979-30116)
+
+`buildQueuedTabOpenEffectPlan`, `applyQueuedTabOpenRuntimeEffect`,
+`buildQueuedTabOpenedProgressPatch`.
+
+### Slice 42 -- Content-page-state projection helpers (~11 functions, lines 31556-31718)
+
+`normalizeContentPageStateUrl`, `getCoordinatorItemStateSources`,
+`shouldIncludeCoordinatorItemForContentPage`, `shouldIncludeProfileProgressForContentPage`,
+`normalizeCoordinatorContentQueueIndex`, `normalizeCoordinatorContentSourceIndexRecords`,
+`normalizeProfileNukeProgressView`, `hasMissingRequestedProfileProgressShard`,
+`hasMissingRequestedCoordinatorSourceShard`, `isContentPageStateProjectionMissing`,
+`shouldLoadFullQueueForTruncatedContentPageState`. Likely the last big
+cluster of sync functions in the file.
+
+### Slice 43 -- Retry on buildTerminalCoordinatorQueueItem + mop-up of remaining isolated singles
+
+Slice 28 left `buildTerminalCoordinatorQueueItem` (12 refs) resident
+because its dependency `buildCoordinatorFailureClassification` wasn't
+extracted yet -- it is now (Slice 25), so retry it. Plus whatever remains
+of the scattered isolated singles surrounded by resident async code:
+`getCoordinatorProgressInFlightKey`, `isSameActiveTransitionForCoordinatorItem`,
+`shouldKeepQueuedTabOpenAfterActiveTransitionFailure`,
+`shouldSkipResumeProjectionFallbackForTrustedAuthority`, `getStorageUpdateQueueSnapshot`,
+`shouldPreemptFinalOpenAuthorityRetry`, `shouldResetCoordinatorItemForIncoming`,
+`shouldResetCoordinatorExecutor`. Each sits alone with no natural
+neighbors -- bundle into whatever module fits contextually, or a small
+standalone module, verifying each individually.
+
+### Slices 44+ -- everything else, via the chaining protocol
+
+After Slice 43, what remains in `sw.js` is essentially: the resident-only
+scheduling core (`scheduleCoordinatorReconcile`, `scheduleCoordinatorQueueResume`,
+`scheduleQueuedWorkContinuation`, `promiseWithTimeout`, `enqueueSpaceFeedStorageUpdate`,
+and similar), the excluded `createCoordinatorAuthority` region, and the 298
+`async` orchestration functions -- i.e. Part 1 is essentially complete and
+Part 2 (below) is what's left. Re-survey the inventory at that point before
+assuming there's nothing more to claim; a stray cluster may still turn up.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
