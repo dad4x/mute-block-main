@@ -613,7 +613,11 @@ test('current terminal/direct progress ignores the full legacy progress blob', (
 })
 
 test('late tab-opening breadcrumbs cannot erase same-attempt action progress', () => {
-    const source = readRepoFile('shared/js/sw.js')
+    // mergeStoredProfileProgressRecord, normalizeProgressPatch,
+    // preserveAdvancedProfileProgress, getProfileProgressStatusRank, and
+    // profileProgressAttemptsMatch moved to swProfileProgressMerge.js in
+    // decomposition Slice 30.
+    const source = readRepoFile('shared/js/swProfileProgressMerge.js')
     const mergeBody = extractFunction(source, 'function mergeStoredProfileProgressRecord(existing = null, incoming = null, normalizedHref = \'\')')
     const normalizeBody = extractFunction(source, 'function normalizeProgressPatch(profileHref, patch = {}, existing = null)')
     const preserveBody = extractFunction(source, 'function preserveAdvancedProfileProgress(previous = {}, next = {})')
@@ -628,8 +632,10 @@ test('late tab-opening breadcrumbs cannot erase same-attempt action progress', (
 })
 
 test('late terminal failure cannot demote a same-attempt successful progress record', () => {
+    // shouldPreserveTerminalProfileProgress moved to swProfileProgressMerge.js
+    // in decomposition Slice 30.
     const body = extractFunction(
-        readRepoFile('shared/js/sw.js'),
+        readRepoFile('shared/js/swProfileProgressMerge.js'),
         'function shouldPreserveTerminalProfileProgress(previous = {}, incoming = {})'
     )
 
@@ -2994,7 +3000,9 @@ test('queued tab open lets durable queued authority outrank stale successful pro
 
 test('queued progress keeps sender tab id in persisted records', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const helperBody = extractFunction(source, 'function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null)')
+    // addSenderTabIdToProgressPatch moved to swProfileProgressMerge.js in
+    // decomposition Slice 30.
+    const helperBody = extractFunction(readRepoFile('shared/js/swProfileProgressMerge.js'), 'function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null)')
     // getActiveCoordinatorDirectProgressRuntimeRejectionReason moved to
     // swCoordinatorProgressRules.js in decomposition Slice 12.
     const runtimeGuardBody = extractFunction(readRepoFile('shared/js/swCoordinatorProgressRules.js'), 'function getActiveCoordinatorDirectProgressRuntimeRejectionReason(item = {}, patch = {}, mapped = {}, options = {})')
@@ -4339,7 +4347,9 @@ test('fresh queued tab progress clears stale close fields', () => {
 })
 
 test('queued retry progress clears stale terminal attempt fields', () => {
-    const swSource = readRepoFile('shared/js/sw.js')
+    // normalizeProgressPatch moved to swProfileProgressMerge.js in
+    // decomposition Slice 30.
+    const swSource = readRepoFile('shared/js/swProfileProgressMerge.js')
     const body = extractFunction(swSource, 'function normalizeProgressPatch(profileHref, patch = {}, existing = null)')
     const queuedIndex = body.indexOf("cleanPatch.status === 'queued'")
     const eventIndex = body.indexOf('const event =')
