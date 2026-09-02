@@ -178,6 +178,9 @@ const {
 const {
     createTabIdUtils
 } = require('./swTabIdUtils')
+const {
+    createPersistentRetryExecutorTimers
+} = require('./swPersistentRetryExecutorTimers')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -372,7 +375,6 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
 let persistOwnedTabIdsTimeout = null
 let postStorageQueuedWorkContinuationReason = ''
 let postStorageQueuedWorkContinuationForceDurableQueueReload = false
-let persistentRetryFailedTimeout = null
 let persistentRetryFailedPromise = null
 let queuedTabReleaseFollowUpTimeout = null
 let coordinatorPauseGeneration = 0
@@ -8531,25 +8533,50 @@ async function restoreCoordinatorPageForPersistentRetry() {
     }
 }
 
-function clearPersistentFailedRetryTimeout() {
-    if(persistentRetryFailedTimeout) {
-        clearTimeout(persistentRetryFailedTimeout)
-        persistentRetryFailedTimeout = null
+// persistentRetryExecutorTimers is constructed here, in place at this
+// cluster's old source-text position (decomposition Slice 22) -- no
+// already-extracted module eagerly references any of its five exported
+// names at its own construction site. clearPersistentFailedRetryAlarm and
+// runPersistentFailedRetryTick are plain hoisted `async function`
+// declarations further below in this file (out of scope, part of the
+// async orchestration layer) -- hoisted declarations are visible
+// throughout their enclosing scope regardless of textual position, so no
+// thunk is needed. See swPersistentRetryExecutorTimers.js's header comment
+// for the Promise-chain realm-crossing note covering
+// resetCoordinatorExecutorStartPromiseAfterTimeout/
+// clearStaleCoordinatorExecutorStartPromise's Promise.resolve() handling
+// (that pair's old function bodies, further below at their original
+// source-text position, were removed the same way).
+const persistentRetryExecutorTimers = createPersistentRetryExecutorTimers({
+    now: () => Date.now(),
+    setTimeoutFn: setTimeout,
+    clearTimeoutFn: clearTimeout,
+    constants: {
+        PERSISTENT_FAILED_RETRY_INTERVAL_MS,
+        COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS
+    },
+    handlers: {
+        clearPersistentFailedRetryAlarm,
+        runPersistentFailedRetryTick,
+        isExecutorRuntimeIdleForPromiseLatch,
+        incrementQueueWakeupMetric,
+        recordCoordinatorDiagnosticEvent
+    },
+    state: {
+        getCoordinatorExecutorStartPromiseStartedAt: () => coordinatorExecutorStartPromiseStartedAt,
+        resetCoordinatorExecutorStartPromise: () => {
+            coordinatorExecutorStartPromise = Promise.resolve()
+            coordinatorExecutorStartPromiseStartedAt = 0
+        }
     }
-}
-
-function clearPersistentFailedRetry() {
-    clearPersistentFailedRetryTimeout()
-    void clearPersistentFailedRetryAlarm()
-}
-
-function schedulePersistentFailedRetry(delayMs = PERSISTENT_FAILED_RETRY_INTERVAL_MS) {
-    clearPersistentFailedRetryTimeout()
-    persistentRetryFailedTimeout = setTimeout(() => {
-        persistentRetryFailedTimeout = null
-        void runPersistentFailedRetryTick()
-    }, Math.max(0, Number.parseInt(delayMs, 10) || 0))
-}
+})
+const {
+    clearPersistentFailedRetryTimeout,
+    clearPersistentFailedRetry,
+    schedulePersistentFailedRetry,
+    resetCoordinatorExecutorStartPromiseAfterTimeout,
+    clearStaleCoordinatorExecutorStartPromise
+} = persistentRetryExecutorTimers
 
 async function ensurePersistentFailedRetryAlarm() {
     if(!browser.alarms?.create) return false
@@ -8775,37 +8802,6 @@ async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {
     coordinatorExecutorStartPromise = trackedPromise
 
     return coordinatorExecutorStartPromise
-}
-
-function resetCoordinatorExecutorStartPromiseAfterTimeout(reason = 'executor-start-timeout') {
-    coordinatorExecutorStartPromise = Promise.resolve()
-    coordinatorExecutorStartPromiseStartedAt = 0
-    incrementQueueWakeupMetric('pump.executorStartPromiseReset')
-    recordCoordinatorDiagnosticEvent(
-        'coordinator-executor-start-promise-reset',
-        reason || 'executor start promise reset'
-    )
-    return true
-}
-
-function clearStaleCoordinatorExecutorStartPromise(reason = 'executor-start-stale-check') {
-    if(!coordinatorExecutorStartPromiseStartedAt) return false
-    if(!isExecutorRuntimeIdleForPromiseLatch()) return false
-
-    const ageMs = Date.now() - coordinatorExecutorStartPromiseStartedAt
-    const staleMs = COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS
-    if(ageMs < staleMs) return false
-
-    coordinatorExecutorStartPromise = Promise.resolve()
-    coordinatorExecutorStartPromiseStartedAt = 0
-    incrementQueueWakeupMetric('pump.changed.clearedStaleExecutorStartPromise')
-    incrementQueueWakeupMetric('pump.changed.clearedIdleStaleExecutorStartPromise')
-    recordCoordinatorDiagnosticEvent(
-        'coordinator-executor-start-promise-idle-stale-reset',
-        reason || 'executor start promise idle stale reset',
-        {ageMs, staleMs}
-    )
-    return true
 }
 
 function queuedRuntimeActionMatchesTabRuntime(action = {}, tabId = null) {
