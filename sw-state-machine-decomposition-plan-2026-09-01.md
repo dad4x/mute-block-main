@@ -2,16 +2,16 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-20 are landed and independently verified
+Status: in progress. Slices 1-23 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
 `3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
 `73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`, `5691a15`, `98d681d`,
-`c1413e5`). `shared/js/sw.js` is down to 33,750 lines from 38,953 at the
-start of this effort (~13.4% reduction), with 20 new modules landed. The
-next slices resume past `swCoordinatorTerminalSettlement.js`'s claimed
-range, still within the region after the excluded
-`createCoordinatorAuthority`-adjacent boundary (see "Boundary after Slice
-17"). See
+`c1413e5`, `82212ce`, `156a68d`, `8c4c7e4`). `shared/js/sw.js` is down to
+33,444 lines from 38,953 at the start of this effort (~14.1% reduction),
+with 23 new modules landed. The next slices resume past
+`swRolledBackQueuedTabRetryClassification.js`'s claimed range, still
+within the region after the excluded `createCoordinatorAuthority`-adjacent
+boundary (see "Boundary after Slice 17"). See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
