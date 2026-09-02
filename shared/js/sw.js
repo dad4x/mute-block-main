@@ -214,6 +214,9 @@ const {
 const {
     createQueuedForegroundLeaseRuntime
 } = require('./swQueuedForegroundLeaseRuntime')
+const {
+    createQueuedWorkerActionSurfaceState
+} = require('./swQueuedWorkerActionSurfaceState')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -22835,43 +22838,53 @@ async function buildTabCreateOptions(action = {}) {
     return options
 }
 
-function shouldUseQueuedWorkerActionSurface(action = {}) {
-    if(normalizeOwnedParentId(action?.ownerTabId) !== SERVICE_WORKER_QUEUE_OWNER_ID) return false
-    if(!isForegroundQueuedTabWork(action, null)) return false
-    if(!browser.windows?.create || !browser.tabs?.update) return false
-    return true
-}
-
-function resetQueuedWorkerActionSurface(reason = '') {
-    if(queuedActionSurfaceCleanupTimeout) {
-        clearTimeout(queuedActionSurfaceCleanupTimeout)
-        queuedActionSurfaceCleanupTimeout = null
+// queuedWorkerActionSurfaceState is constructed here, in place, since none
+// of its nine exports are eagerly referenced before this point in the file
+// (decomposition Slice 32, part 2 of 3) -- see
+// swQueuedWorkerActionSurfaceState.js's header comment for the state-
+// threading and Promise-chain-scrutiny writeup, including why
+// scheduleQueuedWorkerActionSurfaceCleanup (immediately below, still
+// interleaved with this cluster in source order) stays resident rather
+// than moving with it.
+const queuedWorkerActionSurfaceState = createQueuedWorkerActionSurfaceState({
+    now: () => Date.now(),
+    clearTimeoutFn: clearTimeout,
+    constants: {
+        SERVICE_WORKER_QUEUE_OWNER_ID
+    },
+    handlers: {
+        browser,
+        queueRuntime,
+        normalizeTabId,
+        normalizeOwnedParentId,
+        isForegroundQueuedTabWork,
+        getQueuedTabMetadata,
+        getQueuedActionSurfaceUrl,
+        getQueuedActionNoForegroundFallback,
+        incrementQueueWakeupMetric,
+        clearPersistedQueuedWorkerActionSurfaceState
+    },
+    state: {
+        getWindowId: () => queuedActionSurfaceWindowId,
+        setWindowId: value => { queuedActionSurfaceWindowId = value },
+        setAnchorTabId: value => { queuedActionSurfaceAnchorTabId = value },
+        getOpenPromise: () => queuedActionSurfaceOpenPromise,
+        getCleanupTimeout: () => queuedActionSurfaceCleanupTimeout,
+        setCleanupTimeout: value => { queuedActionSurfaceCleanupTimeout = value },
+        setCleanupDueAt: value => { queuedActionSurfaceCleanupDueAt = value }
     }
-    queuedActionSurfaceCleanupDueAt = 0
-    queuedActionSurfaceWindowId = null
-    queuedActionSurfaceAnchorTabId = null
-    void clearPersistedQueuedWorkerActionSurfaceState(reason || 'reset')
-    if(reason) {
-        incrementQueueWakeupMetric(`actionSurface.reset.${reason}`)
-    }
-}
-
-function isQueuedWorkerActionSurfaceUrl(url = '') {
-    return `${url || ''}` === getQueuedActionSurfaceUrl()
-}
-
-function makeQueuedWorkerActionSurfaceState(windowId = null, anchorTabId = null, reason = '') {
-    const normalizedWindowId = Number.parseInt(windowId, 10) || 0
-    const normalizedAnchorTabId = normalizeTabId(anchorTabId || null)
-    if(!normalizedWindowId) return null
-    return {
-        windowId: normalizedWindowId,
-        anchorTabId: normalizedAnchorTabId || null,
-        url: getQueuedActionSurfaceUrl(),
-        reason: `${reason || ''}`.trim(),
-        updatedAt: Date.now()
-    }
-}
+})
+const {
+    shouldUseQueuedWorkerActionSurface,
+    resetQueuedWorkerActionSurface,
+    isQueuedWorkerActionSurfaceUrl,
+    makeQueuedWorkerActionSurfaceState,
+    isIdleQueuedWorkerActionSurfaceTab,
+    hasQueuedWorkerActionSurfaceRuntimeWork,
+    hasDurableQueuedBacklogForActionSurface,
+    tagActionWithQueuedWorkerSurface,
+    isQueuedWorkerActionSurfaceTab
+} = queuedWorkerActionSurfaceState
 
 async function persistQueuedWorkerActionSurfaceState(windowId = null, anchorTabId = null, reason = '') {
     const state = makeQueuedWorkerActionSurfaceState(windowId, anchorTabId, reason)
@@ -23040,14 +23053,6 @@ async function reconcileQueuedWorkerActionSurfaceSingleton(anchorTab = null, rea
     return closed
 }
 
-function isIdleQueuedWorkerActionSurfaceTab(tab = null) {
-    const url = `${tab?.url || ''}`
-    return !url ||
-        /^about:blank$/i.test(url) ||
-        /^chrome:\/\/newtab\/?$/i.test(url) ||
-        isQueuedWorkerActionSurfaceUrl(url)
-}
-
 async function findReusableIdleQueuedWorkerActionSurfaceWindow(previousActiveTab = null) {
     if(!browser.tabs?.query) return null
 
@@ -23115,43 +23120,6 @@ async function closeIdleQueuedWorkerActionSurfaceWindows(reason = 'idle-orphan')
         incrementQueueWakeupMetric('actionSurface.workerWindow.idleOrphanClosed', closed)
     }
     return closed
-}
-
-function hasQueuedWorkerActionSurfaceRuntimeWork(windowId = queuedActionSurfaceWindowId) {
-    const normalizedWindowId = Number.parseInt(windowId, 10) || 0
-    if(queuedActionSurfaceOpenPromise) return true
-
-    for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
-        const metadata = getQueuedTabMetadata(tabId)
-        if(!metadata) continue
-        if(metadata.actionSurfaceMode === 'worker-window') return true
-        if(normalizedWindowId && Number.parseInt(metadata.actionSurfaceWindowId, 10) === normalizedWindowId) return true
-        if(normalizedWindowId && Number.parseInt(metadata.ownerWindowId, 10) === normalizedWindowId) return true
-    }
-
-    for(const action of queueRuntime.listPendingTabActions()) {
-        if(action?.actionSurfaceMode === 'worker-window') return true
-        if(normalizedWindowId && Number.parseInt(action?.actionSurfaceWindowId, 10) === normalizedWindowId) return true
-        if(normalizedWindowId && Number.parseInt(action?.ownerWindowId, 10) === normalizedWindowId) return true
-    }
-
-    return false
-}
-
-function hasDurableQueuedBacklogForActionSurface(queue = {}, windowId = null) {
-    const queuedItems = Object.values(queue || {})
-        .filter(item => `${item?.status || ''}`.trim() === 'queued')
-    if(!queuedItems.length) return false
-
-    const normalizedWindowId = Number.parseInt(windowId, 10) || 0
-    if(!normalizedWindowId) return true
-
-    return queuedItems.some(item => {
-        const itemWindowId = Number.parseInt(item?.actionSurfaceWindowId, 10) || 0
-        if(itemWindowId) return itemWindowId === normalizedWindowId
-        return `${item?.actionSurfaceMode || ''}`.trim() === 'worker-window' ||
-            getQueuedActionNoForegroundFallback(item)
-    })
 }
 
 async function hasDurableQueuedCoordinatorWorkForActionSurface(reason = 'worker-surface-cleanup', windowId = null) {
@@ -23371,25 +23339,6 @@ async function getOrCreateQueuedWorkerActionSurface(previousActiveTab = null) {
         })
 
     return queuedActionSurfaceOpenPromise
-}
-
-function tagActionWithQueuedWorkerSurface(action = {}, surface = {}, tab = {}, activatedAt = Date.now()) {
-    action.actionSurfaceMode = 'worker-window'
-    action.actionSurfaceWindowId = surface.windowId || tab.windowId || null
-    action.actionSurfaceAnchorTabId = surface.anchorTabId || null
-    action.actionSurfaceActivatedAt = activatedAt
-    return action
-}
-
-function isQueuedWorkerActionSurfaceTab(tab = null, metadata = null) {
-    const tabWindowId = Number.parseInt(tab?.windowId, 10) || 0
-    const metadataWindowId = Number.parseInt(metadata?.actionSurfaceWindowId, 10) || 0
-    const currentWindowId = Number.parseInt(queuedActionSurfaceWindowId, 10) || 0
-
-    if(metadata?.actionSurfaceMode === 'worker-window') return true
-    if(tabWindowId && metadataWindowId && tabWindowId === metadataWindowId) return true
-    if(tabWindowId && currentWindowId && tabWindowId === currentWindowId) return true
-    return false
 }
 
 async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = {}) {
