@@ -202,6 +202,9 @@ const {
 const {
     createSwSchedulerAlarmBookkeeping
 } = require('./swSchedulerAlarmBookkeeping')
+const {
+    createCoordinatorRetryCandidates
+} = require('./swCoordinatorRetryCandidates')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -1770,6 +1773,62 @@ const {
     drainPendingCoordinatorDiagnosticEvents,
     shouldFlushPendingCoordinatorDiagnosticEventsNow
 } = coordinatorJobEnvelope
+
+// coordinatorRetryCandidates is constructed here, well before this cluster's
+// old source-text location (decomposition Slice 29): rolledBackQueuedTabRetryClassification
+// (further below) eagerly references bare `getCoordinatorFailureRetryCount`
+// in its own construction-call handlers object. A hoisted `function`
+// declaration is visible throughout its enclosing scope; a `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes -- so this module must construct before that reference.
+// It's placed immediately after coordinatorJobEnvelope (just above) since
+// that's its own latest-constructed dependency (getFailedItemProfileResolutionRetryUrl,
+// applyCoordinatorJobEnvelope); its other deps (coordinatorExecutorClassification,
+// coordinatorStatusRules, coordinatorProgressRules, coordinatorAttemptIdentity,
+// profileResolution, coordinatorRuns, and top-of-file subject.js/jobState.js
+// requires) are all already available by this point. See
+// swCoordinatorRetryCandidates.js's header comment for the full writeup.
+const coordinatorRetryCandidates = createCoordinatorRetryCandidates({
+    now: () => Date.now(),
+    handlers: {
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        normalizeTabTargetUrl,
+        getFailedItemProfileResolutionRetryUrl,
+        isRetryableCoordinatorFailure,
+        shouldApplyProgressToCoordinatorItem,
+        isSuccessfulProfileNukeRecord,
+        isExplicitSecurityVerificationRecord,
+        isTerminalProfileNukeRecord,
+        isRetryableTerminalProfileNukeRecord,
+        makeId,
+        makeAttemptId,
+        getNextAttemptNumberFromValue,
+        normalizeCoordinatorRequestedUrl,
+        stripProfileResolutionQueueKey,
+        makeProfileResolutionQueueKey,
+        getCoordinatorItemQueueKey,
+        getCoordinatorActionKindForRequestedAction,
+        getCoordinatorExecutorTabActionForActionKind,
+        reduceJobEvent,
+        getQueuedTabMaxRetries,
+        applyCoordinatorJobEnvelope,
+        makeEmptyCoordinatorMilestones
+    },
+    constants: {
+        JOB_EVENT_RETRY,
+        QUEUED_PROFILE_RESOLUTION_MODE
+    }
+})
+const {
+    makeStoredWorkRecoveryResumeOwnedResult,
+    getCoordinatorFailureRetryCount,
+    getCoordinatorFailureLastRetryAt,
+    sortCoordinatorRetryCandidates,
+    getCoordinatorRetryableFailureCandidates,
+    getCoordinatorRetrySourcePages,
+    buildFailedCoordinatorResetItem
+} = coordinatorRetryCandidates
 
 // queuedRuntimeActionMatching is constructed here, well before this
 // cluster's old source-text location (decomposition Slice 23, part 1):
@@ -18976,16 +19035,6 @@ async function recoverStoredCoordinatorWork(reason = 'stored-work-recovery', opt
     return runCoordinatorReconcileTick(reason, options)
 }
 
-function makeStoredWorkRecoveryResumeOwnedResult(reason = 'stored-work-recovery', hasWork = false, paused = false) {
-    return {
-        recovered: false,
-        reason,
-        resume: {skipped: true, reason: 'resume-owned-by-reconcile'},
-        hasWork,
-        paused
-    }
-}
-
 async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery', options = {}) {
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(options.currentAuthorityState || null) ||
         getHydratedCoordinatorAuthorityState('storedWorkRecovery.usedResidentAuthority') ||
@@ -19110,177 +19159,6 @@ async function runScheduledCoordinatorReconcileTick(reason = 'coordinator-reconc
             reason: 'reconcile-tick-error',
             edgeTriggered: true
         })
-    }
-}
-
-function getCoordinatorFailureRetryCount(item = {}) {
-    return Number.parseInt(item?.retryCount, 10) || 0
-}
-
-function getCoordinatorFailureLastRetryAt(item = {}) {
-    return Number.parseInt(item?.lastRetryAt, 10) || 0
-}
-
-function sortCoordinatorRetryCandidates(left, right) {
-    const leftItem = left?.item || {}
-    const rightItem = right?.item || {}
-    const retryDelta = getCoordinatorFailureRetryCount(leftItem) - getCoordinatorFailureRetryCount(rightItem)
-    if(retryDelta) return retryDelta
-
-    const lastRetryDelta = getCoordinatorFailureLastRetryAt(leftItem) - getCoordinatorFailureLastRetryAt(rightItem)
-    if(lastRetryDelta) return lastRetryDelta
-
-    const leftTerminalAt = Number.parseInt(leftItem.terminalAt || leftItem.updatedAt || leftItem.createdAt, 10) || 0
-    const rightTerminalAt = Number.parseInt(rightItem.terminalAt || rightItem.updatedAt || rightItem.createdAt, 10) || 0
-    return leftTerminalAt - rightTerminalAt || `${left?.href || ''}`.localeCompare(`${right?.href || ''}`)
-}
-
-function getCoordinatorRetryableFailureCandidates(queue = {}, progress = {}, retryLimit = 2) {
-    return Object.entries(queue || {})
-        .map(([itemKey, item]) => {
-            const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-            const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-            return {href, itemKey, item, resolutionRetryUrl}
-        })
-        .filter(candidate => {
-            const href = candidate.href
-            const item = candidate.item
-            if(!href && !candidate.resolutionRetryUrl) return false
-            if(!isRetryableCoordinatorFailure(item)) return false
-            if(getCoordinatorFailureRetryCount(item) >= retryLimit) return false
-
-            const progressRecord = progress[href] || null
-            const applicableProgressRecord = shouldApplyProgressToCoordinatorItem(item, progressRecord)
-                ? progressRecord
-                : null
-            if(isSuccessfulProfileNukeRecord(applicableProgressRecord)) return false
-            if(isExplicitSecurityVerificationRecord(applicableProgressRecord)) return false
-            if(isTerminalProfileNukeRecord(applicableProgressRecord) && !isRetryableTerminalProfileNukeRecord(applicableProgressRecord)) return false
-
-            return true
-        })
-        .sort(sortCoordinatorRetryCandidates)
-}
-
-function getCoordinatorRetrySourcePages(items = []) {
-    const sourcePages = new Set()
-
-    for(const item of items || []) {
-        if(item?.source?.pageUrl) sourcePages.add(item.source.pageUrl)
-        for(const source of item?.sources || []) {
-            if(source?.pageUrl) sourcePages.add(source.pageUrl)
-        }
-    }
-
-    return Array.from(sourcePages)
-}
-
-function buildFailedCoordinatorResetItem(itemKey = '', item = {}, options = {}) {
-    const now = Number.parseInt(options.now, 10) || Date.now()
-    const runId = options.runId || makeId('failed-reset')
-    const request = options.request || {}
-    const resetQueuedTabRuntime = options.resetQueuedTabRuntime === true
-    const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-    const retryViaResolution = !!resolutionRetryUrl
-    const sourceHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    const href = retryViaResolution ? '' : sourceHref
-    const coordinatorKey = retryViaResolution
-        ? makeProfileResolutionQueueKey(resolutionRetryUrl)
-        : href || getCoordinatorItemQueueKey(item, itemKey)
-    const attemptId = makeAttemptId()
-    const attemptNumber = getNextAttemptNumberFromValue(item)
-    const retryCount = Math.max(0, Number.parseInt(options.retryCount, 10) || 0)
-    const lastRetryAt = Math.max(0, Number.parseInt(options.lastRetryAt, 10) || 0)
-    const retryReason = options.retryReason || ''
-    const requestedUrl = resolutionRetryUrl || (
-        options.requestedUrlMode === 'coordinator'
-            ? normalizeCoordinatorRequestedUrl(item.requestedUrl || href || stripProfileResolutionQueueKey(coordinatorKey))
-            : normalizeTabTargetUrl(item.requestedUrl || href)
-    )
-    const actionKind = getCoordinatorActionKindForRequestedAction(item.actionKind || item.tabAction || item.executorTabAction || '')
-    const reducedRetry = reduceJobEvent(item, {
-        type: JOB_EVENT_RETRY,
-        attemptId,
-        attemptNumber,
-        at: now,
-        retryCount,
-        lastRetryAt
-    })
-    const retryBase = reducedRetry.accepted ? reducedRetry.item : item
-    const executorMaxConcurrent = Number.parseInt(options.maxConcurrent, 10) || 0
-    const maxRetries = getQueuedTabMaxRetries(item)
-    const maxAttempts = resetQueuedTabRuntime
-        ? Math.max(
-            Number.parseInt(item?.maxAttempts || item?.attempt?.max, 10) || 0,
-            attemptNumber + maxRetries + 1,
-            maxRetries + 1
-        )
-        : Number.parseInt(item?.maxAttempts || item?.attempt?.max, 10) || 0
-
-    const nextItem = applyCoordinatorJobEnvelope({
-        ...retryBase,
-        runId,
-        attemptId,
-        attemptNumber,
-        targetProfileHref: href,
-        dedupeKey: href || coordinatorKey,
-        coordinatorKey,
-        resolutionMode: retryViaResolution ? QUEUED_PROFILE_RESOLUTION_MODE : '',
-        resolveProfileFromPage: retryViaResolution,
-        resolutionReason: retryViaResolution ? item.resolutionReason || 'failed-target-source-post-revisit' : item.resolutionReason || '',
-        requestedUrl: requestedUrl || href,
-        actionKind,
-        executorTabAction: getCoordinatorExecutorTabActionForActionKind(actionKind),
-        ...(executorMaxConcurrent ? {executorMaxConcurrent} : {}),
-        executorOwner: 'service-worker',
-        serviceWorkerOwned: true,
-        executorNoForegroundFallback: request.noForegroundFallback === false
-            ? false
-            : item.executorNoForegroundFallback === true || item.noForegroundFallback === true || request.noForegroundFallback === true,
-        status: 'queued',
-        outcome: '',
-        error: '',
-        updatedAt: now,
-        queuedAt: now,
-        activeAt: 0,
-        terminalAt: 0,
-        tabId: null,
-        attempt: 0,
-        retryAttempt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.retryAttempt, 10) || 0,
-        maxRetries,
-        ...(maxAttempts > 0 ? {maxAttempts} : {}),
-        retryCount,
-        lastRetryAt,
-        retryReason,
-        actionLease: null,
-        actionLeaseReleasedAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.actionLeaseReleasedAt, 10) || 0,
-        actionLeaseReleaseReason: resetQueuedTabRuntime ? '' : retryBase?.actionLeaseReleaseReason || '',
-        actionSurfaceMode: resetQueuedTabRuntime ? '' : retryBase?.actionSurfaceMode || '',
-        actionSurfaceWindowId: resetQueuedTabRuntime ? null : retryBase?.actionSurfaceWindowId || null,
-        actionSurfaceAnchorTabId: resetQueuedTabRuntime ? null : retryBase?.actionSurfaceAnchorTabId || null,
-        actionSurfaceActivatedAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.actionSurfaceActivatedAt, 10) || 0,
-        loadPressureRequeueCount: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.loadPressureRequeueCount, 10) || 0,
-        lastLoadPressureAt: resetQueuedTabRuntime ? 0 : Number.parseInt(retryBase?.lastLoadPressureAt, 10) || 0,
-        sourceSettledAt: 0,
-        sourceSettlementKey: '',
-        sourceSettlementOutcome: '',
-        milestones: makeEmptyCoordinatorMilestones()
-    }, {
-        runInput: {id: runId, sourceType: options.envelopeSourceType || 'failed-retry'},
-        source: item.source || {},
-        runId,
-        targetProfileHref: href,
-        requestedUrl: requestedUrl || href,
-        coordinatorKey,
-        actionKind
-    })
-
-    return {
-        nextItem,
-        coordinatorKey,
-        href,
-        sourceHref,
-        retryViaResolution
     }
 }
 
