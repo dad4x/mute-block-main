@@ -199,6 +199,9 @@ const {
 const {
     createQueuedTabReclaimResume
 } = require('./swQueuedTabReclaimResume')
+const {
+    createSwSchedulerAlarmBookkeeping
+} = require('./swSchedulerAlarmBookkeeping')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -17275,11 +17278,6 @@ async function runCoordinatorReconcileExecutorActions(reason = 'reconcile-execut
     })
 }
 
-function nextCoordinatorPauseGeneration() {
-    coordinatorPauseGeneration += 1
-    return coordinatorPauseGeneration
-}
-
 async function nextCoordinatorPauseGenerationFromStorage() {
     const stored = await metricStorageGet({
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0
@@ -17288,17 +17286,6 @@ async function nextCoordinatorPauseGenerationFromStorage() {
     const storedGeneration = Number.parseInt(stored?.[COORDINATOR_PAUSE_GENERATION_KEY], 10) || 0
     coordinatorPauseGeneration = Math.max(coordinatorPauseGeneration, storedGeneration)
     return nextCoordinatorPauseGeneration()
-}
-
-function isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration = 0) {
-    const generation = Number.parseInt(pauseGeneration, 10) || 0
-    return !!generation &&
-        coordinatorPauseRequested === true &&
-        generation === coordinatorPauseGeneration
-}
-
-function isCoordinatorPauseRequestedLocally() {
-    return coordinatorPauseRequested === true
 }
 
 async function isCoordinatorPauseGenerationCurrent(pauseGeneration = 0) {
@@ -17328,21 +17315,6 @@ async function restoreLatestCoordinatorPauseGenerationIfStale(pauseGeneration = 
 
     await setCoordinatorPauseControlState(coordinatorPauseRequested === true, coordinatorPauseGeneration, 'ordinaryMutation')
     return true
-}
-
-function scheduleCoordinatorPauseStateReconcile(reason = 'pause-generation-reconcile') {
-    setTimeout(() => {
-        void setCoordinatorPauseControlState(
-            coordinatorPauseRequested === true,
-            coordinatorPauseGeneration,
-            'reconcile'
-        ).catch(() => null)
-
-        if(coordinatorPauseRequested !== true) {
-            void setCoordinatorRunsPaused(false).catch(() => null)
-            void kickCoordinatorQueueResume(reason).catch(() => null)
-        }
-    }, 0)
 }
 
 async function pauseCoordinatorNukesCleanup(pauseGeneration = coordinatorPauseGeneration) {
@@ -17630,26 +17602,6 @@ async function mutateCoordinatorPauseStateSet(operation = {}) {
     }
 }
 
-function buildPausedCoordinatorQueueItem(item = {}, now = Date.now(), reason = 'coordinator-pause-request') {
-    return {
-        ...item,
-        status: 'queued',
-        outcome: '',
-        error: '',
-        updatedAt: now,
-        activeAt: 0,
-        terminalAt: 0,
-        tabId: null,
-        actionLease: null,
-        actionLeaseReleasedAt: now,
-        actionLeaseReleaseReason: reason,
-        milestones: {
-            ...makeEmptyCoordinatorMilestones(),
-            ...(item.milestones || {})
-        }
-    }
-}
-
 async function pauseStoredCoordinatorWork(options = {}) {
     const reason = `${options.reason || 'coordinator-pause-request'}`.trim()
     const pauseGeneration = Number.parseInt(options.pauseGeneration, 10) || 0
@@ -17792,86 +17744,6 @@ async function terminalizeCoordinatorKeyOnlyItem(coordinatorKey = '', options = 
     })
 }
 
-function hasStoredCoordinatorWork(queue = {}) {
-    return Object.values(queue || {}).some(item => {
-        const status = `${item?.status || ''}`.trim()
-        return isPendingCoordinatorStatus(status) && isCoordinatorQueueAuthoritativeItem(item)
-    })
-}
-
-function hasStoredCoordinatorWorkInQueueView(view = null) {
-    if(view?.hasAuthoritativeStoredWork === true) return true
-    const counts = view && typeof view === 'object' ? view.authoritativeCounts || {} : {}
-    return ['queued', 'opening', 'active', 'acting', 'settling']
-        .some(status => (Number.parseInt(counts[status], 10) || 0) > 0)
-}
-
-function normalizeRawCoordinatorQueueForReconcileFallback(rawQueue = {}) {
-    const normalizedQueue = {}
-    const now = Date.now()
-    for(const [itemKey, rawItem] of Object.entries(rawQueue || {})) {
-        if(!rawItem || typeof rawItem !== 'object') continue
-        if(!isCoordinatorQueueAuthoritativeItem(rawItem)) {
-            normalizedQueue[itemKey] = rawItem
-            continue
-        }
-        const href = getCoordinatorItemHref(rawItem) ||
-            normalizeQuoraProfileUrl(itemKey) ||
-            normalizeQuoraProfileUrl(rawItem.requestedUrl || rawItem.targetProfileHref || rawItem.dedupeKey || '')
-        const requestedUrl = isProfileResolutionItem(rawItem) || `${itemKey || ''}`.trim().startsWith('resolve-profile:')
-            ? getProfileResolutionRequestedUrl(rawItem, itemKey)
-            : normalizeCoordinatorRequestedUrl(rawItem.requestedUrl || href || itemKey)
-        const coordinatorKey = getCoordinatorItemQueueKey(rawItem, itemKey) || href || `${itemKey || ''}`.trim()
-        const actionKind = getCoordinatorActionKindForRequestedAction(
-            rawItem.actionKind ||
-            rawItem.tabAction ||
-            rawItem.executorTabAction ||
-            'nuke'
-        ) || 'mute-block'
-        const executorTabAction = rawItem.executorTabAction ||
-            rawItem.tabAction ||
-            getCoordinatorExecutorTabActionForActionKind(actionKind) ||
-            'nuke'
-        const attemptId = getAttemptIdFromValue(rawItem)
-        const attemptNumber = getAttemptNumberFromValue(rawItem)
-        const maxAttempts = Number.parseInt(rawItem.maxAttempts ?? rawItem.maxRetries, 10) || STALE_QUEUED_TAB_MAX_RETRIES
-        const baseItem = {
-            ...rawItem,
-            status: rawItem.status || 'queued',
-            targetProfileHref: href || rawItem.targetProfileHref || '',
-            requestedUrl,
-            dedupeKey: rawItem.dedupeKey || href || coordinatorKey,
-            coordinatorKey,
-            actionKind,
-            executorTabAction,
-            tabAction: rawItem.tabAction || executorTabAction,
-            executorOwner: rawItem.executorOwner || 'service-worker',
-            serviceWorkerOwned: rawItem.serviceWorkerOwned !== false,
-            ...(rawItem.executorNoForegroundFallback === true || rawItem.noForegroundFallback === true
-                ? {executorNoForegroundFallback: true}
-                : {}),
-            executorMaxConcurrent: Number.parseInt(rawItem.executorMaxConcurrent, 10) || 1,
-            ...(attemptId ? {attemptId} : {}),
-            ...(attemptNumber ? {attemptNumber} : {}),
-            maxAttempts,
-            maxRetries: Number.parseInt(rawItem.maxRetries ?? rawItem.maxAttempts, 10) || STALE_QUEUED_TAB_MAX_RETRIES,
-            ...(attemptId || attemptNumber
-                ? {attempt: makeCoordinatorAttemptEnvelope(rawItem, attemptId, attemptNumber, maxAttempts)}
-                : {}),
-            createdAt: Number.parseInt(rawItem.createdAt, 10) || now,
-            updatedAt: Number.parseInt(rawItem.updatedAt, 10) || now
-        }
-        normalizedQueue[itemKey] = applyCoordinatorJobEnvelope(baseItem, {
-            targetProfileHref: href || '',
-            requestedUrl,
-            coordinatorKey,
-            actionKind,
-            runId: rawItem.runId || ''
-        })
-    }
-    return normalizedQueue
-}
-
 async function hasUnpausedStoredCoordinatorWorkInQueueView(reason = 'stored-work-scheduler') {
     const stored = await metricStorageGet({
         [COORDINATOR_QUEUE_VIEW_KEY]: null,
@@ -17924,115 +17796,76 @@ async function shouldAllowStoredWorkBeforeQuora(reason = 'stored-work-scheduler'
     return hasUnpausedStoredCoordinatorWorkInQueueView(reason)
 }
 
-function isCoordinatorReconcileEdgeTriggerReason(reason = '') {
-    const normalized = `${reason || ''}`.trim()
-    return /^(?:startup.*|content-ready.*|post-enqueue.*|dashboard-.*|manual|terminal-.*|tab-removed|active-transition-.*|claim-durable-confirmation-failed|queued-tab-(?:open-failed|fill-error)|.*(?:timeout|mismatch|runtime).*)$/i.test(normalized)
-}
-
-function clearNamedSchedulerAlarm(name = '') {
-    if(!name || !browser.alarms?.clear) return
-
-    try {
-        const clearResult = browser.alarms.clear(name)
-        if(clearResult?.catch) clearResult.catch(() => false)
-    }
-    catch {}
-}
-
-function clearCoordinatorReconcileAlarms() {
-    clearNamedSchedulerAlarm(COORDINATOR_RECONCILE_ALARM_NAME)
-}
-
-function isCoordinatorReconcileAlarmName(name = '') {
-    return name === COORDINATOR_RECONCILE_ALARM_NAME
-}
-
-function getSchedulerAlarmScheduledTime(alarm = null) {
-    return Number.parseInt(alarm?.scheduledTime, 10) || 0
-}
-
-function isSchedulerAlarmScheduledForDueAt(scheduledTime = 0, dueAt = 0) {
-    if(!scheduledTime || !dueAt) return false
-
-    return scheduledTime >= dueAt - SCHEDULER_ALARM_TIME_TOLERANCE_MS &&
-        scheduledTime <= dueAt + SCHEDULER_ALARM_LATE_TOLERANCE_MS
-}
-
-function suppressStaleCoordinatorResumeAlarm(dueAt = 0) {
-    coordinatorQueueResumeScheduler.markAlarmSuppressed(dueAt, Date.now(), STALE_SCHEDULER_ALARM_SUPPRESSION_MS)
-    clearNamedSchedulerAlarm(COORDINATOR_RESUME_ALARM_NAME)
-}
-
-function suppressStaleCoordinatorReconcileAlarm(dueAt = 0) {
-    coordinatorReconcileScheduler.markAlarmSuppressed(dueAt, Date.now(), STALE_SCHEDULER_ALARM_SUPPRESSION_MS)
-    clearCoordinatorReconcileAlarms()
-}
-
-function scheduleCoordinatorResumeAlarm(dueAt = 0) {
-    const scheduledDueAt = Number.parseInt(dueAt, 10) || 0
-    if(!scheduledDueAt || !browser.alarms?.create) return false
-
-    try {
-        const alarmResult = browser.alarms.create(COORDINATOR_RESUME_ALARM_NAME, {when: scheduledDueAt})
-        const alarmPromise = coordinatorQueueResumeScheduler.setAlarmPromiseForDueAt(alarmResult, scheduledDueAt)
-        alarmPromise.catch(() => false)
-        incrementQueueWakeupMetric('pump.alarmScheduled')
-        return true
-    }
-    catch {
-        coordinatorQueueResumeScheduler.setAlarmPromise(Promise.resolve(false))
-        return false
-    }
-}
-
-function isSuppressedStaleCoordinatorResumeAlarm(alarm = null) {
-    const scheduledTime = getSchedulerAlarmScheduledTime(alarm)
-    const dueAt = coordinatorQueueResumeScheduler.getDueAt()
-    if(dueAt && scheduledTime) {
-        return !isSchedulerAlarmScheduledForDueAt(scheduledTime, dueAt)
-    }
-    if(dueAt) return false
-    const clearedDueAt = coordinatorQueueResumeScheduler.getClearedAlarmDueAt()
-    if(scheduledTime && clearedDueAt) {
-        return isSchedulerAlarmScheduledForDueAt(scheduledTime, clearedDueAt)
-    }
-
-    return coordinatorQueueResumeScheduler.isSuppressionActive(Date.now())
-}
-
-function isSuppressedStaleCoordinatorReconcileAlarm(alarm = null) {
-    const scheduledTime = getSchedulerAlarmScheduledTime(alarm)
-    const dueAt = coordinatorReconcileScheduler.getDueAt()
-    if(dueAt && scheduledTime) {
-        return !isSchedulerAlarmScheduledForDueAt(scheduledTime, dueAt)
-    }
-    if(dueAt) return false
-    const clearedDueAt = coordinatorReconcileScheduler.getClearedAlarmDueAt()
-    if(scheduledTime && clearedDueAt) {
-        return isSchedulerAlarmScheduledForDueAt(scheduledTime, clearedDueAt)
-    }
-
-    return coordinatorReconcileScheduler.isSuppressionActive(Date.now())
-}
-
-function resetCoordinatorReconcileBackoff(reason = 'reconcile-edge-trigger') {
-    if(!coordinatorReconcileScheduler.resetBackoff()) return
-    incrementQueueWakeupMetric('reconcile.backoffReset')
-}
-
-function recordCoordinatorReconcileNoopBackoff() {
-    const backoff = coordinatorReconcileScheduler.recordNoopBackoff(
+const swSchedulerAlarmBookkeeping = createSwSchedulerAlarmBookkeeping({
+    handlers: {
+        browser,
+        incrementQueueWakeupMetric,
+        recordQueueWakeupMetricMax,
+        isPendingCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        makeEmptyCoordinatorMilestones,
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        isProfileResolutionItem,
+        getProfileResolutionRequestedUrl,
+        normalizeCoordinatorRequestedUrl,
+        getCoordinatorItemQueueKey,
+        getCoordinatorActionKindForRequestedAction,
+        getCoordinatorExecutorTabActionForActionKind,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        makeCoordinatorAttemptEnvelope,
+        applyCoordinatorJobEnvelope,
+        setCoordinatorPauseControlState,
+        setCoordinatorRunsPaused,
+        kickCoordinatorQueueResume,
+        coordinatorQueueResumeScheduler,
+        coordinatorReconcileScheduler,
+        setTimeoutFn: setTimeout
+    },
+    constants: {
+        STALE_QUEUED_TAB_MAX_RETRIES,
+        COORDINATOR_RECONCILE_ALARM_NAME,
+        COORDINATOR_RESUME_ALARM_NAME,
+        STALE_SCHEDULER_ALARM_SUPPRESSION_MS,
+        SCHEDULER_ALARM_TIME_TOLERANCE_MS,
+        SCHEDULER_ALARM_LATE_TOLERANCE_MS,
         COORDINATOR_RECONCILE_BACKOFF_BASE_MS,
-        COORDINATOR_RECONCILE_BACKOFF_MAX_MS,
-        Date.now()
-    )
-    recordQueueWakeupMetricMax('reconcile.backoffLevel.max', backoff.level)
-    recordQueueWakeupMetricMax('reconcile.backoffDelay.maxMs', backoff.delayMs)
-}
-
-function hasCoordinatorReconcileBackoff(now = Date.now()) {
-    return coordinatorReconcileScheduler.hasBackoff(now)
-}
+        COORDINATOR_RECONCILE_BACKOFF_MAX_MS
+    },
+    state: {
+        getCoordinatorPauseGeneration: () => coordinatorPauseGeneration,
+        setCoordinatorPauseGeneration: value => {
+            coordinatorPauseGeneration = value
+        },
+        getCoordinatorPauseRequested: () => coordinatorPauseRequested,
+        now: () => Date.now()
+    }
+})
+const {
+    nextCoordinatorPauseGeneration,
+    isCoordinatorPauseGenerationLocallyCurrent,
+    isCoordinatorPauseRequestedLocally,
+    scheduleCoordinatorPauseStateReconcile,
+    buildPausedCoordinatorQueueItem,
+    hasStoredCoordinatorWork,
+    hasStoredCoordinatorWorkInQueueView,
+    normalizeRawCoordinatorQueueForReconcileFallback,
+    isCoordinatorReconcileEdgeTriggerReason,
+    clearNamedSchedulerAlarm,
+    clearCoordinatorReconcileAlarms,
+    isCoordinatorReconcileAlarmName,
+    getSchedulerAlarmScheduledTime,
+    isSchedulerAlarmScheduledForDueAt,
+    suppressStaleCoordinatorResumeAlarm,
+    suppressStaleCoordinatorReconcileAlarm,
+    scheduleCoordinatorResumeAlarm,
+    isSuppressedStaleCoordinatorResumeAlarm,
+    isSuppressedStaleCoordinatorReconcileAlarm,
+    resetCoordinatorReconcileBackoff,
+    recordCoordinatorReconcileNoopBackoff,
+    hasCoordinatorReconcileBackoff
+} = swSchedulerAlarmBookkeeping
 
 function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_MS, options = {}) {
     if(!quoraRuntimeActivated && options.allowBeforeQuora !== true) {
