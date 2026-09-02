@@ -2062,7 +2062,9 @@ test('queued tab release kicks durable stored work even after service worker sle
     const releaseBody = extractFunction(source, 'async function releaseQueuedTab(tabId, options = {})')
     const releaseAndCleanupBody = extractFunction(source, 'async function releaseQueuedTabAndCleanup(tabId, options = {})')
     const releaseReconcileBody = extractFunction(source, 'function scheduleQueuedTabReleaseReconcile(reason = \'queued-tab-slot-release\', options = {})')
-    const metadataOnlyBody = extractFunction(source, 'function cleanupQueuedTabMetadataOnly(tabId)')
+    // cleanupQueuedTabMetadataOnly moved to swQueuedTabDetachSurfaceDedupe.js
+    // in decomposition Slice 36.
+    const metadataOnlyBody = extractFunction(readRepoFile('shared/js/swQueuedTabDetachSurfaceDedupe.js'), 'function cleanupQueuedTabMetadataOnly(tabId)')
     const followUpBody = extractFunction(source, 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
     const missingActiveReleaseBody = extractFunction(source, 'async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = null, reason = \'queued-tab-release-missing-active-tab\', options = {})')
