@@ -2,15 +2,17 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-32 are landed and independently verified
+Status: in progress. Slices 1-33 are landed and independently verified
 (commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
 `3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
 `73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`, `5691a15`, `98d681d`,
 `c1413e5`, `82212ce`, `156a68d`, `8c4c7e4`, `710b182`, `66c389c`, `442a060`,
 `80ab511`, `b0771e4`, `612c527`, `67998ae`, `c2cc96b`, `9f89aed`, `1012fec`,
-`79fb979`). `shared/js/sw.js` is down to 32,094 lines from 38,953 at the
-start of this effort (~17.6% reduction), with 34 new modules landed. The
-next slice is Slice 33 as defined below. See
+`79fb979`, `bcb5e27`). `shared/js/sw.js` is down to 31,978 lines from
+38,953 at the start of this effort (~17.9% reduction), with 36 new modules
+landed. This is the end of the currently-defined batch (Slices 1-33) --
+the next step is to survey the inventory again per "Slices 34+" and
+propose the next batch. See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
