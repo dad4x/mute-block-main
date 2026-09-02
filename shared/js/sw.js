@@ -193,6 +193,9 @@ const {
 const {
     createExecutorEnqueueFailureClassification
 } = require('./swExecutorEnqueueFailureClassification')
+const {
+    createCoordinatorExecutorClassification
+} = require('./swCoordinatorExecutorClassification')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -566,6 +569,53 @@ const {
 } = queueWakeupMetricsShape
 queueWakeupMetrics = makeEmptyQueueWakeupMetrics()
 let pendingQueueWakeupMetricsReset = null
+// coordinatorExecutorClassification is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 26) -- see
+// swCoordinatorExecutorClassification.js's header comment for the full
+// ordering writeup. profileResolution (immediately below) eagerly
+// references bare `getCoordinatorItemHref` in its own construction-call
+// handlers object literal -- the earliest of many such eager references
+// across already-extracted modules, for getCoordinatorItemHref and also
+// (further below) getCoordinatorActionKindForRequestedAction and
+// getCoordinatorItemExecutorTabAction. This module must construct before
+// all of those, which means before profileResolution, the earliest of
+// them. normalizeTabId, getCoordinatorItemQueueKey, getAttemptIdFromValue,
+// and getAttemptNumberFromValue aren't available as bare consts yet at
+// this point (tabIdUtils, profileResolution, and coordinatorAttemptIdentity
+// all construct later), so each is threaded through as a thunk that defers
+// name resolution to call time. getPersistedQueuedTabId and
+// getQueuedTabMetadata are still plain hoisted function declarations far
+// below in this file and work from any point in this scope either way, no
+// thunk needed.
+const coordinatorExecutorClassification = createCoordinatorExecutorClassification({
+    handlers: {
+        queueRuntime,
+        normalizeQuoraProfileUrl,
+        getExecutorTabActionForActionKind,
+        getActionKindForRequestedAction,
+        getQueueItemExecutorTabAction,
+        getPersistedQueuedTabId,
+        getAttemptIdFromValue: (...args) => getAttemptIdFromValue(...args),
+        getAttemptNumberFromValue: (...args) => getAttemptNumberFromValue(...args),
+        getCoordinatorItemQueueKey: (...args) => getCoordinatorItemQueueKey(...args),
+        getQueuedTabMetadata,
+        normalizeTabId: (...args) => normalizeTabId(...args)
+    },
+    state: {
+        getQueuedTabConcurrency: () => queuedTabConcurrency
+    }
+})
+const {
+    getCoordinatorItemHref,
+    findCoordinatorQueueEntryForHref,
+    getCoordinatorExecutorTabActionForActionKind,
+    getCoordinatorActionKindForRequestedAction,
+    getCoordinatorItemExecutorTabAction,
+    getCoordinatorItemExecutorMaxConcurrent,
+    getCoordinatorResumeMaxConcurrent,
+    makeCoordinatorExecutorClassificationCase,
+    getRuntimeSurfaceForCoordinatorItem
+} = coordinatorExecutorClassification
 // profileResolution is constructed here, well before this cluster's old
 // source-text location, rather than in place like prior slices: several
 // of its functions (getCoordinatorItemQueueKey, normalizeCoordinatorRequestedUrl)
@@ -11940,101 +11990,6 @@ async function getLiveProfileTabsByHref() {
     }
 
     return buildLiveProfileTabsByHref(tabs)
-}
-
-function getCoordinatorItemHref(item = {}) {
-    return normalizeQuoraProfileUrl(item?.targetProfileHref || item?.requestedUrl || item?.dedupeKey || '')
-}
-
-function findCoordinatorQueueEntryForHref(queue = {}, href = '') {
-    const normalizedHref = normalizeQuoraProfileUrl(href)
-    if(!normalizedHref) return null
-
-    if(queue?.[normalizedHref]) {
-        return {
-            key: normalizedHref,
-            item: queue[normalizedHref]
-        }
-    }
-
-    for(const [key, item] of Object.entries(queue || {})) {
-        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
-        if(itemHref !== normalizedHref) continue
-
-        return {
-            key,
-            item
-        }
-    }
-
-    return null
-}
-
-function getCoordinatorExecutorTabActionForActionKind(actionKind = '') {
-    return getExecutorTabActionForActionKind(actionKind)
-}
-
-function getCoordinatorActionKindForRequestedAction(action = '') {
-    return getActionKindForRequestedAction(action)
-}
-
-function getCoordinatorItemExecutorTabAction(item = {}, fallbackAction = '') {
-    return getQueueItemExecutorTabAction(item, fallbackAction)
-}
-
-function getCoordinatorItemExecutorMaxConcurrent(item = {}) {
-    const maxConcurrent = Number.parseInt(item?.executorMaxConcurrent, 10)
-    return Number.isFinite(maxConcurrent) && maxConcurrent > 0 ? maxConcurrent : 0
-}
-
-function getCoordinatorResumeMaxConcurrent(items = []) {
-    const values = (items || [])
-        .map(getCoordinatorItemExecutorMaxConcurrent)
-        .filter(value => value > 0)
-
-    if(values.length) return Math.max(...values)
-    return Math.max(1, queuedTabConcurrency || 3)
-}
-
-function makeCoordinatorExecutorClassificationCase(caseName = '', rowKey = '', item = null, details = {}) {
-    const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(rowKey)
-    const tabId = normalizeTabId(details.tabId ?? getPersistedQueuedTabId(item, details.record || null))
-    return {
-        case: `${caseName || ''}`.trim() || 'unknown',
-        rowKey: `${rowKey || href || ''}`.trim(),
-        status: `${item?.status || details.status || ''}`.trim(),
-        tabId: tabId || null,
-        attemptId: getAttemptIdFromValue(item) || getAttemptIdFromValue(details.record) || getAttemptIdFromValue(details.runtime) || '',
-        attemptNumber: getAttemptNumberFromValue(item) || getAttemptNumberFromValue(details.record) || getAttemptNumberFromValue(details.runtime) || 0,
-        reason: `${details.reason || caseName || ''}`.trim()
-    }
-}
-
-function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '', options = {}) {
-    const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-    const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-    const allowAttemptMismatch = options.allowAttemptMismatch === true
-    const matchesRuntime = runtime => {
-        if(!runtime) return false
-        const runtimeHref = normalizeQuoraProfileUrl(runtime.profileHref || runtime.targetUrl || runtime.requestedUrl || runtime.url || '')
-        const runtimeCoordinatorKey = `${runtime.coordinatorKey || ''}`.trim()
-        if(itemHref && runtimeHref && itemHref !== runtimeHref) return false
-        if(coordinatorKey && runtimeCoordinatorKey && coordinatorKey !== runtimeCoordinatorKey) return false
-        if(!allowAttemptMismatch) {
-            const itemAttemptId = getAttemptIdFromValue(item)
-            const runtimeAttemptId = getAttemptIdFromValue(runtime)
-            if(itemAttemptId && runtimeAttemptId && itemAttemptId !== runtimeAttemptId) return false
-            const itemAttemptNumber = getAttemptNumberFromValue(item)
-            const runtimeAttemptNumber = getAttemptNumberFromValue(runtime)
-            if(itemAttemptNumber && runtimeAttemptNumber && itemAttemptNumber !== runtimeAttemptNumber) return false
-        }
-        return !!(itemHref || coordinatorKey)
-    }
-    return queueRuntime.getRuntimeSurface({
-        matchesRuntime,
-        getMetadata: tabId => getQueuedTabMetadata(tabId) || {},
-        getActivationTabId: action => normalizeTabId(action?.tabId || action?.createdTabId || action?.targetTabId)
-    })
 }
 
 async function classifyCoordinatorExecutorState(options = {}) {
