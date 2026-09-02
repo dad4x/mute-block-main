@@ -491,9 +491,42 @@ Caution: `scheduleTerminalOwnedProfileTabCleanup` sounds Promise-chain-shaped
 despite not being declared `async` -- check per the realm-crossing note
 before moving.
 
-### Slices 21+ -- everything else, via the chaining protocol
+### Slice 21 -- Tab-id/URL utilities (~6 functions, lines 8341-8444)
 
-The remaining sync functions past Slice 20 are not hand-enumerated here --
+`getCoordinatorPageUrl`, `getQueuedActionSurfaceUrl`, `normalizeTabId` (207
+external refs -- the highest fan-in of anything claimed yet in this
+effort), `normalizeOwnedParentId`, `isBrowserTabId`, `dedupeCoordinatorTabs`.
+`normalizeTabId` is almost certainly one of the most foundational
+primitives in the whole file -- treat this as its own careful slice even
+though it's small.
+
+### Slice 22 -- Persistent-retry timer / executor-start-promise timeout bookkeeping (~5 functions, lines 8523-8780)
+
+`clearPersistentFailedRetryTimeout`, `clearPersistentFailedRetry`,
+`schedulePersistentFailedRetry`, `resetCoordinatorExecutorStartPromiseAfterTimeout`,
+`clearStaleCoordinatorExecutorStartPromise`.
+
+Caution: schedule/clear-timeout naming -- check per the Promise-chain
+realm-crossing note before moving, same as Slices 9/15/20.
+
+### Slice 23 -- Queued-runtime-action matching + rolled-back-retry classification (~14+ functions, lines 8800-9211+)
+
+`queuedRuntimeActionMatchesTabRuntime`, `queuedRuntimeActionHasActiveOrPendingSurface`,
+`getQueuedRuntimeActionAuthorityEntry`, `getQueuedActionNoForegroundFallback`,
+`markQueuedTabExecutorActionPlanned`, `isQueuedTabRetryBudgetReleaseReason`,
+`getExhaustedRolledBackQueuedTabTerminalError`,
+`shouldAdvanceRolledBackQueuedTabBeforeOpen`, `getRolledBackQueuedTabRetryAttempt`,
+`isExhaustedRolledBackQueuedTabRetry`, `isActiveTransitionRolledBackQueuedTabRetry`,
+`isRuntimeDisappearedRolledBackQueuedTabRetry`, `isTransientOpenRolledBackQueuedTabRetry`,
+`shouldRecoverExhaustedOpenRetryUnderQueuePressure`, and likely a few more
+past line 9211 -- confirm the exact tail boundary against the current
+inventory at claim time rather than trusting this list as exhaustive. This
+is another rulebook cluster (rolled-back-tab-retry classification), similar
+value to Slice 6/12.
+
+### Slices 24+ -- everything else, via the chaining protocol
+
+The remaining sync functions past Slice 23 are not hand-enumerated here --
 that would make this document large and guaranteed to drift out of date as
 each slice shifts every line number after it. Use the claim workflow
 above: regenerate the inventory, find the next line-adjacent same-bucket
@@ -524,6 +557,43 @@ had drifted from its sibling's shared `getQueuedRuntimeActionSubjectHref`
 helper -- exactly this class of rot), and making dependencies on
 now-extracted Part 1 modules explicit imports rather than assuming they're
 still ambient globals.
+
+### Part 2 approach idea (2026-09, not yet started): decide/act splitting
+
+A promising strategy that does NOT need Phase 0 at all, since it stays on
+the sync side of the realm boundary: go inside the big `async` orchestrators
+(`runCoordinatorReconcileTick`, `transitionCoordinatorItemForQueuedTab`,
+`fillQueuedTabsOnce`, `createOwnedTab`) and find the spans of code that only
+*decide* -- no `await`, no Promise touched anywhere in the span -- and pull
+those out as pure sync functions returning a plan/action object. The
+`await`s that actually perform I/O (tab creation, storage reads/writes)
+stay behind as a thin shell in `sw.js`: `await gather()` -> `const plan =
+decide(data)` -> `await apply(plan)`.
+
+This is the same two-phase observe/decide/apply model already prescribed in
+this doc's "Scheduler / Reconciler" section in architecture.md, just
+enforced at the function-extraction level instead of left as a style
+guideline. It's also a generalization of what Slices 6, 12, 17, and 19
+already did opportunistically (pulling predicates/builders out of the
+reconcile core) -- this aims the same technique deliberately at the big
+async orchestrators themselves, from the inside, rather than waiting to
+extract them whole.
+
+Discipline required, learned the hard way this session: the bar for a
+"decide" span isn't "no `async` keyword," it's "touches zero Promises,
+including calls into other modules that return one" (the Slice 7 finding,
+architecture.md's realm-boundary section). A decision span only qualifies
+if it's pure data-in/data-out with no `await` and no `.then()` anywhere in
+it, including transitively. If a decision needs to peek at live state via a
+browser call or an already-extracted module's async export, that peek has
+to happen in the async shell first, with the result passed in as
+already-resolved plain data -- the decide function itself must never touch
+a Promise.
+
+Proposed first candidate when this gets picked up: `transitionCoordinatorItemForQueuedTab`,
+the smallest of the four listed async orchestrators -- map out where its
+actual decide/act boundary falls before touching anything, the same
+Read-before-Move discipline every Part 1 slice has used.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
