@@ -1759,6 +1759,7 @@ test('progress repair is explicit, not a hot runtime path', () => {
     const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const scheduledTickBody = extractFunction(source, 'async function runScheduledCoordinatorReconcileTick(reason = \'coordinator-reconcile-tick\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const retryCandidatesSource = readRepoFile('shared/js/swCoordinatorRetryCandidates.js')
     const ownedResultIndex = recoveryBody.indexOf('makeStoredWorkRecoveryResumeOwnedResult(reason, hasWork, paused)')
 
     assert.match(source, /COORDINATOR_RECONCILE_GATE_TIMEOUT_MS/)
@@ -1790,8 +1791,10 @@ test('progress repair is explicit, not a hot runtime path', () => {
     assert.doesNotMatch(reconcileBody, /reconcileCoordinatorStorageBestEffort/)
     assert.match(recoveryBody, /COORDINATOR_PAUSED_KEY/)
     assert.match(recoveryBody, /reason: paused \? 'coordinator-paused'/)
-    assert.match(source, /function makeStoredWorkRecoveryResumeOwnedResult/)
-    assert.match(source, /resume: \{skipped: true, reason: 'resume-owned-by-reconcile'\}/)
+    // makeStoredWorkRecoveryResumeOwnedResult moved to
+    // swCoordinatorRetryCandidates.js in decomposition Slice 29.
+    assert.match(retryCandidatesSource, /function makeStoredWorkRecoveryResumeOwnedResult/)
+    assert.match(retryCandidatesSource, /resume: \{skipped: true, reason: 'resume-owned-by-reconcile'\}/)
     assert.doesNotMatch(recoveryBody, /resumeCoordinatorQueueExecution\(/)
     assert.match(source, /runCoordinatorReconcileTick\(reason, \{[\s\S]*allowBeforeQuora: true/)
     assert.match(requeueBody, /runCoordinatorReconcileTick\('requeue-failed-reconcile', \{[\s\S]*awaitFill: false/)
@@ -2365,8 +2368,9 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
 
 test('failed resolver requeue preserves source-post resolution mode', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const candidateBody = extractFunction(source, 'function getCoordinatorRetryableFailureCandidates(queue = {}, progress = {}, retryLimit = 2)')
-    const resetBody = extractFunction(source, 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
+    const retryCandidatesSource = readRepoFile('shared/js/swCoordinatorRetryCandidates.js')
+    const candidateBody = extractFunction(retryCandidatesSource, 'function getCoordinatorRetryableFailureCandidates(queue = {}, progress = {}, retryLimit = 2)')
+    const resetBody = extractFunction(retryCandidatesSource, 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
     const retryBody = extractFunction(source, 'async function retryCoordinatorFailedItems(request = {}, sender = {})')
     const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const retryMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRetry(operation = {})')
@@ -2374,6 +2378,8 @@ test('failed resolver requeue preserves source-post resolution mode', () => {
 
     // getFailedItemProfileResolutionRetryUrl moved to
     // swCoordinatorJobEnvelope.js in decomposition Slice 11.
+    // getCoordinatorRetryableFailureCandidates/buildFailedCoordinatorResetItem
+    // moved to swCoordinatorRetryCandidates.js in decomposition Slice 29.
     assert.match(readRepoFile('shared/js/swCoordinatorJobEnvelope.js'), /function getFailedItemProfileResolutionRetryUrl/)
     assert.match(candidateBody, /resolutionRetryUrl/)
     assert.match(candidateBody, /!href && !candidate\.resolutionRetryUrl/)
@@ -2389,7 +2395,7 @@ test('failed resolver requeue preserves source-post resolution mode', () => {
 
 test('manual failed requeue requests reconcile after durable storage', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const resetBody = extractFunction(source, 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
+    const resetBody = extractFunction(readRepoFile('shared/js/swCoordinatorRetryCandidates.js'), 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
     const retryBody = extractFunction(source, 'async function retryCoordinatorFailedItems(request = {}, sender = {})')
     const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const retryMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRetry(operation = {})')
@@ -3409,7 +3415,9 @@ test('stored work recovery reports durable work without deciding executor moveme
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(source, 'async function recoverStoredCoordinatorWorkOnce(reason = \'stored-work-recovery\', options = {})')
 
-    assert.match(source, /function makeStoredWorkRecoveryResumeOwnedResult/)
+    // makeStoredWorkRecoveryResumeOwnedResult moved to
+    // swCoordinatorRetryCandidates.js in decomposition Slice 29.
+    assert.match(readRepoFile('shared/js/swCoordinatorRetryCandidates.js'), /function makeStoredWorkRecoveryResumeOwnedResult/)
     assert.match(body, /return makeStoredWorkRecoveryResumeOwnedResult\(reason, hasWork, paused\)/)
     assert.doesNotMatch(body, /\brepair\b/)
     assert.doesNotMatch(body, /dropVolatileQueuedActionsForDurableResume/)
@@ -3429,7 +3437,9 @@ test('reconcile owns durable executor actions instead of falling back to pump-er
     assert.match(tickBody, /reason: 'queued-only-fast-resume-scheduled'/)
     assert.match(tickBody, /executorQueued: executor\?\.queued/)
     assert.doesNotMatch(tickBody, /resumeCoordinatorQueueExecution\(/)
-    assert.match(source, /resume-owned-by-reconcile/)
+    // resume-owned-by-reconcile lives in makeStoredWorkRecoveryResumeOwnedResult,
+    // moved to swCoordinatorRetryCandidates.js in decomposition Slice 29.
+    assert.match(readRepoFile('shared/js/swCoordinatorRetryCandidates.js'), /resume-owned-by-reconcile/)
     assert.doesNotMatch(recoverBody, /resumeCoordinatorQueueExecution\(/)
     assert.match(executorBody, /runCoordinatorExecutorApplyPhase\(reason/)
     assert.match(executorBody, /dropVolatileSource: 'runCoordinatorReconcileExecutorActions'/)
