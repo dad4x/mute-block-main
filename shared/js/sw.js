@@ -220,6 +220,12 @@ const {
 const {
     createQueuedTabContentScriptEnsureScheduling
 } = require('./swQueuedTabContentScriptEnsureScheduling')
+const {
+    createOwnedTabLifecycle
+} = require('./swOwnedTabLifecycle')
+const {
+    createProfileNukeRecordClassification
+} = require('./swProfileNukeRecordClassification')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -782,6 +788,50 @@ const {
     isBrowserTabId,
     dedupeCoordinatorTabs
 } = tabIdUtils
+// profileNukeRecordClassification is constructed here, immediately after
+// tabIdUtils's destructure, rather than in place like most prior slices
+// (decomposition Slice 33, part 2 of 2): isTransientProfileNukeStatus is
+// eagerly referenced in coordinatorRuns's own construction-call `handlers`
+// object literal right below, and isSuccessfulProfileNukeRecord/
+// isExplicitSecurityVerificationRecord/isTerminalProfileNukeRecord/
+// isRetryableTerminalProfileNukeRecord are eagerly referenced the same way
+// in coordinatorRetryCandidates's and profileProgressMerge's own
+// construction-call handlers object literals further below still. A
+// hoisted `function` declaration is visible throughout its enclosing
+// scope; a `const` destructured from a factory call is in the temporal
+// dead zone until that line executes -- so this module must construct
+// before the earliest of those eager references, i.e. before
+// coordinatorRuns. UNBLOCK_UNMUTE_ACTION_KIND (top-of-file jobState.js
+// require), isActiveCoordinatorStatus/isCoordinatorQueueAuthoritativeItem
+// (coordinatorStatusRules), and normalizeTabId (tabIdUtils, just above)
+// are all already available bare consts by this point.
+// hasMismatchedCoordinatorAttempt (coordinatorAttemptIdentity, constructed
+// further below still) is not available yet, so it's threaded through as
+// a thunk. See swProfileNukeRecordClassification.js's header comment for
+// the full writeup.
+const profileNukeRecordClassification = createProfileNukeRecordClassification({
+    constants: {
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
+    handlers: {
+        isActiveCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        hasMismatchedCoordinatorAttempt: (...args) => hasMismatchedCoordinatorAttempt(...args),
+        normalizeTabId
+    }
+})
+const {
+    isTerminalProfileNukeRecord,
+    isSuccessfulProfileNukeRecord,
+    isSuccessfulUnblockUnmuteProfileRecord,
+    isRetryableTerminalProfileNukeRecord,
+    isQueuedDirectBlockActionIncompleteProgress,
+    shouldRecoverQueuedDirectBlockActionTerminalProgress,
+    isQueuedProfileActionGateTimeoutProgress,
+    shouldRecoverQueuedProfileActionGateTerminalProgress,
+    isExplicitSecurityVerificationRecord,
+    isTransientProfileNukeStatus
+} = profileNukeRecordClassification
 // coordinatorRuns is constructed here, well before this cluster's old
 // source-text location, rather than in place like Slice 14/15 -- see
 // swCoordinatorRuns.js's header comment: queuedTabRuntimeStatus's deps
@@ -790,10 +840,11 @@ const {
 // that reference, not merely before its own former definition point.
 // Every other handler this module needs (coordinatorStatusRules's
 // exports, profileResolution's exports, queueWakeupMetricsShape's
-// runQueueWakeupMetricPhase) is already a bare name in scope by this
-// point; isTransientProfileNukeStatus and getCoordinatorItemHref are
-// still plain hoisted function declarations further below and work from
-// any point in this scope either way.
+// runQueueWakeupMetricPhase, profileNukeRecordClassification's
+// isTransientProfileNukeStatus, just above) is already a bare name in
+// scope by this point; getCoordinatorItemHref is still a plain hoisted
+// function declaration further below and works from any point in this
+// scope either way.
 const coordinatorRuns = createCoordinatorRuns({
     now: () => Date.now(),
     handlers: {
@@ -2076,6 +2127,45 @@ const {
     mergeActivationGuardTabInfo,
     deleteActivationGuardByKey
 } = activationGuardRuntime
+
+// ownedTabLifecycle is constructed here, rather than in place like most
+// prior slices (decomposition Slice 33, part 1 of 2): registerOwnedTab is
+// eagerly referenced in queuedForegroundLeaseRuntime's own construction-
+// call `handlers` object literal right below. A hoisted `function`
+// declaration is visible throughout its enclosing scope; a `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes -- so this module must construct before that reference,
+// i.e. right here, before queuedForegroundLeaseRuntime. normalizeOwnedParentId
+// (tabIdUtils) and queueRuntime are already available bare consts by this
+// point; persistOwnedTabIdsByParent is still a plain hoisted async
+// function declaration further below and works from any point in this
+// scope either way -- see swOwnedTabLifecycle.js's header comment for the
+// full writeup, including why markQueuedTabClosing and
+// scheduleOwnedBlockedProfileSweep, textually interleaved in this
+// cluster's old source-text position, are left resident instead.
+const ownedTabLifecycle = createOwnedTabLifecycle({
+    browser,
+    handlers: {
+        queueRuntime,
+        normalizeOwnedParentId,
+        persistOwnedTabIdsByParent,
+        setTimeoutFn: setTimeout,
+        clearTimeoutFn: clearTimeout
+    },
+    state: {
+        getPersistOwnedTabIdsTimeout: () => persistOwnedTabIdsTimeout,
+        setPersistOwnedTabIdsTimeout: value => { persistOwnedTabIdsTimeout = value }
+    }
+})
+const {
+    getErrorPageUrl,
+    serializeOwnedTabIdsByParent,
+    rebuildOwningParentByChild,
+    schedulePersistOwnedTabIdsByParent,
+    sendTabMessage,
+    registerOwnedTab,
+    unregisterOwnedTab
+} = ownedTabLifecycle
 
 // queuedForegroundLeaseRuntime is constructed here, rather than in place
 // like a plain-in-order slice, because hasOwnedQueuedTabState and
@@ -24335,42 +24425,6 @@ function markQueuedTabClosing(tabId, reason = '') {
     return closeRequestedAt
 }
 
-function getErrorPageUrl(url = '') {
-    const value = `${url || ''}`.trim()
-    if(!value) return ''
-
-    if(/^(?:chrome|edge|about|moz-extension|chrome-error):/i.test(value)) return value
-
-    try {
-        const parsed = new URL(value)
-        const hostname = `${parsed.hostname || ''}`.toLowerCase()
-        if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return value
-        if(hostname && hostname !== 'quora.com' && hostname !== 'www.quora.com' && !hostname.endsWith('.quora.com')) {
-            return value
-        }
-    }
-    catch {
-        return value
-    }
-
-    return ''
-}
-
-function serializeOwnedTabIdsByParent() {
-    const serialized = {}
-
-    for(const [parentTabId, childTabIds] of queueRuntime.listOwnedTabParentEntries()) {
-        if(!childTabIds.length) continue
-        serialized[parentTabId] = childTabIds
-    }
-
-    return serialized
-}
-
-function rebuildOwningParentByChild() {
-    queueRuntime.rebuildOwningParentByChild()
-}
-
 async function persistOwnedTabIdsByParent() {
     try {
         await metricStorageSet({[OWNED_TAB_STATE_KEY]: serializeOwnedTabIdsByParent()}, {
@@ -24378,14 +24432,6 @@ async function persistOwnedTabIdsByParent() {
         })
     }
     catch {}
-}
-
-function schedulePersistOwnedTabIdsByParent(delayMs = 250) {
-    clearTimeout(persistOwnedTabIdsTimeout)
-    persistOwnedTabIdsTimeout = setTimeout(() => {
-        persistOwnedTabIdsTimeout = null
-        void persistOwnedTabIdsByParent()
-    }, delayMs)
 }
 
 async function loadOwnedTabIdsByParent() {
@@ -24410,33 +24456,6 @@ async function loadOwnedTabIdsByParent() {
 }
 
 const ownedTabIdsReady = loadOwnedTabIdsByParent()
-
-function sendTabMessage(tabId, message, timeoutMs = 3000) {
-    const delivery = browser.tabs.sendMessage(tabId, message).catch(error => {
-        if(/Receiving end does not exist|no tab|invalid tab|cannot find tab|not found/i.test(error?.message || '')) return
-        throw error
-    })
-
-    if(!timeoutMs || timeoutMs <= 0) return delivery
-
-    return Promise.race([
-        delivery,
-        new Promise(resolve => setTimeout(() => resolve(null), timeoutMs))
-    ])
-}
-
-function registerOwnedTab(parentTabId, childTabId) {
-    const normalizedParentTabId = normalizeOwnedParentId(parentTabId)
-    if(!normalizedParentTabId || !childTabId) return
-
-    queueRuntime.addOwnedTab(normalizedParentTabId, childTabId)
-    schedulePersistOwnedTabIdsByParent()
-}
-
-function unregisterOwnedTab(childTabId) {
-    if(!childTabId) return
-    if(queueRuntime.removeOwnedTab(childTabId)) schedulePersistOwnedTabIdsByParent()
-}
 
 async function getLiveOwnedTabIds(parentTabId) {
     await ownedTabIdsReady
@@ -25109,141 +25128,6 @@ async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
         sourceTabCandidates: sourceClosed.candidates,
         sourceTabsSignaled: sourceClosed.closed
     }
-}
-
-function isTerminalProfileNukeRecord(record) {
-    if(record?.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
-        return isSuccessfulUnblockUnmuteProfileRecord(record) ||
-            record.status === 'unblocked' ||
-            record.status === 'already-unblocked' ||
-            record.status === 'error' ||
-            record.status === 'error-page' ||
-            record.status === 'profile-unavailable' ||
-            record.status === 'interrupted'
-    }
-
-    return !!record && (
-        !!record.blockSucceeded ||
-        record.status === 'blocked' ||
-        record.status === 'already-blocked' ||
-        record.status === 'error' ||
-        record.status === 'error-page' ||
-        record.status === 'profile-unavailable' ||
-        record.status === 'interrupted'
-    )
-}
-
-function isSuccessfulProfileNukeRecord(record) {
-    if(record?.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
-        return isSuccessfulUnblockUnmuteProfileRecord(record)
-    }
-
-    return !!record && (
-        !!record.blockSucceeded ||
-        record.status === 'blocked' ||
-        record.status === 'already-blocked'
-    )
-}
-
-function isSuccessfulUnblockUnmuteProfileRecord(record = null) {
-    if(!record || record.actionKind !== UNBLOCK_UNMUTE_ACTION_KIND) return false
-    if(record.unblockSucceeded || record.status === 'unblocked' || record.status === 'already-unblocked') return true
-
-    const unblockReason = `${record.unblockReason || ''}`.trim()
-    const unmuteReason = `${record.unmuteReason || ''}`.trim()
-    return record.unblockOk === true &&
-        record.unmuteOk === true &&
-        /^(?:unblocked|already-unblocked|not-blocked|not-blocked-anymore)$/.test(unblockReason) &&
-        !/error|failed|not-found/i.test(unmuteReason) &&
-        !`${record.finalError || ''}`.trim()
-}
-
-function isRetryableTerminalProfileNukeRecord(record) {
-    if(!isTerminalProfileNukeRecord(record)) return false
-    if(isExplicitSecurityVerificationRecord(record)) return false
-
-    const status = `${record?.status || ''}`.trim()
-    if(status === 'interrupted') return true
-    if(status === 'error') return true
-
-    return false
-}
-
-function isQueuedDirectBlockActionIncompleteProgress(record = null, mapped = null) {
-    if(!record || record.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return false
-    if(!isTerminalProfileNukeRecord(record)) return false
-    const status = `${record.status || ''}`.trim()
-    if(status !== 'error' && status !== 'interrupted') return false
-    const errorText = `${mapped?.error || record.finalError || ''}`.trim()
-    if(errorText !== 'Queued direct block action did not complete') return false
-
-    const detailReason = `${record?.directBlockFailureDetail?.reason || record?.directBlockFailureDetail?.code || ''}`.trim()
-    return !detailReason || detailReason === 'queued-direct-block-action-did-not-complete'
-}
-
-function shouldRecoverQueuedDirectBlockActionTerminalProgress(item = null, record = null, mapped = null, options = {}) {
-    if(!item || !isActiveCoordinatorStatus(item?.status)) return false
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
-    if(!isQueuedDirectBlockActionIncompleteProgress(record, mapped)) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) return false
-    if(record?.blockSucceeded === true || record?.status === 'blocked' || record?.status === 'already-blocked') return false
-
-    const senderTabId = normalizeTabId(options.senderTabId || record?.tabId || null)
-    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-    return !senderTabId || !itemTabId || senderTabId === itemTabId
-}
-
-function isQueuedProfileActionGateTimeoutProgress(record = null, mapped = null) {
-    if(!record || record.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return false
-    if(!isTerminalProfileNukeRecord(record)) return false
-    if(isExplicitSecurityVerificationRecord(record)) return false
-
-    const status = `${record.status || ''}`.trim()
-    if(status !== 'error' && status !== 'interrupted') return false
-
-    const errorText = `${mapped?.error || record.finalError || ''}`.trim()
-    return errorText === 'Queued profile action did not receive profile action gate: timed-out-waiting'
-}
-
-function shouldRecoverQueuedProfileActionGateTerminalProgress(item = null, record = null, mapped = null, options = {}) {
-    if(!item || !isActiveCoordinatorStatus(item?.status)) return false
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
-    if(!isQueuedProfileActionGateTimeoutProgress(record, mapped)) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) return false
-    if(record?.blockSucceeded === true || record?.status === 'blocked' || record?.status === 'already-blocked') return false
-
-    const senderTabId = normalizeTabId(options.senderTabId || record?.tabId || null)
-    const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
-    return !senderTabId || !itemTabId || senderTabId === itemTabId
-}
-
-function isExplicitSecurityVerificationRecord(record = null) {
-    if(!record?.securityVerification) return false
-
-    const text = [
-        record.securityVerificationReason,
-        record.finalError,
-        record.errorPageUrl,
-        record.lastUrl,
-        ...(Array.isArray(record.events) ? record.events : [])
-    ].join(' ')
-
-    return /security verification|verify you are human|just a moment|performing security verification|challenge-platform|cdn-cgi|turnstile/i.test(text)
-}
-
-function isTransientProfileNukeStatus(status) {
-    return new Set([
-        'queued',
-        'tab-opening',
-        'tab-opened',
-        'awaiting-visibility',
-        'page-ready',
-        'retrying',
-        'muting',
-        'blocking',
-        'unmuting',
-        'unblocking'
-    ]).has(`${status || ''}`.trim())
 }
 
 function getProgressHeartbeatAt(record) {
