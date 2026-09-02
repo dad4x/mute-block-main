@@ -232,6 +232,9 @@ const {
 const {
     createQueuedTabRetryStaleReconcile
 } = require('./swQueuedTabRetryStaleReconcile')
+const {
+    createQueuedTabDetachSurfaceDedupe
+} = require('./swQueuedTabDetachSurfaceDedupe')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -25508,63 +25511,55 @@ async function advanceCoordinatorQueueForStaleRetryAction(action = null, at = Da
     return retryPromise
 }
 
-function cleanupQueuedTabMetadataOnly(tabId) {
-    if(!tabId) return
-    const metadata = getQueuedTabMetadata(tabId)
-    releaseQueuedActivationGuardForTab(tabId, metadata)
-    if(queueRuntime.deleteActiveQueuedTab(tabId)) {
-        releaseQueuedForegroundLease(tabId, 'queued-tab-metadata-cleanup')
+// queuedTabDetachSurfaceDedupe is constructed here, in place at this
+// cluster's old source-text location (decomposition Slice 36): none of its
+// 5 exports is referenced eagerly (as a bare identifier in another
+// already-extracted module's own construction-call object literal)
+// anywhere in sw.js, so unlike several recent slices there is no forced-
+// early-hoisting requirement. Every handler dependency (queueRuntime,
+// getQueuedTabMetadata, releaseQueuedActivationGuardForTab,
+// releaseQueuedForegroundLease, unregisterOwnedTab, clearQueuedTabMetadata,
+// pushQueueWakeupJournalEntry, normalizeQuoraProfileUrl,
+// normalizeCoordinatorRequestedUrl, getCoordinatorActionKindForRequestedAction,
+// getAttemptIdFromValue, getAttemptNumberFromValue, getCoordinatorItemHref,
+// getCoordinatorItemQueueKey, isActiveCoordinatorStatus, normalizeTabId) is
+// already a bare const by this point in the file. coordinatorAuthority
+// (also already constructed well before this point) is threaded through as
+// a `getCoordinatorAuthority` getter rather than a bare reference, matching
+// the existing precedent used by other modules that read its `.current()`
+// snapshot. See swQueuedTabDetachSurfaceDedupe.js's header comment for the
+// full writeup.
+const queuedTabDetachSurfaceDedupe = createQueuedTabDetachSurfaceDedupe({
+    constants: {
+        SERVICE_WORKER_QUEUE_OWNER_ID
+    },
+    handlers: {
+        queueRuntime,
+        getQueuedTabMetadata,
+        releaseQueuedActivationGuardForTab,
+        releaseQueuedForegroundLease,
+        unregisterOwnedTab,
+        clearQueuedTabMetadata,
+        pushQueueWakeupJournalEntry,
+        normalizeQuoraProfileUrl,
+        normalizeCoordinatorRequestedUrl,
+        getCoordinatorActionKindForRequestedAction,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey,
+        isActiveCoordinatorStatus,
+        normalizeTabId,
+        getCoordinatorAuthority: () => coordinatorAuthority
     }
-    queueRuntime.deletePendingTabAction(tabId)
-    unregisterOwnedTab(tabId)
-    clearQueuedTabMetadata(tabId)
-}
-
-function detachQueuedTabRuntimeState(tabId, reason = 'queued-tab-detached') {
-    if(!tabId) {
-        return {
-            metadata: null,
-            wasActive: false,
-            wasOwnerTab: false,
-            wasOwnedChild: false,
-            foregroundLeaseReleased: false
-        }
-    }
-
-    queueRuntime.markRemovedQueuedRuntimeTab(tabId)
-    const metadata = getQueuedTabMetadata(tabId)
-    releaseQueuedActivationGuardForTab(tabId, metadata)
-    const wasActive = queueRuntime.deleteActiveQueuedTab(tabId)
-    const wasOwnerTab = queueRuntime.hasOwnedParent(tabId)
-    const wasOwnedChild = queueRuntime.hasOwnedChild(tabId)
-    queueRuntime.deletePendingTabAction(tabId)
-    const foregroundLeaseReleased = wasActive
-        ? releaseQueuedForegroundLease(tabId, reason)
-        : false
-    if(wasActive || wasOwnedChild) {
-        pushQueueWakeupJournalEntry({
-            kind: 'state-change',
-            name: 'detachQueuedTabRuntimeState',
-            reason,
-            result: 'state-changed',
-            details: {
-                tabId,
-                wasActive,
-                wasOwnedChild,
-                profileHref: metadata?.profileHref || ''
-            }
-        })
-    }
-    cleanupQueuedTabMetadataOnly(tabId)
-
-    return {
-        metadata,
-        wasActive,
-        wasOwnerTab,
-        wasOwnedChild,
-        foregroundLeaseReleased
-    }
-}
+})
+const {
+    cleanupQueuedTabMetadataOnly,
+    detachQueuedTabRuntimeState,
+    getQueuedRuntimeSurfaceDedupeKey,
+    findAuthorityTabIdForRuntimeSurface,
+    scoreQueuedRuntimeSurfaceForKeep
+} = queuedTabDetachSurfaceDedupe
 
 async function pruneMissingQueuedTabRuntimeState(reason = 'missing-queued-tab-prune') {
     const tabIds = new Set([
@@ -25599,55 +25594,6 @@ async function pruneMissingQueuedTabRuntimeState(reason = 'missing-queued-tab-pr
     }
 
     return pruned
-}
-
-function getQueuedRuntimeSurfaceDedupeKey(tabId = null, metadata = null) {
-    const ownerId = metadata?.ownerTabId || queueRuntime.getOwningParentForChild(tabId) || SERVICE_WORKER_QUEUE_OWNER_ID
-    const subjectKey = normalizeQuoraProfileUrl(metadata?.profileHref || metadata?.targetProfileHref || '') ||
-        metadata?.coordinatorKey ||
-        normalizeCoordinatorRequestedUrl(metadata?.requestedUrl || '')
-    const actionKind = getCoordinatorActionKindForRequestedAction(metadata?.actionKind || metadata?.tabAction || 'nuke')
-    const attemptId = getAttemptIdFromValue(metadata)
-    const attemptNumber = getAttemptNumberFromValue(metadata)
-    if(!ownerId || !subjectKey || !actionKind || !attemptId || !attemptNumber) return ''
-    return [ownerId, subjectKey, actionKind, attemptId, attemptNumber].join('|')
-}
-
-function findAuthorityTabIdForRuntimeSurface(metadata = null, authorityState = null) {
-    const queue = authorityState?.queue || coordinatorAuthority.current()?.queue || {}
-    const subjectHref = normalizeQuoraProfileUrl(metadata?.profileHref || metadata?.targetProfileHref || '')
-    const subjectKey = metadata?.coordinatorKey || subjectHref || normalizeCoordinatorRequestedUrl(metadata?.requestedUrl || '')
-    const expectedAttemptId = getAttemptIdFromValue(metadata)
-    const expectedAttemptNumber = getAttemptNumberFromValue(metadata)
-    if(!subjectKey || !expectedAttemptId || !expectedAttemptNumber) return null
-
-    const directItem = subjectHref
-        ? queue[subjectHref] || queue[subjectKey] || null
-        : queue[subjectKey] || null
-    const candidates = directItem
-        ? [[subjectKey, directItem]]
-        : Object.entries(queue || {})
-    for(const [itemKey, item] of candidates) {
-        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        const itemCoordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-        if(subjectHref && itemHref !== subjectHref) continue
-        if(!subjectHref && itemCoordinatorKey !== subjectKey) continue
-        if(getAttemptIdFromValue(item) !== expectedAttemptId) continue
-        if(getAttemptNumberFromValue(item) !== expectedAttemptNumber) continue
-        if(!isActiveCoordinatorStatus(item?.status || '')) continue
-        return normalizeTabId(item?.tabId || item?.activeTabId || null)
-    }
-    return null
-}
-
-function scoreQueuedRuntimeSurfaceForKeep(tabId = null, metadata = null, authorityTabId = null) {
-    let score = 0
-    if(authorityTabId && normalizeTabId(tabId) === authorityTabId) score += 1000000
-    if(metadata?.liveTabAdoptedAt) score += 100000
-    if(!metadata?.activeTransitionUnconfirmedAt && !metadata?.activeTransitionUnconfirmedReason) score += 10000
-    score += Math.min(Number.parseInt(metadata?.durableActiveAt, 10) || 0, 999999) / 1000
-    score += Math.min(Number.parseInt(metadata?.updatedAt, 10) || 0, 999999) / 1000000
-    return score
 }
 
 async function pruneDuplicateActiveQueuedRuntimeSurfaces(tabIds = [], options = {}) {
