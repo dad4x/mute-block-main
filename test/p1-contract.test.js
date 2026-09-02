@@ -2766,7 +2766,7 @@ test('coordinator executor startup awaits tab filling unless explicitly plan-onl
 
 test('queued executor actions preserve stored foreground policy', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const helperBody = extractFunction(source, 'function getQueuedActionNoForegroundFallback(item = null, options = {})')
+    const helperBody = extractFunction(readRepoFile('shared/js/swRolledBackQueuedTabRetryClassification.js'), 'function getQueuedActionNoForegroundFallback(item = null, options = {})')
     const activateOnOpenBody = extractFunction(source, 'function shouldActivateOwnedQueuedTabOnOpen(action = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
     const recoverBody = extractFunction(source, 'async function recoverPendingTabActionFromCoordinatorQueue(sender = {})')
@@ -3137,7 +3137,7 @@ test('queued background tabs have a content-script injection fallback', () => {
 
 test('queued tab open plan does not carry executor authority state across tab open', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const markBody = extractFunction(source, 'function markQueuedTabExecutorActionPlanned(action = {}, decision = {}, reason = \'executor-open-planned\')')
+    const markBody = extractFunction(readRepoFile('shared/js/swRolledBackQueuedTabRetryClassification.js'), 'function markQueuedTabExecutorActionPlanned(action = {}, decision = {}, reason = \'executor-open-planned\')')
     const planBody = extractFunction(source, 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = Date.now())')
     const activeDetailsIndex = planBody.indexOf('activeTransitionDetails: {')
     const progressPatchIndex = planBody.indexOf('progressPatch: {')

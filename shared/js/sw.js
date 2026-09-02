@@ -181,6 +181,12 @@ const {
 const {
     createPersistentRetryExecutorTimers
 } = require('./swPersistentRetryExecutorTimers')
+const {
+    createQueuedRuntimeActionMatching
+} = require('./swQueuedRuntimeActionMatching')
+const {
+    createRolledBackQueuedTabRetryClassification
+} = require('./swRolledBackQueuedTabRetryClassification')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -1702,6 +1708,49 @@ const {
     drainPendingCoordinatorDiagnosticEvents,
     shouldFlushPendingCoordinatorDiagnosticEventsNow
 } = coordinatorJobEnvelope
+
+// queuedRuntimeActionMatching is constructed here, well before this
+// cluster's old source-text location (decomposition Slice 23, part 1):
+// activationGuardRuntime (just below) eagerly references bare
+// `queuedRuntimeActionHasActiveOrPendingSurface` in its own construction-
+// call handlers object. A hoisted `function` declaration is visible
+// throughout its enclosing scope; a `const` destructured from a factory
+// call is in the temporal dead zone until that line executes -- so this
+// module must construct before activationGuardRuntime. Its own deps --
+// normalizeTabId (tabIdUtils, above), getAttemptIdFromValue/
+// getAttemptNumberFromValue (coordinatorAttemptIdentity, just above),
+// normalizeQuoraProfileUrl (top-of-file require), makeProfileResolutionQueueKey/
+// getCoordinatorItemHref/getCoordinatorItemQueueKey (profileResolution,
+// above), and queueRuntime (top of file) -- are all already bare names or
+// already-constructed instances by this point. getQueuedTabMetadata and
+// getCoordinatorActionKindForRequestedAction are still plain hoisted
+// function declarations far below and work from any point in this scope
+// either way. coordinatorAuthority itself isn't assigned until later, so
+// it's threaded through as a `getCoordinatorAuthority` state thunk
+// (deferred to call time), matching activationGuardRuntime's own
+// `getCoordinatorAuthority` convention just below.
+const queuedRuntimeActionMatching = createQueuedRuntimeActionMatching({
+    handlers: {
+        normalizeTabId,
+        getQueuedTabMetadata,
+        queueRuntime,
+        normalizeQuoraProfileUrl,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorActionKindForRequestedAction,
+        makeProfileResolutionQueueKey,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey
+    },
+    state: {
+        getCoordinatorAuthority: () => coordinatorAuthority
+    }
+})
+const {
+    queuedRuntimeActionMatchesTabRuntime,
+    queuedRuntimeActionHasActiveOrPendingSurface,
+    getQueuedRuntimeActionAuthorityEntry
+} = queuedRuntimeActionMatching
 
 const activationGuardRuntime = createActivationGuardRuntime({
     now: () => Date.now(),
@@ -8804,109 +8853,6 @@ async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {
     return coordinatorExecutorStartPromise
 }
 
-function queuedRuntimeActionMatchesTabRuntime(action = {}, tabId = null) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) return false
-
-    const metadata = getQueuedTabMetadata(normalizedTabId) || {}
-    const pendingAction = queueRuntime.getPendingTabAction(normalizedTabId) || {}
-    const actionHref = normalizeQuoraProfileUrl(
-        action?.profileHref ||
-        action?.targetProfileHref ||
-        action?.targetUrl ||
-        action?.url ||
-        action?.requestedUrl ||
-        ''
-    )
-    const runtimeHref = normalizeQuoraProfileUrl(
-        metadata.profileHref ||
-        pendingAction.profileHref ||
-        pendingAction.targetProfileHref ||
-        pendingAction.targetUrl ||
-        pendingAction.url ||
-        pendingAction.requestedUrl ||
-        ''
-    )
-    const actionCoordinatorKey = `${action?.coordinatorKey || actionHref || ''}`.trim()
-    const runtimeCoordinatorKey = `${metadata.coordinatorKey || pendingAction.coordinatorKey || runtimeHref || ''}`.trim()
-    if(actionHref && runtimeHref && actionHref !== runtimeHref) return false
-    if(actionCoordinatorKey && runtimeCoordinatorKey && actionCoordinatorKey !== runtimeCoordinatorKey) return false
-    if(!actionHref && !actionCoordinatorKey) return false
-    if(!runtimeHref && !runtimeCoordinatorKey) return false
-
-    const actionAttemptId = getAttemptIdFromValue(action)
-    const runtimeAttemptId = getAttemptIdFromValue(metadata) || getAttemptIdFromValue(pendingAction)
-    if(actionAttemptId && runtimeAttemptId && actionAttemptId !== runtimeAttemptId) return false
-
-    const actionAttemptNumber = getAttemptNumberFromValue(action)
-    const runtimeAttemptNumber = getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(pendingAction)
-    if(actionAttemptNumber && runtimeAttemptNumber && actionAttemptNumber !== runtimeAttemptNumber) return false
-
-    const actionKind = getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || action?.action || '')
-    const runtimeActionKind = getCoordinatorActionKindForRequestedAction(
-        metadata.actionKind ||
-        metadata.tabAction ||
-        pendingAction.actionKind ||
-        pendingAction.tabAction ||
-        pendingAction.action ||
-        ''
-    )
-    if(actionKind && runtimeActionKind && actionKind !== runtimeActionKind) return false
-
-    return true
-}
-
-function queuedRuntimeActionHasActiveOrPendingSurface(action = {}) {
-    const runtimeTabIds = new Set([
-        ...queueRuntime.listActiveQueuedTabIds(),
-        ...queueRuntime.listPendingTabActionTabIds()
-    ])
-    for(const tabId of runtimeTabIds) {
-        if(queuedRuntimeActionMatchesTabRuntime(action, tabId)) return true
-    }
-    return false
-}
-
-function getQueuedRuntimeActionAuthorityEntry(action = {}, currentAuthorityState = null) {
-    const queue = currentAuthorityState?.queue || coordinatorAuthority.current()?.queue || {}
-    const normalizedHref = normalizeQuoraProfileUrl(
-        action?.profileHref ||
-        action?.targetProfileHref ||
-        action?.targetUrl ||
-        action?.url ||
-        action?.requestedUrl ||
-        ''
-    )
-    const coordinatorKey = action?.coordinatorKey || (normalizedHref
-        ? normalizedHref
-        : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
-    const directItem = normalizedHref
-        ? queue[normalizedHref] || queue[coordinatorKey] || null
-        : queue[coordinatorKey] || null
-    if(directItem) {
-        return {
-            item: directItem,
-            key: normalizedHref && queue[normalizedHref] ? normalizedHref : coordinatorKey,
-            href: normalizedHref
-        }
-    }
-
-    for(const [key, item] of Object.entries(queue || {})) {
-        const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
-        const itemKey = getCoordinatorItemQueueKey(item, key)
-        if((normalizedHref && itemHref === normalizedHref) ||
-            (coordinatorKey && itemKey === coordinatorKey)) {
-            return {item, key, href: itemHref || normalizedHref}
-        }
-    }
-
-    return {
-        item: null,
-        key: normalizedHref || coordinatorKey || '',
-        href: normalizedHref
-    }
-}
-
 async function getRecoverableLiveTabForQueuedRuntimeAction(action = {}, entry = {}, options = {}) {
     const item = entry.item || null
     const itemKey = entry.key || entry.href || ''
@@ -9127,294 +9073,73 @@ async function recoverQueuedRuntimeActionBeforeOpen(action = {}, options = {}) {
     return {changed: false, adopted: false, deferred: false, reason: recovery.reason || 'queued-runtime-action-no-live-tab'}
 }
 
-function getQueuedActionNoForegroundFallback(item = null, options = {}) {
-    if(item?.executorNoForegroundFallback === false || item?.noForegroundFallback === false) return false
-    if(item?.executorNoForegroundFallback === true || item?.noForegroundFallback === true) return true
-    return options.noForegroundFallback === true
-}
-
-function markQueuedTabExecutorActionPlanned(action = {}, decision = {}, reason = 'executor-open-planned') {
-    return {
-        ...action,
-        executorPlanKind: 'open-tab',
-        executorPlanReason: reason,
-        executorPlanDecisionReason: decision?.reason || '',
-        executorPlanAuthorityValidated: decision?.authorityValidated === true,
-        executorPlanCreatedAt: Date.now()
+// rolledBackQueuedTabRetryClassification is constructed here, in place at
+// this cluster's old source-text position (decomposition Slice 23, part
+// 2): no already-extracted module eagerly references any of its exported
+// names at its own construction call site in sw.js, so no early-
+// construction reordering is needed (contrast with
+// queuedRuntimeActionMatching, this slice's other module, constructed well
+// above -- see that module's header comment). It needs
+// isQueuedTabAttemptBudgetExhausted (queuedTabRuntimeStatus, above) among
+// its handlers, which is exactly the dependency that ruled out folding this
+// cluster into queuedRuntimeActionMatching instead.
+const rolledBackQueuedTabRetryClassification = createRolledBackQueuedTabRetryClassification({
+    now: () => Date.now(),
+    constants: {
+        QUEUE_LOAD_THROTTLE_MAX_MS,
+        STALE_QUEUED_TAB_MAX_RETRIES,
+        JOB_EVENT_RETRY
+    },
+    handlers: {
+        isTerminalCoordinatorStatus,
+        isActiveCoordinatorStatus,
+        isCoordinatorQueueAuthoritativeItem,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorFailureRetryCount,
+        getQueuedTabMaxRetries,
+        normalizeTabId,
+        getQueueLoadThrottle,
+        normalizeQuoraProfileUrl,
+        normalizeAttemptId,
+        isQueuedTabAttemptBudgetExhausted,
+        makeAttemptId,
+        getNextAttemptNumberFromValue,
+        reduceJobEvent,
+        getCoordinatorActionKindForRequestedAction,
+        applyCoordinatorJobEnvelope,
+        makeEmptyCoordinatorMilestones,
+        getCoordinatorItemHref,
+        getQueuedTabRetryAttempt,
+        normalizeProgressPatch,
+        getCoordinatorItemExecutorTabAction,
+        getCoordinatorItemOpenUrl,
+        getCoordinatorItemQueueKey,
+        normalizeCoordinatorRequestedUrl,
+        isProfileResolutionItem
     }
-}
-
-function isQueuedTabRetryBudgetReleaseReason(reason = '') {
-    const normalized = `${reason || ''}`.trim()
-    return normalized === 'active-transition-failed' ||
-        normalized === 'queued-tab-release-fast-executor-preflight' ||
-        normalized === 'executor-plan-active-transition-retry-budget-exhausted' ||
-        /(?:^|-)active-missing-tab(?:-|$)/.test(normalized) ||
-        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(normalized) ||
-        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(normalized) ||
-        /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized) ||
-        /(?:^|-)content-script-(?:ensure-failed|unscriptable|version-mismatch)(?:-|$)/.test(normalized) ||
-        /(?:^|-)claim-nudge-not-accepted(?:-|$)/.test(normalized) ||
-        /(?:^|-)fresh-content-script-recovery(?:-|$)/.test(normalized) ||
-        /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalized) ||
-        /(?:^|-)queued-tab-final-open-decision-timeout(?:-|$)/.test(normalized) ||
-        /(?:^|-)queued-stale-runtime-(?:missing-metadata|missing-queued-action|action-already-pruned|action-drained-before-authority|action-pruned-after-fill-timeout)(?:-|$)/.test(normalized)
-}
-
-function getExhaustedRolledBackQueuedTabTerminalError(item = null) {
-    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-    if(reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)) {
-        return 'Queued tab active transition failed after exhausting retry budget'
-    }
-    if(/(?:^|-)active-missing-tab(?:-|$)/.test(reason) ||
-        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(reason) ||
-        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(reason)) {
-        return 'Queued tab runtime disappeared after exhausting retry budget'
-    }
-    return 'Queued tab failed to open after exhausting retry budget'
-}
-
-function shouldAdvanceRolledBackQueuedTabBeforeOpen(item = null) {
-    if(!item || isTerminalCoordinatorStatus(item.status) || isActiveCoordinatorStatus(item.status)) return false
-    return isQueuedTabRetryBudgetReleaseReason(item.actionLeaseReleaseReason) &&
-        !!getAttemptIdFromValue(item) &&
-        !!getAttemptNumberFromValue(item)
-}
-
-function getRolledBackQueuedTabRetryAttempt(item = {}) {
-    return Math.max(
-        getCoordinatorFailureRetryCount(item),
-        Number.parseInt(item?.retryAttempt, 10) || 0
-    )
-}
-
-function isExhaustedRolledBackQueuedTabRetry(item = null) {
-    if(!shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) return false
-    return getRolledBackQueuedTabRetryAttempt(item) >= getQueuedTabMaxRetries(item)
-}
-
-function isActiveTransitionRolledBackQueuedTabRetry(item = null) {
-    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-    return reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)
-}
-
-function isRuntimeDisappearedRolledBackQueuedTabRetry(item = null) {
-    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-    return /(?:^|-)active-missing-tab(?:-|$)/.test(reason) ||
-        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(reason) ||
-        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(reason)
-}
-
-function isTransientOpenRolledBackQueuedTabRetry(item = null) {
-    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-    if(!reason) return false
-    if(isActiveTransitionRolledBackQueuedTabRetry(item)) return false
-    if(isRuntimeDisappearedRolledBackQueuedTabRetry(item)) {
-        return false
-    }
-    return isQueuedTabRetryBudgetReleaseReason(reason)
-}
-
-function shouldRecoverExhaustedOpenRetryUnderQueuePressure(item = null, options = {}) {
-    if(options.recoverQueueLoadPressure !== true) return false
-    if(!item || !isTransientOpenRolledBackQueuedTabRetry(item)) return false
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
-    if(options.serviceWorkerOwned !== true &&
-        item?.serviceWorkerOwned !== true &&
-        item?.executorOwner !== 'service-worker') {
-        return false
-    }
-    if(normalizeTabId(item?.tabId || item?.activeTabId || null)) return false
-    if((Number.parseInt(item?.activeAt, 10) || 0) > 0) return false
-
-    const throttle = getQueueLoadThrottle()
-    const pressureReason = `${throttle?.reason || ''}`.trim()
-    if(throttle?.active === true &&
-        /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)) {
-        return true
-    }
-
-    const lastPressureAt = Number.parseInt(throttle?.lastPressureAt, 10) || 0
-    return lastPressureAt > 0 &&
-        Date.now() - lastPressureAt <= QUEUE_LOAD_THROTTLE_MAX_MS &&
-        /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)
-}
-
-function shouldRecoverExhaustedRolledBackQueuedTabRetry(item = null, options = {}) {
-    if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
-    if(options.queueOnlyAuthority === true) return true
-    if(options.recoverActiveTransitionFailures !== true) return false
-    const activeTransitionRetry = isActiveTransitionRolledBackQueuedTabRetry(item)
-    const runtimeDisappearedRetry = isRuntimeDisappearedRolledBackQueuedTabRetry(item)
-    const transientOpenRetry = isTransientOpenRolledBackQueuedTabRetry(item)
-    const pressureOpenRetry = shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options)
-    if(!activeTransitionRetry &&
-        !runtimeDisappearedRetry &&
-        !(transientOpenRetry && (options.recoverTransientOpenRetry === true || pressureOpenRetry))) {
-        return false
-    }
-    return isCoordinatorQueueAuthoritativeItem(item) &&
-        (options.serviceWorkerOwned === true ||
-            item?.serviceWorkerOwned === true ||
-            item?.executorOwner === 'service-worker')
-}
-
-function wouldActiveMissingTabRequeueExhaustRetryBudget(item = null) {
-    if(!item || !isActiveCoordinatorStatus(item.status)) return false
-    if(!getAttemptIdFromValue(item) || !getAttemptNumberFromValue(item)) return false
-    return getRolledBackQueuedTabRetryAttempt(item) + 1 >= getQueuedTabMaxRetries(item)
-}
-
-function makeExhaustedRolledBackQueuedTerminalizationKey(itemKey = '', itemOrAttempt = {}, attemptNumber = 0) {
-    const normalizedKey = normalizeQuoraProfileUrl(itemKey || '') || `${itemKey || ''}`.trim()
-    const attemptId = typeof itemOrAttempt === 'string'
-        ? normalizeAttemptId(itemOrAttempt)
-        : getAttemptIdFromValue(itemOrAttempt)
-    const normalizedAttemptNumber = Number.parseInt(
-        typeof itemOrAttempt === 'string' ? attemptNumber : getAttemptNumberFromValue(itemOrAttempt),
-        10
-    ) || 0
-    return `${normalizedKey}|${attemptId}|${normalizedAttemptNumber}`
-}
-
-function buildRolledBackQueuedTabRetryAction(item = {}, action = {}) {
-    const sourceAttemptId = getAttemptIdFromValue(item)
-    const sourceAttemptNumber = getAttemptNumberFromValue(item)
-    if(!sourceAttemptId || !sourceAttemptNumber) return null
-
-    const retryAttempt = getRolledBackQueuedTabRetryAttempt(item)
-    const maxRetries = getQueuedTabMaxRetries(item)
-    if(retryAttempt >= maxRetries || isQueuedTabAttemptBudgetExhausted(item)) return null
-
-    return {
-        ...action,
-        retryAttempt: retryAttempt + 1,
-        sourceAttemptId,
-        sourceAttemptNumber,
-        allowActiveTransitionAfterRollback: true,
-        attemptId: makeAttemptId(),
-        attemptNumber: getNextAttemptNumberFromValue(item),
-        maxRetries
-    }
-}
-
-function buildForcedRolledBackQueuedTabRetryItem(item = {}, now = Date.now(), reason = 'executor-plan-active-transition-retry-budget-recovered') {
-    const sourceAttemptId = getAttemptIdFromValue(item)
-    const sourceAttemptNumber = getAttemptNumberFromValue(item)
-    if(!sourceAttemptId || !sourceAttemptNumber) return null
-
-    const retryAttempt = getRolledBackQueuedTabRetryAttempt(item)
-    const attemptId = makeAttemptId()
-    const attemptNumber = getNextAttemptNumberFromValue(item)
-    const nextRetryAttempt = retryAttempt + 1
-    const maxRetries = Math.max(getQueuedTabMaxRetries(item), nextRetryAttempt + 1)
-    const configuredMaxAttempts = Math.max(
-        Number.parseInt(item?.attempt?.max, 10) || 0,
-        Number.parseInt(item?.maxAttempts, 10) || 0
-    )
-    const maxAttempts = Math.max(configuredMaxAttempts, attemptNumber + 1, maxRetries + 1)
-    const reduced = reduceJobEvent(item, {
-        type: JOB_EVENT_RETRY,
-        sourceAttemptId,
-        sourceAttemptNumber,
-        attemptId,
-        attemptNumber,
-        at: now,
-        retryCount: nextRetryAttempt,
-        lastRetryAt: now
-    })
-    if(!reduced.accepted) return null
-
-    const actionKind = getCoordinatorActionKindForRequestedAction(item.actionKind || item.tabAction || item.executorTabAction || '')
-    return applyCoordinatorJobEnvelope({
-        ...reduced.item,
-        attempt: {
-            id: attemptId,
-            number: attemptNumber,
-            max: maxAttempts
-        },
-        attemptId,
-        attemptNumber,
-        maxAttempts,
-        actionKind,
-        status: 'queued',
-        outcome: '',
-        error: '',
-        updatedAt: now,
-        queuedAt: now,
-        activeAt: 0,
-        terminalAt: 0,
-        tabId: null,
-        retryAttempt: nextRetryAttempt,
-        maxRetries,
-        actionLease: null,
-        actionLeaseReleasedAt: now,
-        actionLeaseReleaseReason: reason,
-        milestones: makeEmptyCoordinatorMilestones()
-    }, {
-        runInput: {id: item.runId || '', sourceType: item.source?.type || item.scope?.type || ''},
-        source: item.source || {},
-        runId: item.runId || '',
-        targetProfileHref: getCoordinatorItemHref(item),
-        requestedUrl: item.requestedUrl || getCoordinatorItemHref(item),
-        coordinatorKey: item.coordinatorKey || getCoordinatorItemHref(item),
-        actionKind
-    })
-}
-
-function buildQueuedDirectBlockActionRetryRecord(item = {}, record = {}, now = Date.now()) {
-    const retryAttempt = getQueuedTabRetryAttempt(item, record)
-    const nextRetryAttempt = retryAttempt + 1
-    const maxRetries = Math.max(getQueuedTabMaxRetries(item, record), nextRetryAttempt + 1)
-    return normalizeProgressPatch(getCoordinatorItemHref(item) || record.profileHref || '', {
-        ...record,
-        status: 'queued',
-        outcome: '',
-        error: '',
-        finalError: '',
-        terminalAt: 0,
-        completedAt: 0,
-        tabClosedAt: 0,
-        actionKind: record.actionKind || item.actionKind || 'mute-block',
-        runId: record.runId || item.runId || '',
-        queuedAt: now,
-        retryAttempt: nextRetryAttempt,
-        maxRetries,
-        attemptId: makeAttemptId(),
-        attemptNumber: getNextAttemptNumberFromValue(item),
-        directBlockFailureDetail: null,
-        directBlockRetryRecovery: true,
-        event: 'Queued direct block action did not complete; retrying queued action',
-        replaceProgressRecord: true
-    }, record)
-}
-
-function buildQueuedProfileActionGateRetryRecord(item = {}, record = {}, now = Date.now()) {
-    const retryAttempt = getQueuedTabRetryAttempt(item, record)
-    const nextRetryAttempt = retryAttempt + 1
-    const maxRetries = Math.max(getQueuedTabMaxRetries(item, record), nextRetryAttempt + 1)
-    return normalizeProgressPatch(getCoordinatorItemHref(item) || record.profileHref || '', {
-        ...record,
-        status: 'queued',
-        outcome: '',
-        error: '',
-        finalError: '',
-        terminalAt: 0,
-        completedAt: 0,
-        tabClosedAt: 0,
-        openedViablePage: false,
-        actionKind: record.actionKind || item.actionKind || 'mute-block',
-        runId: record.runId || item.runId || '',
-        queuedAt: now,
-        retryAttempt: nextRetryAttempt,
-        maxRetries,
-        attemptId: makeAttemptId(),
-        attemptNumber: getNextAttemptNumberFromValue(item),
-        profileActionGateRetryRecovery: true,
-        event: 'Queued profile action did not receive profile action gate; retrying queued action',
-        replaceProgressRecord: true
-    }, record)
-}
+})
+const {
+    getQueuedActionNoForegroundFallback,
+    markQueuedTabExecutorActionPlanned,
+    isQueuedTabRetryBudgetReleaseReason,
+    getExhaustedRolledBackQueuedTabTerminalError,
+    shouldAdvanceRolledBackQueuedTabBeforeOpen,
+    getRolledBackQueuedTabRetryAttempt,
+    isExhaustedRolledBackQueuedTabRetry,
+    isActiveTransitionRolledBackQueuedTabRetry,
+    isRuntimeDisappearedRolledBackQueuedTabRetry,
+    isTransientOpenRolledBackQueuedTabRetry,
+    shouldRecoverExhaustedOpenRetryUnderQueuePressure,
+    shouldRecoverExhaustedRolledBackQueuedTabRetry,
+    wouldActiveMissingTabRequeueExhaustRetryBudget,
+    makeExhaustedRolledBackQueuedTerminalizationKey,
+    buildRolledBackQueuedTabRetryAction,
+    buildForcedRolledBackQueuedTabRetryItem,
+    buildQueuedDirectBlockActionRetryRecord,
+    buildQueuedProfileActionGateRetryRecord,
+    buildCoordinatorExecutorActionForQueuedItem
+} = rolledBackQueuedTabRetryClassification
 
 async function planQueuedTabExecutorAction(action = {}, options = {}) {
     const openDecision = await promiseWithTimeout(
@@ -9457,44 +9182,6 @@ async function planQueuedTabExecutorAction(action = {}, options = {}) {
         authorityValidated: !!(options.currentAuthorityState || options.authorityState),
         authorityState: options.currentAuthorityState || options.authorityState || null
     }, 'executor-apply-phase')
-}
-
-function buildCoordinatorExecutorActionForQueuedItem(item = {}, ownerTabId = null, ownerWindowId = null, options = {}) {
-    const tabAction = getCoordinatorItemExecutorTabAction(item, options.tabAction)
-    const fallbackKey = `${options.fallbackKey || ''}`.trim()
-    const url = getCoordinatorItemOpenUrl(item, fallbackKey)
-    const normalizedHref = getCoordinatorItemHref(item)
-    const coordinatorKey = getCoordinatorItemQueueKey(item, fallbackKey)
-    const actionSubjectKey = normalizedHref || coordinatorKey
-    if(!url || !actionSubjectKey) return null
-
-    const requestedActionKind = getCoordinatorActionKindForRequestedAction(item?.actionKind || tabAction)
-    const noForegroundFallback = getQueuedActionNoForegroundFallback(item, options)
-    return {
-        url,
-        profileHref: normalizedHref || '',
-        coordinatorKey,
-        requestedUrl: normalizeCoordinatorRequestedUrl(isProfileResolutionItem(item) ? url : item?.requestedUrl || url),
-        resolutionMode: item?.resolutionMode || '',
-        resolveProfileFromPage: item?.resolveProfileFromPage === true,
-        resolutionReason: item?.resolutionReason || '',
-        candidateConfidence: item?.candidateConfidence || '',
-        candidateCollector: item?.candidateCollector || '',
-        tabAction,
-        actionKind: requestedActionKind,
-        jobKey: item.jobKey || '',
-        scope: item.scope || null,
-        canonicalSubject: item.canonicalSubject || null,
-        attempt: item.attempt || null,
-        runId: item.runId || '',
-        ownerTabId,
-        ownerWindowId,
-        noForegroundFallback,
-        retryAttempt: 0,
-        attemptId: getAttemptIdFromValue(item),
-        attemptNumber: getAttemptNumberFromValue(item),
-        maxRetries: STALE_QUEUED_TAB_MAX_RETRIES
-    }
 }
 
 async function reprimeRecoveredServiceWorkerQueuedAction(item = {}, itemKey = '', options = {}) {
