@@ -211,6 +211,9 @@ const {
 const {
     createQueuedTabMetadataAndActionLease
 } = require('./swQueuedTabMetadataAndActionLease')
+const {
+    createQueuedForegroundLeaseRuntime
+} = require('./swQueuedForegroundLeaseRuntime')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -2067,6 +2070,64 @@ const {
     mergeActivationGuardTabInfo,
     deleteActivationGuardByKey
 } = activationGuardRuntime
+
+// queuedForegroundLeaseRuntime is constructed here, rather than in place
+// like a plain-in-order slice, because hasOwnedQueuedTabState and
+// restoreQueuedTabRuntimeFromActiveAuthorityForSender are eagerly
+// referenced in coordinatorReclaimEvidence's and
+// coordinatorQueueMachineEventDispatcher's own construction-call `handlers`/
+// `runtime` object literals (decomposition Slice 32, part 1 of 3). A `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes, so this module must construct before the earlier of those
+// two eager references, i.e. right here, before coordinatorReclaimEvidence.
+// See swQueuedForegroundLeaseRuntime.js's header comment for the full
+// ordering and state-threading writeup.
+const queuedForegroundLeaseRuntime = createQueuedForegroundLeaseRuntime({
+    now: () => Date.now(),
+    constants: {
+        SERVICE_WORKER_QUEUE_OWNER_ID,
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
+    handlers: {
+        queueRuntime,
+        normalizeTabId,
+        normalizeQuoraProfileUrl,
+        wasQueuedRuntimeTabRemoved,
+        getQueuedTabMetadata,
+        setQueuedTabMetadata,
+        findCoordinatorQueueEntryForHref,
+        isActiveCoordinatorStatus,
+        coordinatorItemMatchesQueuedTabRuntime,
+        getCoordinatorItemHref,
+        getCoordinatorItemQueueKey,
+        getCoordinatorItemExecutorTabAction,
+        getCoordinatorActionKindForRequestedAction,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        makeClaimableQueuedTabAction,
+        registerOwnedTab,
+        incrementQueueWakeupMetric
+    },
+    state: {
+        getCoordinatorAuthority: () => coordinatorAuthority,
+        getForegroundLeaseTabId: () => queuedForegroundLeaseTabId,
+        setForegroundLeaseTabId: value => { queuedForegroundLeaseTabId = value }
+    }
+})
+const {
+    isForegroundRequiredProfileActionRequest,
+    restoreQueuedTabRuntimeFromActiveAuthorityForSender,
+    hasOwnedQueuedTabState,
+    isForegroundQueuedTabAction,
+    isForegroundQueuedTabWork,
+    getQueuedForegroundLeaseTabId,
+    makeQueuedTabMetadataProgressPatch,
+    clearQueuedForegroundLease,
+    releaseQueuedForegroundLease,
+    addExpectedTerminalTabId,
+    isExpectedTerminalSweepTab,
+    shouldActivateOwnedQueuedTabOnOpen
+} = queuedForegroundLeaseRuntime
 
 const coordinatorReclaimEvidence = createCoordinatorReclaimEvidence({
     handlers: {
@@ -22701,133 +22762,6 @@ async function beginCoordinatorProfileAction(request = {}, sender = {}) {
     }
 }
 
-function isForegroundRequiredProfileActionRequest(request = {}) {
-    if(request?.requireForegroundWork === true) return true
-    const reason = `${request?.reason || ''}`.trim().toLowerCase()
-    return reason === 'mute-confirmation' ||
-        reason === 'block-confirmation' ||
-        reason === 'unmute-confirmation' ||
-        reason === 'unblock-confirmation' ||
-        reason.endsWith('-confirmation')
-}
-
-function restoreQueuedTabRuntimeFromActiveAuthorityForSender(tabId = null, senderTab = null, metadata = null, options = {}) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId || normalizeTabId(senderTab?.id) !== normalizedTabId) return null
-    if(wasQueuedRuntimeTabRemoved(normalizedTabId) && options.allowRemovedSenderTab !== true) return null
-
-    const currentAuthorityState = coordinatorAuthority.current()
-    const queue = currentAuthorityState?.queue || {}
-    const baseMetadata = metadata || {}
-    const href = normalizeQuoraProfileUrl(baseMetadata.profileHref || baseMetadata.requestedUrl || senderTab?.url || '')
-    const coordinatorKey = `${baseMetadata.coordinatorKey || href || ''}`.trim()
-    const entry = coordinatorKey && queue[coordinatorKey]
-        ? {key: coordinatorKey, item: queue[coordinatorKey]}
-        : findCoordinatorQueueEntryForHref(queue, href) ||
-            Object.entries(queue)
-                .map(([key, item]) => ({key, item}))
-                .find(candidate =>
-                    isActiveCoordinatorStatus(candidate.item?.status) &&
-                    normalizeTabId(candidate.item?.tabId || candidate.item?.activeTabId || null) === normalizedTabId
-                ) ||
-            null
-    const item = entry?.item || null
-    const matchesRuntime = metadata
-        ? coordinatorItemMatchesQueuedTabRuntime(item, entry?.key || coordinatorKey, baseMetadata, normalizedTabId)
-        : normalizeTabId(item?.tabId || item?.activeTabId || null) === normalizedTabId
-    if(!item ||
-        !isActiveCoordinatorStatus(item.status) ||
-        !matchesRuntime) {
-        return null
-    }
-
-    const restoredMetadata = {
-        ...baseMetadata,
-        profileHref: getCoordinatorItemHref(item) || href,
-        coordinatorKey: getCoordinatorItemQueueKey(item, entry?.key || coordinatorKey),
-        requestedUrl: item.requestedUrl || baseMetadata.requestedUrl || href,
-        tabAction: getCoordinatorItemExecutorTabAction(item, baseMetadata.tabAction || 'nuke'),
-        actionKind: getCoordinatorActionKindForRequestedAction(item.actionKind || baseMetadata.actionKind || baseMetadata.tabAction || 'mute-block'),
-        runId: item.runId || baseMetadata.runId || '',
-        attemptId: getAttemptIdFromValue(item) || getAttemptIdFromValue(baseMetadata),
-        attemptNumber: getAttemptNumberFromValue(item) || getAttemptNumberFromValue(baseMetadata),
-        actionSurfaceMode: item.actionSurfaceMode || baseMetadata.actionSurfaceMode || '',
-        actionSurfaceWindowId: item.actionSurfaceWindowId || baseMetadata.actionSurfaceWindowId || senderTab?.windowId || null,
-        actionSurfaceAnchorTabId: item.actionSurfaceAnchorTabId || baseMetadata.actionSurfaceAnchorTabId || null,
-        actionSurfaceActivatedAt: item.actionSurfaceActivatedAt || baseMetadata.actionSurfaceActivatedAt || 0,
-        durableActiveAt: item.activeAt || Date.now(),
-        durableActiveReason: 'begin-profile-action-runtime-restored'
-    }
-    const action = makeClaimableQueuedTabAction({
-        action: restoredMetadata.tabAction,
-        profileHref: restoredMetadata.profileHref,
-        targetUrl: restoredMetadata.profileHref,
-        coordinatorKey: restoredMetadata.coordinatorKey,
-        requestedUrl: restoredMetadata.requestedUrl,
-        actionKind: restoredMetadata.actionKind,
-        runId: restoredMetadata.runId,
-        ownerTabId: restoredMetadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-        ownerWindowId: restoredMetadata.ownerWindowId || senderTab?.windowId || null,
-        noForegroundFallback: !!restoredMetadata.noForegroundFallback,
-        actionSurfaceMode: restoredMetadata.actionSurfaceMode || '',
-        attemptId: restoredMetadata.attemptId,
-        attemptNumber: restoredMetadata.attemptNumber
-    }, restoredMetadata)
-
-    queueRuntime.clearRemovedQueuedRuntimeTab(normalizedTabId)
-    queueRuntime.addActiveQueuedTab(normalizedTabId)
-    setQueuedTabMetadata(normalizedTabId, restoredMetadata)
-    if(action) queueRuntime.setPendingTabAction(normalizedTabId, action)
-    registerOwnedTab(restoredMetadata.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID, normalizedTabId)
-    incrementQueueWakeupMetric('beginProfileAction.runtimeRestoredFromAuthority')
-    return {metadata: restoredMetadata, action}
-}
-
-function hasOwnedQueuedTabState(tabId) {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) return false
-    return queueRuntime.hasQueuedTabMetadata(normalizedTabId) ||
-        queueRuntime.hasActiveQueuedTab(normalizedTabId) ||
-        queueRuntime.hasOwnedTabState(normalizedTabId)
-}
-
-function isForegroundQueuedTabAction(value = '') {
-    const action = `${value || ''}`.trim()
-    return action === 'nuke' || action === 'mute-block' || action === UNBLOCK_UNMUTE_ACTION_KIND
-}
-
-function isForegroundQueuedTabWork(metadata = null, record = null) {
-    return isForegroundQueuedTabAction(metadata?.tabAction || metadata?.actionKind || record?.actionKind || '')
-}
-
-function getQueuedForegroundLeaseTabId() {
-    const tabId = normalizeTabId(queuedForegroundLeaseTabId)
-    if(!tabId) {
-        queuedForegroundLeaseTabId = null
-        return null
-    }
-
-    const metadata = getQueuedTabMetadata(tabId)
-    if(!queueRuntime.hasActiveQueuedTab(tabId) || metadata?.closeRequestedAt) {
-        queuedForegroundLeaseTabId = null
-        return null
-    }
-
-    return tabId
-}
-
-function makeQueuedTabMetadataProgressPatch(metadata = {}, patch = {}) {
-    return {
-        ...patch,
-        actionKind: patch.actionKind || metadata?.actionKind || metadata?.tabAction || 'mute-block',
-        runId: patch.runId || metadata?.runId || '',
-        attemptId: getAttemptIdFromValue(patch) || getAttemptIdFromValue(metadata),
-        attemptNumber: getAttemptNumberFromValue(patch) || getAttemptNumberFromValue(metadata),
-        ownerTabId: patch.ownerTabId || metadata?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-        ownerWindowId: patch.ownerWindowId || metadata?.ownerWindowId || null
-    }
-}
-
 async function recordQueuedTabMetadataMilestone(tabId, metadata = null, patch = {}) {
     const profileHref = normalizeQuoraProfileUrl(metadata?.profileHref || patch?.profileHref || '')
     if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
@@ -22885,50 +22819,6 @@ async function promoteNextQueuedForegroundCandidate(reason = 'foreground-lease-r
     return {promoted: false, reason: 'no-foreground-candidate'}
 }
 
-function clearQueuedForegroundLease(reason = '') {
-    const normalizedTabId = normalizeTabId(queuedForegroundLeaseTabId)
-    if(!normalizedTabId) {
-        queuedForegroundLeaseTabId = null
-        return false
-    }
-
-    queuedForegroundLeaseTabId = null
-    setQueuedTabMetadata(normalizedTabId, {
-        foregroundLeaseReleasedAt: Date.now(),
-        foregroundLeaseReleaseReason: `${reason || ''}`.trim()
-    })
-    return true
-}
-
-function releaseQueuedForegroundLease(tabId, reason = '') {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId || normalizeTabId(queuedForegroundLeaseTabId) !== normalizedTabId) return false
-
-    return clearQueuedForegroundLease(reason)
-}
-
-function addExpectedTerminalTabId(tabIdsByHref, href = '', tabId = null) {
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedHref || !normalizedTabId) return
-
-    let tabIds = tabIdsByHref.get(normalizedHref)
-    if(!tabIds) {
-        tabIds = new Set()
-        tabIdsByHref.set(normalizedHref, tabIds)
-    }
-    tabIds.add(normalizedTabId)
-}
-
-function isExpectedTerminalSweepTab(tabId, href = '', expectedTabIdsByHref = new Map()) {
-    const normalizedTabId = normalizeTabId(tabId)
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
-    if(!normalizedTabId || !normalizedHref) return false
-
-    if(expectedTabIdsByHref.get(normalizedHref)?.has(normalizedTabId)) return true
-    return hasOwnedQueuedTabState(normalizedTabId)
-}
-
 async function buildTabCreateOptions(action = {}) {
     const options = {
         url: normalizeTabTargetUrl(action.url),
@@ -22943,12 +22833,6 @@ async function buildTabCreateOptions(action = {}) {
     }
 
     return options
-}
-
-function shouldActivateOwnedQueuedTabOnOpen(action = {}) {
-    return action?.active === true ||
-        action?.activateOnOpen === true ||
-        action?.foregroundOnOpen === true
 }
 
 function shouldUseQueuedWorkerActionSurface(action = {}) {

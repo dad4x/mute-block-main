@@ -2781,7 +2781,7 @@ test('coordinator executor startup awaits tab filling unless explicitly plan-onl
 test('queued executor actions preserve stored foreground policy', () => {
     const source = readRepoFile('shared/js/sw.js')
     const helperBody = extractFunction(readRepoFile('shared/js/swRolledBackQueuedTabRetryClassification.js'), 'function getQueuedActionNoForegroundFallback(item = null, options = {})')
-    const activateOnOpenBody = extractFunction(source, 'function shouldActivateOwnedQueuedTabOnOpen(action = {})')
+    const activateOnOpenBody = extractFunction(readRepoFile('shared/js/swQueuedForegroundLeaseRuntime.js'), 'function shouldActivateOwnedQueuedTabOnOpen(action = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
     const recoverBody = extractFunction(source, 'async function recoverPendingTabActionFromCoordinatorQueue(sender = {})')
     const adoptBody = extractFunction(source, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
