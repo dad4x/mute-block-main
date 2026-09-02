@@ -250,6 +250,9 @@ const {
 const {
     createCoordinatorJobMilestoneBookkeeping
 } = require('./swCoordinatorJobMilestoneBookkeeping')
+const {
+    createQueuedTabOpenEffect
+} = require('./swQueuedTabOpenEffect')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -29244,160 +29247,34 @@ async function fillQueuedTabs(options = {}) {
     return queuedTabFillPromise
 }
 
-function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = Date.now()) {
-    const retryAttempt = Number.parseInt(action.retryAttempt, 10) || 0
-    const attemptNumber = getAttemptNumberFromValue(action) || retryAttempt + 1
-    const attemptId = getAttemptIdFromValue(action) || makeAttemptId()
-    const maxRetries = getQueuedTabMaxRetries(action)
-    const actionKind = action.actionKind || (action.tabAction === 'nuke' ? 'mute-block' : action.tabAction || null)
-    const profileHref = normalizeQuoraProfileUrl(action.profileHref || action.targetProfileHref || action.url || '')
-    const coordinatorKey = action.coordinatorKey || (profileHref ? profileHref : makeProfileResolutionQueueKey(action.requestedUrl || action.url || ''))
-    const requestedUrl = normalizeCoordinatorRequestedUrl(action.requestedUrl || action.url || '')
-    const lastUrl = tab.url || normalizeTabTargetUrl(action.url)
-    const tabWindowId = Number.parseInt(tab?.windowId, 10) || null
-    const actionSurfaceMode = action.actionSurfaceMode || ''
-    const actionSurfaceWindowId = action.actionSurfaceWindowId ||
-        (actionSurfaceMode === 'worker-window' ? tabWindowId : null)
-    const ownerWindowId = action.ownerWindowId || tabWindowId || null
-
-    return {
-        action,
-        tab,
-        retryAttempt,
-        attemptId,
-        attemptNumber,
-        maxRetries,
-        openedAt,
-        actionKind,
-        profileHref,
-        coordinatorKey,
-        requestedUrl,
-        metadata: {
-            profileHref,
-            coordinatorKey,
-            requestedUrl,
-            resolutionMode: action.resolutionMode || '',
-            resolveProfileFromPage: action.resolveProfileFromPage === true,
-            resolutionReason: action.resolutionReason || '',
-            candidateConfidence: action.candidateConfidence || '',
-            candidateCollector: action.candidateCollector || '',
-            ownerTabId: action.ownerTabId || null,
-            ownerWindowId,
-            actionSurfaceMode,
-            actionSurfaceWindowId,
-            actionSurfaceAnchorTabId: action.actionSurfaceAnchorTabId || null,
-            actionSurfaceActivatedAt: action.actionSurfaceActivatedAt || 0,
-            runId: action.runId || '',
-            tabAction: action.tabAction || null,
-            actionKind,
-            jobKey: action.jobKey || '',
-            scope: action.scope || null,
-            canonicalSubject: action.canonicalSubject || null,
-            attempt: action.attempt || null,
-            noForegroundFallback: !!action.noForegroundFallback,
-            retryAttempt,
-            attemptId,
-            attemptNumber,
-            maxRetries,
-            openedAt,
-            lastUrl
-        },
-        pendingAction: {
-            action: action.tabAction || null,
-            profileHref,
-            targetUrl: profileHref || '',
-            coordinatorKey,
-            requestedUrl,
-            resolutionMode: action.resolutionMode || '',
-            resolveProfileFromPage: action.resolveProfileFromPage === true,
-            resolutionReason: action.resolutionReason || '',
-            candidateConfidence: action.candidateConfidence || '',
-            candidateCollector: action.candidateCollector || '',
-            actionKind,
-            jobKey: action.jobKey || '',
-            scope: action.scope || null,
-            canonicalSubject: action.canonicalSubject || null,
-            attempt: action.attempt || null,
-            runId: action.runId || '',
-            ownerTabId: action.ownerTabId || null,
-            ownerWindowId,
-            actionSurfaceMode,
-            actionSurfaceWindowId,
-            actionSurfaceAnchorTabId: action.actionSurfaceAnchorTabId || null,
-            noForegroundFallback: !!action.noForegroundFallback,
-            attemptId,
-            attemptNumber
-        },
-        activeTransitionDetails: {
-            retryAttempt,
-            attemptId,
-            attemptNumber,
-            maxRetries,
-            allowActiveTransitionAfterRollback: action.allowActiveTransitionAfterRollback === true,
-            openedAt
-        },
-        progressPatch: {
-            actionKind: action.actionKind || (action.tabAction === 'nuke' ? 'mute-block' : action.tabAction || 'mute-block'),
-            runId: action.runId || '',
-            status: 'tab-opening',
-            tabId: tab.id,
-            tabCreatedAt: openedAt,
-            tabOpenedAt: openedAt,
-            contentOpenedAt: 0,
-            actionReadyAt: 0,
-            muteAttemptedAt: 0,
-            mutedAt: 0,
-            blockAttemptedAt: 0,
-            blockedAt: 0,
-            terminalAt: 0,
-            slotReleasedAt: 0,
-            closeRequestedAt: 0,
-            tabClosedAt: 0,
-            closedByExtension: false,
-            closeReason: '',
-            finalError: '',
-            retryAttempt,
-            attemptId,
-            attemptNumber,
-            maxRetries,
-            ownerTabId: action.ownerTabId || null,
-            ownerWindowId,
-            actionSurfaceMode,
-            actionSurfaceWindowId,
-            actionSurfaceActivatedAt: action.actionSurfaceActivatedAt || 0,
-            lastUrl
-        }
+// queuedTabOpenEffect (decomposition Slice 41) is constructed in place at
+// this cluster's old source-text position -- no already-extracted module
+// eagerly references any of its three exports at its own construction call
+// site in sw.js, so there's no early-construction ordering constraint here.
+// See swQueuedTabOpenEffect.js's header comment for the full Promise-chain
+// realm-crossing scrutiny (none of the three build or return a Promise).
+const queuedTabOpenEffect = createQueuedTabOpenEffect({
+    now: () => Date.now(),
+    handlers: {
+        queueRuntime,
+        getAttemptNumberFromValue,
+        getAttemptIdFromValue,
+        makeAttemptId,
+        getQueuedTabMaxRetries,
+        normalizeQuoraProfileUrl,
+        makeProfileResolutionQueueKey,
+        normalizeCoordinatorRequestedUrl,
+        normalizeTabTargetUrl,
+        normalizeTabId,
+        setQueuedTabMetadata,
+        registerOwnedTab
     }
-}
-
-function applyQueuedTabOpenRuntimeEffect(plan = {}) {
-    const tabId = normalizeTabId(plan?.tab?.id)
-    if(!tabId) return false
-
-    queueRuntime.addActiveQueuedTab(tabId)
-    setQueuedTabMetadata(tabId, plan.metadata || {})
-    queueRuntime.setPendingTabAction(tabId, plan.pendingAction || {})
-    registerOwnedTab(plan?.action?.ownerTabId, tabId)
-    return true
-}
-
-function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {}) {
-    const retryAttempt = Number.parseInt(plan.retryAttempt, 10) || 0
-    return {
-        ...(plan.progressPatch || {}),
-        replaceProgressRecord: transition.activeTransitionContinued !== true,
-        activeTransitionAccepted: transition.activeTransitionAccepted === true,
-        activeTransitionError: transition.activeTransitionError || '',
-        activeTransitionContinued: transition.activeTransitionContinued === true,
-        event: transition.activeTransitionContinued
-            ? 'Background opened a queued tab; active transition lagged after action started'
-            : transition.activeTransitionError
-            ? 'Background opened a queued tab; active transition failed before content-script ensure'
-            : retryAttempt > 0
-            ? `Background opened retry attempt ${plan.attemptNumber}`
-            : 'Background opened a queued tab'
-    }
-}
+})
+const {
+    buildQueuedTabOpenEffectPlan,
+    applyQueuedTabOpenRuntimeEffect,
+    buildQueuedTabOpenedProgressPatch
+} = queuedTabOpenEffect
 
 async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {}) {
     let activeTransitionAccepted = false

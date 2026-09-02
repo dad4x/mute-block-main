@@ -2833,8 +2833,11 @@ test('queued tab opens wait for target URL before active transition', () => {
 test('background tab opening updates authoritative Current Work', () => {
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
-    const planBody = extractFunction(source, 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = Date.now())')
-    const progressBody = extractFunction(source, 'function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {})')
+    // buildQueuedTabOpenEffectPlan/buildQueuedTabOpenedProgressPatch moved to
+    // swQueuedTabOpenEffect.js in decomposition Slice 41.
+    const queuedTabOpenEffectSource = readRepoFile('shared/js/swQueuedTabOpenEffect.js')
+    const planBody = extractFunction(queuedTabOpenEffectSource, 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = now())')
+    const progressBody = extractFunction(queuedTabOpenEffectSource, 'function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {})')
     const activeEffectBody = extractFunction(source, 'async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {})')
     const ensureContentBody = extractFunction(source, 'async function ensureQueuedTabContentScript(tabId, reason = \'\')')
     const transitionIndex = body.indexOf('confirmQueuedTabOpenDurableActiveEffect(next, tab, openPlan, {')
@@ -3160,9 +3163,10 @@ test('queued background tabs have a content-script injection fallback', () => {
 })
 
 test('queued tab open plan does not carry executor authority state across tab open', () => {
-    const source = readRepoFile('shared/js/sw.js')
     const markBody = extractFunction(readRepoFile('shared/js/swRolledBackQueuedTabRetryClassification.js'), 'function markQueuedTabExecutorActionPlanned(action = {}, decision = {}, reason = \'executor-open-planned\')')
-    const planBody = extractFunction(source, 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = Date.now())')
+    // buildQueuedTabOpenEffectPlan moved to swQueuedTabOpenEffect.js in
+    // decomposition Slice 41.
+    const planBody = extractFunction(readRepoFile('shared/js/swQueuedTabOpenEffect.js'), 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = now())')
     const activeDetailsIndex = planBody.indexOf('activeTransitionDetails: {')
     const progressPatchIndex = planBody.indexOf('progressPatch: {')
     const activeDetailsBody = planBody.slice(activeDetailsIndex, progressPatchIndex)
