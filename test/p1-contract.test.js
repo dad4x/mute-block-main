@@ -688,7 +688,7 @@ test('reconcile preserves expected live tabs for resume adoption', () => {
         'function shouldReconcileMissingActiveCoordinatorTab(item = null, record = null, href = \'\', liveProfileTabsByHref = new Map(), now = Date.now())'
     )
     const runtimeActorBody = extractFunction(
-        source,
+        readRepoFile('shared/js/swActiveQueuedTabStaleness.js'),
         'function hasConfirmedRuntimeActorForCoordinatorItem(item = null, record = null)'
     )
     const releaseDeferBody = extractFunction(
@@ -713,8 +713,9 @@ test('reconcile preserves expected live tabs for resume adoption', () => {
 
 test('active queued action phase uses its own wall clock cap', () => {
     const source = readRepoFile('shared/js/sw.js')
+    const activeQueuedTabStalenessSource = readRepoFile('shared/js/swActiveQueuedTabStaleness.js')
     const helper = extractFunction(
-        source,
+        activeQueuedTabStalenessSource,
         'function hasActiveQueuedTabActionPhaseProgress(record = null, metadata = null)'
     )
     const sweep = extractFunction(
@@ -722,11 +723,11 @@ test('active queued action phase uses its own wall clock cap', () => {
         'async function sweepStaleQueuedTabs(parentTabId = null, options = {})'
     )
     const staleTimeout = extractFunction(
-        source,
+        activeQueuedTabStalenessSource,
         'function getActiveQueuedTabStaleTimeoutMs(record, metadata = null)'
     )
     const staleAnchor = extractFunction(
-        source,
+        activeQueuedTabStalenessSource,
         'function getPersistedActiveProgressStaleAnchor(record = null)'
     )
 
@@ -1933,9 +1934,10 @@ test('active queued jobs have a wall-clock cap', () => {
     assert.match(source, /COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS = 60000/)
     assert.match(source, /STALE_QUEUED_TAB_MAX_RETRIES = 1/)
     assert.match(contentSource, /ACTION_LEASE_WAIT_MS = 45000/)
-    assert.match(source, /function getActiveQueuedTabStartedAt/)
-    assert.match(source, /function getActiveQueuedTabActionPhaseStartedAt/)
-    assert.match(source, /function getActiveQueuedTabAgeAnchor/)
+    const activeQueuedTabStalenessSource = readRepoFile('shared/js/swActiveQueuedTabStaleness.js')
+    assert.match(activeQueuedTabStalenessSource, /function getActiveQueuedTabStartedAt/)
+    assert.match(activeQueuedTabStalenessSource, /function getActiveQueuedTabActionPhaseStartedAt/)
+    assert.match(activeQueuedTabStalenessSource, /function getActiveQueuedTabAgeAnchor/)
     assert.match(sweepBody, /activeAgeExpired/)
     assert.match(sweepBody, /getActiveQueuedTabAgeAnchor/)
     assert.match(sweepBody, /Queued tab exceeded the active job time limit/)
