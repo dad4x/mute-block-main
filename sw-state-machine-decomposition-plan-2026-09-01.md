@@ -524,14 +524,137 @@ inventory at claim time rather than trusting this list as exhaustive. This
 is another rulebook cluster (rolled-back-tab-retry classification), similar
 value to Slice 6/12.
 
-### Slices 24+ -- everything else, via the chaining protocol
+### Slice 24 -- Queued-activation-intent / pending-item subject-key + slot-capacity getters (~5 functions, lines 9291-9413)
 
-The remaining sync functions past Slice 23 are not hand-enumerated here --
-that would make this document large and guaranteed to drift out of date as
-each slice shifts every line number after it. Use the claim workflow
-above: regenerate the inventory, find the next line-adjacent same-bucket
-(or obviously-related-across-bucket) cluster past the excluded region,
-size it, propose it, execute it.
+`getQueuedActivationIntentSubjectKey`, `getPendingCoordinatorItemSubjectKey`,
+`filterCurrentPendingItemsForPlannedActions`, `countQueuedExecutorSlotsForOwner`,
+`getCoordinatorExecutorPlanBatchLimit`.
+
+### Slice 25 -- Executor enqueue-failure / materialization-capacity classification (~13 functions, lines 10041-10269)
+
+`buildEnqueueFailureTerminalizationDiagnostics`, `getCoordinatorFailureClassification`,
+`buildCoordinatorFailureClassification`, `isExecutorMaterializationDeferredByCapacity`,
+`isQueuedExecutorCapacityConsumed`, `isExecutorEnqueueTimeoutStillMaterializing`,
+`coordinatorItemHasExecutorOpenAttempt`, `normalizeQueuedAuthorityEnqueueMaterializationReason`,
+`shouldTreatCapacityDeferralAsNoOpenForRow`,
+`normalizeQueuedAuthorityEnqueueMaterializationReasonForRow`,
+`getQueuedAuthorityEnqueueMaterializationReason`, `hasBlockingRuntimeSurfaceAfterEnqueueFailure`,
+`shouldRecoverLiveSurfaceAfterFinalOpenDecline`.
+
+### Slice 26 -- Coordinator executor-classification/runtime-surface helpers (~9 functions, lines 12170-12238)
+
+`getCoordinatorItemHref` (126 external refs), `findCoordinatorQueueEntryForHref`,
+`getCoordinatorExecutorTabActionForActionKind`, `getCoordinatorActionKindForRequestedAction`,
+`getCoordinatorItemExecutorTabAction`, `getCoordinatorItemExecutorMaxConcurrent`,
+`getCoordinatorResumeMaxConcurrent`, `makeCoordinatorExecutorClassificationCase`,
+`getRuntimeSurfaceForCoordinatorItem`.
+
+### Slice 27 -- Queued-tab reclaim/resume/durable-authority predicates (~7 functions, lines 12496-13475)
+
+`shouldResumeCoordinatorItem`, `getLiveTabForCoordinatorItem`,
+`selectQueuedWorkerReclaimTab`, `isQueuedTabActionBackedByDurableQueuedAuthority`,
+`dropVolatileQueuedActionsForDurableResume`, `dropVolatileQueuedActionsForCoordinatorItem`.
+
+### Slice 28 -- Scheduler alarm/backoff bookkeeping (~15 functions, lines 17663-18418)
+
+`nextCoordinatorPauseGeneration`, `isCoordinatorPauseGenerationLocallyCurrent`,
+`isCoordinatorPauseRequestedLocally`, `scheduleCoordinatorPauseStateReconcile`,
+`buildPausedCoordinatorQueueItem`, `buildTerminalCoordinatorQueueItem`,
+`hasStoredCoordinatorWork`, `hasStoredCoordinatorWorkInQueueView`,
+`normalizeRawCoordinatorQueueForReconcileFallback`, `isCoordinatorReconcileEdgeTriggerReason`,
+`clearNamedSchedulerAlarm`, `clearCoordinatorReconcileAlarms`, `isCoordinatorReconcileAlarmName`,
+`getSchedulerAlarmScheduledTime`, `isSchedulerAlarmScheduledForDueAt`,
+`suppressStaleCoordinatorResumeAlarm`, `suppressStaleCoordinatorReconcileAlarm`,
+`scheduleCoordinatorResumeAlarm`, `isSuppressedStaleCoordinatorResumeAlarm`,
+`isSuppressedStaleCoordinatorReconcileAlarm`, `resetCoordinatorReconcileBackoff`,
+`recordCoordinatorReconcileNoopBackoff`, `hasCoordinatorReconcileBackoff`.
+
+Caution: **do not include** `scheduleCoordinatorReconcile` (122 external refs)
+or `scheduleCoordinatorQueueResume` (138 external refs), which sit
+immediately after this cluster. These look like the actual scheduling core
+itself rather than bookkeeping around it -- high-value but almost
+certainly needs to stay resident in `sw.js`, or be attempted as its own
+extremely careful standalone slice later, not folded into this one.
+`scheduleCoordinatorResumeAlarm` in this list is a smaller, narrower
+function distinct from `scheduleCoordinatorQueueResume` -- verify that
+distinction holds before moving it.
+
+### Slice 29 -- Coordinator retry-candidate/failure-reset builders (~9 functions, lines 19531-19730)
+
+`makeStoredWorkRecoveryResumeOwnedResult`, `getCoordinatorFailureRetryCount`,
+`getCoordinatorFailureLastRetryAt`, `sortCoordinatorRetryCandidates`,
+`getCoordinatorRetryableFailureCandidates`, `getCoordinatorRetrySourcePages`,
+`buildFailedCoordinatorResetItem`.
+
+### Slice 30 -- Profile-progress merge/normalize helpers (~13 functions, lines 20972-21444)
+
+`getProfileProgressStatusRank`, `profileProgressAttemptsMatch`,
+`preserveAdvancedProfileProgress`, `mergeStoredProfileProgressRecord`,
+`normalizeStoredProfileNukeProgress`, `preserveTerminalProfileProgress`,
+`shouldPreserveTerminalProfileProgress`, `normalizeProgressPatch`,
+`addSenderTabIdToProgressPatch`, `ensureProfileNukeProgressReady`,
+`removeProfileHrefFromPendingSpaceRecords`, `removeProfileHrefFromRememberedNukedPosts`,
+`removeProfileHrefFromCoordinatorRuns`.
+
+Caution: `promiseWithTimeout` (46 refs) sits immediately before this
+cluster at line ~20950. Despite no `async` keyword, its name strongly
+suggests it builds a `Promise.race`-style chain itself -- do not include it
+in this or any slice without very careful analysis; it's likely core
+async-utility infrastructure that needs to stay resident.
+
+### Slice 31 -- Queued-tab metadata + action-lease bookkeeping (~13 functions, lines 21846-22317)
+
+`getQueuedTabMetadata` (64 refs), `wasQueuedRuntimeTabRemoved`,
+`setQueuedTabMetadata`, `remapQueuedTabToResolvedProfile`,
+`clearQueuedTabMetadata`, `normalizeCoordinatorActionLease`,
+`isCoordinatorActionLeaseExpired`, `isCoordinatorActionLeaseHolder`,
+`clearExpiredCoordinatorActionLeases`, `findActiveCoordinatorActionLease`,
+`makeCoordinatorActionLease`, `findCoordinatorStoredWorkCancelTarget`.
+
+### Slice 32 -- Queued-tab foreground/worker-action-surface predicates+bookkeeping (~20+ functions, lines 23882-25149)
+
+`isForegroundRequiredProfileActionRequest`, `restoreQueuedTabRuntimeFromActiveAuthorityForSender`,
+`hasOwnedQueuedTabState`, `isForegroundQueuedTabAction`, `isForegroundQueuedTabWork`,
+`getQueuedForegroundLeaseTabId`, `makeQueuedTabMetadataProgressPatch`,
+`clearQueuedForegroundLease`, `releaseQueuedForegroundLease`, `addExpectedTerminalTabId`,
+`isExpectedTerminalSweepTab`, `shouldActivateOwnedQueuedTabOnOpen`,
+`shouldUseQueuedWorkerActionSurface`, `resetQueuedWorkerActionSurface`,
+`isQueuedWorkerActionSurfaceUrl`, `makeQueuedWorkerActionSurfaceState`,
+`isIdleQueuedWorkerActionSurfaceTab`, `hasQueuedWorkerActionSurfaceRuntimeWork`,
+`hasDurableQueuedBacklogForActionSurface`, `scheduleQueuedWorkerActionSurfaceCleanup`,
+`tagActionWithQueuedWorkerSurface`, `isQueuedWorkerActionSurfaceTab`,
+`queuedTabMatchesExpectedOpenUrl`, `hasScriptingInjectionApi`,
+`getExpectedContentScriptVersion`, `scheduleQueuedTabContentScriptEnsure`,
+`shouldDeferQueuedWorkerContentScriptEnsureRelease`. Sizeable -- will likely
+need an internal split, same as Slices 6/9/11/12/23. Several `schedule*`
+names present -- apply the Promise-chain check carefully.
+
+### Slice 33 -- Owned-tab/profile-nuke-record classification predicates (~15+ functions, lines 25654-26946)
+
+`markQueuedTabClosing`, `getErrorPageUrl`, `serializeOwnedTabIdsByParent`,
+`rebuildOwningParentByChild`, `schedulePersistOwnedTabIdsByParent`,
+`sendTabMessage`, `registerOwnedTab`, `unregisterOwnedTab`,
+`scheduleOwnedBlockedProfileSweep`, `isTerminalProfileNukeRecord`,
+`isSuccessfulProfileNukeRecord`, `isSuccessfulUnblockUnmuteProfileRecord`,
+`isRetryableTerminalProfileNukeRecord`, `isQueuedDirectBlockActionIncompleteProgress`,
+`shouldRecoverQueuedDirectBlockActionTerminalProgress`,
+`isQueuedProfileActionGateTimeoutProgress`,
+`shouldRecoverQueuedProfileActionGateTerminalProgress`,
+`isExplicitSecurityVerificationRecord`, `isTransientProfileNukeStatus`.
+
+### Slices 34+ -- everything else, via the chaining protocol
+
+Beyond Slice 33, roughly another 150 sync functions remain from ~line
+27000 to 33184+ (queued-tab retry/action-key bookkeeping, coordinator-row-
+event metrics, milestone scheduling, content-page-state normalizers) --
+not hand-enumerated here, that would make this document large and
+guaranteed to drift out of date. Use the claim workflow above: regenerate
+the inventory, find the next line-adjacent same-bucket (or
+obviously-related-across-bucket) cluster past the excluded region, size
+it, propose it, execute it. After that region clears, what remains in
+`sw.js` is almost entirely the 298 `async` orchestration functions -- Part
+2 territory below, either blocked on Phase 0 or addressable piece-by-piece
+via the decide/act splitting idea.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
