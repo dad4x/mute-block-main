@@ -3155,7 +3155,7 @@ test('queued tab open plan does not carry executor authority state across tab op
 test('queued tab fill bounds stale open-decision reads', () => {
     const source = readRepoFile('shared/js/sw.js')
     const planBody = extractFunction(source, 'async function planQueuedTabExecutorAction(action = {}, options = {})')
-    const planLimitBody = extractFunction(source, 'function getCoordinatorExecutorPlanBatchLimit(ownerTabId = null, options = {})')
+    const planLimitBody = extractFunction(readRepoFile('shared/js/swQueuedActivationSubjectKeys.js'), 'function getCoordinatorExecutorPlanBatchLimit(ownerTabId = null, options = {})')
     const finalCheckBody = extractFunction(source, 'async function validateQueuedTabOpenAgainstCurrentAuthority(action = {})')
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
