@@ -175,6 +175,9 @@ const {
 const {
     createCoordinatorTerminalSettlement
 } = require('./swCoordinatorTerminalSettlement')
+const {
+    createTabIdUtils
+} = require('./swTabIdUtils')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -434,7 +437,6 @@ let queuedActionSurfaceAnchorTabId = null
 let queuedActionSurfaceOpenPromise = null
 let queuedActionSurfaceCleanupTimeout = null
 let queuedActionSurfaceCleanupDueAt = 0
-let coordinatorDedupePromise = Promise.resolve()
 let coordinatorResumePromise = null
 let coordinatorReconcilePromise = null
 let coordinatorReconcilePromiseStartedAt = 0
@@ -598,6 +600,48 @@ const {
     makeCoordinatorResolutionSubject,
     getCoordinatorSubjectKey
 } = profileResolution
+// tabIdUtils is constructed here, well before this cluster's old
+// source-text location (decomposition Slice 21): normalizeTabId is by far
+// the highest-fan-in function claimed by any slice so far (207 external
+// refs), and makeQueuedTabOpenUrlCommitHelpers (swexecutor.js, constructed
+// just below) eagerly references bare `normalizeTabId` in its own
+// construction-call object literal -- the earliest of many such eager
+// references across already-extracted modules (coordinatorRuns just below,
+// plus coordinatorProgressRules, coordinatorProgressReducer,
+// activationGuardRuntime, coordinatorReclaimEvidence,
+// coordinatorReconcileInputs, queuedTabRuntimeStatus, and
+// coordinatorReconcileLockedMaterialization, all constructed further down
+// but still well before this cluster's old position). A hoisted `function`
+// declaration is visible throughout its enclosing scope; a `const`
+// destructured from a factory call is in the temporal dead zone until that
+// line executes -- so this module must construct before all of those eager
+// references, which means before makeQueuedTabOpenUrlCommitHelpers, the
+// earliest of them. It needs QUEUED_ACTION_SURFACE_COORDINATOR_HASH and
+// SERVICE_WORKER_QUEUE_OWNER_ID (both already-defined consts by this
+// point) and dedupeCoordinatorTabsOnce, still a plain hoisted `async
+// function` declaration far below -- hoisted declarations are visible
+// throughout their enclosing scope regardless of textual position, so no
+// thunk is needed there. See swTabIdUtils.js's header comment for the
+// coordinatorDedupePromise state-relocation and Promise-chain
+// realm-crossing notes.
+const tabIdUtils = createTabIdUtils({
+    browser,
+    constants: {
+        QUEUED_ACTION_SURFACE_COORDINATOR_HASH,
+        SERVICE_WORKER_QUEUE_OWNER_ID
+    },
+    handlers: {
+        dedupeCoordinatorTabsOnce
+    }
+})
+const {
+    getCoordinatorPageUrl,
+    getQueuedActionSurfaceUrl,
+    normalizeTabId,
+    normalizeOwnedParentId,
+    isBrowserTabId,
+    dedupeCoordinatorTabs
+} = tabIdUtils
 // coordinatorRuns is constructed here, well before this cluster's old
 // source-text location, rather than in place like Slice 14/15 -- see
 // swCoordinatorRuns.js's header comment: queuedTabRuntimeStatus's deps
@@ -8338,31 +8382,6 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
     }
 }
 
-function getCoordinatorPageUrl() {
-    return browser.runtime.getURL('coordinator.html')
-}
-
-function getQueuedActionSurfaceUrl() {
-    return `${getCoordinatorPageUrl()}${QUEUED_ACTION_SURFACE_COORDINATOR_HASH}`
-}
-
-function normalizeTabId(value) {
-    const parsed = Number.parseInt(value, 10)
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null
-}
-
-function normalizeOwnedParentId(value) {
-    const tabId = normalizeTabId(value)
-    if(tabId) return tabId
-
-    const ownedParentId = `${value || ''}`.trim()
-    return ownedParentId === SERVICE_WORKER_QUEUE_OWNER_ID ? SERVICE_WORKER_QUEUE_OWNER_ID : null
-}
-
-function isBrowserTabId(value) {
-    return !!normalizeTabId(value)
-}
-
 async function rememberCoordinatorTabId(tabId) {
     const normalizedTabId = normalizeTabId(tabId)
     if(!normalizedTabId) return
@@ -8439,14 +8458,6 @@ async function getKnownCoordinatorTab(tabId) {
         }
         return null
     }
-}
-
-function dedupeCoordinatorTabs(preferredTabId = null) {
-    coordinatorDedupePromise = coordinatorDedupePromise
-        .catch(() => null)
-        .then(() => dedupeCoordinatorTabsOnce(preferredTabId))
-
-    return coordinatorDedupePromise
 }
 
 async function dedupeCoordinatorTabsOnce(preferredTabId = null) {
