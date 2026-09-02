@@ -2065,7 +2065,10 @@ test('queued tab release kicks durable stored work even after service worker sle
     // cleanupQueuedTabMetadataOnly moved to swQueuedTabDetachSurfaceDedupe.js
     // in decomposition Slice 36.
     const metadataOnlyBody = extractFunction(readRepoFile('shared/js/swQueuedTabDetachSurfaceDedupe.js'), 'function cleanupQueuedTabMetadataOnly(tabId)')
-    const followUpBody = extractFunction(source, 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
+    // scheduleQueuedTabReleaseFollowUp moved to swQueuedTabActionBookkeeping.js
+    // in decomposition Slice 38.
+    const queuedTabActionBookkeepingSource = readRepoFile('shared/js/swQueuedTabActionBookkeeping.js')
+    const followUpBody = extractFunction(queuedTabActionBookkeepingSource, 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
     const missingActiveReleaseBody = extractFunction(source, 'async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = null, reason = \'queued-tab-release-missing-active-tab\', options = {})')
     const staleSweepBody = extractFunction(source, 'async function sweepStaleQueuedTabs(parentTabId = null, options = {})')
@@ -2077,7 +2080,7 @@ test('queued tab release kicks durable stored work even after service worker sle
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
     const applyBody = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
 
-    assert.match(source, /queuedTabReleaseFollowUpTimeout/)
+    assert.match(queuedTabActionBookkeepingSource, /queuedTabReleaseFollowUpTimeout/)
     assert.doesNotMatch(source, /function cleanupQueuedTabState/)
     assert.match(releaseAndCleanupBody, /result = await releaseQueuedTab\(tabId, options\)/)
     assert.match(releaseAndCleanupBody, /if\(!result\?\.rollbackDeferred\) \{[\s\S]*cleanupQueuedTabMetadataOnly\(tabId\)/)
@@ -3703,7 +3706,9 @@ test('storage reconcile immediately reconciles active rows whose persisted tab i
 
 test('terminal queued progress schedules stored work continuation', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const releaseFollowUpBody = extractFunction(source, 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
+    // scheduleQueuedTabReleaseFollowUp moved to swQueuedTabActionBookkeeping.js
+    // in decomposition Slice 38.
+    const releaseFollowUpBody = extractFunction(readRepoFile('shared/js/swQueuedTabActionBookkeeping.js'), 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
     const postStorageContinuationBody = extractFunction(source, 'function flushPostStorageQueuedWorkContinuation()')
     const terminalContinuationBody = extractFunction(source, 'function scheduleTerminalProgressContinuation(reason = \'terminal-progress-continuation\')')
