@@ -274,7 +274,15 @@ const queueRuntime = createQueueRuntimeState()
 // writeup, including why the rest of Slice 12's cluster had to move into a
 // second module (swCoordinatorProgressRules.js, constructed further below)
 // instead of this same one.
+//
+// shouldResetCoordinatorItemForIncoming and shouldResetCoordinatorExecutor
+// joined this module in decomposition Slice 43 (mop-up of remaining
+// isolated singles). UNBLOCK_UNMUTE_ACTION_KIND comes straight from the
+// jobState.js require at the top of sw.js, already available here.
 const coordinatorStatusRules = createCoordinatorStatusRules({
+    constants: {
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
     handlers: {
         isTerminalJobStatus,
         isRetryableJobFailure,
@@ -287,7 +295,9 @@ const {
     isPendingCoordinatorStatus,
     isRetryableCoordinatorFailure,
     isRetryableCoordinatorFailureFromProgress,
-    isCoordinatorQueueAuthoritativeItem
+    isCoordinatorQueueAuthoritativeItem,
+    shouldResetCoordinatorItemForIncoming,
+    shouldResetCoordinatorExecutor
 } = coordinatorStatusRules
 const schedulerClock = {
     setTimeout,
@@ -20430,22 +20440,6 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
     return result
 }
 
-function shouldResetCoordinatorItemForIncoming(existing = null, actionKind = '', rawItem = {}, runInput = {}, source = {}) {
-    if(!existing) return false
-    const explicitReset = rawItem?.resetExisting === true ||
-        runInput?.resetExisting === true ||
-        source?.resetExisting === true
-    if(explicitReset) return true
-
-    if(isRetryableCoordinatorFailure(existing)) return true
-
-    const terminalExisting = isTerminalCoordinatorStatus(existing?.status)
-    if(!terminalExisting) return false
-
-    const sourceType = `${rawItem?.source?.type || source?.type || runInput?.sourceType || ''}`.trim()
-    return actionKind === UNBLOCK_UNMUTE_ACTION_KIND && sourceType === 'profile-reverse'
-}
-
 async function enqueueCoordinatorItemsStorage(request = {}) {
     const runInput = request.run && typeof request.run === 'object' ? request.run : {}
     const hasExecuteInput = request.execute && typeof request.execute === 'object'
@@ -20881,15 +20875,6 @@ async function finishCoordinatorEnqueue(request = {}, sender = {}, enqueueResult
         skipStoredWorkCheck: true,
         awaitFill: true
     })
-}
-
-function shouldResetCoordinatorExecutor(request = {}, rawItems = []) {
-    const runInput = request.run && typeof request.run === 'object' ? request.run : {}
-    const source = request.source && typeof request.source === 'object' ? request.source : {}
-
-    return runInput?.resetExisting === true ||
-        source?.resetExisting === true ||
-        rawItems.some(item => item?.resetExisting === true)
 }
 
 function promiseWithTimeout(promise, timeoutMs = SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS, label = 'operation') {
