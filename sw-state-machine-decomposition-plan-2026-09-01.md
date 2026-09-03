@@ -2,17 +2,39 @@
 
 Date: 2026-09-01
 
-Status: in progress. Slices 1-33 are landed and independently verified
-(commits `3567f1c`, `e55da51`, `5d6216d`, `2146d30`, `e73173d`, `ba3792a`,
-`3df5b6a`, `eda4c7f`, `b85c2f3`, `440642e`, `659d7be`, `decfd6b`, `b6fe562`,
-`73a4dbe`, `5343789`, `582d661`, `3a056ce`, `58862e8`, `5691a15`, `98d681d`,
-`c1413e5`, `82212ce`, `156a68d`, `8c4c7e4`, `710b182`, `66c389c`, `442a060`,
-`80ab511`, `b0771e4`, `612c527`, `67998ae`, `c2cc96b`, `9f89aed`, `1012fec`,
-`79fb979`, `bcb5e27`). `shared/js/sw.js` is down to 31,978 lines from
-38,953 at the start of this effort (~17.9% reduction), with 36 new modules
-landed. This is the end of the currently-defined batch (Slices 1-33) --
-the next step is to survey the inventory again per "Slices 34+" and
-propose the next batch. See
+Status: Part 1 (sync-only extraction) is essentially complete. Slices
+1-43 are landed and independently verified (see `git log --oneline` for
+the full commit list, starting at `3567f1c`, most recent `4400732`).
+`shared/js/sw.js` is down to 30,812 lines from 38,953 at the start of this
+effort (~20.9% reduction), with 44+ new modules landed.
+
+Slice 43's fresh mop-up survey (2026-09) found, past the excluded
+`createCoordinatorAuthority`/WAL region: exactly 9 sync functions remain,
+all confirmed resident-only for documented reasons (`scheduleCoordinatorReconcile`,
+`scheduleCoordinatorQueueResume`, `scheduleQueuedWorkContinuation`,
+`promiseWithTimeout`, `scheduleQueuedWorkerActionSurfaceCleanup`,
+`markQueuedTabClosing`, `scheduleOwnedBlockedProfileSweep`,
+`scheduleQueuedTabReleaseReconcile`, `enqueueSpaceFeedStorageUpdate`) --
+no cluster left, genuinely down to the resident scheduling/storage-
+serialization core. It also flagged 15 unclaimed sync stragglers *before*
+the excluded region (lines 477-5538 as of that survey, e.g.
+`resetQueuedTabFillState`, `getActiveStorageContext`,
+`scheduleTerminalProgressProjectionFlush`), each individually skipped by
+an earlier slice for a documented reason (harness regex-suppression,
+domain mismatch, Promise-chain caution) -- worth a final small pass if
+there's appetite, but not a real cluster. The permanently-excluded
+`createCoordinatorAuthority`/WAL boundary still holds ~30 sync functions
+by design (see "Boundary after Slice 17").
+
+With that, what's left in `sw.js` is: the ~9 resident scheduling
+functions, the ~15 individually-skipped stragglers, the ~30-function
+excluded WAL region, and the 298 `async` orchestration functions. Part 2
+(below) -- or the decide/act splitting approach -- is the remaining real
+work. The next step is either a final small mop-up pass on the 15
+stragglers, or moving to Part 2. See "Slices 44+" below for the mop-up
+option; see "Part 2" further down for the async-core options.
+
+See
 [architecture.md](architecture.md) for the durable model this plan works
 within, and its "Module Extraction And The Test Harness Realm Boundary"
 section for the constraint this plan is built around.
@@ -749,15 +771,33 @@ of the scattered isolated singles surrounded by resident async code:
 neighbors -- bundle into whatever module fits contextually, or a small
 standalone module, verifying each individually.
 
-### Slices 44+ -- everything else, via the chaining protocol
+### Slice 44 (optional) -- mop-up the 15 pre-excluded-region stragglers
 
-After Slice 43, what remains in `sw.js` is essentially: the resident-only
-scheduling core (`scheduleCoordinatorReconcile`, `scheduleCoordinatorQueueResume`,
-`scheduleQueuedWorkContinuation`, `promiseWithTimeout`, `enqueueSpaceFeedStorageUpdate`,
-and similar), the excluded `createCoordinatorAuthority` region, and the 298
-`async` orchestration functions -- i.e. Part 1 is essentially complete and
-Part 2 (below) is what's left. Re-survey the inventory at that point before
-assuming there's nothing more to claim; a stray cluster may still turn up.
+Slice 43's fresh survey confirmed what remains in `sw.js` past the
+excluded region is genuinely resident-only (9 functions, no cluster). It
+also found 15 unclaimed sync functions sitting *before* the excluded
+region (lines 477-5538 as of that survey) that earlier slices skipped
+individually for documented reasons (harness regex-suppression, domain
+mismatch, Promise-chain caution) rather than as a coherent cluster --
+e.g. `resetQueuedTabFillState`, `getActiveStorageContext`,
+`scheduleTerminalProgressProjectionFlush`. Re-survey the current inventory
+to get the exact, current list (line numbers will have shifted) and
+handle each individually: some may now be safely movable if their
+original blocker has since resolved (the same situation that let
+`buildTerminalCoordinatorQueueItem` move in Slice 43 part 1), others may
+still need to stay resident -- verify fresh rather than assuming the old
+reason still holds. This is optional cleanup, not required before moving
+to Part 2.
+
+Part 1 (sync-only extraction) is otherwise complete. What's left in
+`sw.js` beyond the above is: the resident-only scheduling core
+(`scheduleCoordinatorReconcile`, `scheduleCoordinatorQueueResume`,
+`scheduleQueuedWorkContinuation`, `promiseWithTimeout`,
+`scheduleQueuedWorkerActionSurfaceCleanup`, `markQueuedTabClosing`,
+`scheduleOwnedBlockedProfileSweep`, `scheduleQueuedTabReleaseReconcile`,
+`enqueueSpaceFeedStorageUpdate`), the excluded `createCoordinatorAuthority`/
+WAL region (~30 functions, by design), and the 298 `async` orchestration
+functions. Part 2 (below) is the remaining real work.
 
 ## Part 2 -- async orchestration (blocked on Phase 0)
 
