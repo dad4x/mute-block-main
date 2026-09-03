@@ -1244,8 +1244,8 @@ const {
 // factory call is in the temporal dead zone until that line executes, so
 // this module must construct after all four, which means after
 // coordinatorProgressRules, the latest of them. Nothing already-extracted
-// eagerly references any of this module's 14 function names at its own
-// construction-call site (checked via grep across every `create*(` call
+// eagerly references any of this module's 14 original function names at its
+// own construction-call site (checked via grep across every `create*(` call
 // site's handlers/constants object literal in the whole file), so there is
 // no earlier eager dependent forcing this any further up. getPersistedQueuedTabId
 // and normalizeTabId are still plain hoisted function declarations far below
@@ -1254,6 +1254,18 @@ const {
 // normalizeProgressPatch and isSuccessfulProfileNukeRecord come from
 // profileProgressMerge (decomposition Slice 30, constructed well above this
 // point).
+//
+// buildTerminalCoordinatorQueueItem joined this module in decomposition
+// Slice 43 (retry of a Slice 28 leftover -- see this module's own file
+// header for the full ordering writeup). Its own dependency
+// buildCoordinatorFailureClassification isn't a bare const until
+// executorEnqueueFailureClassification's destructure much further down
+// (~line 10818), well after this construction site, so it's threaded
+// through as a `(...args) => buildCoordinatorFailureClassification(...args)`
+// thunk that defers name resolution to call time -- the two already-
+// extracted modules that eagerly reference buildTerminalCoordinatorQueueItem
+// itself (queuedTabRuntimeStatus and coordinatorReconcileLockedMaterialization)
+// both construct after this point, so no further hoisting is needed.
 const coordinatorProgressReducer = createCoordinatorProgressReducer({
     now: () => Date.now(),
     constants: {
@@ -1262,6 +1274,7 @@ const coordinatorProgressReducer = createCoordinatorProgressReducer({
         JOB_EVENT_ENQUEUED,
         JOB_EVENT_TAB_OPENED,
         JOB_EVENT_MILESTONE,
+        JOB_EVENT_PAUSE,
         UNBLOCK_UNMUTE_ACTION_KIND
     },
     handlers: {
@@ -1278,7 +1291,8 @@ const coordinatorProgressReducer = createCoordinatorProgressReducer({
         normalizeProgressPatch,
         isSuccessfulProfileNukeRecord,
         getCoordinatorStatusFromProgress,
-        shouldApplyProgressToCoordinatorItem
+        shouldApplyProgressToCoordinatorItem,
+        buildCoordinatorFailureClassification: (...args) => buildCoordinatorFailureClassification(...args)
     }
 })
 const {
@@ -1291,6 +1305,7 @@ const {
     transitionCoordinatorItemFromProgress,
     shouldPersistCoordinatorRowEventQueueItemChange,
     makeTerminalProgressRecordFromCoordinatorItem,
+    buildTerminalCoordinatorQueueItem,
     hasTerminalProgressDriftFromCoordinatorItem,
     shouldRestoreTerminalProgressFromCoordinatorItem,
     shouldPreferSuccessfulProgressOverTerminalCoordinatorItem,
@@ -18400,69 +18415,6 @@ async function cancelCoordinatorCurrentWorkItem(request = {}) {
         canceledWorkKeys: storedResult.canceledWorkKeys || [],
         ownedTabIds,
         reason: storedResult.reason || ''
-    }
-}
-
-function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
-    const now = Number.parseInt(options.now, 10) || Date.now()
-    const status = `${options.status || 'failed'}`.trim()
-    const reason = `${options.reason || ''}`.trim()
-    const explicitFailureClassification = options.failureClassification &&
-        typeof options.failureClassification === 'object'
-        ? options.failureClassification
-        : null
-    const failureClassification = explicitFailureClassification ||
-        buildCoordinatorFailureClassification(
-            reason,
-            options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state')
-        )
-    const eventType = options.eventType ||
-        (status === 'canceled' ? JOB_EVENT_PAUSE : JOB_EVENT_TERMINAL)
-    const reduced = reduceJobEvent(item, {
-        type: eventType,
-        status,
-        outcome: options.outcome || (status === 'canceled' ? 'paused' : 'timeout'),
-        error: options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state'),
-        at: now,
-        terminalAt: now,
-        reason,
-        milestones: {
-            closeRequestedAt: Number.parseInt(item?.milestones?.closeRequestedAt, 10) || now,
-            tabClosedAt: now
-        }
-    })
-
-    if(reduced.accepted) {
-        return {
-            ...reduced.item,
-            updatedAt: Number.parseInt(reduced.item?.updatedAt, 10) || now,
-            terminalAt: Number.parseInt(reduced.item?.terminalAt, 10) || now,
-            actionLease: null,
-            actionLeaseReleasedAt: Number.parseInt(reduced.item?.actionLeaseReleasedAt, 10) || now,
-            actionLeaseReleaseReason: reduced.item?.actionLeaseReleaseReason || reason,
-            ...(failureClassification ? {failureClassification} : {}),
-            tabId: null
-        }
-    }
-
-    return {
-        ...item,
-        status,
-        outcome: `${options.outcome || (status === 'canceled' ? 'paused' : 'timeout')}`.trim(),
-        error: `${options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state')}`.trim(),
-        updatedAt: now,
-        terminalAt: now,
-        actionLease: null,
-        actionLeaseReleasedAt: now,
-        actionLeaseReleaseReason: reason,
-        ...(failureClassification ? {failureClassification} : {}),
-        tabId: null,
-        milestones: {
-            ...makeEmptyCoordinatorMilestones(),
-            ...(item.milestones || {}),
-            closeRequestedAt: Number.parseInt(item?.milestones?.closeRequestedAt, 10) || now,
-            tabClosedAt: now
-        }
     }
 }
 
