@@ -975,6 +975,10 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     const wakeupMetricsShape = readRepoFile('shared/js/swQueueWakeupMetricsShape.js')
     const browserSessionRuntime = readRepoFile('shared/js/swBrowserSessionRuntime.js')
     const html = readRepoFile('shared/coordinator.html')
+    // getStorageUpdateQueueSnapshot (the only sw.js "currentEpoch" reference)
+    // moved to swCoordinatorReconcileSupportSingles.js in decomposition
+    // Slice 43.
+    const coordinatorReconcileSupportSinglesSource = readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js')
 
     assert.match(helper, /chrome\.storage\.local\.get\(\{\[key\]: null\}, storage =>/)
     assert.match(helper, /currentEpoch/)
@@ -994,7 +998,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.doesNotMatch(helper, /queueWrite\.reason\.repair/)
     assert.match(helper, /ownStorageGetMs is merged wall time/)
 
-    assert.match(worker, /currentEpoch/)
+    assert.match(coordinatorReconcileSupportSinglesSource, /currentEpoch/)
     assert.match(wakeupMetricsShape, /previousEpochs/)
     assert.match(wakeupMetricsShape, /lifetime/)
     assert.match(worker, /QUEUE_WAKEUP_METRICS_VIEW_KEY/)
@@ -1212,7 +1216,9 @@ test('service worker secs per block aggregate can use progress milestone timing'
 test('terminal work can preempt final-open authority retry delay', () => {
     const source = readRepoFile('shared/js/sw.js')
     const schedulerBody = extractFunction(source, 'function scheduleCoordinatorQueueResume(delayMs = 500, reason = \'scheduled-resume\')')
-    const preemptBody = extractFunction(source, 'function shouldPreemptFinalOpenAuthorityRetry(reason = \'\', options = {})')
+    // shouldPreemptFinalOpenAuthorityRetry moved to
+    // swCoordinatorReconcileSupportSingles.js in decomposition Slice 43.
+    const preemptBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js'), 'function shouldPreemptFinalOpenAuthorityRetry(reason = \'\', options = {})')
 
     assert.match(schedulerBody, /!shouldPreemptFinalOpenAuthorityRetry\(normalizedReason, options\)/)
     assert.match(preemptBody, /terminal-progress/)
@@ -2851,7 +2857,9 @@ test('background tab opening updates authoritative Current Work', () => {
     const rollbackBody = extractFunction(source, 'async function mutateCoordinatorQueuedTabOpenRollback(operation = {})')
     const transitionBody = extractFunction(source, 'async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}, details = {}, href = \'\', coordinatorKey = \'\')')
     const confirmBody = extractFunction(source, 'async function confirmQueuedTabDurablyActive(action = {}, tab = {}, details = {})')
-    const keepOpenBody = extractFunction(source, 'function shouldKeepQueuedTabOpenAfterActiveTransitionFailure(action = {}, tab = {}, details = {})')
+    // shouldKeepQueuedTabOpenAfterActiveTransitionFailure moved to
+    // swCoordinatorReconcileSupportSingles.js in decomposition Slice 43.
+    const keepOpenBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js'), 'function shouldKeepQueuedTabOpenAfterActiveTransitionFailure(action = {}, tab = {}, details = {})')
 
     assert.notEqual(transitionIndex, -1)
     assert.notEqual(progressIndex, -1)
@@ -3245,6 +3253,9 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     const source = readRepoFile('shared/js/sw.js')
     const latchSource = readRepoFile('shared/js/swStorageIdlePromiseLatch.js')
     const reclaimResumeSource = readRepoFile('shared/js/swQueuedTabReclaimResume.js')
+    // shouldSkipResumeProjectionFallbackForTrustedAuthority moved to
+    // swCoordinatorReconcileSupportSingles.js in decomposition Slice 43.
+    const reconcileSupportSinglesSource = readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js')
     const body = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
     const dropBody = extractFunction(reclaimResumeSource, 'function dropVolatileQueuedActionsForDurableResume(reason = \'resume-rebuild-from-durable-queue\', details = {})')
     const resumeBody = extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
@@ -3281,7 +3292,7 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     assert.match(resumeBody, /runCoordinatorExecutorApplyPhase\(options\.reason \|\| 'resume'/)
     assert.match(resumeBody, /dropVolatileReason: options\.reason \|\| 'resume-rebuild-from-durable-queue'/)
     assert.match(resumeBody, /const hasTrustedAuthorityStateForResume = !!\([\s\S]*suppliedAuthorityState\?\.queue[\s\S]*residentAuthorityStateForResume\?\.queue[\s\S]*\)/)
-    assert.match(source, /function shouldSkipResumeProjectionFallbackForTrustedAuthority\(reason = ''\) \{[\s\S]*terminal-progress[\s\S]*queued-tab-\(\?:slot-\)\?release/)
+    assert.match(reconcileSupportSinglesSource, /function shouldSkipResumeProjectionFallbackForTrustedAuthority\(reason = ''\) \{[\s\S]*terminal-progress[\s\S]*queued-tab-\(\?:slot-\)\?release/)
     assert.match(resumeBody, /const shouldUseProjectionFallbackForResume = forceDurableQueueReload \|\|[\s\S]*!hasTrustedAuthorityStateForResume \|\|[\s\S]*!shouldSkipResumeProjectionFallbackForTrustedAuthority\(options\.reason\)/)
     assert.match(resumeBody, /serviceWorkerOwned &&[\s\S]*options\.awaitFill !== false &&[\s\S]*shouldUseProjectionFallbackForResume &&[\s\S]*loadCoordinatorQueueProjection\(\{[\s\S]*metricPath: 'pump\.resume\.storageProjectionFallback\.load'/)
     assert.match(reclaimResumeSource, /name: 'volatile-queued-actions-dropped'/)
@@ -3773,7 +3784,9 @@ test('dashboard resume uses executor path without scheduling repair', () => {
 
 test('dashboard exposes read-only why-not-running coordinator diagnostics', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const snapshotBody = extractFunction(source, 'function getStorageUpdateQueueSnapshot()')
+    // getStorageUpdateQueueSnapshot moved to swCoordinatorReconcileSupportSingles.js
+    // in decomposition Slice 43.
+    const snapshotBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js'), 'function getStorageUpdateQueueSnapshot()')
     const diagnosticBody = extractFunction(source, 'async function getCoordinatorWhyNotRunning(request = {})')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const accountingStart = bootstrap.indexOf("else if(request.action === 'get-coordinator-queue-accounting')")
