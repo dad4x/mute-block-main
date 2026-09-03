@@ -58,6 +58,30 @@
 // region immediately after this cluster's old source-text position are
 // explicitly out of scope for this decomposition effort (see the plan's
 // "Boundary after Slice 17" section) and are untouched here.
+//
+// buildTerminalCoordinatorQueueItem added in decomposition Slice 43 (retry
+// of a Slice 28 leftover): Slice 28 left it resident in sw.js because its
+// own dependency, buildCoordinatorFailureClassification, wasn't extracted
+// yet (it landed in swExecutorEnqueueFailureClassification.js at Slice 25,
+// but that module doesn't construct in sw.js until after line ~10818,
+// while this module constructs at line ~1257 to satisfy queuedTabRuntimeStatus's
+// and coordinatorReconcileLockedMaterialization's own eager references to
+// buildTerminalCoordinatorQueueItem, both well before line 10818). Since a
+// `const` destructured from a factory call is in the temporal dead zone
+// until that line executes, buildCoordinatorFailureClassification is
+// threaded through as a `(...args) => buildCoordinatorFailureClassification(...args)`
+// thunk that defers name resolution to call time, matching the
+// swQueuedTabMetadataAndActionLease.js precedent for the same situation.
+// reduceJobEvent and JOB_EVENT_PAUSE/JOB_EVENT_TERMINAL (already a dep of
+// this module) come straight from the jobState.js require at the top of
+// sw.js and are available from the very first line, so no thunk is needed
+// for those. buildTerminalCoordinatorQueueItem reads Date.now() via a local
+// `const now = ... || Date.now()`; per the module's established convention
+// (see the Clock note above) that local is renamed to `nowMs` and reads the
+// module's own `now()` dep instead, matching every other function here that
+// had the same shadowing issue. No async/Promise-chain risk: grepped for
+// `.then(`, `.catch(`, `Promise.`, `async`, `setTimeout`, `void` -- none
+// found.
 
 function createCoordinatorProgressReducer(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
@@ -67,6 +91,7 @@ function createCoordinatorProgressReducer(deps = {}) {
         JOB_EVENT_ENQUEUED,
         JOB_EVENT_TAB_OPENED,
         JOB_EVENT_MILESTONE,
+        JOB_EVENT_PAUSE,
         UNBLOCK_UNMUTE_ACTION_KIND
     } = deps.constants || {}
     const {
@@ -83,7 +108,8 @@ function createCoordinatorProgressReducer(deps = {}) {
         normalizeProgressPatch,
         isSuccessfulProfileNukeRecord,
         getCoordinatorStatusFromProgress,
-        shouldApplyProgressToCoordinatorItem
+        shouldApplyProgressToCoordinatorItem,
+        buildCoordinatorFailureClassification
     } = deps.handlers || {}
 
     function getCoordinatorTransitionTerminalAt(item = {}, record = {}, nowMs = now(), options = {}) {
@@ -498,6 +524,69 @@ function createCoordinatorProgressReducer(deps = {}) {
         }
     }
 
+    function buildTerminalCoordinatorQueueItem(item = {}, options = {}) {
+        const nowMs = Number.parseInt(options.now, 10) || now()
+        const status = `${options.status || 'failed'}`.trim()
+        const reason = `${options.reason || ''}`.trim()
+        const explicitFailureClassification = options.failureClassification &&
+            typeof options.failureClassification === 'object'
+            ? options.failureClassification
+            : null
+        const failureClassification = explicitFailureClassification ||
+            buildCoordinatorFailureClassification(
+                reason,
+                options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state')
+            )
+        const eventType = options.eventType ||
+            (status === 'canceled' ? JOB_EVENT_PAUSE : JOB_EVENT_TERMINAL)
+        const reduced = reduceJobEvent(item, {
+            type: eventType,
+            status,
+            outcome: options.outcome || (status === 'canceled' ? 'paused' : 'timeout'),
+            error: options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state'),
+            at: nowMs,
+            terminalAt: nowMs,
+            reason,
+            milestones: {
+                closeRequestedAt: Number.parseInt(item?.milestones?.closeRequestedAt, 10) || nowMs,
+                tabClosedAt: nowMs
+            }
+        })
+
+        if(reduced.accepted) {
+            return {
+                ...reduced.item,
+                updatedAt: Number.parseInt(reduced.item?.updatedAt, 10) || nowMs,
+                terminalAt: Number.parseInt(reduced.item?.terminalAt, 10) || nowMs,
+                actionLease: null,
+                actionLeaseReleasedAt: Number.parseInt(reduced.item?.actionLeaseReleasedAt, 10) || nowMs,
+                actionLeaseReleaseReason: reduced.item?.actionLeaseReleaseReason || reason,
+                ...(failureClassification ? {failureClassification} : {}),
+                tabId: null
+            }
+        }
+
+        return {
+            ...item,
+            status,
+            outcome: `${options.outcome || (status === 'canceled' ? 'paused' : 'timeout')}`.trim(),
+            error: `${options.error || (status === 'canceled' ? 'Paused by user' : 'Queued tab closed before reaching a terminal state')}`.trim(),
+            updatedAt: nowMs,
+            terminalAt: nowMs,
+            actionLease: null,
+            actionLeaseReleasedAt: nowMs,
+            actionLeaseReleaseReason: reason,
+            ...(failureClassification ? {failureClassification} : {}),
+            tabId: null,
+            milestones: {
+                ...makeEmptyCoordinatorMilestones(),
+                ...(item.milestones || {}),
+                closeRequestedAt: Number.parseInt(item?.milestones?.closeRequestedAt, 10) || nowMs,
+                tabClosedAt: nowMs
+            }
+        }
+    }
+
     return {
         getCoordinatorTransitionTerminalAt,
         getCoordinatorProgressReducerEventType,
@@ -508,6 +597,7 @@ function createCoordinatorProgressReducer(deps = {}) {
         transitionCoordinatorItemFromProgress,
         shouldPersistCoordinatorRowEventQueueItemChange,
         makeTerminalProgressRecordFromCoordinatorItem,
+        buildTerminalCoordinatorQueueItem,
         hasTerminalProgressDriftFromCoordinatorItem,
         shouldRestoreTerminalProgressFromCoordinatorItem,
         shouldPreferSuccessfulProgressOverTerminalCoordinatorItem,
