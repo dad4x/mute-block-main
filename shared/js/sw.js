@@ -170,6 +170,9 @@ const {
     createCoordinatorProgressReducer
 } = require('./swCoordinatorProgressReducer')
 const {
+    createCoordinatorReconcileSupportSingles
+} = require('./swCoordinatorReconcileSupportSingles')
+const {
     createCoordinatorSourceProvenance
 } = require('./swCoordinatorSourceProvenance')
 const {
@@ -1798,6 +1801,73 @@ const serializedStorageUpdateQueue = createSerializedStorageUpdateQueue({
     pushJournalEntry: entry => pushQueueWakeupJournalEntry(entry),
     startCycle: reason => startQueueWakeupMetricCycle('storage', 'enqueueSpaceFeedStorageUpdate', reason || '')
 })
+
+// coordinatorReconcileSupportSingles (decomposition Slice 43, mop-up of
+// remaining isolated singles) constructs here, right after storageUpdateState,
+// rather than immediately after coordinatorProgressReducer's destructure
+// like most of its other dependencies would otherwise allow: its
+// getStorageUpdateQueueSnapshot function needs the storageUpdateState
+// instance directly (not a hoisted function, so no thunk trick applies to
+// it the way it does for getActiveStorageContext below), and storageUpdateState
+// isn't assigned until this line. Every other dependency this module needs
+// (normalizeQuoraProfileUrl, coordinatorProgressRules's
+// getCoordinatorStatusFromProgress/shouldApplyProgressToCoordinatorItem,
+// coordinatorAttemptIdentity's getAttemptIdFromValue/getAttemptNumberFromValue/
+// hasMismatchedCoordinatorAttempt, coordinatorStatusRules's
+// isActiveCoordinatorStatus, profileProgressMerge's normalizeProgressPatch/
+// addSenderTabIdToProgressPatch, queuedTabMetadataAndActionLease's
+// getQueuedTabMetadata, profileNukeRecordClassification's
+// isTerminalProfileNukeRecord, coordinatorExecutorClassification's
+// getCoordinatorActionKindForRequestedAction, and activeQueuedTabStaleness's
+// hasActiveQueuedTabActionPhaseProgress) is already a bare const well before
+// this point. getActiveStorageContext is still a hoisted `function`
+// declaration further below (untouched by this slice) and works from any
+// point in this scope either way. profileNukeProgress, coordinatorAuthority,
+// queueWakeupMetrics, and lastCoordinatorExecutorApplyResult are all threaded
+// through as state getter/setter closures (see this module's own file
+// header comment) -- coordinatorAuthority in particular isn't constructed
+// until much later, but the closure isn't invoked until call time, well
+// after module-eval completes, so no TDZ concern.
+const coordinatorReconcileSupportSingles = createCoordinatorReconcileSupportSingles({
+    now: () => Date.now(),
+    handlers: {
+        normalizeQuoraProfileUrl,
+        normalizeProgressPatch,
+        addSenderTabIdToProgressPatch,
+        getCoordinatorStatusFromProgress,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        normalizeTabId,
+        isActiveCoordinatorStatus,
+        shouldApplyProgressToCoordinatorItem,
+        hasMismatchedCoordinatorAttempt,
+        getQueuedTabMetadata,
+        isTerminalProfileNukeRecord,
+        getCoordinatorActionKindForRequestedAction,
+        hasActiveQueuedTabActionPhaseProgress,
+        storageUpdateState,
+        getActiveStorageContext
+    },
+    state: {
+        getProfileNukeProgress: () => profileNukeProgress,
+        getCoordinatorAuthority: () => coordinatorAuthority,
+        getQueueWakeupMetrics: () => queueWakeupMetrics,
+        setLastCoordinatorExecutorApplyResult: value => {
+            lastCoordinatorExecutorApplyResult = value
+        }
+    }
+})
+const {
+    getCoordinatorProgressInFlightKey,
+    isSameActiveTransitionForCoordinatorItem,
+    shouldKeepQueuedTabOpenAfterActiveTransitionFailure,
+    shouldSkipResumeProjectionFallbackForTrustedAuthority,
+    getStorageUpdateQueueSnapshot,
+    refreshAuthorityStateIfChanged,
+    finishCoordinatorExecutorApplyResult,
+    shouldPreemptFinalOpenAuthorityRetry
+} = coordinatorReconcileSupportSingles
+
 let coordinatorAuthoritySnapshotObserver = null
 
 function getActiveStorageUpdateToken() {
@@ -12288,31 +12358,6 @@ async function applyCoordinatorQueueMachineEvent(event = {}, operation = {}) {
     return coordinatorQueueMachineEventDispatcher(event, operation)
 }
 
-function getCoordinatorProgressInFlightKey(profileHref = '', patch = {}, options = {}) {
-    const normalizedHref = normalizeQuoraProfileUrl(profileHref || patch?.profileHref || '')
-    if(!normalizedHref) return ''
-
-    const record = normalizeProgressPatch(
-        normalizedHref,
-        addSenderTabIdToProgressPatch(patch, options.senderTabId),
-        profileNukeProgress?.[normalizedHref] || {}
-    )
-    if(!record) return ''
-
-    const mapped = getCoordinatorStatusFromProgress(record)
-    if(!mapped.status) return ''
-
-    return [
-        normalizedHref,
-        getAttemptIdFromValue(record) || '',
-        getAttemptNumberFromValue(record) || 0,
-        record.actionKind || '',
-        mapped.status || '',
-        mapped.outcome || '',
-        mapped.error || ''
-    ].join('|')
-}
-
 async function recordCoordinatorJobProgressViaQueueMachine(profileHref = '', patch = {}, options = {}) {
     const inFlightKey = getCoordinatorProgressInFlightKey(profileHref, patch, options)
     const terminalInFlight = inFlightKey && options?.expectTerminal === true
@@ -12337,31 +12382,6 @@ async function recordCoordinatorJobProgressViaQueueMachine(profileHref = '', pat
         })
     if(inFlightKey) coordinatorProgressInFlightPromises.set(inFlightKey, progressPromise)
     return progressPromise
-}
-
-function isSameActiveTransitionForCoordinatorItem(item = null, record = null, tabId = null) {
-    const normalizedTabId = normalizeTabId(tabId || record?.tabId || null)
-    if(!item || !record || !normalizedTabId) return false
-    if(!isActiveCoordinatorStatus(item.status)) return false
-    if(normalizeTabId(item.tabId || item.activeTabId || null) !== normalizedTabId) return false
-    if(!shouldApplyProgressToCoordinatorItem(item, record)) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) return false
-
-    const itemAttemptId = getAttemptIdFromValue(item)
-    const recordAttemptId = getAttemptIdFromValue(record)
-    if((itemAttemptId || recordAttemptId) &&
-        (!itemAttemptId || !recordAttemptId || itemAttemptId !== recordAttemptId)) {
-        return false
-    }
-
-    const itemAttemptNumber = getAttemptNumberFromValue(item)
-    const recordAttemptNumber = getAttemptNumberFromValue(record)
-    if((itemAttemptNumber || recordAttemptNumber) &&
-        (!itemAttemptNumber || !recordAttemptNumber || itemAttemptNumber !== recordAttemptNumber)) {
-        return false
-    }
-
-    return true
 }
 
 async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}, details = {}, href = '', coordinatorKey = '') {
@@ -12612,31 +12632,6 @@ async function confirmQueuedTabDurablyActive(action = {}, tab = {}, details = {}
 
     markQueuedTabDurablyActive(tabId, 'targeted-row-check')
     return true
-}
-
-function shouldKeepQueuedTabOpenAfterActiveTransitionFailure(action = {}, tab = {}, details = {}) {
-    const tabId = normalizeTabId(tab?.id)
-    const profileHref = normalizeQuoraProfileUrl(
-        action.profileHref ||
-        action.targetProfileHref ||
-        action.url ||
-        ''
-    )
-    if(!tabId || !profileHref) return false
-
-    const metadata = getQueuedTabMetadata(tabId)
-    const record = profileNukeProgress?.[profileHref] || null
-    if(!record || isTerminalProfileNukeRecord(record)) return false
-
-    const expectedAttempt = {
-        status: 'active',
-        actionKind: getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || ''),
-        attemptId: details.attemptId || getAttemptIdFromValue(action),
-        attemptNumber: Number.parseInt(details.attemptNumber, 10) || getAttemptNumberFromValue(action)
-    }
-    if(hasMismatchedCoordinatorAttempt(expectedAttempt, record)) return false
-
-    return hasActiveQueuedTabActionPhaseProgress(record, metadata)
 }
 
 async function rollbackFailedQueuedTabOpen(action = {}, tab = {}, details = {}) {
@@ -13884,39 +13879,6 @@ async function resumeCoordinatorQueueExecution(coordinator = {}, options = {}) {
     return coordinatorResumePromise
 }
 
-function finishCoordinatorExecutorApplyResult(result = {}) {
-    const unresolvedExecutorCases = Array.isArray(result?.unresolvedExecutorCases)
-        ? result.unresolvedExecutorCases
-        : []
-    const unresolvedCaseKeys = new Set(unresolvedExecutorCases.map(item =>
-        `${item?.case || ''}\n${item?.rowKey || ''}`
-    ))
-    const consumedExecutorCases = Array.isArray(result?.consumedExecutorCases)
-        ? result.consumedExecutorCases.filter(item =>
-            !unresolvedCaseKeys.has(`${item?.case || ''}\n${item?.rowKey || ''}`)
-        )
-        : []
-    lastCoordinatorExecutorApplyResult = {
-        generatedAt: Date.now(),
-        reason: result?.reason || '',
-        changed: result?.changed === true,
-        queued: Number.parseInt(result?.queued, 10) || 0,
-        pending: Number.parseInt(result?.pending, 10) || 0,
-        adopted: Number.parseInt(result?.adopted, 10) || 0,
-        requeued: Number.parseInt(result?.requeued, 10) || 0,
-        resolvedStaleRuntime: Number.parseInt(result?.resolvedStaleRuntime, 10) || 0,
-        resolvedTerminalRuntime: Number.parseInt(result?.resolvedTerminalRuntime, 10) || 0,
-        consumedExecutorCases,
-        unresolvedExecutorCases,
-        primaryUnresolvedCase: result?.primaryUnresolvedCase || null
-    }
-    return {
-        ...result,
-        consumedExecutorCases,
-        unresolvedExecutorCases
-    }
-}
-
 async function recoverQueuedStaleRuntimeMissingQueuedAction(itemKey = '', item = null, options = {}, staleReason = 'queued-stale-runtime-missing-queued-action') {
     if(!itemKey || !item) return null
     if(!shouldRecoverExhaustedRolledBackQueuedTabRetry(item, {
@@ -14690,16 +14652,6 @@ async function requeueStalledActivePendingAction(classified = null, itemKey = ''
         status: 'queued',
         reason: 'active-pending-action-stale-claim-requeued'
     }
-}
-
-// Re-fetching coordinatorAuthority.current() clones the entire resident
-// queue/runs/stored state, so callers only do it after an operation actually
-// reports a change -- never unconditionally. Centralizing that gate here
-// keeps future call sites from accidentally dropping it and re-triggering a
-// full re-clone on every iteration regardless of whether anything changed.
-function refreshAuthorityStateIfChanged(currentAuthorityState, shouldRefresh) {
-    if(shouldRefresh !== true) return currentAuthorityState
-    return coordinatorAuthority.current() || currentAuthorityState
 }
 
 async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-apply', options = {}) {
@@ -17630,39 +17582,6 @@ async function waitForUserStartDurableActivation(startedActiveRows = 0, timeoutM
     throw new Error(`user initiated coordinator queue fast start timed out after ${Math.max(1000, Number.parseInt(timeoutMs, 10) || 15000)}ms`)
 }
 
-function shouldSkipResumeProjectionFallbackForTrustedAuthority(reason = '') {
-    return /terminal-progress|terminal-job-progress|queued-tab-(?:slot-)?release|profile-tabs-without-active-authority|queued-tab-open-pre-runtime-tab-missing|resolved-(?:stale|terminal)-runtime/.test(`${reason || ''}`)
-}
-
-function getStorageUpdateQueueSnapshot() {
-    const now = Date.now()
-    const active = getActiveStorageContext() || null
-    const counters = queueWakeupMetrics?.currentEpoch?.counters || {}
-    return {
-        depth: storageUpdateState.getDepth(),
-        active: !!active,
-        currentReason: active?.reason || '',
-        currentPhase: active?.currentPhase || '',
-        currentStartedAt: Number.parseInt(active?.startedAt, 10) || 0,
-        currentEnqueuedAt: Number.parseInt(active?.enqueuedAt, 10) || 0,
-        currentRunMs: active?.startedAt ? now - (Number.parseInt(active.startedAt, 10) || now) : 0,
-        oldestWaitMs: active?.enqueuedAt ? now - (Number.parseInt(active.enqueuedAt, 10) || now) : 0,
-        timedOut: Number.parseInt(counters['storageUpdate.timedOut'], 10) || 0,
-        fallbackReturned: Number.parseInt(counters['storageUpdate.fallbackReturned'], 10) || 0,
-        abandoned: Number.parseInt(counters['storageUpdate.abandoned'], 10) || 0,
-        timeoutBeforeStart: Number.parseInt(counters['storageUpdate.timeout.beforeStart'], 10) || 0,
-        timeoutDuringStorageGet: Number.parseInt(counters['storageUpdate.timeout.duringStorageGet'], 10) || 0,
-        queueWalSegmentStorageGetMs: Math.round(Number(active?.queueWalSegmentStorageGetMs) || 0),
-        queueWalHydrateMs: Math.round(Number(active?.queueWalHydrateMs) || 0),
-        queueWalAppendPrepareMs: Math.round(Number(active?.queueWalAppendPrepareMs) || 0),
-        queueWalPhysicalPayloadMs: Math.round(Number(active?.queueWalPhysicalPayloadMs) || 0),
-        queueWalStorageSetMs: Math.round(Number(active?.queueWalStorageSetMs) || 0),
-        queueWalReplayVerifyMs: Math.round(Number(active?.queueWalReplayVerifyMs) || 0),
-        queueProjectionBuildMs: Math.round(Number(active?.queueProjectionBuildMs) || 0),
-        queueProjectionStorageSetMs: Math.round(Number(active?.queueProjectionStorageSetMs) || 0)
-    }
-}
-
 async function getCoordinatorWhyNotRunning(request = {}) {
     const currentAuthorityState = getHydratedCoordinatorAuthorityState('whyNotRunning.usedResidentAuthority') ||
         await loadCoordinatorQueueRunsProjection({
@@ -18673,12 +18592,6 @@ function scheduleCoordinatorQueueResume(delayMs = 500, reason = 'scheduled-resum
         void runScheduledCoordinatorQueueResume().catch(() => null)
     })
     return true
-}
-
-function shouldPreemptFinalOpenAuthorityRetry(reason = '', options = {}) {
-    if(options.preemptFinalOpenAuthorityRetry === true) return true
-    const normalizedReason = `${reason || ''}`
-    return /terminal-progress|durable-(?:active|queued)-work|storage-idle-durable|active-missing-tab|active-transition|queued-tab-opened|slot-freed/.test(normalizedReason)
 }
 
 async function hasScheduledCoordinatorRuntimeOrDurableWork(reason = 'scheduled-work-check') {
