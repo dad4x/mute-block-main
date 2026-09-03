@@ -462,8 +462,6 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'background-blocked-sweep-terminal'
 ])
 let persistOwnedTabIdsTimeout = null
-let postStorageQueuedWorkContinuationReason = ''
-let postStorageQueuedWorkContinuationForceDurableQueueReload = false
 let persistentRetryFailedPromise = null
 let coordinatorPauseGeneration = 0
 let coordinatorPauseRequested = false
@@ -2011,30 +2009,6 @@ function notifyCoordinatorDashboardStateChanged(keys = [], reason = '') {
         reason: normalizeStorageMetricPathName(reason),
         keys: changedKeys
     }).catch(() => {})
-}
-
-function requestPostStorageQueuedWorkContinuation(reason = 'queued-work-continuation') {
-    const options = arguments[1] && typeof arguments[1] === 'object' ? arguments[1] : {}
-    postStorageQueuedWorkContinuationReason = `${reason || 'queued-work-continuation'}`.trim() || 'queued-work-continuation'
-    postStorageQueuedWorkContinuationForceDurableQueueReload =
-        postStorageQueuedWorkContinuationForceDurableQueueReload ||
-        options.forceDurableQueueReload === true
-}
-
-function flushPostStorageQueuedWorkContinuation() {
-    const reason = postStorageQueuedWorkContinuationReason
-    const forceDurableQueueReload = postStorageQueuedWorkContinuationForceDurableQueueReload === true
-    postStorageQueuedWorkContinuationReason = ''
-    postStorageQueuedWorkContinuationForceDurableQueueReload = false
-    if(!reason) return false
-
-    void kickCoordinatorQueueResume(reason, {
-        backgroundFastPath: true,
-        allowBeforeQuora: true,
-        skipAuthorityReconcile: true,
-        forceDurableQueueReload
-    }).catch(() => null)
-    return true
 }
 
 async function getLiveQueuedWorkerSurfaceProfileTabCount(targetProfileHref = '') {
@@ -4967,10 +4941,13 @@ const queuedWorkFastResume = createQueuedWorkFastResume({
         scheduleCoordinatorReconcile,
         scheduleQueuedWorkContinuation,
         runCoordinatorReconcileTick,
-        runCoordinatorQueueExecutorFastPath
+        runCoordinatorQueueExecutorFastPath,
+        kickCoordinatorQueueResume
     }
 })
 const {
+    requestPostStorageQueuedWorkContinuation,
+    flushPostStorageQueuedWorkContinuation,
     scheduleDurableQueueResumeFromIdleStorage,
     scheduleQueuedOnlyDurableWorkContinuation,
     kickQueuedWorkAfterSlotFreed

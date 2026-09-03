@@ -3731,7 +3731,7 @@ test('terminal queued progress schedules stored work continuation', () => {
     // in decomposition Slice 38.
     const releaseFollowUpBody = extractFunction(readRepoFile('shared/js/swQueuedTabActionBookkeeping.js'), 'function scheduleQueuedTabReleaseFollowUp(delayMs = 500)')
     const continuationBody = extractFunction(source, 'function scheduleQueuedWorkContinuation(reason = \'queued-work-continuation\')')
-    const postStorageContinuationBody = extractFunction(source, 'function flushPostStorageQueuedWorkContinuation()')
+    const postStorageContinuationBody = extractFunction(readRepoFile('shared/js/swQueuedWorkFastResume.js'), 'function flushPostStorageQueuedWorkContinuation()')
     // scheduleTerminalProgressContinuation/scheduleTerminalProgressSettlement
     // moved to swCoordinatorJobMilestoneBookkeeping.js in decomposition Slice 40.
     const milestoneBookkeepingSource = readRepoFile('shared/js/swCoordinatorJobMilestoneBookkeeping.js')
