@@ -48,6 +48,7 @@ const {
     createChromeLocalStorageAdapter,
     createSerializedStorageUpdateQueue,
     createSerializedStorageUpdateState,
+    createStorageUpdateAccessors,
     getWalRecordsForGeneration,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
@@ -587,7 +588,7 @@ const queueWakeupMetricsShape = createQueueWakeupMetricsShape({
         loadQueueWakeupMetrics,
         normalizeObjectNumberMap: (...args) => normalizeObjectNumberMap(...args),
         normalizeQueueWakeupPhaseMap: (...args) => normalizeQueueWakeupPhaseMap(...args),
-        getActiveStorageContext,
+        getActiveStorageContext: (...args) => getActiveStorageContext(...args),
         getDurablyActiveQueuedTabCount: (...args) => getDurablyActiveQueuedTabCount(...args),
         getQueueRuntimeCounts: queueRuntime.getRuntimeCounts
     }
@@ -1749,7 +1750,7 @@ const storageMetrics = createStorageMetrics({
         recordQueueWakeupMetricMax,
         incrementActiveStorageMetricDetail,
         setActiveStorageMetricDetail,
-        getActiveStorageContext
+        getActiveStorageContext: (...args) => getActiveStorageContext(...args)
     },
     state: {
         getSnapshotObserver: () => coordinatorAuthoritySnapshotObserver
@@ -1776,6 +1777,28 @@ const {
 
 const coordinatorStorageAdapter = createChromeLocalStorageAdapter(() => browser.storage.local)
 const storageUpdateState = createSerializedStorageUpdateState()
+// storageUpdateAccessors (sw.js decomposition mop-up slice, 2026-09) constructs
+// immediately after storageUpdateState -- its only hard dependency -- so that
+// getActiveStorageUpdateToken/getActiveStorageContext/isStorageUpdateAbandoned/
+// suppressAbandonedStorageOperation are real bare consts (not hoisted function
+// declarations) before every other already-extracted module's construction call
+// below that references getActiveStorageContext eagerly as a plain deps.handlers
+// value (coordinatorReconcileSupportSingles, storageIdlePromiseLatch). Two
+// earlier, higher-up construction calls (queueWakeupMetricsShape at the top of
+// this file, storageMetrics just above) reference getActiveStorageContext before
+// storageUpdateState even exists, so those two keep a call-time thunk
+// (`(...args) => getActiveStorageContext(...args)`) instead.
+const storageUpdateAccessors = createStorageUpdateAccessors({
+    storageUpdateState,
+    incrementQueueWakeupMetric,
+    setActiveStorageMetricDetail
+})
+const {
+    getActiveStorageUpdateToken,
+    getActiveStorageContext,
+    isStorageUpdateAbandoned,
+    suppressAbandonedStorageOperation
+} = storageUpdateAccessors
 const serializedStorageUpdateQueue = createSerializedStorageUpdateQueue({
     state: storageUpdateState,
     setTimeout,
@@ -1807,22 +1830,21 @@ const serializedStorageUpdateQueue = createSerializedStorageUpdateQueue({
 // rather than immediately after coordinatorProgressReducer's destructure
 // like most of its other dependencies would otherwise allow: its
 // getStorageUpdateQueueSnapshot function needs the storageUpdateState
-// instance directly (not a hoisted function, so no thunk trick applies to
-// it the way it does for getActiveStorageContext below), and storageUpdateState
-// isn't assigned until this line. Every other dependency this module needs
-// (normalizeQuoraProfileUrl, coordinatorProgressRules's
-// getCoordinatorStatusFromProgress/shouldApplyProgressToCoordinatorItem,
-// coordinatorAttemptIdentity's getAttemptIdFromValue/getAttemptNumberFromValue/
-// hasMismatchedCoordinatorAttempt, coordinatorStatusRules's
-// isActiveCoordinatorStatus, profileProgressMerge's normalizeProgressPatch/
-// addSenderTabIdToProgressPatch, queuedTabMetadataAndActionLease's
-// getQueuedTabMetadata, profileNukeRecordClassification's
-// isTerminalProfileNukeRecord, coordinatorExecutorClassification's
-// getCoordinatorActionKindForRequestedAction, and activeQueuedTabStaleness's
-// hasActiveQueuedTabActionPhaseProgress) is already a bare const well before
-// this point. getActiveStorageContext is still a hoisted `function`
-// declaration further below (untouched by this slice) and works from any
-// point in this scope either way. profileNukeProgress, coordinatorAuthority,
+// instance directly, and storageUpdateState isn't assigned until this line.
+// Every other dependency this module needs (normalizeQuoraProfileUrl,
+// coordinatorProgressRules's getCoordinatorStatusFromProgress/
+// shouldApplyProgressToCoordinatorItem, coordinatorAttemptIdentity's
+// getAttemptIdFromValue/getAttemptNumberFromValue/hasMismatchedCoordinatorAttempt,
+// coordinatorStatusRules's isActiveCoordinatorStatus, profileProgressMerge's
+// normalizeProgressPatch/addSenderTabIdToProgressPatch,
+// queuedTabMetadataAndActionLease's getQueuedTabMetadata,
+// profileNukeRecordClassification's isTerminalProfileNukeRecord,
+// coordinatorExecutorClassification's getCoordinatorActionKindForRequestedAction,
+// and activeQueuedTabStaleness's hasActiveQueuedTabActionPhaseProgress) is
+// already a bare const well before this point. getActiveStorageContext (a
+// second mop-up slice's addition to swstorage.js's createStorageUpdateAccessors,
+// constructed just above right after storageUpdateState) is also a real bare
+// const by this point, no thunk needed. profileNukeProgress, coordinatorAuthority,
 // queueWakeupMetrics, and lastCoordinatorExecutorApplyResult are all threaded
 // through as state getter/setter closures (see this module's own file
 // header comment) -- coordinatorAuthority in particular isn't constructed
@@ -1869,26 +1891,6 @@ const {
 } = coordinatorReconcileSupportSingles
 
 let coordinatorAuthoritySnapshotObserver = null
-
-function getActiveStorageUpdateToken() {
-    return storageUpdateState.getActiveToken()
-}
-
-function getActiveStorageContext() {
-    return storageUpdateState.getActiveContext()
-}
-
-function isStorageUpdateAbandoned(updateToken = getActiveStorageUpdateToken()) {
-    return storageUpdateState.isAbandoned(updateToken)
-}
-
-function suppressAbandonedStorageOperation(operation = 'storage') {
-    if(!isStorageUpdateAbandoned()) return false
-    incrementQueueWakeupMetric('storageUpdate.lateWriteSuppressed')
-    setActiveStorageMetricDetail('lateWriteSuppressed', true)
-    setActiveStorageMetricDetail('abortedOperation', operation)
-    return true
-}
 
 async function metricStorageGet(defaults = {}, options = {}) {
     incrementQueueWakeupMetric('storageGetCalls')
