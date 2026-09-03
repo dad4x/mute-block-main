@@ -527,11 +527,6 @@ let coordinatorExecutorStartPromiseStartedAt = 0
 let coordinatorFastExecutorActiveUntil = 0
 const lastQueuedWorkContinuationBackgroundKickAtByReason = new Map()
 const QUEUED_WORK_CONTINUATION_BACKGROUND_KICK_RETRY_DELAY_MS = 250
-
-function isKeyedThrottleCoalesced(throttleMap, key, windowMs, now = Date.now()) {
-    const lastAt = throttleMap.get(key) || 0
-    return lastAt > 0 && now - lastAt < windowMs
-}
 let coordinatorStoredWorkRestorePromise = null
 let lastUserStartQueueResult = null
 let lastCoordinatorExecutorApplyResult = null
@@ -1862,7 +1857,10 @@ const coordinatorReconcileSupportSingles = createCoordinatorReconcileSupportSing
         getCoordinatorActionKindForRequestedAction,
         hasActiveQueuedTabActionPhaseProgress,
         storageUpdateState,
-        getActiveStorageContext
+        getActiveStorageContext,
+        browser,
+        normalizeStorageMetricPathName,
+        COORDINATOR_DASHBOARD_STATE_KEYS
     },
     state: {
         getProfileNukeProgress: () => profileNukeProgress,
@@ -1874,6 +1872,8 @@ const coordinatorReconcileSupportSingles = createCoordinatorReconcileSupportSing
     }
 })
 const {
+    isKeyedThrottleCoalesced,
+    notifyCoordinatorDashboardStateChanged,
     getCoordinatorProgressInFlightKey,
     isSameActiveTransitionForCoordinatorItem,
     shouldKeepQueuedTabOpenAfterActiveTransitionFailure,
@@ -1999,18 +1999,6 @@ async function metricStorageRemove(keys = [], options = {}) {
     finally {
         recordStoragePathLatencyMetrics('write', pathName, Date.now() - startedAt)
     }
-}
-
-function notifyCoordinatorDashboardStateChanged(keys = [], reason = '') {
-    const changedKeys = Array.from(new Set(keys || []))
-        .filter(key => COORDINATOR_DASHBOARD_STATE_KEYS.has(key))
-    if(!changedKeys.length) return
-
-    void browser.runtime.sendMessage({
-        action: 'coordinator-dashboard-state-changed',
-        reason: normalizeStorageMetricPathName(reason),
-        keys: changedKeys
-    }).catch(() => {})
 }
 
 async function getLiveQueuedWorkerSurfaceProfileTabCount(targetProfileHref = '') {
