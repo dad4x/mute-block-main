@@ -8,6 +8,13 @@
 // plan's "mop-up" slice guidance (option (a): bundle thematically loose but
 // individually safe singles into one small catch-all).
 //
+// Two more joined in a later mop-up pass (2026-09, the plan's 15
+// pre-excluded-region stragglers): isKeyedThrottleCoalesced (a generic
+// Map-keyed throttle predicate with no natural neighbor) and
+// notifyCoordinatorDashboardStateChanged (a one-caller dashboard-push
+// notifier). See their own function header comments below for
+// destination reasoning specific to each.
+//
 // getCoordinatorProgressInFlightKey: builds the coalescing key for
 // in-flight progress-patch application (recordCoordinatorJobProgressViaQueueMachine,
 // its one caller, stays resident in sw.js).
@@ -34,9 +41,11 @@
 //
 // Promise-chain realm-crossing scrutiny (per architecture.md's Slice-7
 // refinement): every body was grepped for `.then(`, `.catch(`, `Promise.`,
-// `async`, `setTimeout`, and `void`. None found -- all eight functions are
-// plain synchronous data-in/data-out (or data-in/state-write) logic, and
-// none builds or returns a Promise chain reaching into another module.
+// `async`, `setTimeout`, and `void`. None found among the original eight --
+// all plain synchronous data-in/data-out (or data-in/state-write) logic,
+// none building or returning a Promise chain reaching into another module.
+// notifyCoordinatorDashboardStateChanged (added in the later mop-up pass)
+// is the one exception -- see its own function header comment below.
 //
 // Clock note: getStorageUpdateQueueSnapshot and finishCoordinatorExecutorApplyResult
 // read Date.now() directly, so a `now` clock dep is threaded through for
@@ -93,7 +102,10 @@ function createCoordinatorReconcileSupportSingles(deps = {}) {
         getCoordinatorActionKindForRequestedAction,
         hasActiveQueuedTabActionPhaseProgress,
         storageUpdateState,
-        getActiveStorageContext
+        getActiveStorageContext,
+        browser,
+        normalizeStorageMetricPathName,
+        COORDINATOR_DASHBOARD_STATE_KEYS
     } = deps.handlers || {}
     const {
         getProfileNukeProgress = () => ({}),
@@ -101,6 +113,44 @@ function createCoordinatorReconcileSupportSingles(deps = {}) {
         getQueueWakeupMetrics = () => null,
         setLastCoordinatorExecutorApplyResult = () => {}
     } = deps.state || {}
+
+    // isKeyedThrottleCoalesced (sw.js decomposition mop-up slice, 2026-09):
+    // a generic Map-keyed-by-reason/timestamp throttle predicate, factored
+    // out (ea59342) as a shared helper for two unrelated call sites (a
+    // queued-tab claim-nudge throttle, a queue-continuation background-kick
+    // throttle) with no natural same-bucket neighbor. Both call sites always
+    // pass `now` explicitly (grepped before moving), so the `now = Date.now()`
+    // default is never actually exercised in practice, but it's threaded
+    // through this module's own `now` dep regardless per the plan's clock
+    // note, so a future caller relying on the default doesn't silently read
+    // the real Node clock instead of the test harness's fake one.
+    function isKeyedThrottleCoalesced(throttleMap, key, windowMs, nowMs = now()) {
+        const lastAt = throttleMap.get(key) || 0
+        return lastAt > 0 && nowMs - lastAt < windowMs
+    }
+
+    // notifyCoordinatorDashboardStateChanged (sw.js decomposition mop-up
+    // slice, 2026-09): another isolated single (one caller, metricStorageSet).
+    // Promise-chain realm-crossing note: this builds
+    // `browser.runtime.sendMessage(...).catch(() => {})`. `browser` (the
+    // webextension-polyfill import) is always resolved via `require()` in
+    // both sw.js and every extracted module alike, so this carries the same
+    // realm-crossing profile the plan's other schedule/notify-shaped
+    // functions get scrutinized for. Verified against the full
+    // test:parallel suite before landing -- passed clean, matching the
+    // pattern this codebase has already seen play out safely for
+    // swQueuedWorkFastResume.js's fire-and-forget chains.
+    function notifyCoordinatorDashboardStateChanged(keys = [], reason = '') {
+        const changedKeys = Array.from(new Set(keys || []))
+            .filter(key => COORDINATOR_DASHBOARD_STATE_KEYS.has(key))
+        if(!changedKeys.length) return
+
+        void browser.runtime.sendMessage({
+            action: 'coordinator-dashboard-state-changed',
+            reason: normalizeStorageMetricPathName(reason),
+            keys: changedKeys
+        }).catch(() => {})
+    }
 
     function getCoordinatorProgressInFlightKey(profileHref = '', patch = {}, options = {}) {
         const normalizedHref = normalizeQuoraProfileUrl(profileHref || patch?.profileHref || '')
@@ -255,6 +305,8 @@ function createCoordinatorReconcileSupportSingles(deps = {}) {
     }
 
     return {
+        isKeyedThrottleCoalesced,
+        notifyCoordinatorDashboardStateChanged,
         getCoordinatorProgressInFlightKey,
         isSameActiveTransitionForCoordinatorItem,
         shouldKeepQueuedTabOpenAfterActiveTransitionFailure,

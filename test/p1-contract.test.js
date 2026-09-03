@@ -472,7 +472,7 @@ test('resident authority observer ignores raw queue snapshots', () => {
 test('service worker pushes compact dashboard refresh after compact state writes', () => {
     const source = readRepoFile('shared/js/sw.js')
     const setBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
-    const notifyBody = extractFunction(source, 'function notifyCoordinatorDashboardStateChanged(keys = [], reason = \'\')')
+    const notifyBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileSupportSingles.js'), 'function notifyCoordinatorDashboardStateChanged(keys = [], reason = \'\')')
 
     assert.match(source, /COORDINATOR_DASHBOARD_STATE_KEYS/)
     assert.match(setBody, /notifyCoordinatorDashboardStateChanged\(keys, pathName\)/)
