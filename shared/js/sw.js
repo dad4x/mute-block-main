@@ -474,12 +474,6 @@ let queuedTabFillAuthorityState = null
 let queuedTabFillPromiseClearRequested = false
 let queuedTabFillOpeningActionKeys = new Set()
 let queuedTabNudgeAttemptedAtByTabId = new Map()
-
-function resetQueuedTabFillState() {
-    queuedTabFillPromise = null
-    queuedTabFillPromiseStartedAt = 0
-    queuedTabFillOpeningActionKeys = new Set()
-}
 let profileNukeProgress = {}
 let coordinatorAuthorityShadowWalStore = makePairedCheckpointStore({queue: {}}, {
     snapshotSeq: 0,
@@ -4993,7 +4987,10 @@ const storageIdlePromiseLatch = createStorageIdlePromiseLatch({
     },
     state: {
         getQueuedTabFillPromise: () => queuedTabFillPromise,
+        setQueuedTabFillPromise: value => { queuedTabFillPromise = value },
         getQueuedTabFillPromiseStartedAt: () => queuedTabFillPromiseStartedAt,
+        setQueuedTabFillPromiseStartedAt: value => { queuedTabFillPromiseStartedAt = value },
+        setQueuedTabFillOpeningActionKeys: value => { queuedTabFillOpeningActionKeys = value },
         getCoordinatorReconcilePromise: () => coordinatorReconcilePromise,
         setCoordinatorReconcilePromise: value => { coordinatorReconcilePromise = value },
         getCoordinatorReconcilePromiseStartedAt: () => coordinatorReconcilePromiseStartedAt,
@@ -5012,7 +5009,6 @@ const storageIdlePromiseLatch = createStorageIdlePromiseLatch({
         pushQueueWakeupJournalEntry,
         scheduleCoordinatorQueueResume,
         scheduleCoordinatorReconcile,
-        resetQueuedTabFillState,
         flushPostStorageQueuedWorkContinuation,
         requestPostStorageQueuedWorkContinuation,
         scheduleQueueWakeupMetricsFlush,
@@ -5020,6 +5016,7 @@ const storageIdlePromiseLatch = createStorageIdlePromiseLatch({
     }
 })
 const {
+    resetQueuedTabFillState,
     recordActiveStorageWorkSnapshot,
     getStorageContextJournalDetails,
     getStorageTimeoutBucket,

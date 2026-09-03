@@ -45,19 +45,20 @@
 //     (recoverStorageGetTimeoutSerializedTail's call to it), still a
 //     same-realm call since it's invoked, not chained.
 //
-// resetQueuedTabFillState (still bare in sw.js, out of scope per the plan's
-// explicit note -- it touches state well beyond this cluster) is threaded
-// through as a dep. storageUpdateState and queueRuntime are the existing
-// already-extracted-module instances, passed through as-is.
+// resetQueuedTabFillState joined this module in the sw.js decomposition
+// mop-up slice (2026-09) -- see its own function header comment just above
+// its definition below. storageUpdateState and queueRuntime are the
+// existing already-extracted-module instances, passed through as-is.
 //
 // Every Date.now() call in the moved bodies is threaded through as
 // `now: () => Date.now()` per the plan's clock/environment-global note.
 // The mutable module-level `let`s these functions read/write
 // (queuedTabFillPromise, queuedTabFillPromiseStartedAt,
-// coordinatorReconcilePromise, coordinatorReconcilePromiseStartedAt,
-// coordinatorFastExecutorActiveUntil, coordinatorResumePromise) are
-// threaded through as live get/set accessors under `state`, matching the
-// convention already used by swQueueWakeupMetricsShape.js.
+// queuedTabFillOpeningActionKeys, coordinatorReconcilePromise,
+// coordinatorReconcilePromiseStartedAt, coordinatorFastExecutorActiveUntil,
+// coordinatorResumePromise) are threaded through as live get/set accessors
+// under `state`, matching the convention already used by
+// swQueueWakeupMetricsShape.js.
 
 function createStorageIdlePromiseLatch(deps = {}) {
     const {
@@ -72,7 +73,10 @@ function createStorageIdlePromiseLatch(deps = {}) {
     } = deps.constants || {}
     const {
         getQueuedTabFillPromise,
+        setQueuedTabFillPromise,
         getQueuedTabFillPromiseStartedAt,
+        setQueuedTabFillPromiseStartedAt,
+        setQueuedTabFillOpeningActionKeys,
         getCoordinatorReconcilePromise,
         setCoordinatorReconcilePromise,
         getCoordinatorReconcilePromiseStartedAt,
@@ -91,12 +95,32 @@ function createStorageIdlePromiseLatch(deps = {}) {
         pushQueueWakeupJournalEntry,
         scheduleCoordinatorQueueResume,
         scheduleCoordinatorReconcile,
-        resetQueuedTabFillState,
         flushPostStorageQueuedWorkContinuation,
         requestPostStorageQueuedWorkContinuation,
         scheduleQueueWakeupMetricsFlush,
         scheduleDurableQueueResumeFromIdleStorage
     } = deps.handlers || {}
+
+    // resetQueuedTabFillState (sw.js decomposition mop-up slice, 2026-09):
+    // moved in from sw.js, where it was left resident "out of scope" for
+    // Slice 9 (it touches queuedTabFillOpeningActionKeys, state well beyond
+    // Slice 9's own cluster). It's folded in here as a local function --
+    // this module already threaded it through as an external handler dep
+    // for clearStaleQueuedTabFillPromise/clearStorageTimeoutPromiseLatches,
+    // so those two callers below now just call the sibling function
+    // directly. The three mutable sw.js `let`s it resets
+    // (queuedTabFillPromise, queuedTabFillPromiseStartedAt,
+    // queuedTabFillOpeningActionKeys) are still read/written directly by
+    // bare name at many other sw.js call sites outside this module's scope,
+    // so they stay sw.js `let`s -- only write access is threaded through as
+    // live setter accessors here, matching the existing
+    // setCoordinatorReconcilePromise/setCoordinatorReconcilePromiseStartedAt
+    // convention immediately above.
+    function resetQueuedTabFillState() {
+        setQueuedTabFillPromise(null)
+        setQueuedTabFillPromiseStartedAt(0)
+        setQueuedTabFillOpeningActionKeys(new Set())
+    }
 
     function recordActiveStorageWorkSnapshot(queue = {}, options = {}) {
         const context = getActiveStorageContext()
@@ -435,6 +459,7 @@ function createStorageIdlePromiseLatch(deps = {}) {
     }
 
     return {
+        resetQueuedTabFillState,
         recordActiveStorageWorkSnapshot,
         getStorageContextJournalDetails,
         getStorageTimeoutBucket,
