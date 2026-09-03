@@ -582,7 +582,8 @@ const queueWakeupMetricsShape = createQueueWakeupMetricsShape({
         normalizeQueueWakeupPhaseMap: (...args) => normalizeQueueWakeupPhaseMap(...args),
         getActiveStorageContext: (...args) => getActiveStorageContext(...args),
         getDurablyActiveQueuedTabCount: (...args) => getDurablyActiveQueuedTabCount(...args),
-        getQueueRuntimeCounts: queueRuntime.getRuntimeCounts
+        getQueueRuntimeCounts: queueRuntime.getRuntimeCounts,
+        getFirstPositiveNumber: (...args) => getFirstPositiveNumber(...args)
     }
 })
 const {
@@ -617,6 +618,7 @@ const {
     incrementQueueWakeupMetric,
     getQueueWakeupMetricCounter,
     recordQueueWakeupPhase,
+    recordQueueWakeupPhaseSamplesFromProgress,
     recordQueueWakeupMetricMax,
     incrementActiveStorageMetricDetail,
     setActiveStorageMetricDetail,
@@ -5093,42 +5095,6 @@ async function refreshQueueWakeupMetricsViewForDashboard(reason = 'dashboard-ref
         refreshed: true,
         reason,
         view
-    }
-}
-
-function recordQueueWakeupPhaseSamplesFromProgress(record = {}) {
-    if(!record || typeof record !== 'object') return
-
-    const queuedAt = getFirstPositiveNumber(record.queuedAt, record.createdAt)
-    const tabOpenedAt = getFirstPositiveNumber(record.tabOpenedAt, record.tabCreatedAt)
-    const claimAcceptedAt = getFirstPositiveNumber(record.claimAcceptedAt, record.contentOpenedAt)
-    const actionReadyAt = getFirstPositiveNumber(record.actionReadyAt)
-    const actionStartedAt = getFirstPositiveNumber(
-        record.blockAttemptedAt,
-        record.muteAttemptedAt,
-        record.unblockAttemptedAt,
-        record.unmuteAttemptedAt
-    )
-    const terminalAt = getFirstPositiveNumber(record.terminalAt, record.blockedAt, record.unblockedAt, record.updatedAt)
-    const slotReleasedAt = getFirstPositiveNumber(record.slotReleasedAt)
-
-    if(queuedAt && tabOpenedAt && tabOpenedAt >= queuedAt) {
-        recordQueueWakeupPhase('durableQueueToTabOpen', tabOpenedAt - queuedAt)
-    }
-    if(tabOpenedAt && claimAcceptedAt && claimAcceptedAt >= tabOpenedAt) {
-        recordQueueWakeupPhase('tabOpenToClaimAccepted', claimAcceptedAt - tabOpenedAt)
-    }
-    if(claimAcceptedAt && actionStartedAt && actionStartedAt >= claimAcceptedAt) {
-        recordQueueWakeupPhase('claimAcceptedToActionStart', actionStartedAt - claimAcceptedAt)
-    }
-    if(actionReadyAt && actionStartedAt && actionStartedAt >= actionReadyAt) {
-        recordQueueWakeupPhase('actionReadyToActionStart', actionStartedAt - actionReadyAt)
-    }
-    if(actionStartedAt && terminalAt && terminalAt >= actionStartedAt) {
-        recordQueueWakeupPhase('actionStartToTerminal', terminalAt - actionStartedAt)
-    }
-    if(terminalAt && slotReleasedAt && slotReleasedAt >= terminalAt) {
-        recordQueueWakeupPhase('terminalToSlotRelease', slotReleasedAt - terminalAt)
     }
 }
 
