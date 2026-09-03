@@ -12314,6 +12314,57 @@ async function recordCoordinatorJobProgressViaQueueMachine(profileHref = '', pat
     return progressPromise
 }
 
+function decideActiveTransitionOutcome(item, record, now, params = {}) {
+    const {href, senderTabId} = params
+    if(!item) return {outcome: 'reject', reason: 'missing-row'}
+    if(!shouldApplyProgressToCoordinatorItem(item, record)) {
+        return {outcome: 'reject', reason: 'action-kind-changed'}
+    }
+    if(isTerminalCoordinatorStatus(item.status)) {
+        return {outcome: 'reject', reason: 'terminal-status'}
+    }
+    if(hasMismatchedCoordinatorAttempt(item, record)) {
+        return {
+            outcome: 'reject',
+            reason: 'stale-attempt',
+            diagnostic: {
+                profileHref: href,
+                incomingAttemptId: getAttemptIdFromValue(record),
+                expectedAttemptId: getAttemptIdFromValue(item),
+                senderTabId: senderTabId || null,
+                message: 'Ignored queued tab transition from stale attempt'
+            }
+        }
+    }
+    const currentAttemptId = getAttemptIdFromValue(item)
+    const currentAttemptNumber = getAttemptNumberFromValue(item)
+    const incomingAttemptId = getAttemptIdFromValue(record)
+    const incomingAttemptNumber = getAttemptNumberFromValue(record)
+    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
+        return {
+            outcome: 'reject',
+            reason: 'missing-attempt-identity',
+            diagnostic: {
+                profileHref: href,
+                incomingAttemptId,
+                expectedAttemptId: currentAttemptId,
+                senderTabId: senderTabId || null,
+                message: 'Ignored queued tab transition without required attempt identity'
+            }
+        }
+    }
+
+    const mapped = getCoordinatorStatusFromProgress(record)
+    if(!mapped.status) return {outcome: 'reject', reason: 'no-mapped-status'}
+
+    const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
+        now
+    })
+    if(JSON.stringify(nextItem) === JSON.stringify(item)) return {outcome: 'noop'}
+
+    return {outcome: 'proceed', mapped, nextItem}
+}
+
 function decideActiveTransitionMutation(currentItem, context, params = {}) {
     const {
         record,
@@ -12413,41 +12464,23 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
     const runs = currentAuthorityState.runs
     const itemKey = href && queue[href] ? href : coordinatorKey
     const item = queue[itemKey]
-    if(!item) return false
-    if(!shouldApplyProgressToCoordinatorItem(item, record)) return false
-    if(isTerminalCoordinatorStatus(item.status)) return false
-    if(hasMismatchedCoordinatorAttempt(item, record)) {
-        await recordStaleAttemptDiagnostic({
-            profileHref: href,
-            incomingAttemptId: getAttemptIdFromValue(record),
-            expectedAttemptId: getAttemptIdFromValue(item),
-            senderTabId: tab?.id || null,
-            message: 'Ignored queued tab transition from stale attempt'
-        })
+    const decision = decideActiveTransitionOutcome(item, record, now, {
+        href,
+        senderTabId: tab?.id || null
+    })
+    if(decision.outcome === 'reject') {
+        if(decision.diagnostic) {
+            await recordStaleAttemptDiagnostic(decision.diagnostic)
+        }
         return false
     }
+    if(decision.outcome === 'noop') return true
+    const {mapped, nextItem} = decision
+
     const currentAttemptId = getAttemptIdFromValue(item)
     const currentAttemptNumber = getAttemptNumberFromValue(item)
     const incomingAttemptId = getAttemptIdFromValue(record)
     const incomingAttemptNumber = getAttemptNumberFromValue(record)
-    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
-        await recordStaleAttemptDiagnostic({
-            profileHref: href,
-            incomingAttemptId,
-            expectedAttemptId: currentAttemptId,
-            senderTabId: tab?.id || null,
-            message: 'Ignored queued tab transition without required attempt identity'
-        })
-        return false
-    }
-
-    const mapped = getCoordinatorStatusFromProgress(record)
-    if(!mapped.status) return false
-
-    const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-        now
-    })
-    if(JSON.stringify(nextItem) === JSON.stringify(item)) return true
 
     const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
     const itemCoordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
