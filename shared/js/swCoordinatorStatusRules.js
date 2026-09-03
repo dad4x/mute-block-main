@@ -40,8 +40,26 @@
 //
 // None of the six moved bodies read Date.now() or any other environment
 // global, so this module needs no clock dependency.
+//
+// shouldResetCoordinatorItemForIncoming and shouldResetCoordinatorExecutor
+// added in decomposition Slice 43 (mop-up of remaining isolated singles):
+// both are enqueue-time "should this reset the existing item/executor"
+// gates, and shouldResetCoordinatorItemForIncoming calls this module's own
+// isRetryableCoordinatorFailure and isTerminalCoordinatorStatus internally
+// (ordinary same-factory function calls, no dep threading needed) plus
+// UNBLOCK_UNMUTE_ACTION_KIND (added as a constant, already available from
+// the jobState.js require at the top of sw.js). shouldResetCoordinatorExecutor
+// has no dependencies beyond its own parameters. Neither reads Date.now()
+// or any other environment global, and neither has any async keyword or
+// Promise/`.then()`/`.catch()` chain (grepped both bodies per architecture.md's
+// realm-crossing note) -- no realm-crossing risk. Both had exactly one
+// external reference each, called from deep inside resident async
+// enqueue-path functions, so no eager construction-order concern either.
 
 function createCoordinatorStatusRules(deps = {}) {
+    const {
+        UNBLOCK_UNMUTE_ACTION_KIND
+    } = deps.constants || {}
     const {
         isTerminalJobStatus,
         isRetryableJobFailure,
@@ -73,13 +91,40 @@ function createCoordinatorStatusRules(deps = {}) {
             `${item?.executorOwner || ''}` === 'service-worker'
     }
 
+    function shouldResetCoordinatorItemForIncoming(existing = null, actionKind = '', rawItem = {}, runInput = {}, source = {}) {
+        if(!existing) return false
+        const explicitReset = rawItem?.resetExisting === true ||
+            runInput?.resetExisting === true ||
+            source?.resetExisting === true
+        if(explicitReset) return true
+
+        if(isRetryableCoordinatorFailure(existing)) return true
+
+        const terminalExisting = isTerminalCoordinatorStatus(existing?.status)
+        if(!terminalExisting) return false
+
+        const sourceType = `${rawItem?.source?.type || source?.type || runInput?.sourceType || ''}`.trim()
+        return actionKind === UNBLOCK_UNMUTE_ACTION_KIND && sourceType === 'profile-reverse'
+    }
+
+    function shouldResetCoordinatorExecutor(request = {}, rawItems = []) {
+        const runInput = request.run && typeof request.run === 'object' ? request.run : {}
+        const source = request.source && typeof request.source === 'object' ? request.source : {}
+
+        return runInput?.resetExisting === true ||
+            source?.resetExisting === true ||
+            rawItems.some(item => item?.resetExisting === true)
+    }
+
     return {
         isTerminalCoordinatorStatus,
         isActiveCoordinatorStatus,
         isPendingCoordinatorStatus,
         isRetryableCoordinatorFailure,
         isRetryableCoordinatorFailureFromProgress,
-        isCoordinatorQueueAuthoritativeItem
+        isCoordinatorQueueAuthoritativeItem,
+        shouldResetCoordinatorItemForIncoming,
+        shouldResetCoordinatorExecutor
     }
 }
 
