@@ -369,9 +369,60 @@ function createSerializedStorageUpdateQueue(options = {}) {
     }
 }
 
+// createStorageUpdateAccessors (sw.js decomposition mop-up slice, 2026-09):
+// the four thin wrapper functions sw.js's reconcile/metric callers use to
+// read/gate the active serialized-storage-update context, previously left
+// resident in sw.js pending a future slice (see swCoordinatorReconcileInputs.js's
+// header comment for the original deferral). getActiveStorageUpdateToken,
+// getActiveStorageContext, and isStorageUpdateAbandoned are one-line
+// delegations to the storageUpdateState instance's own getActiveToken/
+// getActiveContext/isAbandoned methods (same default-parameter behavior in
+// both places); suppressAbandonedStorageOperation additionally calls the
+// already-extracted swQueueWakeupMetricsShape.js module's
+// incrementQueueWakeupMetric/setActiveStorageMetricDetail as plain
+// synchronous calls (no Promise chain), so it carries no realm-crossing risk
+// per architecture.md's Slice-7 refinement. Kept as separate wrapper
+// functions (not a bare rename to the state instance's own methods) since
+// every call site in sw.js still calls them as bare identifiers.
+function createStorageUpdateAccessors(deps = {}) {
+    const {
+        storageUpdateState,
+        incrementQueueWakeupMetric,
+        setActiveStorageMetricDetail
+    } = deps
+
+    function getActiveStorageUpdateToken() {
+        return storageUpdateState.getActiveToken()
+    }
+
+    function getActiveStorageContext() {
+        return storageUpdateState.getActiveContext()
+    }
+
+    function isStorageUpdateAbandoned(updateToken = getActiveStorageUpdateToken()) {
+        return storageUpdateState.isAbandoned(updateToken)
+    }
+
+    function suppressAbandonedStorageOperation(operation = 'storage') {
+        if(!isStorageUpdateAbandoned()) return false
+        incrementQueueWakeupMetric('storageUpdate.lateWriteSuppressed')
+        setActiveStorageMetricDetail('lateWriteSuppressed', true)
+        setActiveStorageMetricDetail('abortedOperation', operation)
+        return true
+    }
+
+    return {
+        getActiveStorageUpdateToken,
+        getActiveStorageContext,
+        isStorageUpdateAbandoned,
+        suppressAbandonedStorageOperation
+    }
+}
+
 module.exports = {
     createChromeLocalStorageAdapter,
     createSerializedStorageUpdateQueue,
     createSerializedStorageUpdateState,
+    createStorageUpdateAccessors,
     ...walSnapshotStore
 }

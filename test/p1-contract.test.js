@@ -1662,7 +1662,7 @@ test('service worker local storage goes through production adapter seam', () => 
     const adapterBody = extractFunction(storageSource, 'function createChromeLocalStorageAdapter(getStorageArea)')
     const metricGetBody = extractFunction(source, 'async function metricStorageGet(defaults = {}, options = {})')
     const metricSetBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
-    const suppressBody = extractFunction(source, 'function suppressAbandonedStorageOperation(operation = \'storage\')')
+    const suppressBody = extractFunction(storageSource, 'function suppressAbandonedStorageOperation(operation = \'storage\')')
     const nonAdapterSource = source.replace(
         /const coordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/,
         ''
