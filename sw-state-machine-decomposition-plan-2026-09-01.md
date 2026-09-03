@@ -2,11 +2,15 @@
 
 Date: 2026-09-01
 
-Status: Part 1 (sync-only extraction) is complete. Slices 1-44 are landed
-and independently verified (see `git log --oneline` for the full commit
-list, starting at `3567f1c`, most recent `789a5cd`). `shared/js/sw.js` is
-down to 30,742 lines from 38,953 at the start of this effort (~21.1%
-reduction), with 45+ new modules landed.
+Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
+(async orchestration) has begun: Slice P2-1 is landed and independently
+verified (commits `25ae7d3`, `675bca8`), proving the decide/act splitting
+technique end-to-end on a real async orchestrator for the first time. See
+`git log --oneline` for the full commit list, starting at `3567f1c`, most
+recent `675bca8`. `shared/js/sw.js` is at 30,742 lines, down from 38,953
+at the start of this effort (~21.1% reduction), with 45+ new modules
+landed (Part 2's work so far stays physically in `sw.js`, no new module
+yet).
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -918,7 +922,32 @@ first to find every `await` hiding inside an apparent decision chain
 (diagnostic recording, metric-adjacent side effects, and similar) before
 proposing an extraction boundary.
 
-### Slice P2-1 -- extract the two pure spans from transitionCoordinatorItemForQueuedTabLocked
+### Slice P2-1 -- extract the two pure spans from transitionCoordinatorItemForQueuedTabLocked (done)
+
+Completed (commits `25ae7d3`, `675bca8`; both independently re-verified by
+reading the full diffs and running the test suite twice more). The
+technique works end-to-end on a live async orchestrator:
+
+- Part 1 (`mutate()` → `decideActiveTransitionMutation`) confirmed
+  byte-identical and mechanical, but the plan's own suggested params list
+  was incomplete -- the real closure also used `itemKey` (distinct from
+  `itemCoordinatorKey`) and `tabId`, which the executing agent caught by
+  diffing against the original before running tests, not by trusting the
+  spec. Lesson: even a "trivial, mechanical" extraction's exact closure
+  variable list should be verified against the real code, not assumed
+  from a plan-doc description written before the code was read that
+  closely.
+- Part 2 (Decide A → `decideActiveTransitionOutcome`) landed with the
+  planned discriminated-object shape, diagnostic payloads preserved
+  exactly, verified by manually tracing the two synthetic tests that
+  exercise the stale-attempt and missing-attempt-identity reject paths
+  before running the suite.
+
+Both extracted functions stay physically in `sw.js`, not in a new module
+-- this slice proved the technique, it didn't answer the separate
+question of whether/when these should later move across a module
+boundary (which would need the same realm-crossing scrutiny as any Part 1
+slice).
 
 The first executable Part 2 slice, following on from the scoping above.
 Two small, separately-committed, in-place changes -- no new module yet,
