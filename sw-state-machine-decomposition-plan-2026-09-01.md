@@ -918,13 +918,63 @@ first to find every `await` hiding inside an apparent decision chain
 (diagnostic recording, metric-adjacent side effects, and similar) before
 proposing an extraction boundary.
 
-Not yet executed -- this is a scoping writeup, not a slice definition
-ready to hand to an execution pass. A concrete next step would be turning
-Decide A (with the reason-code restructuring) and the `mutate` callback
-extraction into two small, separately-verified sync-only changes local to
-`transitionCoordinatorItemForQueuedTabLocked` -- no new module needed for
-either yet, since this is upstream analysis before the file-extraction
-question even arises.
+### Slice P2-1 -- extract the two pure spans from transitionCoordinatorItemForQueuedTabLocked
+
+The first executable Part 2 slice, following on from the scoping above.
+Two small, separately-committed, in-place changes -- no new module yet,
+both stay local to `shared/js/sw.js` near
+`transitionCoordinatorItemForQueuedTabLocked` (currently ~line 12317; **re-verify
+before executing**, line numbers have shifted repeatedly all session).
+This deliberately does NOT touch anything else in the function's I/O
+(the `await coordinatorAuthority.applyWithinStorageUpdate(...)` call
+itself, the run-recompute/save block, or the final
+`scheduleCoordinatorQueueResume` call) -- those stay exactly as they are.
+
+**Part 1 of this slice (lowest risk, do first): extract the `mutate()`
+callback.** It is already 100% pure sync with zero `await`s -- pull it out
+of the `applyWithinStorageUpdate({...})` call's inline object literal into
+a standalone, named, top-level sync function (e.g.
+`decideActiveTransitionMutation`) taking `(currentItem, context, params)`
+where `params` bundles what it currently closes over
+(`record`, `mapped`, `now`, `incomingAttemptId`, `incomingAttemptNumber`,
+`itemHref`, `itemCoordinatorKey`). Wire it back in as
+`mutate: (currentItem, context) => decideActiveTransitionMutation(currentItem, context, {...})`.
+Pure mechanical extraction, behavior must be byte-identical. Verify with
+the full test suite, commit on its own.
+
+**Part 2 of this slice (real restructuring, more care needed): extract
+Decide A into a function returning a decision object instead of directly
+returning/awaiting.** Currently Decide A's early-reject paths sometimes
+`return false` directly and sometimes `await recordStaleAttemptDiagnostic(...)`
+before returning false -- that `await` is why this can't be a naive
+block-wrap. Restructure it to a pure function (e.g.
+`decideActiveTransitionOutcome(item, record, now)`) returning a discriminated
+object: `{outcome: 'reject', reason, diagnostic}` (where `diagnostic` is
+the payload that used to be passed to `recordStaleAttemptDiagnostic`, or
+absent for the plain early-returns like missing item / terminal status /
+`shouldApplyProgressToCoordinatorItem` failing), `{outcome: 'noop'}` (the
+JSON.stringify-equal case, which today `return true`s), or `{outcome:
+'proceed', mapped, nextItem}`. `transitionCoordinatorItemForQueuedTabLocked`
+then does: `const decision = decideActiveTransitionOutcome(item, record, now)`,
+handles each outcome (including `if(decision.diagnostic) await recordStaleAttemptDiagnostic(decision.diagnostic)`
+before returning false for the reject case), and only proceeds into the
+`applyWithinStorageUpdate` call for the `'proceed'` outcome. This changes
+control flow shape but must preserve identical externally-observable
+behavior (same return values, same diagnostic calls with the same
+payloads, same order) -- write it carefully, then verify against the full
+test suite, paying particular attention to any test that exercises the
+stale-attempt or missing-attempt-identity reject paths specifically (grep
+`swSynthetic.test.js` for `recordStaleAttemptDiagnostic` or
+`stale-attempt`/`attempt-identity` reason strings to find them). Commit
+separately from Part 1.
+
+This slice does not resolve the async orchestration realm-boundary
+question at all -- both extracted functions stay physically in `sw.js`.
+Its value is proving the decide/act splitting technique works end-to-end
+on a real function before deciding whether/how to eventually move such
+functions into their own module (which would still need the same
+realm-crossing scrutiny as any Part 1 slice, since these decide functions
+would then be called across a module boundary from the async shell).
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
