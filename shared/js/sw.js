@@ -12314,6 +12314,45 @@ async function recordCoordinatorJobProgressViaQueueMachine(profileHref = '', pat
     return progressPromise
 }
 
+function decideActiveTransitionMutation(currentItem, context, params = {}) {
+    const {
+        record,
+        mapped,
+        now,
+        incomingAttemptId,
+        incomingAttemptNumber,
+        itemHref,
+        itemCoordinatorKey,
+        itemKey,
+        tabId
+    } = params
+    if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
+        return context.reject('missing-or-terminal-row')
+    }
+    if(!shouldApplyProgressToCoordinatorItem(currentItem, record)) {
+        return context.reject('action-kind-changed')
+    }
+    if(hasMismatchedCoordinatorAttempt(currentItem, record)) {
+        return context.reject('stale-attempt', {staleAttempt: true})
+    }
+    if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
+        (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
+        return context.reject('missing-attempt-identity', {staleAttempt: true})
+    }
+    if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== itemHref ||
+        getCoordinatorItemQueueKey(currentItem, itemKey) !== itemCoordinatorKey) {
+        return context.reject('row-target-changed-before-authority-apply')
+    }
+    if(isSameActiveTransitionForCoordinatorItem(currentItem, record, tabId)) {
+        incrementQueueWakeupMetric('coordinatorAuthority.activeTransition.duplicateSameTabNoop')
+        return currentItem
+    }
+    const transitionedItem = transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
+        now
+    })
+    return transitionedItem
+}
+
 async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}, details = {}, href = '', coordinatorKey = '') {
     const actionKind = getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || '')
     const now = Number.parseInt(details.openedAt, 10) || Date.now()
@@ -12427,33 +12466,17 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
         currentAuthorityState,
         forceFreshAuthorityState: forceFreshActiveTransitionAuthority,
         allowCurrentAuthorityState: true,
-        mutate(currentItem, context) {
-            if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
-                return context.reject('missing-or-terminal-row')
-            }
-            if(!shouldApplyProgressToCoordinatorItem(currentItem, record)) {
-                return context.reject('action-kind-changed')
-            }
-            if(hasMismatchedCoordinatorAttempt(currentItem, record)) {
-                return context.reject('stale-attempt', {staleAttempt: true})
-            }
-            if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
-                (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
-                return context.reject('missing-attempt-identity', {staleAttempt: true})
-            }
-            if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== itemHref ||
-                getCoordinatorItemQueueKey(currentItem, itemKey) !== itemCoordinatorKey) {
-                return context.reject('row-target-changed-before-authority-apply')
-            }
-            if(isSameActiveTransitionForCoordinatorItem(currentItem, record, tabId)) {
-                incrementQueueWakeupMetric('coordinatorAuthority.activeTransition.duplicateSameTabNoop')
-                return currentItem
-            }
-            const transitionedItem = transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
-                now
-            })
-            return transitionedItem
-        }
+        mutate: (currentItem, context) => decideActiveTransitionMutation(currentItem, context, {
+            record,
+            mapped,
+            now,
+            incomingAttemptId,
+            incomingAttemptNumber,
+            itemHref,
+            itemCoordinatorKey,
+            itemKey,
+            tabId
+        })
     })
 
     recordFlightRecorderEvent({
