@@ -36,13 +36,19 @@
 // harness/CI environment with different timing sensitivity) can revert
 // just this file without touching the verified-safe half of Slice 9.
 //
-// runCoordinatorReconcileTick and runCoordinatorQueueExecutorFastPath are
-// threaded through as deps (still bare, async, sw.js-resident functions).
-// coordinatorFastExecutorActiveUntil and queuedTabFillPromise (mutable
-// module-level `let`s in sw.js) are threaded through as live get accessors,
-// matching the convention used elsewhere in this decomposition.
+// runCoordinatorReconcileTick, runCoordinatorQueueExecutorFastPath, and
+// (as of the sw.js decomposition mop-up slice, 2026-09)
+// kickCoordinatorQueueResume are threaded through as deps (still bare,
+// async, sw.js-resident functions). coordinatorFastExecutorActiveUntil and
+// queuedTabFillPromise (mutable module-level `let`s in sw.js) are threaded
+// through as live get accessors, matching the convention used elsewhere in
+// this decomposition.
 // Every Date.now() call is threaded through as `now: () => Date.now()` per
 // the plan's clock/environment-global note.
+//
+// requestPostStorageQueuedWorkContinuation/flushPostStorageQueuedWorkContinuation
+// (also joined in the mop-up slice) are a self-contained pair with their
+// own closure-local state -- see their function header comment below.
 
 function createQueuedWorkFastResume(deps = {}) {
     const {
@@ -60,8 +66,52 @@ function createQueuedWorkFastResume(deps = {}) {
         scheduleCoordinatorReconcile,
         scheduleQueuedWorkContinuation,
         runCoordinatorReconcileTick,
-        runCoordinatorQueueExecutorFastPath
+        runCoordinatorQueueExecutorFastPath,
+        kickCoordinatorQueueResume
     } = deps.handlers || {}
+
+    // requestPostStorageQueuedWorkContinuation/flushPostStorageQueuedWorkContinuation
+    // joined this module in the sw.js decomposition mop-up slice (2026-09).
+    // The two fields they exclusively read/write
+    // (postStorageQueuedWorkContinuationReason/
+    // postStorageQueuedWorkContinuationForceDurableQueueReload) were sw.js
+    // module-level `let`s referenced nowhere else in sw.js (grepped before
+    // moving), so they become ordinary closure-local state here rather than
+    // state accessors threaded back to sw.js -- the whole exclusive-use pair
+    // moved together. flushPostStorageQueuedWorkContinuation's
+    // `void kickCoordinatorQueueResume(...).catch(() => null)` fire-and-
+    // forget chain is the same shape this file's header comment already
+    // covers for scheduleDurableQueueResumeFromIdleStorage/
+    // scheduleQueuedOnlyDurableWorkContinuation/kickQueuedWorkAfterSlotFreed
+    // (a Promise chain reaching into a still-sw.js-resident async
+    // orchestration function) -- verified against the full test:parallel
+    // suite before landing, same as those three.
+    let postStorageQueuedWorkContinuationReason = ''
+    let postStorageQueuedWorkContinuationForceDurableQueueReload = false
+
+    function requestPostStorageQueuedWorkContinuation(reason = 'queued-work-continuation') {
+        const options = arguments[1] && typeof arguments[1] === 'object' ? arguments[1] : {}
+        postStorageQueuedWorkContinuationReason = `${reason || 'queued-work-continuation'}`.trim() || 'queued-work-continuation'
+        postStorageQueuedWorkContinuationForceDurableQueueReload =
+            postStorageQueuedWorkContinuationForceDurableQueueReload ||
+            options.forceDurableQueueReload === true
+    }
+
+    function flushPostStorageQueuedWorkContinuation() {
+        const reason = postStorageQueuedWorkContinuationReason
+        const forceDurableQueueReload = postStorageQueuedWorkContinuationForceDurableQueueReload === true
+        postStorageQueuedWorkContinuationReason = ''
+        postStorageQueuedWorkContinuationForceDurableQueueReload = false
+        if(!reason) return false
+
+        void kickCoordinatorQueueResume(reason, {
+            backgroundFastPath: true,
+            allowBeforeQuora: true,
+            skipAuthorityReconcile: true,
+            forceDurableQueueReload
+        }).catch(() => null)
+        return true
+    }
 
     function scheduleDurableQueueResumeFromIdleStorage(context = {}) {
         const durableActiveRows = Number.parseInt(context.durableActiveRows, 10) || 0
@@ -152,6 +202,8 @@ function createQueuedWorkFastResume(deps = {}) {
     }
 
     return {
+        requestPostStorageQueuedWorkContinuation,
+        flushPostStorageQueuedWorkContinuation,
         scheduleDurableQueueResumeFromIdleStorage,
         scheduleQueuedOnlyDurableWorkContinuation,
         kickQueuedWorkAfterSlotFreed
