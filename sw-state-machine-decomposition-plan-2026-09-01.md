@@ -856,10 +856,73 @@ to happen in the async shell first, with the result passed in as
 already-resolved plain data -- the decide function itself must never touch
 a Promise.
 
-Proposed first candidate when this gets picked up: `transitionCoordinatorItemForQueuedTab`,
-the smallest of the four listed async orchestrators -- map out where its
-actual decide/act boundary falls before touching anything, the same
-Read-before-Move discipline every Part 1 slice has used.
+### First candidate mapped (2026-09): transitionCoordinatorItemForQueuedTab(Locked)
+
+Read both functions in full before writing this (the Read-before-Move
+discipline every Part 1 slice has used), rather than guessing at shape.
+Findings, as of this snapshot (line numbers will drift, re-verify before
+executing):
+
+`transitionCoordinatorItemForQueuedTab` itself (~70 lines, sw.js ~line
+12040) turned out to be a poor first candidate -- it's almost entirely
+orchestration glue (compute a dedup key, check an in-flight-promise Map,
+dispatch to `applyCoordinatorQueueMachineEvent`, track the promise). There
+is a real decide span but it's a few lines, not worth a separate module.
+
+Its sibling `transitionCoordinatorItemForQueuedTabLocked` (~209 lines,
+sw.js ~line 12387) is the actual substantive one, and its shape corrects a
+premise in the approach idea above: it is **not** one decide-block-then-
+act-block. It **alternates** decide and act segments, twice:
+
+1. **Decide A** (~40 lines): item lookup, `shouldApplyProgressToCoordinatorItem`,
+   `isTerminalCoordinatorStatus`, `hasMismatchedCoordinatorAttempt`,
+   attempt-identity checks, `getCoordinatorStatusFromProgress`,
+   `transitionCoordinatorItemFromProgress`, and a no-op comparison --
+   almost entirely built from already-extracted Slice 12/17/19 pure
+   functions, which is exactly why it reads as a decision block even
+   though it's still inline. **Gotcha**: two of its reject paths
+   (`hasMismatchedCoordinatorAttempt` true, and a missing-attempt-identity
+   case) currently `await recordStaleAttemptDiagnostic(...)` as a side
+   effect *before* returning false. That `await` disqualifies those two
+   spots from a naive "just wrap this block in a function" extraction --
+   the decide function must return a reason code (and the diagnostic
+   payload) instead of performing the await itself, and the async shell
+   performs `await recordStaleAttemptDiagnostic(...)` after getting the
+   decision back, based on the reason. This is the concrete case the
+   "touches zero Promises" discipline note above was written for --
+   without reading the full function first, it's easy to miss that an
+   `await` is hiding inside what looks like a pure validation chain.
+2. **Act A** (the real I/O): `await coordinatorAuthority.applyWithinStorageUpdate(...)`.
+   Its `mutate(currentItem, context)` callback (~26 lines) is already
+   100% pure sync with zero awaits -- it re-runs a similar check against
+   the possibly-fresher `currentItem` read at commit time. This one is a
+   trivial, low-risk extraction on its own: it's already isolated as a
+   closure argument, just needs its closed-over values
+   (`record`/`mapped`/`now`/`incomingAttemptId`/`incomingAttemptNumber`/
+   `itemHref`/`itemCoordinatorKey`) passed in explicitly instead of
+   captured.
+3. **Decide B** (~few lines): check `authorityResult.accepted`/`durable`,
+   compute affected run IDs via `getCoordinatorRunIdsForHref`, decide
+   whether `recomputeCoordinatorRuns` (Slice 16) changed anything.
+4. **Act B** (conditional): `await saveCoordinatorState(...)` only if
+   Decide B found a change, then an unconditional fire-and-forget
+   `scheduleCoordinatorQueueResume(...)` call (resident, not awaited).
+
+Practical implication for scoping future Part 2 slices: expect this
+alternating shape to be the norm, not the exception, in the remaining
+async orchestrators -- budget for multiple small decide-extractions per
+function rather than one per function, and always read the full function
+first to find every `await` hiding inside an apparent decision chain
+(diagnostic recording, metric-adjacent side effects, and similar) before
+proposing an extraction boundary.
+
+Not yet executed -- this is a scoping writeup, not a slice definition
+ready to hand to an execution pass. A concrete next step would be turning
+Decide A (with the reason-code restructuring) and the `mutate` callback
+extraction into two small, separately-verified sync-only changes local to
+`transitionCoordinatorItemForQueuedTabLocked` -- no new module needed for
+either yet, since this is upstream analysis before the file-extraction
+question even arises.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
