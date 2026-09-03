@@ -18509,7 +18509,10 @@ const swSchedulerAlarmBookkeeping = createSwSchedulerAlarmBookkeeping({
         kickCoordinatorQueueResume,
         coordinatorQueueResumeScheduler,
         coordinatorReconcileScheduler,
-        setTimeoutFn: setTimeout
+        setTimeoutFn: setTimeout,
+        scheduleCoordinatorQueueResume,
+        shouldContinueQueuedOnlyWorkWithFastExecutor,
+        scheduleQueuedOnlyDurableWorkContinuation
     },
     constants: {
         STALE_QUEUED_TAB_MAX_RETRIES,
@@ -18552,7 +18555,8 @@ const {
     isSuppressedStaleCoordinatorReconcileAlarm,
     resetCoordinatorReconcileBackoff,
     recordCoordinatorReconcileNoopBackoff,
-    hasCoordinatorReconcileBackoff
+    hasCoordinatorReconcileBackoff,
+    scheduleCoordinatorReconcileExecutorContinuation
 } = swSchedulerAlarmBookkeeping
 
 function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_MS, options = {}) {
@@ -19284,34 +19288,6 @@ async function runCoordinatorReconcileTick(reason = 'coordinator-reconcile', opt
     coordinatorReconcilePromise = trackedPromise
 
     return coordinatorReconcilePromise
-}
-
-function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {}) {
-    if(!((after?.hasStoredWork && !after?.paused) || authority?.budgetExhausted === true)) {
-        return false
-    }
-
-    if(authority?.budgetExhausted === true) {
-        incrementQueueWakeupMetric('reconcile.rescheduled')
-        scheduleCoordinatorQueueResume(1000, 'reconcile-authority-budget-exhausted', {
-            allowBeforeQuora: options.allowBeforeQuora === true
-        })
-        return true
-    }
-
-    if(shouldContinueQueuedOnlyWorkWithFastExecutor(after)) {
-        scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'reconcile'}-queued-only-fast-resume`, {
-            awaitFill: options.awaitFill !== false,
-            allowBeforeQuora: options.allowBeforeQuora === true
-        })
-        return true
-    }
-
-    incrementQueueWakeupMetric('reconcile.rescheduled')
-    scheduleCoordinatorQueueResume(1000, 'reconcile-has-stored-work', {
-        allowBeforeQuora: options.allowBeforeQuora === true
-    })
-    return true
 }
 
 async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile', options = {}) {

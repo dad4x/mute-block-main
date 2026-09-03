@@ -77,6 +77,22 @@
 // declarations, hoisted, visible regardless of textual position) are
 // threaded through directly with no thunk needed.
 //
+// scheduleCoordinatorReconcileExecutorContinuation added in decomposition
+// Slice 43 (mop-up of remaining isolated singles): a natural fit here, the
+// glue that decides whether a reconcile tick needs a follow-up resume/
+// fast-executor continuation scheduled. It calls scheduleCoordinatorQueueResume
+// (still resident in sw.js, per the plan's explicit caution above -- a
+// hoisted `function` declaration, so no thunk is needed despite this module
+// constructing before it) and shouldContinueQueuedOnlyWorkWithFastExecutor/
+// scheduleQueuedOnlyDurableWorkContinuation (swStorageIdlePromiseLatch.js,
+// Slice 9, already a bare const by this module's construction point). No
+// async keyword and no Promise/`.then()`/`.catch()` chain of its own
+// (grepped per architecture.md's realm-crossing note) -- it only calls into
+// other functions without touching what they return, so it carries no
+// realm-crossing risk either direction. Had exactly one external reference
+// (runScheduledCoordinatorReconcileTick, resident in sw.js), so no eager
+// construction-order concern.
+//
 // State ownership: coordinatorPauseGeneration and coordinatorPauseRequested
 // are bare sw.js `let` bindings (declared near the top of the file) that
 // stay in sw.js because several sw.js-resident `async` functions
@@ -180,7 +196,10 @@ function createSwSchedulerAlarmBookkeeping(deps = {}) {
         kickCoordinatorQueueResume,
         coordinatorQueueResumeScheduler,
         coordinatorReconcileScheduler,
-        setTimeoutFn = setTimeout
+        setTimeoutFn = setTimeout,
+        scheduleCoordinatorQueueResume,
+        shouldContinueQueuedOnlyWorkWithFastExecutor,
+        scheduleQueuedOnlyDurableWorkContinuation
     } = deps.handlers || {}
     const {
         STALE_QUEUED_TAB_MAX_RETRIES,
@@ -441,6 +460,34 @@ function createSwSchedulerAlarmBookkeeping(deps = {}) {
         return coordinatorReconcileScheduler.hasBackoff(now)
     }
 
+    function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {}) {
+        if(!((after?.hasStoredWork && !after?.paused) || authority?.budgetExhausted === true)) {
+            return false
+        }
+
+        if(authority?.budgetExhausted === true) {
+            incrementQueueWakeupMetric('reconcile.rescheduled')
+            scheduleCoordinatorQueueResume(1000, 'reconcile-authority-budget-exhausted', {
+                allowBeforeQuora: options.allowBeforeQuora === true
+            })
+            return true
+        }
+
+        if(shouldContinueQueuedOnlyWorkWithFastExecutor(after)) {
+            scheduleQueuedOnlyDurableWorkContinuation(`${reason || 'reconcile'}-queued-only-fast-resume`, {
+                awaitFill: options.awaitFill !== false,
+                allowBeforeQuora: options.allowBeforeQuora === true
+            })
+            return true
+        }
+
+        incrementQueueWakeupMetric('reconcile.rescheduled')
+        scheduleCoordinatorQueueResume(1000, 'reconcile-has-stored-work', {
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
+        return true
+    }
+
     return {
         nextCoordinatorPauseGeneration,
         isCoordinatorPauseGenerationLocallyCurrent,
@@ -463,7 +510,8 @@ function createSwSchedulerAlarmBookkeeping(deps = {}) {
         isSuppressedStaleCoordinatorReconcileAlarm,
         resetCoordinatorReconcileBackoff,
         recordCoordinatorReconcileNoopBackoff,
-        hasCoordinatorReconcileBackoff
+        hasCoordinatorReconcileBackoff,
+        scheduleCoordinatorReconcileExecutorContinuation
     }
 }
 

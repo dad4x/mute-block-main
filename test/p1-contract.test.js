@@ -2673,7 +2673,9 @@ test('coordinator reconcile loop is split into ordered authority phases', () => 
     const runtimeBody = extractFunction(source, 'async function reconcileCoordinatorRuntimeActorsPhase(ctx = {})')
     const authorityBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
     const persistBody = extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})')
-    const continuationBody = extractFunction(source, "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
+    // scheduleCoordinatorReconcileExecutorContinuation moved to
+    // swSchedulerAlarmBookkeeping.js in decomposition Slice 43.
+    const continuationBody = extractFunction(readRepoFile('shared/js/swSchedulerAlarmBookkeeping.js'), "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
 
     const orderedPhases = [
         'loadCoordinatorReconcileAuthorityPhase(options)',
@@ -2711,7 +2713,7 @@ test('current reconcile authority paths do not introduce repair operation kinds 
         extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})'),
         extractFunction(source, 'async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {})'),
         extractFunction(source, 'async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {})'),
-        extractFunction(source, "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
+        extractFunction(readRepoFile('shared/js/swSchedulerAlarmBookkeeping.js'), "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
     ].join('\n')
 
     assert.doesNotMatch(currentAuthorityBodies, /operationKind: 'repair-/)
@@ -3356,7 +3358,9 @@ test('idle storage updates reconcile durable active work before queue fill', () 
     assert.doesNotMatch(fastPathBody, /changed-without-runtime[\s\S]{0,250}scheduleCoordinatorReconcile/)
 
     const reconcileBody = extractFunction(source, "async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile', options = {})")
-    const continuationBody = extractFunction(source, "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
+    // scheduleCoordinatorReconcileExecutorContinuation moved to
+    // swSchedulerAlarmBookkeeping.js in decomposition Slice 43.
+    const continuationBody = extractFunction(readRepoFile('shared/js/swSchedulerAlarmBookkeeping.js'), "function scheduleCoordinatorReconcileExecutorContinuation(after = null, authority = null, reason = 'reconcile', options = {})")
     assert.match(reconcileBody, /scheduleCoordinatorQueueResume\(1000, `\$\{reason \|\| 'reconcile'\}-post-authority-change`, \{[\s\S]*allowBeforeQuora: options\.allowBeforeQuora === true/)
     assert.doesNotMatch(reconcileBody, /post-authority-change[\s\S]{0,250}scheduleCoordinatorReconcile/)
     assert.match(reconcileBody, /after\?\.durableActiveRows[\s\S]*<= 0[\s\S]*after\?\.durableQueuedRows[\s\S]*> 0[\s\S]*runCoordinatorQueueExecutorFastPath\(`\$\{reason \|\| 'reconcile'\}-post-active-reconcile`, \{[\s\S]*returnAfterDurableActive: true,[\s\S]*allowBeforeQuora: options\.allowBeforeQuora === true,[\s\S]*forceDurableQueueReload: true/)
