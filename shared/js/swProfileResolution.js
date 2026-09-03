@@ -14,14 +14,15 @@
 // them read `Date.now()` or any other environment global the test
 // harness fakes, so no clock dep needed either.
 //
-// recordQueueWakeupPhaseSamplesFromProgress, which sits in the middle of
-// this cluster in file order (a consumer of the already-extracted
-// swQueueWakeupMetricsShape.js module's recordQueueWakeupPhase, not part
-// of this domain), stays behind in sw.js per the plan's explicit
-// exclusion. It calls this module's getFirstPositiveNumber as a plain
-// dep, unaffected by the move since sw.js destructures this module's
-// return value back into a bare `getFirstPositiveNumber` const at module
-// scope, matching every other extracted module's convention here.
+// recordQueueWakeupPhaseSamplesFromProgress, which sat in the middle of
+// this cluster in file order (a consumer of swQueueWakeupMetricsShape.js's
+// recordQueueWakeupPhase, not part of this domain), stayed resident in
+// sw.js at the time of this slice, per the plan's explicit exclusion. It
+// calls this module's getFirstPositiveNumber as a plain dep -- as of the
+// sw.js decomposition mop-up slice (2026-09) it moved into
+// swQueueWakeupMetricsShape.js itself instead (its actual consumer's own
+// module), with getFirstPositiveNumber threaded through as a handler dep
+// there rather than a bare sw.js reference.
 //
 // getCoordinatorItemQueueKey has 74 external references, several of them
 // inside other already-extracted modules' `deps.handlers` object-literal

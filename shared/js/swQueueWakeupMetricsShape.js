@@ -62,7 +62,8 @@ function createQueueWakeupMetricsShape(deps = {}) {
         normalizeQueueWakeupPhaseMap,
         getActiveStorageContext,
         getDurablyActiveQueuedTabCount,
-        getQueueRuntimeCounts
+        getQueueRuntimeCounts,
+        getFirstPositiveNumber
     } = deps.handlers || {}
 
     function getExtensionVersion() {
@@ -574,6 +575,52 @@ function createQueueWakeupMetricsShape(deps = {}) {
         scheduleQueueWakeupMetricsFlush()
     }
 
+    // recordQueueWakeupPhaseSamplesFromProgress (sw.js decomposition mop-up
+    // slice, 2026-09): a progress-record-to-phase-sample mapper built on top
+    // of recordQueueWakeupPhase above. Two earlier slices (5d6216d, 659d7be)
+    // deliberately left it resident, each noting it was "a consumer of this
+    // cluster rather than part of it" -- a scope decision, not a technical
+    // blocker: it has no Promise chain, no Date.now() call, and its only two
+    // dependencies (recordQueueWakeupPhase, its own sibling here, and
+    // swProfileResolution.js's getFirstPositiveNumber) are both plain
+    // synchronous calls into already-extracted modules. Threaded
+    // getFirstPositiveNumber through as a new handler dep.
+    function recordQueueWakeupPhaseSamplesFromProgress(record = {}) {
+        if(!record || typeof record !== 'object') return
+
+        const queuedAt = getFirstPositiveNumber(record.queuedAt, record.createdAt)
+        const tabOpenedAt = getFirstPositiveNumber(record.tabOpenedAt, record.tabCreatedAt)
+        const claimAcceptedAt = getFirstPositiveNumber(record.claimAcceptedAt, record.contentOpenedAt)
+        const actionReadyAt = getFirstPositiveNumber(record.actionReadyAt)
+        const actionStartedAt = getFirstPositiveNumber(
+            record.blockAttemptedAt,
+            record.muteAttemptedAt,
+            record.unblockAttemptedAt,
+            record.unmuteAttemptedAt
+        )
+        const terminalAt = getFirstPositiveNumber(record.terminalAt, record.blockedAt, record.unblockedAt, record.updatedAt)
+        const slotReleasedAt = getFirstPositiveNumber(record.slotReleasedAt)
+
+        if(queuedAt && tabOpenedAt && tabOpenedAt >= queuedAt) {
+            recordQueueWakeupPhase('durableQueueToTabOpen', tabOpenedAt - queuedAt)
+        }
+        if(tabOpenedAt && claimAcceptedAt && claimAcceptedAt >= tabOpenedAt) {
+            recordQueueWakeupPhase('tabOpenToClaimAccepted', claimAcceptedAt - tabOpenedAt)
+        }
+        if(claimAcceptedAt && actionStartedAt && actionStartedAt >= claimAcceptedAt) {
+            recordQueueWakeupPhase('claimAcceptedToActionStart', actionStartedAt - claimAcceptedAt)
+        }
+        if(actionReadyAt && actionStartedAt && actionStartedAt >= actionReadyAt) {
+            recordQueueWakeupPhase('actionReadyToActionStart', actionStartedAt - actionReadyAt)
+        }
+        if(actionStartedAt && terminalAt && terminalAt >= actionStartedAt) {
+            recordQueueWakeupPhase('actionStartToTerminal', terminalAt - actionStartedAt)
+        }
+        if(terminalAt && slotReleasedAt && slotReleasedAt >= terminalAt) {
+            recordQueueWakeupPhase('terminalToSlotRelease', slotReleasedAt - terminalAt)
+        }
+    }
+
     function recordQueueWakeupMetricMax(name = '', value = 0) {
         const key = `${name || ''}`.trim()
         const number = Number(value) || 0
@@ -821,6 +868,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
         incrementQueueWakeupMetric,
         getQueueWakeupMetricCounter,
         recordQueueWakeupPhase,
+        recordQueueWakeupPhaseSamplesFromProgress,
         recordQueueWakeupMetricMax,
         incrementActiveStorageMetricDetail,
         setActiveStorageMetricDetail,
