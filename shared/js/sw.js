@@ -10830,14 +10830,29 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
 // declarations are visible throughout their enclosing scope regardless of
 // textual position, so no thunk is needed, but it's still threaded through
 // as a handler dep rather than called as a bare global.
+//
+// shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure joined this
+// module in decomposition Slice 43 (mop-up of remaining isolated singles).
+// isQueuedAuthorityNoSurfaceRetryBudgetExhausted (swQueuedTabRuntimeStatus.js),
+// isCoordinatorQueueAuthoritativeItem (swCoordinatorStatusRules.js), and
+// getQueueLoadThrottle (swQueueWakeupMetricsShape.js) are all already bare
+// consts by this point, so no thunk is needed for any of them; `now` is
+// threaded through per the clock note (this function reads Date.now()).
 const executorEnqueueFailureClassification = createExecutorEnqueueFailureClassification({
+    now: () => Date.now(),
+    constants: {
+        QUEUE_LOAD_THROTTLE_MAX_MS
+    },
     handlers: {
         queueRuntime,
         getDurablyActiveQueuedTabCount,
         getSchedulerBlockingQueuedExecutorCount,
         getQueuedProfileOpenReservationCount,
         getEffectiveQueuedTabConcurrency,
-        normalizeTabId
+        normalizeTabId,
+        isQueuedAuthorityNoSurfaceRetryBudgetExhausted,
+        isCoordinatorQueueAuthoritativeItem,
+        getQueueLoadThrottle
     }
 })
 const {
@@ -10853,7 +10868,8 @@ const {
     normalizeQueuedAuthorityEnqueueMaterializationReasonForRow,
     getQueuedAuthorityEnqueueMaterializationReason,
     hasBlockingRuntimeSurfaceAfterEnqueueFailure,
-    shouldRecoverLiveSurfaceAfterFinalOpenDecline
+    shouldRecoverLiveSurfaceAfterFinalOpenDecline,
+    shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure
 } = executorEnqueueFailureClassification
 
 async function recoverQueuedAuthorityLiveTabAfterMaterializationFailure(item = null, itemKey = '', record = null, options = {}) {
@@ -11070,31 +11086,6 @@ async function recoverQueuedActionLiveTabAfterFinalOpenDecline(action = {}, deci
         }
     }
     return recovery || {changed: false, unresolved: false, reason: 'final-open-live-recovery-no-live-tab'}
-}
-
-function shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure(item = null, options = {}) {
-    if(options.retryBeforeTerminal !== true) return false
-    if(!item || `${item.status || ''}`.trim() !== 'queued') return false
-    if(!isQueuedAuthorityNoSurfaceRetryBudgetExhausted(item, options.record || null)) return false
-    if(!isCoordinatorQueueAuthoritativeItem(item)) return false
-    if(options.queueOnlyAuthority !== true &&
-        options.serviceWorkerOwned !== true &&
-        item?.serviceWorkerOwned !== true &&
-        item?.executorOwner !== 'service-worker') {
-        return false
-    }
-    if(normalizeTabId(item?.tabId || item?.activeTabId || null)) return false
-    if((Number.parseInt(item?.activeAt, 10) || 0) > 0) return false
-
-    const throttle = getQueueLoadThrottle()
-    const pressureReason = `${throttle?.reason || ''}`.trim()
-    const pressurePattern = /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i
-    if(throttle?.active === true && pressurePattern.test(pressureReason)) return true
-
-    const lastPressureAt = Number.parseInt(throttle?.lastPressureAt, 10) || 0
-    return lastPressureAt > 0 &&
-        Date.now() - lastPressureAt <= QUEUE_LOAD_THROTTLE_MAX_MS &&
-        pressurePattern.test(pressureReason)
 }
 
 async function terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems(items = [], options = {}) {
