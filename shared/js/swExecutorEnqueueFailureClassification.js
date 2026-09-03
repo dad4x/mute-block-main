@@ -42,15 +42,39 @@
 // inside async orchestration functions that stay resident in sw.js), so
 // this module constructs in place at the cluster's old source-text
 // position, matching the Slice 19/22/24 precedent.
+//
+// shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure added in
+// decomposition Slice 43 (mop-up of remaining isolated singles): a natural
+// topical fit alongside shouldRecoverLiveSurfaceAfterFinalOpenDecline,
+// which it sits right next to in its old sw.js position (immediately before
+// the async terminalizeQueuedAuthorityEnqueueFailureCoordinatorItems that
+// is its one caller). No async/Promise-chain risk (grepped for `.then(`,
+// `.catch(`, `Promise.`, `async`, `setTimeout`, `void` -- none found). It
+// reads Date.now() directly, so a `now` clock dep is added for it (none of
+// the original thirteen needed one). Its other dependencies --
+// isQueuedAuthorityNoSurfaceRetryBudgetExhausted (swQueuedTabRuntimeStatus.js),
+// isCoordinatorQueueAuthoritativeItem (swCoordinatorStatusRules.js),
+// getQueueLoadThrottle (swQueueWakeupMetricsShape.js), and normalizeTabId
+// (already a handler dep of this module) -- are all already-constructed
+// bare consts by the time this module constructs in sw.js, so no thunk is
+// needed for any of them. QUEUE_LOAD_THROTTLE_MAX_MS is threaded through as
+// a new constant.
 
 function createExecutorEnqueueFailureClassification(deps = {}) {
+    const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
+    const {
+        QUEUE_LOAD_THROTTLE_MAX_MS
+    } = deps.constants || {}
     const {
         queueRuntime,
         getDurablyActiveQueuedTabCount,
         getSchedulerBlockingQueuedExecutorCount,
         getQueuedProfileOpenReservationCount,
         getEffectiveQueuedTabConcurrency,
-        normalizeTabId
+        normalizeTabId,
+        isQueuedAuthorityNoSurfaceRetryBudgetExhausted,
+        isCoordinatorQueueAuthoritativeItem,
+        getQueueLoadThrottle
     } = deps.handlers || {}
 
     function isQueuedExecutorCapacityConsumed(fillResult = {}) {
@@ -290,6 +314,31 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
             reason === 'stale-attempt-number'
     }
 
+    function shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure(item = null, options = {}) {
+        if(options.retryBeforeTerminal !== true) return false
+        if(!item || `${item.status || ''}`.trim() !== 'queued') return false
+        if(!isQueuedAuthorityNoSurfaceRetryBudgetExhausted(item, options.record || null)) return false
+        if(!isCoordinatorQueueAuthoritativeItem(item)) return false
+        if(options.queueOnlyAuthority !== true &&
+            options.serviceWorkerOwned !== true &&
+            item?.serviceWorkerOwned !== true &&
+            item?.executorOwner !== 'service-worker') {
+            return false
+        }
+        if(normalizeTabId(item?.tabId || item?.activeTabId || null)) return false
+        if((Number.parseInt(item?.activeAt, 10) || 0) > 0) return false
+
+        const throttle = getQueueLoadThrottle()
+        const pressureReason = `${throttle?.reason || ''}`.trim()
+        const pressurePattern = /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i
+        if(throttle?.active === true && pressurePattern.test(pressureReason)) return true
+
+        const lastPressureAt = Number.parseInt(throttle?.lastPressureAt, 10) || 0
+        return lastPressureAt > 0 &&
+            now() - lastPressureAt <= QUEUE_LOAD_THROTTLE_MAX_MS &&
+            pressurePattern.test(pressureReason)
+    }
+
     return {
         buildEnqueueFailureTerminalizationDiagnostics,
         getCoordinatorFailureClassification,
@@ -303,7 +352,8 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
         normalizeQueuedAuthorityEnqueueMaterializationReasonForRow,
         getQueuedAuthorityEnqueueMaterializationReason,
         hasBlockingRuntimeSurfaceAfterEnqueueFailure,
-        shouldRecoverLiveSurfaceAfterFinalOpenDecline
+        shouldRecoverLiveSurfaceAfterFinalOpenDecline,
+        shouldRecoverQueuedAuthorityEnqueueFailureUnderPressure
     }
 }
 
