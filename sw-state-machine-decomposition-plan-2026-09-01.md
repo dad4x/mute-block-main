@@ -3,17 +3,21 @@
 Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
-(async orchestration) has begun: Slice P2-1 is landed and independently
-verified (commits `25ae7d3`, `675bca8`), proving the decide/act splitting
-technique end-to-end on a real async orchestrator for the first time. The
-next 20 Part 2 target functions are identified (see "Next 20 Part 2
-targets" below); Slice P2-2 (mapping and beginning extraction of the
-~951-line `fillQueuedTabsOnce`, the largest remaining function) is defined
-and queued to execute next. See `git log --oneline` for the full commit
-list, starting at `3567f1c`, most recent `675bca8`. `shared/js/sw.js` is
-at 30,742 lines, down from 38,953 at the start of this effort (~21.1%
-reduction), with 45+ new modules landed (Part 2's work so far stays
-physically in `sw.js`, no new module yet).
+(async orchestration) is underway: Slice P2-1 (commits `25ae7d3`,
+`675bca8`) proved the decide/act splitting technique end-to-end; Slice
+P2-2 (commit `bdae45c`) extracted the first decide span from the
+~951-line `fillQueuedTabsOnce` (the largest remaining function) and left
+a detailed map of 9 remaining spans for follow-up slices (see "Slice
+P2-2" below -- next targets are its #1 `pausedState` gate and #6's two
+guard-clause pairs). See `git log --oneline` for the full commit list,
+starting at `3567f1c`, most recent `bdae45c`. `shared/js/sw.js` is at
+30,805 lines (up slightly from 30,742 -- the new decide function's
+signature/wrapper overhead outweighs the few lines saved so far; this is
+expected for a same-file restructuring and will reverse as more of the
+function's logic moves into named, reusable decide functions), down from
+38,953 at the start of this effort (~20.9% reduction from the original
+baseline). Part 2's work so
+far stays physically in `sw.js`, no new module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1052,26 +1056,86 @@ wrappers, skip unless a future read finds otherwise: `runCoordinatorReconcileTic
 (~5 lines), `applyCoordinatorQueueMachineEvent` (~4 lines, delegates
 entirely elsewhere).
 
-### Slice P2-2 -- map and begin extracting fillQueuedTabsOnce
+### Slice P2-2 -- map and begin extracting fillQueuedTabsOnce (done)
 
-Target #1 above. Unlike Part 1's mechanical moves, this requires reading
-the full ~951-line function first (the same Read-before-Move discipline
-P2-1 used) to find its decide/act boundaries -- nobody has done that read
-yet, so don't trust any assumed structure. Given the size, don't attempt
-the whole function in one slice: map the full function's decide/act shape
-(expect the P2-1 lesson to hold -- alternating segments, possibly several,
-with awaits potentially hiding inside apparent decision chains via
-diagnostic/metric side effects), then extract the single clearest and
-safest decide span first, verify thoroughly, commit, and report back a
-map of what remains (candidate spans with rough line ranges and any
-awaits-in-disguise already spotted) so the next slice can pick up without
-re-reading the whole function from scratch. Note: this function was
-touched by a correctness fix earlier this session (the
-`queuedTabFillOpeningActionKeys` sweep, near the end of the function,
-added after the main `while` loop) -- preserve that fix's behavior
-exactly, it is not up for restructuring in this slice unless the
-restructuring is proven behavior-preserving with the same rigor as the
-rest of the extraction.
+Completed (commit `bdae45c`; independently re-verified by reading the
+diff and running the test suite twice more). Found the function is
+messier than P2-1's target: not a clean alternating decide/act pattern,
+mostly a ~140-line prelude then a sequence of `await` I/O calls each
+followed by a small sync guard, then a giant `while` loop with awaits and
+sync decision fragments densely interleaved -- few spans over 10-15 lines
+are fully await-free. Extracted the single cleanest one:
+`decideQueueLoadThrottleGate(params)`, the queue-load-throttle early-return
+gate, byte-identical mechanical move (confirmed non-Promise side effects
+like `scheduleCoordinatorQueueResume` stay inside the decide function per
+the P2-1 precedent). Left the correctness-fix tail region
+(`queuedTabFillOpeningActionKeys` sweep) untouched as instructed.
+
+**Map of remaining decide/act spans, for whoever picks up the next slice**
+(line numbers as of the P2-2 read, before that slice's own edit shifted
+things by ~+32; re-grep before trusting any of these):
+
+1. **`pausedState` gate** (~29546-29569 pre-edit) -- `await metricStorageGet(...)`
+   then a pure sync check/return, structurally identical to what P2-2
+   already extracted. Safest next pick, do this one first.
+2. **Post-cleanup restore-actions block** (~29571-29612) -- mixed:
+   `await sweepStaleQueuedTabs`, `await pruneQueuedTabActions`, sync
+   `pruneDuplicateQueuedTabActions`, then a conditionally-awaited
+   `loadCoordinatorCurrentAuthorityState()` feeding a sync filter and
+   restore call. Awaits interleaved with decisions that depend on their
+   results before more awaits -- not a clean single extraction.
+3. **`slotDecision` outcome handling** (~29658-29718, inside the `while`
+   loop, right after `await applyCoordinatorQueueMachineEvent(...)`) --
+   fully sync given `slotDecision` as data, but 5 exit shapes
+   (return/break/continue×2/proceed) and mutates outer `fillFailureReason`.
+   Good target for the P2-1-style discriminated-object pattern (the shell
+   translates `outcome` into the right control-flow verb), but more
+   design surface than #1 -- do after #1 and #6.
+4. **`finalOpenDecision` reject-path branching** (~29755-29879) -- heavily
+   interleaved: sync `pushQueueWakeupJournalEntry` immediately followed by
+   `await recoverQueuedActionLiveTabAfterFinalOpenDecline(...).catch(...)`,
+   then multiple sync sub-branches (`adopted`/`unresolved`/`stale-attempt`/
+   `authorityUnavailable`), each with its own scheduling calls. Individual
+   sub-branch bodies (e.g. the `stale-attempt` prune branch, ~29816-29844)
+   are internally pure sync and extractable one at a time -- needs
+   per-branch extraction, not one block.
+5. **Pre-open recovery/capacity/pause checks** (~29882-30009) -- three
+   more `await X().catch(...)` calls each followed by a small sync
+   decision (`adopted`/`deferred` checks, capacity comparison,
+   `isCoordinatorPausedInStorage` check). Same alternating pattern as #4,
+   per-branch candidates.
+6. **Activation guard / reservation claim** (~30011-30058) --
+   `claimQueuedActivationGuard` (sync) → guard-failure branch (sync,
+   schedule+break) is a small clean decide candidate; then
+   `reserveQueuedProfileOpen` (sync) → reservation-failure branch (sync)
+   is another. Both self-contained, similar size/shape to #1 -- good
+   quick wins, do alongside #1.
+7. **Tab-create try/catch** (~30059-30219) -- the actual
+   `await createOwnedTab(...)` I/O plus a recovery-retry loop with
+   `await getLiveProfileTabsByHref()` and `await new Promise(setTimeout)`
+   inside. Genuinely await-heavy, low priority for decide extraction,
+   mostly "act."
+8. **Post-open confirm/rollback chain** (~30220-30386) --
+   `await getQueuedExecutorTabStatusWithTimeout`,
+   `await rollbackFailedQueuedTabOpen`,
+   `await confirmQueuedTabOpenDurableActiveEffect`,
+   `await recordCoordinatorJobProgressViaQueueMachine`, interleaved with
+   sync plan-building (`buildQueuedTabOpenEffectPlan`,
+   `buildQueuedTabOpenedProgressPatch`, both already Part-1-extracted) and
+   two large `returnAfterDurableActive` branches. Dense; would need
+   sub-span-by-sub-span treatment, not a single extraction. No
+   awaits-in-disguise spotted beyond the obvious ones.
+9. **Tail region (~30399-30463, the `queuedTabFillOpeningActionKeys`
+   sweep + final summary)** -- fully sync, no awaits, but this is the
+   explicit correctness-fix region prior slices were told not to touch.
+   A future slice could extract it faithfully if it independently
+   re-verifies the fix's behavior with the same rigor as new logic.
+
+Best next targets, in order of safety: #1, then #6's two guard-clause
+pairs, then #3 (needs the discriminated-object pattern). Once those land,
+`fillQueuedTabsOnce` will likely need 1-2 more slices for #4/#5's
+per-branch extractions before it's meaningfully thinned out; #7/#8 may
+stay mostly as-is long-term since they're genuinely I/O-dominated.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
