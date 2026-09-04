@@ -5,12 +5,15 @@ Date: 2026-09-01
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 (async orchestration) has begun: Slice P2-1 is landed and independently
 verified (commits `25ae7d3`, `675bca8`), proving the decide/act splitting
-technique end-to-end on a real async orchestrator for the first time. See
-`git log --oneline` for the full commit list, starting at `3567f1c`, most
-recent `675bca8`. `shared/js/sw.js` is at 30,742 lines, down from 38,953
-at the start of this effort (~21.1% reduction), with 45+ new modules
-landed (Part 2's work so far stays physically in `sw.js`, no new module
-yet).
+technique end-to-end on a real async orchestrator for the first time. The
+next 20 Part 2 target functions are identified (see "Next 20 Part 2
+targets" below); Slice P2-2 (mapping and beginning extraction of the
+~951-line `fillQueuedTabsOnce`, the largest remaining function) is defined
+and queued to execute next. See `git log --oneline` for the full commit
+list, starting at `3567f1c`, most recent `675bca8`. `shared/js/sw.js` is
+at 30,742 lines, down from 38,953 at the start of this effort (~21.1%
+reduction), with 45+ new modules landed (Part 2's work so far stays
+physically in `sw.js`, no new module yet).
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1004,6 +1007,71 @@ on a real function before deciding whether/how to eventually move such
 functions into their own module (which would still need the same
 realm-crossing scrutiny as any Part 1 slice, since these decide functions
 would then be called across a module boundary from the async shell).
+
+### Next 20 Part 2 targets (function-level priority list, 2026-09)
+
+Surveyed the remaining 298 `async` functions by line count rather than
+just external-ref count -- several high-ref functions
+(`applyCoordinatorQueueMachineEvent` at 69 refs, notably) turned out to be
+thin wrappers delegating into already-extracted dispatcher modules
+(`swQueueMachineDispatcher.js`/`swQueueMachineHandlers.js`), not real Part
+2 targets. The actual decide/act debt is concentrated in a handful of
+large functions. Ordered by size/centrality (line numbers as of this
+survey, re-verify before executing -- each of the largest four is
+expected to need multiple slices on its own, the Part 2 equivalent of
+Part 1's oversized-cluster splits):
+
+1. **`fillQueuedTabsOnce`** (~951 lines, currently line 29515) -- by far
+   the largest remaining function in the file. Expect 3-4 slices.
+2. **`confirmQueuedTabOpenDurableActiveEffect`** (~386 lines, ~29129).
+   Expect 2 slices.
+3. **`runCoordinatorQueueExecutorFastPath`** (~302 lines, ~18627). Expect
+   2 slices.
+4. `resumeCoordinatorQueueExecutionOnce` (~275 lines, ~17646).
+5. `sweepStaleQueuedTabs` (~227 lines, ~26058).
+6. `releaseQueuedTab` (~214 lines, ~26524).
+7. `adoptLiveCoordinatorQueuedTab` (~204 lines, ~13146).
+8. `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (~176 lines, ~13670).
+9. `ensureQueuedTabContentScript` (~159 lines, ~23915).
+10. `fillQueuedTabs` (~160 lines, ~28969) -- the outer wrapper around
+    #1; likely thin but check for its own decide content.
+11. `kickCoordinatorQueueResume` (~160 lines, ~17258).
+12. `pruneQueuedTabActions` (~108 lines, ~25691).
+13. `rollbackFailedQueuedTabOpen` (~92 lines, ~12623).
+14. `planQueuedTabExecutorAction` (~43 lines, ~9966) -- short, but the
+    name suggests real decision content; verify rather than assume
+    trivial from size alone.
+15. `getQueuedExecutorTabStatusWithTimeout` (~51 lines, ~2724).
+
+Deprioritized -- confirmed short enough at survey time to likely be thin
+wrappers, skip unless a future read finds otherwise: `runCoordinatorReconcileTick`
+(~24 lines), `recordCoordinatorJobProgressViaQueueMachine` (~26 lines),
+`nudgeQueuedTabActionClaimWithRetries` (~27 lines),
+`releaseQueuedTabAndCleanup` (~15 lines), `createOwnedTab` (~30 lines),
+`confirmQueuedTabDurablyActive` (~41 lines), `getQueuedExecutorTabWithTimeout`
+(~5 lines), `applyCoordinatorQueueMachineEvent` (~4 lines, delegates
+entirely elsewhere).
+
+### Slice P2-2 -- map and begin extracting fillQueuedTabsOnce
+
+Target #1 above. Unlike Part 1's mechanical moves, this requires reading
+the full ~951-line function first (the same Read-before-Move discipline
+P2-1 used) to find its decide/act boundaries -- nobody has done that read
+yet, so don't trust any assumed structure. Given the size, don't attempt
+the whole function in one slice: map the full function's decide/act shape
+(expect the P2-1 lesson to hold -- alternating segments, possibly several,
+with awaits potentially hiding inside apparent decision chains via
+diagnostic/metric side effects), then extract the single clearest and
+safest decide span first, verify thoroughly, commit, and report back a
+map of what remains (candidate spans with rough line ranges and any
+awaits-in-disguise already spotted) so the next slice can pick up without
+re-reading the whole function from scratch. Note: this function was
+touched by a correctness fix earlier this session (the
+`queuedTabFillOpeningActionKeys` sweep, near the end of the function,
+added after the main `while` loop) -- preserve that fix's behavior
+exactly, it is not up for restructuring in this slice unless the
+restructuring is proven behavior-preserving with the same rigor as the
+rest of the extraction.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
