@@ -2168,7 +2168,7 @@ test('queued tab release kicks durable stored work even after service worker sle
     assert.match(fillBody, /await sweepProfileTabsWithoutActiveQueueAuthority\(\{[\s\S]*queueOnlyAuthority: options\.queueOnlyAuthority === true/)
     assert.ok(
         fillBody.indexOf('sweepProfileTabsWithoutActiveQueueAuthority({') <
-        fillBody.indexOf('if(throttle.active && queueRuntime.getActivationIntentCount()')
+        fillBody.indexOf('decideQueueLoadThrottleGate({throttle, cycle, now: Date.now()})')
     )
     assert.match(applyBody, /let liveProfileTabsByHref = await getLiveProfileTabsByHref\(\)/)
     assert.match(applyBody, /sweepProfileTabsWithoutActiveQueueAuthority\(\{[\s\S]*currentAuthorityState,[\s\S]*liveProfileTabsByHref/)
@@ -4831,7 +4831,12 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     assert.ok(createIndex < boundedCreateIndex)
     assert.ok(createIndex < openFailureIndex)
     assert.match(fillBody, /const getCapacityUsed = \(\) => Math\.max\([\s\S]*queueRuntime\.getActiveQueuedTabCount\(\),[\s\S]*getSchedulerBlockingQueuedExecutorCount\(\)[\s\S]*\) \+[\s\S]*getQueuedProfileOpenReservationCount\(\) \+[\s\S]*openedTabs/)
-    assert.match(fillBody, /throttle\.active && queueRuntime\.getActivationIntentCount\(\) && getSchedulerBlockingQueuedExecutorCount\(\) >= 1/)
+    // The queue-load-throttle gate check was extracted to decideQueueLoadThrottleGate
+    // in decomposition Slice P2-2 (Part 2 decide/act splitting), called from fillBody
+    // rather than inlined there.
+    const throttleGateBody = extractFunction(source, 'function decideQueueLoadThrottleGate(params = {})')
+    assert.match(throttleGateBody, /throttle\.active && queueRuntime\.getActivationIntentCount\(\) && getSchedulerBlockingQueuedExecutorCount\(\) >= 1/)
+    assert.match(fillBody, /decideQueueLoadThrottleGate\(\{throttle, cycle, now: Date\.now\(\)\}\)/)
     assert.match(fillBody, /while\(getCapacityUsed\(\) < getEffectiveQueuedTabConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
     assert.match(fillBody, /queueRuntime\.requeueActivationIntent/)
     assert.match(fillBody, /scheduleQueuedWorkContinuation\('queued-tab-open-failed'\)/)
