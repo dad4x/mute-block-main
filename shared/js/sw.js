@@ -29512,6 +29512,38 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
     }
 }
 
+function decideQueueLoadThrottleGate(params = {}) {
+    const {throttle, cycle, now} = params
+    if(!(throttle.active && queueRuntime.getActivationIntentCount() && getSchedulerBlockingQueuedExecutorCount() >= 1)) {
+        return null
+    }
+    const delayMs = Math.max(1000, throttle.until - now)
+    scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle')
+    incrementQueueWakeupMetric('pump.noop.throttled')
+    finishQueueWakeupMetricCycle(cycle, 'no-op', 'queue-load-throttled', {
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        retryInMs: delayMs,
+        throttleLevel: throttle.level,
+        reason: throttle.reason
+    })
+    recordFlightRecorderEvent({
+        kind: 'fill-decision',
+        source: 'fillQueuedTabsOnce',
+        reason: 'queue-load-throttled',
+        accepted: false,
+        changed: false
+    })
+    return {
+        openedTabs: 0,
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        remainingActions: queueRuntime.getActivationIntentCount(),
+        reason: 'queue-load-throttled',
+        throttled: true
+    }
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -29615,33 +29647,8 @@ async function fillQueuedTabsOnce(options = {}) {
         queueOnlyAuthority: options.queueOnlyAuthority === true
     })
 
-    if(throttle.active && queueRuntime.getActivationIntentCount() && getSchedulerBlockingQueuedExecutorCount() >= 1) {
-        const delayMs = Math.max(1000, throttle.until - Date.now())
-        scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle')
-        incrementQueueWakeupMetric('pump.noop.throttled')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'queue-load-throttled', {
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            retryInMs: delayMs,
-            throttleLevel: throttle.level,
-            reason: throttle.reason
-        })
-        recordFlightRecorderEvent({
-            kind: 'fill-decision',
-            source: 'fillQueuedTabsOnce',
-            reason: 'queue-load-throttled',
-            accepted: false,
-            changed: false
-        })
-        return {
-            openedTabs: 0,
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount(),
-            reason: 'queue-load-throttled',
-            throttled: true
-        }
-    }
+    const throttleGateResult = decideQueueLoadThrottleGate({throttle, cycle, now: Date.now()})
+    if(throttleGateResult) return throttleGateResult
 
     if(queueRuntime.getActiveQueuedTabCount() <= 0 && queueRuntime.getPendingTabActionCount() <= 0) {
         clearDetachedQueuedProfileOpenReservations('fill-start-detached-reservation-clear')
