@@ -1137,6 +1137,52 @@ pairs, then #3 (needs the discriminated-object pattern). Once those land,
 per-branch extractions before it's meaningfully thinned out; #7/#8 may
 stay mostly as-is long-term since they're genuinely I/O-dominated.
 
+### Slice P2-3 -- pausedState gate + activation-guard/reservation-claim pair
+
+Targets map regions #1 and #6 from Slice P2-2's map above. Re-grep for
+current line numbers before trusting the ones in the map (they're already
+known to have shifted by ~+32 after P2-2's own edit, and will have moved
+again).
+
+**#1, `pausedState` gate:** structurally near-identical to
+`decideQueueLoadThrottleGate` (the P2-2 precedent) -- `await metricStorageGet(...)`
+followed by a pure sync check/early-return. Extract the sync part the
+same way: a standalone `decidePausedStateGate(params)`-style function
+(name your own, follow the established naming pattern), called after the
+`await`, same discriminated null-or-result-object shape P2-2 used.
+
+**#6, activation-guard / reservation-claim pair:** two small,
+self-contained, back-to-back guard clauses inside the `while` loop:
+`claimQueuedActivationGuard` (sync) → guard-failure branch (sync,
+schedules something + `break`s the loop), then `reserveQueuedProfileOpen`
+(sync) → reservation-failure branch (sync). Read both fully before
+extracting -- confirm each guard-failure branch is genuinely await-free
+(P2-2's report said so from its read, but re-verify yourself, don't take
+a prior slice's report as ground truth without checking). These sit
+inside a `while` loop with `continue`/`break` control flow and mutate
+loop-scoped variables (e.g. `fillFailureReason`), so the same
+discriminated-object return pattern as P2-1/P2-2 applies: the decide
+function returns an outcome, the loop body translates it into the right
+verb (`break`/`continue`/proceed). Two separate small functions (one per
+guard), not one combined function, unless reading them shows they're
+more entangled with each other than the map suggested.
+
+As with every Part 2 slice: read the current code fresh rather than
+trusting old line numbers or prior slices' characterizations, verify
+behavior preservation by tracing any relevant test in
+`test/swSynthetic.test.js` before running the suite, run the full suite
+at least twice given this is still real logic restructuring, and update
+`test/p1-contract.test.js` source-text assertions precisely if the
+extraction breaks any (P2-2 had to fix two). Commit each extraction
+separately if that keeps things independently bisectable, or together if
+they turn out simple and low-risk enough -- your call once you've read
+the actual code.
+
+After this slice, report a refreshed version of the remaining-span map
+(regions #2-#5, #7-#9) with current line numbers, since two more regions
+will have been consumed and everything after them will have shifted
+again.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
