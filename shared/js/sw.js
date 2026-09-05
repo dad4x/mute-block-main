@@ -29691,6 +29691,105 @@ function decideSlotOutcome(params = {}) {
     return {outcome: 'proceed', next, activationGuardKey: '', openingActionKey: ''}
 }
 
+function decideFinalOpenRecoveryOutcome(params = {}) {
+    const {next, finalOpenDecision, finalOpenRecovery} = params
+    if(finalOpenRecovery?.adopted === true) {
+        const fillFailureReason = finalOpenRecovery.reason || 'queued-live-tab-adopted-after-final-open-decline'
+        incrementQueueWakeupMetric('pump.changed.adoptedLiveTabAfterFinalOpenDecline')
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-final-open-recovery',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            tabId: finalOpenRecovery.tabId || null,
+            accepted: true,
+            changed: true,
+            reason: fillFailureReason
+        })
+        return {outcome: 'continue', recoveredLiveTab: true, fillFailureReason}
+    }
+    if(finalOpenRecovery?.unresolved === true) {
+        const recoveryReason = finalOpenRecovery.reason || 'queued-authority-live-profile-tab-unclassified'
+        const fillFailureReason = recoveryReason
+        const fillFailureError = finalOpenRecovery.error || finalOpenDecision.error || ''
+        incrementQueueWakeupMetric('pump.noop.finalOpenLiveTabUnclassified')
+        scheduleCoordinatorQueueResume(1000, recoveryReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: recoveryReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        return {outcome: 'break', fillFailureReason, fillFailureError}
+    }
+    if(finalOpenDecision.reason === 'stale-attempt' ||
+        finalOpenDecision.reason === 'stale-attempt-number') {
+        const pruneReason = 'queued-tab-stale-action-pruned'
+        const fillFailureReason = pruneReason
+        incrementQueueWakeupMetric('pump.changed.prunedStaleAttemptQueuedAction')
+        incrementQueueWakeupMetric('pump.changed.droppedAuthorityStaleQueuedAction')
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-action-pruned',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            accepted: false,
+            changed: true,
+            reason: finalOpenDecision.reason || 'stale-attempt'
+        })
+        scheduleCoordinatorQueueResume(1000, pruneReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: pruneReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        return {outcome: 'continue', fillFailureReason, prunedStaleAttempt: true}
+    }
+    if(finalOpenDecision.authorityUnavailable === true) {
+        const retryReason = finalOpenDecision.reason || 'queued-tab-final-open-authority-unavailable'
+        const actionKey = getQueuedTabActionKey(
+            next.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+            next.profileHref || next.coordinatorKey || next.url || '',
+            next.tabAction || ''
+        )
+        const alreadyQueued = actionKey && queueRuntime.someActivationIntent(action => {
+            const candidateSubject = action.profileHref || action.coordinatorKey || action.url || ''
+            return getQueuedTabActionKey(
+                action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+                candidateSubject,
+                action.tabAction || ''
+            ) === actionKey
+        })
+        if(!alreadyQueued) {
+            queueRuntime.requeueActivationIntent(next, {
+                source: 'runtime-effect'
+            })
+            incrementQueueWakeupMetric('pump.changed.requeuedFinalOpenAuthorityUnavailable')
+        }
+        scheduleCoordinatorQueueResume(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, retryReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS + 1000, {
+            reason: retryReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        const fillFailureReason = retryReason
+        const fillFailureError = finalOpenDecision.error || ''
+        return {outcome: 'break', fillFailureReason, fillFailureError}
+    }
+    return {outcome: 'continue'}
+}
+
 function decidePreOpenRecoveryOutcome(params = {}) {
     const {next, preOpenRecovery} = params
     if(preOpenRecovery?.adopted === true) {
@@ -29989,100 +30088,20 @@ async function fillQueuedTabsOnce(options = {}) {
                     reason: 'final-open-live-recovery-error',
                     error: error?.message || `${error || ''}`
                 }))
-                if(finalOpenRecovery?.adopted === true) {
-                    recoveredLiveTabs += 1
-                    fillFailureReason = finalOpenRecovery.reason || 'queued-live-tab-adopted-after-final-open-decline'
-                    incrementQueueWakeupMetric('pump.changed.adoptedLiveTabAfterFinalOpenDecline')
-                    recordFlightRecorderEvent({
-                        kind: 'queued-tab-final-open-recovery',
-                        source: 'fillQueuedTabsOnce',
-                        rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                        targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                        attemptId: getAttemptIdFromValue(next),
-                        attemptNumber: getAttemptNumberFromValue(next),
-                        runId: next.runId || '',
-                        tabId: finalOpenRecovery.tabId || null,
-                        accepted: true,
-                        changed: true,
-                        reason: fillFailureReason
-                    })
+                const finalOpenRecoveryDecision = decideFinalOpenRecoveryOutcome({
+                    next,
+                    finalOpenDecision,
+                    finalOpenRecovery
+                })
+                if(finalOpenRecoveryDecision.outcome === 'continue') {
+                    if(finalOpenRecoveryDecision.recoveredLiveTab) recoveredLiveTabs += 1
+                    if(finalOpenRecoveryDecision.prunedStaleAttempt) prunedStaleAttemptActions += 1
+                    if(finalOpenRecoveryDecision.fillFailureReason) fillFailureReason = finalOpenRecoveryDecision.fillFailureReason
                     continue
                 }
-                if(finalOpenRecovery?.unresolved === true) {
-                    const recoveryReason = finalOpenRecovery.reason || 'queued-authority-live-profile-tab-unclassified'
-                    fillFailureReason = recoveryReason
-                    fillFailureError = finalOpenRecovery.error || finalOpenDecision.error || ''
-                    incrementQueueWakeupMetric('pump.noop.finalOpenLiveTabUnclassified')
-                    scheduleCoordinatorQueueResume(1000, recoveryReason, {
-                        allowBeforeQuora: true
-                    })
-                    scheduleCoordinatorReconcile(1000, {
-                        reason: recoveryReason,
-                        edgeTriggered: true,
-                        allowBeforeQuora: true
-                    })
-                    break
-                }
-                if(finalOpenDecision.reason === 'stale-attempt' ||
-                    finalOpenDecision.reason === 'stale-attempt-number') {
-                    const pruneReason = 'queued-tab-stale-action-pruned'
-                    fillFailureReason = pruneReason
-                    prunedStaleAttemptActions += 1
-                    incrementQueueWakeupMetric('pump.changed.prunedStaleAttemptQueuedAction')
-                    incrementQueueWakeupMetric('pump.changed.droppedAuthorityStaleQueuedAction')
-                    recordFlightRecorderEvent({
-                        kind: 'queued-tab-action-pruned',
-                        source: 'fillQueuedTabsOnce',
-                        rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                        targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                        attemptId: getAttemptIdFromValue(next),
-                        attemptNumber: getAttemptNumberFromValue(next),
-                        runId: next.runId || '',
-                        accepted: false,
-                        changed: true,
-                        reason: finalOpenDecision.reason || 'stale-attempt'
-                    })
-                    scheduleCoordinatorQueueResume(1000, pruneReason, {
-                        allowBeforeQuora: true
-                    })
-                    scheduleCoordinatorReconcile(1000, {
-                        reason: pruneReason,
-                        edgeTriggered: true,
-                        allowBeforeQuora: true
-                    })
-                    continue
-                }
-                if(finalOpenDecision.authorityUnavailable === true) {
-                    const retryReason = finalOpenDecision.reason || 'queued-tab-final-open-authority-unavailable'
-                    const actionKey = getQueuedTabActionKey(
-                        next.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-                        next.profileHref || next.coordinatorKey || next.url || '',
-                        next.tabAction || ''
-                    )
-                    const alreadyQueued = actionKey && queueRuntime.someActivationIntent(action => {
-                        const candidateSubject = action.profileHref || action.coordinatorKey || action.url || ''
-                        return getQueuedTabActionKey(
-                            action.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
-                            candidateSubject,
-                            action.tabAction || ''
-                        ) === actionKey
-                    })
-                    if(!alreadyQueued) {
-                        queueRuntime.requeueActivationIntent(next, {
-                            source: 'runtime-effect'
-                        })
-                        incrementQueueWakeupMetric('pump.changed.requeuedFinalOpenAuthorityUnavailable')
-                    }
-                    scheduleCoordinatorQueueResume(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, retryReason, {
-                        allowBeforeQuora: true
-                    })
-                    scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS + 1000, {
-                        reason: retryReason,
-                        edgeTriggered: true,
-                        allowBeforeQuora: true
-                    })
-                    fillFailureReason = retryReason
-                    fillFailureError = finalOpenDecision.error || ''
+                if(finalOpenRecoveryDecision.outcome === 'break') {
+                    fillFailureReason = finalOpenRecoveryDecision.fillFailureReason
+                    fillFailureError = finalOpenRecoveryDecision.fillFailureError
                     break
                 }
                 continue
