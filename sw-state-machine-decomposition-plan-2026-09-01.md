@@ -7,19 +7,20 @@ Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 of `fillQueuedTabsOnce` in sequence per an explicit request to finish the
 whole function: Slice P2-1 (commits `25ae7d3`, `675bca8`) proved the
 decide/act splitting technique on a different function; Slices P2-2
-through P2-5 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`) have
-extracted 8 decide spans across the first 5 of ~9 mapped regions of the
-~951-line `fillQueuedTabsOnce` (the largest remaining function), including
-two bare-`return` outcome cases. Slice P2-6 (region #4,
-`finalOpenDecision` reject-path branching) is defined and queued next,
-followed by regions #7, #8, #9. See `git log --oneline` for the full
-commit list, starting at `3567f1c`, most recent `851f4fe`. `shared/js/sw.js`
-is at 30,885 lines (fluctuating around the Part 1 baseline of 30,742 as
-Part 2's same-file restructuring trades inline code for named decide
-functions; expect this to trend down once more of `fillQueuedTabsOnce`
-consolidates), down from 38,953 at the start of this effort (~20.7%
-reduction from the original baseline). Part 2's work so far stays
-physically in `sw.js`, no new module yet.
+through P2-6 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
+`bf4ef17`) have extracted 9 decide spans across 6 of ~9 mapped regions of
+the ~951-line `fillQueuedTabsOnce` (the largest remaining function),
+including two bare-`return` outcome cases. Slice P2-7 (a targeted
+sub-span inside region #7's tab-create try/catch -- most of #7 is
+confirmed genuinely I/O-dominated and not extractable) is defined and
+queued next, followed by regions #8, #9. See `git log --oneline` for the
+full commit list, starting at `3567f1c`, most recent `bf4ef17`.
+`shared/js/sw.js` is at 30,904 lines (fluctuating around the Part 1
+baseline of 30,742 as Part 2's same-file restructuring trades inline code
+for named decide functions; expect this to trend down once more of
+`fillQueuedTabsOnce` consolidates), down from 38,953 at the start of this
+effort (~20.6% reduction from the original baseline). Part 2's work so
+far stays physically in `sw.js`, no new module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1374,7 +1375,17 @@ function, but only with the same independent re-verification rigor as
 new logic, confirming byte-for-byte behavior preservation, not assumed
 from its already-sync appearance.
 
-### Slice P2-6 -- finalOpenDecision reject-path branching (region #4)
+### Slice P2-6 -- finalOpenDecision reject-path branching (region #4) (done)
+
+Completed (commit `bf4ef17`; independently re-verified by hand-tracing
+all four branches plus the fallthrough against the diff, and running the
+test suite twice more). Correct in every branch. One harmless observation
+from the trace, not a blocker: the original code's trailing bare
+`continue` (the "none of the four cases matched" fallback) is now
+unreachable dead code, since `decideFinalOpenRecoveryOutcome` always
+returns `'continue'` or `'break'` and both are handled by the shell's own
+`if` blocks before that line is ever reached. No behavior change, just
+worth a follow-up cleanup pass whenever someone is back in this area.
 
 Confirmed by a fresh read (2026-09, current lines ~29951-30089; re-verify
 before executing) that region #4 is more layered than a single decide
@@ -1425,6 +1436,56 @@ Same rigor as every prior Part 2 slice: hand-trace relevant tests in
 `final-open`, `adoptedLiveTabAfterFinalOpenDecline`, or similar) before
 running the suite, run the full suite at least twice, re-grep all line
 numbers fresh.
+
+### Slice P2-7 -- post-open-failure recovery outcome (inside region #7)
+
+Confirmed by a fresh read (2026-09, current lines ~30165-30325; re-verify
+before executing) that region #7 as a whole is exactly as flagged --
+genuinely I/O-dominated, mostly "act" -- with one real exception worth
+extracting:
+
+- The `try { tab = await promiseWithTimeout(createOwnedTab(next), ...) }`
+  success path is a linear, unconditional sequence of sync side effects
+  (metric increments, `mergeActivationGuardTabInfo`, a flight-recorder
+  event) with no branching -- there's nothing to "decide" here, it's pure
+  action recording. Not worth extracting; leave inline.
+- The `catch(error) { ... }` block has a timed-out-tab recovery retry
+  loop (`await getLiveProfileTabsByHref()` + `await new Promise(setTimeout)`,
+  up to 6 iterations) that's genuinely await-heavy -- leave inline, no
+  extraction candidate here either.
+- **But** inside that same `catch` block's `else` branch (genuine open
+  failure, not recovered), after journaling the failure, there's a
+  **fourth** await: `const postOpenRecovery = await recoverQueuedRuntimeActionBeforeOpen(next, {...}).catch(...)`,
+  followed by a clean, fully synchronous decision (confirmed
+  independently: zero `await`/`.then(`/`.catch(` in the span right after
+  it): if `postOpenRecovery?.adopted === true` or
+  `postOpenRecovery?.reason === 'queued-runtime-action-already-has-runtime-surface'`
+  -> set reason, metric, `scheduleCoordinatorQueueResume`,
+  `scheduleQueuedWorkContinuation`, `break`; else -> a conditional
+  `queueRuntime.requeueActivationIntent(...)` gated on
+  `openFailureCount <= 3 && !queueRuntime.hasPausedQueuedOwner(next.ownerTabId)`,
+  then unconditional `scheduleCoordinatorQueueResume` +
+  `scheduleQueuedWorkContinuation` + `break` either way.
+
+This is the slice's only real target: extract this post-`postOpenRecovery`
+decision into a decide function (e.g. `decidePostOpenFailureRecoveryOutcome(params)`)
+taking `next`, `postOpenRecovery`, `openFailureCount`, `openFailure` as
+needed. Both branches end in `break` here (there's no `continue`/`return`
+case in this particular span, simpler than P2-4/P2-6's shape) -- a
+discriminated `{outcome: 'break', fillFailureReason}` covers it, or even
+just a single always-`break` return if that reads more cleanly given both
+paths break identically; use your judgment. `Date.now()` appears in this
+span too (`lastOpenFailureAt: Date.now()`) -- thread it as `now` per the
+clock note if you extract that far, or leave the requeue call's argument
+construction inline if splitting it awkwardly.
+
+If reading the actual code shows this is more entangled with the
+surrounding `catch` block's other state (`openFailureCount`, `openFailure`,
+`tab`) than described, extract only what's clearly safe and report the
+rest -- this is a legitimately smaller, more surgical slice than P2-4/
+P2-6, don't force additional scope onto it.
+
+Same verification rigor as every prior Part 2 slice.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
