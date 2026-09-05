@@ -1227,6 +1227,59 @@ Next best target: #3 (`slotDecision` outcome handling), per P2-2's
 original ordering -- fully sync given `slotDecision` as data, needs the
 discriminated-object pattern for its 5 exit shapes.
 
+### Slice P2-4 -- slotDecision outcome handling
+
+Targets map region #3. Confirmed by a fresh read (2026-09, current lines
+~29717-29782) rather than trusting the stale map -- re-verify line
+numbers again before executing, but the shape below is current as of this
+writing:
+
+Right after `const slotDecision = await applyCoordinatorQueueMachineEvent({...})`
+inside the `while` loop, there are six sequential checks against
+`slotDecision`, all synchronous (confirmed: zero `await`/`.then(`/`.catch(`
+in this exact span):
+
+1. `slotDecision?.paused === true` -> sets `fillFailureReason`, a metric,
+   a flight-recorder event, then a plain `return {...}` -- this one exits
+   the *entire async function*, not just the loop.
+2. `slotDecision?.planOnlyQueuedAuthorityPreserved === true` -> a metric,
+   then `break`.
+3. `slotDecision?.clearedStaleServiceWorkerOwnerPause === true` -> a
+   metric only, no exit -- falls through to check #4 next. (Easy to miss
+   this one since it doesn't exit; make sure the decide function models
+   "increment this metric AND keep evaluating" rather than treating it as
+   another discriminated branch.)
+4. `slotDecision?.canceledPausedOwner === true` -> `continue`.
+5. `slotDecision?.activationGuardInFlight === true` -> sets
+   `fillFailureReason`, a metric, a flight-recorder event, a
+   `scheduleCoordinatorQueueResume(500, ...)` call, then `continue`.
+6. `if(!next)` (where `next = slotDecision?.action || null`, computed
+   just before check 1) -> sets `fillFailureReason`, then `break`.
+
+If none trigger, execution falls into the `try { ... }` block that
+follows (out of scope for this slice -- that's region #4/#7/#8 territory).
+
+Extract this into a decide function (e.g. `decideSlotOutcome(params)`)
+returning a discriminated object with an outcome the loop body translates
+into the right verb: `{outcome: 'return', result}` for case 1,
+`{outcome: 'break', fillFailureReason?}` for cases 2 and 6,
+`{outcome: 'continue', fillFailureReason?}` for cases 4 and 5, and
+`{outcome: 'proceed', next, activationGuardKey: '', openingActionKey: ''}`
+if nothing triggers (note `next`, `activationGuardKey`, and
+`openingActionKey` are all declared/reset right in this span in the
+current code -- decide whether the decide function should just signal
+"proceed" and let the loop body keep doing that local `let` setup, or
+whether to fold it in; either is defensible, use your judgment after
+reading). Metric/flight-recorder/`scheduleCoordinatorQueueResume` calls
+all confirmed non-Promise-touching by prior slices' precedent -- keep
+them inside the decide function per the established convention. This is
+the first Part 2 span with a bare `return` (not just `break`/`continue`)
+as one of its outcomes -- handle that translation carefully in the loop
+body (`if(decision.outcome === 'return') return decision.result`), and
+give it the same scrutiny as P2-1's diagnostic-await discovery: read
+every line, don't assume the shape from this summary without confirming
+against the actual current code.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
