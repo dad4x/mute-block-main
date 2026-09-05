@@ -29691,6 +29691,131 @@ function decideSlotOutcome(params = {}) {
     return {outcome: 'proceed', next, activationGuardKey: '', openingActionKey: ''}
 }
 
+function decidePreOpenRecoveryOutcome(params = {}) {
+    const {next, preOpenRecovery} = params
+    if(preOpenRecovery?.adopted === true) {
+        const fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-before-open'
+        incrementQueueWakeupMetric('pump.changed.adoptedLiveTabBeforeDuplicateOpen')
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-pre-open-recovery',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            tabId: preOpenRecovery.tabId || null,
+            accepted: true,
+            changed: true,
+            reason: fillFailureReason
+        })
+        return {outcome: 'continue', recoveredLiveTab: true, fillFailureReason}
+    }
+    if(preOpenRecovery?.deferred === true) {
+        queueRuntime.requeueActivationIntent(next, {
+            source: 'runtime-effect'
+        })
+        const fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-needs-reconcile'
+        const fillFailureError = preOpenRecovery.error || ''
+        incrementQueueWakeupMetric('pump.noop.deferredDuplicateLiveTabBeforeOpen')
+        scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: fillFailureReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-pre-open-recovery',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            accepted: false,
+            changed: false,
+            reason: fillFailureReason
+        })
+        return {outcome: 'break', fillFailureReason, fillFailureError}
+    }
+    return {outcome: 'proceed'}
+}
+
+function decideLiveProfileTabCapacityGate(params = {}) {
+    const {next, liveProfileTabs, openedTabs} = params
+    if(queueRuntime.getActiveQueuedTabCount() <= 0 &&
+        queueRuntime.getPendingTabActionCount() <= 0 &&
+        liveProfileTabs <= 0) {
+        clearDetachedQueuedProfileOpenReservations('pre-open-detached-reservation-clear')
+    }
+    const openReservations = getQueuedProfileOpenReservationCount()
+    if(liveProfileTabs + openReservations + openedTabs >= getEffectiveQueuedTabConcurrency()) {
+        queueRuntime.requeueActivationIntent(next, {
+            source: 'runtime-effect'
+        })
+        const fillFailureReason = 'live-profile-tab-in-flight'
+        incrementQueueWakeupMetric('pump.noop.liveProfileTabInFlight')
+        scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+            allowBeforeQuora: true
+        })
+        scheduleCoordinatorReconcile(1000, {
+            reason: fillFailureReason,
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-open-decision',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            accepted: false,
+            changed: false,
+            reason: fillFailureReason,
+            liveProfileTabs,
+            queuedProfileOpenReservations: openReservations
+        })
+        return {outcome: 'break', fillFailureReason}
+    }
+    return {outcome: 'proceed'}
+}
+
+function decidePreOpenPausedGate(params = {}) {
+    const {next, cycle, isPaused} = params
+    if(!isPaused) return {outcome: 'proceed'}
+    queueRuntime.requeueActivationIntent(next, {
+        source: 'runtime-effect'
+    })
+    incrementQueueWakeupMetric('pump.noop.pausedBeforeOpen')
+    finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        remainingActions: queueRuntime.getActivationIntentCount()
+    })
+    recordFlightRecorderEvent({
+        kind: 'fill-decision',
+        source: 'fillQueuedTabsOnce',
+        reason: 'coordinator-paused',
+        accepted: false,
+        changed: false
+    })
+    return {
+        outcome: 'return',
+        result: {
+            openedTabs: 0,
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount(),
+            reason: 'coordinator-paused',
+            paused: true
+        }
+    }
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -29976,122 +30101,30 @@ async function fillQueuedTabsOnce(options = {}) {
                 reason: 'queued-runtime-action-pre-open-recovery-error',
                 error: error?.message || `${error || ''}`
             }))
-            if(preOpenRecovery?.adopted === true) {
-                recoveredLiveTabs += 1
-                fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-before-open'
-                incrementQueueWakeupMetric('pump.changed.adoptedLiveTabBeforeDuplicateOpen')
-                recordFlightRecorderEvent({
-                    kind: 'queued-tab-pre-open-recovery',
-                    source: 'fillQueuedTabsOnce',
-                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                    attemptId: getAttemptIdFromValue(next),
-                    attemptNumber: getAttemptNumberFromValue(next),
-                    runId: next.runId || '',
-                    tabId: preOpenRecovery.tabId || null,
-                    accepted: true,
-                    changed: true,
-                    reason: fillFailureReason
-                })
+            const preOpenRecoveryDecision = decidePreOpenRecoveryOutcome({next, preOpenRecovery})
+            if(preOpenRecoveryDecision.outcome === 'continue') {
+                if(preOpenRecoveryDecision.recoveredLiveTab) recoveredLiveTabs += 1
+                fillFailureReason = preOpenRecoveryDecision.fillFailureReason
                 continue
             }
-            if(preOpenRecovery?.deferred === true) {
-                queueRuntime.requeueActivationIntent(next, {
-                    source: 'runtime-effect'
-                })
-                fillFailureReason = preOpenRecovery.reason || 'queued-runtime-action-live-tab-needs-reconcile'
-                fillFailureError = preOpenRecovery.error || ''
-                incrementQueueWakeupMetric('pump.noop.deferredDuplicateLiveTabBeforeOpen')
-                scheduleCoordinatorQueueResume(1000, fillFailureReason, {
-                    allowBeforeQuora: true
-                })
-                scheduleCoordinatorReconcile(1000, {
-                    reason: fillFailureReason,
-                    edgeTriggered: true,
-                    allowBeforeQuora: true
-                })
-                recordFlightRecorderEvent({
-                    kind: 'queued-tab-pre-open-recovery',
-                    source: 'fillQueuedTabsOnce',
-                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                    attemptId: getAttemptIdFromValue(next),
-                    attemptNumber: getAttemptNumberFromValue(next),
-                    runId: next.runId || '',
-                    accepted: false,
-                    changed: false,
-                    reason: fillFailureReason
-                })
+            if(preOpenRecoveryDecision.outcome === 'break') {
+                fillFailureReason = preOpenRecoveryDecision.fillFailureReason
+                fillFailureError = preOpenRecoveryDecision.fillFailureError
                 break
             }
 
             const liveProfileTabs = await getLiveQueuedWorkerSurfaceProfileTabCount(
                 next.profileHref || next.targetProfileHref || next.requestedUrl || next.url || ''
             )
-            if(queueRuntime.getActiveQueuedTabCount() <= 0 &&
-                queueRuntime.getPendingTabActionCount() <= 0 &&
-                liveProfileTabs <= 0) {
-                clearDetachedQueuedProfileOpenReservations('pre-open-detached-reservation-clear')
-            }
-            const openReservations = getQueuedProfileOpenReservationCount()
-            if(liveProfileTabs + openReservations + openedTabs >= getEffectiveQueuedTabConcurrency()) {
-                queueRuntime.requeueActivationIntent(next, {
-                    source: 'runtime-effect'
-                })
-                fillFailureReason = 'live-profile-tab-in-flight'
-                incrementQueueWakeupMetric('pump.noop.liveProfileTabInFlight')
-                scheduleCoordinatorQueueResume(1000, fillFailureReason, {
-                    allowBeforeQuora: true
-                })
-                scheduleCoordinatorReconcile(1000, {
-                    reason: fillFailureReason,
-                    edgeTriggered: true,
-                    allowBeforeQuora: true
-                })
-                recordFlightRecorderEvent({
-                    kind: 'queued-tab-open-decision',
-                    source: 'fillQueuedTabsOnce',
-                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                    attemptId: getAttemptIdFromValue(next),
-                    attemptNumber: getAttemptNumberFromValue(next),
-                    runId: next.runId || '',
-                    accepted: false,
-                    changed: false,
-                    reason: fillFailureReason,
-                    liveProfileTabs,
-                    queuedProfileOpenReservations: openReservations
-                })
+            const liveProfileTabCapacityDecision = decideLiveProfileTabCapacityGate({next, liveProfileTabs, openedTabs})
+            if(liveProfileTabCapacityDecision.outcome === 'break') {
+                fillFailureReason = liveProfileTabCapacityDecision.fillFailureReason
                 break
             }
 
-            if(await isCoordinatorPausedInStorage('queued-tab-pre-open-paused-check')) {
-                queueRuntime.requeueActivationIntent(next, {
-                    source: 'runtime-effect'
-                })
-                fillFailureReason = 'coordinator-paused'
-                incrementQueueWakeupMetric('pump.noop.pausedBeforeOpen')
-                finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
-                    active: queueRuntime.getActiveQueuedTabCount(),
-                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                    remainingActions: queueRuntime.getActivationIntentCount()
-                })
-                recordFlightRecorderEvent({
-                    kind: 'fill-decision',
-                    source: 'fillQueuedTabsOnce',
-                    reason: 'coordinator-paused',
-                    accepted: false,
-                    changed: false
-                })
-                return {
-                    openedTabs: 0,
-                    active: queueRuntime.getActiveQueuedTabCount(),
-                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                    remainingActions: queueRuntime.getActivationIntentCount(),
-                    reason: 'coordinator-paused',
-                    paused: true
-                }
-            }
+            const preOpenPaused = await isCoordinatorPausedInStorage('queued-tab-pre-open-paused-check')
+            const preOpenPausedDecision = decidePreOpenPausedGate({next, cycle, isPaused: preOpenPaused})
+            if(preOpenPausedDecision.outcome === 'return') return preOpenPausedDecision.result
 
             const activationGuardDecision = decideActivationGuardClaim({next})
             if(activationGuardDecision.outcome === 'break') {
