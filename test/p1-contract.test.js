@@ -3584,29 +3584,44 @@ test('queued tab release schedules next fill before derived release storage writ
 test('queued tab fill returns after durable active without awaiting opened progress', () => {
     const source = readRepoFile('shared/js/sw.js')
     const body = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
+    // The returnAfterDurableActive branch's fill-promise-clear bookkeeping,
+    // deferred progress save, content-script-ensure kickoff, and early
+    // return were extracted to decideReturnAfterDurableActiveOutcome in
+    // decomposition Slice P2-8 (Part 2 decide/act splitting), called from
+    // fillBody rather than inlined there.
+    const decisionBody = extractFunction(source, 'function decideReturnAfterDurableActiveOutcome(params = {})')
     const patchIndex = body.indexOf('const openedProgressPatch =')
     const returnAfterIndex = body.indexOf('if(options.returnAfterDurableActive === true)', patchIndex)
     const earlyEnsureIndex = body.indexOf('const earlyContentEnsurePromise = options.returnAfterDurableActive === true')
-    const deferredProgressIndex = body.indexOf('void recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})', returnAfterIndex)
-    const deferredCatchIndex = body.indexOf('queued-tab-opened-progress-deferred-failed', deferredProgressIndex)
-    const ensureIndex = body.indexOf('const contentEnsurePromise = earlyContentEnsurePromise || promiseWithTimeout', returnAfterIndex)
-    const durableReturnResumeIndex = body.indexOf("scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active'", returnAfterIndex)
-    const durableReturnIndex = body.indexOf('return {', durableReturnResumeIndex)
-    const awaitedProgressIndex = body.indexOf('await recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})', durableReturnIndex)
+    const decisionCallIndex = body.indexOf('decideReturnAfterDurableActiveOutcome({', returnAfterIndex)
+    const setClearRequestedIndex = body.indexOf('queuedTabFillPromiseClearRequested = true', decisionCallIndex)
+    const returnDecisionResultIndex = body.indexOf('return returnAfterDurableActiveDecision.result', decisionCallIndex)
+    const awaitedProgressIndex = body.indexOf('await recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})', returnDecisionResultIndex)
     const postTransitionConfirmIndex = body.indexOf('queued-tab-open-post-transition-confirm', awaitedProgressIndex)
+
+    const deferredProgressIndex = decisionBody.indexOf('void recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})')
+    const deferredCatchIndex = decisionBody.indexOf('queued-tab-opened-progress-deferred-failed', deferredProgressIndex)
+    const ensureIndex = decisionBody.indexOf('const contentEnsurePromise = earlyContentEnsurePromise || promiseWithTimeout', deferredProgressIndex)
+    const durableReturnResumeIndex = decisionBody.indexOf("scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active'")
+    const durableReturnIndex = decisionBody.indexOf('return {', durableReturnResumeIndex)
 
     assert.notEqual(patchIndex, -1)
     assert.match(body, /confirmQueuedTabOpenDurableActiveEffect\(next, tab, openPlan, \{[\s\S]*returnAfterDurableActive: options\.returnAfterDurableActive === true[\s\S]*\}\)/)
     assert.ok(earlyEnsureIndex > -1)
     assert.ok(earlyEnsureIndex < returnAfterIndex)
     assert.ok(returnAfterIndex > patchIndex)
-    assert.ok(deferredProgressIndex > returnAfterIndex)
+    assert.ok(decisionCallIndex > returnAfterIndex)
+    assert.ok(setClearRequestedIndex > decisionCallIndex)
+    assert.ok(returnDecisionResultIndex > setClearRequestedIndex)
+    assert.ok(awaitedProgressIndex > returnDecisionResultIndex)
+    assert.ok(postTransitionConfirmIndex > awaitedProgressIndex)
+
+    assert.notEqual(deferredProgressIndex, -1)
     assert.ok(deferredCatchIndex > deferredProgressIndex)
     assert.ok(ensureIndex > deferredProgressIndex)
     assert.ok(durableReturnResumeIndex > ensureIndex)
     assert.ok(durableReturnIndex > durableReturnResumeIndex)
-    assert.ok(awaitedProgressIndex > durableReturnIndex)
-    assert.ok(postTransitionConfirmIndex > awaitedProgressIndex)
+    assert.match(decisionBody, /if\(queuedTabFillPromise\) \{[\s\S]*resetQueuedTabFillState\(\)[\s\S]*\}\s*else \{[\s\S]*setClearRequested = true[\s\S]*\}/)
 })
 
 test('queued profile action claim is bounded and retried for stored work', () => {
