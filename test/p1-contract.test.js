@@ -4804,7 +4804,7 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     const terminalScheduleIndex = releaseBody.indexOf('scheduleReleaseContinuation()', terminalIndex)
     const rollbackIndex = releaseBody.indexOf('durableWrites.push(rollbackFailedQueuedTabOpen')
     const finalScheduleIndex = releaseBody.indexOf('scheduleReleaseContinuation()', durableIndex)
-    const pausedGateIndex = fillBody.indexOf('if(pausedState?.[COORDINATOR_PAUSED_KEY] === true)')
+    const pausedGateIndex = fillBody.indexOf('decidePausedStateGate({pausedState, cycle})')
     const createIndex = fillBody.indexOf('createOwnedTab(next)')
     const boundedCreateIndex = fillBody.indexOf("'queued owned tab create'")
     const openFailureIndex = fillBody.indexOf('openFailureCount')
@@ -4837,6 +4837,21 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     const throttleGateBody = extractFunction(source, 'function decideQueueLoadThrottleGate(params = {})')
     assert.match(throttleGateBody, /throttle\.active && queueRuntime\.getActivationIntentCount\(\) && getSchedulerBlockingQueuedExecutorCount\(\) >= 1/)
     assert.match(fillBody, /decideQueueLoadThrottleGate\(\{throttle, cycle, now: Date\.now\(\)\}\)/)
+    // The pausedState gate check was extracted to decidePausedStateGate in
+    // decomposition Slice P2-3 (Part 2 decide/act splitting), called from
+    // fillBody rather than inlined there.
+    const pausedGateBody = extractFunction(source, 'function decidePausedStateGate(params = {})')
+    assert.match(pausedGateBody, /pausedState\?\.\[COORDINATOR_PAUSED_KEY\] !== true/)
+    assert.match(fillBody, /decidePausedStateGate\(\{pausedState, cycle\}\)/)
+    // The activation-guard-claim and profile-open-reservation-claim guard
+    // pairs inside the fill loop were extracted to decideActivationGuardClaim
+    // and decideProfileOpenReservationClaim in the same slice.
+    const activationGuardClaimBody = extractFunction(source, 'function decideActivationGuardClaim(params = {})')
+    const profileOpenReservationClaimBody = extractFunction(source, 'function decideProfileOpenReservationClaim(params = {})')
+    assert.match(activationGuardClaimBody, /claimQueuedActivationGuard\(next, null, 'queued-tab-pre-open'\)/)
+    assert.match(profileOpenReservationClaimBody, /reserveQueuedProfileOpen\(next, 'queued-tab-create'\)/)
+    assert.match(fillBody, /decideActivationGuardClaim\(\{next\}\)/)
+    assert.match(fillBody, /decideProfileOpenReservationClaim\(\{next, openingActionKey\}\)/)
     assert.match(fillBody, /while\(getCapacityUsed\(\) < getEffectiveQueuedTabConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
     assert.match(fillBody, /queueRuntime\.requeueActivationIntent/)
     assert.match(fillBody, /scheduleQueuedWorkContinuation\('queued-tab-open-failed'\)/)
