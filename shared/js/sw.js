@@ -30026,6 +30026,75 @@ function decideReturnAfterDurableActiveOutcome(params = {}) {
     }
 }
 
+function decideFillQueuedTabsOnceOutcome(params = {}) {
+    const {openedTabs, recoveredLiveTabs, fillFailureReason, prunedStaleAttemptActions, fillFailureError, cycle} = params
+    for(const action of queueRuntime.listActivationIntents()) {
+        const untouchedKey = getQueuedRuntimeActionFillKey(action)
+        if(untouchedKey) queuedTabFillOpeningActionKeys.delete(untouchedKey)
+    }
+
+    if(openedTabs > 0 || recoveredLiveTabs > 0) {
+        if(openedTabs > 0) {
+            incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
+        }
+        const changedReason = openedTabs > 0
+            ? 'opened-tab'
+            : fillFailureReason || 'queued-live-tab-adopted-after-final-open-decline'
+        finishQueueWakeupMetricCycle(cycle, 'state-changed', changedReason, {
+            openedTabs,
+            recoveredLiveTabs,
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount()
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: changedReason,
+            accepted: true,
+            changed: true
+        })
+        return {
+            openedTabs,
+            recoveredLiveTabs,
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount(),
+            reason: changedReason
+        }
+    }
+    else {
+        incrementQueueWakeupMetric('pump.noop.noPendingItems')
+        const noOpenReason = fillFailureReason || (prunedStaleAttemptActions > 0
+            ? 'queued-tab-stale-action-pruned'
+            : 'no-tab-opened')
+        finishQueueWakeupMetricCycle(cycle, 'no-op', noOpenReason, {
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount(),
+            prunedStaleAttemptActions
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: noOpenReason,
+            accepted: false,
+            changed: prunedStaleAttemptActions > 0,
+            prunedStaleAttemptActions
+        })
+        return {
+            openedTabs: 0,
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount(),
+            reason: noOpenReason,
+            prunedStaleAttemptActions,
+            authorityUnavailable: /authority-unavailable|final-open-decision-timeout|queue-read-failed/.test(noOpenReason),
+            ...(fillFailureError ? {error: fillFailureError} : {})
+        }
+    }
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -30550,71 +30619,14 @@ async function fillQueuedTabsOnce(options = {}) {
         }
     }
 
-    for(const action of queueRuntime.listActivationIntents()) {
-        const untouchedKey = getQueuedRuntimeActionFillKey(action)
-        if(untouchedKey) queuedTabFillOpeningActionKeys.delete(untouchedKey)
-    }
-
-    if(openedTabs > 0 || recoveredLiveTabs > 0) {
-        if(openedTabs > 0) {
-            incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
-        }
-        const changedReason = openedTabs > 0
-            ? 'opened-tab'
-            : fillFailureReason || 'queued-live-tab-adopted-after-final-open-decline'
-        finishQueueWakeupMetricCycle(cycle, 'state-changed', changedReason, {
-            openedTabs,
-            recoveredLiveTabs,
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount()
-        })
-        recordFlightRecorderEvent({
-            kind: 'fill-decision',
-            source: 'fillQueuedTabsOnce',
-            reason: changedReason,
-            accepted: true,
-            changed: true
-        })
-        return {
-            openedTabs,
-            recoveredLiveTabs,
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount(),
-            reason: changedReason
-        }
-    }
-    else {
-        incrementQueueWakeupMetric('pump.noop.noPendingItems')
-        const noOpenReason = fillFailureReason || (prunedStaleAttemptActions > 0
-            ? 'queued-tab-stale-action-pruned'
-            : 'no-tab-opened')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', noOpenReason, {
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount(),
-            prunedStaleAttemptActions
-        })
-        recordFlightRecorderEvent({
-            kind: 'fill-decision',
-            source: 'fillQueuedTabsOnce',
-            reason: noOpenReason,
-            accepted: false,
-            changed: prunedStaleAttemptActions > 0,
-            prunedStaleAttemptActions
-        })
-        return {
-            openedTabs: 0,
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount(),
-            reason: noOpenReason,
-            prunedStaleAttemptActions,
-            authorityUnavailable: /authority-unavailable|final-open-decision-timeout|queue-read-failed/.test(noOpenReason),
-            ...(fillFailureError ? {error: fillFailureError} : {})
-        }
-    }
+    return decideFillQueuedTabsOnceOutcome({
+        openedTabs,
+        recoveredLiveTabs,
+        fillFailureReason,
+        prunedStaleAttemptActions,
+        fillFailureError,
+        cycle
+    })
 }
 
 async function terminalizeQueuedTabNonProfileLandingFromMetadata(tabId, expectedMetadata = {}, landingUrl = '') {
