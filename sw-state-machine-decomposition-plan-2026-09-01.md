@@ -7,19 +7,20 @@ Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 of `fillQueuedTabsOnce` in sequence per an explicit request to finish the
 whole function: Slice P2-1 (commits `25ae7d3`, `675bca8`) proved the
 decide/act splitting technique on a different function; Slices P2-2
-through P2-6 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
-`bf4ef17`) have extracted 9 decide spans across 6 of ~9 mapped regions of
-the ~951-line `fillQueuedTabsOnce` (the largest remaining function),
-including two bare-`return` outcome cases. Slice P2-7 (a targeted
-sub-span inside region #7's tab-create try/catch -- most of #7 is
-confirmed genuinely I/O-dominated and not extractable) is defined and
-queued next, followed by regions #8, #9. See `git log --oneline` for the
-full commit list, starting at `3567f1c`, most recent `bf4ef17`.
-`shared/js/sw.js` is at 30,904 lines (fluctuating around the Part 1
-baseline of 30,742 as Part 2's same-file restructuring trades inline code
-for named decide functions; expect this to trend down once more of
-`fillQueuedTabsOnce` consolidates), down from 38,953 at the start of this
-effort (~20.6% reduction from the original baseline). Part 2's work so
+through P2-7 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
+`bf4ef17`, `e3caa43`) have extracted 10 decide spans across 7 of ~9 mapped
+regions of the ~951-line `fillQueuedTabsOnce` (the largest remaining
+function), including two bare-`return` outcome cases. Slice P2-8 (region
+#8, the densest remaining span, flagged as open-ended -- extract what's
+genuinely safe, an honest "not much extractable here" is a fine outcome)
+is defined and queued next, followed by region #9. See
+`git log --oneline` for the full commit list, starting at `3567f1c`, most
+recent `e3caa43`. `shared/js/sw.js` is at 30,919 lines (fluctuating around
+the Part 1 baseline of 30,742 as Part 2's same-file restructuring trades
+inline code for named decide functions; expect this to trend down once
+more of `fillQueuedTabsOnce` consolidates), down from 38,953 at the start
+of this effort (~20.6% reduction from the original baseline). Part 2's
+work so
 far stays physically in `sw.js`, no new module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
@@ -1437,7 +1438,14 @@ Same rigor as every prior Part 2 slice: hand-trace relevant tests in
 running the suite, run the full suite at least twice, re-grep all line
 numbers fresh.
 
-### Slice P2-7 -- post-open-failure recovery outcome (inside region #7)
+### Slice P2-7 -- post-open-failure recovery outcome (inside region #7) (done)
+
+Completed (commit `e3caa43`; independently re-verified by hand-tracing
+both branches against the diff and running the test suite twice more).
+Confirmed correct, including a subtle detail: the fallback branch's
+`fillFailureReason` reassignment in the shell is redundant (the outer
+variable already held the same value from earlier in the catch block)
+but harmless since the value written matches exactly.
 
 Confirmed by a fresh read (2026-09, current lines ~30165-30325; re-verify
 before executing) that region #7 as a whole is exactly as flagged --
@@ -1486,6 +1494,61 @@ rest -- this is a legitimately smaller, more surgical slice than P2-4/
 P2-6, don't force additional scope onto it.
 
 Same verification rigor as every prior Part 2 slice.
+
+### Slice P2-8 -- post-open confirm/rollback chain (region #8)
+
+Confirmed by a fresh read (2026-09, current lines ~30341-30506; re-verify
+before executing) that region #8 is the densest remaining span in
+`fillQueuedTabsOnce` -- awaits and sync logic genuinely interleaved
+throughout, not a handful of clean sub-blocks like #5 turned out to be.
+Concretely: `await confirmQueuedTabOpenDurableActiveEffect(...)` ->
+tiny sync check (`releaseQueuedProfileOpenReservation` + `if(activeTransition.keepOpen !== true) continue`)
+-> sync `openedProgressPatch` build -> a large branch on
+`options.returnAfterDurableActive === true` containing several `void
+x().catch()`/`void x().then()` fire-and-forget chains, scheduling calls,
+and a bare `return {...}` (a **third** bare-return case) -- OR, if that
+option is false, a direct `await recordCoordinatorJobProgressViaQueueMachine(...)`,
+then `await getQueuedExecutorTabStatusWithTimeout(...)`, then a branch
+that (if the tab is missing) does `await rollbackFailedQueuedTabOpen(...).catch(...)`
+followed by more sync cleanup, or (if just slow/errored) a sync
+`setQueuedTabMetadata` + schedule call, then unconditionally sets up a
+content-script-ensure promise chain and profile-tab sweep calls.
+
+**Guaranteed small win, do this first:** the tiny sync check right after
+the first await (`releaseQueuedProfileOpenReservation` + reservation-href
+reset + `if(activeTransition.keepOpen !== true) continue`) -- confirm it's
+genuinely free of anything you'd need to extract further and pull it into
+its own small decide function if that reads cleanly, or leave it inline
+if it's small enough that extraction adds more noise than clarity; your
+judgment.
+
+**Beyond that, this slice is open-ended -- survey rather than assume.**
+Note a `void promiseReturningCall().catch(...)` fire-and-forget
+side effect *can* safely live inside a plain sync decide function even
+under the strict Part 2 discipline (constructing and not awaiting a
+Promise doesn't require an async caller -- this was already established
+safe back in Slice 27's `swQueuedTabReclaimResume.js` precedent), so
+don't rule out the `returnAfterDurableActive` branch purely because it
+contains `void`-fired calls; rule it out (or in) based on whether it's
+otherwise genuinely await-free and whether extracting something this
+large is actually worth the risk/complexity trade given its size. Look
+for other individually-clean sync spans after each of the remaining
+awaits (e.g. right after `getQueuedExecutorTabStatusWithTimeout` resolves,
+is the branch on `!confirmedOpenTabStatus.tab` -> `.missing` cleanly
+separable into "the part with a nested await" vs "the sync cleanup after
+that nested await resolves," the way P2-5 and P2-7 found clean sync
+tails after their own nested awaits?). Extract whatever is genuinely safe
+and report the rest with specific reasoning, the same way P2-7 correctly
+reported most of region #7 as not worth extracting. Forcing extractions
+onto a region this interleaved just to say it's "done" is explicitly not
+the goal -- an honest "here's what's safe and here's what isn't, and
+here's why" is a fully successful outcome for this slice.
+
+Same verification rigor as every prior Part 2 slice, with extra care
+given the density here: hand-trace relevant tests in
+`test/swSynthetic.test.js` for whatever you do extract, run the full
+suite at least twice (three times if you land more than 2-3 separate
+extractions, matching the elevated scrutiny given to P2-4/P2-6).
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
