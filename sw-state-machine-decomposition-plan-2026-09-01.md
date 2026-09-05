@@ -4,20 +4,19 @@ Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 (async orchestration) is underway: Slice P2-1 (commits `25ae7d3`,
-`675bca8`) proved the decide/act splitting technique end-to-end; Slice
-P2-2 (commit `bdae45c`) extracted the first decide span from the
-~951-line `fillQueuedTabsOnce` (the largest remaining function) and left
-a detailed map of 9 remaining spans for follow-up slices (see "Slice
-P2-2" below -- next targets are its #1 `pausedState` gate and #6's two
-guard-clause pairs). See `git log --oneline` for the full commit list,
-starting at `3567f1c`, most recent `bdae45c`. `shared/js/sw.js` is at
-30,805 lines (up slightly from 30,742 -- the new decide function's
-signature/wrapper overhead outweighs the few lines saved so far; this is
-expected for a same-file restructuring and will reverse as more of the
-function's logic moves into named, reusable decide functions), down from
-38,953 at the start of this effort (~20.9% reduction from the original
-baseline). Part 2's work so
-far stays physically in `sw.js`, no new module yet.
+`675bca8`) proved the decide/act splitting technique end-to-end; Slices
+P2-2 and P2-3 (commits `bdae45c`, `ad2f9d6`) have extracted 4 of the ~9
+mapped decide spans from the ~951-line `fillQueuedTabsOnce` (the largest
+remaining function) -- see "Slice P2-3" below for the refreshed remaining-
+span map, next target is #3 (`slotDecision` outcome handling). See
+`git log --oneline` for the full commit list, starting at `3567f1c`, most
+recent `ad2f9d6`. `shared/js/sw.js` is at 30,834 lines (fluctuating
+slightly around the Part 1 baseline of 30,742 as Part 2's same-file
+restructuring trades inline code for named decide functions; expect this
+to trend down once more of `fillQueuedTabsOnce` consolidates), down from
+38,953 at the start of this effort (~20.8% reduction from the original
+baseline). Part 2's work so far stays physically in `sw.js`, no new
+module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1137,7 +1136,32 @@ pairs, then #3 (needs the discriminated-object pattern). Once those land,
 per-branch extractions before it's meaningfully thinned out; #7/#8 may
 stay mostly as-is long-term since they're genuinely I/O-dominated.
 
-### Slice P2-3 -- pausedState gate + activation-guard/reservation-claim pair
+### Slice P2-3 -- pausedState gate + activation-guard/reservation-claim pair (done)
+
+Completed (commit `ad2f9d6`; independently re-verified by reading the
+full diff and running the test suite twice more). Extracted
+`decidePausedStateGate` (region #1, structurally identical to
+`decideQueueLoadThrottleGate`) and `decideActivationGuardClaim` /
+`decideProfileOpenReservationClaim` (region #6, kept as two functions --
+reading showed only sequential ordering, not real entanglement).
+
+**Subtlety found on independent re-review, not a blocker but worth
+flagging for future readers:** the extracted `decideProfileOpenReservationClaim`
+only returns `openReservationHref` on its `'proceed'` outcome; the
+function-scoped `openReservationHref` variable (declared once before the
+`while` loop, not reset per-iteration) is left untouched on the `'break'`
+outcome, whereas the original code unconditionally reassigned it every
+time regardless of success or failure. This is behaviorally equivalent
+only because every path that successfully reserves later releases and
+resets `openReservationHref` back to `''` before the loop could plausibly
+continue (four such release points exist in the function) -- so the
+invariant "`openReservationHref` is always `''` at the top of a loop
+iteration" holds today, but it's now an *implicit* invariant relying on
+those four release points instead of an *explicit* unconditional
+reassignment. Traced by hand and confirmed correct as of this commit;
+flagging here so a future change to any of those four release points (or
+a new `continue` path added to the loop) re-checks this invariant rather
+than assuming it still holds.
 
 Targets map regions #1 and #6 from Slice P2-2's map above. Re-grep for
 current line numbers before trusting the ones in the map (they're already
@@ -1182,6 +1206,26 @@ After this slice, report a refreshed version of the remaining-span map
 (regions #2-#5, #7-#9) with current line numbers, since two more regions
 will have been consumed and everything after them will have shifted
 again.
+
+**Refreshed remaining-span map (`fillQueuedTabsOnce` now spans lines
+29628-30500 in `shared/js/sw.js` as of commit `ad2f9d6`; re-grep before
+trusting, this will drift again after the next slice):**
+
+- **#2 Post-cleanup restore-actions block:** ~29663-29708.
+- **#3 `slotDecision` outcome handling:** ~29718-29786 (from the
+  `applyCoordinatorQueueMachineEvent` call through
+  `if(!next) { fillFailureReason = ...; break }`).
+- **#4 `finalOpenDecision` reject-path branching:** ~29800-29923.
+- **#5 Pre-open recovery/capacity/pause checks:** ~29949-30076 (now feeds
+  directly into the P2-3-extracted guards at ~30078/30088).
+- **#7 Tab-create try/catch:** ~30100-30256.
+- **#8 Post-open confirm/rollback chain:** ~30257-30437.
+- **#9 Tail region (`queuedTabFillOpeningActionKeys` sweep + summary):**
+  ~30425-30489, before the closing brace at ~30500.
+
+Next best target: #3 (`slotDecision` outcome handling), per P2-2's
+original ordering -- fully sync given `slotDecision` as data, needs the
+discriminated-object pattern for its 5 exit shapes.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
