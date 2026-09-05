@@ -7,21 +7,19 @@ Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 of `fillQueuedTabsOnce` in sequence per an explicit request to finish the
 whole function: Slice P2-1 (commits `25ae7d3`, `675bca8`) proved the
 decide/act splitting technique on a different function; Slices P2-2
-through P2-7 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
-`bf4ef17`, `e3caa43`) have extracted 10 decide spans across 7 of ~9 mapped
-regions of the ~951-line `fillQueuedTabsOnce` (the largest remaining
-function), including two bare-`return` outcome cases. Slice P2-8 (region
-#8, the densest remaining span, flagged as open-ended -- extract what's
-genuinely safe, an honest "not much extractable here" is a fine outcome)
-is defined and queued next, followed by region #9. See
+through P2-8 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
+`bf4ef17`, `e3caa43`, `fb838fa`) have extracted 11 decide spans across 8 of
+~9 mapped regions of the `fillQueuedTabsOnce` function (the largest
+remaining function), including three bare-`return`/state-mutation outcome
+cases. Only region #9 (the final, most sensitive span -- the
+`queuedTabFillOpeningActionKeys` sweep and summary blocks, i.e. the
+explicit correctness fix from earlier this session) remains. See
 `git log --oneline` for the full commit list, starting at `3567f1c`, most
-recent `e3caa43`. `shared/js/sw.js` is at 30,919 lines (fluctuating around
-the Part 1 baseline of 30,742 as Part 2's same-file restructuring trades
-inline code for named decide functions; expect this to trend down once
-more of `fillQueuedTabsOnce` consolidates), down from 38,953 at the start
-of this effort (~20.6% reduction from the original baseline). Part 2's
-work so
-far stays physically in `sw.js`, no new module yet.
+recent `fb838fa`. `shared/js/sw.js` line count fluctuates around the Part
+1 baseline of 30,742 as Part 2's same-file restructuring trades inline
+code for named decide functions, down from 38,953 at the start of this
+effort. Part 2's work so far stays physically in `sw.js`, no new module
+yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1549,6 +1547,61 @@ given the density here: hand-trace relevant tests in
 `test/swSynthetic.test.js` for whatever you do extract, run the full
 suite at least twice (three times if you land more than 2-3 separate
 extractions, matching the elevated scrutiny given to P2-4/P2-6).
+
+**Completed** (commit `fb838fa`; independently re-verified by reading the
+full diff, hand-tracing against the described branch structure, and
+running the test suite twice more, both green). The agent extracted the
+entire `options.returnAfterDurableActive === true` branch (~65 lines,
+including the third bare-return case and its `void`-fired fire-and-forget
+calls) into `decideReturnAfterDurableActiveOutcome(params)`, returning
+`{setClearRequested, result}`; the shell applies
+`queuedTabFillPromiseClearRequested = true` itself when
+`setClearRequested` is true, then returns `result` -- confirmed this
+exactly preserves the original's module-level state mutation, which the
+decide function cannot touch directly since it's a plain sync helper
+outside the closure's assignment scope. Left the smaller spans in the
+`options.returnAfterDurableActive === false` path (the
+`getQueuedExecutorTabStatusWithTimeout`/rollback branch and the trailing
+content-script-ensure/profile-sweep setup) resident with explicit
+reasoning, matching P2-7's precedent of an honest partial result over a
+forced extraction. Updated `test/p1-contract.test.js`'s ordering
+assertions for the new function. All `void x().catch()`/`void x().then()`
+fire-and-forget calls inside the decide function confirmed safe per the
+Slice-27 precedent (constructing/firing a Promise without awaiting it
+doesn't require an async caller).
+
+### Slice P2-9 -- final region (region #9, `queuedTabFillOpeningActionKeys` sweep + summary)
+
+This is the last mapped region of `fillQueuedTabsOnce` and the most
+sensitive: it is the explicit correctness fix made earlier in this same
+decomposition effort (`fillQueuedTabsOnce` was found to leave stale
+"in-flight" markers in `queuedTabFillOpeningActionKeys` for actions never
+attempted in a given pass). Unlike every other region, this span is
+already fully synchronous end-to-end -- there is no await interleaving to
+split, so the only benefit of extracting it is code organization, not
+solving an async-orchestration problem. That means the honest options
+here are: (a) extract it into a pure decide/build function if doing so
+clearly improves readability without needing more than the read-only
+locals it already closes over, or (b) explicitly leave it resident and
+say so, if extraction would require threading enough closure state or
+subtly restructuring the sweep that the risk isn't worth the payoff for a
+region with zero remaining async-decomposition value. Do not force
+extraction just to mark all 9 regions complete -- an honest "leaving this
+resident, here's why" is a fully valid outcome for this slice, same as
+P2-7's finding for most of region #7.
+
+Before executing: re-grep `fillQueuedTabsOnce` fresh (line numbers have
+shifted since P2-8 landed) to confirm the exact current bounds of this
+tail region and read it in full before proposing any extraction.
+
+If anything is extracted, the verification bar is the highest of any
+Part 2 slice so far given this region's history as a subtle, previously-
+shipped bug fix: confirm byte-for-byte behavior preservation against the
+current code (not assumed from its already-sync appearance), specifically
+hand-trace that every key added to `queuedTabFillOpeningActionKeys`
+earlier in the function is still correctly swept/cleared under every exit
+path, run the full suite at least three times, and independently re-read
+the full diff line by line before considering this done.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
