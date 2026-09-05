@@ -29944,6 +29944,88 @@ function decidePostOpenFailureRecoveryOutcome(params = {}) {
     return {outcome: 'break', fillFailureReason: 'queued-tab-open-failed'}
 }
 
+function decideReturnAfterDurableActiveOutcome(params = {}) {
+    const {
+        queuedTabFillPromise,
+        openPlan,
+        openedProgressPatch,
+        tab,
+        next,
+        earlyContentEnsurePromise,
+        openedTabs,
+        recoveredLiveTabs,
+        cycle
+    } = params
+    let setClearRequested = false
+    if(queuedTabFillPromise) {
+        resetQueuedTabFillState()
+        incrementQueueWakeupMetric('pump.changed.clearedFillPromiseAfterDurableActive')
+        incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
+        incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
+    }
+    else {
+        setClearRequested = true
+    }
+    if(openPlan.profileHref && openedProgressPatch) {
+        void recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})
+            .catch(error => {
+                recordCoordinatorDiagnosticEvent(
+                    'queued-tab-opened-progress-deferred-failed',
+                    error?.message || 'Queued tab opened progress save failed'
+                )
+                scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-progress-deferred-failed', {
+                    allowBeforeQuora: true
+                })
+                return null
+            })
+    }
+    const contentEnsurePromise = earlyContentEnsurePromise || promiseWithTimeout(
+        ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
+        QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
+        'queued tab content script ensure'
+    ).catch(error => ({
+        ensured: false,
+        reason: 'content-script-ensure-failed',
+        error: error?.message || `${error || ''}`
+    }))
+    void contentEnsurePromise.then(result =>
+        handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened-return-after-durable-active')
+    )
+    scheduleOwnedBlockedProfileSweep(next.ownerTabId, 750)
+    void sweepOwnedBlockedProfileTabs(next.ownerTabId)
+    scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active', {
+        allowBeforeQuora: true
+    })
+    incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
+    finishQueueWakeupMetricCycle(cycle, 'state-changed', 'opened-tab', {
+        openedTabs,
+        recoveredLiveTabs,
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        remainingActions: queueRuntime.getActivationIntentCount(),
+        returnAfterDurableActive: true
+    })
+    recordFlightRecorderEvent({
+        kind: 'fill-decision',
+        source: 'fillQueuedTabsOnce',
+        reason: 'opened-tab',
+        accepted: true,
+        changed: true
+    })
+    return {
+        setClearRequested,
+        result: {
+            openedTabs,
+            recoveredLiveTabs,
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount(),
+            reason: 'opened-tab',
+            returnAfterDurableActive: true
+        }
+    }
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -30388,70 +30470,21 @@ async function fillQueuedTabsOnce(options = {}) {
                 activeTransitionContinued: activeTransition.activeTransitionContinued
             }) : null
             if(options.returnAfterDurableActive === true) {
-                if(queuedTabFillPromise) {
-                    resetQueuedTabFillState()
-                    incrementQueueWakeupMetric('pump.changed.clearedFillPromiseAfterDurableActive')
-                    incrementQueueWakeupMetric('pump.changed.clearedStaleFillPromise')
-                    incrementQueueWakeupMetric('pump.changed.clearedIdleStaleFillPromise')
-                }
-                else {
+                const returnAfterDurableActiveDecision = decideReturnAfterDurableActiveOutcome({
+                    queuedTabFillPromise,
+                    openPlan,
+                    openedProgressPatch,
+                    tab,
+                    next,
+                    earlyContentEnsurePromise,
+                    openedTabs,
+                    recoveredLiveTabs,
+                    cycle
+                })
+                if(returnAfterDurableActiveDecision.setClearRequested) {
                     queuedTabFillPromiseClearRequested = true
                 }
-                if(openPlan.profileHref && openedProgressPatch) {
-                    void recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})
-                        .catch(error => {
-                            recordCoordinatorDiagnosticEvent(
-                                'queued-tab-opened-progress-deferred-failed',
-                                error?.message || 'Queued tab opened progress save failed'
-                            )
-                            scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-progress-deferred-failed', {
-                                allowBeforeQuora: true
-                            })
-                            return null
-                        })
-                }
-                const contentEnsurePromise = earlyContentEnsurePromise || promiseWithTimeout(
-                    ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
-                    QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
-                    'queued tab content script ensure'
-                ).catch(error => ({
-                    ensured: false,
-                    reason: 'content-script-ensure-failed',
-                    error: error?.message || `${error || ''}`
-                }))
-                void contentEnsurePromise.then(result =>
-                    handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened-return-after-durable-active')
-                )
-                scheduleOwnedBlockedProfileSweep(next.ownerTabId, 750)
-                void sweepOwnedBlockedProfileTabs(next.ownerTabId)
-                scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active', {
-                    allowBeforeQuora: true
-                })
-                incrementQueueWakeupMetric('job.nextSlotFilled', openedTabs)
-                finishQueueWakeupMetricCycle(cycle, 'state-changed', 'opened-tab', {
-                    openedTabs,
-                    recoveredLiveTabs,
-                    active: queueRuntime.getActiveQueuedTabCount(),
-                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                    remainingActions: queueRuntime.getActivationIntentCount(),
-                    returnAfterDurableActive: true
-                })
-                recordFlightRecorderEvent({
-                    kind: 'fill-decision',
-                    source: 'fillQueuedTabsOnce',
-                    reason: 'opened-tab',
-                    accepted: true,
-                    changed: true
-                })
-                return {
-                    openedTabs,
-                    recoveredLiveTabs,
-                    active: queueRuntime.getActiveQueuedTabCount(),
-                    schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                    remainingActions: queueRuntime.getActivationIntentCount(),
-                    reason: 'opened-tab',
-                    returnAfterDurableActive: true
-                }
+                return returnAfterDurableActiveDecision.result
             }
             if(openPlan.profileHref && openedProgressPatch) {
                 await recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref, openedProgressPatch, {senderTabId: tab.id})
