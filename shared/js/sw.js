@@ -29915,6 +29915,35 @@ function decidePreOpenPausedGate(params = {}) {
     }
 }
 
+function decidePostOpenFailureRecoveryOutcome(params = {}) {
+    const {next, postOpenRecovery, openFailureCount, openFailure, now} = params
+    if(postOpenRecovery?.adopted === true ||
+        postOpenRecovery?.reason === 'queued-runtime-action-already-has-runtime-surface') {
+        const fillFailureReason = postOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-after-open-timeout'
+        incrementQueueWakeupMetric('pump.changed.recoveredOpenTimeoutRuntimeSurface')
+        scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+            allowBeforeQuora: true
+        })
+        scheduleQueuedWorkContinuation(fillFailureReason)
+        return {outcome: 'break', fillFailureReason}
+    }
+    if(openFailureCount <= 3 && !queueRuntime.hasPausedQueuedOwner(next.ownerTabId)) {
+        queueRuntime.requeueActivationIntent({
+            ...next,
+            openFailureCount,
+            lastOpenFailureAt: now,
+            lastOpenFailure: openFailure
+        }, {
+            source: 'runtime-effect'
+        })
+    }
+    scheduleCoordinatorQueueResume(QUEUED_TAB_CREATE_TIMEOUT_MS * 6, 'queued-tab-open-failed', {
+        allowBeforeQuora: true
+    })
+    scheduleQueuedWorkContinuation('queued-tab-open-failed')
+    return {outcome: 'break', fillFailureReason: 'queued-tab-open-failed'}
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -30296,31 +30325,17 @@ async function fillQueuedTabsOnce(options = {}) {
                         reason: 'queued-runtime-action-post-open-recovery-error',
                         error: recoveryError?.message || `${recoveryError || ''}`
                     }))
-                    if(postOpenRecovery?.adopted === true ||
-                        postOpenRecovery?.reason === 'queued-runtime-action-already-has-runtime-surface') {
-                        fillFailureReason = postOpenRecovery.reason || 'queued-runtime-action-live-tab-adopted-after-open-timeout'
-                        incrementQueueWakeupMetric('pump.changed.recoveredOpenTimeoutRuntimeSurface')
-                        scheduleCoordinatorQueueResume(1000, fillFailureReason, {
-                            allowBeforeQuora: true
-                        })
-                        scheduleQueuedWorkContinuation(fillFailureReason)
+                    const postOpenFailureRecoveryDecision = decidePostOpenFailureRecoveryOutcome({
+                        next,
+                        postOpenRecovery,
+                        openFailureCount,
+                        openFailure,
+                        now: Date.now()
+                    })
+                    if(postOpenFailureRecoveryDecision.outcome === 'break') {
+                        fillFailureReason = postOpenFailureRecoveryDecision.fillFailureReason
                         break
                     }
-                    if(openFailureCount <= 3 && !queueRuntime.hasPausedQueuedOwner(next.ownerTabId)) {
-                        queueRuntime.requeueActivationIntent({
-                            ...next,
-                            openFailureCount,
-                            lastOpenFailureAt: Date.now(),
-                            lastOpenFailure: openFailure
-                        }, {
-                            source: 'runtime-effect'
-                        })
-                    }
-                    scheduleCoordinatorQueueResume(QUEUED_TAB_CREATE_TIMEOUT_MS * 6, 'queued-tab-open-failed', {
-                        allowBeforeQuora: true
-                    })
-                    scheduleQueuedWorkContinuation('queued-tab-open-failed')
-                    break
                 }
             }
             const openedAt = Date.now()
