@@ -3,23 +3,24 @@
 Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
-(async orchestration) is underway, working through all remaining regions
-of `fillQueuedTabsOnce` in sequence per an explicit request to finish the
-whole function: Slice P2-1 (commits `25ae7d3`, `675bca8`) proved the
-decide/act splitting technique on a different function; Slices P2-2
-through P2-8 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`,
-`bf4ef17`, `e3caa43`, `fb838fa`) have extracted 11 decide spans across 8 of
-~9 mapped regions of the `fillQueuedTabsOnce` function (the largest
-remaining function), including three bare-`return`/state-mutation outcome
-cases. Only region #9 (the final, most sensitive span -- the
-`queuedTabFillOpeningActionKeys` sweep and summary blocks, i.e. the
-explicit correctness fix from earlier this session) remains. See
-`git log --oneline` for the full commit list, starting at `3567f1c`, most
-recent `fb838fa`. `shared/js/sw.js` line count fluctuates around the Part
-1 baseline of 30,742 as Part 2's same-file restructuring trades inline
-code for named decide functions, down from 38,953 at the start of this
-effort. Part 2's work so far stays physically in `sw.js`, no new module
-yet.
+(async orchestration) has finished its first goal: all 9 mapped regions
+of `fillQueuedTabsOnce` (the largest remaining function) are now
+decomposed via the decide/act splitting technique. Slice P2-1 (commits
+`25ae7d3`, `675bca8`) proved the technique on a different function;
+Slices P2-2 through P2-9 (commits `bdae45c`, `ad2f9d6`, `1b79649`,
+`851f4fe`, `bf4ef17`, `e3caa43`, `fb838fa`, and the commit landing this
+plan update) extracted 12 decide spans across all 9 regions, including
+three bare-`return`/state-mutation outcome cases. `fillQueuedTabsOnce` remains a single
+`async` function (by Part 2 design, until Phase 0 lands) but its body is
+now a sequence of awaits interleaved with calls into named, independently
+-readable `decide*` helpers rather than large inline decision blocks. See
+`git log --oneline` for the full commit list, starting at `3567f1c`. Part
+2's work so far stays physically in `sw.js`, no new module yet.
+`shared/js/sw.js` line count fluctuates around the Part 1 baseline of
+30,742 as Part 2's same-file restructuring trades inline code for named
+decide functions, down from 38,953 at the start of this effort. No
+further Part 2 target has been chosen yet; the "Next 20 Part 2 targets"
+list below remains the candidate pool pending explicit direction.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1602,6 +1603,52 @@ hand-trace that every key added to `queuedTabFillOpeningActionKeys`
 earlier in the function is still correctly swept/cleared under every exit
 path, run the full suite at least three times, and independently re-read
 the full diff line by line before considering this done.
+
+**Completed** (done directly rather than via an execution agent, given
+the region's small, fully self-contained scope and the scoping work
+already in hand from writing this slice's spec; commit follows). Fresh
+grep confirmed `fillQueuedTabsOnce` at 30029-30619 post-P2-8, with the
+tail region at lines 30553-30617: the `queuedTabFillOpeningActionKeys`
+untouched-key sweep loop followed by the `openedTabs > 0 ||
+recoveredLiveTabs > 0` if/else summary-and-return blocks. All six values
+read by this region (`openedTabs`, `recoveredLiveTabs`,
+`fillFailureReason`, `prunedStaleAttemptActions`, `fillFailureError`,
+`cycle`) are declared once near the top of `fillQueuedTabsOnce` and
+mutated only during the loop, never read again after this tail -- fully
+self-contained. Every other identifier the region touches
+(`queueRuntime`, `getQueuedRuntimeActionFillKey`,
+`queuedTabFillOpeningActionKeys`, `incrementQueueWakeupMetric`,
+`finishQueueWakeupMetricCycle`, `recordFlightRecorderEvent`,
+`getSchedulerBlockingQueuedExecutorCount`) is module-scope in `sw.js`
+already (several already-extracted-module exports destructured back to
+their bare names per the established pattern), so none needed threading
+as params -- matching the precedent already set by
+`decidePostOpenFailureRecoveryOutcome` and
+`decideReturnAfterDurableActiveOutcome` calling module-scope helpers
+directly while only per-call locals are passed through `params`. Notably
+this region is the only one of the 9 with zero `await`s and zero Promise
+construction anywhere nearby -- there was no realm-crossing risk to
+reason about at all, making this the single lowest-risk extraction of
+the entire Part 2 effort so far: a pure textual move into
+`decideFillQueuedTabsOnceOutcome(params)`, confirmed via `git diff` to be
+byte-for-byte identical body content, only re-indented and given a
+`params` destructure header and a `return decideFillQueuedTabsOnceOutcome({...})`
+call site. No `test/p1-contract.test.js` update was needed -- grepped for
+every literal string unique to the moved block and confirmed none of the
+existing assertions were scoped to `fillQueuedTabsOnce`'s extracted body
+in a way that cared about this content's location. Verified: `node -c`
+syntax check, full test suite green three times, `npx mix --production`
+and `node tools/build-chrome-dev.js` both green.
+
+**All 9 mapped regions of `fillQueuedTabsOnce` are now addressed.** This
+closes out the "go through all through 9" instruction. `fillQueuedTabsOnce`
+itself still exists as a single `async` function (Part 2's discipline
+keeps it that way until Phase 0 lands), but its body is now a sequence of
+awaits interleaved with calls into ~12 named, independently-readable
+`decide*` sync functions rather than large blocks of inline decision
+logic. No further Part 2 target has been chosen yet; the "Next 20 Part 2
+targets" list above remains the candidate pool for whatever is picked
+next, pending explicit direction.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
