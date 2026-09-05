@@ -5,18 +5,19 @@ Date: 2026-09-01
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
 (async orchestration) is underway: Slice P2-1 (commits `25ae7d3`,
 `675bca8`) proved the decide/act splitting technique end-to-end; Slices
-P2-2 and P2-3 (commits `bdae45c`, `ad2f9d6`) have extracted 4 of the ~9
-mapped decide spans from the ~951-line `fillQueuedTabsOnce` (the largest
-remaining function) -- see "Slice P2-3" below for the refreshed remaining-
-span map, next target is #3 (`slotDecision` outcome handling). See
-`git log --oneline` for the full commit list, starting at `3567f1c`, most
-recent `ad2f9d6`. `shared/js/sw.js` is at 30,834 lines (fluctuating
-slightly around the Part 1 baseline of 30,742 as Part 2's same-file
-restructuring trades inline code for named decide functions; expect this
-to trend down once more of `fillQueuedTabsOnce` consolidates), down from
-38,953 at the start of this effort (~20.8% reduction from the original
-baseline). Part 2's work so far stays physically in `sw.js`, no new
-module yet.
+P2-2 through P2-4 (commits `bdae45c`, `ad2f9d6`, `1b79649`) have extracted
+5 of the ~9 mapped decide spans from the ~951-line `fillQueuedTabsOnce`
+(the largest remaining function), including the first bare-`return`
+outcome case -- see "Slice P2-4" below for the refreshed remaining-span
+map, next targets are #5 (pre-open recovery/capacity/pause checks) and #4
+(`finalOpenDecision` reject-path branching). See `git log --oneline` for
+the full commit list, starting at `3567f1c`, most recent `1b79649`.
+`shared/js/sw.js` is at 30,852 lines (fluctuating around the Part 1
+baseline of 30,742 as Part 2's same-file restructuring trades inline code
+for named decide functions; expect this to trend down once more of
+`fillQueuedTabsOnce` consolidates), down from 38,953 at the start of this
+effort (~20.8% reduction from the original baseline). Part 2's work so
+far stays physically in `sw.js`, no new module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1227,7 +1228,17 @@ Next best target: #3 (`slotDecision` outcome handling), per P2-2's
 original ordering -- fully sync given `slotDecision` as data, needs the
 discriminated-object pattern for its 5 exit shapes.
 
-### Slice P2-4 -- slotDecision outcome handling
+### Slice P2-4 -- slotDecision outcome handling (done)
+
+Completed (commit `1b79649`; independently re-verified by hand-tracing
+all 6 branches against the diff and running the test suite twice more).
+Extracted `decideSlotOutcome(params)` with all four outcome shapes,
+including the first bare-`return` case in Part 2 -- the loop shell does
+`if(slotOutcome.outcome === 'return') return slotOutcome.result`. Manual
+trace confirmed the reordering of a few `fillFailureReason` assignments
+(now happening after the decide call returns, instead of inline before
+each metric/flight-recorder call) has zero observable effect, since
+nothing reads the outer variable in between.
 
 Targets map region #3. Confirmed by a fresh read (2026-09, current lines
 ~29717-29782) rather than trusting the stale map -- re-verify line
@@ -1279,6 +1290,18 @@ body (`if(decision.outcome === 'return') return decision.result`), and
 give it the same scrutiny as P2-1's diagnostic-await discovery: read
 every line, don't assume the shape from this summary without confirming
 against the actual current code.
+
+**Refreshed remaining-span map (`fillQueuedTabsOnce` now spans
+`shared/js/sw.js:29694-30518` as of commit `1b79649`; re-grep before
+trusting):**
+
+- **#4 `finalOpenDecision` reject-path branching:** 29826-29965.
+- **#5 Pre-open recovery/capacity/pause checks:** 29967-30094 (feeds into
+  the already-extracted `decideActivationGuardClaim` call at ~30096).
+- **#7 Tab-create try/catch:** 30113-30273.
+- **#8 Post-open confirm/rollback chain:** 30274-30440.
+- **#9 Tail region (`queuedTabFillOpeningActionKeys` sweep + summary):**
+  30453-30517, before the closing brace at 30518.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
