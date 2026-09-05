@@ -1303,6 +1303,70 @@ trusting):**
 - **#9 Tail region (`queuedTabFillOpeningActionKeys` sweep + summary):**
   30453-30517, before the closing brace at 30518.
 
+### Slice P2-5 -- pre-open recovery/capacity/pause checks (region #5)
+
+The user asked to go through all remaining regions (#4, #5, #7, #8, #9)
+in sequence -- this is the first of that run.
+
+Confirmed by a fresh read (2026-09, current lines ~29967-30094; re-verify
+before executing) that region #5 is not one block but three independent
+`await` + sync-decide sub-blocks in sequence, each separated by its own
+await, each cleanly extractable on its own:
+
+1. **Pre-open recovery outcome**: `await recoverQueuedRuntimeActionBeforeOpen(next, {...}).catch(...)`
+   (the `.catch` already normalizes errors into the same shape, so the
+   await site itself is safe) -> sync check: `.adopted === true` ->
+   metric/flight-recorder/`continue`; `.deferred === true` -> requeue,
+   metric, two schedule calls, flight-recorder, `break`; neither -> fall
+   through.
+2. **Live-profile-tab capacity gate**: `await getLiveQueuedWorkerSurfaceProfileTabCount(...)`
+   -> sync: a conditional `clearDetachedQueuedProfileOpenReservations(...)`
+   side effect, then a capacity comparison
+   (`liveProfileTabs + openReservations + openedTabs >= getEffectiveQueuedTabConcurrency()`)
+   that requeues + metric + two schedule calls + flight-recorder + `break`
+   if over capacity, else falls through.
+3. **Pre-open paused gate**: `await isCoordinatorPausedInStorage('queued-tab-pre-open-paused-check')`
+   -> sync: if true, requeue + metric + `finishQueueWakeupMetricCycle` +
+   flight-recorder + a bare `return {...}` (same shape as `decideSlotOutcome`'s
+   `paused` branch in Slice P2-4 -- reuse that established `{outcome:
+   'return', result}` pattern), else falls through into the
+   already-extracted `decideActivationGuardClaim` call.
+
+Extract each of the three as its own small decide function (e.g.
+`decidePreOpenRecoveryOutcome`, `decideLiveProfileTabCapacityGate`,
+`decidePreOpenPausedGate` -- your naming call, stay consistent with
+existing conventions), each taking the values it needs as explicit
+params (`next`, `preOpenRecovery`/`liveProfileTabs`/`openReservations`/
+`openedTabs`/`cycle` as applicable) and returning a discriminated outcome
+(`'continue'` / `'break'` / `'return'` / `'proceed'` as appropriate to
+each). Verify each is genuinely await-free itself before extracting (the
+`.catch()` on sub-block 1's await already means the await risk is
+contained to that one line, which stays in the shell). Same rigor as
+every prior Part 2 slice: trace relevant tests by hand first, run the
+full suite at least twice, re-grep line numbers fresh, don't trust this
+summary's line numbers without confirming.
+
+### Slices P2-6 through P2-8 -- regions #4, #7, #8, #9
+
+To be scoped in detail once P2-5 lands and shifts line numbers again, but
+noted here so the sequence is visible: #4 (`finalOpenDecision`
+reject-path branching, ~29826-29965 as of this writing) was already
+flagged as "heavily interleaved... needs per-branch extraction, not one
+block" -- expect it to look like several P2-5-style small sub-block
+extractions once read fresh, not one clean span. #7 (tab-create
+try/catch) was flagged as "genuinely await-heavy, low priority... mostly
+act" -- the corresponding slice should read it fresh and report if there
+is truly nothing safely extractable, which is a legitimate outcome, not
+a failure to force past. #8 (post-open confirm/rollback chain) was
+flagged as "dense... needs sub-span-by-sub-span treatment" -- expect
+multiple small extractions, scope them at read time the way #5 did for
+#3's fallthrough spans. #9 (the tail region, `queuedTabFillOpeningActionKeys`
+sweep + summary) is fully sync already but is the explicit correctness
+fix from earlier this session -- it may be extracted for consistency with
+the rest of the function, but only with the same independent
+re-verification rigor as new logic, confirming byte-for-byte behavior
+preservation, not assumed from its already-sync appearance.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
