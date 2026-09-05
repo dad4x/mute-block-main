@@ -3,21 +3,23 @@
 Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
-(async orchestration) is underway: Slice P2-1 (commits `25ae7d3`,
-`675bca8`) proved the decide/act splitting technique end-to-end; Slices
-P2-2 through P2-4 (commits `bdae45c`, `ad2f9d6`, `1b79649`) have extracted
-5 of the ~9 mapped decide spans from the ~951-line `fillQueuedTabsOnce`
-(the largest remaining function), including the first bare-`return`
-outcome case -- see "Slice P2-4" below for the refreshed remaining-span
-map, next targets are #5 (pre-open recovery/capacity/pause checks) and #4
-(`finalOpenDecision` reject-path branching). See `git log --oneline` for
-the full commit list, starting at `3567f1c`, most recent `1b79649`.
-`shared/js/sw.js` is at 30,852 lines (fluctuating around the Part 1
-baseline of 30,742 as Part 2's same-file restructuring trades inline code
-for named decide functions; expect this to trend down once more of
-`fillQueuedTabsOnce` consolidates), down from 38,953 at the start of this
-effort (~20.8% reduction from the original baseline). Part 2's work so
-far stays physically in `sw.js`, no new module yet.
+(async orchestration) is underway, working through all remaining regions
+of `fillQueuedTabsOnce` in sequence per an explicit request to finish the
+whole function: Slice P2-1 (commits `25ae7d3`, `675bca8`) proved the
+decide/act splitting technique on a different function; Slices P2-2
+through P2-5 (commits `bdae45c`, `ad2f9d6`, `1b79649`, `851f4fe`) have
+extracted 8 decide spans across the first 5 of ~9 mapped regions of the
+~951-line `fillQueuedTabsOnce` (the largest remaining function), including
+two bare-`return` outcome cases. Slice P2-6 (region #4,
+`finalOpenDecision` reject-path branching) is defined and queued next,
+followed by regions #7, #8, #9. See `git log --oneline` for the full
+commit list, starting at `3567f1c`, most recent `851f4fe`. `shared/js/sw.js`
+is at 30,885 lines (fluctuating around the Part 1 baseline of 30,742 as
+Part 2's same-file restructuring trades inline code for named decide
+functions; expect this to trend down once more of `fillQueuedTabsOnce`
+consolidates), down from 38,953 at the start of this effort (~20.7%
+reduction from the original baseline). Part 2's work so far stays
+physically in `sw.js`, no new module yet.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -1303,7 +1305,16 @@ trusting):**
 - **#9 Tail region (`queuedTabFillOpeningActionKeys` sweep + summary):**
   30453-30517, before the closing brace at 30518.
 
-### Slice P2-5 -- pre-open recovery/capacity/pause checks (region #5)
+### Slice P2-5 -- pre-open recovery/capacity/pause checks (region #5) (done)
+
+Completed (commit `851f4fe`; independently re-verified by hand-tracing
+all three sub-blocks against the diff and running the test suite twice
+more). Shape matched the plan's description exactly, no surprises. One
+coverage gap noted, not a blocker: no test in `swSynthetic.test.js`
+isolates the third sub-block's specific `coordinator-paused` check
+(there are now three separate paused-checks in this function across
+P2-4/P2-5, each in a different spot) in isolation from the other two --
+covered only by full-suite regression, which passed twice.
 
 The user asked to go through all remaining regions (#4, #5, #7, #8, #9)
 in sequence -- this is the first of that run.
@@ -1348,24 +1359,72 @@ summary's line numbers without confirming.
 
 ### Slices P2-6 through P2-8 -- regions #4, #7, #8, #9
 
-To be scoped in detail once P2-5 lands and shifts line numbers again, but
-noted here so the sequence is visible: #4 (`finalOpenDecision`
-reject-path branching, ~29826-29965 as of this writing) was already
-flagged as "heavily interleaved... needs per-branch extraction, not one
-block" -- expect it to look like several P2-5-style small sub-block
-extractions once read fresh, not one clean span. #7 (tab-create
-try/catch) was flagged as "genuinely await-heavy, low priority... mostly
-act" -- the corresponding slice should read it fresh and report if there
-is truly nothing safely extractable, which is a legitimate outcome, not
-a failure to force past. #8 (post-open confirm/rollback chain) was
-flagged as "dense... needs sub-span-by-sub-span treatment" -- expect
-multiple small extractions, scope them at read time the way #5 did for
-#3's fallthrough spans. #9 (the tail region, `queuedTabFillOpeningActionKeys`
-sweep + summary) is fully sync already but is the explicit correctness
-fix from earlier this session -- it may be extracted for consistency with
-the rest of the function, but only with the same independent
-re-verification rigor as new logic, confirming byte-for-byte behavior
-preservation, not assumed from its already-sync appearance.
+#7, #8, #9 are still to be scoped in detail once earlier slices land and
+shift line numbers again. #7 (tab-create try/catch) was flagged as
+"genuinely await-heavy, low priority... mostly act" -- the corresponding
+slice should read it fresh and report if there is truly nothing safely
+extractable, which is a legitimate outcome, not a failure to force past.
+#8 (post-open confirm/rollback chain) was flagged as "dense... needs
+sub-span-by-sub-span treatment" -- expect multiple small extractions,
+scope them at read time the way #5 did for #3's fallthrough spans. #9
+(the tail region, `queuedTabFillOpeningActionKeys` sweep + summary) is
+fully sync already but is the explicit correctness fix from earlier this
+session -- it may be extracted for consistency with the rest of the
+function, but only with the same independent re-verification rigor as
+new logic, confirming byte-for-byte behavior preservation, not assumed
+from its already-sync appearance.
+
+### Slice P2-6 -- finalOpenDecision reject-path branching (region #4)
+
+Confirmed by a fresh read (2026-09, current lines ~29951-30089; re-verify
+before executing) that region #4 is more layered than a single decide
+span, exactly as previously flagged:
+
+1. `const finalOpenDecision = await validateQueuedTabOpenAgainstCurrentAuthority(next, {...})`
+   -- entry await.
+2. An unconditional `recordFlightRecorderEvent(...)` using
+   `finalOpenDecision` -- trivial, always runs, not really a decision.
+   Leave inline or extract trivially; not the focus of this slice.
+3. `if(!finalOpenDecision.open) { ... }` -- the reject-handling block.
+   Inside it: an unconditional metric + `pushQueueWakeupJournalEntry`
+   (again, not really a decision, always runs when `!open`), then a
+   **second** await:
+   `const finalOpenRecovery = await recoverQueuedActionLiveTabAfterFinalOpenDecline(next, finalOpenDecision, {...}).catch(...)`
+   (the `.catch` normalizes errors, so this await site itself is safe),
+   then a **fully synchronous four-way branch** on `finalOpenRecovery`/
+   `finalOpenDecision` (confirmed zero `await`/`.then(`/`.catch(` in this
+   span independently): `.adopted === true` -> metric+flight-recorder ->
+   `continue`; `.unresolved === true` -> metric+2 schedule calls ->
+   `break`; `finalOpenDecision.reason === 'stale-attempt'|'stale-attempt-number'`
+   -> metrics+flight-recorder+2 schedule calls -> `continue`;
+   `finalOpenDecision.authorityUnavailable === true` -> actionKey
+   computation + `queueRuntime.someActivationIntent(...)` dedup check +
+   conditional requeue + 2 schedule calls -> `break`; none of the above
+   -> a bare trailing `continue`.
+4. If `finalOpenDecision.open` is true, falls through past the whole
+   `if` block into region #5's territory (already extracted).
+
+**This slice's primary target is the four-way branch in step 3** -- it's
+the cleanest, highest-value span here, structurally similar to
+`decideSlotOutcome` (P2-4): extract it into a decide function (e.g.
+`decideFinalOpenRecoveryOutcome(params)`) taking `next`,
+`finalOpenDecision`, `finalOpenRecovery` and returning a discriminated
+outcome (`'continue'` with optional `fillFailureReason`/counters like
+`recoveredLiveTab`/`prunedStaleAttempt`, or `'break'` with
+`fillFailureReason`/`fillFailureError`). The two smaller unconditional
+side-effect spots (step 2's flight-recorder call, step 3's
+metric+journal-entry before the second await) are lower priority --
+extract them too if it reads cleanly, but don't let them block landing
+the four-way branch, which is the real win. Read every line fresh before
+committing to this structure; the four-way branch in particular has a lot
+of surface area (actionKey computation, a `someActivationIntent` closure)
+so trace it carefully rather than skimming.
+
+Same rigor as every prior Part 2 slice: hand-trace relevant tests in
+`test/swSynthetic.test.js` (search for `stale-attempt`, `authorityUnavailable`,
+`final-open`, `adoptedLiveTabAfterFinalOpenDecline`, or similar) before
+running the suite, run the full suite at least twice, re-grep all line
+numbers fresh.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
