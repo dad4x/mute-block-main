@@ -29544,6 +29544,87 @@ function decideQueueLoadThrottleGate(params = {}) {
     }
 }
 
+function decidePausedStateGate(params = {}) {
+    const {pausedState, cycle} = params
+    if(pausedState?.[COORDINATOR_PAUSED_KEY] !== true) {
+        return null
+    }
+    incrementQueueWakeupMetric('pump.noop.paused')
+    finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        remainingActions: queueRuntime.getActivationIntentCount()
+    })
+    recordFlightRecorderEvent({
+        kind: 'fill-decision',
+        source: 'fillQueuedTabsOnce',
+        reason: 'coordinator-paused',
+        accepted: false,
+        changed: false
+    })
+    return {
+        openedTabs: 0,
+        active: queueRuntime.getActiveQueuedTabCount(),
+        schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+        remainingActions: queueRuntime.getActivationIntentCount(),
+        reason: 'coordinator-paused',
+        paused: true
+    }
+}
+
+function decideActivationGuardClaim(params = {}) {
+    const {next} = params
+    const activationGuardKey = claimQueuedActivationGuard(next, null, 'queued-tab-pre-open')
+    if(activationGuardKey) {
+        return {outcome: 'proceed', activationGuardKey}
+    }
+    queueRuntime.requeueActivationIntent(next, {
+        source: 'runtime-effect'
+    })
+    const fillFailureReason = 'queued-activation-in-flight'
+    incrementQueueWakeupMetric('pump.noop.activationGuardInFlight')
+    scheduleCoordinatorQueueResume(500, fillFailureReason, {
+        allowBeforeQuora: true
+    })
+    recordFlightRecorderEvent({
+        kind: 'queued-tab-open-decision',
+        source: 'fillQueuedTabsOnce',
+        rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+        targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+        attemptId: getAttemptIdFromValue(next),
+        attemptNumber: getAttemptNumberFromValue(next),
+        runId: next.runId || '',
+        accepted: false,
+        changed: false,
+        reason: fillFailureReason
+    })
+    return {outcome: 'break', fillFailureReason}
+}
+
+function decideProfileOpenReservationClaim(params = {}) {
+    const {next, openingActionKey} = params
+    const openReservationHref = reserveQueuedProfileOpen(next, 'queued-tab-create')
+    if(openReservationHref) {
+        return {outcome: 'proceed', openReservationHref}
+    }
+    releaseQueuedActivationGuard(next)
+    if(openingActionKey) queuedTabFillOpeningActionKeys.delete(openingActionKey)
+    queueRuntime.requeueActivationIntent(next, {
+        source: 'runtime-effect'
+    })
+    const fillFailureReason = 'profile-open-reservation-in-flight'
+    incrementQueueWakeupMetric('pump.noop.profileOpenReservationInFlight')
+    scheduleCoordinatorQueueResume(1000, fillFailureReason, {
+        allowBeforeQuora: true
+    })
+    scheduleCoordinatorReconcile(1000, {
+        reason: fillFailureReason,
+        edgeTriggered: true,
+        allowBeforeQuora: true
+    })
+    return {outcome: 'break', fillFailureReason}
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -29576,29 +29657,8 @@ async function fillQueuedTabsOnce(options = {}) {
     })
 
     const pausedState = await metricStorageGet({[COORDINATOR_PAUSED_KEY]: false}).catch(() => null)
-    if(pausedState?.[COORDINATOR_PAUSED_KEY] === true) {
-        incrementQueueWakeupMetric('pump.noop.paused')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount()
-        })
-        recordFlightRecorderEvent({
-            kind: 'fill-decision',
-            source: 'fillQueuedTabsOnce',
-            reason: 'coordinator-paused',
-            accepted: false,
-            changed: false
-        })
-        return {
-            openedTabs: 0,
-            active: queueRuntime.getActiveQueuedTabCount(),
-            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-            remainingActions: queueRuntime.getActivationIntentCount(),
-            reason: 'coordinator-paused',
-            paused: true
-        }
-    }
+    const pausedGateResult = decidePausedStateGate({pausedState, cycle})
+    if(pausedGateResult) return pausedGateResult
 
     const queuedActionsBeforeCleanup = queueRuntime.listActivationIntents()
 
@@ -30015,54 +30075,23 @@ async function fillQueuedTabsOnce(options = {}) {
                 }
             }
 
-            activationGuardKey = claimQueuedActivationGuard(next, null, 'queued-tab-pre-open')
-            if(!activationGuardKey) {
-                queueRuntime.requeueActivationIntent(next, {
-                    source: 'runtime-effect'
-                })
-                fillFailureReason = 'queued-activation-in-flight'
-                incrementQueueWakeupMetric('pump.noop.activationGuardInFlight')
-                scheduleCoordinatorQueueResume(500, fillFailureReason, {
-                    allowBeforeQuora: true
-                })
-                recordFlightRecorderEvent({
-                    kind: 'queued-tab-open-decision',
-                    source: 'fillQueuedTabsOnce',
-                    rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                    targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                    attemptId: getAttemptIdFromValue(next),
-                    attemptNumber: getAttemptNumberFromValue(next),
-                    runId: next.runId || '',
-                    accepted: false,
-                    changed: false,
-                    reason: fillFailureReason
-                })
+            const activationGuardDecision = decideActivationGuardClaim({next})
+            if(activationGuardDecision.outcome === 'break') {
+                fillFailureReason = activationGuardDecision.fillFailureReason
                 break
             }
+            activationGuardKey = activationGuardDecision.activationGuardKey
             openingActionKey = getQueuedRuntimeActionFillKey(next) || ''
             if(openingActionKey) queuedTabFillOpeningActionKeys.add(openingActionKey)
 
             void sweepOwnedBlockedProfileTabs(next.ownerTabId)
-            openReservationHref = reserveQueuedProfileOpen(next, 'queued-tab-create')
-            if(!openReservationHref) {
-                releaseQueuedActivationGuard(next)
+            const profileOpenReservationDecision = decideProfileOpenReservationClaim({next, openingActionKey})
+            if(profileOpenReservationDecision.outcome === 'break') {
                 activationGuardKey = ''
-                if(openingActionKey) queuedTabFillOpeningActionKeys.delete(openingActionKey)
-                queueRuntime.requeueActivationIntent(next, {
-                    source: 'runtime-effect'
-                })
-                fillFailureReason = 'profile-open-reservation-in-flight'
-                incrementQueueWakeupMetric('pump.noop.profileOpenReservationInFlight')
-                scheduleCoordinatorQueueResume(1000, fillFailureReason, {
-                    allowBeforeQuora: true
-                })
-                scheduleCoordinatorReconcile(1000, {
-                    reason: fillFailureReason,
-                    edgeTriggered: true,
-                    allowBeforeQuora: true
-                })
+                fillFailureReason = profileOpenReservationDecision.fillFailureReason
                 break
             }
+            openReservationHref = profileOpenReservationDecision.openReservationHref
             let tab = null
             try {
                 const tabCreateTimeoutMs = options.returnAfterDurableActive === true
