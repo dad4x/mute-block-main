@@ -4853,8 +4853,16 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     assert.match(fillBody, /decideActivationGuardClaim\(\{next\}\)/)
     assert.match(fillBody, /decideProfileOpenReservationClaim\(\{next, openingActionKey\}\)/)
     assert.match(fillBody, /while\(getCapacityUsed\(\) < getEffectiveQueuedTabConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
-    assert.match(fillBody, /queueRuntime\.requeueActivationIntent/)
-    assert.match(fillBody, /scheduleQueuedWorkContinuation\('queued-tab-open-failed'\)/)
+    // The post-open-failure recovery decision (after the `postOpenRecovery`
+    // await inside the tab-create catch's genuine-failure branch, including
+    // the loop's last remaining inline `queueRuntime.requeueActivationIntent`
+    // call) was extracted to decidePostOpenFailureRecoveryOutcome in
+    // decomposition Slice P2-7 (Part 2 decide/act splitting), called from
+    // fillBody rather than inlined there.
+    const postOpenFailureRecoveryBody = extractFunction(source, 'function decidePostOpenFailureRecoveryOutcome(params = {})')
+    assert.match(postOpenFailureRecoveryBody, /queueRuntime\.requeueActivationIntent/)
+    assert.match(postOpenFailureRecoveryBody, /scheduleQueuedWorkContinuation\('queued-tab-open-failed'\)/)
+    assert.match(fillBody, /decidePostOpenFailureRecoveryOutcome\(\{/)
     assert.match(createOwnedTabBody, /getLastFocusedActiveTab\(\)/)
     assert.match(createOwnedTabBody, /restoreBackgroundQueuedTabFocus\(tab, previousActiveTab, action\)/)
     assert.match(restoreFocusBody, /action\?\.noForegroundFallback !== true/)
