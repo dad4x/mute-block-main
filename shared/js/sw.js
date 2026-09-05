@@ -29625,6 +29625,72 @@ function decideProfileOpenReservationClaim(params = {}) {
     return {outcome: 'break', fillFailureReason}
 }
 
+function decideSlotOutcome(params = {}) {
+    const {slotDecision, cycle} = params
+    const next = slotDecision?.action || null
+    if(slotDecision?.paused === true) {
+        incrementQueueWakeupMetric('pump.noop.pausedBeforeOpen')
+        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
+            active: queueRuntime.getActiveQueuedTabCount(),
+            schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+            remainingActions: queueRuntime.getActivationIntentCount()
+        })
+        recordFlightRecorderEvent({
+            kind: 'fill-decision',
+            source: 'fillQueuedTabsOnce',
+            reason: 'coordinator-paused',
+            accepted: false,
+            changed: false
+        })
+        return {
+            outcome: 'return',
+            result: {
+                openedTabs: 0,
+                active: queueRuntime.getActiveQueuedTabCount(),
+                schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
+                remainingActions: queueRuntime.getActivationIntentCount(),
+                reason: 'coordinator-paused',
+                paused: true
+            }
+        }
+    }
+    if(slotDecision?.planOnlyQueuedAuthorityPreserved === true) {
+        incrementQueueWakeupMetric('pump.noop.planOnlyQueuedAuthorityPreserved')
+        return {outcome: 'break'}
+    }
+    if(slotDecision?.clearedStaleServiceWorkerOwnerPause === true) {
+        incrementQueueWakeupMetric('pump.changed.clearedStaleServiceWorkerOwnerPause')
+    }
+    if(slotDecision?.canceledPausedOwner === true) {
+        return {outcome: 'continue'}
+    }
+    if(slotDecision?.activationGuardInFlight === true) {
+        const fillFailureReason = 'queued-activation-in-flight'
+        incrementQueueWakeupMetric('pump.noop.activationGuardInFlight')
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-open-decision',
+            source: 'fillQueuedTabsOnce',
+            rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
+            targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
+            attemptId: getAttemptIdFromValue(next),
+            attemptNumber: getAttemptNumberFromValue(next),
+            runId: next.runId || '',
+            accepted: false,
+            changed: false,
+            reason: fillFailureReason
+        })
+        scheduleCoordinatorQueueResume(500, fillFailureReason, {
+            allowBeforeQuora: true
+        })
+        return {outcome: 'continue', fillFailureReason}
+    }
+    if(!next) {
+        const fillFailureReason = slotDecision?.reason || 'no-activation-intent'
+        return {outcome: 'break', fillFailureReason}
+    }
+    return {outcome: 'proceed', next, activationGuardKey: '', openingActionKey: ''}
+}
+
 async function fillQueuedTabsOnce(options = {}) {
     await ownedTabIdsReady
     let openedTabs = 0
@@ -29722,67 +29788,19 @@ async function fillQueuedTabsOnce(options = {}) {
         }, {
             reason: 'activation-slot'
         })
-        const next = slotDecision?.action || null
-        let activationGuardKey = ''
-        let openingActionKey = ''
-        if(slotDecision?.paused === true) {
-            fillFailureReason = 'coordinator-paused'
-            incrementQueueWakeupMetric('pump.noop.pausedBeforeOpen')
-            finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused', {
-                active: queueRuntime.getActiveQueuedTabCount(),
-                schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                remainingActions: queueRuntime.getActivationIntentCount()
-            })
-            recordFlightRecorderEvent({
-                kind: 'fill-decision',
-                source: 'fillQueuedTabsOnce',
-                reason: 'coordinator-paused',
-                accepted: false,
-                changed: false
-            })
-            return {
-                openedTabs: 0,
-                active: queueRuntime.getActiveQueuedTabCount(),
-                schedulerBlockingActive: getSchedulerBlockingQueuedExecutorCount(),
-                remainingActions: queueRuntime.getActivationIntentCount(),
-                reason: 'coordinator-paused',
-                paused: true
-            }
-        }
-        if(slotDecision?.planOnlyQueuedAuthorityPreserved === true) {
-            incrementQueueWakeupMetric('pump.noop.planOnlyQueuedAuthorityPreserved')
+        const slotOutcome = decideSlotOutcome({slotDecision, cycle})
+        if(slotOutcome.outcome === 'return') return slotOutcome.result
+        if(slotOutcome.outcome === 'break') {
+            if(slotOutcome.fillFailureReason !== undefined) fillFailureReason = slotOutcome.fillFailureReason
             break
         }
-        if(slotDecision?.clearedStaleServiceWorkerOwnerPause === true) {
-            incrementQueueWakeupMetric('pump.changed.clearedStaleServiceWorkerOwnerPause')
-        }
-        if(slotDecision?.canceledPausedOwner === true) {
+        if(slotOutcome.outcome === 'continue') {
+            if(slotOutcome.fillFailureReason !== undefined) fillFailureReason = slotOutcome.fillFailureReason
             continue
         }
-        if(slotDecision?.activationGuardInFlight === true) {
-            fillFailureReason = 'queued-activation-in-flight'
-            incrementQueueWakeupMetric('pump.noop.activationGuardInFlight')
-            recordFlightRecorderEvent({
-                kind: 'queued-tab-open-decision',
-                source: 'fillQueuedTabsOnce',
-                rowKey: next.coordinatorKey || next.profileHref || next.targetProfileHref || next.url || '',
-                targetUrl: next.profileHref || next.targetProfileHref || next.url || next.requestedUrl || '',
-                attemptId: getAttemptIdFromValue(next),
-                attemptNumber: getAttemptNumberFromValue(next),
-                runId: next.runId || '',
-                accepted: false,
-                changed: false,
-                reason: fillFailureReason
-            })
-            scheduleCoordinatorQueueResume(500, fillFailureReason, {
-                allowBeforeQuora: true
-            })
-            continue
-        }
-        if(!next) {
-            fillFailureReason = slotDecision?.reason || 'no-activation-intent'
-            break
-        }
+        const next = slotOutcome.next
+        let activationGuardKey = slotOutcome.activationGuardKey
+        let openingActionKey = slotOutcome.openingActionKey
 
         try {
             if(next.executorPlanKind !== 'open-tab') {
