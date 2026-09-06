@@ -29126,6 +29126,34 @@ const {
     buildQueuedTabOpenedProgressPatch
 } = queuedTabOpenEffect
 
+function decideFastActiveTransitionOutcome(params = {}) {
+    const {activeTransitionAccepted, activeTransitionError, tab} = params
+    if(activeTransitionAccepted) {
+        markQueuedTabDurablyActive(tab.id, 'active-transition-fast-confirmed')
+    }
+    else {
+        setQueuedTabMetadata(tab.id, {
+            activeTransitionContinuedAt: Date.now(),
+            activeTransitionError,
+            activeTransitionUnconfirmedAt: Date.now(),
+            activeTransitionUnconfirmedReason: 'fast-path-storage-lane-detached'
+        })
+        markQueuedTabDurablyActive(tab.id, 'active-transition-fast-detached')
+        scheduleCoordinatorQueueResume(1000, 'active-transition-fast-detached', {
+            allowBeforeQuora: true
+        })
+        scheduleQueuedWorkContinuation('active-transition-fast-detached')
+    }
+    return {
+        activeTransitionAccepted,
+        activeTransitionError,
+        activeTransitionContinued: !activeTransitionAccepted,
+        activeTransitionFastUnconfirmed: !activeTransitionAccepted,
+        keepOpen: true,
+        rolledBack: false
+    }
+}
+
 async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {}) {
     let activeTransitionAccepted = false
     let activeTransitionError = ''
@@ -29168,30 +29196,7 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
         catch(error) {
             activeTransitionError = error?.message || `${error || ''}`
         }
-        if(activeTransitionAccepted) {
-            markQueuedTabDurablyActive(tab.id, 'active-transition-fast-confirmed')
-        }
-        else {
-            setQueuedTabMetadata(tab.id, {
-                activeTransitionContinuedAt: Date.now(),
-                activeTransitionError,
-                activeTransitionUnconfirmedAt: Date.now(),
-                activeTransitionUnconfirmedReason: 'fast-path-storage-lane-detached'
-            })
-            markQueuedTabDurablyActive(tab.id, 'active-transition-fast-detached')
-            scheduleCoordinatorQueueResume(1000, 'active-transition-fast-detached', {
-                allowBeforeQuora: true
-            })
-            scheduleQueuedWorkContinuation('active-transition-fast-detached')
-        }
-        return {
-            activeTransitionAccepted,
-            activeTransitionError,
-            activeTransitionContinued: !activeTransitionAccepted,
-            activeTransitionFastUnconfirmed: !activeTransitionAccepted,
-            keepOpen: true,
-            rolledBack: false
-        }
+        return decideFastActiveTransitionOutcome({activeTransitionAccepted, activeTransitionError, tab})
     }
     try {
         activeTransitionAccepted = await promiseWithTimeout(
