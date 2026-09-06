@@ -1650,6 +1650,95 @@ logic. No further Part 2 target has been chosen yet; the "Next 20 Part 2
 targets" list above remains the candidate pool for whatever is picked
 next, pending explicit direction.
 
+## Part 2 continued -- confirmQueuedTabOpenDurableActiveEffect
+
+Priority target #2 from the list above. Fresh read (2026-09, current
+lines 29129-29513, ~385 lines; re-verify before executing) of the whole
+function. Structurally different from `fillQueuedTabsOnce`: not one long
+`while` loop, but a handful of large mutually-exclusive branches selected
+by `options.returnAfterDurableActive` and by whether the active-transition
+await succeeds.
+
+**Map of decide/act spans:**
+
+1. **Setup + Promise-chain construction** (29130-29143) -- declares the
+   mutable outcome locals, computes the timeout, and builds (but does not
+   yet await) `activeTransitionPromise` by chaining `.then()` off
+   `transitionCoordinatorItemForQueuedTab(...)`. The `.then()` callback
+   body (29144-29159) is itself fully sync (`releaseQueuedActivationGuard`,
+   `incrementQueueWakeupMetric`, `markQueuedTabDurablyActive`,
+   `scheduleCoordinatorQueueResume`) but is attached to a Promise that
+   isn't awaited until later -- leave this construction resident; there's
+   no decide/act win here, and moving Promise-chain construction is where
+   past slices found the most subtlety.
+2. **`returnAfterDurableActive` fast path** (29160-29195) -- `await
+   promiseWithTimeout(activeTransitionPromise, ...)` in a try/catch, then
+   a fully sync tail (29171-29194): branch on `activeTransitionAccepted`,
+   set metadata/mark/schedule calls, then an unconditional `return {...}`.
+   **Cleanest candidate, structurally identical to the many bare-return
+   decide extractions already done in `fillQueuedTabsOnce`** (P2-4/P2-6/
+   P2-8/P2-9's pattern) -- do this first.
+3. **Main-path await + a dead-code guard** (29196-29227) -- the second
+   `await promiseWithTimeout(...)` try/catch (act, not extractable), then
+   an `if(returnAfterDurableActive && !activeTransitionAccepted && ...)`
+   check at 29207. **This condition is unreachable**: branch 2 above
+   always returns when `returnAfterDurableActive` is true, so by line 29207
+   it is always false. Confirmed by tracing control flow, not just
+   grepping -- this is pre-existing dead code, not something this
+   decomposition effort introduced. Flag it in the extraction's commit
+   message but do not "fix" it (out of scope); if this span is ever
+   extracted, preserve the dead branch byte-for-byte like every prior
+   slice has preserved other harmless oddities (e.g. P2-6's unreachable
+   trailing `continue`).
+4. **The big nested `if(!activeTransitionAccepted)` block** (29228-29385)
+   -- the real complexity. `await confirmQueuedTabDurablyActive(...)` ->
+   sync `shouldKeepQueuedTabOpenAfterActiveTransitionFailure` check ->
+   two exclusive paths:
+   - **`activeTransitionContinued` path** (29246-29254): fully sync
+     (`setQueuedTabMetadata` + `scheduleCoordinatorQueueResume`), falls
+     through to the function's final `return` at 29506-29512 -- a clean,
+     small, self-contained decide candidate on its own.
+   - **rollback path** (29255-29385): `markQueuedTabClosing` -> `await
+     rollbackFailedQueuedTabOpen(...)` -> sync branch (early return if
+     `rolledBack`) -> conditional `await loadCoordinatorQueueProjection()`
+     -> sync computation of `sameTabReclaimedByDifferentAttempt` -> early
+     return if true (with its own `await browser.tabs.remove` + `void
+     releaseQueuedTab`) -> nested `if(activeTransitionSettled)` with
+     another conditional `await loadCoordinatorQueueProjection()` -> sync
+     `rowStayedQueued` computation -> early return if true (with its own
+     awaits) -> final sync fallthrough return. Heavily interleaved, same
+     shape as `fillQueuedTabsOnce`'s old regions #4/#5 -- needs
+     per-branch extraction across multiple slices, not one block. The
+     individual sync decision fragments (`sameTabReclaimedByDifferentAttempt`
+     computation, `rowStayedQueued` computation, each roughly 15-20 lines)
+     are themselves clean candidates once isolated from their bracketing
+     awaits.
+5. **`else` branch: `returnAfterDurableActive` false path when transition
+   accepted immediately** (29387-29504) -- `markQueuedTabDurablyActive`,
+   then (if `returnAfterDurableActive`, already established false by this
+   point via the same dead-code pattern as #3 -- **also unreachable**,
+   confirm on execution) an early return, then sync
+   `sameTabReclaimedByDifferentAttempt` computation (structurally
+   identical to the one inside #4's rollback path, worth comparing side by
+   side for a possible shared helper once both are extracted) -> early
+   return if true -> `await getQueuedExecutorTabStatusWithTimeout(...)` ->
+   sync branch on `liveTabStatus` (missing/tab-lookup-failed/ok), each
+   sub-branch self-contained with its own awaits and returns.
+
+**Best next slice: extract #2 only** (the `returnAfterDurableActive`
+fast-path sync tail) as Slice P2-10 -- smallest, safest, most isolated,
+proven pattern. Params needed: `activeTransitionAccepted`,
+`activeTransitionError`, `tab`. Everything else it touches
+(`markQueuedTabDurablyActive`, `setQueuedTabMetadata`,
+`scheduleCoordinatorQueueResume`, `scheduleQueuedWorkContinuation`,
+`Date.now`) is module-scope in `sw.js`, so no realm-crossing question
+applies (Part 2 stays in-file) and nothing else needs threading. Later
+slices will pick off #4's two sub-branches and #5's independent sub-spans
+one at a time, following the same incremental, map-then-extract rhythm
+used for `fillQueuedTabsOnce`.
+
+Same verification rigor as every prior Part 2 slice.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
