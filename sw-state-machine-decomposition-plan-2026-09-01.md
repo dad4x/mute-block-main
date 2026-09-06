@@ -1739,6 +1739,34 @@ used for `fillQueuedTabsOnce`.
 
 Same verification rigor as every prior Part 2 slice.
 
+**Completed** (done directly, same as P2-9, given the span's small,
+isolated, well-understood scope; independently re-verified by reading the
+full diff -- confirmed byte-for-byte textual move, no logic changed --
+and running the full test suite twice more, both green, plus both
+production builds). Extracted lines 29171-29194 into
+`decideFastActiveTransitionOutcome(params)`, taking
+`{activeTransitionAccepted, activeTransitionError, tab}`; the call site
+became a single `return decideFastActiveTransitionOutcome({...})`.
+Checked `test/p1-contract.test.js` for assertions scoped to the moved
+literal strings (`active-transition-fast-confirmed`,
+`active-transition-fast-detached`, `fast-path-storage-lane-detached`) --
+none exist; the one nearby assertion referencing similar-looking strings
+(`active-transition-fast-unconfirmed`, `fast-path-storage-lane-timeout`,
+region #3's dead-code span) matches different, untouched content, so no
+test update was needed.
+
+### Slice P2-11 -- next up
+
+Region #4's two sub-branches (the `activeTransitionContinued` path,
+29246-29254 pre-P2-10-edit, and the larger rollback path,
+29255-29385 pre-P2-10-edit) are the next candidates -- re-grep fresh
+before executing, since P2-10's edit shifted everything below it by
+roughly -18 lines (30 lines removed from the call site, 28 lines added
+for the new function placed earlier in the file -- net shift is small but
+non-zero, don't trust these numbers without re-checking). Start with the
+`activeTransitionContinued` path (smaller, cleaner, no nested awaits) before
+attempting the rollback path's per-branch extraction.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
