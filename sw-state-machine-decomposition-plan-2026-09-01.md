@@ -2102,6 +2102,39 @@ already-confirmed-different `fillQueuedTabsOnce` throttle gate from
 P2-2/P2-14's own mapping note; untouched by this slice, no update
 needed.
 
+### Slice P2-15 -- authority preflight (region 6) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff and running the full test suite twice more, both green, plus both
+production builds). The `await runCoordinatorAuthorityReconcileActions(...)`
+call and its options-object construction stayed resident (genuine I/O);
+extracted the sync guard-and-branch that consumes its result (18768-18788
+pre-edit) into `decideFastExecutorAuthorityPreflightOutcome(params)`,
+taking `{authorityPreflight, reason, options}` and returning
+`{authorityPreflightChanged, earlyReturn}` (`earlyReturn` is either the
+bare-return object or `null` to continue) -- the shell destructures both
+fields, matching the same discriminated-outcome-plus-continue shape used
+for several `fillQueuedTabsOnce` extractions.
+
+Found and fixed **two** real test dependencies in
+`test/p1-contract.test.js`'s `'idle storage updates reconcile durable
+active work before queue fill'` test (the one with `fastPathBody`):
+`assert.match(fastPathBody, /pump\.fastExecutor\.authorityPreflightContinued/)`
+and `assert.doesNotMatch(fastPathBody, /post-authority-preflight[\s\S]{0,250}scheduleCoordinatorReconcile/)`
+both targeted content that moved out of `fastPathBody` entirely. Added an
+`extractFunction` call for the new `decideFastExecutorAuthorityPreflightOutcome`
+and re-pointed both assertions at it -- the second one especially needed
+re-pointing rather than just leaving it (a `doesNotMatch` against content
+that no longer exists in `fastPathBody` would have passed vacuously,
+silently stopping it from actually verifying the anti-regression
+invariant it was written for). Double-checked
+`options.continueAfterAuthorityPreflight === true` and
+`authorityPreflightChanged`-referencing assertions still hold: both
+strings still appear in `fastPathBody` from other, untouched usages
+further down the function (lines ~18826/18849/18911 for the former, the
+`forceDurableQueueReload`/`changed` computations for the latter), so
+those assertions needed no change.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the

@@ -18663,6 +18663,36 @@ function decideFastExecutorThrottleGate(params = {}) {
     return null
 }
 
+function decideFastExecutorAuthorityPreflightOutcome(params = {}) {
+    const {authorityPreflight, reason, options} = params
+    let authorityPreflightChanged = false
+    if(authorityPreflight?.changed === true || (authorityPreflight?.actions || 0) > 0) {
+        authorityPreflightChanged = true
+        incrementQueueWakeupMetric('pump.fastExecutor.authorityPreflightChanged')
+        scheduleCoordinatorQueueResume(1000, `${reason || 'resume'}-post-authority-preflight`, {
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
+        if(options.continueAfterAuthorityPreflight === true) {
+            incrementQueueWakeupMetric('pump.fastExecutor.authorityPreflightContinued')
+        }
+        else {
+            return {
+                authorityPreflightChanged,
+                earlyReturn: {
+                    ...(authorityPreflight || {}),
+                    queued: 0,
+                    pending: 0,
+                    active: 0,
+                    changed: true,
+                    fastPath: true,
+                    reason: 'fast-executor-authority-preflight-changed'
+                }
+            }
+        }
+    }
+    return {authorityPreflightChanged, earlyReturn: null}
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
         resetQueuedTabFillState()
@@ -18765,26 +18795,10 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
             queueOnlyAuthority: true,
             forceDurableQueueReload: forceDurableQueueReloadForRuntimeRecovery
         })
-        if(authorityPreflight?.changed === true || (authorityPreflight?.actions || 0) > 0) {
-            authorityPreflightChanged = true
-            incrementQueueWakeupMetric('pump.fastExecutor.authorityPreflightChanged')
-            scheduleCoordinatorQueueResume(1000, `${reason || 'resume'}-post-authority-preflight`, {
-                allowBeforeQuora: options.allowBeforeQuora === true
-            })
-            if(options.continueAfterAuthorityPreflight === true) {
-                incrementQueueWakeupMetric('pump.fastExecutor.authorityPreflightContinued')
-            }
-            else {
-                return {
-                    ...(authorityPreflight || {}),
-                    queued: 0,
-                    pending: 0,
-                    active: 0,
-                    changed: true,
-                    fastPath: true,
-                    reason: 'fast-executor-authority-preflight-changed'
-                }
-            }
+        const preflightDecision = decideFastExecutorAuthorityPreflightOutcome({authorityPreflight, reason, options})
+        authorityPreflightChanged = preflightDecision.authorityPreflightChanged
+        if(preflightDecision.earlyReturn) {
+            return preflightDecision.earlyReturn
         }
     }
 
