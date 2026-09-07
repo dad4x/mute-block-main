@@ -29154,6 +29154,28 @@ function decideFastActiveTransitionOutcome(params = {}) {
     }
 }
 
+function decideActiveTransitionContinuationChoice(params = {}) {
+    const {activeTransitionAccepted, activeTransitionError, action, tab, plan} = params
+    let activeTransitionContinued = false
+    if(!activeTransitionAccepted) {
+        activeTransitionContinued = shouldKeepQueuedTabOpenAfterActiveTransitionFailure(
+            action,
+            tab,
+            plan.activeTransitionDetails || {}
+        )
+    }
+    if(activeTransitionContinued) {
+        setQueuedTabMetadata(tab.id, {
+            activeTransitionContinuedAt: Date.now(),
+            activeTransitionError
+        })
+        scheduleCoordinatorQueueResume(1000, 'active-transition-continued', {
+            allowBeforeQuora: true
+        })
+    }
+    return {activeTransitionContinued}
+}
+
 async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {}) {
     let activeTransitionAccepted = false
     let activeTransitionError = ''
@@ -29241,23 +29263,10 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
             QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
             'queued tab active confirmation check'
         ).catch(() => false)
-        if(!activeTransitionAccepted) {
-            activeTransitionContinued = shouldKeepQueuedTabOpenAfterActiveTransitionFailure(
-                action,
-                tab,
-                plan.activeTransitionDetails || {}
-            )
-        }
-        if(activeTransitionContinued) {
-            setQueuedTabMetadata(tab.id, {
-                activeTransitionContinuedAt: Date.now(),
-                activeTransitionError
-            })
-            scheduleCoordinatorQueueResume(1000, 'active-transition-continued', {
-                allowBeforeQuora: true
-            })
-        }
-        else if(!activeTransitionAccepted) {
+        activeTransitionContinued = decideActiveTransitionContinuationChoice({
+            activeTransitionAccepted, activeTransitionError, action, tab, plan
+        }).activeTransitionContinued
+        if(!activeTransitionContinued && !activeTransitionAccepted) {
             markQueuedTabClosing(tab.id, 'active-transition-failed')
             const rolledBack = await rollbackFailedQueuedTabOpen(action, tab, {
                 ...(plan.activeTransitionDetails || {}),

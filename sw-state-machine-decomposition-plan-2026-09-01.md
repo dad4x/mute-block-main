@@ -1868,6 +1868,40 @@ addressed by this documentation, not by code changes -- that satisfies
 "go through all of those" for those two without forcing a pointless
 extraction.
 
+### Slice P2-11 -- activeTransitionContinued guard (region 4a) (done)
+
+Completed (done directly, same as P2-9/P2-10; independently re-verified
+by reading the full diff and running the full test suite twice, both
+green, plus both production builds). Extracted the guard computation and
+its `if(activeTransitionContinued) {...}` side-effect branch (lines
+29244-29259 pre-edit) into `decideActiveTransitionContinuationChoice(params)`,
+taking `{activeTransitionAccepted, activeTransitionError, action, tab,
+plan}` and returning `{activeTransitionContinued}`.
+
+Unlike P2-9/P2-10 this was **not** a pure textual move: the original
+`if(activeTransitionContinued) {A} else if(!activeTransitionAccepted)
+{B}` became `activeTransitionContinued = decide(...).activeTransitionContinued;
+if(!activeTransitionContinued && !activeTransitionAccepted) {B}` (with
+`A`'s side effects now living inside the decide function). Hand-traced
+all three reachable cases to confirm equivalence: (1)
+`activeTransitionContinued` true -> decide performs `A`'s side effects,
+shell's `if` is false, `B` skipped, matches original; (2)
+`activeTransitionContinued` false and `activeTransitionAccepted` false ->
+decide performs no side effects, shell's `if` is true, `B` runs, matches
+original's `else if(!activeTransitionAccepted)`; (3)
+`activeTransitionContinued` false and `activeTransitionAccepted` true ->
+neither `A` nor `B` runs in either version. All three match.
+
+Found and fixed one real test dependency: `test/p1-contract.test.js`'s
+`'background tab opening updates authoritative Current Work'` test had
+`assert.match(activeEffectBody.slice(failedTransitionIndex),
+/shouldKeepQueuedTabOpenAfterActiveTransitionFailure\(/)`, which broke
+because that call moved out of `confirmQueuedTabOpenDurableActiveEffect`'s
+body entirely. Added an `extractFunction` call for the new
+`decideActiveTransitionContinuationChoice` and pointed that assertion (and
+the `active-transition-continued` half of a combined regex-alternation
+assertion, split out for precision) at the new function's body instead.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the

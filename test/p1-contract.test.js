@@ -2849,6 +2849,9 @@ test('background tab opening updates authoritative Current Work', () => {
     const planBody = extractFunction(queuedTabOpenEffectSource, 'function buildQueuedTabOpenEffectPlan(action = {}, tab = {}, openedAt = now())')
     const progressBody = extractFunction(queuedTabOpenEffectSource, 'function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {})')
     const activeEffectBody = extractFunction(source, 'async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {})')
+    // the activeTransitionContinued guard was extracted to
+    // decideActiveTransitionContinuationChoice in decomposition Slice P2-11.
+    const continuationChoiceBody = extractFunction(source, 'function decideActiveTransitionContinuationChoice(params = {})')
     const ensureContentBody = extractFunction(source, 'async function ensureQueuedTabContentScript(tabId, reason = \'\')')
     const transitionIndex = body.indexOf('confirmQueuedTabOpenDurableActiveEffect(next, tab, openPlan, {')
     const progressIndex = body.indexOf('recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref')
@@ -2924,8 +2927,9 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.match(activeEffectBody, /activeTransitionError/)
     assert.match(activeEffectBody, /activeTransitionContinued/)
     assert.match(activeEffectBody.slice(failedTransitionIndex), /confirmQueuedTabDurablyActive\(action, tab/)
-    assert.match(activeEffectBody.slice(failedTransitionIndex), /shouldKeepQueuedTabOpenAfterActiveTransitionFailure\(/)
-    assert.match(activeEffectBody.slice(failedTransitionIndex), /scheduleCoordinatorQueueResume\(1000, 'active-transition-(?:continued|unconfirmed)', \{[\s\S]*allowBeforeQuora: true/)
+    assert.match(continuationChoiceBody, /shouldKeepQueuedTabOpenAfterActiveTransitionFailure\(/)
+    assert.match(continuationChoiceBody, /scheduleCoordinatorQueueResume\(1000, 'active-transition-continued', \{[\s\S]*allowBeforeQuora: true/)
+    assert.match(activeEffectBody.slice(failedTransitionIndex), /scheduleCoordinatorQueueResume\(1000, 'active-transition-unconfirmed', \{[\s\S]*allowBeforeQuora: true/)
     assert.match(activeEffectBody, /if\(returnAfterDurableActive && !activeTransitionAccepted && !activeTransitionSettled\) \{[\s\S]*activeTransitionUnconfirmedReason: 'fast-path-storage-lane-timeout'[\s\S]*markQueuedTabDurablyActive\(tab\.id, 'active-transition-fast-unconfirmed'\)[\s\S]*scheduleQueuedWorkContinuation\('active-transition-fast-unconfirmed'\)[\s\S]*activeTransitionFastUnconfirmed: true/)
     assert.ok(
         activeEffectBody.indexOf('if(returnAfterDurableActive && !activeTransitionAccepted && !activeTransitionSettled)') <
