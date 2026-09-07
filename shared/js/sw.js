@@ -13535,6 +13535,10 @@ async function restoreActiveLiveCoordinatorQueuedTabAction(item = null, itemKey 
         durableActiveReason: 'active-live-runtime-restored',
         lastUrl: liveTab?.url || tab?.url || requestedUrl
     }
+    const preRestoreMetadata = getQueuedTabMetadata(tabId) || {}
+    if(wasQueuedRuntimeTabRemoved(tabId) || preRestoreMetadata.closeRequestedAt || preRestoreMetadata.closeReason) {
+        return {changed: false, reason: 'active-live-runtime-tab-closing'}
+    }
     applyQueuedTabOpenRuntimeEffect(plan)
 
     const confirmedActive = await confirmQueuedTabDurablyActive(action, liveTab, {
