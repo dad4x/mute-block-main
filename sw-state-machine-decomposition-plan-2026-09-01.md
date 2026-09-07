@@ -2515,6 +2515,37 @@ test, for `decideFastExecutorAuthorityPreflightOutcome` and
 pattern, confirmed no stray references to the other 3 moved names.
 Ran the full suite twice more and both builds myself, all green.
 
+### Slice P2.5-3 -- swResumeQueueExecutionDecisions.js (done)
+
+Completed (commit `3aa90c7`, via sub-agent; independently re-verified:
+read the new module in full, confirmed it matches the bodies extracted
+earlier for P2-18 through P2-21, and independently re-derived the TDZ
+check myself rather than trusting the report). **This one found a
+genuine construction-order hazard**, correctly caught and fixed by the
+agent: two dependencies (`isCoordinatorPauseRequestedLocally`,
+`normalizeRawCoordinatorQueueForReconcileFallback`) only become bare
+consts after `swSchedulerAlarmBookkeeping`'s destructure, which resolves
+*later* in the file than these functions' original resident position --
+as hoisted `function` declarations that was fine (JS hoisting means a
+function body can reference a not-yet-assigned `const` as long as it's
+not *called* until later), but a `deps` object literal passed to a
+factory call is evaluated immediately, so the same bare-identifier
+reference would throw a real TDZ `ReferenceError` if the construction
+call were placed at the old position. Fixed by moving the construction
+call to right after `fastExecutorDecisions`'s own destructure (which
+lands after the needed declarations). Verified myself by checking all 9
+dependencies' actual declaration lines against the construction call
+site (18578): all 9 confirmed before it, and specifically confirmed
+`isCoordinatorPauseRequestedLocally` (18357) and
+`normalizeRawCoordinatorQueueForReconcileFallback` (18362) would indeed
+have been referenced before their declarations had the call stayed at
+the functions' old ~17626 position -- the hazard was real, not
+over-cautious. Two `test/p1-contract.test.js` references needed
+updating (`decideResumeShouldUseFallbackOutcome`,
+`decideResumeCoordinatorStoredPausedOutcome`), fixed following the
+established pattern; confirmed no stray references to the other 5 moved
+names. Ran the full suite twice more and both builds myself, all green.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
