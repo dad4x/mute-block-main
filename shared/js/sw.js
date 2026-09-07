@@ -260,6 +260,9 @@ const {
 const {
     createQueuedTabOpenEffect
 } = require('./swQueuedTabOpenEffect')
+const {
+    createQueuedTabActiveTransitionDecisions
+} = require('./swQueuedTabActiveTransitionDecisions')
 const queueRuntime = createQueueRuntimeState()
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
@@ -12314,95 +12317,65 @@ async function recordCoordinatorJobProgressViaQueueMachine(profileHref = '', pat
     return progressPromise
 }
 
-function decideActiveTransitionOutcome(item, record, now, params = {}) {
-    const {href, senderTabId} = params
-    if(!item) return {outcome: 'reject', reason: 'missing-row'}
-    if(!shouldApplyProgressToCoordinatorItem(item, record)) {
-        return {outcome: 'reject', reason: 'action-kind-changed'}
+// queuedTabActiveTransitionDecisions (decomposition Slice P2.5-1) is
+// constructed here, at decideActiveTransitionOutcome's old source-text
+// position: that's the earliest call site among the module's five decide
+// functions (right below, in transitionCoordinatorItemForQueuedTabLocked),
+// so constructing here also precedes decideFastActiveTransitionOutcome/
+// decideActiveTransitionContinuationChoice/
+// decideActiveTransitionReclaimedByDifferentAttempt's own old source-text
+// position much further down -- their call sites don't force any earlier
+// construction either. No already-extracted module eagerly references any
+// of this module's five exports at its own construction-call site (each of
+// the five source functions had exactly one call site in the whole file
+// before this move), so there's no forcing hazard from that direction.
+// Every handler below is already a bare const by this point: coordinatorStatusRules
+// (isTerminalCoordinatorStatus, isActiveCoordinatorStatus),
+// coordinatorAttemptIdentity (hasMismatchedCoordinatorAttempt,
+// getAttemptIdFromValue, getAttemptNumberFromValue), coordinatorProgressRules
+// (shouldApplyProgressToCoordinatorItem, getCoordinatorStatusFromProgress),
+// coordinatorProgressReducer (transitionCoordinatorItemFromProgress),
+// coordinatorExecutorClassification/profileResolution (getCoordinatorItemHref,
+// getCoordinatorItemQueueKey), the top-of-file subject.js require
+// (normalizeQuoraProfileUrl), tabIdUtils (normalizeTabId),
+// coordinatorReconcileSupportSingles (isSameActiveTransitionForCoordinatorItem,
+// shouldKeepQueuedTabOpenAfterActiveTransitionFailure), queueWakeupMetricsShape
+// (incrementQueueWakeupMetric), and coordinatorReconcileInputs/
+// queuedTabMetadataAndActionLease (markQueuedTabDurablyActive,
+// setQueuedTabMetadata). scheduleCoordinatorQueueResume and
+// scheduleQueuedWorkContinuation are still plain hoisted function
+// declarations further down in this file and are available from any point
+// in this scope regardless of textual position.
+const queuedTabActiveTransitionDecisions = createQueuedTabActiveTransitionDecisions({
+    handlers: {
+        shouldApplyProgressToCoordinatorItem,
+        isTerminalCoordinatorStatus,
+        hasMismatchedCoordinatorAttempt,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        getCoordinatorStatusFromProgress,
+        transitionCoordinatorItemFromProgress,
+        getCoordinatorItemHref,
+        normalizeQuoraProfileUrl,
+        getCoordinatorItemQueueKey,
+        isSameActiveTransitionForCoordinatorItem,
+        incrementQueueWakeupMetric,
+        markQueuedTabDurablyActive,
+        setQueuedTabMetadata,
+        scheduleCoordinatorQueueResume,
+        scheduleQueuedWorkContinuation,
+        shouldKeepQueuedTabOpenAfterActiveTransitionFailure,
+        normalizeTabId,
+        isActiveCoordinatorStatus
     }
-    if(isTerminalCoordinatorStatus(item.status)) {
-        return {outcome: 'reject', reason: 'terminal-status'}
-    }
-    if(hasMismatchedCoordinatorAttempt(item, record)) {
-        return {
-            outcome: 'reject',
-            reason: 'stale-attempt',
-            diagnostic: {
-                profileHref: href,
-                incomingAttemptId: getAttemptIdFromValue(record),
-                expectedAttemptId: getAttemptIdFromValue(item),
-                senderTabId: senderTabId || null,
-                message: 'Ignored queued tab transition from stale attempt'
-            }
-        }
-    }
-    const currentAttemptId = getAttemptIdFromValue(item)
-    const currentAttemptNumber = getAttemptNumberFromValue(item)
-    const incomingAttemptId = getAttemptIdFromValue(record)
-    const incomingAttemptNumber = getAttemptNumberFromValue(record)
-    if((currentAttemptId && !incomingAttemptId) || (currentAttemptNumber && !incomingAttemptNumber)) {
-        return {
-            outcome: 'reject',
-            reason: 'missing-attempt-identity',
-            diagnostic: {
-                profileHref: href,
-                incomingAttemptId,
-                expectedAttemptId: currentAttemptId,
-                senderTabId: senderTabId || null,
-                message: 'Ignored queued tab transition without required attempt identity'
-            }
-        }
-    }
-
-    const mapped = getCoordinatorStatusFromProgress(record)
-    if(!mapped.status) return {outcome: 'reject', reason: 'no-mapped-status'}
-
-    const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-        now
-    })
-    if(JSON.stringify(nextItem) === JSON.stringify(item)) return {outcome: 'noop'}
-
-    return {outcome: 'proceed', mapped, nextItem}
-}
-
-function decideActiveTransitionMutation(currentItem, context, params = {}) {
-    const {
-        record,
-        mapped,
-        now,
-        incomingAttemptId,
-        incomingAttemptNumber,
-        itemHref,
-        itemCoordinatorKey,
-        itemKey,
-        tabId
-    } = params
-    if(!currentItem || isTerminalCoordinatorStatus(currentItem.status)) {
-        return context.reject('missing-or-terminal-row')
-    }
-    if(!shouldApplyProgressToCoordinatorItem(currentItem, record)) {
-        return context.reject('action-kind-changed')
-    }
-    if(hasMismatchedCoordinatorAttempt(currentItem, record)) {
-        return context.reject('stale-attempt', {staleAttempt: true})
-    }
-    if((getAttemptIdFromValue(currentItem) && !incomingAttemptId) ||
-        (getAttemptNumberFromValue(currentItem) && !incomingAttemptNumber)) {
-        return context.reject('missing-attempt-identity', {staleAttempt: true})
-    }
-    if((getCoordinatorItemHref(currentItem) || normalizeQuoraProfileUrl(itemKey)) !== itemHref ||
-        getCoordinatorItemQueueKey(currentItem, itemKey) !== itemCoordinatorKey) {
-        return context.reject('row-target-changed-before-authority-apply')
-    }
-    if(isSameActiveTransitionForCoordinatorItem(currentItem, record, tabId)) {
-        incrementQueueWakeupMetric('coordinatorAuthority.activeTransition.duplicateSameTabNoop')
-        return currentItem
-    }
-    const transitionedItem = transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
-        now
-    })
-    return transitionedItem
-}
+})
+const {
+    decideActiveTransitionOutcome,
+    decideActiveTransitionMutation,
+    decideFastActiveTransitionOutcome,
+    decideActiveTransitionContinuationChoice,
+    decideActiveTransitionReclaimedByDifferentAttempt
+} = queuedTabActiveTransitionDecisions
 
 async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}, details = {}, href = '', coordinatorKey = '') {
     const actionKind = getCoordinatorActionKindForRequestedAction(action?.actionKind || action?.tabAction || '')
@@ -29212,79 +29185,6 @@ const {
     applyQueuedTabOpenRuntimeEffect,
     buildQueuedTabOpenedProgressPatch
 } = queuedTabOpenEffect
-
-function decideFastActiveTransitionOutcome(params = {}) {
-    const {activeTransitionAccepted, activeTransitionError, tab} = params
-    if(activeTransitionAccepted) {
-        markQueuedTabDurablyActive(tab.id, 'active-transition-fast-confirmed')
-    }
-    else {
-        setQueuedTabMetadata(tab.id, {
-            activeTransitionContinuedAt: Date.now(),
-            activeTransitionError,
-            activeTransitionUnconfirmedAt: Date.now(),
-            activeTransitionUnconfirmedReason: 'fast-path-storage-lane-detached'
-        })
-        markQueuedTabDurablyActive(tab.id, 'active-transition-fast-detached')
-        scheduleCoordinatorQueueResume(1000, 'active-transition-fast-detached', {
-            allowBeforeQuora: true
-        })
-        scheduleQueuedWorkContinuation('active-transition-fast-detached')
-    }
-    return {
-        activeTransitionAccepted,
-        activeTransitionError,
-        activeTransitionContinued: !activeTransitionAccepted,
-        activeTransitionFastUnconfirmed: !activeTransitionAccepted,
-        keepOpen: true,
-        rolledBack: false
-    }
-}
-
-function decideActiveTransitionContinuationChoice(params = {}) {
-    const {activeTransitionAccepted, activeTransitionError, action, tab, plan} = params
-    let activeTransitionContinued = false
-    if(!activeTransitionAccepted) {
-        activeTransitionContinued = shouldKeepQueuedTabOpenAfterActiveTransitionFailure(
-            action,
-            tab,
-            plan.activeTransitionDetails || {}
-        )
-    }
-    if(activeTransitionContinued) {
-        setQueuedTabMetadata(tab.id, {
-            activeTransitionContinuedAt: Date.now(),
-            activeTransitionError
-        })
-        scheduleCoordinatorQueueResume(1000, 'active-transition-continued', {
-            allowBeforeQuora: true
-        })
-    }
-    return {activeTransitionContinued}
-}
-
-function decideActiveTransitionReclaimedByDifferentAttempt(params = {}) {
-    const {currentAuthorityState, plan, action, tab} = params
-    const profileHref = plan.profileHref || normalizeQuoraProfileUrl(action.profileHref || action.url || '')
-    const coordinatorKey = plan.coordinatorKey || action.coordinatorKey || profileHref || ''
-    const currentItem = coordinatorKey && currentAuthorityState?.queue?.[coordinatorKey]
-        ? currentAuthorityState.queue[coordinatorKey]
-        : profileHref
-        ? currentAuthorityState?.queue?.[profileHref] || null
-        : null
-    const currentTabId = normalizeTabId(currentItem?.tabId || currentItem?.activeTabId || null)
-    const expectedAttemptId = getAttemptIdFromValue(plan.activeTransitionDetails || {}) || getAttemptIdFromValue(action)
-    const expectedAttemptNumber = getAttemptNumberFromValue(plan.activeTransitionDetails || {}) || getAttemptNumberFromValue(action)
-    const currentAttemptId = getAttemptIdFromValue(currentItem)
-    const currentAttemptNumber = getAttemptNumberFromValue(currentItem)
-    const sameTabReclaimedByDifferentAttempt = currentItem &&
-        isActiveCoordinatorStatus(currentItem.status) &&
-        currentTabId &&
-        currentTabId === normalizeTabId(tab?.id) &&
-        ((expectedAttemptId && currentAttemptId && currentAttemptId !== expectedAttemptId) ||
-            (expectedAttemptNumber && currentAttemptNumber && currentAttemptNumber !== expectedAttemptNumber))
-    return {sameTabReclaimedByDifferentAttempt}
-}
 
 async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {}) {
     let activeTransitionAccepted = false
