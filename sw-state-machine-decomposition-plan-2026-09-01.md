@@ -2356,6 +2356,46 @@ assertions on the moved literals (`runtime-action-revalidation`,
 `queueRuntime.getActivationIntentCount() &&`) -- none exist, no test
 update needed.
 
+### Slice P2-21 -- fallback guard + two derivations (region 5's clean pieces) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed pure textual moves throughout -- and running the full
+test suite twice more, both green, plus both production builds).
+Extracted three pieces: the top-level fallback guard condition into
+`decideResumeShouldUseFallbackOutcome(params)` (matching #4's
+boolean-only-extraction pattern), and the two small sync derivations
+(`rawQueue`/`pendingRawItems` from an already-resolved `rawQueueState`,
+and `walQueueCounts`/`pendingWalItems` from an already-resolved
+`walAuthorityState`) into `decideResumeRawQueueFallbackItems(params)` and
+`decideResumeWalQueueFallbackItems(params)` respectively. Left everything
+else in region 5 resident, per the mapping's assessment (the `if/else`
+branches themselves mix awaits with sync setup/result-merging
+inseparably).
+
+Found and fixed one real test dependency: `test/p1-contract.test.js`'s
+`'executor apply classifies before reducer decisions instead of
+pre-filling runtime surfaces'` test had an assertion checking (in one
+regex, via `[\s\S]*` ordering) that the fallback guard condition
+appeared before `loadCoordinatorQueueProjection(...)` inside
+`resumeBody` -- broke because the guard condition moved out of
+`resumeBody` entirely. Added an `extractFunction` call for
+`decideResumeShouldUseFallbackOutcome` and split the check in two: one
+assertion confirming the new function's body still has the three key
+condition clauses, and one confirming `resumeBody` still calls
+`decideResumeShouldUseFallbackOutcome({...})` before
+`loadCoordinatorQueueProjection({... 'pump.resume.storageProjectionFallback.load'...})`,
+preserving the original ordering guarantee the test was written to
+verify.
+
+**This completes every region on `resumeCoordinatorQueueExecutionOnce`'s
+priority list** (Slices P2-18 through P2-21). It now has 6 named
+`decide*` helpers pulled out of it. Region 1 (setup prelude, except its
+tiny no-coordinator guard) and the rest of region 5 (the interleaved
+`if`/`else` branches) remain resident, assessed as either low-value or
+genuinely act-dominated. No further Part 2 target has been chosen yet;
+priority #5 (`sweepStaleQueuedTabs`) is next on the "Next 20 Part 2
+targets" list.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any

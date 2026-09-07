@@ -17672,6 +17672,42 @@ function decideResumeShouldRevalidateFillOutcome(params = {}) {
         applyResult.reason !== 'no-coordinator'
 }
 
+function decideResumeShouldUseFallbackOutcome(params = {}) {
+    const {serviceWorkerOwned, options, shouldUseProjectionFallbackForResume, applyResult} = params
+    return serviceWorkerOwned &&
+        options.awaitFill !== false &&
+        shouldUseProjectionFallbackForResume &&
+        !((options.returnAfterDurableActive === true || serviceWorkerOwned) && queueRuntime.getActiveQueuedTabCount() > 0) &&
+        applyResult?.fillResult?.timedOut !== true &&
+        applyResult?.fillResult?.authorityUnavailable !== true &&
+        applyResult?.fillResult?.reason !== 'queued-tab-open-failed' &&
+        applyResult?.fillResult?.reason !== 'queued-tab-fill-timeout' &&
+        applyResult?.fillResult?.reason !== 'queued-tab-final-open-decision-timeout' &&
+        (Number.parseInt(applyResult?.active, 10) || 0) <= 0 &&
+        (Number.parseInt(applyResult?.fillResult?.active, 10) || 0) <= 0 &&
+        (Number.parseInt(applyResult?.fillResult?.openedTabs, 10) || 0) <= 0 &&
+        (Number.parseInt(applyResult?.fillResult?.recoveredLiveTabs, 10) || 0) <= 0
+}
+
+function decideResumeRawQueueFallbackItems(params = {}) {
+    const {rawQueueState} = params
+    const rawQueue = rawQueueState?.[COORDINATOR_PAUSED_KEY] === true
+        ? {}
+        : normalizeRawCoordinatorQueueForReconcileFallback(
+            normalizeCoordinatorMap(rawQueueState?.[COORDINATOR_QUEUE_KEY] || {})
+        )
+    const pendingRawItems = Object.values(rawQueue).filter(item => `${item?.status || ''}`.trim() === 'queued')
+    return {rawQueue, pendingRawItems}
+}
+
+function decideResumeWalQueueFallbackItems(params = {}) {
+    const {walAuthorityState} = params
+    const walQueueCounts = getCoordinatorQueueWorkCounts(walAuthorityState?.queue || {})
+    const pendingWalItems = Object.values(walAuthorityState?.queue || {})
+        .filter(item => `${item?.status || ''}`.trim() === 'queued')
+    return {walQueueCounts, pendingWalItems}
+}
+
 function decideResumeCoordinatorQueueExecutionOnceOutcome(params = {}) {
     const {applyResult, cycle} = params
     if(applyResult.reason === 'executor-already-running') {
@@ -17838,30 +17874,13 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
             reason: `${options.reason || 'resume'}-runtime-action-revalidation`
         })
     }
-    if(serviceWorkerOwned &&
-        options.awaitFill !== false &&
-        shouldUseProjectionFallbackForResume &&
-        !((options.returnAfterDurableActive === true || serviceWorkerOwned) && queueRuntime.getActiveQueuedTabCount() > 0) &&
-        applyResult?.fillResult?.timedOut !== true &&
-        applyResult?.fillResult?.authorityUnavailable !== true &&
-        applyResult?.fillResult?.reason !== 'queued-tab-open-failed' &&
-        applyResult?.fillResult?.reason !== 'queued-tab-fill-timeout' &&
-        applyResult?.fillResult?.reason !== 'queued-tab-final-open-decision-timeout' &&
-        (Number.parseInt(applyResult?.active, 10) || 0) <= 0 &&
-        (Number.parseInt(applyResult?.fillResult?.active, 10) || 0) <= 0 &&
-        (Number.parseInt(applyResult?.fillResult?.openedTabs, 10) || 0) <= 0 &&
-        (Number.parseInt(applyResult?.fillResult?.recoveredLiveTabs, 10) || 0) <= 0) {
+    if(decideResumeShouldUseFallbackOutcome({serviceWorkerOwned, options, shouldUseProjectionFallbackForResume, applyResult})) {
         const rawQueueState = await metricStorageGet({
                 [COORDINATOR_QUEUE_KEY]: {},
                 [COORDINATOR_PAUSED_KEY]: false
             })
             .catch(() => null)
-        const rawQueue = rawQueueState?.[COORDINATOR_PAUSED_KEY] === true
-            ? {}
-            : normalizeRawCoordinatorQueueForReconcileFallback(
-                normalizeCoordinatorMap(rawQueueState?.[COORDINATOR_QUEUE_KEY] || {})
-            )
-        const pendingRawItems = Object.values(rawQueue).filter(item => `${item?.status || ''}`.trim() === 'queued')
+        const {rawQueue, pendingRawItems} = decideResumeRawQueueFallbackItems({rawQueueState})
         if(pendingRawItems.length) {
             dropVolatileQueuedActionsForDurableResume(
                 `${options.reason || 'resume'}-raw-queue-fallback-drop-volatile`,
@@ -17905,9 +17924,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
                     metricPath: 'pump.resume.storageProjectionFallback.load'
                 })
                 .catch(() => null)
-            const walQueueCounts = getCoordinatorQueueWorkCounts(walAuthorityState?.queue || {})
-            const pendingWalItems = Object.values(walAuthorityState?.queue || {})
-                .filter(item => `${item?.status || ''}`.trim() === 'queued')
+            const {walQueueCounts, pendingWalItems} = decideResumeWalQueueFallbackItems({walAuthorityState})
             if(pendingWalItems.length &&
                 walQueueCounts.durableActiveRows <= 0 &&
                 walAuthorityState?.stored?.[COORDINATOR_PAUSED_KEY] !== true) {
