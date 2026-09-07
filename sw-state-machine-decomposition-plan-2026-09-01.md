@@ -2060,6 +2060,28 @@ then #3's pure-sync prefix if there's appetite for a smaller marginal
 win. #1, #3's fallback layers, #4, #7, #8, #9 stay resident as assessed
 above.**
 
+### Slice P2-13 -- paused-check guard (region 2) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff and running the full test suite twice more, both green, plus both
+production builds). Extracted the consequent of the paused-check guard
+into `decideFastExecutorPausedOutcome()` (no params -- the whole
+consequent is self-contained, referencing only module-scope
+`incrementQueueWakeupMetric`/`browser`/`COORDINATOR_RESUME_ALARM_NAME`).
+The guard's condition itself
+(`options.skipPauseStorageCheck !== true && await isCoordinatorPausedInStorage(...)`)
+now assigns to a `coordinatorPaused` local before the `if`, preserving
+the original's `&&` short-circuit semantics exactly (assigning a
+short-circuited boolean expression to a variable evaluates identically
+to using it directly in an `if` condition -- confirmed, not just
+assumed). Checked `test/p1-contract.test.js` for assertions on the moved
+literals (`pump.fastExecutor.paused`, `coordinator-paused`,
+`skipPauseStorageCheck`) scoped to `fastPathBody`
+(`extractFunction(source, "async function runCoordinatorQueueExecutorFastPath(...)")`
+at line ~3356) -- none exist; a separate, unrelated `resumeBody` also
+matches the string `'coordinator-paused'` but extracts a different
+function entirely, untouched by this slice.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
