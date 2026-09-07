@@ -741,11 +741,6 @@ module.exports.__test = {
 }
 `
 
-    function localRequire(request) {
-        if(request === 'webextension-polyfill') return browser
-        return baseRequire(request)
-    }
-
     function FakeDate(...args) {
         if(this instanceof FakeDate) {
             return args.length ? new Date(...args) : new Date(timers.now)
@@ -762,7 +757,6 @@ module.exports.__test = {
         console,
         module,
         exports: module.exports,
-        require: localRequire,
         __filename: swPath,
         __dirname: path.dirname(swPath),
         setTimeout: timers.setTimeout,
@@ -770,6 +764,9 @@ module.exports.__test = {
         Date: FakeDate,
         URL,
         URLSearchParams,
+        Buffer,
+        TextEncoder,
+        TextDecoder,
         Promise,
         Map,
         Set,
@@ -786,9 +783,12 @@ module.exports.__test = {
         JSON,
         Math
     }
+    vm.createContext(context)
+    const localRequire = createSharedRealmRequire(context, browser, baseRequire)(path.dirname(swPath))
+    context.require = localRequire
 
     const wrapper = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`
-    const compiled = vm.runInNewContext(wrapper, context, {filename: swPath})
+    const compiled = new vm.Script(wrapper, {filename: swPath}).runInContext(context)
     compiled(module.exports, localRequire, module, swPath, path.dirname(swPath))
 
     return {
