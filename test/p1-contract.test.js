@@ -3608,8 +3608,9 @@ test('queued tab fill returns after durable active without awaiting opened progr
     // deferred progress save, content-script-ensure kickoff, and early
     // return were extracted to decideReturnAfterDurableActiveOutcome in
     // decomposition Slice P2-8 (Part 2 decide/act splitting), called from
-    // fillBody rather than inlined there.
-    const decisionBody = extractFunction(source, 'function decideReturnAfterDurableActiveOutcome(params = {})')
+    // fillBody rather than inlined there, then moved to
+    // swFillQueuedTabsOnceDecisions.js in decomposition Slice P2.5-4.
+    const decisionBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decideReturnAfterDurableActiveOutcome(params = {})')
     const patchIndex = body.indexOf('const openedProgressPatch =')
     const returnAfterIndex = body.indexOf('if(options.returnAfterDurableActive === true)', patchIndex)
     const earlyEnsureIndex = body.indexOf('const earlyContentEnsurePromise = options.returnAfterDurableActive === true')
@@ -4873,21 +4874,24 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     assert.match(fillBody, /const getCapacityUsed = \(\) => Math\.max\([\s\S]*queueRuntime\.getActiveQueuedTabCount\(\),[\s\S]*getSchedulerBlockingQueuedExecutorCount\(\)[\s\S]*\) \+[\s\S]*getQueuedProfileOpenReservationCount\(\) \+[\s\S]*openedTabs/)
     // The queue-load-throttle gate check was extracted to decideQueueLoadThrottleGate
     // in decomposition Slice P2-2 (Part 2 decide/act splitting), called from fillBody
-    // rather than inlined there.
-    const throttleGateBody = extractFunction(source, 'function decideQueueLoadThrottleGate(params = {})')
+    // rather than inlined there, then moved to swFillQueuedTabsOnceDecisions.js in
+    // decomposition Slice P2.5-4.
+    const throttleGateBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decideQueueLoadThrottleGate(params = {})')
     assert.match(throttleGateBody, /throttle\.active && queueRuntime\.getActivationIntentCount\(\) && getSchedulerBlockingQueuedExecutorCount\(\) >= 1/)
     assert.match(fillBody, /decideQueueLoadThrottleGate\(\{throttle, cycle, now: Date\.now\(\)\}\)/)
     // The pausedState gate check was extracted to decidePausedStateGate in
     // decomposition Slice P2-3 (Part 2 decide/act splitting), called from
-    // fillBody rather than inlined there.
-    const pausedGateBody = extractFunction(source, 'function decidePausedStateGate(params = {})')
+    // fillBody rather than inlined there, then moved to
+    // swFillQueuedTabsOnceDecisions.js in decomposition Slice P2.5-4.
+    const pausedGateBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decidePausedStateGate(params = {})')
     assert.match(pausedGateBody, /pausedState\?\.\[COORDINATOR_PAUSED_KEY\] !== true/)
     assert.match(fillBody, /decidePausedStateGate\(\{pausedState, cycle\}\)/)
     // The activation-guard-claim and profile-open-reservation-claim guard
     // pairs inside the fill loop were extracted to decideActivationGuardClaim
-    // and decideProfileOpenReservationClaim in the same slice.
-    const activationGuardClaimBody = extractFunction(source, 'function decideActivationGuardClaim(params = {})')
-    const profileOpenReservationClaimBody = extractFunction(source, 'function decideProfileOpenReservationClaim(params = {})')
+    // and decideProfileOpenReservationClaim in the same slice, then moved to
+    // swFillQueuedTabsOnceDecisions.js in decomposition Slice P2.5-4.
+    const activationGuardClaimBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decideActivationGuardClaim(params = {})')
+    const profileOpenReservationClaimBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decideProfileOpenReservationClaim(params = {})')
     assert.match(activationGuardClaimBody, /claimQueuedActivationGuard\(next, null, 'queued-tab-pre-open'\)/)
     assert.match(profileOpenReservationClaimBody, /reserveQueuedProfileOpen\(next, 'queued-tab-create'\)/)
     assert.match(fillBody, /decideActivationGuardClaim\(\{next\}\)/)
@@ -4898,8 +4902,9 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     // the loop's last remaining inline `queueRuntime.requeueActivationIntent`
     // call) was extracted to decidePostOpenFailureRecoveryOutcome in
     // decomposition Slice P2-7 (Part 2 decide/act splitting), called from
-    // fillBody rather than inlined there.
-    const postOpenFailureRecoveryBody = extractFunction(source, 'function decidePostOpenFailureRecoveryOutcome(params = {})')
+    // fillBody rather than inlined there, then moved to
+    // swFillQueuedTabsOnceDecisions.js in decomposition Slice P2.5-4.
+    const postOpenFailureRecoveryBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decidePostOpenFailureRecoveryOutcome(params = {})')
     assert.match(postOpenFailureRecoveryBody, /queueRuntime\.requeueActivationIntent/)
     assert.match(postOpenFailureRecoveryBody, /scheduleQueuedWorkContinuation\('queued-tab-open-failed'\)/)
     assert.match(fillBody, /decidePostOpenFailureRecoveryOutcome\(\{/)
