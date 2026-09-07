@@ -1968,6 +1968,98 @@ design, both assessed as genuinely act-dominated. No further Part 2
 target has been chosen yet; the "Next 20 Part 2 targets" list remains the
 candidate pool pending explicit direction.
 
+## Part 2 continued -- runCoordinatorQueueExecutorFastPath
+
+Priority target #3. Fresh read (2026-09, current lines 18627-18927, ~300
+lines; re-verify before executing) of the whole function.
+
+**Map of decide/act spans:**
+
+1. **Setup prelude (18628-18641):** fill-promise cleanup if/else,
+   `coordinatorFastExecutorActiveUntil` bump, `volatileQueuedActionsAtStart`
+   capture, a metric increment. Fully sync but pure unconditional
+   initialization, not a decision -- same call as `fillQueuedTabsOnce`'s
+   own prelude (P2-2's note: "not a clean alternating decide/act pattern").
+   Leave resident.
+2. **Paused-check guard (18642-18655):** `if(options.skipPauseStorageCheck
+   !== true && await isCoordinatorPausedInStorage(...))` -- the await is
+   embedded in the condition itself (short-circuits when the option is
+   set). Consequent (18644-18654) is fully sync: metric increment, a
+   fire-and-forget `void browser.alarms?.clear?.(...).catch(...)`, bare
+   return. **Clean candidate** -- resolve the boolean in the shell
+   (preserving the short-circuit by assigning to a local first, same
+   `&&` semantics either way), then call a decide function for the
+   consequent. Do this first.
+3. **Resident-authority-state resolution (18656-18716):** the real
+   complexity. An initial pure-sync prefix (18656-18667: `runtimeCountsAtStart`,
+   `runtimeSurfaceEmptyAtStart`, initial `residentAuthorityState`, a
+   conditional `recordResidentAuthorityStaleQueuedActions` side-effect
+   call, initial counts) is itself extractable -- but everything after it
+   (18668-18716) is two layers of `if(!effectiveResidentAuthorityHasDurableWork)`
+   fallback, each gated behind its own conditional `await` (`metricStorageGet`,
+   `loadCoordinatorQueueProjection`) with substantial sync computation
+   feeding into and out of each await (queue normalization, count
+   recalculation, `refreshResidentCoordinatorAuthorityState` calls that
+   mutate resident module state). Same shape as `fillQueuedTabsOnce`'s
+   region #2 ("not a clean single extraction"). **Assessment: extract
+   only the pure-sync prefix (18656-18667); leave the two-layer fallback
+   resident and documented**, matching the P2-7/4b precedent for
+   genuinely act-dominated regions.
+4. **`forceDurableQueueReloadForRuntimeRecovery` computation (18717-18724):**
+   small, fully sync, no return -- fold into whichever neighboring slice
+   reads most naturally, or leave inline; low priority either way.
+5. **Throttle gate (18725-18744):** `getQueueLoadThrottle()` then two
+   sync `if` branches, no awaits anywhere. **Looks structurally similar
+   to the already-extracted `decideQueueLoadThrottleGate`
+   (`fillQueuedTabsOnce`'s region #1) but is NOT the same logic** --
+   confirmed by reading both: different condition shape
+   (`throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() > 0`
+   vs `throttle.active && queueRuntime.getActivationIntentCount() &&
+   getSchedulerBlockingQueuedExecutorCount() >= 1`), different metric
+   names (`pump.fastExecutor.throttled` vs `pump.noop.throttled`),
+   different return shape, and a second `rememberQueueLoadProgress`
+   branch this one has that the other doesn't. **Needs its own new
+   decide function, not reuse** -- same "verify before merging" lesson
+   as P2-12's finding on the reclaimed-attempt derivations.
+6. **Authority preflight (18746-18775):** `await
+   runCoordinatorAuthorityReconcileActions(...)` (act) then a fully sync
+   guard-and-branch (18754-18774: set flags, metric increments, schedule
+   call, either continue or bare-return). **Clean candidate**, same
+   proven shape as regions 2 and 6 above.
+7. **`forceDurableQueueReload`/`currentAuthorityState` ternary (18777-18780):**
+   trivial, 4 lines, no meaningful decision -- leave inline.
+8. **Main resume call (18782-18814):** `await promiseWithTimeout(resumeCoordinatorQueueExecutionOnce(...), ...)`.
+   Genuine I/O, the function's core "act." The options object passed in
+   is itself just sync construction, not a decision -- not a Part 2
+   target (building a literal isn't "deciding" anything). Leave resident.
+9. **Post-resume cleanup (18815-18830):** three sub-spans, only the
+   middle one has an await -- `if(volatileQueuedActionsAtStart > 0 && ...)`
+   metric increment (18815-18820, sync) -> `if(authorityPreflightChanged
+   && options.continueAfterAuthorityPreflight === true) { await
+   coordinatorAuthority.hydrate().catch(...) }` (18821-18823, act, must
+   stay resident and sequenced between the two sync spans) -> fill-promise
+   cleanup (18824-18830, sync). Each sync half is individually small (5-6
+   lines); **low priority, marginal value given the size** -- candidates
+   only if a later slice wants to be thorough, not a priority pick.
+10. **Empty-runtime retry block (18832-18875):** fully sync
+    (`runtimeCountsAfterResume`, `runtimeSurfaceEmpty`,
+    `queuedOrPendingPlanned` computation, then a large multi-condition
+    `if` with a bare-return branch). No awaits anywhere in this span.
+    **Clean, sizeable candidate**, same shape as several already-extracted
+    bare-return blocks in `fillQueuedTabsOnce`.
+11. **Final change-detection/scheduling/return tail (18877-18926):**
+    fully sync, no awaits -- `changed`/`reportedChanged` computation,
+    several `if` branches with `scheduleCoordinatorQueueResume`/
+    `scheduleCoordinatorReconcile`/metric calls, ending in the function's
+    final `return`. **Clean, sizeable candidate**, same shape as
+    `fillQueuedTabsOnce`'s region #9 tail (`decideFillQueuedTabsOnceOutcome`).
+
+**Priority order for extraction: #2 (paused-check), #5 (throttle gate),
+#6 (authority preflight), #10 (empty-runtime retry), #11 (final tail),
+then #3's pure-sync prefix if there's appetite for a smaller marginal
+win. #1, #3's fallback layers, #4, #7, #8, #9 stay resident as assessed
+above.**
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
