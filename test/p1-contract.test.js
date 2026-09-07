@@ -3265,8 +3265,10 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     const dropBody = extractFunction(reclaimResumeSource, 'function dropVolatileQueuedActionsForDurableResume(reason = \'resume-rebuild-from-durable-queue\', details = {})')
     const resumeBody = extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
     // the storage-projection-fallback guard condition was extracted to
-    // decideResumeShouldUseFallbackOutcome in decomposition Slice P2-21.
-    const shouldUseFallbackBody = extractFunction(source, 'function decideResumeShouldUseFallbackOutcome(params = {})')
+    // decideResumeShouldUseFallbackOutcome in decomposition Slice P2-21,
+    // then moved to swResumeQueueExecutionDecisions.js in decomposition
+    // Slice P2.5-3.
+    const shouldUseFallbackBody = extractFunction(readRepoFile('shared/js/swResumeQueueExecutionDecisions.js'), 'function decideResumeShouldUseFallbackOutcome(params = {})')
 
     assert.doesNotMatch(body, /classifierReducerOwnsRuntimeSurfaces/)
     assert.doesNotMatch(body, /existing-runtime-fill/)
@@ -4094,8 +4096,10 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     const resumePausedBody = extractFunction(sw, 'async function resumePausedCoordinatorNukes()')
     const resumeBody = extractFunction(sw, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
     // the stored-pause-state guard was extracted to
-    // decideResumeCoordinatorStoredPausedOutcome in decomposition Slice P2-19.
-    const storedPausedOutcomeBody = extractFunction(sw, 'function decideResumeCoordinatorStoredPausedOutcome(params = {})')
+    // decideResumeCoordinatorStoredPausedOutcome in decomposition Slice P2-19,
+    // then moved to swResumeQueueExecutionDecisions.js in decomposition
+    // Slice P2.5-3.
+    const storedPausedOutcomeBody = extractFunction(readRepoFile('shared/js/swResumeQueueExecutionDecisions.js'), 'function decideResumeCoordinatorStoredPausedOutcome(params = {})')
     const pauseControlBody = extractFunction(dashboard, 'function syncCurrentWorkPauseControls(queueItems = [])')
     const togglePauseBody = extractFunction(dashboard, 'async function toggleCurrentWorkPause()')
     const flashButtonBody = extractFunction(dashboard, 'function flashButton(button)')
