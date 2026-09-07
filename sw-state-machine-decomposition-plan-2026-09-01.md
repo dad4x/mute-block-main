@@ -2152,6 +2152,45 @@ else in `runCoordinatorQueueExecutorFastPath` after this span. Checked
 (`emptyRuntimeRetry`, `empty-runtime-retry`, `emptyRuntimeDurableReload`,
 `runtimeSurfaceEmpty`) -- none exist, no test update needed.
 
+### Slice P2-17 -- final tail (region 11) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move -- and running the full test
+suite twice more, both green, plus both production builds). Extracted
+the whole final span (`changed`/`reportedChanged` computation, three
+scheduling `if` branches, the function's terminal `return`) into
+`decideFastExecutorFinalOutcome(params)`, taking `{result,
+authorityPreflightChanged, options, reason, authorityPreflight}` and
+returning the final result object directly -- same shape as
+`fillQueuedTabsOnce`'s region #9 tail extraction (`decideFillQueuedTabsOnceOutcome`).
+
+Found and fixed **five** real test dependencies in the same
+`'idle storage updates reconcile durable active work before queue fill'`
+test as P2-15: three positive assertions
+(`if(result?.timedOut === true) {...}`, the `changed` computation, the
+`if(changed) {...}` branch) and two negative `doesNotMatch` assertions
+(`timeout-continuation...scheduleCoordinatorReconcile`,
+`changed-without-runtime...scheduleCoordinatorReconcile`) all targeted
+content that moved out of `fastPathBody`. Added an `extractFunction` call
+for `decideFastExecutorFinalOutcome` and re-pointed all five at it --
+again taking care with the two `doesNotMatch` assertions specifically,
+since leaving them against `fastPathBody` would have made them pass
+vacuously (the strings they check for no longer appear there at all)
+rather than actually re-verifying the anti-regression invariants they
+were written for.
+
+**This completes every region on Slice P2-13's priority list** (#2, #5,
+#6, #10, #11) for `runCoordinatorQueueExecutorFastPath`.
+`runCoordinatorQueueExecutorFastPath` now has 5 named `decide*` helpers
+pulled out of it. Regions #1 (setup prelude), #3 (resident-authority-state
+resolution, except its pure-sync prefix), #4 (small ternary), #7
+(trivial ternary), #8 (main resume I/O call), and #9 (post-resume cleanup,
+marginal value) remain resident, all assessed and documented above as
+either genuinely act-dominated or too marginal to be worth the added
+indirection. No further Part 2 target has been chosen yet; the "Next 20
+Part 2 targets" list remains the candidate pool pending explicit
+direction (`resumeCoordinatorQueueExecutionOnce` is priority #4 next).
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the

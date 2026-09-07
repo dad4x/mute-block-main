@@ -3357,6 +3357,9 @@ test('idle storage updates reconcile durable active work before queue fill', () 
     // the authority-preflight guard was extracted to
     // decideFastExecutorAuthorityPreflightOutcome in decomposition Slice P2-15.
     const preflightOutcomeBody = extractFunction(source, 'function decideFastExecutorAuthorityPreflightOutcome(params = {})')
+    // the final changed-detection/scheduling/return tail was extracted to
+    // decideFastExecutorFinalOutcome in decomposition Slice P2-17.
+    const finalOutcomeBody = extractFunction(source, 'function decideFastExecutorFinalOutcome(params = {})')
     assert.match(fastPathBody, /let authorityPreflightChanged = false/)
     assert.match(fastPathBody, /options\.continueAfterAuthorityPreflight === true/)
     assert.match(preflightOutcomeBody, /pump\.fastExecutor\.authorityPreflightContinued/)
@@ -3368,12 +3371,12 @@ test('idle storage updates reconcile durable active work before queue fill', () 
     assert.match(fastPathBody, /forceDurableQueueReload: forceDurableQueueReloadForRuntimeRecovery/)
     assert.match(fastPathBody, /const forceDurableQueueReload = forceDurableQueueReloadForRuntimeRecovery && authorityPreflightChanged !== true/)
     assert.match(fastPathBody, /const currentAuthorityState = authorityPreflightChanged[\s\S]*coordinatorAuthority\.current\(\)/)
-    assert.match(fastPathBody, /if\(result\?\.timedOut === true\) \{[\s\S]*pump\.fastExecutor\.timeoutContinuation[\s\S]*scheduleCoordinatorQueueResume\(1000, followupReason, \{[\s\S]*allowBeforeQuora: true/)
-    assert.match(fastPathBody, /const changed = \(result\?\.queued \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.adopted \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.active \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.runtimeActive \|\| 0\) > 0 \|\|[\s\S]*authorityPreflightChanged \|\|[\s\S]*result\?\.changed === true/)
-    assert.match(fastPathBody, /if\(changed\) \{[\s\S]*incrementQueueWakeupMetric\('pump\.fastExecutor\.changed'\)[\s\S]*!getSchedulerBlockingQueuedExecutorCount\(\) &&[\s\S]*queueRuntime\.getActivationIntentCount\(\) <= 0 &&[\s\S]*queueRuntime\.getPendingTabActionCount\(\) <= 0 &&[\s\S]*result\?\.queued[\s\S]*result\?\.pending[\s\S]*scheduleCoordinatorQueueResume\(1000, followupReason, \{[\s\S]*allowBeforeQuora: true/)
+    assert.match(finalOutcomeBody, /if\(result\?\.timedOut === true\) \{[\s\S]*pump\.fastExecutor\.timeoutContinuation[\s\S]*scheduleCoordinatorQueueResume\(1000, followupReason, \{[\s\S]*allowBeforeQuora: true/)
+    assert.match(finalOutcomeBody, /const changed = \(result\?\.queued \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.adopted \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.active \|\| 0\) > 0 \|\|[\s\S]*\(result\?\.runtimeActive \|\| 0\) > 0 \|\|[\s\S]*authorityPreflightChanged \|\|[\s\S]*result\?\.changed === true/)
+    assert.match(finalOutcomeBody, /if\(changed\) \{[\s\S]*incrementQueueWakeupMetric\('pump\.fastExecutor\.changed'\)[\s\S]*!getSchedulerBlockingQueuedExecutorCount\(\) &&[\s\S]*queueRuntime\.getActivationIntentCount\(\) <= 0 &&[\s\S]*queueRuntime\.getPendingTabActionCount\(\) <= 0 &&[\s\S]*result\?\.queued[\s\S]*result\?\.pending[\s\S]*scheduleCoordinatorQueueResume\(1000, followupReason, \{[\s\S]*allowBeforeQuora: true/)
     assert.doesNotMatch(preflightOutcomeBody, /post-authority-preflight[\s\S]{0,250}scheduleCoordinatorReconcile/)
-    assert.doesNotMatch(fastPathBody, /timeout-continuation[\s\S]{0,250}scheduleCoordinatorReconcile/)
-    assert.doesNotMatch(fastPathBody, /changed-without-runtime[\s\S]{0,250}scheduleCoordinatorReconcile/)
+    assert.doesNotMatch(finalOutcomeBody, /timeout-continuation[\s\S]{0,250}scheduleCoordinatorReconcile/)
+    assert.doesNotMatch(finalOutcomeBody, /changed-without-runtime[\s\S]{0,250}scheduleCoordinatorReconcile/)
 
     const reconcileBody = extractFunction(source, "async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile', options = {})")
     // scheduleCoordinatorReconcileExecutorContinuation moved to

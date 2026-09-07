@@ -18742,6 +18742,60 @@ function decideFastExecutorEmptyRuntimeRetryOutcome(params = {}) {
     return null
 }
 
+function decideFastExecutorFinalOutcome(params = {}) {
+    const {result, authorityPreflightChanged, options, reason, authorityPreflight} = params
+    const changed = (result?.queued || 0) > 0 ||
+        (result?.adopted || 0) > 0 ||
+        (result?.active || 0) > 0 ||
+        (result?.runtimeActive || 0) > 0 ||
+        authorityPreflightChanged ||
+        result?.changed === true
+    const reportedChanged = authorityPreflightChanged && options.continueAfterAuthorityPreflight === true
+        ? false
+        : changed
+    if(result?.timedOut === true) {
+        const followupReason = `${reason || 'resume'}-fast-executor-timeout-continuation`
+        incrementQueueWakeupMetric('pump.fastExecutor.timeoutContinuation')
+        scheduleCoordinatorQueueResume(1000, followupReason, {
+            allowBeforeQuora: true
+        })
+    }
+    if(result?.fillResult?.authorityUnavailable === true ||
+        result?.fillResult?.reason === 'final-open-decision-timeout' ||
+        result?.fillResult?.reason === 'queued-tab-final-open-decision-timeout') {
+        scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, {
+            reason: result.fillResult.reason || 'queued-tab-final-open-authority-unavailable',
+            edgeTriggered: true,
+            allowBeforeQuora: true
+        })
+    }
+    if(changed) {
+        incrementQueueWakeupMetric('pump.fastExecutor.changed')
+        if(!getSchedulerBlockingQueuedExecutorCount() &&
+            queueRuntime.getActivationIntentCount() <= 0 &&
+            queueRuntime.getPendingTabActionCount() <= 0 &&
+            ((Number.parseInt(result?.queued, 10) || 0) > 0 ||
+                (Number.parseInt(result?.pending, 10) || 0) > 0)) {
+            const followupReason = `${reason || 'resume'}-changed-without-runtime`
+            scheduleCoordinatorQueueResume(1000, followupReason, {
+                allowBeforeQuora: true
+            })
+        }
+    }
+    else {
+        incrementQueueWakeupMetric('pump.fastExecutor.noop')
+    }
+
+    return {
+        ...(result || {}),
+        authorityPreflight: authorityPreflightChanged ? authorityPreflight : undefined,
+        authorityPreflightChanged,
+        changed: reportedChanged,
+        fastPath: true,
+        reason: result?.reason || 'fast-executor-resume'
+    }
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
         resetQueuedTabFillState()
@@ -18911,56 +18965,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         return emptyRuntimeRetryOutcome
     }
 
-    const changed = (result?.queued || 0) > 0 ||
-        (result?.adopted || 0) > 0 ||
-        (result?.active || 0) > 0 ||
-        (result?.runtimeActive || 0) > 0 ||
-        authorityPreflightChanged ||
-        result?.changed === true
-    const reportedChanged = authorityPreflightChanged && options.continueAfterAuthorityPreflight === true
-        ? false
-        : changed
-    if(result?.timedOut === true) {
-        const followupReason = `${reason || 'resume'}-fast-executor-timeout-continuation`
-        incrementQueueWakeupMetric('pump.fastExecutor.timeoutContinuation')
-        scheduleCoordinatorQueueResume(1000, followupReason, {
-            allowBeforeQuora: true
-        })
-    }
-    if(result?.fillResult?.authorityUnavailable === true ||
-        result?.fillResult?.reason === 'final-open-decision-timeout' ||
-        result?.fillResult?.reason === 'queued-tab-final-open-decision-timeout') {
-        scheduleCoordinatorReconcile(QUEUED_TAB_FINAL_OPEN_AUTHORITY_RETRY_MS, {
-            reason: result.fillResult.reason || 'queued-tab-final-open-authority-unavailable',
-            edgeTriggered: true,
-            allowBeforeQuora: true
-        })
-    }
-    if(changed) {
-        incrementQueueWakeupMetric('pump.fastExecutor.changed')
-        if(!getSchedulerBlockingQueuedExecutorCount() &&
-            queueRuntime.getActivationIntentCount() <= 0 &&
-            queueRuntime.getPendingTabActionCount() <= 0 &&
-            ((Number.parseInt(result?.queued, 10) || 0) > 0 ||
-                (Number.parseInt(result?.pending, 10) || 0) > 0)) {
-            const followupReason = `${reason || 'resume'}-changed-without-runtime`
-            scheduleCoordinatorQueueResume(1000, followupReason, {
-                allowBeforeQuora: true
-            })
-        }
-    }
-    else {
-        incrementQueueWakeupMetric('pump.fastExecutor.noop')
-    }
-
-    return {
-        ...(result || {}),
-        authorityPreflight: authorityPreflightChanged ? authorityPreflight : undefined,
-        authorityPreflightChanged,
-        changed: reportedChanged,
-        fastPath: true,
-        reason: result?.reason || 'fast-executor-resume'
-    }
+    return decideFastExecutorFinalOutcome({result, authorityPreflightChanged, options, reason, authorityPreflight})
 }
 
 async function runScheduledCoordinatorQueueResume(reason = '', options = {}) {
