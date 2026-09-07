@@ -1902,6 +1902,72 @@ body entirely. Added an `extractFunction` call for the new
 the `active-transition-continued` half of a combined regex-alternation
 assertion, split out for precision) at the new function's body instead.
 
+### Slice P2-12 -- region 5's reclaimed-attempt derivation (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move -- and running the full test
+suite twice more, both green, plus both production builds). Extracted
+the sync derivation of `profileHref`/`coordinatorKey`/`currentItem`/
+attempt-id comparisons -> `sameTabReclaimedByDifferentAttempt` (lines
+29417-29434 pre-edit) into `decideActiveTransitionReclaimedByDifferentAttempt(params)`,
+taking `{currentAuthorityState, plan, action, tab}` and returning
+`{sameTabReclaimedByDifferentAttempt}`. Confirmed nothing past the
+consuming `if` block in this region reads `profileHref`/`coordinatorKey`/
+`currentItem` again, so only the one boolean needed to cross the
+function boundary.
+
+**Resolved the "shared helper?" question from the mapping note: no, keep
+them separate.** Compared this span against region 4b's near-identical-
+looking derivation (lines 29312-29316ish, still resident) line by line:
+they differ in three ways that make merging risky rather than a clean
+dedup -- (1) region 4b pre-derives `currentQueue = currentAuthorityState?.queue
+|| {}` and indexes `currentQueue[key]`, while region 5 indexes
+`currentAuthorityState?.queue?.[key]` directly; (2) region 4b compares
+`normalizeTabId(currentItem.tabId || currentItem.activeTabId || null) ===
+normalizeTabId(tab.id)` with no optional chaining on `currentItem` or
+`tab` (both presumed non-null in that branch), while region 5 computes a
+`currentTabId` local first with `currentItem?.`/`tab?.id` optional
+chaining and an extra `currentTabId &&` truthy guard before the equality
+check -- these produce different results for a hypothetical falsy-but-
+defined tab id (e.g. `0`, if that ever occurs); (3) `currentAuthorityState`
+itself comes from different sources in each branch (region 4b:
+`options.currentAuthorityState` or a fresh
+`loadCoordinatorQueueProjection()`; region 5: `coordinatorAuthority.current()`,
+possibly hydrated). Forcing a shared helper would mean either silently
+picking one behavior for both call sites (a real, if probably rarely
+triggered, behavior change) or adding parameters just to preserve the
+divergence, which defeats the purpose of sharing. Leaving them as two
+separate, independently-named functions once both are extracted is the
+correct call -- flagging the near-duplicate shape here for whoever next
+touches either one, but not merging speculatively.
+
+**Region 5's tab-lookup-failed sync tail (the `else if(!liveTabStatus.tab)`
+branch, unconditional `setQueuedTabMetadata` + `scheduleCoordinatorQueueResume`,
+falls through to the shared final return) was assessed and deliberately
+left resident, not extracted.** Unlike every other extraction in this
+slice, this span makes no decision of its own -- the branch it's
+gated behind is already resolved by the caller's `if`/`else if`, so
+extracting it would only wrap 5 lines of unconditional side effects in a
+new function name with zero readability or risk-reduction benefit. This
+matches the standing principle (stated since P2-7) that forcing an
+extraction just to say a region is "done" is not the goal.
+
+**Regions #3, #4b, and region 5's dead-code branch and tab-lookup-failed
+tail are now all explicitly assessed and either extracted or
+deliberately left resident with documented reasoning.** This completes
+the "go through all of those" pass over
+`confirmQueuedTabOpenDurableActiveEffect`'s regions 3 through 5.
+`confirmQueuedTabOpenDurableActiveEffect` itself remains a single `async`
+function (Part 2 discipline, pending Phase 0), now with 4 named
+`decide*` helpers pulled out of it (`decideFastActiveTransitionOutcome`,
+`decideActiveTransitionContinuationChoice`,
+`decideActiveTransitionReclaimedByDifferentAttempt`, plus the untouched
+region 4b/dead-code observations). Region 1 (the Promise-chain
+construction) and region 4b (the rollback path) remain resident by
+design, both assessed as genuinely act-dominated. No further Part 2
+target has been chosen yet; the "Next 20 Part 2 targets" list remains the
+candidate pool pending explicit direction.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
