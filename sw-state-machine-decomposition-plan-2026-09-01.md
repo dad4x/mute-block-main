@@ -3,24 +3,30 @@
 Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
-(async orchestration) has finished its first goal: all 9 mapped regions
-of `fillQueuedTabsOnce` (the largest remaining function) are now
-decomposed via the decide/act splitting technique. Slice P2-1 (commits
-`25ae7d3`, `675bca8`) proved the technique on a different function;
-Slices P2-2 through P2-9 (commits `bdae45c`, `ad2f9d6`, `1b79649`,
-`851f4fe`, `bf4ef17`, `e3caa43`, `fb838fa`, and the commit landing this
-plan update) extracted 12 decide spans across all 9 regions, including
-three bare-`return`/state-mutation outcome cases. `fillQueuedTabsOnce` remains a single
-`async` function (by Part 2 design, until Phase 0 lands) but its body is
-now a sequence of awaits interleaved with calls into named, independently
--readable `decide*` helpers rather than large inline decision blocks. See
-`git log --oneline` for the full commit list, starting at `3567f1c`. Part
-2's work so far stays physically in `sw.js`, no new module yet.
-`shared/js/sw.js` line count fluctuates around the Part 1 baseline of
-30,742 as Part 2's same-file restructuring trades inline code for named
-decide functions, down from 38,953 at the start of this effort. No
-further Part 2 target has been chosen yet; the "Next 20 Part 2 targets"
-list below remains the candidate pool pending explicit direction.
+(async orchestration, decide/act splitting, still same-file pending
+Phase 0) has fully decomposed the top 3 priority targets: `fillQueuedTabsOnce`
+(~951 lines, all 9 regions), `confirmQueuedTabOpenDurableActiveEffect`
+(~386 lines, all 5 regions), and `runCoordinatorQueueExecutorFastPath`
+(~302 lines, all 5 regions) -- 17 slices (P2-1 through P2-17) total, ~17
+named `decide*` helpers extracted. See `git log --oneline` for the full
+commit list, starting at `3567f1c`. Part 2's work so far stays physically
+in `sw.js`, no new module yet. `shared/js/sw.js` line count fluctuates
+around the Part 1 baseline of 30,742 as Part 2's same-file restructuring
+trades inline code for named decide functions, down from 38,953 at the
+start of this effort. Priority target #4 (`resumeCoordinatorQueueExecutionOnce`)
+is next on the "Next 20 Part 2 targets" list below, pending explicit
+direction to continue.
+
+**Phase 0 now has a concrete design** (see "Phase 0" section below,
+written 2026-09 after mapping the actual `require()` graph): a
+shared-context in-realm CommonJS loader in `test/lib/swHarness.js`,
+replacing the current `baseRequire`-into-the-outer-Node-realm delegation
+with `vm.runInContext` calls against the same contextified sandbox
+`sw.js` itself runs in. Confirmed the graph is small and closed (69
+direct requires from `sw.js`, all flat relative paths within `shared/js/`,
+no subdirectories, no JSON, no Node builtins) so the loader doesn't need
+to replicate Node's full resolution algorithm. Not yet implemented --
+this is the plan, pending a decision to execute it.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -2191,22 +2197,218 @@ indirection. No further Part 2 target has been chosen yet; the "Next 20
 Part 2 targets" list remains the candidate pool pending explicit
 direction (`resumeCoordinatorQueueExecutionOnce` is priority #4 next).
 
-## Phase 0 -- test harness realm fix (prerequisite for Part 2)
+## Phase 0 -- test harness realm fix (prerequisite for moving decide* logic into a module)
 
-Before any `async` orchestration code can move into its own module, the
-test harness's module-loading needs to stop mixing realms. The likely
-shape: have `test/lib/swHarness.js` bundle first-party `require()`s into
-the same `vm.createContext` source it already builds for `sw.js`, mirroring
-what webpack does for production, rather than sandboxing `sw.js` alone
-while `require()`-ing its dependencies normally into the surrounding Node
-process.
+Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
+future one) can move out of `sw.js` into its own module, the test
+harness's module-loading needs to stop mixing realms. This section
+supersedes the earlier placeholder above with a concrete design, written
+2026-09 after re-reading `test/lib/swHarness.js` in full and mapping the
+actual `require()` graph rather than assuming its shape.
 
-This is scoped, independent engineering work on the harness, with its own
-risks: fake-timer leakage if the sandbox boundary moves, and module-cache
-semantics for a hand-rolled in-context loader (a module required twice must
-resolve to the same instance, matching Node's own cache behavior, or
-`coordinatorAuthority`-style singletons will silently duplicate). It is not
-designed in detail here; it is called out because it gates all of Part 2.
+### The problem, restated precisely
+
+`test/lib/swHarness.js`'s `loadServiceWorkerHarness()` does, today:
+
+1. Reads `shared/js/sw.js`'s source as text, applies a handful of
+   test-only string patches (injecting `__testHarnessDeactivated` guards,
+   a throw-hook, timeout-constant overrides), and appends the
+   `module.exports.__test = {...}` block that exposes internals to tests.
+2. Builds a `context` object carrying `console`, `module`, `exports`, a
+   `require: localRequire` function, a `FakeDate` wired to the harness's
+   fake timers, the fake `setTimeout`/`clearTimeout`, and a curated set of
+   built-ins (`Promise`, `Map`, `Set`, `JSON`, `Math`, etc. -- passed by
+   reference from the outer Node realm, so identity-compatible, but the
+   *context itself* is still a distinct V8 realm from plain Node code).
+3. Wraps the patched source in a CJS-style function wrapper and runs it
+   via `vm.runInNewContext(wrapper, context, {filename: swPath})` -- this
+   both contextifies `context` and executes the wrapper in one call,
+   creating a fresh realm every single invocation.
+4. `localRequire` special-cases `webextension-polyfill` (returns the fake
+   `browser`) and delegates every other `require()` call to
+   `baseRequire = createRequire(swPath)` -- **real Node `require`,
+   resolving and executing in the outer, non-sandboxed realm.**
+
+Step 4 is the bug: every module `sw.js` requires -- all ~69 of them, plus
+whatever they transitively require -- loads and runs in the plain Node
+realm, not `sw.js`'s vm realm. `architecture.md`'s "Module Extraction And
+The Test Harness Realm Boundary" section documents the consequence
+(confirmed twice already, via the WAL-extraction regression and Slice 7):
+a same-realm `await` chain costs one microtask tick, a chain crossing this
+vm/Node boundary costs two, and that extra tick can silently reorder
+concurrent reconcile-tick work with zero difference in the moved code's
+logic. Production is unaffected -- webpack bundles every module into one
+realm -- so this is purely a harness-fidelity gap, not a real
+architectural constraint, but it has already blocked two real
+extractions and gates every future one that touches `async`-adjacent
+code.
+
+### Confirmed scope of the require graph (2026-09 investigation)
+
+Before designing the fix, mapped the actual graph rather than assuming
+it:
+
+- `sw.js` has 69 `require()` call sites (excluding `webextension-polyfill`),
+  all first-party, all flat relative paths (`./xxx`, never `../xxx`, never
+  a subdirectory, never a `.json` file).
+- A handful of the ~76 files under `shared/js/` transitively require each
+  other (e.g. `swCoordinatorQueueWal.js` -> `swstorage.js` -> `walSnapshotStore.js`;
+  `swQueueMachineDispatcher.js`/`swQueueMachineHandlers.js` -> `swQueueMachineEvents.js`;
+  a few others -> `subject.js`/`jobState.js`/`defaults.js`) -- same
+  pattern, all flat relative requires within `shared/js/`.
+- No first-party module requires anything outside `shared/js/`, a
+  subdirectory, a `.json` file, or a Node builtin (`grep`-confirmed empty
+  for all of these).
+- Only two test files instantiate the harness at all:
+  `test/swSynthetic.test.js` (535 `loadServiceWorkerHarness()` calls,
+  sharded into the `synthetic-1`..`synthetic-46` parallel lanes) and
+  `test/swScenarioFuzz.test.js` (2 calls). `test/p1-contract.test.js`
+  reads `sw.js` as raw source text via regex/`extractFunction` and never
+  touches the harness -- entirely unaffected by this change.
+
+This is a small, closed graph with no exotic resolution cases to handle --
+the fix doesn't need to replicate Node's full module resolution algorithm,
+just flat-relative-path-plus-`.js` resolution.
+
+### Design: a shared-context in-realm CommonJS loader
+
+Replace step 4's `baseRequire` delegation with a hand-rolled loader that
+compiles every first-party module into the **same** contextified sandbox
+`sw.js` itself runs in, instead of a fresh one per file or the outer Node
+realm:
+
+1. Build the `context` object exactly as today (browser, FakeDate, fake
+   timers, curated built-ins), but call `vm.createContext(context)`
+   explicitly first instead of relying on `vm.runInNewContext` to do it
+   implicitly. This contextified object is the one shared realm for this
+   harness instantiation.
+2. Replace `localRequire` with a loader keyed by resolved absolute path:
+   - `webextension-polyfill` still returns the fake `browser` directly (no
+     change).
+   - A relative request (`./x`, `../x` -- none of the latter exist today,
+     but resolve correctly anyway) resolves against the requesting
+     module's own directory, appending `.js` if missing (no `.json`,
+     no subdirectory `index.js` handling needed given the confirmed
+     graph -- but resolve defensively rather than assuming the file
+     exists without checking).
+   - Anything else (a bare package name) falls through to the existing
+     `baseRequire` as a defensive fallback -- should never be hit given
+     today's graph, but fails safe rather than silently mis-resolving if
+     a future module adds a real external dependency.
+   - **Module cache**: a `Map<resolvedPath, moduleRecord>` scoped to this
+     one harness instantiation (a fresh `Map` each `loadServiceWorkerHarness()`
+     call, matching today's full per-call isolation). Insert the
+     `moduleRecord` into the cache *before* running the module body (Node's
+     own cache-then-run ordering), so a circular `require()` -- none exist
+     today, per the graph above, but the loader shouldn't silently break
+     if one is added later -- resolves to the same, if partially
+     populated, `exports` object rather than recursing or duplicating.
+   - Each file's source gets the same CJS wrapper treatment `sw.js`
+     already gets (`(function(exports, require, module, __filename,
+     __dirname) {...})`), compiled and run via `vm.runInContext(wrapper,
+     context, {filename: resolvedPath})` against the **same** `context`
+     object used for `sw.js` -- this is the one line that actually fixes
+     the bug: same contextified sandbox means same realm, so `await`ing
+     into any of these modules costs exactly the same one microtask tick
+     as a same-realm call within `sw.js` itself, matching production.
+3. `sw.js`'s own top-level `require` becomes this same loader, rooted at
+   `path.dirname(swPath)`, so `sw.js` and everything it (transitively)
+   requires now share one realm, uniformly -- not just future `decide*`
+   modules, all ~69+ already-extracted Part 1 modules too. This is
+   deliberate: per `architecture.md`'s finding, "all `require()`'d modules
+   share one common realm with each other, separate from `sw.js`'s
+   vm-sandboxed realm" today -- a fix that only special-cased *new*
+   modules into `sw.js`'s realm while leaving the existing ~69 in the
+   outer Node realm would create a third realm and likely make the
+   crossing-counting problem worse, not better. Fixing it uniformly for
+   the whole graph is both correct and no harder to implement than a
+   partial fix.
+
+### A side benefit worth calling out
+
+Once a first-party module runs in the same contextified sandbox as
+`sw.js`, it automatically sees the same `Date`/`setTimeout`/`clearTimeout`
+(the fake-timer-backed ones) as its own globals -- no more need to
+manually thread `now`/`Date.now`/environment-globals into a module purely
+to keep it realm-consistent with the fake clock, the way the "Clock/
+environment-global note" elsewhere in this plan requires for modules that
+stay in the *current*, unfixed harness. That specific class of
+dependency-injection boilerplate becomes optional (still fine for
+testability if a module's author wants it, but no longer *mandatory for
+correctness*) for any module extracted after Phase 0 lands. This doesn't
+retroactively simplify already-extracted modules -- no reason to touch
+those -- but it changes the calculus for what to inject going forward.
+
+### Performance consideration
+
+535 harness instantiations in `swSynthetic.test.js` alone means the new
+loader will re-read and re-compile every first-party module's source on
+every single call, rather than benefiting from Node's process-wide
+`require` cache the way `baseRequire` does today. Two mitigating facts,
+not a reason to skip addressing it:
+
+- `sw.js` itself is *already* fully re-read, string-patched, and
+  `vm`-compiled on every one of those 535 calls today (that's inherent to
+  the string-patching approach, unrelated to this fix), and the current
+  suite runs fast (each `synthetic-N` shard, averaging ~12 instantiations,
+  finishes in roughly 1-2 seconds) -- so per-instantiation full
+  recompilation of a large file is already proven not to be a bottleneck
+  at this codebase's scale.
+- Even so, the cheap, correct mitigation is to cache the **compiled**
+  `vm.Script` object (not the module instance) at process scope, keyed by
+  resolved absolute path, separate from the per-instantiation module-cache
+  `Map` described above. `vm.Script#runInContext(context)` can be called
+  against a different contextified sandbox each time, re-executing the
+  same pre-parsed code to produce fresh, isolated module state per
+  harness instantiation while paying the file-read and V8-parse cost only
+  once per process. Implement this from the start rather than treating it
+  as a follow-up -- it is a small addition to the loader (a second `Map`
+  keyed by path, checked before `fs.readFileSync`) and removes any
+  question about whether the fix measurably slows the suite down.
+
+### Rollout and validation
+
+This is a single, self-contained change to `test/lib/swHarness.js` --
+no `sw.js` source changes, no changes to any already-extracted module.
+Blast radius is exactly `swSynthetic.test.js`'s 535 calls and
+`swScenarioFuzz.test.js`'s 2 calls; `p1-contract.test.js` and the `unit`/
+`wal` lanes don't use the harness and are structurally unaffected.
+
+1. Implement the loader as designed above, replacing `localRequire`'s
+   `baseRequire` delegation for relative requires.
+2. Run `npm run test:parallel` (the full suite, all lanes) at least
+   three times given the blast radius -- this is the correct validation
+   oracle: the existing synthetic and scenario-fuzz suites are already
+   proven sensitive to exactly this class of tick-ordering bug (that's
+   how the WAL extraction and Slice 7 findings were originally caught),
+   so a clean pass across the whole suite is strong evidence the realm
+   unification didn't silently reorder anything that matters.
+3. **Anticipate, don't assume away, new failures.** Collapsing 69+ real
+   crossings down to zero changes tick-relative ordering for *every*
+   already-required module at once, not just future ones -- a test that
+   happens to depend on today's harness-only double-tick behavior (rather
+   than on `sw.js`'s actual logic) could start failing even though nothing
+   about production behavior changed. If that happens: investigate each
+   failure on its own merits the same way any other regression would be
+   investigated, don't assume "the harness is just more correct now" as a
+   substitute for checking. If a failure genuinely traces to a test
+   asserting harness-artifact tick counts rather than real behavior, fix
+   the test's expectation and say so in the commit; if it traces to
+   something else, treat it as a real bug.
+4. Run both production builds (`npx mix --production`,
+   `node tools/build-chrome-dev.js`) as a sanity check even though this
+   change touches no shipped code -- consistent with every other slice's
+   verification bar in this plan.
+5. After landing: update `architecture.md`'s "Module Extraction And The
+   Test Harness Realm Boundary" section to record that the constraint is
+   resolved (don't delete the section -- the history and the underlying
+   mechanism are still worth keeping as context for why the harness is
+   shaped this way). Update this plan doc's Part 1 "Excluded/resident-only
+   regions" list and Part 2 completion notes to note that the realm
+   constraint no longer blocks moving the accumulated `decide*` functions
+   (or the 5 individually-reconfirmed-blocked Slice 44 stragglers, several
+   of which were blocked specifically by this) into a real module,
+   whenever that work is picked up next.
 
 ## Risk controls
 
