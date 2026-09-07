@@ -2437,6 +2437,16 @@ slice is purely additive so its own risk is near zero (nothing existing
 changes behavior), verified by a full suite run confirming the baseline
 still passes unchanged.
 
+**Completed** (commit `db12da9`, via sub-agent; independently re-verified
+by reading the full diff, confirming `createSharedRealmRequire`/
+`compiledModuleScripts` are referenced nowhere outside their own
+definition -- i.e. genuinely unwired -- and re-running the full test
+suite myself, unchanged pass). Matches the design exactly: same function
+names, same cache-before-run ordering, same `.js`-append resolution. The
+agent's own verification included a throwaway standalone sanity check
+(not committed) confirming the loader could actually `require('./defaults')`
+successfully in isolation before wiring was attempted.
+
 **Slice P0-2 -- wire it in.** In `loadServiceWorkerHarness`: replace
 `vm.runInNewContext(wrapper, context, {filename: swPath})` with an
 explicit `vm.createContext(context)` followed by
