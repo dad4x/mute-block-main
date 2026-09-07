@@ -2291,6 +2291,26 @@ act-dominated respectively.**
 
 Same verification rigor as every prior Part 2 slice.
 
+### Slice P2-18 -- final tail (region 6) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move -- and running the full test
+suite twice more, both green, plus both production builds). Extracted
+the whole final span (three `if(applyResult.reason === ...)`-style
+branches, an `if/else if/else` on `queued`/`adopted`/`terminalizedExhausted`,
+and the terminal `return`) into
+`decideResumeCoordinatorQueueExecutionOnceOutcome(params)`, taking
+`{applyResult, cycle}` and returning the final result object directly --
+same shape as the two prior "final tail" extractions
+(`decideFillQueuedTabsOnceOutcome`, `decideFastExecutorFinalOutcome`).
+Checked `test/p1-contract.test.js` for assertions scoped to `resumeBody`
+(`extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(...)')`,
+used across 4 separate tests) that might target the moved content -- none
+do; the `'coordinator-paused'`/`COORDINATOR_PAUSED_KEY` matches at one of
+those call sites resolve against the two still-resident pause guards
+(region 2/3, not yet extracted), confirmed by grepping the current
+function body directly rather than assuming.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any

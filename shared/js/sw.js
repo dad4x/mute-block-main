@@ -17647,6 +17647,63 @@ async function getCoordinatorWhyNotRunning(request = {}) {
     }
 }
 
+function decideResumeCoordinatorQueueExecutionOnceOutcome(params = {}) {
+    const {applyResult, cycle} = params
+    if(applyResult.reason === 'executor-already-running') {
+        finishQueueWakeupMetricCycle(cycle, 'no-op', 'executor-already-running', {
+            active: applyResult.active || 0,
+            runtimeActive: applyResult.runtimeActive || 0,
+            provisionalActive: Math.max(0, (applyResult.runtimeActive || 0) - (applyResult.active || 0)),
+            queuedActions: queueRuntime.getActivationIntentCount(),
+            fillReason: applyResult.fillReason || ''
+        })
+        return {
+            queued: 0,
+            pending: applyResult.pending || 0,
+            active: applyResult.active || 0,
+            reason: 'executor-already-running'
+        }
+    }
+
+    if(applyResult.reason === 'coordinator-paused') {
+        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
+        return {queued: 0, pending: 0, reason: 'coordinator-paused'}
+    }
+
+    if(applyResult.queued > 0 || applyResult.adopted > 0) {
+        finishQueueWakeupMetricCycle(cycle, 'state-changed', applyResult.reason, {
+            queued: applyResult.queued || 0,
+            pending: applyResult.pending || 0,
+            adopted: applyResult.adopted || 0,
+            terminalizedExhausted: applyResult.terminalizedExhausted || 0
+        })
+    }
+    else if(applyResult.terminalizedExhausted > 0) {
+        finishQueueWakeupMetricCycle(cycle, 'state-changed', applyResult.reason, {
+            pending: applyResult.pending || 0,
+            adopted: applyResult.adopted || 0,
+            terminalizedExhausted: applyResult.terminalizedExhausted || 0
+        })
+    }
+    else {
+        finishQueueWakeupMetricCycle(cycle, 'no-op', applyResult.reason, {
+            pending: applyResult.pending || 0,
+            adopted: applyResult.adopted || 0
+        })
+    }
+
+    return {
+        queued: applyResult.queued || 0,
+        pending: applyResult.pending || 0,
+        active: applyResult.active,
+        adopted: applyResult.adopted || 0,
+        requeued: applyResult.requeued || 0,
+        terminalizedExhausted: applyResult.terminalizedExhausted || 0,
+        fillResult: applyResult.fillResult || null,
+        reason: applyResult.reason
+    }
+}
+
 async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {}) {
     const cycle = startQueueWakeupMetricCycle('pump', 'resumeCoordinatorQueueExecutionOnce', options.reason || 'resume', {
         serviceWorkerOwned: options.serviceWorkerOwned === true
@@ -17867,59 +17924,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
         }
     }
 
-    if(applyResult.reason === 'executor-already-running') {
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'executor-already-running', {
-            active: applyResult.active || 0,
-            runtimeActive: applyResult.runtimeActive || 0,
-            provisionalActive: Math.max(0, (applyResult.runtimeActive || 0) - (applyResult.active || 0)),
-            queuedActions: queueRuntime.getActivationIntentCount(),
-            fillReason: applyResult.fillReason || ''
-        })
-        return {
-            queued: 0,
-            pending: applyResult.pending || 0,
-            active: applyResult.active || 0,
-            reason: 'executor-already-running'
-        }
-    }
-
-    if(applyResult.reason === 'coordinator-paused') {
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
-        return {queued: 0, pending: 0, reason: 'coordinator-paused'}
-    }
-
-    if(applyResult.queued > 0 || applyResult.adopted > 0) {
-        finishQueueWakeupMetricCycle(cycle, 'state-changed', applyResult.reason, {
-            queued: applyResult.queued || 0,
-            pending: applyResult.pending || 0,
-            adopted: applyResult.adopted || 0,
-            terminalizedExhausted: applyResult.terminalizedExhausted || 0
-        })
-    }
-    else if(applyResult.terminalizedExhausted > 0) {
-        finishQueueWakeupMetricCycle(cycle, 'state-changed', applyResult.reason, {
-            pending: applyResult.pending || 0,
-            adopted: applyResult.adopted || 0,
-            terminalizedExhausted: applyResult.terminalizedExhausted || 0
-        })
-    }
-    else {
-        finishQueueWakeupMetricCycle(cycle, 'no-op', applyResult.reason, {
-            pending: applyResult.pending || 0,
-            adopted: applyResult.adopted || 0
-        })
-    }
-
-    return {
-        queued: applyResult.queued || 0,
-        pending: applyResult.pending || 0,
-        active: applyResult.active,
-        adopted: applyResult.adopted || 0,
-        requeued: applyResult.requeued || 0,
-        terminalizedExhausted: applyResult.terminalizedExhausted || 0,
-        fillResult: applyResult.fillResult || null,
-        reason: applyResult.reason
-    }
+    return decideResumeCoordinatorQueueExecutionOnceOutcome({applyResult, cycle})
 }
 
 async function runCoordinatorReconcileExecutorActions(reason = 'reconcile-executor-actions', options = {}) {
