@@ -17647,6 +17647,22 @@ async function getCoordinatorWhyNotRunning(request = {}) {
     }
 }
 
+function decideResumeCoordinatorLocallyPausedOutcome(params = {}) {
+    const {cycle} = params
+    if(!isCoordinatorPauseRequestedLocally()) return null
+    incrementQueueWakeupMetric('pump.noop.paused')
+    finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
+    return {queued: 0, pending: 0, reason: 'coordinator-paused', paused: true}
+}
+
+function decideResumeCoordinatorStoredPausedOutcome(params = {}) {
+    const {cycle, pausedState} = params
+    if(!pausedState[COORDINATOR_PAUSED_KEY]) return null
+    incrementQueueWakeupMetric('pump.noop.paused')
+    finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
+    return {queued: 0, pending: 0, reason: 'coordinator-paused'}
+}
+
 function decideResumeCoordinatorQueueExecutionOnceOutcome(params = {}) {
     const {applyResult, cycle} = params
     if(applyResult.reason === 'executor-already-running') {
@@ -17761,18 +17777,16 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
         })
     }
 
-    if(isCoordinatorPauseRequestedLocally()) {
-        incrementQueueWakeupMetric('pump.noop.paused')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
-        return {queued: 0, pending: 0, reason: 'coordinator-paused', paused: true}
+    const locallyPausedOutcome = decideResumeCoordinatorLocallyPausedOutcome({cycle})
+    if(locallyPausedOutcome) {
+        return locallyPausedOutcome
     }
     const pausedState = options.skipPauseStorageCheck === true
         ? {[COORDINATOR_PAUSED_KEY]: false}
         : await metricStorageGet({[COORDINATOR_PAUSED_KEY]: false})
-    if(pausedState[COORDINATOR_PAUSED_KEY]) {
-        incrementQueueWakeupMetric('pump.noop.paused')
-        finishQueueWakeupMetricCycle(cycle, 'no-op', 'coordinator-paused')
-        return {queued: 0, pending: 0, reason: 'coordinator-paused'}
+    const storedPausedOutcome = decideResumeCoordinatorStoredPausedOutcome({cycle, pausedState})
+    if(storedPausedOutcome) {
+        return storedPausedOutcome
     }
     if(serviceWorkerOwned && queueRuntime.resumeQueuedOwner(SERVICE_WORKER_QUEUE_OWNER_ID)) {
         incrementQueueWakeupMetric('pump.changed.clearedStaleServiceWorkerOwnerPause')
