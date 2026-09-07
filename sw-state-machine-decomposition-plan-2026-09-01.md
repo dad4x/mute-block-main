@@ -2474,6 +2474,28 @@ Phase-0 sub-agent workflow, execute via one sub-agent per module (one at
 a time), each independently re-verified in full (diff read, test suite
 2-3x, both builds) before the next starts.
 
+### Slice P2.5-1 -- swQueuedTabActiveTransitionDecisions.js (done)
+
+Completed (commit `bde23f2`, via sub-agent; independently re-verified:
+read the new module file in full and confirmed it matches the bodies
+extracted earlier in this plan for P2-10/P2-11/P2-12, read the wiring in
+`sw.js` (require + construct + destructure, standard shape), and -- since
+this is the *first* module extraction after Phase 0, with no realm
+concern to reason about but a fresh construction-order concern -- wrote a
+small script checking all 19 injected dependencies are declared before
+the construction call site (line 12349): all 19 confirmed declared
+earlier in the file, no TDZ hazard. Confirmed `sw.js` no longer defines
+any of the 5 functions itself (clean removal, not a duplicate). Ran the
+full test suite twice more and both builds myself, all green. The two
+positional-arg-style functions (`decideActiveTransitionOutcome`,
+`decideActiveTransitionMutation`, predating the `params = {}` convention)
+were correctly left unnormalized, matching the instruction not to
+"modernize" them during a behavior-preserving move. One
+`test/p1-contract.test.js` reference needed updating (an `extractFunction`
+call targeting `decideActiveTransitionContinuationChoice`), fixed
+following the established annotated-comment pattern; confirmed no other
+stray references to the other 4 moved names existed.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
