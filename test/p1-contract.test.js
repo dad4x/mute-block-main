@@ -3360,11 +3360,14 @@ test('idle storage updates reconcile durable active work before queue fill', () 
 
     const fastPathBody = extractFunction(source, "async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {})")
     // the authority-preflight guard was extracted to
-    // decideFastExecutorAuthorityPreflightOutcome in decomposition Slice P2-15.
-    const preflightOutcomeBody = extractFunction(source, 'function decideFastExecutorAuthorityPreflightOutcome(params = {})')
+    // decideFastExecutorAuthorityPreflightOutcome in decomposition Slice P2-15,
+    // then moved to swFastExecutorDecisions.js in decomposition Slice P2.5-2.
+    const fastExecutorDecisionsSource = readRepoFile('shared/js/swFastExecutorDecisions.js')
+    const preflightOutcomeBody = extractFunction(fastExecutorDecisionsSource, 'function decideFastExecutorAuthorityPreflightOutcome(params = {})')
     // the final changed-detection/scheduling/return tail was extracted to
-    // decideFastExecutorFinalOutcome in decomposition Slice P2-17.
-    const finalOutcomeBody = extractFunction(source, 'function decideFastExecutorFinalOutcome(params = {})')
+    // decideFastExecutorFinalOutcome in decomposition Slice P2-17, then moved
+    // to swFastExecutorDecisions.js in decomposition Slice P2.5-2.
+    const finalOutcomeBody = extractFunction(fastExecutorDecisionsSource, 'function decideFastExecutorFinalOutcome(params = {})')
     assert.match(fastPathBody, /let authorityPreflightChanged = false/)
     assert.match(fastPathBody, /options\.continueAfterAuthorityPreflight === true/)
     assert.match(preflightOutcomeBody, /pump\.fastExecutor\.authorityPreflightContinued/)
