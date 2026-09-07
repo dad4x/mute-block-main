@@ -2463,10 +2463,75 @@ correct now" -- per the design's explicit warning that collapsing 69+
 realm crossings to zero can flip tick-relative ordering for tests that
 happen to depend on today's harness artifact.
 
-**Slice P0-3 -- fix any fallout (contingent, only if P0-2 surfaces
-failures).** Scope depends entirely on what P0-2 finds; not defined in
-advance beyond the investigation discipline stated in the design above.
-If P0-2 comes back clean, skip this slice entirely.
+**Completed** (commit `372f5c9`, via sub-agent; independently re-verified
+by reading the full diff, running `npm run test:parallel` twice more
+myself, plus both production builds). Matched the design exactly: the
+`context` object is built without a `require` key, `vm.createContext(context)`
+is called explicitly, `localRequire` is derived from
+`createSharedRealmRequire(context, browser, baseRequire)(path.dirname(swPath))`
+and assigned onto `context.require` afterward, and `sw.js`'s own
+(per-call-patched) source is compiled fresh every call via
+`new vm.Script(wrapper, {filename: swPath}).runInContext(context)` --
+deliberately never cached in `compiledModuleScripts`, since that cache is
+only valid for the ~69 *required* modules whose source is identical every
+call, not `sw.js` itself (whose source varies per test's `options`). The
+agent also found and fixed a real gap the design didn't anticipate:
+`Buffer`/`TextEncoder`/`TextDecoder` needed adding to the sandbox's
+built-in globals list, since `walSnapshotStore.js` and
+`swStorageMetrics.js` use them and previously got them for free as
+ambient Node globals while running in the outer realm via `baseRequire`
+-- independently confirmed by grepping both files' usage before accepting
+the fix. One test-oracle gap in `swSynthetic.test.js` needed fixing
+(a hardcoded assumption that every non-materialized branch always leaves
+exactly 1 queued action, which doesn't hold for the
+`queued-tab-fill-timeout-before-open-attempt` branch -- confirmed by
+reading that branch's actual code at sw.js and finding it never mutates
+the queue itself, so trusting `sw.js`'s own self-reported
+`fillRemainingActions` field, which already existed on every
+`unresolvedExecutorCases` entry, is more correct than the old fixed
+assumption).
+
+**This slice also surfaced a real, pre-existing production bug**, exactly
+the kind of thing the design's "anticipate, don't assume away, new
+failures" warning was written for. `SW_SCENARIO_FUZZ_SEED=0x5eed node
+test/swScenarioFuzz.test.js` failed deterministically (`active queued tab
+102 is missing from fake browser`) with the realm fix in place. Confirmed
+independently (not just trusting the agent) via A/B: stashed the harness
+change, reran the identical seed against unmodified `sw.js` -- passed
+cleanly. This proved the tick-count collapse *exposed* a genuine
+concurrency bug rather than *creating* a test-oracle mismatch. Traced the
+mechanism by hand (see Slice P0-3 below) before handing the fix to
+another sub-agent, per the design's explicit instruction not to wave
+newly-surfaced failures away as "the harness is just more correct now."
+
+### Slice P0-3 -- fix the exposed race (done)
+
+Completed (commit `f845a99`, via sub-agent, after independent root-cause
+tracing). `restoreActiveLiveCoordinatorQueuedTabAction` (`shared/js/sw.js`)
+had exactly one entry-point guard (`wasQueuedRuntimeTabRemoved(tabId)`,
+checking only whether a tab was *fully* removed from runtime tracking)
+before its one real `await` (`getQueuedExecutorTabStatusWithTimeout`).
+Confirmed by direct code reading that a concurrent `markQueuedTabClosing`
+call (e.g. from `handleQueuedTabContentScriptEnsureResult`) sets the
+*earlier*-stage `closeRequestedAt`/`closeReason` metadata signal, which
+this function never checked at all, at any point -- so a close racing
+against this function's await window went unnoticed and the function
+proceeded to `applyQueuedTabOpenRuntimeEffect(plan)`, re-marking an
+already-tearing-down tab as active, with nothing to ever clean it up
+afterward (`queueRuntime.deleteActiveQueuedTab`'s one call site is gated
+on `!runtimeDetached`, which doesn't apply to this path). Fix: a single
+fresh re-check of both `wasQueuedRuntimeTabRemoved(tabId)` and
+`preRestoreMetadata.closeRequestedAt`/`.closeReason` immediately before
+`applyQueuedTabOpenRuntimeEffect(plan)` -- placed there deliberately so
+it covers the entire window from function entry regardless of whether
+the concurrent close happened before or during the await, rather than
+needing two separate checks. Reused the exact
+`closeRequestedAt || closeReason` idiom already used in several other
+places in `sw.js`, confirmed via grep before writing the fix rather than
+inventing a new predicate. Verified: seed `0x5eed` fails without the fix
+and passes with it, the other two default scenario-fuzz seeds
+(`0xc0de`, `0x51a7e`) continue to pass, full suite green across 3 runs
+(agent) + 2 more (independent re-verification), both builds green.
 
 **Slice P0-4 -- record completion.** Update `architecture.md`'s "Module
 Extraction And The Test Harness Realm Boundary" section to note the
