@@ -2340,6 +2340,22 @@ assertion at it, pairing naturally with the adjacent
 unchanged, since that constant is used several more times later in the
 function's still-resident fallback region).
 
+### Slice P2-20 -- "should revalidate fill" guard (region 4) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move of the condition -- and
+running the full test suite twice more, both green, plus both production
+builds). Extracted the five-clause boolean condition into
+`decideResumeShouldRevalidateFillOutcome({options, applyResult})`,
+returning the raw `&&`-chain value (not coerced to a strict boolean --
+behaviorally identical in an `if(...)` regardless). The shell kept the
+`await fillQueuedTabs({...})` call and the `applyResult.fillResult = ...`
+assignment, since those depend on the awaited result and can't move into
+a sync decide function. Checked `test/p1-contract.test.js` for
+assertions on the moved literals (`runtime-action-revalidation`,
+`queueRuntime.getActivationIntentCount() &&`) -- none exist, no test
+update needed.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
