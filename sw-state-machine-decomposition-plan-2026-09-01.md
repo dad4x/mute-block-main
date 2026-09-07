@@ -2496,6 +2496,25 @@ call targeting `decideActiveTransitionContinuationChoice`), fixed
 following the established annotated-comment pattern; confirmed no other
 stray references to the other 4 moved names existed.
 
+### Slice P2.5-2 -- swFastExecutorDecisions.js (done)
+
+Completed (commit `70afe42`, via sub-agent; independently re-verified:
+read the new module file in full, confirmed it matches the bodies
+extracted earlier for P2-13 through P2-17, read the wiring in `sw.js`,
+and independently checked all 10 injected dependencies' declaration
+lines against the construction call site (line 18653) myself -- all 10
+confirmed declared earlier via `const`/destructure, no TDZ hazard;
+`scheduleCoordinatorQueueResume`/`scheduleCoordinatorReconcile` are
+destructured from an already-required scheduler module, not same-file
+`function` declarations as the agent's report suggested, but still
+resolve well before the construction site either way). Confirmed `sw.js`
+no longer defines any of the 5 functions. Two
+`test/p1-contract.test.js` references needed updating (both in the same
+test, for `decideFastExecutorAuthorityPreflightOutcome` and
+`decideFastExecutorFinalOutcome`); fixed following the established
+pattern, confirmed no stray references to the other 3 moved names.
+Ran the full suite twice more and both builds myself, all green.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
