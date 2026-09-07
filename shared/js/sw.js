@@ -17663,6 +17663,15 @@ function decideResumeCoordinatorStoredPausedOutcome(params = {}) {
     return {queued: 0, pending: 0, reason: 'coordinator-paused'}
 }
 
+function decideResumeShouldRevalidateFillOutcome(params = {}) {
+    const {options, applyResult} = params
+    return options.awaitFill !== false &&
+        queueRuntime.getActivationIntentCount() &&
+        !isCoordinatorPauseRequestedLocally() &&
+        applyResult.reason !== 'coordinator-paused' &&
+        applyResult.reason !== 'no-coordinator'
+}
+
 function decideResumeCoordinatorQueueExecutionOnceOutcome(params = {}) {
     const {applyResult, cycle} = params
     if(applyResult.reason === 'executor-already-running') {
@@ -17821,11 +17830,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
             ? 'resumed-persisted-service-worker-queue'
             : 'resumed-persisted-coordinator-queue'
     })
-    if(options.awaitFill !== false &&
-        queueRuntime.getActivationIntentCount() &&
-        !isCoordinatorPauseRequestedLocally() &&
-        applyResult.reason !== 'coordinator-paused' &&
-        applyResult.reason !== 'no-coordinator') {
+    if(decideResumeShouldRevalidateFillOutcome({options, applyResult})) {
         applyResult.fillResult = await fillQueuedTabs({
             pauseAlreadyChecked: true,
             queueOnlyAuthority,
