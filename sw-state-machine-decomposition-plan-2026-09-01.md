@@ -2213,6 +2213,84 @@ indirection. No further Part 2 target has been chosen yet; the "Next 20
 Part 2 targets" list remains the candidate pool pending explicit
 direction (`resumeCoordinatorQueueExecutionOnce` is priority #4 next).
 
+## Part 2 continued -- resumeCoordinatorQueueExecutionOnce
+
+Priority target #4. Fresh read (2026-09, current lines 17650-17923, ~274
+lines; re-verify before executing) of the whole function.
+
+**Map of decide/act spans:**
+
+1. **Setup prelude (17650-17685)** -- mostly sync computation of many
+   locals threaded through the rest of the function
+   (`serviceWorkerOwned`, `queueOnlyAuthority`, `residentAuthorityStateForResume`,
+   `shouldUseProjectionFallbackForResume`, etc.), plus one conditional
+   `await dedupeCoordinatorTabs(...)` embedded in the `existingCoordinator`
+   ternary. Same shape as `fillQueuedTabsOnce`'s own prelude -- not a
+   decide target on its own since nearly everything computed here is
+   consumed downstream. The trailing `if(!ownerTabId) {...; return {...}}`
+   guard (17681-17685) is technically a clean small decide-and-return, but
+   given its size (5 lines, no reused params beyond `cycle`) the payoff is
+   marginal -- candidate only if doing a thorough pass, not a priority.
+2. **Local pause-request guard (17707-17711)** -- `if(isCoordinatorPauseRequestedLocally())
+   {...; return {...}}`, fully sync, checked *before* the `pausedState`
+   fetch below. **Clean, small, proven-shape candidate** (same pattern as
+   `decideFastExecutorPausedOutcome`).
+3. **Stored pause-state guard (17715-17719)** -- `if(pausedState[COORDINATOR_PAUSED_KEY])
+   {...; return {...}}`, fully sync, checked *after* `pausedState` is
+   resolved (17712-17714, a conditional-await/ternary). **Clean, small
+   candidate, but must stay a separate decide function from #2** -- the
+   two guards have genuinely different return shapes (`paused: true` on
+   the local-pause branch, absent on the stored-pause branch) and,
+   crucially, merging them into one function called after `pausedState`
+   resolves would change behavior: today, a locally-paused coordinator
+   returns *without ever calling* `metricStorageGet` for `pausedState`;
+   collapsing the two checks into one post-fetch decide function would
+   make that storage read happen unconditionally. Keep them as two
+   separate small decide functions, in their original relative order
+   around the fetch.
+4. **"Should call `fillQueuedTabs` again" guard (17753-17764)** -- the
+   condition (17753-17757, five ANDed clauses, fully sync) gates an
+   `await fillQueuedTabs({...}).then(result => applyResult.fillResult = result)`-
+   shaped act. **Extract just the boolean condition** as a decide
+   function returning `true`/`false`; the shell keeps the await and the
+   `applyResult.fillResult = ...` assignment (which itself references the
+   awaited result, so it can't move into the decide function).
+5. **The fallback block (17765-17868, ~104 lines)** -- the real
+   complexity, same shape as `fillQueuedTabsOnce`'s and
+   `confirmQueuedTabOpenDurableActiveEffect`'s hardest regions: a large
+   sync multi-clause guard condition (17765-17777, 13 lines) gates a body
+   that does a conditional `await metricStorageGet(...)` -> sync
+   `rawQueue`/`pendingRawItems` computation -> an `if/else` where *both*
+   branches mix sync setup, an `await enqueueExistingExecutorForCoordinator(...)`,
+   and sync result-merging back onto `applyResult`. **Assessment,
+   matching the established precedent for this shape:**
+   - The top-level guard condition (17765-17777) is a clean decide
+     candidate on its own -- extract just the boolean, matching #4's
+     pattern.
+   - The two sync computation spans right after each conditional fetch
+     (`rawQueue`/`pendingRawItems` at 17783-17788, `walQueueCounts`/
+     `pendingWalItems` at 17832-17834) are individually small, clean
+     decide candidates (pure derivations from an already-resolved value).
+   - Everything else in this block -- the `if(pendingRawItems.length)`/
+     `else` branches themselves, and everything inside them -- mixes
+     awaits with sync setup/result-merging inseparably and should stay
+     resident, matching the P2-7/4b "honest not-much-here" precedent.
+6. **Final tail (17870-17922)** -- fully sync, no awaits anywhere: a
+   sequence of `if(applyResult.reason === ...)`/`else if`/`else` branches
+   each calling `finishQueueWakeupMetricCycle` and returning, ending in an
+   unconditional final `return`. **The best target in this function** --
+   same shape as `fillQueuedTabsOnce`'s region #9
+   (`decideFillQueuedTabsOnceOutcome`) and
+   `runCoordinatorQueueExecutorFastPath`'s region #11
+   (`decideFastExecutorFinalOutcome`). Do this one first.
+
+**Priority order: #6 (final tail) first, then #2/#3 (the two pause
+guards), then #4 and #5's boolean-only extractions. #1 and the rest of
+#5 stay resident as assessed above, low priority or genuinely
+act-dominated respectively.**
+
+Same verification rigor as every prior Part 2 slice.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
