@@ -18624,6 +18624,20 @@ async function awaitCoordinatorResumeAlarmPersistence(reason = 'scheduled-resume
     ).catch(() => false)
 }
 
+function decideFastExecutorPausedOutcome() {
+    incrementQueueWakeupMetric('pump.fastExecutor.paused')
+    void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
+    return {
+        queued: 0,
+        pending: 0,
+        active: 0,
+        changed: false,
+        paused: true,
+        fastPath: true,
+        reason: 'coordinator-paused'
+    }
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
         resetQueuedTabFillState()
@@ -18639,19 +18653,10 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
     )
     const volatileQueuedActionsAtStart = queueRuntime.getActivationIntentCount()
     incrementQueueWakeupMetric('pump.fastExecutor.requested')
-    if(options.skipPauseStorageCheck !== true &&
-        await isCoordinatorPausedInStorage(`${reason || 'resume-fast-executor'}-paused-check`)) {
-        incrementQueueWakeupMetric('pump.fastExecutor.paused')
-        void browser.alarms?.clear?.(COORDINATOR_RESUME_ALARM_NAME).catch(() => false)
-        return {
-            queued: 0,
-            pending: 0,
-            active: 0,
-            changed: false,
-            paused: true,
-            fastPath: true,
-            reason: 'coordinator-paused'
-        }
+    const coordinatorPaused = options.skipPauseStorageCheck !== true &&
+        await isCoordinatorPausedInStorage(`${reason || 'resume-fast-executor'}-paused-check`)
+    if(coordinatorPaused) {
+        return decideFastExecutorPausedOutcome()
     }
     const runtimeCountsAtStart = queueRuntime.getRuntimeCounts()
     const runtimeSurfaceEmptyAtStart = !getSchedulerBlockingQueuedExecutorCount() &&
