@@ -2410,6 +2410,63 @@ Blast radius is exactly `swSynthetic.test.js`'s 535 calls and
    of which were blocked specifically by this) into a real module,
    whenever that work is picked up next.
 
+### Phase 0 execution slices
+
+Per an explicit request to dole this out to small-context sub-agents
+rather than a single large one, split into four bite-sized chunks. Each
+sub-agent gets a self-contained prompt quoting the exact design above
+plus the precise file/function targets below; each chunk is
+independently verified (full diff read, `npm run test:parallel`, both
+production builds) before the next one starts, one agent at a time.
+
+**Slice P0-1 -- add the loader, unwired (additive only).** Add new code
+to `test/lib/swHarness.js`: a module-level (process-scope)
+`Map<absolutePath, vm.Script>` for the compiled-source cache described
+above, and a factory function -- suggested name
+`createSharedRealmRequire(context, browser, baseRequire)` -- that returns
+a `require`-shaped function closed over a fresh per-call
+`Map<absolutePath, moduleRecord>` instance cache. Implements: the
+`webextension-polyfill` special case, relative-path resolution
+(`path.resolve(callerDir, request)`, append `.js` if missing), the
+cache-before-run insertion for circular-require safety, reading+compiling
+via the `vm.Script` cache (compile once per process, `runInContext`
+against the *current* `context` each call), and a fallback to
+`baseRequire` for any non-relative, non-`webextension-polyfill` request.
+**Do not call this function from `loadServiceWorkerHarness` yet** -- this
+slice is purely additive so its own risk is near zero (nothing existing
+changes behavior), verified by a full suite run confirming the baseline
+still passes unchanged.
+
+**Slice P0-2 -- wire it in.** In `loadServiceWorkerHarness`: replace
+`vm.runInNewContext(wrapper, context, {filename: swPath})` with an
+explicit `vm.createContext(context)` followed by
+`new vm.Script(wrapper, {filename: swPath}).runInContext(context)`
+(or equivalent), and replace `localRequire`'s body with a call to
+`createSharedRealmRequire(context, browser, baseRequire)` rooted at
+`path.dirname(swPath)`. This is the actual behavior-changing chunk --
+everything `sw.js` requires now runs in its realm instead of the outer
+Node realm. Verify with the full rigor the design's "Rollout and
+validation" section specifies: `npm run test:parallel` at least three
+times, both production builds, and if anything newly fails, investigate
+it on its own merits rather than assuming "the harness is just more
+correct now" -- per the design's explicit warning that collapsing 69+
+realm crossings to zero can flip tick-relative ordering for tests that
+happen to depend on today's harness artifact.
+
+**Slice P0-3 -- fix any fallout (contingent, only if P0-2 surfaces
+failures).** Scope depends entirely on what P0-2 finds; not defined in
+advance beyond the investigation discipline stated in the design above.
+If P0-2 comes back clean, skip this slice entirely.
+
+**Slice P0-4 -- record completion.** Update `architecture.md`'s "Module
+Extraction And The Test Harness Realm Boundary" section to note the
+constraint is resolved (keep the history, don't delete it). Update this
+plan doc: mark this whole Phase 0 section done with commit references,
+and note in Part 1's "Excluded/resident-only regions" and the Part 2
+target list that the realm constraint no longer blocks moving the
+accumulated `decide*` functions -- or the Slice 44 stragglers that were
+blocked by it -- into a real module.
+
 ## Risk controls
 
 - One slice per commit, sized per the claim workflow above.
