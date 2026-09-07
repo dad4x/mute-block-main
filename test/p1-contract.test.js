@@ -2850,8 +2850,9 @@ test('background tab opening updates authoritative Current Work', () => {
     const progressBody = extractFunction(queuedTabOpenEffectSource, 'function buildQueuedTabOpenedProgressPatch(plan = {}, transition = {})')
     const activeEffectBody = extractFunction(source, 'async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {})')
     // the activeTransitionContinued guard was extracted to
-    // decideActiveTransitionContinuationChoice in decomposition Slice P2-11.
-    const continuationChoiceBody = extractFunction(source, 'function decideActiveTransitionContinuationChoice(params = {})')
+    // decideActiveTransitionContinuationChoice in decomposition Slice P2-11,
+    // then moved to swQueuedTabActiveTransitionDecisions.js in Slice P2.5-1.
+    const continuationChoiceBody = extractFunction(readRepoFile('shared/js/swQueuedTabActiveTransitionDecisions.js'), 'function decideActiveTransitionContinuationChoice(params = {})')
     const ensureContentBody = extractFunction(source, 'async function ensureQueuedTabContentScript(tabId, reason = \'\')')
     const transitionIndex = body.indexOf('confirmQueuedTabOpenDurableActiveEffect(next, tab, openPlan, {')
     const progressIndex = body.indexOf('recordCoordinatorJobProgressViaQueueMachine(openPlan.profileHref')
