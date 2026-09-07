@@ -2311,6 +2311,35 @@ those call sites resolve against the two still-resident pause guards
 (region 2/3, not yet extracted), confirmed by grepping the current
 function body directly rather than assuming.
 
+### Slice P2-19 -- the two pause guards (regions 2/3) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff and running the full test suite twice more, both green, plus both
+production builds). Extracted the local pause-request guard into
+`decideResumeCoordinatorLocallyPausedOutcome({cycle})` and the
+stored-pause-state guard into
+`decideResumeCoordinatorStoredPausedOutcome({cycle, pausedState})`,
+kept as two separate functions per the mapping note's warning (merging
+them would make the `metricStorageGet` fetch happen unconditionally even
+when locally paused, a real behavior change). Both use the established
+null-means-continue return convention; the shell resolves `pausedState`
+between the two calls exactly where the original code did, preserving
+the original check order.
+
+Found and fixed one real test dependency: `test/p1-contract.test.js`'s
+`'dashboard has reversible pause and explicit current work cancel'` test
+had `assert.match(resumeBody, /reason: 'coordinator-paused'/)`, which
+broke because that literal (the object-shorthand `reason:` key -- as
+opposed to the `applyResult.reason !== 'coordinator-paused'` comparison
+elsewhere, which doesn't match the same regex) no longer appears
+anywhere in `resumeBody` at all, both occurrences having moved into the
+two new decide functions. Added an `extractFunction` call for
+`decideResumeCoordinatorStoredPausedOutcome` and re-pointed the
+assertion at it, pairing naturally with the adjacent
+`COORDINATOR_PAUSED_KEY` assertion (still valid against `resumeBody`
+unchanged, since that constant is used several more times later in the
+function's still-resident fallback region).
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any

@@ -4085,6 +4085,9 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     const cancelStoredMutationBody = extractFunction(sw, 'async function mutateCoordinatorStoredWorkCancel(operation = {})')
     const resumePausedBody = extractFunction(sw, 'async function resumePausedCoordinatorNukes()')
     const resumeBody = extractFunction(sw, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
+    // the stored-pause-state guard was extracted to
+    // decideResumeCoordinatorStoredPausedOutcome in decomposition Slice P2-19.
+    const storedPausedOutcomeBody = extractFunction(sw, 'function decideResumeCoordinatorStoredPausedOutcome(params = {})')
     const pauseControlBody = extractFunction(dashboard, 'function syncCurrentWorkPauseControls(queueItems = [])')
     const togglePauseBody = extractFunction(dashboard, 'async function toggleCurrentWorkPause()')
     const flashButtonBody = extractFunction(dashboard, 'function flashButton(button)')
@@ -4146,7 +4149,7 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(cancelBody, /shouldContinueSync: \(\) => isCoordinatorPauseGenerationLocallyCurrent\(pauseGeneration\)/)
     assert.doesNotMatch(cancelBody, /setCoordinatorPauseControlState\(false, pauseGeneration, 'ordinaryMutation'\)/)
     assert.match(resumeBody, /COORDINATOR_PAUSED_KEY/)
-    assert.match(resumeBody, /reason: 'coordinator-paused'/)
+    assert.match(storedPausedOutcomeBody, /reason: 'coordinator-paused'/)
 })
 
 test('contributor modal rows are queueable without follow proxy controls', () => {
