@@ -18693,6 +18693,55 @@ function decideFastExecutorAuthorityPreflightOutcome(params = {}) {
     return {authorityPreflightChanged, earlyReturn: null}
 }
 
+function decideFastExecutorEmptyRuntimeRetryOutcome(params = {}) {
+    const {options, result, reason} = params
+    const runtimeCountsAfterResume = queueRuntime.getRuntimeCounts()
+    const runtimeSurfaceEmpty = !getSchedulerBlockingQueuedExecutorCount() &&
+        runtimeCountsAfterResume.queuedTabActions <= 0 &&
+        runtimeCountsAfterResume.pendingTabActions <= 0
+    const queuedOrPendingPlanned = ((Number.parseInt(result?.queued, 10) || 0) > 0 ||
+        (Number.parseInt(result?.pending, 10) || 0) > 0)
+    if(options.awaitFill !== false &&
+        options.forceDurableQueueReload !== true &&
+        options.forcedDurableRuntimeRecovery !== true &&
+        result?.timedOut !== true &&
+        result?.fillResult?.timedOut !== true &&
+        result?.fillResult?.reason !== 'queued-tab-open-failed' &&
+        result?.fillResult?.reason !== 'queued-tab-fill-timeout' &&
+        result?.fillResult?.reason !== 'queued-tab-final-open-decision-timeout' &&
+        result?.fillResult?.authorityUnavailable !== true &&
+        runtimeSurfaceEmpty &&
+        queuedOrPendingPlanned &&
+        (Number.parseInt(result?.active, 10) || 0) <= 0 &&
+        (Number.parseInt(result?.adopted, 10) || 0) <= 0) {
+        const followupReason = `${reason || 'resume'}-empty-runtime-retry`
+        const alreadyHandlingEmptyRuntime = /empty-runtime/.test(`${reason || ''}`)
+        if(!alreadyHandlingEmptyRuntime) {
+            incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeDurableReload')
+            scheduleCoordinatorQueueResume(1000, followupReason, {
+                allowBeforeQuora: options.allowBeforeQuora === true
+            })
+            scheduleCoordinatorReconcile(1000, {
+                reason: followupReason,
+                edgeTriggered: true,
+                allowBeforeQuora: options.allowBeforeQuora === true
+            })
+        }
+        else {
+            incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeRetryAlreadyScheduled')
+        }
+        return {
+            ...(result || {}),
+            emptyRuntimeRetryScheduled: !alreadyHandlingEmptyRuntime,
+            fastPath: true,
+            reason: alreadyHandlingEmptyRuntime
+                ? (result?.reason || 'empty-runtime-retry-already-scheduled')
+                : 'empty-runtime-retry-scheduled'
+        }
+    }
+    return null
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
         resetQueuedTabFillState()
@@ -18857,49 +18906,9 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         }
     }
 
-    const runtimeCountsAfterResume = queueRuntime.getRuntimeCounts()
-    const runtimeSurfaceEmpty = !getSchedulerBlockingQueuedExecutorCount() &&
-        runtimeCountsAfterResume.queuedTabActions <= 0 &&
-        runtimeCountsAfterResume.pendingTabActions <= 0
-    const queuedOrPendingPlanned = ((Number.parseInt(result?.queued, 10) || 0) > 0 ||
-        (Number.parseInt(result?.pending, 10) || 0) > 0)
-    if(options.awaitFill !== false &&
-        options.forceDurableQueueReload !== true &&
-        options.forcedDurableRuntimeRecovery !== true &&
-        result?.timedOut !== true &&
-        result?.fillResult?.timedOut !== true &&
-        result?.fillResult?.reason !== 'queued-tab-open-failed' &&
-        result?.fillResult?.reason !== 'queued-tab-fill-timeout' &&
-        result?.fillResult?.reason !== 'queued-tab-final-open-decision-timeout' &&
-        result?.fillResult?.authorityUnavailable !== true &&
-        runtimeSurfaceEmpty &&
-        queuedOrPendingPlanned &&
-        (Number.parseInt(result?.active, 10) || 0) <= 0 &&
-        (Number.parseInt(result?.adopted, 10) || 0) <= 0) {
-        const followupReason = `${reason || 'resume'}-empty-runtime-retry`
-        const alreadyHandlingEmptyRuntime = /empty-runtime/.test(`${reason || ''}`)
-        if(!alreadyHandlingEmptyRuntime) {
-            incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeDurableReload')
-            scheduleCoordinatorQueueResume(1000, followupReason, {
-                allowBeforeQuora: options.allowBeforeQuora === true
-            })
-            scheduleCoordinatorReconcile(1000, {
-                reason: followupReason,
-                edgeTriggered: true,
-                allowBeforeQuora: options.allowBeforeQuora === true
-            })
-        }
-        else {
-            incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeRetryAlreadyScheduled')
-        }
-        return {
-            ...(result || {}),
-            emptyRuntimeRetryScheduled: !alreadyHandlingEmptyRuntime,
-            fastPath: true,
-            reason: alreadyHandlingEmptyRuntime
-                ? (result?.reason || 'empty-runtime-retry-already-scheduled')
-                : 'empty-runtime-retry-scheduled'
-        }
+    const emptyRuntimeRetryOutcome = decideFastExecutorEmptyRuntimeRetryOutcome({options, result, reason})
+    if(emptyRuntimeRetryOutcome) {
+        return emptyRuntimeRetryOutcome
     }
 
     const changed = (result?.queued || 0) > 0 ||

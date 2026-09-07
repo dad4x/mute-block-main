@@ -2135,6 +2135,23 @@ further down the function (lines ~18826/18849/18911 for the former, the
 `forceDurableQueueReload`/`changed` computations for the latter), so
 those assertions needed no change.
 
+### Slice P2-16 -- empty-runtime retry block (region 10) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move -- and running the full test
+suite twice more, both green, plus both production builds). Extracted
+the whole span (`runtimeCountsAfterResume`/`runtimeSurfaceEmpty`/
+`queuedOrPendingPlanned` computation, the large multi-condition guard,
+and its bare-return body) into
+`decideFastExecutorEmptyRuntimeRetryOutcome(params)`, taking
+`{options, result, reason}` and returning either the early-return object
+or `null` (same null-means-continue convention as P2-14's throttle gate).
+Confirmed none of the three locals it computes are referenced anywhere
+else in `runCoordinatorQueueExecutorFastPath` after this span. Checked
+`test/p1-contract.test.js` for references to the moved literals
+(`emptyRuntimeRetry`, `empty-runtime-retry`, `emptyRuntimeDurableReload`,
+`runtimeSurfaceEmpty`) -- none exist, no test update needed.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the
