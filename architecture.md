@@ -258,10 +258,33 @@ old-generation cleanup, not as a garbage-collection model.
 
 ## Module Extraction And The Test Harness Realm Boundary
 
-`sw.js` runs inside a `vm.createContext` sandbox in tests, with `Date` and
-timers injected so fake-timer control works. A module loaded into the
-surrounding test process via a plain `require()` lives in a different V8
-realm from that sandboxed `sw.js` source.
+**Resolved 2026-09** (`test/lib/swHarness.js`, commits `db12da9`,
+`372f5c9`, `f845a99`): the harness now compiles `sw.js` and every module
+it (transitively) requires into the *same* contextified `vm` sandbox via
+a hand-rolled in-realm CommonJS loader (`createSharedRealmRequire`),
+instead of sandboxing `sw.js` alone while its ~69 required sibling
+modules ran via a plain `require()` into the outer Node process. This
+matches production, where webpack bundles everything into one realm.
+Landing it collapsed 69+ real realm crossings to zero across the whole
+require graph and, doing so, exposed (not caused) a genuine pre-existing
+concurrency bug in `restoreActiveLiveCoordinatorQueuedTabAction` that the
+old harness's extra microtask ticks had been masking -- confirmed via A/B
+(the bug reproduced with the realm fix in place and did not reproduce
+without it, against identical `sw.js` logic) before being fixed
+separately. See
+[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md)'s
+"Phase 0" section for the full design and rollout history. The
+constraint described below no longer applies to new extractions -- an
+`async` function, or one that builds/chains a Promise into another
+module, can now move into its own module without a realm penalty either
+way. The history is kept below because the underlying mechanism (and the
+two confirmed regressions that motivated fixing it) are still useful
+context for anyone extending the harness further.
+
+`sw.js` used to run inside a `vm.createContext` sandbox in tests, with
+`Date` and timers injected so fake-timer control works, while a module
+loaded into the surrounding test process via a plain `require()` lived in
+a different V8 realm from that sandboxed `sw.js` source.
 
 A same-realm `await` chain costs one microtask tick. The identical chain
 crossing a vm/real-Node realm boundary costs two, in either direction. This
@@ -281,14 +304,16 @@ async functions, and the module awaiting vm-injected async capabilities --
 each crossing doubling its tick cost and compounding across the reconcile
 tick's concurrent work.
 
-Constraint for future extraction: a function with no `async` keyword and no
-Promise chain in its body can be pulled into its own module freely; it
-carries no realm penalty either way. An `async` function that participates
-in ordering within a reconcile tick (queue WAL persist, checkpoint
-switching, and similar) must stay in `sw.js` unless the test harness's
-module-loading strategy changes to put an extracted module in the same
-realm as the vm-sandboxed source. Do not re-attempt an async
-WAL/coordinator-authority extraction without addressing that first.
+**(Historical -- resolved, see above.)** Constraint that used to apply to
+future extraction: a function with no `async` keyword and no Promise
+chain in its body could be pulled into its own module freely; it carried
+no realm penalty either way. An `async` function that participated in
+ordering within a reconcile tick (queue WAL persist, checkpoint
+switching, and similar) had to stay in `sw.js` unless the test harness's
+module-loading strategy changed to put an extracted module in the same
+realm as the vm-sandboxed source. That strategy change is what "Resolved
+2026-09" above describes; this constraint no longer restricts new
+extractions.
 
 Refinement found during the sw.js decomposition plan's Slice 7 (2026-09):
 "no `async` keyword" is not the same test as "no realm penalty." A

@@ -17,16 +17,20 @@ start of this effort. Priority target #4 (`resumeCoordinatorQueueExecutionOnce`)
 is next on the "Next 20 Part 2 targets" list below, pending explicit
 direction to continue.
 
-**Phase 0 now has a concrete design** (see "Phase 0" section below,
-written 2026-09 after mapping the actual `require()` graph): a
-shared-context in-realm CommonJS loader in `test/lib/swHarness.js`,
-replacing the current `baseRequire`-into-the-outer-Node-realm delegation
-with `vm.runInContext` calls against the same contextified sandbox
-`sw.js` itself runs in. Confirmed the graph is small and closed (69
-direct requires from `sw.js`, all flat relative paths within `shared/js/`,
-no subdirectories, no JSON, no Node builtins) so the loader doesn't need
-to replicate Node's full resolution algorithm. Not yet implemented --
-this is the plan, pending a decision to execute it.
+**Phase 0 is done** (see "Phase 0" section below for the full design and
+execution history; commits `db12da9`, `372f5c9`, `f845a99`). `sw.js` and
+every module it (transitively) requires now execute in one shared `vm`
+realm instead of `sw.js` alone being sandboxed while its ~69 required
+modules ran in the outer Node realm, matching production's webpack-
+bundled reality. Landing it exposed (and a follow-up commit fixed) a
+real, pre-existing concurrency bug in
+`restoreActiveLiveCoordinatorQueuedTabAction` that the old harness's
+extra microtask ticks had been masking -- confirmed via A/B before
+fixing. **The realm-crossing constraint that gated moving any `decide*`
+function (or an `async` function generally) into its own module no
+longer applies** -- the ~17 `decide*` functions Part 2 has accumulated so
+far, and any future one, are now candidates for a real module extraction
+whenever that work is picked up; not yet started.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -39,6 +43,18 @@ still Promise-chain into a resident module; `scheduleQueueWakeupMetricsFlush`
 has a hard test-harness regex-suppression blocker;
 `scheduleTerminalProgressProjectionFlush`/`saveTerminalProgressProjectionAfterAuthority`
 still share mutable state with and chain into a resident async function).
+**Update, post-Phase-0 (2026-09):** the realm-crossing constraint that
+blocked 4 of these 5 (`ensureBrowserSessionStartupMetricsReset`,
+`startQueueWakeupMetricsBackedStartupWork`,
+`scheduleTerminalProgressProjectionFlush`,
+`saveTerminalProgressProjectionAfterAuthority` -- the ones blocked by
+"Promise-chain[ing] into a resident module") no longer applies now that
+Phase 0 has landed (see below) -- they're candidates for extraction
+again, on their own merits (the shared-mutable-state coupling for the
+terminal-progress pair may still be a real reason to keep them together,
+independent of realms; re-verify before assuming it's now trivial).
+`scheduleQueueWakeupMetricsFlush` remains blocked by its own, unrelated,
+still-real regex-suppression constraint.
 
 Part 1 is now genuinely finished: what remains in `sw.js` past the
 excluded `createCoordinatorAuthority`/WAL region is exactly those 5
@@ -2197,7 +2213,7 @@ indirection. No further Part 2 target has been chosen yet; the "Next 20
 Part 2 targets" list remains the candidate pool pending explicit
 direction (`resumeCoordinatorQueueExecutionOnce` is priority #4 next).
 
-## Phase 0 -- test harness realm fix (prerequisite for moving decide* logic into a module)
+## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
 future one) can move out of `sw.js` into its own module, the test
