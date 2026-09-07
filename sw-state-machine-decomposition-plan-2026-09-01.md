@@ -2396,6 +2396,84 @@ genuinely act-dominated. No further Part 2 target has been chosen yet;
 priority #5 (`sweepStaleQueuedTabs`) is next on the "Next 20 Part 2
 targets" list.
 
+## Part 2.5 -- moving the accumulated decide* functions into real modules
+
+Now that Phase 0 has landed, the ~29 `decide*` functions Part 2 has
+accumulated (all still physically resident in `sw.js`) can move into
+real modules, matching every other Part 1 extraction's shape. Surveyed
+the actual set (`grep -n '^function decide[A-Za-z]*(' shared/js/sw.js`)
+and checked cross-references (`grep -c '\bfnName('` for each) before
+designing the split, rather than assuming.
+
+**Confirmed: every one of the 29 has exactly 2 references in the whole
+file -- its own definition and exactly one call site, from its own
+parent orchestrator function. None call each other.** This makes the
+split trivial to reason about: no shared sub-dependencies between decide
+functions, no risk of splitting a cluster that's secretly coupled.
+
+**Grouping, by originating orchestrator (matches Part 1's per-domain
+module convention, not one giant catch-all module):**
+
+- **`swQueuedTabActiveTransitionDecisions.js`** (5 functions):
+  `decideActiveTransitionOutcome`, `decideActiveTransitionMutation` (both
+  from Slice P2-1, the technique's original proving ground -- these two
+  predate the `params = {}` object-destructure convention every later
+  slice settled on, using positional args instead; **leave that as-is,
+  don't normalize it while moving** -- changing a call signature during
+  what should be a behavior-preserving relocation adds risk for no
+  benefit), `decideFastActiveTransitionOutcome`,
+  `decideActiveTransitionContinuationChoice`,
+  `decideActiveTransitionReclaimedByDifferentAttempt` (from Slices
+  P2-10/P2-11/P2-12, `confirmQueuedTabOpenDurableActiveEffect`'s
+  regions).
+- **`swFillQueuedTabsOnceDecisions.js`** (12 functions, the largest
+  group): `decideQueueLoadThrottleGate`, `decidePausedStateGate`,
+  `decideActivationGuardClaim`, `decideProfileOpenReservationClaim`,
+  `decideSlotOutcome`, `decideFinalOpenRecoveryOutcome`,
+  `decidePreOpenRecoveryOutcome`, `decideLiveProfileTabCapacityGate`,
+  `decidePreOpenPausedGate`, `decidePostOpenFailureRecoveryOutcome`,
+  `decideReturnAfterDurableActiveOutcome`,
+  `decideFillQueuedTabsOnceOutcome` (Slices P2-2 through P2-9,
+  `fillQueuedTabsOnce`'s 9 regions).
+- **`swFastExecutorDecisions.js`** (5 functions): `decideFastExecutorPausedOutcome`,
+  `decideFastExecutorThrottleGate`, `decideFastExecutorAuthorityPreflightOutcome`,
+  `decideFastExecutorEmptyRuntimeRetryOutcome`, `decideFastExecutorFinalOutcome`
+  (Slices P2-13 through P2-17, `runCoordinatorQueueExecutorFastPath`).
+- **`swResumeQueueExecutionDecisions.js`** (7 functions): `decideResumeCoordinatorLocallyPausedOutcome`,
+  `decideResumeCoordinatorStoredPausedOutcome`,
+  `decideResumeShouldRevalidateFillOutcome`,
+  `decideResumeShouldUseFallbackOutcome`, `decideResumeRawQueueFallbackItems`,
+  `decideResumeWalQueueFallbackItems`,
+  `decideResumeCoordinatorQueueExecutionOnceOutcome` (Slices P2-18
+  through P2-21, `resumeCoordinatorQueueExecutionOnce`).
+
+**Execution shape, matching Part 1's established `createX(deps = {})`
+factory convention** (see `shared/js/swQueuedTabOpenEffect.js` for a
+faithful reference example): for each module, identify its functions'
+full dependency footprint (every bare identifier referenced that isn't a
+JS builtin or the function's own param) via grep, construct it in
+`sw.js` immediately after `require`ing it, and destructure its exports
+back onto the original bare names (the established trick that means
+every one of the 29 call sites -- already confirmed to be exactly one
+each -- needs zero edits beyond the destructure). Check each new
+module's construction point against every already-extracted module's own
+construction-time `deps` object literal for the TDZ/construction-order
+hazard documented earlier in this plan (an eager bare-identifier
+reference to a not-yet-constructed name) before picking where in `sw.js`
+to place the `require`+construct call. No realm-crossing scrutiny is
+needed for these moves -- Phase 0 resolved that for the whole file -- but
+still confirm each function is a pure textual move (byte-identical body)
+independently, the same rigor as every prior slice.
+
+**Plan: four slices, one module each (P2.5-1 through P2.5-4), smallest
+first** (`swQueuedTabActiveTransitionDecisions.js`, 5 functions) to prove
+the pattern before the largest (`swFillQueuedTabsOnceDecisions.js`, 12
+functions). Given the mechanical-but-error-prone nature of a dependency-
+footprint inventory across many functions, and the proven success of the
+Phase-0 sub-agent workflow, execute via one sub-agent per module (one at
+a time), each independently re-verified in full (diff read, test suite
+2-3x, both builds) before the next starts.
+
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
 Before any of the ~17 `decide*` functions accumulated by Part 2 (or any
