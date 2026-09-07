@@ -3263,6 +3263,9 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     const body = extractFunction(source, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
     const dropBody = extractFunction(reclaimResumeSource, 'function dropVolatileQueuedActionsForDurableResume(reason = \'resume-rebuild-from-durable-queue\', details = {})')
     const resumeBody = extractFunction(source, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
+    // the storage-projection-fallback guard condition was extracted to
+    // decideResumeShouldUseFallbackOutcome in decomposition Slice P2-21.
+    const shouldUseFallbackBody = extractFunction(source, 'function decideResumeShouldUseFallbackOutcome(params = {})')
 
     assert.doesNotMatch(body, /classifierReducerOwnsRuntimeSurfaces/)
     assert.doesNotMatch(body, /existing-runtime-fill/)
@@ -3298,7 +3301,8 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     assert.match(resumeBody, /const hasTrustedAuthorityStateForResume = !!\([\s\S]*suppliedAuthorityState\?\.queue[\s\S]*residentAuthorityStateForResume\?\.queue[\s\S]*\)/)
     assert.match(reconcileSupportSinglesSource, /function shouldSkipResumeProjectionFallbackForTrustedAuthority\(reason = ''\) \{[\s\S]*terminal-progress[\s\S]*queued-tab-\(\?:slot-\)\?release/)
     assert.match(resumeBody, /const shouldUseProjectionFallbackForResume = forceDurableQueueReload \|\|[\s\S]*!hasTrustedAuthorityStateForResume \|\|[\s\S]*!shouldSkipResumeProjectionFallbackForTrustedAuthority\(options\.reason\)/)
-    assert.match(resumeBody, /serviceWorkerOwned &&[\s\S]*options\.awaitFill !== false &&[\s\S]*shouldUseProjectionFallbackForResume &&[\s\S]*loadCoordinatorQueueProjection\(\{[\s\S]*metricPath: 'pump\.resume\.storageProjectionFallback\.load'/)
+    assert.match(shouldUseFallbackBody, /serviceWorkerOwned &&[\s\S]*options\.awaitFill !== false &&[\s\S]*shouldUseProjectionFallbackForResume &&/)
+    assert.match(resumeBody, /decideResumeShouldUseFallbackOutcome\(\{[\s\S]*loadCoordinatorQueueProjection\(\{[\s\S]*metricPath: 'pump\.resume\.storageProjectionFallback\.load'/)
     assert.match(reclaimResumeSource, /name: 'volatile-queued-actions-dropped'/)
     assert.match(dropBody, /getQueuedTabFillPromise\(\) && !clearStaleQueuedTabFillPromise\(reason\)/)
     assert.match(dropBody, /pump\.noop\.preservedVolatileQueuedActionsDuringFill/)
