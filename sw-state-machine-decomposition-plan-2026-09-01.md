@@ -1755,17 +1755,118 @@ none exist; the one nearby assertion referencing similar-looking strings
 region #3's dead-code span) matches different, untouched content, so no
 test update was needed.
 
-### Slice P2-11 -- next up
+### Regions #3/#4/#5 -- fresh re-map post-P2-10 (2026-09)
 
-Region #4's two sub-branches (the `activeTransitionContinued` path,
-29246-29254 pre-P2-10-edit, and the larger rollback path,
-29255-29385 pre-P2-10-edit) are the next candidates -- re-grep fresh
-before executing, since P2-10's edit shifted everything below it by
-roughly -18 lines (30 lines removed from the call site, 28 lines added
-for the new function placed earlier in the file -- net shift is small but
-non-zero, don't trust these numbers without re-checking). Start with the
-`activeTransitionContinued` path (smaller, cleaner, no nested awaits) before
-attempting the rollback path's per-branch extraction.
+Per an explicit "go through all of those" request covering the rest of
+`confirmQueuedTabOpenDurableActiveEffect`. Re-grepped: the function is
+now 29157-29518 (P2-10 shifted everything below its insertion point by a
+net -18 lines). Read the whole remaining body fresh rather than trusting
+the pre-P2-10 line numbers in the map above.
+
+**Region #3 (dead-code guard, 29212-29232): confirmed still dead, no
+extraction planned.** Traced control flow again from the current source:
+`if(returnAfterDurableActive) { ... return ... }` at 29188 always returns
+when `returnAfterDurableActive` is true, so by line 29212
+`returnAfterDurableActive` is unconditionally `false` and the guard's
+condition can never be true. This is pre-existing dead code, unrelated to
+this decomposition effort. Extracting dead code serves no Part 2 goal
+(there's no await-reordering risk to resolve in code that never runs) and
+would just be noise -- **explicitly leaving this resident, documented
+here rather than touched**, consistent with the "honest not-much-here" as
+a fully valid slice outcome established since P2-7.
+
+**Region #4 (29244-29390): the `activeTransitionContinued`/rollback
+split.** Two genuinely different pieces:
+
+- **4a -- continuation-choice guard (29244-29259):** `if(!activeTransitionAccepted)
+  { activeTransitionContinued = shouldKeepQueuedTabOpenAfterActiveTransitionFailure(...) }`
+  then `if(activeTransitionContinued) { setQueuedTabMetadata(...);
+  scheduleCoordinatorQueueResume(...) }` (falls through to the shared
+  final `return` at 29511-29517 when taken). Fully sync, no awaits
+  anywhere in this span, structurally the same shape as every clean
+  decide extraction already done. **Slice P2-11 target: extract as
+  `decideActiveTransitionContinuationChoice(params)`**, returning
+  `{activeTransitionContinued}` so the shell can still branch into the
+  `else if(!activeTransitionAccepted)` rollback path below it -- the
+  decide function performs the metadata/schedule side effects itself
+  when continuing, matching the established precedent (e.g.
+  `decidePostOpenFailureRecoveryOutcome` also calls
+  `scheduleCoordinatorQueueResume` from inside a decide function). Params:
+  `activeTransitionAccepted`, `action`, `tab`, `plan`, `activeTransitionError`.
+
+- **4b -- rollback path (29260-29390):** genuinely await-dominated, the
+  same shape as `fillQueuedTabsOnce`'s old regions #4/#5/#7 --
+  `markQueuedTabClosing` -> `await rollbackFailedQueuedTabOpen(...)` ->
+  sync early-return if `rolledBack` (but that branch itself does `await
+  browser.tabs.remove(...)`, so it's mixed, not pure decide) -> a
+  conditional-await resolution of `currentAuthorityState` (act) -> a pure
+  sync block deriving `profileHref`/`coordinatorKey`/`currentItem`/
+  attempt-id comparisons into `sameTabReclaimedByDifferentAttempt`
+  (29291-29307, decide-able on its own, but its consuming branch again
+  does `await browser.tabs.remove`, so only the boolean computation
+  itself is extractable, not the branch that acts on it) -> nested
+  `if(activeTransitionSettled)` with another conditional-await resolution
+  of `state` (act) -> another pure sync `rowStayedQueued` derivation
+  (29332-29347, same shape as the one above -- **this is the second,
+  near-identical copy** of the reclaimed-attempt-style boolean derivation
+  pattern seen in region #5 below) -> that branch too does `await
+  browser.tabs.remove`. **Assessment: only the two boolean-derivation
+  spans (29291-29307 and 29332-29347) are pure decide candidates; every
+  branch that consumes them is itself mixed await/sync "act," not
+  extractable.** Given each derivation needs ~6 params threaded
+  (`currentAuthorityState`/`state`, `plan`, `action`, `tab`, plus a couple
+  locals) for a payoff of isolating a ~15-line boolean expression whose
+  surrounding control flow stays in the shell either way, this is a
+  marginal win at real complexity cost. **Decision: extract 4a only in
+  Slice P2-11; leave 4b resident and documented, matching the P2-7
+  "honest not-much-here" precedent** -- the two boolean derivations are
+  candidates for a *future* slice only if this same duplicated pattern
+  gets revisited (see region #5's note below).
+
+**Region #5 (29392-29509): the `else` branch (`returnAfterDurableActive`
+false, transition accepted immediately by the `.then()` deferred-settle
+path or resolved before the `try` completed).** Structure:
+
+- `markQueuedTabDurablyActive(tab.id, 'active-transition')` (sync).
+- `if(returnAfterDurableActive) { return {...} }` (29394-29402) --
+  **also confirmed dead code**, same reasoning as region #3
+  (`returnAfterDurableActive` is unconditionally `false` inside this
+  `else` branch, since the `if(returnAfterDurableActive)` at 29188
+  already returned earlier when true). Leave resident, documented, no
+  extraction -- same call as region #3.
+- Conditional-await authority hydration (29403-29407, act) -> pure sync
+  derivation of `profileHref`/`coordinatorKey`/`currentItem`/
+  `sameTabReclaimedByDifferentAttempt` (29408-29425) -- **the same
+  boolean-derivation shape as region 4b's first span**, but here its
+  consuming branch (29426-29448) also mixes `await browser.tabs.remove`,
+  so again only the derivation itself is a pure decide candidate, not the
+  branch. **Slice P2-12 target: extract this derivation** as
+  `decideSameTabReclaimedByDifferentAttempt(params)` (or a name shared
+  with region 4b's near-identical span if a shared helper reads better
+  once both are in hand -- decide during execution, not preemptively,
+  since the two spans differ slightly: region 4b reads from
+  `currentAuthorityState.queue`/`currentQueue[key]` shaped data, region 5
+  reads from `currentAuthorityState.queue?.[key]` directly with a
+  different tab-id field precedence; confirm they're truly identical
+  logic before merging, don't assume from similar shape alone).
+- `await getQueuedExecutorTabStatusWithTimeout(...)` (act) -> sync branch
+  on `liveTabStatus` with three shapes (`missing` -> rollback+return,
+  `!tab` -> metadata+schedule, `else` implicit fallthrough to final
+  return) (29449-29508). The `missing` branch does more awaits
+  (`rollbackFailedQueuedTabOpen`, conditional `releaseQueuedTab`); the
+  `!liveTabStatus.tab` branch (29497-29508, the tab-lookup-failed/timeout
+  case) is fully sync (`setQueuedTabMetadata` + `scheduleCoordinatorQueueResume`,
+  falls through to final return) -- **another clean decide candidate**,
+  Slice P2-12 territory alongside the derivation above.
+
+**Plan: Slice P2-11 does region 4a only (the safe win). Slice P2-12
+covers region 5's two extractable spans (the reclaimed-attempt
+derivation + the tab-lookup-failed sync tail) and finalizes the
+assessment on whether 4b's and 5's boolean derivations should share a
+helper.** Both regions #3 and the dead branch inside region #5 are
+addressed by this documentation, not by code changes -- that satisfies
+"go through all of those" for those two without forcing a pointless
+extraction.
 
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
