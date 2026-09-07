@@ -29176,6 +29176,29 @@ function decideActiveTransitionContinuationChoice(params = {}) {
     return {activeTransitionContinued}
 }
 
+function decideActiveTransitionReclaimedByDifferentAttempt(params = {}) {
+    const {currentAuthorityState, plan, action, tab} = params
+    const profileHref = plan.profileHref || normalizeQuoraProfileUrl(action.profileHref || action.url || '')
+    const coordinatorKey = plan.coordinatorKey || action.coordinatorKey || profileHref || ''
+    const currentItem = coordinatorKey && currentAuthorityState?.queue?.[coordinatorKey]
+        ? currentAuthorityState.queue[coordinatorKey]
+        : profileHref
+        ? currentAuthorityState?.queue?.[profileHref] || null
+        : null
+    const currentTabId = normalizeTabId(currentItem?.tabId || currentItem?.activeTabId || null)
+    const expectedAttemptId = getAttemptIdFromValue(plan.activeTransitionDetails || {}) || getAttemptIdFromValue(action)
+    const expectedAttemptNumber = getAttemptNumberFromValue(plan.activeTransitionDetails || {}) || getAttemptNumberFromValue(action)
+    const currentAttemptId = getAttemptIdFromValue(currentItem)
+    const currentAttemptNumber = getAttemptNumberFromValue(currentItem)
+    const sameTabReclaimedByDifferentAttempt = currentItem &&
+        isActiveCoordinatorStatus(currentItem.status) &&
+        currentTabId &&
+        currentTabId === normalizeTabId(tab?.id) &&
+        ((expectedAttemptId && currentAttemptId && currentAttemptId !== expectedAttemptId) ||
+            (expectedAttemptNumber && currentAttemptNumber && currentAttemptNumber !== expectedAttemptNumber))
+    return {sameTabReclaimedByDifferentAttempt}
+}
+
 async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, plan = {}, options = {}) {
     let activeTransitionAccepted = false
     let activeTransitionError = ''
@@ -29414,24 +29437,9 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
             await coordinatorAuthority.hydrate().catch(() => null)
             currentAuthorityState = coordinatorAuthority.current()
         }
-        const profileHref = plan.profileHref || normalizeQuoraProfileUrl(action.profileHref || action.url || '')
-        const coordinatorKey = plan.coordinatorKey || action.coordinatorKey || profileHref || ''
-        const currentItem = coordinatorKey && currentAuthorityState?.queue?.[coordinatorKey]
-            ? currentAuthorityState.queue[coordinatorKey]
-            : profileHref
-            ? currentAuthorityState?.queue?.[profileHref] || null
-            : null
-        const currentTabId = normalizeTabId(currentItem?.tabId || currentItem?.activeTabId || null)
-        const expectedAttemptId = getAttemptIdFromValue(plan.activeTransitionDetails || {}) || getAttemptIdFromValue(action)
-        const expectedAttemptNumber = getAttemptNumberFromValue(plan.activeTransitionDetails || {}) || getAttemptNumberFromValue(action)
-        const currentAttemptId = getAttemptIdFromValue(currentItem)
-        const currentAttemptNumber = getAttemptNumberFromValue(currentItem)
-        const sameTabReclaimedByDifferentAttempt = currentItem &&
-            isActiveCoordinatorStatus(currentItem.status) &&
-            currentTabId &&
-            currentTabId === normalizeTabId(tab?.id) &&
-            ((expectedAttemptId && currentAttemptId && currentAttemptId !== expectedAttemptId) ||
-                (expectedAttemptNumber && currentAttemptNumber && currentAttemptNumber !== expectedAttemptNumber))
+        const {sameTabReclaimedByDifferentAttempt} = decideActiveTransitionReclaimedByDifferentAttempt({
+            currentAuthorityState, plan, action, tab
+        })
         if(sameTabReclaimedByDifferentAttempt) {
             markQueuedTabClosing(tab.id, 'active-transition-reclaimed-by-new-attempt')
             const detached = detachQueuedTabRuntimeState(tab.id, 'active-transition-reclaimed-by-new-attempt')
