@@ -2082,6 +2082,26 @@ at line ~3356) -- none exist; a separate, unrelated `resumeBody` also
 matches the string `'coordinator-paused'` but extracts a different
 function entirely, untouched by this slice.
 
+### Slice P2-14 -- throttle gate (region 5) (done)
+
+Completed (done directly; independently re-verified by reading the full
+diff -- confirmed byte-for-byte textual move -- and running the full test
+suite twice more, both green, plus both production builds). Extracted
+the whole throttle-gate span (`getQueueLoadThrottle()` call plus both
+`if` branches) into `decideFastExecutorThrottleGate(params)`, taking
+`{options}` and returning either the throttled outcome object or `null`
+(matching `decideQueueLoadThrottleGate`'s null-return-means-not-throttled
+convention). Confirmed `throttle` is not referenced anywhere else in
+`runCoordinatorQueueExecutorFastPath` after this span, so the whole local
+could move without leaving anything behind. Checked
+`test/p1-contract.test.js` for references to the moved literals
+(`queue-load-throttle`, `pump.fastExecutor.throttled`,
+`rememberQueueLoadProgress`) -- the one hit
+(`decideQueueLoadThrottleGate` at line ~4856) is the unrelated,
+already-confirmed-different `fillQueuedTabsOnce` throttle gate from
+P2-2/P2-14's own mapping note; untouched by this slice, no update
+needed.
+
 ## Phase 0 -- test harness realm fix (prerequisite for Part 2)
 
 Before any `async` orchestration code can move into its own module, the

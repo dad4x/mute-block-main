@@ -18638,6 +18638,31 @@ function decideFastExecutorPausedOutcome() {
     }
 }
 
+function decideFastExecutorThrottleGate(params = {}) {
+    const {options} = params
+    const throttle = getQueueLoadThrottle()
+    if(throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() > 0) {
+        const delayMs = Math.max(1000, throttle.until - Date.now())
+        scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle', {
+            allowBeforeQuora: options.allowBeforeQuora === true
+        })
+        incrementQueueWakeupMetric('pump.fastExecutor.throttled')
+        return {
+            queued: 0,
+            pending: 0,
+            active: 0,
+            changed: false,
+            throttled: true,
+            fastPath: true,
+            reason: 'queue-load-throttled'
+        }
+    }
+    if(throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() <= 0) {
+        rememberQueueLoadProgress('fast-executor-idle-durable-work')
+    }
+    return null
+}
+
 async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executor', options = {}) {
     if(queuedTabFillPromise && isExecutorRuntimeIdleForPromiseLatch()) {
         resetQueuedTabFillState()
@@ -18727,25 +18752,9 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
         options.forceDurableQueueReload !== true) {
         incrementQueueWakeupMetric('pump.fastExecutor.emptyRuntimeInitialDurableReload')
     }
-    const throttle = getQueueLoadThrottle()
-    if(throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() > 0) {
-        const delayMs = Math.max(1000, throttle.until - Date.now())
-        scheduleCoordinatorQueueResume(delayMs, 'queue-load-throttle', {
-            allowBeforeQuora: options.allowBeforeQuora === true
-        })
-        incrementQueueWakeupMetric('pump.fastExecutor.throttled')
-        return {
-            queued: 0,
-            pending: 0,
-            active: 0,
-            changed: false,
-            throttled: true,
-            fastPath: true,
-            reason: 'queue-load-throttled'
-        }
-    }
-    if(throttle?.active === true && getSchedulerBlockingQueuedExecutorCount() <= 0) {
-        rememberQueueLoadProgress('fast-executor-idle-durable-work')
+    const throttleOutcome = decideFastExecutorThrottleGate({options})
+    if(throttleOutcome) {
+        return throttleOutcome
     }
 
     let authorityPreflight = null
