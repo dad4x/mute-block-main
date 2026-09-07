@@ -3,19 +3,15 @@
 Date: 2026-09-01
 
 Status: Part 1 (sync-only extraction) is complete (Slices 1-44). Part 2
-(async orchestration, decide/act splitting, still same-file pending
-Phase 0) has fully decomposed the top 3 priority targets: `fillQueuedTabsOnce`
-(~951 lines, all 9 regions), `confirmQueuedTabOpenDurableActiveEffect`
-(~386 lines, all 5 regions), and `runCoordinatorQueueExecutorFastPath`
-(~302 lines, all 5 regions) -- 17 slices (P2-1 through P2-17) total, ~17
-named `decide*` helpers extracted. See `git log --oneline` for the full
-commit list, starting at `3567f1c`. Part 2's work so far stays physically
-in `sw.js`, no new module yet. `shared/js/sw.js` line count fluctuates
-around the Part 1 baseline of 30,742 as Part 2's same-file restructuring
-trades inline code for named decide functions, down from 38,953 at the
-start of this effort. Priority target #4 (`resumeCoordinatorQueueExecutionOnce`)
-is next on the "Next 20 Part 2 targets" list below, pending explicit
-direction to continue.
+(async orchestration, decide/act splitting) has fully decomposed the top
+4 priority targets: `fillQueuedTabsOnce` (~951 lines, all 9 regions),
+`confirmQueuedTabOpenDurableActiveEffect` (~386 lines, all 5 regions),
+`runCoordinatorQueueExecutorFastPath` (~302 lines, all 5 regions), and
+`resumeCoordinatorQueueExecutionOnce` (~274 lines, all its regions) --
+21 slices (P2-1 through P2-21) total, ~29 named `decide*` helpers
+extracted. Priority target #5 (`sweepStaleQueuedTabs`) is next on the
+"Next 20 Part 2 targets" list below, pending explicit direction to
+continue.
 
 **Phase 0 is done** (see "Phase 0" section below for the full design and
 execution history; commits `db12da9`, `372f5c9`, `f845a99`). `sw.js` and
@@ -26,11 +22,23 @@ bundled reality. Landing it exposed (and a follow-up commit fixed) a
 real, pre-existing concurrency bug in
 `restoreActiveLiveCoordinatorQueuedTabAction` that the old harness's
 extra microtask ticks had been masking -- confirmed via A/B before
-fixing. **The realm-crossing constraint that gated moving any `decide*`
-function (or an `async` function generally) into its own module no
-longer applies** -- the ~17 `decide*` functions Part 2 has accumulated so
-far, and any future one, are now candidates for a real module extraction
-whenever that work is picked up; not yet started.
+fixing.
+
+**Part 2.5 is also done** (see "Part 2.5" section below). All ~29
+`decide*` functions Part 2 accumulated now live in 4 real modules --
+`swQueuedTabActiveTransitionDecisions.js`, `swFastExecutorDecisions.js`,
+`swResumeQueueExecutionDecisions.js`, `swFillQueuedTabsOnceDecisions.js`
+-- matching every other Part 1 extraction's shape, with zero `decide*`
+function definitions left physically resident in `sw.js`. One slice
+(`swFillQueuedTabsOnceDecisions.js`) found and correctly handled a real
+reassigned-`let` hazard (`queuedTabFillOpeningActionKeys`) via a
+`deps.state` getter closure rather than a stale one-time destructure --
+not a pure textual move like the other three, flagged and independently
+re-verified in detail. See `git log --oneline` for the full commit list,
+starting at `3567f1c`. `shared/js/sw.js` line count is now well below
+the Part 1 baseline of 30,742, having shed the ~29 decide functions'
+source text to the 4 new modules on top of Part 1's own reductions, down
+from 38,953 at the start of this effort.
 
 Slice 44's mop-up re-checked all 15 stragglers Slice 43 had flagged (lines
 477-5646 as of that pass, before the excluded `createCoordinatorAuthority`/
@@ -2545,6 +2553,69 @@ updating (`decideResumeShouldUseFallbackOutcome`,
 `decideResumeCoordinatorStoredPausedOutcome`), fixed following the
 established pattern; confirmed no stray references to the other 5 moved
 names. Ran the full suite twice more and both builds myself, all green.
+
+### Slice P2.5-4 -- swFillQueuedTabsOnceDecisions.js (done)
+
+Completed (commit `bdafe0c`, via sub-agent; independently re-verified
+with the highest scrutiny of the four modules, both for size -- 12
+functions, the largest group -- and because this one is **not** a pure
+textual move). Wrote a small Python script to extract and content-diff
+(whitespace-normalized) all 12 function bodies from the pre-move source
+against the new module: 10 confirmed byte-identical, 2
+(`decideProfileOpenReservationClaim`, `decideFillQueuedTabsOnceOutcome`)
+confirmed identical except for the one expected substitution. Also
+independently traced every one of the 6 raw
+`queuedTabFillOpeningActionKeys` references in the pre-move source
+(`git show`) to confirm exactly 2 of them fell inside the 12 moved
+functions and 4 stayed resident in `fillQueuedTabs`/`fillQueuedTabsOnce`
+-- matching the agent's claim precisely, not just trusting the count.
+
+**The real finding: `queuedTabFillOpeningActionKeys` is a module-level
+`let` that `sw.js` reassigns to a fresh `Set` on every fill cycle** (plus
+a setter used elsewhere). A one-time `deps.handlers` destructure would
+have frozen the new module onto the `Set` instance that existed at
+*module-load* time, going stale (and silently diverging from `sw.js`'s
+actual live state) the moment `sw.js` swapped in a new one -- a real
+correctness bug the pure-move framing used by every other slice in this
+plan would have introduced. The agent correctly caught this and threaded
+it via a `deps.state.getQueuedTabFillOpeningActionKeys` getter closure
+instead (`() => queuedTabFillOpeningActionKeys`, always resolving to
+whatever the module-level binding currently holds), changing the two call
+sites from `queuedTabFillOpeningActionKeys.delete(...)` to
+`getQueuedTabFillOpeningActionKeys().delete(...)`. Confirmed this pattern
+is not novel but matches an already-established one elsewhere in `sw.js`
+(e.g. `getQueuedTabFillPromise: () => queuedTabFillPromise` for a
+different reassignable `let`, in `storageIdlePromiseLatch`'s own
+construction call) -- both call sites mutate the same live `Set` instance
+by reference, correct regardless of how many times `sw.js` has reassigned
+the binding since module load.
+
+Independently re-derived the full TDZ check for all 32 dependencies
+myself (not just spot-checking): 23 resolved cleanly as
+`const`/destructure bindings before the construction call (line 5016); 9
+initially flagged by a naive grep script turned out to be a false
+positive (the grep matched the dependency's own name *inside the
+construction call's object literal*, not a real declaration) -- verified
+each of those 9 is actually a hoisted `function`/`async function`
+declaration elsewhere in the file, which carries no TDZ risk regardless
+of textual position. No real hazard beyond the one the agent already
+found and fixed.
+
+Six `test/p1-contract.test.js` references needed updating
+(`decideReturnAfterDurableActiveOutcome`, `decideQueueLoadThrottleGate`,
+`decidePausedStateGate`, `decideActivationGuardClaim`,
+`decideProfileOpenReservationClaim`, `decidePostOpenFailureRecoveryOutcome`),
+all fixed following the established pattern; confirmed no stray
+references to the other 6 moved names. Ran the full suite three times
+more myself (plus the three default scenario-fuzz seeds individually,
+given this slice's behavioral nuance) and both builds, all green.
+
+**This completes Part 2.5.** All ~29 `decide*` functions Part 2
+accumulated now live in 4 real modules
+(`swQueuedTabActiveTransitionDecisions.js`, `swFastExecutorDecisions.js`,
+`swResumeQueueExecutionDecisions.js`, `swFillQueuedTabsOnceDecisions.js`),
+matching every other Part 1 extraction's shape, with zero remaining
+`decide*` function definitions physically resident in `sw.js` itself.
 
 ## Phase 0 -- test harness realm fix (done; was the prerequisite for moving decide* logic into a module)
 
