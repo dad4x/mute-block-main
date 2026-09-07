@@ -398,6 +398,48 @@ function matchUrlPattern(url = '', pattern = '') {
     return new RegExp(`^${escaped}$`).test(`${url || ''}`)
 }
 
+// Process-scope cache: compiled vm.Script objects only, never module
+// instances/exports -- a Script can be safely re-run against a different
+// context to produce fresh, isolated state per harness instantiation.
+const compiledModuleScripts = new Map() // absolutePath -> vm.Script
+
+function createSharedRealmRequire(context, browser, baseRequire) {
+    const moduleCache = new Map() // absolutePath -> {exports}
+
+    function requireFrom(callerDir) {
+        return function localRequire(request) {
+            if(request === 'webextension-polyfill') return browser
+            if(!request.startsWith('.')) return baseRequire(request)
+
+            let resolvedPath = path.resolve(callerDir, request)
+            if(!resolvedPath.endsWith('.js')) resolvedPath += '.js'
+
+            if(moduleCache.has(resolvedPath)) {
+                return moduleCache.get(resolvedPath).exports
+            }
+
+            const moduleRecord = {exports: {}}
+            moduleCache.set(resolvedPath, moduleRecord) // insert before running the body, for circular-require safety (matches Node's require cache ordering)
+
+            let script = compiledModuleScripts.get(resolvedPath)
+            if(!script) {
+                const source = fs.readFileSync(resolvedPath, 'utf8')
+                const wrapper = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`
+                script = new vm.Script(wrapper, {filename: resolvedPath})
+                compiledModuleScripts.set(resolvedPath, script)
+            }
+
+            const compiled = script.runInContext(context)
+            const moduleDir = path.dirname(resolvedPath)
+            compiled(moduleRecord.exports, requireFrom(moduleDir), moduleRecord, resolvedPath, moduleDir)
+
+            return moduleRecord.exports
+        }
+    }
+
+    return requireFrom
+}
+
 function loadServiceWorkerHarness(options = {}) {
     const repoRoot = path.resolve(__dirname, '..', '..')
     const swPath = path.join(repoRoot, 'shared/js/sw.js')
