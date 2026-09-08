@@ -1018,11 +1018,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(wakeupMetricsShape, /epoch\.counters\['serviceWorker\.started'\] = 1/)
     assert.match(worker, /summarizeQueueWakeupMetricEpoch/)
     assert.match(worker, /MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY/)
-    assert.match(bootstrap, /if\(!hasBrowserSessionStorage\(\)\) \{[\s\S]*browser\.runtime\.onStartup\.addListener/)
-    assert.ok(
-        bootstrap.indexOf('if(!hasBrowserSessionStorage())') <
-        bootstrap.indexOf('browser.runtime.onStartup.addListener')
-    )
+    assert.match(bootstrap, /browser\.runtime\.onStartup\.addListener\(\(\) => \{[\s\S]*handleCoordinatorBrowserStartup\(\)/)
 
     assert.match(html, /resetMetricsButton/)
     assert.match(dashboard, /reset-queue-wakeup-metrics/)
@@ -3870,7 +3866,7 @@ test('extension update rearms stored work from compact queue view', () => {
     const scheduleBody = extractFunction(browserSessionRuntime, 'function scheduleStoredWorkRearmAfterExtensionReload(reason = \'extension-updated\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const installedIndex = bootstrap.indexOf('browser.runtime.onInstalled.addListener')
-    const installedBody = bootstrap.slice(installedIndex, bootstrap.indexOf('if(!hasBrowserSessionStorage())', installedIndex))
+    const installedBody = bootstrap.slice(installedIndex, bootstrap.indexOf('browser.runtime.onStartup.addListener', installedIndex))
 
     const storedReasonIndex = rearmBody.indexOf("const storedWorkReason = `${reason || 'extension-updated'}-stored-work`")
     const queueViewIndex = rearmBody.indexOf('hasUnpausedStoredCoordinatorWorkInQueueView(storedWorkReason)', storedReasonIndex)

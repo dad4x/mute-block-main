@@ -30154,7 +30154,6 @@ registerServiceWorkerListeners({
         getOwnedNukeStatus,
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
-        hasBrowserSessionStorage,
         hasStoredCoordinatorWorkInQueueView,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
