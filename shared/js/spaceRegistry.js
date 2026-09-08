@@ -33,6 +33,7 @@ function getSpaceCategoryLongLabel(category) {
 function normalizeSpaceUrl(url) {
     try {
         const parsed = new URL(url)
+        if(parsed.protocol !== 'https:') return ''
         parsed.search = ''
         parsed.hash = ''
 
