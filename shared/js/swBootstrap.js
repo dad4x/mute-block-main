@@ -76,7 +76,6 @@ function registerServiceWorkerListeners(deps = {}) {
         getOwnedNukeStatus,
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
-        hasBrowserSessionStorage,
         hasStoredCoordinatorWorkInQueueView,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
@@ -164,16 +163,9 @@ function registerServiceWorkerListeners(deps = {}) {
             return null
         })
     })
-    if(!hasBrowserSessionStorage()) {
-        browser.runtime.onStartup.addListener(() => {
-            return handleCoordinatorBrowserStartup()
-        })
-    }
-    else {
-        browser.runtime.onStartup.addListener(() => {
-            return handleCoordinatorBrowserStartup()
-        })
-    }
+    browser.runtime.onStartup.addListener(() => {
+        return handleCoordinatorBrowserStartup()
+    })
     if(browser.alarms?.onAlarm) {
         browser.alarms.onAlarm.addListener(async alarm => {
             if(alarm?.name === COORDINATOR_RESUME_ALARM_NAME) {
