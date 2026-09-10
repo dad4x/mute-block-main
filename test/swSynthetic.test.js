@@ -2352,8 +2352,15 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     assert.equal(storage.mbCoordinatorQueueView.counts.failed || 0, 0)
     assert.equal(storage.mbCoordinatorEvents.at(-1).type, 'retry')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'failed')
-    assert.equal(storage.mbProfileNukeProgressView?.records?.[href], undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
+    // Tombstoned rather than deleted (see makeTombstonedProfileProgressRecord
+    // in sw.js) so a straggling fire-and-forget checkpoint write can't
+    // resurrect stale progress after the retry has moved the row elsewhere.
+    assert.ok(storage.mbProfileNukeProgressView?.records?.[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
+    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
+    const retryTombstoneShardRecord = getProgressShardRecord(storage, href)
+    assert.ok(retryTombstoneShardRecord)
+    assert.equal(retryTombstoneShardRecord.status, '')
     const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
     assert.equal(currentAuthority[href], undefined)
     assert.equal(currentAuthority[retryKey].status, 'queued')
@@ -2423,8 +2430,15 @@ test('manual failed requeue deletes compact progress projection without rewritin
     assert.equal(result.selected, 1)
     assert.equal(result.queued, 1)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'failed')
-    assert.equal(storage.mbProfileNukeProgressView?.records?.[href], undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
+    // Tombstoned rather than deleted -- see the matching comment on the
+    // sibling "manual failed requeue deletes compact progress projection"
+    // test above.
+    assert.ok(storage.mbProfileNukeProgressView?.records?.[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
+    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
+    const requeueTombstoneShardRecord = getProgressShardRecord(storage, href)
+    assert.ok(requeueTombstoneShardRecord)
+    assert.equal(requeueTombstoneShardRecord.status, '')
     const currentAuthority = (await sw.coordinatorAuthority.hydrate()).queue
     assert.ok(['queued', 'opening', 'active'].includes(currentAuthority[href].status))
     assert.equal(currentAuthority[href].runId, result.runId)
@@ -7389,6 +7403,140 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
     const storedRecord = Object.values(storage[LEGACY_PROFILE_PROGRESS_KEY] || {})
         .find(record => record?.profileHref === href)
     assert.deepEqual(storedRecord, progressRecord)
+})
+
+// Entropy-reduction Phase 2 tripwire (see entropy-reduction-action-plan-2026-09-09.md):
+// summarizeProfileNukeProgressRecord (swProfileNukeProgress.js) is the one
+// explicit field allowlist every persisted profile-progress record passes
+// through, for both the compact view and the sharded storage. It has no
+// runtime or compile-time check that it stays in sync with whatever fields
+// content.js/sw.js actually write into a progress patch -- a forgotten
+// field there silently drops on every durable write. This test can't
+// detect a brand-new field nobody thought to add here, but it does turn
+// "an existing field silently stops round-tripping" (removed from the
+// allowlist, a typo'd key, a mapping accidentally dropped) into a loud,
+// specific CI failure instead of quietly-wrong stored data. When adding a
+// new field to profile-progress records, add it to both
+// summarizeProfileNukeProgressRecord AND this test's patch/expected pair.
+test('profile-progress field allowlist round-trips every known field (schema tripwire)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Schema-Tripwire'
+    const serverNow = 900000
+    const clientUpdatedAt = 5000
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: serverNow,
+        storage: {
+            mbCoordinatorPaused: false
+        }
+    })
+
+    const patch = {
+        status: 'blocked',
+        actionKind: 'mute-block',
+        attemptId: 'attempt-schema-check',
+        attemptNumber: 3,
+        runId: 'run-schema-check',
+        tabId: 777,
+        lastUrl: 'https://www.quora.com/profile/Synthetic-Schema-Tripwire',
+        queuedAt: 111,
+        tabCreatedAt: 222,
+        tabOpenedAt: 333,
+        contentOpenedAt: 444,
+        actionReadyAt: 555,
+        waitingForForegroundAt: 666,
+        foregroundLeaseAcquiredAt: 777,
+        foregroundPromotedAt: 888,
+        muteAttemptedAt: 999,
+        blockAttemptedAt: 1111,
+        unmuteAttemptedAt: 1222,
+        unblockAttemptedAt: 1333,
+        terminalAt: 1444,
+        updatedAt: clientUpdatedAt,
+        actionSurfaceMode: 'foreground',
+        actionSurfaceWindowId: 42,
+        actionSurfaceAnchorTabId: 43,
+        actionSurfaceActivatedAt: 1555,
+        muteSucceeded: true,
+        blockSucceeded: true,
+        unblockSucceeded: true,
+        unmuteSucceeded: true,
+        foundBlockedBeforeQueue: true,
+        finalError: 'schema-check-final-error',
+        muteError: 'schema-check-mute-error',
+        blockError: 'schema-check-block-error',
+        directBlockFailureDetail: {reason: 'schema-check-detail'},
+        unblockReason: 'schema-check-unblock-reason',
+        unmuteReason: 'schema-check-unmute-reason',
+        unavailableReason: 'schema-check-unavailable-reason',
+        resolvedProfileHref: 'https://www.quora.com/profile/Synthetic-Schema-Tripwire-Resolved',
+        remappedFromRequested: true,
+        closeReason: 'schema-check-close-reason',
+        errorPageUrl: 'https://www.quora.com/error-page',
+        securityVerificationUrl: 'https://www.quora.com/security-check',
+        clearedAt: 1666
+    }
+
+    const result = await browser.runtime.sendMessage({
+        action: 'record-direct-profile-progress',
+        profileHref: href,
+        patch
+    }, {tab: {id: 12, windowId: 1}})
+
+    assert.equal(result.recorded, true)
+
+    const expected = {
+        profileHref: href,
+        status: 'blocked',
+        actionKind: 'mute-block',
+        attemptId: 'attempt-schema-check',
+        attemptNumber: 3,
+        runId: 'run-schema-check',
+        tabId: 777,
+        lastUrl: 'https://www.quora.com/profile/Synthetic-Schema-Tripwire',
+        queuedAt: 111,
+        tabCreatedAt: 222,
+        tabOpenedAt: 333,
+        contentOpenedAt: 444,
+        actionReadyAt: 555,
+        waitingForForegroundAt: 666,
+        foregroundLeaseAcquiredAt: 777,
+        foregroundPromotedAt: 888,
+        muteAttemptedAt: 999,
+        blockAttemptedAt: 1111,
+        unmuteAttemptedAt: 1222,
+        unblockAttemptedAt: 1333,
+        // normalizeProgressPatch (swProfileProgressMerge.js) always
+        // re-stamps terminalAt to the server's own now() when a record
+        // transitions to a newly-successful terminal state, regardless of
+        // what the patch claims -- intentional, not a round-trip failure.
+        terminalAt: serverNow,
+        updatedAt: serverNow,
+        actionSurfaceMode: 'foreground',
+        actionSurfaceWindowId: 42,
+        actionSurfaceAnchorTabId: 43,
+        actionSurfaceActivatedAt: 1555,
+        muteSucceeded: true,
+        blockSucceeded: true,
+        unblockSucceeded: true,
+        unmuteSucceeded: true,
+        foundBlockedBeforeQueue: true,
+        finalError: 'schema-check-final-error',
+        muteError: 'schema-check-mute-error',
+        blockError: 'schema-check-block-error',
+        directBlockFailureDetail: {reason: 'schema-check-detail'},
+        unblockReason: 'schema-check-unblock-reason',
+        unmuteReason: 'schema-check-unmute-reason',
+        unavailableReason: 'schema-check-unavailable-reason',
+        resolvedProfileHref: 'https://www.quora.com/profile/Synthetic-Schema-Tripwire-Resolved',
+        remappedFromRequested: true,
+        closeReason: 'schema-check-close-reason',
+        errorPageUrl: 'https://www.quora.com/error-page',
+        securityVerificationUrl: 'https://www.quora.com/security-check',
+        clearedAt: 1666,
+        directProgressClientUpdatedAt: clientUpdatedAt
+    }
+
+    assert.deepEqual(storage.mbProfileNukeProgressView.records[href], expected)
+    assert.deepEqual(getProgressShardRecord(storage, href), expected)
 })
 
 test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {

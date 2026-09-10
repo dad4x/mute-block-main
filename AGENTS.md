@@ -111,3 +111,21 @@ the version-bump-before-build requirement is unconditional.
 
 Never use Puppeteer in this repository. For live browser validation, use direct
 Chrome DevTools Protocol calls over the remote-debugging endpoint instead.
+
+# Known Architectural Traps
+
+This codebase has been edited across many sessions by different AI models
+with no consistent shared approach, which has produced a specific, recurring
+failure shape: a local fix that quietly relies on an implicit invariant
+elsewhere, which a later session (with no visibility into that invariant)
+breaks without realizing it. Before making non-trivial changes to
+`shared/js/sw.js`, `shared/js/content.js`, the profile-progress/coordinator
+modules, or the storage layer (`swstorage.js`, `swProfileNukeProgress.js`),
+read `entropy-reduction-action-plan-2026-09-09.md` — it names the specific
+recurring patterns found so far (an untyped unioned progress record, stale
+invariant proxies, unscoped heuristic DOM fallbacks, restricted-domain
+fields some code paths never populate, delete/reset racing fire-and-forget
+writers, duplicated constants across files, storage-abstraction leakage,
+scattered timeout magic numbers) with concrete file:line examples of each.
+Check whether the change you're making is a new instance of one of them
+before writing it.

@@ -40,7 +40,9 @@ const {
     sanitizeProfileHrefSlug
 } = require('./subject')
 const {
-    mapProgressToCoordinatorState
+    mapProgressToCoordinatorState,
+    TRANSIENT_PROGRESS_STATUSES,
+    UNBLOCK_UNMUTE_ACTION_KIND
 } = require('./jobState')
 
 const SPACE_FEED_PROFILES_PER_BATCH = 3
@@ -176,7 +178,6 @@ let initialized = false
 let alreadyBlockedCoordinatorReconcileKey = ''
 let manualUnblockedReconcileKey = ''
 const PROFILE_ACTION_BUTTON_ORDER = ['unblock-unmute', 'mute-block-close', 'mute-block', 'close-tab']
-const UNBLOCK_UNMUTE_ACTION_KIND = 'unblock-unmute'
 const SPACE_POST_NUKE_MIN_PROFILES = 2
 const SPACE_FEED_POST_NUKE_MIN_PROFILES = 1
 const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
@@ -215,16 +216,6 @@ const UNMUTE_ACTION_REGEX = /\bun[\s-]*mute\b/i
 const UNBLOCK_ACTION_REGEX = /\bun[\s-]*block\b/i
 const UNMUTE_CONTEXT_REGEX = /\bun[\s-]*mut(?:e|ed|ing)\b/i
 const UNBLOCK_CONTEXT_REGEX = /\bun[\s-]*block(?:ed|ing)?\b/i
-const TRANSIENT_PROFILE_NUKE_STATUSES = new Set([
-    'queued',
-    'tab-opening',
-    'tab-opened',
-    'awaiting-visibility',
-    'page-ready',
-    'retrying',
-    'muting',
-    'blocking'
-])
 addEventListener('unhandledrejection', event => {
     if(isExtensionContextInvalidatedError(event.reason) || isRuntimeConnectionError(event.reason)) {
         event.preventDefault()
@@ -664,7 +655,7 @@ async function reconcileReloadCanceledNukes() {
 }
 
 function isTransientProfileNukeStatus(status) {
-    return TRANSIENT_PROFILE_NUKE_STATUSES.has(`${status || ''}`.trim())
+    return TRANSIENT_PROGRESS_STATUSES.has(`${status || ''}`.trim())
 }
 
 function getPendingSpaceFeedRecord(postKey) {
@@ -12455,6 +12446,15 @@ async function unblockUnmuteProfile(options = {}) {
         }
     }
     else {
+        // Unlike the startedBlocked branch above, unmuteProfileBestEffort()
+        // never records any progress patch of its own -- without this call,
+        // a fresh href taking this path (already unblocked, just needs
+        // unmuting) could complete the whole action with actionKind left
+        // blank in the persisted record.
+        await recordReverseActionProgress({
+            event: 'Reverse action started already-unblocked flow',
+            ...getReverseActionDebugSnapshot()
+        })
         unmute = await unmuteProfileBestEffort({silent, allowForegroundFallback})
         if(!unmute.ok && unmute.reason !== 'unmute-option-not-found' && unmute.reason !== 'unmute-option-not-offered') {
             return {ok: false, reason: unmute.reason || 'unmute-failed', unmute}

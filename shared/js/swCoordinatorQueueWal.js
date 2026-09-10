@@ -1,10 +1,12 @@
 const {
+    appendWalRecordsToGeneration,
     buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
     getWalRecordsForGeneration,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
-    isSegmentedWalStorageMeta
+    isSegmentedWalStorageMeta,
+    recoverProjectedState
 } = require('./swstorage')
 
 function requireCoordinatorQueueWalCapability(groupName = '', capabilities = {}, name = '') {
@@ -278,6 +280,71 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         }
     }
 
+    // Entropy-reduction Phase 4, Option C (see entropy-reduction-action-plan-2026-09-09.md):
+    // this module wrapped everything around a WAL mutation append (defaults,
+    // physical-payload assembly, metrics) except the append itself and its
+    // immediate accept/reject decision -- sw.js's persistCoordinatorAuthorityQueueWalMutation
+    // and its batch sibling each called the raw appendWalRecordsToGeneration
+    // primitive directly and duplicated the accept/reject-and-hard-limit
+    // logic (and, separately, the post-append replay-verify logic)
+    // near-verbatim. Both are genuinely identical logic between the single
+    // and batch callers (only the surrounding diagnostic/metric-name text
+    // differs, which stays in each caller since single vs "batch" wording
+    // is caller-specific) -- pulled out here as the two functions below.
+    // Deliberately data-in/data-out: this module has no scheduling or
+    // diagnostic-recording capabilities threaded into it, so on a
+    // non-ok result the caller still decides what metric to bump, what
+    // diagnostic event to record, and whether to schedule a reconcile --
+    // exactly what each caller already did before this extraction.
+    function prepareCoordinatorQueueWalAppend(storedWal, records, options = {}) {
+        const append = appendWalRecordsToGeneration(storedWal, records, {
+            segmentId: options.segmentId
+        })
+        if(append?.rejected) {
+            return {
+                ok: false,
+                stage: 'append-rejected',
+                reason: append.reason || 'append-rejected',
+                append
+            }
+        }
+
+        const physicalWal = getCoordinatorQueueWalPhysicalPayload(append.store, {
+            previousMeta: options.previousMeta,
+            previousStored: options.previousStored || {}
+        })
+        if((physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0) >= physicalWal.hardLimit) {
+            return {
+                ok: false,
+                stage: 'hard-limit',
+                reason: 'queue-wal-segment-hard-limit',
+                append,
+                physicalWal
+            }
+        }
+
+        return {ok: true, append, physicalWal}
+    }
+
+    function verifyAppendedCoordinatorQueueWalReplay(append) {
+        const recoveredAfterAppend = recoverProjectedState(append.store)
+        const appendedRecordIds = new Set((append.records || []).map(record => record.id).filter(Boolean))
+        const ignoredAppendedRecords = (recoveredAfterAppend?.projected?.ignored || [])
+            .filter(entry => appendedRecordIds.has(entry?.record?.id))
+        const failed = recoveredAfterAppend?.recovered !== true || ignoredAppendedRecords.length > 0
+        const authoritativeProjectionQueue = recoveredAfterAppend?.recovered === true
+            ? recoveredAfterAppend?.projected?.state?.queue || recoveredAfterAppend?.state?.queue || null
+            : null
+
+        return {
+            ok: !failed,
+            recoveredAfterAppend,
+            ignoredAppendedRecords,
+            authoritativeProjectionQueue,
+            reason: ignoredAppendedRecords[0]?.reason || recoveredAfterAppend?.reason || null
+        }
+    }
+
     return {
         shouldUseCoordinatorQueueWalBackend,
         normalizeCoordinatorQueueWalStore,
@@ -288,7 +355,9 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         getCoordinatorQueueWalPhysicalPayload,
         recordCoordinatorQueueWalPhysicalPayloadMetrics,
         getRetiredCoordinatorQueueWalPhysicalKeys,
-        makeCoordinatorAuthorityQueueWalRemoveRecord
+        makeCoordinatorAuthorityQueueWalRemoveRecord,
+        prepareCoordinatorQueueWalAppend,
+        verifyAppendedCoordinatorQueueWalReplay
     }
 }
 
