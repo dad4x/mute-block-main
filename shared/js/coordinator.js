@@ -558,7 +558,7 @@ async function clearCompletedRuns() {
 
     for(const run of runItems) {
         const runId = run?.id || run?.runId || ''
-        if(runId && `${run.status || ''}` === 'complete') {
+        if(runId && `${run.status || ''}` === 'empty') {
             nextHiddenRunIds.add(runId)
         }
     }
@@ -1005,7 +1005,7 @@ function getDisplayRuns(queueItems, options = {}) {
             sourceType: 'space-feed',
             createdAt: 0,
             updatedAt: 0,
-            status: 'active',
+            status: 'running',
             sourcePages: []
         }
         const runItems = getRunQueueItems(queueItems, runId, existing)
@@ -1028,7 +1028,7 @@ function getDisplayRuns(queueItems, options = {}) {
             itemCount: targetHrefs.length || runItems.length,
             activeCount,
             terminalCount,
-            status: runItems.length > 0 && terminalCount === runItems.length ? 'complete' : existing.status || 'active',
+            status: runItems.length > 0 && terminalCount === runItems.length ? 'empty' : existing.status || 'running',
             submittedAt: getRunSubmitTime(runId, existing),
             updatedAt: Math.max(Number.parseInt(existing.updatedAt, 10) || 0, latestItemUpdatedAt),
             displayTargetProfileHrefs: displayTargetHrefs
@@ -2088,7 +2088,8 @@ function getStatusHelp(status = '') {
         failed: 'Failed: work ended without success. Outcome/error explains retryability.',
         skipped: 'Skipped: no destructive work was possible or needed.',
         canceled: 'Canceled: work was stopped by an operator action.',
-        complete: 'Complete: every target in the run has reached a terminal state.',
+        running: 'Running: the run has queued or in-progress items.',
+        empty: 'Empty: every target in the run has reached a terminal state, or the run has no items.',
         retry: 'Retry: failed-row retry action.',
         enqueued: 'Enqueued: new queue work was submitted.',
         paused: 'Paused: pending work was stopped.'

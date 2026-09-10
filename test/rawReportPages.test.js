@@ -43,7 +43,7 @@ function test(name, fn) {
 }
 
 test('raw report page captures live under test fixtures', () => {
-    assert.equal(path.relative(repoRoot, RAW_REPORT_PAGES_DIR), 'test/fixtures/raw-report-pages')
+    assert.equal(path.relative(repoRoot, RAW_REPORT_PAGES_DIR).split(path.sep).join('/'), 'test/fixtures/raw-report-pages')
     assert.equal(fs.existsSync(path.join(repoRoot, 'raw-report-pages')), false)
     assert.deepEqual(listRawReportPageFiles(), EXPECTED_CAPTURE_FILES)
 })

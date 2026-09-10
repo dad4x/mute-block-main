@@ -1,14 +1,14 @@
 {
   "name": "mute-block",
-  "version": "1.6.1211",
+  "version": "1.6.1227",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
     "prod": "npx mix --production",
     "build:chrome-dev": "node tools/build-chrome-dev.js",
-    "sync:chrome-dev": "node tools/cdp/sync-windows-build.js",
-    "reload:chrome-dev": "node tools/cdp/reload-windows-extension.js --extension-id auto",
-    "reset:chrome-dev-tabs": "node tools/cdp/reset-windows-tabs.js --extension-id auto",
+    "launch:chrome-dev": "node tools/cdp/launch-local-chrome.js",
+    "reload:chrome-dev": "node tools/cdp/reload-chrome-dev.js --extension-id auto",
+    "reset:chrome-dev-tabs": "node tools/cdp/reset-chrome-dev-tabs.js --extension-id auto",
     "dev:text-replace": "node tools/dev/text-replace.js",
     "live:phase": "node tools/cdp/live-test-loop.js",
     "build:chrome": "web-ext build --config=chrome-config.cjs",

@@ -139,7 +139,16 @@ function createProfileNukeProgress(deps = {}) {
             remappedFromRequested: source.remappedFromRequested === true,
             closeReason: source.closeReason || '',
             errorPageUrl: source.errorPageUrl || '',
-            securityVerificationUrl: source.securityVerificationUrl || ''
+            securityVerificationUrl: source.securityVerificationUrl || '',
+            // Both purely bookkeeping for recordDirectProfileProgressFromRequest's
+            // out-of-order/stale-write guard (sw.js) -- clearedAt marks a row
+            // clearProfileNukeState tombstoned rather than deleted, and
+            // directProgressClientUpdatedAt is the client-origination
+            // timestamp that guard compares against. Neither must be
+            // dropped here, or the guard loses its stored basis for
+            // comparison across a service-worker restart.
+            clearedAt: Number.parseInt(source.clearedAt, 10) || 0,
+            directProgressClientUpdatedAt: Number.parseInt(source.directProgressClientUpdatedAt, 10) || 0
         }
     }
 

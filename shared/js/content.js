@@ -647,7 +647,16 @@ async function safeStorageSet(value) {
 }
 
 async function reconcileReloadCanceledNukes() {
-    const result = await safeSendRuntimeMessage({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []})
+    // This runs unconditionally during init(), for every page type, before
+    // either the profile page's mute-block button or the space page's
+    // asset/neutral/target buttons get created -- so an unbounded message
+    // wait here stalls button injection on every page, not just this one
+    // cleanup step. safeSendRuntimeMessage has no timeout at all; use the
+    // same bounded pattern as the sibling coordinator-state refresh call in
+    // refreshContentPageCoordinatorStateFromRuntime instead, so a
+    // slow/asleep service worker degrades to "skip this cleanup cycle"
+    // rather than blocking page setup indefinitely.
+    const result = await safeSendRuntimeMessageWithTimeout({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []}, 4000)
     const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
     if(!canceledUrls.length) return
 
@@ -1106,10 +1115,47 @@ async function recordProfileNukeProgress(href, patch = {}) {
         [normalizedHref]: nextRecord
     })
 
+    // Not under the coordinator queue protocol -- this is a legacy direct
+    // action (the "Mute Block"/"Unblock Unmute" buttons on a manually-opened
+    // profile page). There's no attemptId/runId and never will be, so this
+    // doesn't go through the queue-machine event path above; it persists
+    // straight to the profile-progress projection instead, independent of
+    // the coordinator queue. Without this, legacy-action progress only ever
+    // lived in this tab's own memory and was lost the moment the tab closed.
+    //
+    // Deliberately NOT awaited: this function is called repeatedly inline
+    // throughout muteProfile/blockProfile/unblockUnmuteProfile's own
+    // multi-step Quora UI sequence (open menu -> confirm -> verify), and
+    // those callers never inspect this function's return value -- they just
+    // `await` it as a checkpoint. Under the service-worker responsiveness
+    // problems observed live-testing this session, awaiting a 4s-bounded
+    // message here at every checkpoint measurably delayed that UI sequence
+    // and was observed to leave a legacy action only partially completed
+    // (an "unmuted" confirmation fired but the block was never actually
+    // removed). Persisting the audit record durably is worth doing, but not
+    // at the cost of slowing down or destabilizing the actual user-facing
+    // action -- fire it in the background and let the in-memory cache pick
+    // up the durable record if/when it lands.
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'record-direct-profile-progress',
+        profileHref: normalizedHref,
+        patch: nextRecord
+    }, null, 4000).then(directResult => {
+        if(!directResult?.recorded) return
+        const acceptedRecord = directResult.record && typeof directResult.record === 'object'
+            ? directResult.record
+            : nextRecord
+        profileNukeProgress = pruneProfileNukeProgress({
+            ...profileNukeProgress,
+            [normalizedHref]: acceptedRecord
+        })
+    }).catch(() => null)
+
     return {
         ...nextRecord,
         runtimeRecorded: false,
-        localOnly: true
+        localOnly: true,
+        persistPending: true
     }
 }
 
@@ -2704,21 +2750,28 @@ function getProfileUnavailableReason() {
 
     const title = (document.title || '').toLowerCase()
     const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()
-    const patterns = [
+
+    // Quora-enforced terminal states (the account itself was banned/disabled
+    // by Quora, not merely missing) are distinguished from generic
+    // not-found cases so callers can treat them as equivalent to an
+    // already-completed block rather than a transient skip.
+    const enforcedPatterns = [
+        // Quora can expose this phrase with dropped "s" glyphs in innerText.
+        /\bthis? (?:profile|user|account) has? been (?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/,
+        /\bthis (?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/,
+        /\b(?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/
+    ]
+    const notFoundPatterns = [
         /\buser not found\b/,
         /\bprofile not found\b/,
         /\bpage not found\b/,
-        // Quora can expose this phrase with dropped "s" glyphs in innerText.
-        /\bthis? (?:profile|user|account) has? been (?:unavailable|disabled|deactivated|deleted|suspended|restricted)\b/,
-        /\bthis (?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted)\b/,
-        /\b(?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted)\b/,
         /\b(?:profile|user|account) (?:does not|doesn't) exist\b/,
         /\bno longer exists\b/
     ]
+    const matches = pattern => pattern.test(title) || pattern.test(bodyText)
 
-    if(patterns.some(pattern => pattern.test(title) || pattern.test(bodyText))) {
-        return 'Profile unavailable'
-    }
+    if(enforcedPatterns.some(matches)) return 'Profile banned'
+    if(notFoundPatterns.some(matches)) return 'Profile unavailable'
 
     return ''
 }
@@ -3943,8 +3996,22 @@ function scoreActionCandidate(candidate, preferredRegex = null, rootText = '') {
 }
 
 function getGlobalPrimaryAction(preferredRegex = null) {
+    // This scans the WHOLE document, not just a dialog -- unlike
+    // getDialogPrimaryAction, there's no overlay root to scope the search to.
+    // scoreActionCandidate's styling/position heuristics (e.g. +80 for a
+    // qu-bg--red/qu-bg--blue primary-styled button) exist to break ties among
+    // otherwise-plausible candidates, not to invent one: without requiring an
+    // actual label match first, this used to happily return Quora's own
+    // unrelated "Add question" composer button (styled as the page's one
+    // prominent red CTA) whenever dismissProfileActionSurface() called this
+    // with no real dialog left to dismiss, hijacking the page mid-action.
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(candidate => !shouldIgnoreActionCandidate(candidate) && isVisible(candidate))
+        .filter(candidate => {
+            if(!preferredRegex) return true
+            const label = `${candidate.getAttribute('aria-label') || ''} ${getElementText(candidate)}`.trim()
+            return preferredRegex.test(label)
+        })
         .map(button => ({button, score: scoreActionCandidate(button, preferredRegex)}))
         .filter(candidate => candidate.score > -600)
 
@@ -6320,18 +6387,18 @@ function getSpaceFeedContentRoot() {
         .candidate || document.body
 }
 
-function getSpaceFeedTimestampScanDistance(timestamp) {
+function getSpaceFeedTimestampScanDistance(timestamp, precomputedRect = null) {
     const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
-    const rect = timestamp?.getBoundingClientRect?.() || null
+    const rect = precomputedRect || timestamp?.getBoundingClientRect?.() || null
     if(!rect) return Number.POSITIVE_INFINITY
     if(rect.bottom >= 0 && rect.top <= viewportHeight) return 0
     if(rect.top > viewportHeight) return rect.top - viewportHeight
     return Math.abs(rect.bottom)
 }
 
-function isSpaceFeedTimestampInScanWindow(timestamp) {
+function isSpaceFeedTimestampInScanWindow(timestamp, precomputedRect = null) {
     const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
-    const rect = timestamp?.getBoundingClientRect?.() || null
+    const rect = precomputedRect || timestamp?.getBoundingClientRect?.() || null
     if(!rect) return false
 
     return rect.bottom >= -SPACE_FEED_SCAN_ABOVE_VIEWPORT_MARGIN_PX &&
@@ -6422,14 +6489,26 @@ function getViewportSampledSpaceFeedTimestamps() {
 }
 
 function getBoundedVisibleSpaceFeedTimestamps() {
-    const nodes = Array.from(document.querySelectorAll('a.post_timestamp'))
+    // Scoped to the feed's own content root (falls back to document.body
+    // when unresolved, same as an unscoped query) rather than the whole
+    // document, and each node's bounding rect is measured once and reused
+    // for both the window check and the distance calculation below --
+    // measuring twice per node here was forcing a redundant layout reflow
+    // for every post ever loaded into this (non-virtualized) feed on every
+    // scan.
+    const scanRoot = getSpaceFeedContentRoot() || document
+    const nodes = Array.from(scanRoot.querySelectorAll('a.post_timestamp'))
     const timestamps = nodes
-        .map((timestamp, index) => ({
-            timestamp,
-            index,
-            distance: getSpaceFeedTimestampScanDistance(timestamp)
-        }))
-        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp))
+        .map((timestamp, index) => {
+            const rect = timestamp?.getBoundingClientRect?.() || null
+            return {
+                timestamp,
+                index,
+                rect,
+                distance: getSpaceFeedTimestampScanDistance(timestamp, rect)
+            }
+        })
+        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp, entry.rect))
 
     if(timestamps.length <= SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
         return timestamps.map(entry => entry.timestamp)
@@ -7700,6 +7779,25 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
 
     parent.appendChild(host)
     return host
+}
+
+function syncSpaceFeedPostHeaderReservedSpace(postRoot, host) {
+    if(!postRoot || !host) return
+
+    const timestamp = postRoot.querySelector('a.post_timestamp')
+    const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
+    if(!headerContainer || !postRoot.contains(headerContainer)) return
+
+    // The button host is absolutely positioned over the header row (see
+    // .mb-ext_post-nuke-slot), so it doesn't push byline text out of the
+    // way on its own -- the header's own padding-right has to reserve
+    // enough space. The static CSS default (.mb-ext_post-header-host) only
+    // covers the single-badge "already nuked" case; the two-button
+    // idle/queueable state (variable-length "Nuke 'Em N" counter beside
+    // "Mute-Block") can be noticeably wider, so measure the host's actual
+    // rendered width instead of guessing a fixed constant.
+    const reserved = Math.ceil(host.getBoundingClientRect().width) + 24
+    headerContainer.style.paddingRight = `${Math.max(reserved, 0)}px`
 }
 
 function setSpaceFeedButtonUrls(button, urls) {
@@ -9315,6 +9413,7 @@ function syncSpaceFeedPostButtons(renderModel) {
             setMuteBlockHelp(doneButton, 'This post has already been nuked')
             setNukeButtonDone(doneButton)
             doneButton.disabled = true
+            syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
             continue
         }
 
@@ -9416,6 +9515,8 @@ function syncSpaceFeedPostButtons(renderModel) {
             setNukeButtonIdle(singleButton, 'Mute-Block')
             singleButton.disabled = true
         }
+
+        syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
     }
 
     for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
@@ -10689,13 +10790,36 @@ async function maybeRunAutoProfileAction() {
         }
         const skipQueuedUnavailableTab = async message => {
             console.info(message)
-            await recordQueuedProfileProgress({
-                status: 'profile-unavailable',
-                openedViablePage: false,
-                finalError: message,
-                unavailableReason: getProfileUnavailableReason() || message,
-                event: message
-            })
+            const unavailableReason = getProfileUnavailableReason() || message
+            if(unavailableReason === 'Profile banned') {
+                // Quora banned/deactivated the account itself -- there is no
+                // block control to interact with and never will be, so this
+                // is functionally identical to an already-blocked profile.
+                // Record it the same way a real block success is recorded
+                // (status/blockSucceeded/blockedAt) so every downstream
+                // dedup/skip check -- the space-feed "Nuked" badge, future
+                // queue-building -- treats it as done without needing to
+                // reopen a tab for it again.
+                await recordQueuedProfileProgress({
+                    status: 'blocked',
+                    openedViablePage: false,
+                    blockSucceeded: true,
+                    blockedAt: Date.now(),
+                    finalError: '',
+                    blockReason: 'quora-banned',
+                    unavailableReason,
+                    event: 'Profile is banned/deactivated by Quora; treated as already blocked'
+                })
+            }
+            else {
+                await recordQueuedProfileProgress({
+                    status: 'profile-unavailable',
+                    openedViablePage: false,
+                    finalError: message,
+                    unavailableReason,
+                    event: message
+                })
+            }
             await releaseQueuedTabSlot()
             await requestCloseTab(2, 100, true)
         }
@@ -12356,7 +12480,16 @@ async function unblockUnmuteProfile(options = {}) {
 
 async function muteProfile(options = {}) {
     const {allowBlockFallback = false, silent = false, allowForegroundFallback = false} = options
+    // muteProfile() has exactly one caller -- handleMuteBlockClick, the
+    // legacy direct profile-page button -- so this is the one place that
+    // needs to stamp actionKind for that whole flow (blockProfile() is only
+    // ever reached through here). Without it, every patch in the sequence
+    // spreads `actionKind` forward from an empty `previous`, leaving the
+    // persisted record's actionKind blank forever: harmless behaviorally
+    // (nothing branches on it for the mute-block path), but useless for the
+    // recorded history this exists to support.
     noteCurrentProfileNukeProgress({
+        actionKind: 'mute-block',
         status: 'muting',
         muteAttempted: true,
         muteAttemptedAt: Date.now(),

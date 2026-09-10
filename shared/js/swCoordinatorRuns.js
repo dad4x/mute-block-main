@@ -74,12 +74,20 @@ function createCoordinatorRuns(deps = {}) {
     }
 
     function getCoordinatorRunStatus(runItems = [], existingRun = {}) {
-        if(!runItems.length) return existingRun?.paused ? 'paused' : 'complete'
+        // Run-level status is a deliberately small 3-state rollup --
+        // 'running' / 'paused' / 'empty' -- distinct from the much larger
+        // per-item status vocabulary (queued/opening/active/acting/settling/
+        // succeeded/failed/skipped/canceled). 'empty' means "nothing left to
+        // do in this run," regardless of whether that's because every item
+        // succeeded, some were canceled, or the run never had any items --
+        // it intentionally doesn't distinguish cause at the run level (that
+        // detail lives on each item's own status).
+        if(!runItems.length) return existingRun?.paused ? 'paused' : 'empty'
 
         const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
-        if(terminalCount === runItems.length) return 'complete'
+        if(terminalCount === runItems.length) return 'empty'
         if(existingRun?.paused) return 'paused'
-        return 'active'
+        return 'running'
     }
 
     function materializeCoordinatorRunsPausedStateFromControl(queue = {}, runs = {}, paused = false, nowMs = now()) {
@@ -99,7 +107,7 @@ function createCoordinatorRuns(deps = {}) {
             const runItems = getCoordinatorRunItems(queue, runId, run)
             if(!runItems.some(item => isPendingCoordinatorStatus(item?.status))) continue
 
-            const status = paused ? 'paused' : 'active'
+            const status = paused ? 'paused' : 'running'
             if(run.paused === paused && `${run.status || ''}` === status) continue
 
             nextRuns[runId] = {

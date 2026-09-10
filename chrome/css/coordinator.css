@@ -526,7 +526,8 @@ a.row-subtitle:hover {
 .badge--opening,
 .badge--active,
 .badge--acting,
-.badge--settling {
+.badge--settling,
+.badge--running {
     background: #cffafe;
     border: 1px solid #67e8f9;
     color: #155e75;

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const {
-    DEFAULT_REMOTE_CHROME_DEV_PATH,
+    DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
     evaluate,
     getJson,
@@ -26,9 +26,9 @@ function shouldRemoveStorageKey(key = '') {
 runMain(async () => {
     const config = await resolveCdpConfig({
         host: getOption('host', process.env.MB_CDP_HOST || '127.0.0.1'),
-        port: Number.parseInt(getOption('port', process.env.MB_CDP_PORT || 9223), 10) || 9223,
+        port: Number.parseInt(getOption('port', process.env.MB_CDP_PORT || 9222), 10) || 9222,
         extensionId: getOption('extension-id', 'auto'),
-        extensionPath: getOption('extension-path', process.env.MB_EXTENSION_PATH || DEFAULT_REMOTE_CHROME_DEV_PATH),
+        extensionPath: getOption('extension-path', process.env.MB_EXTENSION_PATH || DEFAULT_CHROME_DEV_PATH),
         extensionVersion: getOption('extension-version', process.env.MB_EXTENSION_VERSION || '')
     })
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`

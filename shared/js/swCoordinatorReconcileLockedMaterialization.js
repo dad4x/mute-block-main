@@ -509,7 +509,7 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
                 sourceType,
                 createdAt: run.createdAt || item.createdAt || item.queuedAt || nowMs,
                 updatedAt: Math.max(Number.parseInt(run.updatedAt, 10) || 0, Number.parseInt(item.updatedAt || item.queuedAt, 10) || nowMs),
-                status: run.status || 'active',
+                status: run.status || 'running',
                 paused: run.paused === true ? true : false,
                 sourcePages: Array.from(sourcePages),
                 targetProfileHrefs: Array.from(targetProfileHrefs),

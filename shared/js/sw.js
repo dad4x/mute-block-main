@@ -9005,43 +9005,6 @@ async function settleTerminalCoordinatorItems(options = {}) {
     })
 }
 
-async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {}) {
-    const itemKey = `${options.itemKey || ''}`.trim()
-    const item = options.item || null
-    const settlementKey = `${options.settlementKey || ''}`
-    const sourceSettlementOutcome = `${options.sourceSettlementOutcome || ''}`.trim()
-    const now = Number.parseInt(options.now, 10) || Date.now()
-
-    return coordinatorAuthority.applyWithinStorageUpdate({
-        operationKind: 'terminal-settlement',
-        rowKey: itemKey,
-        expectedAttemptId: getAttemptIdFromValue(item),
-        expectedAttemptNumber: getAttemptNumberFromValue(item),
-        reason: 'ordinaryMutation',
-        metricPath: 'terminalSettlement.save',
-        deferProjectionSave: options.deferAuthorityProjectionSave === true,
-        projectionReconcileDelayMs: options.projectionReconcileDelayMs || 30000,
-        currentAuthorityState: options.currentAuthorityState || null,
-        mutate(currentItem, context) {
-            if(!isTerminalCoordinatorStatus(currentItem?.status)) {
-                return context.reject('nonterminal-row')
-            }
-            if(getCoordinatorItemSettlementKey(currentItem) !== settlementKey) {
-                return context.reject('row-changed-before-authority-apply')
-            }
-            if(currentItem.sourceSettlementKey === settlementKey) {
-                return currentItem
-            }
-            return {
-                ...currentItem,
-                sourceSettledAt: now,
-                sourceSettlementKey: settlementKey,
-                sourceSettlementOutcome
-            }
-        }
-    })
-}
-
 async function settleTerminalCoordinatorItemsLocked(options = {}) {
     const requestedHrefs = getNormalizedProfileHrefList(options.profileHrefs || [])
 
@@ -9163,6 +9126,23 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
 
     terminalEntries = getCoordinatorTerminalItemEntries(queue, requestedHrefs)
 
+    // Stage every row's mutation in memory first, then persist all of them
+    // in a single batched WAL write (matching the pattern already used by
+    // mutateCoordinatorStoredWorkCancel) instead of one applyWithinStorageUpdate
+    // round-trip per row. There's no genuine inter-row ordering dependency:
+    // each row's guard checks (still-terminal, settlement key unchanged
+    // since it was read) are pure in-memory comparisons against `item`,
+    // which is a stable snapshot already captured before this loop runs and
+    // isn't mutated by processing any other row -- the previous per-row
+    // persistence only mattered for making change visible to code outside
+    // this function, not to later iterations of this same loop, and this
+    // whole function only ever runs inside an already-serialized storage
+    // update cycle (the "Locked" suffix convention), so nothing else can
+    // interleave mid-loop regardless.
+    const settlementResults = []
+    const settlementHrefsByRowKey = new Map()
+    const nextQueueForSettlement = {...queue}
+
     for(const {itemKey, href, item} of terminalEntries) {
         const currentRecord = progress[href] || profileNukeProgress?.[href] || null
         if(shouldRestoreTerminalProgressFromCoordinatorItem(item, currentRecord)) {
@@ -9208,35 +9188,84 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
             clearedHrefs.add(href)
         }
 
-        const authorityResult = await applyTerminalCoordinatorAuthoritySettlementLocked({
-            itemKey,
-            item,
-            settlementKey,
-            sourceSettlementOutcome,
-            now,
-            currentAuthorityState,
-        })
+        const nextItem = {
+            ...item,
+            sourceSettledAt: now,
+            sourceSettlementKey: settlementKey,
+            sourceSettlementOutcome
+        }
+        nextQueueForSettlement[itemKey] = nextItem
+        settlementHrefsByRowKey.set(itemKey, href)
+        settlementResults.push(makeCoordinatorAuthorityApplyResult({
+            operationKind: 'terminal-settlement',
+            rowKey: itemKey,
+            reason: 'ordinaryMutation'
+        }, {
+            accepted: true,
+            changed: true,
+            durable: true,
+            reason: 'persisted',
+            previousRow: item,
+            nextRow: nextItem,
+            terminal: true
+        }))
+    }
 
-        if(authorityResult?.accepted === true && authorityResult?.durable === true) {
-            currentAuthorityState = coordinatorAuthority.current()
-            queue = currentAuthorityState.queue
-            if(authorityResult.changed === true) {
-                queueChanged = true
-                queueChangedRows += 1
+    if(settlementResults.length) {
+        const nextProjection = makeCoordinatorAuthorityProjection({
+            ...currentAuthorityState,
+            queue: nextQueueForSettlement,
+            runs: currentAuthorityState.runs
+        })
+        let settlementPersistence = null
+        try {
+            settlementPersistence = await persistCoordinatorAuthorityQueueWalBatchMutation(
+                settlementResults,
+                nextProjection,
+                {
+                    operationKind: 'terminal-settlement',
+                    reason: 'ordinaryMutation',
+                    previousProjectionQueue: queue,
+                    metricPath: 'terminalSettlement.save.queueWal',
+                    projectionMetricPath: 'terminalSettlement.save.projection'
+                }
+            )
+        }
+        catch(error) {
+            settlementPersistence = {
+                saved: false,
+                reason: 'persistence-error',
+                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
             }
         }
+
+        if(settlementPersistence?.saved === true) {
+            currentAuthorityState = coordinatorAuthority.current()
+            queue = currentAuthorityState.queue
+            queueChanged = true
+            queueChangedRows += settlementResults.length
+        }
         else {
-            confirmedHrefs.delete(href)
-            clearedHrefs.delete(href)
+            for(const href of settlementHrefsByRowKey.values()) {
+                confirmedHrefs.delete(href)
+                clearedHrefs.delete(href)
+            }
             incrementQueueWakeupMetric('terminalSettlement.authorityApplyFailed')
             recordCoordinatorDiagnosticEvent(
                 'terminal-settlement-authority-apply-failed',
-                authorityResult?.reason || 'Terminal settlement authority mutation failed'
+                settlementPersistence?.reason || 'Terminal settlement authority mutation failed'
             )
             scheduleCoordinatorReconcile(1000, {
                 reason: 'terminal-settlement-authority-apply-failed',
                 edgeTriggered: true
             })
+            // The single-row applyWithinStorageUpdate path this replaced
+            // read/wrote through coordinatorAuthority directly, which
+            // synced its resident cache even on a failed attempt. Batching
+            // bypasses that for the (now single) attempt, so hydrate
+            // explicitly here too -- otherwise coordinatorAuthority.current()
+            // can report stale/empty state after a failed settlement batch.
+            await coordinatorAuthority.hydrate().catch(() => null)
         }
     }
 
@@ -18067,92 +18096,109 @@ async function cancelCoordinatorCurrentWork() {
     const pauseGeneration = await nextCoordinatorPauseGenerationFromStorage()
     coordinatorPauseRequested = true
     await setCoordinatorPauseControlState(true, pauseGeneration, 'ordinaryMutation')
-    const storedResult = await cancelStoredCoordinatorWork({
-        reason: 'current-work-cancel-request',
-        pauseGeneration
-    })
-    if(storedResult &&
-        typeof storedResult === 'object' &&
-        !storedResult.reason &&
-        !(storedResult.canceledUrls || []).length &&
-        !(storedResult.canceledWorkKeys || []).length &&
-        await refreshStaleCompactQueueViewIfNeeded('current-work-cancel', 'pump.changed.staleQueueViewRefreshed', {
-            ignorePaused: true
-        })) {
-        return {
-            canceledUrls: [],
-            canceledWorkKeys: [],
-            ownedTabIds: [],
-            reason: 'stale-queue-view-refreshed'
+    try {
+        const storedResult = await cancelStoredCoordinatorWork({
+            reason: 'current-work-cancel-request',
+            pauseGeneration
+        })
+        if(storedResult &&
+            typeof storedResult === 'object' &&
+            !storedResult.reason &&
+            !(storedResult.canceledUrls || []).length &&
+            !(storedResult.canceledWorkKeys || []).length &&
+            await refreshStaleCompactQueueViewIfNeeded('current-work-cancel', 'pump.changed.staleQueueViewRefreshed', {
+                ignorePaused: true
+            })) {
+            return {
+                canceledUrls: [],
+                canceledWorkKeys: [],
+                ownedTabIds: [],
+                paused: false,
+                pauseGeneration,
+                reason: 'stale-queue-view-refreshed'
+            }
         }
-    }
-    if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false) {
-        return {
-            canceledUrls: storedResult?.canceledUrls || [],
-            canceledWorkKeys: storedResult?.canceledWorkKeys || [],
-            ownedTabIds: [],
-            reason: storedResult?.reason || 'cancel-persistence-failed',
-            persistence: storedResult?.persistence || null
+        if(!storedResult || typeof storedResult !== 'object' || storedResult?.reason || storedResult?.persistence?.saved === false) {
+            return {
+                canceledUrls: storedResult?.canceledUrls || [],
+                canceledWorkKeys: storedResult?.canceledWorkKeys || [],
+                ownedTabIds: [],
+                paused: false,
+                pauseGeneration,
+                reason: storedResult?.reason || 'cancel-persistence-failed',
+                persistence: storedResult?.persistence || null
+            }
         }
-    }
 
-    results.push(await stopOwnerNukes(SERVICE_WORKER_QUEUE_OWNER_ID, {
-        closeOwnedTabs: true,
-        reason: 'current-work-cancel-request',
-        shouldContinue: () => isCoordinatorPauseGenerationCurrent(pauseGeneration),
-        shouldContinueSync: () => isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)
-    }))
-
-    if(coordinatorTabId) {
-        results.push(await stopOwnerNukes(coordinatorTabId, {
+        results.push(await stopOwnerNukes(SERVICE_WORKER_QUEUE_OWNER_ID, {
             closeOwnedTabs: true,
             reason: 'current-work-cancel-request',
             shouldContinue: () => isCoordinatorPauseGenerationCurrent(pauseGeneration),
             shouldContinueSync: () => isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)
         }))
-    }
 
-    const ownedTabIds = Array.from(new Set([
-        ...(storedResult.ownedTabIds || []),
-        ...results.flatMap(result => result.ownedTabIds || [])
-    ]))
-    for(const tabId of ownedTabIds) {
-        if(!tabId) continue
-        markQueuedTabClosing(tabId, 'current-work-cancel-request')
-        try {
-            await browser.tabs.remove(tabId)
+        if(coordinatorTabId) {
+            results.push(await stopOwnerNukes(coordinatorTabId, {
+                closeOwnedTabs: true,
+                reason: 'current-work-cancel-request',
+                shouldContinue: () => isCoordinatorPauseGenerationCurrent(pauseGeneration),
+                shouldContinueSync: () => isCoordinatorPauseGenerationLocallyCurrent(pauseGeneration)
+            }))
         }
-        catch {}
-    }
 
-    await pruneMissingQueuedTabRuntimeState('cancel-current-work-runtime-prune')
+        const ownedTabIds = Array.from(new Set([
+            ...(storedResult.ownedTabIds || []),
+            ...results.flatMap(result => result.ownedTabIds || [])
+        ]))
+        for(const tabId of ownedTabIds) {
+            if(!tabId) continue
+            markQueuedTabClosing(tabId, 'current-work-cancel-request')
+            try {
+                await browser.tabs.remove(tabId)
+            }
+            catch {}
+        }
 
-    const canceledUrls = Array.from(new Set([
-        ...(storedResult.canceledUrls || []),
-        ...results.flatMap(result => result.canceledUrls || [])
-    ]))
-    const canceledWorkKeys = storedResult.canceledWorkKeys || []
-    if(!canceledUrls.length &&
-        !canceledWorkKeys.length &&
-        await refreshStaleCompactQueueViewIfNeeded('current-work-cancel', 'pump.changed.staleQueueViewRefreshed', {
-            ignorePaused: true
-        })) {
+        await pruneMissingQueuedTabRuntimeState('cancel-current-work-runtime-prune')
+
+        const canceledUrls = Array.from(new Set([
+            ...(storedResult.canceledUrls || []),
+            ...results.flatMap(result => result.canceledUrls || [])
+        ]))
+        const canceledWorkKeys = storedResult.canceledWorkKeys || []
+        if(!canceledUrls.length &&
+            !canceledWorkKeys.length &&
+            await refreshStaleCompactQueueViewIfNeeded('current-work-cancel', 'pump.changed.staleQueueViewRefreshed', {
+                ignorePaused: true
+            })) {
+            return {
+                canceledUrls: [],
+                canceledWorkKeys: [],
+                ownedTabIds,
+                paused: false,
+                pauseGeneration,
+                reason: 'stale-queue-view-refreshed'
+            }
+        }
+
         return {
-            canceledUrls: [],
-            canceledWorkKeys: [],
+            canceledUrls,
+            canceledWorkKeys,
             ownedTabIds,
-            paused: true,
-            pauseGeneration,
-            reason: 'stale-queue-view-refreshed'
+            paused: false,
+            pauseGeneration
         }
     }
-
-    return {
-        canceledUrls,
-        canceledWorkKeys,
-        ownedTabIds,
-        paused: true,
-        pauseGeneration
+    finally {
+        // Cancel stops the *current* work; it should not leave the
+        // coordinator indefinitely unable to pick up anything new. The
+        // pause set above is only a safety guard for the duration of this
+        // cancel (so a resume/new-queue race can't sneak in mid-teardown).
+        // Clear it again once the cancel is done, on every exit path
+        // including failure -- leaving it stuck paused after a *failed*
+        // cancel would be worse than the failure itself.
+        coordinatorPauseRequested = false
+        await setCoordinatorPauseControlState(false, pauseGeneration, 'ordinaryMutation').catch(() => null)
     }
 }
 
@@ -18252,6 +18298,20 @@ async function cancelStoredCoordinatorWork(options = {}) {
             storageKey,
             profileHref
         })
+    }, {
+        // A cancel/pause request is exactly what a user reaches for when the
+        // system is already under heavy write load (many active tabs
+        // heartbeating progress through this same serialized queue). Using
+        // the default timeout here meant the cancel's own enqueued write
+        // could time out purely from queue *wait* time -- the timeout clock
+        // starts at enqueue, not when it actually gets to run -- before it
+        // ever got a chance to execute, which is the opposite of what a
+        // safety-stop should do under load. Match the existing
+        // QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS convention already used
+        // for other must-not-starve operations (see
+        // settleTerminalCoordinatorItems) instead of the plain default.
+        reason: `cancel-stored-work${hasTarget ? '-item' : ''}`,
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
 
@@ -20784,11 +20844,44 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
                 const itemHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
                 return itemHref === normalizedHref
             })
-        const preserveCoordinatorState = `${nextProgress[normalizedHref]?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND ||
+        // A queued unblock-unmute attempt sets attemptId; a legacy/direct
+        // profile-page action never does (see recordDirectProfileProgressFromRequest
+        // and content.js's non-queued recordProfileNukeProgress branch). Without
+        // the attemptId check, this preserved *any* stored unblock-unmute
+        // progress record -- including a legacy one just written by
+        // record-direct-profile-progress -- leaving it stuck at whatever
+        // intermediate (pre-verification) fields it last had, since nothing
+        // else ever clears a legacy record. Only a live queued attempt (either
+        // still reflected in the progress row's own attemptId, or with a
+        // matching queue row) needs this record preserved for the coordinator's
+        // own terminal settlement to read later.
+        const preserveCoordinatorState = (
+            `${nextProgress[normalizedHref]?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND &&
+            !!nextProgress[normalizedHref]?.attemptId
+        ) ||
             matchingQueueEntries.some(([, item]) => `${item?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND)
 
         if(nextProgress[normalizedHref] && !preserveCoordinatorState) {
-            delete nextProgress[normalizedHref]
+            // Tombstone rather than delete: a full delete leaves nothing for
+            // recordDirectProfileProgressFromRequest's staleness guard to
+            // compare against, so an earlier checkpoint's fire-and-forget
+            // write from this same action sequence (see content.js's
+            // recordProfileNukeProgress) can straggle in afterward and
+            // recreate a stale intermediate record from scratch. A blank
+            // tombstone -- no actionKind/status/succeeded flags -- is inert
+            // for every classification predicate that reads this row
+            // (isTerminalProfileNukeRecord and friends all require a
+            // specific status/actionKind combination, so they see this
+            // exactly as they'd see no record at all) while still carrying a
+            // fresh directProgressClientUpdatedAt for that guard to reject
+            // anything older against.
+            const clearedAt = Date.now()
+            nextProgress[normalizedHref] = {
+                profileHref: normalizedHref,
+                clearedAt,
+                updatedAt: clearedAt,
+                directProgressClientUpdatedAt: clearedAt
+            }
             progressChanged = true
         }
 
@@ -20888,9 +20981,10 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
         if(derivedChanged) {
             if(progressChanged) {
                 try {
-                    progressProjectionCleanup = await deleteProfileNukeProgressRowProjection([normalizedHref], {
-                        metricPath: 'clearProfile.progressProjectionDelete'
-                    })
+                    progressProjectionCleanup = await saveProfileNukeProgressRowProjection(
+                        {[normalizedHref]: nextProgress[normalizedHref]},
+                        {metricPath: 'clearProfile.progressProjectionTombstone'}
+                    )
                 }
                 catch(error) {
                     progressProjectionCleanup = false
@@ -28865,6 +28959,67 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
     }
 }
 
+// Legacy single-profile actions (the direct "Mute Block"/"Unblock Unmute"
+// buttons on a manually-opened profile page, not opened by the coordinator
+// queue) have no attemptId/runId and are never a "coordinator job" -- routing
+// them through recordJobProgressFromRequest's queue-machine event would
+// create a synthetic coordinator queue row for work that never went through
+// the queue. This is the queue-independent equivalent: merge the patch onto
+// whatever progress record already exists for this href and persist it
+// straight to the profile-progress projection, with no queue/WAL/attempt
+// machinery involved. Before this existed, the legacy path's progress calls
+// only updated an in-memory content-script variable (see
+// recordProfileNukeProgress's non-queued branch in content.js) and were
+// lost the moment the tab closed.
+async function recordDirectProfileProgressFromRequest(request = {}) {
+    const profileHref = normalizeQuoraProfileUrl(request.profileHref || request.href || '')
+    if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
+
+    const previous = profileNukeProgress?.[profileHref] || null
+    const incomingPatch = request.patch || {}
+
+    // These writes are fire-and-forget from the content script (deliberately
+    // not awaited there anymore, to avoid blocking the legacy action's own
+    // UI sequence on service-worker responsiveness -- see content.js's
+    // recordProfileNukeProgress), so several checkpoint patches for the same
+    // href can reach the service worker out of the order they were created
+    // in if an earlier send gets delayed. normalizeProgressPatch always
+    // stamps `updatedAt` with the service worker's own processing time
+    // (reflecting arrival order, not origination order) and has no notion
+    // of rejecting a stale write, so guard here instead: compare the
+    // client's own original timestamp -- stamped once, before send, by
+    // content.js's normalizeProfileProgressPatch -- against whatever was
+    // stored by the last direct-progress write for this href, and skip
+    // merging in a patch that's older than what already landed. Scoped to
+    // this function only (via the directProgressClientUpdatedAt field it
+    // maintains) so it can't affect the queued-attempt path's own merge
+    // behavior, which has its own, different ordering guarantees.
+    //
+    // This also catches a straggler arriving *after* clearProfileNukeState
+    // ends the same action sequence: that function leaves a tombstone (not a
+    // deletion) with a fresh directProgressClientUpdatedAt precisely so
+    // `previous` is never null here and an earlier checkpoint's delayed
+    // write can't recreate a stale record from nothing.
+    const incomingClientUpdatedAt = Number.parseInt(incomingPatch.updatedAt, 10) || 0
+    const previousClientUpdatedAt = Number.parseInt(previous?.directProgressClientUpdatedAt, 10) || 0
+    if(previous && incomingClientUpdatedAt && previousClientUpdatedAt && incomingClientUpdatedAt < previousClientUpdatedAt) {
+        return {recorded: false, reason: 'stale-direct-progress-patch'}
+    }
+
+    const record = normalizeProgressPatch(profileHref, incomingPatch, previous)
+    if(!record) return {recorded: false, reason: 'invalid-patch'}
+    record.directProgressClientUpdatedAt = incomingClientUpdatedAt || record.updatedAt
+
+    const saved = await saveProfileNukeProgressRowProjection({[profileHref]: record}, {
+        metricPath: 'directProfileProgress.save'
+    }).catch(() => false)
+
+    return {
+        recorded: !!saved,
+        record: saved ? record : null
+    }
+}
+
 async function fillQueuedTabs(options = {}) {
     if(queuedTabFillPromise) {
         if(options.returnAfterDurableActive === true &&
@@ -30184,6 +30339,7 @@ registerServiceWorkerListeners({
         reconcileCoordinatorStorageBestEffort,
         reconcileReleasedActiveCoordinatorTab,
         recordCoordinatorJobProgressViaQueueMachine,
+        recordDirectProfileProgressFromRequest,
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,

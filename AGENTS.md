@@ -97,20 +97,15 @@ The tag is the Git equivalent of an ADE savepoint for that build. Do not tag a
 known-broken or accidentally generated package; discard it or advance to a new
 version and rebuild.
 
-For test-only builds that do not generate release zips and will not be copied,
-installed, or used as a live validation baseline, the relaxed rule applies:
-version bumps, commits, and tags are not required unless the user asks for them
-or the test build becomes the candidate release.
-
-# Windows Live-Browser Copy Preference
-
-When pushing the unpacked Chrome build to the Windows laptop for live CDP
-validation, prefer `rsync` first because it preserves the current fast
-incremental copy workflow.
-
-If `rsync` hangs or the VPN/tunnel is flaky, use a bounded retry and then fall
-back to `scp` or tar-over-ssh rather than repeatedly waiting on the same hung
-copy.
+There is no relaxed rule for local/dev/test-only builds. Every build,
+including `npm run build:chrome-dev` and any other build run purely for local
+live-testing iteration, still bumps the version first. The version number is
+the only cheap way to tell from the running extension (`chrome://extensions/`
+or the popup) whether a reload actually picked up new code, so skipping the
+bump on "just a test build" defeats the entire point during a live-testing
+loop. Commits and Git tags remain optional for test-only builds unless the
+user asks for them or the test build becomes the candidate release -- only
+the version-bump-before-build requirement is unconditional.
 
 # Live Browser Automation
 

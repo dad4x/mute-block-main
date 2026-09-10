@@ -4,7 +4,7 @@ const {spawnSync} = require('child_process')
 const path = require('path')
 
 const {
-    DEFAULT_REMOTE_CHROME_DEV_PATH,
+    DEFAULT_CHROME_DEV_PATH,
     getOption,
     runMain
 } = require('./lib/cdp')
@@ -56,9 +56,8 @@ function parseJsonTail(text = '') {
 
 runMain(async () => {
     const phase = getOption('phase', '')
-    const remotePath = getOption('extension-path', DEFAULT_REMOTE_CHROME_DEV_PATH)
+    const extensionPath = getOption('extension-path', DEFAULT_CHROME_DEV_PATH)
     const skipProd = hasFlag('skip-prod')
-    const skipSync = hasFlag('skip-sync')
     const skipReload = hasFlag('skip-reload')
     const skipTabReset = hasFlag('skip-tab-reset')
     const allowWorkProducing = hasFlag('allow-work-producing')
@@ -84,35 +83,20 @@ runMain(async () => {
         return
     }
 
-    if(!skipSync) {
-        const sync = run(process.execPath, [
-            'tools/cdp/sync-windows-build.js',
-            '--skip-build-dev',
-            '--remote-path',
-            remotePath
-        ])
-        steps.push({name: 'sync-windows-build', result: summarize(sync), data: parseJsonTail(sync.stdout)})
-        if(!sync.ok) {
-            console.log(JSON.stringify({ok: false, failedStep: 'sync-windows-build', steps}, null, 2))
-            process.exitCode = 1
-            return
-        }
-    }
-
     let extensionId = 'auto'
     if(!skipReload) {
         const reload = run(process.execPath, [
-            'tools/cdp/reload-windows-extension.js',
+            'tools/cdp/reload-chrome-dev.js',
             '--extension-id',
             'auto',
             '--extension-path',
-            remotePath
+            extensionPath
         ])
         const data = parseJsonTail(reload.stdout)
         if(data?.extensionId) extensionId = data.extensionId
-        steps.push({name: 'reload-windows-extension', result: summarize(reload), data})
+        steps.push({name: 'reload-chrome-dev', result: summarize(reload), data})
         if(!reload.ok) {
-            console.log(JSON.stringify({ok: false, failedStep: 'reload-windows-extension', steps}, null, 2))
+            console.log(JSON.stringify({ok: false, failedStep: 'reload-chrome-dev', steps}, null, 2))
             process.exitCode = 1
             return
         }
@@ -120,15 +104,15 @@ runMain(async () => {
 
     if(!skipTabReset) {
         const resetTabs = run(process.execPath, [
-            'tools/cdp/reset-windows-tabs.js',
+            'tools/cdp/reset-chrome-dev-tabs.js',
             '--extension-id',
             extensionId,
             '--extension-path',
-            remotePath
+            extensionPath
         ])
-        steps.push({name: 'reset-windows-tabs', result: summarize(resetTabs), data: parseJsonTail(resetTabs.stdout)})
+        steps.push({name: 'reset-chrome-dev-tabs', result: summarize(resetTabs), data: parseJsonTail(resetTabs.stdout)})
         if(!resetTabs.ok) {
-            console.log(JSON.stringify({ok: false, failedStep: 'reset-windows-tabs', extensionId, steps}, null, 2))
+            console.log(JSON.stringify({ok: false, failedStep: 'reset-chrome-dev-tabs', extensionId, steps}, null, 2))
             process.exitCode = 1
             return
         }
@@ -140,7 +124,7 @@ runMain(async () => {
             '--extension-id',
             extensionId,
             '--extension-path',
-            remotePath,
+            extensionPath,
             '--phase',
             phase,
             ...phaseArgs
@@ -158,7 +142,7 @@ runMain(async () => {
     console.log(JSON.stringify({
         ok: true,
         extensionId,
-        extensionPath: remotePath,
+        extensionPath,
         phase: phase || '',
         steps
     }, null, 2))
