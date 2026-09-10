@@ -364,7 +364,6 @@ const MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL = 30
 const MAX_QUEUE_WAKEUP_METRIC_PHASES = 64
 const MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY = 8
 const CURRENT_WORK_RETENTION_MS = 24 * 60 * 60 * 1000
-const TERMINAL_COORDINATOR_STATUSES = new Set(['succeeded', 'failed', 'skipped', 'canceled'])
 const STALE_ACTIVE_QUEUED_TAB_MS = 10000
 const QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS = 15000
 const STALE_BACKGROUND_OPENING_QUEUED_TAB_MS = 20000
@@ -6126,30 +6125,32 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
     const appendRecord = cloneCoordinatorAuthorityValue(record)
     delete appendRecord.id
     delete appendRecord.seq
-    const append = runQueueWakeupMetricPhase('queueWalAppendPrepare', () => appendWalRecordsToGeneration(storedWal, [appendRecord], {
-        segmentId: `queue-authority-${record.operationKind || 'row-mutation'}-${Date.now()}`
+    // Append + physical-payload build + hard-limit check are delegated to
+    // prepareCoordinatorQueueWalAppend (swCoordinatorQueueWal.js) -- see the
+    // comment there. Collapses what used to be two separately-timed metric
+    // phases ('queueWalAppendPrepare', 'queueWalPhysicalPayload') into one,
+    // an accepted minor loss of timing granularity from the consolidation.
+    const prepared = runQueueWakeupMetricPhase('queueWalAppendPrepare', () => prepareCoordinatorQueueWalAppend(storedWal, [appendRecord], {
+        segmentId: `queue-authority-${record.operationKind || 'row-mutation'}-${Date.now()}`,
+        previousMeta: previousWalMeta,
+        previousStored: nextProjection?.stored || {}
     }))
-    if(append?.rejected) {
+    if(!prepared.ok && prepared.stage === 'append-rejected') {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendRejected')
         recordCoordinatorDiagnosticEvent(
             'coordinator-authority-queue-wal-append-rejected',
-            append.reason || 'Coordinator authority queue WAL append was rejected'
+            prepared.reason || 'Coordinator authority queue WAL append was rejected'
         )
         return {
             saved: false,
             backend: 'queue-wal',
-            reason: append.reason || 'append-rejected'
+            reason: prepared.reason || 'append-rejected'
         }
     }
-
-    const physicalWal = runQueueWakeupMetricPhase('queueWalPhysicalPayload', () => getCoordinatorQueueWalPhysicalPayload(append.store, {
-        previousMeta: previousWalMeta,
-        previousStored: nextProjection?.stored || {}
-    }))
-    if((physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0) >= physicalWal.hardLimit) {
+    if(!prepared.ok) {
         recordCoordinatorQueueWalPhysicalPayloadMetrics({
-            previousCommitted: physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0,
-            committedSegments: physicalWal.committedSegments
+            previousCommitted: prepared.physicalWal.hardLimitCommittedSegments || prepared.physicalWal.previousCommitted || 0,
+            committedSegments: prepared.physicalWal.committedSegments
         })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
         scheduleCoordinatorQueueWalCheckpointSwitch('segmentHardLimit')
@@ -6161,9 +6162,10 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
             saved: false,
             backend: 'queue-wal',
             reason: 'queue-wal-segment-hard-limit',
-            append
+            append: prepared.append
         }
     }
+    const {append, physicalWal} = prepared
 
     recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal)
     const walPayload = options.includeProjectionInWalSave === true
@@ -6203,11 +6205,11 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
 
     const projectionMetricPath = options.projectionMetricPath || `authority.${result.operationKind || 'row-mutation'}.projection.save`
     const projectionQueueOperation = `${result.operationKind || 'authority-row-mutation'}-projection`
-    const recoveredAfterAppend = runQueueWakeupMetricPhase('queueWalReplayVerify', () => recoverProjectedState(append.store))
-    const appendedRecordIds = new Set((append.records || []).map(record => record.id).filter(Boolean))
-    const ignoredAppendedRecords = (recoveredAfterAppend?.projected?.ignored || [])
-        .filter(entry => appendedRecordIds.has(entry?.record?.id))
-    if(recoveredAfterAppend?.recovered !== true || ignoredAppendedRecords.length) {
+    // Replay-verify delegated to verifyAppendedCoordinatorQueueWalReplay
+    // (swCoordinatorQueueWal.js) -- see the comment there.
+    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append))
+    const {recoveredAfterAppend, ignoredAppendedRecords} = replayVerified
+    if(!replayVerified.ok) {
         incrementQueueWakeupMetric(ignoredAppendedRecords.length
             ? 'coordinatorAuthority.queueWal.appendIgnoredAfterReplay'
             : 'coordinatorAuthority.queueWal.appendRecoveryFailed')
@@ -6215,8 +6217,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
             ignoredAppendedRecords.length
                 ? 'coordinator-authority-queue-wal-append-ignored-after-replay'
                 : 'coordinator-authority-queue-wal-append-recovery-failed',
-            ignoredAppendedRecords[0]?.reason ||
-                recoveredAfterAppend?.reason ||
+            replayVerified.reason ||
                 'Coordinator authority queue WAL append did not replay as durable authority'
         )
         scheduleCoordinatorReconcile(1000, {
@@ -6228,15 +6229,13 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         return {
             saved: false,
             backend: 'queue-wal',
-            reason: ignoredAppendedRecords[0]?.reason || recoveredAfterAppend?.reason || 'append-replay-failed',
+            reason: replayVerified.reason || 'append-replay-failed',
             append,
             walSaved: true,
             replayIgnored: ignoredAppendedRecords
         }
     }
-    const authoritativeProjectionQueue = recoveredAfterAppend?.recovered === true
-        ? recoveredAfterAppend?.projected?.state?.queue || recoveredAfterAppend?.state?.queue || null
-        : null
+    const authoritativeProjectionQueue = replayVerified.authoritativeProjectionQueue
     if(!authoritativeProjectionQueue) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.projectionRecoveryFailed')
         recordCoordinatorDiagnosticEvent(
@@ -6390,30 +6389,29 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         delete next.seq
         return next
     })
-    const append = runQueueWakeupMetricPhase('queueWalAppendPrepare', () => appendWalRecordsToGeneration(storedWal, appendRecords, {
-        segmentId: `queue-authority-${operationKind}-batch-${Date.now()}`
+    // See the matching comment in persistCoordinatorAuthorityQueueWalMutation
+    // above for why this is delegated to prepareCoordinatorQueueWalAppend.
+    const prepared = runQueueWakeupMetricPhase('queueWalAppendPrepare', () => prepareCoordinatorQueueWalAppend(storedWal, appendRecords, {
+        segmentId: `queue-authority-${operationKind}-batch-${Date.now()}`,
+        previousMeta: previousWalMeta,
+        previousStored: nextProjection?.stored || {}
     }))
-    if(append?.rejected) {
+    if(!prepared.ok && prepared.stage === 'append-rejected') {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendRejected')
         recordCoordinatorDiagnosticEvent(
             'coordinator-authority-queue-wal-batch-append-rejected',
-            append.reason || 'Coordinator authority queue WAL batch append was rejected'
+            prepared.reason || 'Coordinator authority queue WAL batch append was rejected'
         )
         return {
             saved: false,
             backend: 'queue-wal',
-            reason: append.reason || 'append-rejected'
+            reason: prepared.reason || 'append-rejected'
         }
     }
-
-    const physicalWal = runQueueWakeupMetricPhase('queueWalPhysicalPayload', () => getCoordinatorQueueWalPhysicalPayload(append.store, {
-        previousMeta: previousWalMeta,
-        previousStored: nextProjection?.stored || {}
-    }))
-    if((physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0) >= physicalWal.hardLimit) {
+    if(!prepared.ok) {
         recordCoordinatorQueueWalPhysicalPayloadMetrics({
-            previousCommitted: physicalWal.hardLimitCommittedSegments || physicalWal.previousCommitted || 0,
-            committedSegments: physicalWal.committedSegments
+            previousCommitted: prepared.physicalWal.hardLimitCommittedSegments || prepared.physicalWal.previousCommitted || 0,
+            committedSegments: prepared.physicalWal.committedSegments
         })
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentHardBlocked')
         scheduleCoordinatorQueueWalCheckpointSwitch('segmentHardLimit')
@@ -6425,9 +6423,10 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
             saved: false,
             backend: 'queue-wal',
             reason: 'queue-wal-segment-hard-limit',
-            append
+            append: prepared.append
         }
     }
+    const {append, physicalWal} = prepared
 
     recordCoordinatorQueueWalPhysicalPayloadMetrics(physicalWal)
     const walSaved = await metricStorageSet(physicalWal.payload, {
@@ -6462,11 +6461,11 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         storageContext.coordinatorAuthorityQueueOperation = operationKind
     }
 
-    const recoveredAfterAppend = runQueueWakeupMetricPhase('queueWalReplayVerify', () => recoverProjectedState(append.store))
-    const appendedRecordIds = new Set((append.records || []).map(record => record.id).filter(Boolean))
-    const ignoredAppendedRecords = (recoveredAfterAppend?.projected?.ignored || [])
-        .filter(entry => appendedRecordIds.has(entry?.record?.id))
-    if(recoveredAfterAppend?.recovered !== true || ignoredAppendedRecords.length) {
+    // See the matching comment in persistCoordinatorAuthorityQueueWalMutation
+    // above for why this is delegated to verifyAppendedCoordinatorQueueWalReplay.
+    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append))
+    const {ignoredAppendedRecords} = replayVerified
+    if(!replayVerified.ok) {
         incrementQueueWakeupMetric(ignoredAppendedRecords.length
             ? 'coordinatorAuthority.queueWal.batchAppendIgnoredAfterReplay'
             : 'coordinatorAuthority.queueWal.batchAppendRecoveryFailed')
@@ -6474,8 +6473,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
             ignoredAppendedRecords.length
                 ? 'coordinator-authority-queue-wal-batch-append-ignored-after-replay'
                 : 'coordinator-authority-queue-wal-batch-append-recovery-failed',
-            ignoredAppendedRecords[0]?.reason ||
-                recoveredAfterAppend?.reason ||
+            replayVerified.reason ||
                 'Coordinator authority queue WAL batch append did not replay as durable authority'
         )
         scheduleCoordinatorReconcile(1000, {
@@ -6487,15 +6485,13 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         return {
             saved: false,
             backend: 'queue-wal',
-            reason: ignoredAppendedRecords[0]?.reason || recoveredAfterAppend?.reason || 'batch-append-replay-failed',
+            reason: replayVerified.reason || 'batch-append-replay-failed',
             append,
             walSaved: true,
             replayIgnored: ignoredAppendedRecords
         }
     }
-    const authoritativeProjectionQueue = recoveredAfterAppend?.projected?.state?.queue ||
-        recoveredAfterAppend?.state?.queue ||
-        null
+    const authoritativeProjectionQueue = replayVerified.authoritativeProjectionQueue
     const projectionQueueBase = authoritativeProjectionQueue || nextProjection.queue || {}
 
     try {
@@ -7928,7 +7924,9 @@ const {
     getCoordinatorQueueWalPhysicalPayload,
     recordCoordinatorQueueWalPhysicalPayloadMetrics,
     getRetiredCoordinatorQueueWalPhysicalKeys,
-    makeCoordinatorAuthorityQueueWalRemoveRecord
+    makeCoordinatorAuthorityQueueWalRemoveRecord,
+    prepareCoordinatorQueueWalAppend,
+    verifyAppendedCoordinatorQueueWalReplay
 } = coordinatorQueueWal
 
 const coordinatorAuthority = createCoordinatorAuthority()
@@ -19795,12 +19793,18 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     }
 
     await coordinatorAuthority.hydrate()
+    // Tombstone rather than delete these rows, same reasoning as
+    // clearProfileNukeState/makeTombstonedProfileProgressRecord: a plain
+    // delete leaves nothing for recordDirectProfileProgressFromRequest's
+    // staleness guard to compare against, so a fire-and-forget checkpoint
+    // write still in flight for one of these hrefs could resurrect a stale
+    // record after the retry has already moved on.
     if(progressProjectionRemovalHrefs.size) {
         profileNukeProgress = {
             ...profileNukeProgress
         }
         for(const href of progressProjectionRemovalHrefs) {
-            delete profileNukeProgress[href]
+            profileNukeProgress[href] = makeTombstonedProfileProgressRecord(href)
         }
     }
 
@@ -19808,9 +19812,10 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     let projectionCleanup = {saved: true, rows: 0}
     try {
         projectionCleanup = progressProjectionRemovalHrefs.size
-            ? await deleteProfileNukeProgressRowProjection(Array.from(progressProjectionRemovalHrefs), {
-                metricPath: 'failedRetry.progressProjectionDelete'
-            })
+            ? await saveProfileNukeProgressRowProjection(
+                Object.fromEntries(Array.from(progressProjectionRemovalHrefs, href => [href, makeTombstonedProfileProgressRecord(href)])),
+                {metricPath: 'failedRetry.progressProjectionTombstone'}
+            )
             : {saved: true, rows: 0}
     }
     catch(error) {
@@ -20117,12 +20122,14 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     }
 
     await coordinatorAuthority.hydrate()
+    // Tombstone rather than delete these rows -- see the matching comment
+    // in the failed-retry path above for why.
     if(progressProjectionRemovalHrefs.size) {
         profileNukeProgress = {
             ...profileNukeProgress
         }
         for(const href of progressProjectionRemovalHrefs) {
-            delete profileNukeProgress[href]
+            profileNukeProgress[href] = makeTombstonedProfileProgressRecord(href)
         }
     }
 
@@ -20130,9 +20137,10 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     let projectionCleanup = {saved: true, rows: 0}
     try {
         projectionCleanup = progressProjectionRemovalHrefs.size
-            ? await deleteProfileNukeProgressRowProjection(Array.from(progressProjectionRemovalHrefs), {
-                metricPath: 'failedRequeue.progressProjectionDelete'
-            })
+            ? await saveProfileNukeProgressRowProjection(
+                Object.fromEntries(Array.from(progressProjectionRemovalHrefs, href => [href, makeTombstonedProfileProgressRecord(href)])),
+                {metricPath: 'failedRequeue.progressProjectionTombstone'}
+            )
             : {saved: true, rows: 0}
     }
     catch(error) {
@@ -20806,6 +20814,30 @@ async function loadProjectedProfileNukeProgressRow(profileHref = '', metricPath 
     }
 }
 
+// A blank tombstone -- no actionKind/status/succeeded flags -- rather than
+// deleting the key outright. A full delete leaves nothing for
+// recordDirectProfileProgressFromRequest's staleness guard to compare
+// against, so an earlier checkpoint's fire-and-forget write (see content.js's
+// recordProfileNukeProgress) can straggle in afterward and recreate a stale
+// record from scratch. This tombstone shape is inert for every
+// classification predicate that reads a progress row (isTerminalProfileNukeRecord
+// and friends all require a specific status/actionKind combination, so they
+// see this exactly as they'd see no record at all) while still carrying a
+// fresh directProgressClientUpdatedAt for that guard to reject anything
+// older against. Shared by clearProfileNukeState and the failed-retry/
+// failed-requeue progress-removal paths, which all clear a profile's
+// progress row for the same reason: giving a new attempt a clean slate
+// without losing the ordering guard's comparison basis.
+function makeTombstonedProfileProgressRecord(profileHref) {
+    const clearedAt = Date.now()
+    return {
+        profileHref,
+        clearedAt,
+        updatedAt: clearedAt,
+        directProgressClientUpdatedAt: clearedAt
+    }
+}
+
 async function clearProfileNukeState(profileHref = '', reason = '') {
     await ensureProfileNukeProgressReady()
 
@@ -20862,26 +20894,7 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
             matchingQueueEntries.some(([, item]) => `${item?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND)
 
         if(nextProgress[normalizedHref] && !preserveCoordinatorState) {
-            // Tombstone rather than delete: a full delete leaves nothing for
-            // recordDirectProfileProgressFromRequest's staleness guard to
-            // compare against, so an earlier checkpoint's fire-and-forget
-            // write from this same action sequence (see content.js's
-            // recordProfileNukeProgress) can straggle in afterward and
-            // recreate a stale intermediate record from scratch. A blank
-            // tombstone -- no actionKind/status/succeeded flags -- is inert
-            // for every classification predicate that reads this row
-            // (isTerminalProfileNukeRecord and friends all require a
-            // specific status/actionKind combination, so they see this
-            // exactly as they'd see no record at all) while still carrying a
-            // fresh directProgressClientUpdatedAt for that guard to reject
-            // anything older against.
-            const clearedAt = Date.now()
-            nextProgress[normalizedHref] = {
-                profileHref: normalizedHref,
-                clearedAt,
-                updatedAt: clearedAt,
-                directProgressClientUpdatedAt: clearedAt
-            }
+            nextProgress[normalizedHref] = makeTombstonedProfileProgressRecord(normalizedHref)
             progressChanged = true
         }
 

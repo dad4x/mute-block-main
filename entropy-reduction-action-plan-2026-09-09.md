@@ -1,0 +1,507 @@
+# Entropy Reduction Action Plan — 2026-09-09
+
+## Motivating problem
+
+This codebase has been extensively edited across many sessions by different
+AI models and agents, often working with limited context and no shared,
+enforced set of conventions. That produces a specific, recurring failure
+shape: local fixes that are individually reasonable but rely on an implicit
+invariant elsewhere in the codebase, which later erodes silently when a
+different session (with no visibility into that invariant) changes the thing
+it depended on. This document exists so that the *next* low-context session —
+of any model — has something durable to read before repeating the pattern,
+rather than rediscovering it from scratch. That's itself part of the fix
+(see Phase 5).
+
+Concrete origin: a single live-testing session (2026-09-09, documented in
+`live-testing-todo-2026-09-08.md`) chasing one reported bug (an
+internally-inconsistent persisted profile-progress record) surfaced four
+independent, unrelated bugs stacked on top of each other, each a different
+instance of the same underlying gap: no schema/typed-union discipline for
+state that different code paths mutate independently over time.
+
+## Named patterns (see live-testing-todo-2026-09-08.md for the concrete bugs each was drawn from)
+
+0. **Untyped, unioned progress record (the root pattern).** `profileNukeProgress[href]`
+   is one flat object accumulating fields from conceptually distinct action
+   kinds (`mute-block` vs `unblock-unmute`) via unconditional spread-merges
+   (`normalizeProgressPatch` in `swProfileProgressMerge.js`,
+   `normalizeProfileProgressPatch` in `content.js`). No schema makes an
+   incoherent combination (e.g. `status: "blocked"` alongside
+   `unblockReason: "unmuted"`) inexpressible — only scattered, partial,
+   ad hoc guards do, and those guards are exactly the kind of thing that
+   erodes across editing sessions.
+1. **Stale invariants baked into boolean expressions.** A condition uses one
+   field's value as a proxy for a broader classification (e.g. "does this
+   `actionKind` imply a queued attempt?") without an explicit discriminator.
+   The proxy was true only because of a *now-changed* absence elsewhere.
+   Example: `clearProfileNukeState`'s `preserveCoordinatorState` check.
+2. **Unscoped "best effort" fallback search with no relevance floor.** A
+   ranking/scoring function picks "best of what's available" across an
+   unbounded search space, with no hard requirement tied to the caller's
+   actual intent — safe only until something unrelated scores well by
+   accident. Example: `getGlobalPrimaryAction`.
+3. **Restricted-domain fields some code paths never populate.** A field like
+   `actionKind` or `status` is read in branching logic everywhere, but at
+   least one constructor of the record never sets it, relying on inheritance
+   through a merge. Example: legacy `muteProfile()` never stamping
+   `actionKind`. (Deferred per user decision — see Phase 3.)
+4. **Delete/reset racing fire-and-forget writers.** Clearing or resetting a
+   keyed piece of shared state erases the comparison basis a still-in-flight
+   async write needs to detect its own staleness. Example:
+   `clearProfileNukeState` used to hard-delete instead of tombstone.
+5. **Nested wait-loop budgets that don't add up.** An outer `waitFor*`
+   timeout gives an inner `waitFor*`/read call nearly its entire budget in
+   one attempt, leaving no room for a real retry. Example:
+   `unmuteProfileBestEffort`'s `waitForProfileMenuState(..., 2500, 250)`
+   wrapping a `readProfileMenuState(..., 1800, 200)`.
+6. **Duplicated constants across a module boundary.** The same literal value
+   (e.g. `UNBLOCK_UNMUTE_ACTION_KIND = 'unblock-unmute'`) is independently
+   declared in more than one file rather than shared from one source, so a
+   typo'd rename in one place silently breaks cross-boundary matching.
+7. **Storage-abstraction leakage.** `swstorage.js`/`swProfileNukeProgress.js`
+   exist to encapsulate WAL/batching/sharding, but business logic in `sw.js`
+   still calls low-level primitives directly and must know about
+   shards/views/WAL to use them correctly. Concrete leak found live tonight:
+   `summarizeProfileNukeProgressRecord`'s explicit field allowlist is a
+   second, disconnected source of truth from whatever constructs a patch —
+   forgetting to add a new field there silently drops it on every durable
+   write, with nothing that fails loudly. Also: tests asserting on WAL
+   segment counts directly (an implementation detail) rather than on
+   behavior is the same leak showing up in the test suite.
+8. **Scattered timeout/interval magic numbers, no symbolic registry.**
+   `waitFor*(..., timeoutMs, intervalMs)` call sites (Pattern 5's root
+   cause) each invent their own numeric literals with no shared vocabulary
+   for what a given wait represents (a quick single-attempt check vs. a
+   multi-attempt retry budget vs. a full end-to-end verification), so
+   there's no way to reason about or tune the system's overall patience as
+   a whole. See [[feedback-symbolic-timeout-registry]] (project memory) —
+   deferred by the same reactive policy as Phase 3's setter work, seeded by
+   the next real timeout bug that needs fixing anyway rather than built
+   proactively.
+
+## Phases
+
+- **Phase 1 — Recon, no code changes.** Inventory real instances of each
+  pattern above. Output is a findings doc, not fixes. *(In progress — see
+  sub-plan below.)*
+- **Phase 2 — Tripwires at the exact leak points Phase 1 finds.** Cheap,
+  targeted tests that turn silent entropy into a loud CI failure without any
+  architectural change. Two known in advance: (a) a schema-consistency test
+  asserting every field ever written into a progress-record patch also
+  appears in `summarizeProfileNukeProgressRecord`'s allowlist; (b) an
+  equality test asserting independently-declared action-kind constants
+  match across files. *(Not started.)*
+- **Phase 3 — Reactive schema/setter work, deferred by design.** Introducing
+  validated setters/constants for restricted-domain fields (pattern 1, 3, 6)
+  happens opportunistically, "as it comes up" against a real bug — not as a
+  scheduled sweep. See
+  `../memory/feedback_restricted_domain_setters.md` (project memory) for the
+  standing rule. Expected to also address the storage-boundary gap (pattern
+  7) and the untyped-union root pattern (0), per user note 2026-09-09.
+  *(Not started; triggers opportunistically.)*
+- **Phase 4 — Storage-abstraction boundary, scoped separately.** Bigger than
+  a tripwire can fix. Needs its own design pass once Phase 1 shows how many
+  call sites actually reach past the `swstorage.js`/`swProfileNukeProgress.js`
+  boundary. *(Not started; likely folds into Phase 3's schema work rather
+  than being fully separate — re-evaluate after Phase 1.)*
+- **Phase 5 — Process.** A short "known traps" pointer in `AGENTS.md` linking
+  to this document, so the next low-context session (of any model) reads it
+  before repeating one of the patterns above. *(Not started.)*
+
+## Phase 1 Findings (2026-09-09)
+
+Three scoped research agents ran in parallel (content.js; sw.js + progress
+modules; storage-abstraction boundary). Raw per-instance findings below;
+each entry is `file:line — description — risk — reason`.
+
+### Task A — content.js
+
+**Pattern 2 (unscoped heuristic fallback), beyond the already-fixed
+`getGlobalPrimaryAction` cluster:**
+- `content.js:3215` `getProfileMenuButtonFallback` — scores every menu-like
+  button across the whole main content area (not just a row) when the
+  narrow row-anchored lookup fails, floor `score > 0` — risk: medium — could
+  pick an unrelated "more options" menu on a busy page.
+- `content.js:5379` `getOriginalPosterProfileHref()`'s `scoreOriginalPosterLink`
+  fallback — scores every visible profile link in `main`/`document.body` by
+  nearby keywords when inline-data lookup fails — risk: medium — thin/
+  ambiguous surrounding text could misidentify a commenter/follower as the
+  original poster, driving nuke/report targeting at the wrong profile.
+- `content.js:11709` `getInPageConfirmPairAction` (used by
+  `getUnmuteConfirmAction`'s fallback) — unlike its sibling
+  `getUnblockConfirmAction`, scans the **entire document** for a confirm
+  button when the dialog-scoped lookup is empty — risk: medium-high — on a
+  page listing several other muted users' own controls (settings/
+  notifications), could click a different profile's unmute control.
+
+**Pattern 3 (`actionKind` left unset), a second real gap beyond the
+already-fixed `muteProfile()` entry point:**
+- `content.js:12457-12462` — the "already unblocked, just unmute" branch of
+  `unblockUnmuteProfile()` calls `unmuteProfileBestEffort()` directly with
+  no preceding progress-patch call, and `unmuteProfileBestEffort()` itself
+  never records any patch — risk: high — for a fresh href entering this
+  branch, `actionKind` can stay permanently blank, and this is likely the
+  single most common "reverse" case (unmuting something that was never
+  blocked).
+- `content.js:4653-4692` (`handleUnblockUnmuteClick`) and `content.js:1990-1994`
+  (the `'unblock-unmute-profile'` message handler) — both real entry points
+  into the branch above, neither stamps `actionKind` upstream either — risk:
+  medium — no safety net catches the gap before it reaches
+  `unblockUnmuteProfile`.
+
+**Pattern 5 (nested wait-loop budget mismatch) — a systemic shape, not one
+instance:** every `waitForProfileMenuState(expectedState, ..., outerMs,
+outerIntervalMs)` caller loops an inner `readProfileMenuState(..., 1800,
+200)` that costs up to ~2200ms per call regardless of the outer interval
+requested.
+- `content.js:12764` (`blockProfile`'s early-applied check) outer `(1500,
+  200)` — risk: high — inner floor alone exceeds the whole outer budget;
+  can never complete one full iteration.
+- `content.js:12281` (`unmuteProfile`) outer `(2500, 500)` — risk: high —
+  ~300ms margin, effectively single-shot.
+- `content.js:12348` (`unmuteProfileBestEffort`, the originally-flagged
+  instance) outer `(2500, 250)` — risk: high — same shape.
+- `content.js:4214` (`waitForVerifiedProfileUnblocked`) and `content.js:12288`
+  outer `(5000, 500)` — risk: medium — only 1-2 real iterations possible.
+  **This is very likely the mechanism behind the live-testing session's
+  unexplained "unblock verification keeps failing under repeated cycling"
+  finding** (see live-testing-todo-2026-09-08.md) — the budget is tight
+  enough that any real added latency (Quora-side lag, extra CPU load) can
+  exhaust it before a second attempt lands.
+- `content.js:4313` (`waitForVerifiedProfileBlocked`) outer `(6000, 500)` —
+  risk: medium-low — ~2 iterations.
+- `content.js:12297`/`12598` outer `(8000, 500)` — risk: low — ~3
+  iterations, adequate as-is.
+
+### Task B — sw.js + progress/coordinator modules
+
+**Pattern 1 (stale invariant proxy):** no new instances beyond the
+already-fixed `preserveCoordinatorState`. Every other `actionKind ===
+UNBLOCK_UNMUTE_ACTION_KIND` site checked branches on the field's own literal
+meaning (selecting unblock-flow fields vs. block-flow fields), not as a
+stand-in for an unrelated classification; places that actually need to
+decide queued-vs-legacy or ownership already check explicit fields
+(`attemptId`, `serviceWorkerOwned`) alongside status/actionKind.
+
+**Pattern 6 (duplicated constants):**
+- `content.js:179` independently declares `UNBLOCK_UNMUTE_ACTION_KIND =
+  'unblock-unmute'` even though `content.js` already imports from
+  `jobState.js` (which exports this exact constant) elsewhere — risk:
+  medium — currently in sync, but nothing stops future drift.
+- `sw.js:367` `TERMINAL_COORDINATOR_STATUSES` duplicates `jobState.js:18`'s
+  `TERMINAL_JOB_STATUSES` (identical set) — risk: low — dead code (never
+  referenced again after declaration), but a live duplicate waiting to be
+  picked up.
+- **Confirmed drift, not just duplication:** `content.js:218`
+  (`TRANSIENT_PROFILE_NUKE_STATUSES`) vs. `jobState.js:19-30`
+  (`TRANSIENT_PROGRESS_STATUSES`) vs.
+  `swProfileNukeRecordClassification.js:179-190`
+  (`isTransientProfileNukeStatus`'s inline Set) — three independent copies
+  of the "transient status" list, and **content.js's copy is missing
+  `'unmuting'` and `'unblocking'`** that the other two include — risk: high
+  — content.js's transient-status check silently disagrees with the
+  service worker's classification for unblock/unmute-in-progress states.
+- Adjacent, flagged for awareness: `isExplicitSecurityVerificationRecord`
+  has an identical duplicated body (not just a constant) in both
+  `jobState.js:123-135` and `swProfileNukeRecordClassification.js:164-176`.
+
+**Pattern 4 (delete/reset racing fire-and-forget writers) — the fixed bug's
+sibling code paths, not fully covered by the original fix:**
+- `sw.js:19799-19804` (failed-retry coordinator-authority path) and
+  `sw.js:20121-20126` (sibling failed-requeue path) — both do `delete
+  profileNukeProgress[href]` directly on the same shared map
+  `clearProfileNukeState` was fixed to stop doing this to — risk: high —
+  same failure shape as the fixed bug, duplicated into two more code paths
+  the original fix didn't cover.
+- `swProfileNukeProgress.js:316-323`/`346-350` (view/shard record removal)
+  — risk: low — these are derived/rebuildable display projections, not the
+  authoritative merge record, so a stale write landing after deletion only
+  leaves a stray UI-visible entry until the next rebuild.
+
+### Task C — Storage-abstraction boundary
+
+**Leakage into `sw.js`'s read/rebuild paths (write paths are comparatively
+well-contained):**
+- `sw.js:42-61` — top-level `require('./swstorage')` pulls in low-level WAL
+  primitives (segment/checkpoint/generation functions) directly into
+  business-logic file scope — risk: high.
+- `sw.js:1901,1929` — `metricStorageGet`/`metricStorageSet` are thin
+  metric-wrapped passthroughs *defined in sw.js itself*, then called ~90
+  times throughout with hand-assembled raw storage keys — risk: high — no
+  single choke point enforces correct key combinations.
+- `sw.js:6129,6393` — `appendWalRecordsToGeneration` called directly in
+  `persistCoordinatorAuthorityQueueWalMutation`/its batch sibling, in
+  parallel with the *wrapped* path via `swCoordinatorQueueWal.js` that
+  sw.js also uses elsewhere — risk: high — two parallel append paths whose
+  consistency depends on convention, not construction.
+- ~8+ functions (e.g. `loadCoordinatorQueueRunsProgressProjection` and
+  siblings at `sw.js:8032-8090,8100-8340,9000-9050,20730-20800,30153-30170`)
+  each independently re-implement the same "assemble defaults → get →
+  recover WAL → reproject" recipe — risk: high — duplicated recipe means
+  duplicated chances to get a key or call order wrong.
+- By contrast, `saveProfileNukeProgressRowProjection`/
+  `deleteProfileNukeProgressRowProjection` correctly centralize the *write*
+  path, and most steady-state writes already go through them — the leakage
+  is concentrated in reads/rebuilds and the WAL-append path, not writes.
+
+**Field-allowlist depth:** only one allowlist of this shape exists in the
+audited storage files —
+`swProfileNukeProgress.js:96-152` `summarizeProfileNukeProgressRecord`,
+**44 fields**, the single choke point every persisted progress record
+passes through — risk: high by depth (44 fields, no compile-time or
+runtime check that it stays in sync with whatever constructs records in
+sw.js), not by breadth (no second disagreeing allowlist found).
+
+**Tests coupled to storage-internal representation:** concentrated in
+`test/swSynthetic.test.js` (51 references to internal WAL/shard key
+literals, vs. 11 and 6 in `walSnapshotStore(Fuzz).test.js`, which are the
+storage module's own expected unit tests). Notable: `swSynthetic.test.js:3133,3218`
+assert directly on WAL segment/checkpoint key names and payload key
+membership rather than on observable queue state; `:3295,3351,3403`
+fabricate internal meta/segment-count shapes directly; several tests
+(`:2434,2767,2900,2987`) filter/delete by the `mbProfileNukeProgressShard.`
+key prefix even though their names suggest they're testing projection
+*behavior*, not key format.
+
+## Status log
+
+- 2026-09-09: Plan created. Phase 1 sub-plan drafted (see
+  `entropy-audit-phase1-subplan-2026-09-09.md`), farmed out to 3 scoped
+  research agents. All three completed same day; findings folded in above.
+  Phase 1 complete. Re-evaluating with user before starting Phase 2.
+- 2026-09-09 (same day): User approved fixing the "obvious" confirmed bugs
+  from Phase 1 findings immediately, ahead of the phased tripwire/deferred
+  work. Fixed, rebuilt as `1.6.1228`, full test suite green:
+  - `TRANSIENT_PROFILE_NUKE_STATUSES` drift (content.js was missing
+    `'unmuting'`/`'unblocking'`) — eliminated by importing
+    `TRANSIENT_PROGRESS_STATUSES`/`UNBLOCK_UNMUTE_ACTION_KIND` from
+    `jobState.js` instead of re-declaring locally, removing both duplicates
+    at the source rather than just patching the values.
+  - Dead duplicate `TERMINAL_COORDINATOR_STATUSES` in `sw.js` — deleted
+    (confirmed unused).
+  - The two sibling delete-instead-of-tombstone sites (`sw.js`'s
+    failed-retry and failed-requeue progress-cleanup paths) — fixed using a
+    new shared `makeTombstonedProfileProgressRecord(profileHref)` helper,
+    also adopted by `clearProfileNukeState` to remove the third copy of the
+    same tombstone-construction literal. Updated the two `swSynthetic.test.js`
+    tests and two `p1-contract.test.js` source-shape assertions that
+    expected the old delete-based behavior.
+  - The second `actionKind`-never-set gap: `unblockUnmuteProfile()`'s
+    "already unblocked, just unmute" branch now calls
+    `recordReverseActionProgress` (stamping `actionKind:
+    'unblock-unmute'`) before `unmuteProfileBestEffort()`, matching the
+    `startedBlocked` branch's existing behavior.
+  - Not fixed in this pass (left for Phase 2/3 as originally scoped): the
+    unscoped heuristic-fallback instances (Pattern 2), the nested
+    wait-loop budget mismatches (Pattern 5, including the one likely
+    behind the live-testing verification-timeout finding), and the
+    storage-abstraction leakage (Pattern 7) — these need design judgment
+    (new timeout values, narrowing a search scope, or a boundary redesign)
+    rather than being a mechanical, obviously-correct change.
+- 2026-09-10: Phase 2 complete (both tripwires landed, test-only, no
+  extension rebuild needed, full suite green):
+  - `test/swSynthetic.test.js` — new test `'profile-progress field
+    allowlist round-trips every known field (schema tripwire)'` sends a
+    `record-direct-profile-progress` message with every field
+    `summarizeProfileNukeProgressRecord` knows about set to a distinguishable
+    sentinel value, then asserts the compact view record and the sharded
+    storage record both deep-equal the expected shape. Caught one real
+    subtlety while writing it: `terminalAt` is intentionally re-stamped to
+    server `now()` whenever a record's success state newly reaches a
+    terminal status (`swProfileProgressMerge.js`'s `successChanged` check),
+    overriding whatever the patch claims — not a round-trip failure, and
+    now documented in the test itself. Known, accepted limitation: this
+    catches an *existing* field silently breaking (removed from the
+    allowlist, a typo, a dropped mapping), not a *brand-new* field nobody
+    thought to add to this test's fixture — there's no independent second
+    schema to diff against, since the allowlist function is the only place
+    the record shape is named as a group.
+  - `test/p1-contract.test.js` — new test `'isExplicitSecurityVerificationRecord
+    stays identical across its two independent declarations'` asserts the
+    function bodies in `jobState.js` and `swProfileNukeRecordClassification.js`
+    stay textually identical (whitespace-normalized), matching this file's
+    existing source-shape-assertion convention.
+  - Triage of the remaining Phase 1 defer list (Patterns 2, 5, 7) starts
+    next, to split "actually cheap once you look closely" from "needs its
+    own design session" before doing any more fixing.
+- 2026-09-10: Triage conclusion — all three remaining patterns deferred, no
+  code changes this round:
+  - **Pattern 2 (heuristic fallbacks)**: on closer reading,
+    `getInPageConfirmPairAction`'s document-wide fallback in
+    `getUnmuteConfirmAction` isn't a redundant unguarded copy of a pattern
+    its sibling `getUnblockConfirmAction` already solves safely —
+    `getUnblockConfirmAction` has no such fallback at all, it just returns
+    null. Removing it would trade a rare false-positive risk (clicking
+    someone else's unmute button) for a new false-negative risk (unmute
+    confirmation silently failing whenever the scoped lookup is empty) —
+    a real tradeoff needing live-testing validation, not a mechanical fix.
+    All of Pattern 2 stays deferred.
+  - **Pattern 5 (wait-loop budgets)**: reading `readProfileMenuState`'s
+    actual cost model closely (not just the audit summary) showed it's
+    more nuanced than flat per-attempt cost — the 400ms sleep is
+    unconditional but the up-to-1800ms poll ceiling only gets paid in the
+    slow/failure case, and some flagged sites (e.g. `unmuteProfile`'s
+    `unmutedWithoutConfirm` → `unmutedAfterDismiss` pair) are already a
+    working two-stage retry, not a single broken wait. One case
+    (`blockProfile`'s `blockedAppliedEarly`, outer `1500ms/200ms`) is
+    unambiguously broken — its own inner attempt alone can exceed that
+    budget. Decided not to patch even that one now: doing so would mean
+    planting one more scattered magic-number literal, which is exactly
+    what the newly-captured symbolic-timeout-registry idea (Pattern 8,
+    below) argues against, and unlike the `actionKind` fix this was found
+    by static reading, not a live-observed failure — doesn't meet the same
+    bar that triggered Phase 3-style reactive work elsewhere. Deferred in
+    full alongside Pattern 8's registry.
+  - **Pattern 7 (storage leakage)**: deferred as originally scoped, no
+    change to that assessment.
+  - New pattern captured during this triage, not from Phase 1's original
+    audit: **Pattern 8, scattered timeout/interval magic numbers, no
+    symbolic registry** (see the patterns list above and
+    [[feedback-symbolic-timeout-registry]] project memory) — same reactive
+    trigger discipline as Phase 3's setter work.
+  - Moving on to Phase 4's own recon (storage-abstraction boundary, deeper
+    than Phase 1's initial survey) and Phase 5 (process) next.
+- 2026-09-10: Phase 5 complete — added a "Known Architectural Traps" section
+  to `AGENTS.md` pointing at this document, so the next low-context session
+  reads it before touching `sw.js`/`content.js`/the progress/storage
+  modules. Phase 4 deep recon launched (background research agent): going
+  beyond Phase 1's survey-level findings to catalog the duplicated
+  read/rebuild recipe functions precisely (near-identical vs. genuinely
+  different behavior), assess whether the two parallel WAL-append paths
+  can be unified, categorize the ~90 raw storage-key call sites by whether
+  they have an obvious consolidation target, assess per-test whether the
+  storage-internals-coupled tests could be rewritten behaviorally, and
+  propose 2-3 concrete candidate consolidation designs with tradeoffs.
+  Findings to be folded in below once it completes.
+- 2026-09-10: Phase 4 deep recon complete, findings folded in below
+  ("Phase 4 Findings" section). Recon-only, no code changes. Re-evaluating
+  with user on whether Option C (completing the WAL-append wrapper) is
+  cheap/safe enough to do now, or whether all of Phase 4 stays as pure
+  design input for later, as originally scoped.
+
+## Phase 4 Findings (2026-09-10) — storage-boundary deep recon
+
+**Correction to Phase 1's framing**: the "two parallel WAL-append paths"
+finding doesn't hold up under closer inspection. `createCoordinatorQueueWalStore`
+(`swCoordinatorQueueWal.js`) never calls `appendWalRecordsToGeneration`
+itself — it only wraps the surrounding concerns (defaults, physical-payload
+assembly, metrics). There's one mutation path
+(`persistCoordinatorAuthorityQueueWalMutation`/its batch sibling) that
+necessarily mixes wrapped helpers with a raw primitive call because **the
+wrapper's surface is incomplete, not because two competing paths exist**.
+The real gap: `createCoordinatorQueueWalStore` needs an
+`appendMutation()`/`appendBatchMutation()` method encapsulating the append
+call plus ~150 lines of hard-limit checking, payload building, metrics, and
+post-append replay-verify currently duplicated near-verbatim between the
+single and batch persist functions in `sw.js`.
+
+**The duplicated read/rebuild recipe (Pattern 7's other half)**: 12 named
+functions + 2 unnamed ones in `sw.js` (full catalog with line ranges in the
+recon transcript) share a byte-identical 4-line core recipe (assemble
+defaults → `metricStorageGet` → WAL hydrate → WAL recover), differing only
+in which fields they load. Genuinely consolidation-safe on the data-shape
+axis, but two real behavioral landmines: (1) `closeRuntimeTabsReclaimedByAuthority`
+is a side effect present in only 2 of ~14 sites, not a clean data toggle —
+one call site (`refreshCoordinatorQueueViewForDashboard`) gets it seemingly
+by accident on a dashboard-refresh path; (2) a "prefer resident authority,
+skip storage if already hydrated" shortcut is independently reimplemented
+in two places with different field sets, confirming this pattern
+self-duplicates over time exactly as this whole audit predicts. Consolidation
+risk is entirely in correctly auditing these two flags per call site, not
+in the read logic itself.
+
+**Storage call-site categorization** (~80 real `metricStorageGet`/`Set`
+sites in `sw.js`, close to Phase 1's ~90 estimate): roughly 45% are simple
+single-key reads/writes unrelated to WAL/sharding (fine as direct calls,
+not real leakage), ~35% are "load/save projection" style operations that
+duplicate the recipe above or each other (`saveProfileNukeProgressRowProjection`/
+`deleteProfileNukeProgressRowProjection` share almost their entire
+read-prologue), ~20% are genuinely bespoke one-offs correctly modeled as
+direct calls today. The real consolidation opportunity is concentrated in
+~10 distinct duplicated recipes, not spread across 30 independent sites.
+
+**Test-coupling reassessment**: splits cleanly into two groups, not one
+pile. Group 1 (~12 tests) are genuine unit tests of the storage module's
+own key-derivation/corruption/migration contract — the internal key format
+*is* what they test; leave these alone. Group 2 is incidental key-prefix
+scanning used as a proxy for a behavioral property with no higher-level
+concept to assert against yet (e.g. a "this operation only touched a
+minimal state slice" guarantee, currently only expressible by listing raw
+key names) — these would become clean behavioral assertions "for free" if
+the read-side consolidation introduces an explicit options object to
+assert on instead. One test (`'content-page projection rebuild...'`) is
+purely incidental and could be rewritten today with no loss of intent.
+
+**Three candidate designs, not a recommendation to implement any of them
+now:**
+- **Option A** — one parameterized `loadCoordinatorProjection(options)`
+  replacing all 14 duplicates. Justified by the evidence (the recipe really
+  is uniform) but requires auditing every call site's
+  `reclaimRuntimeTabs`/`preferResidentAuthority` flags correctly — get it
+  wrong and either leak stale tabs or introduce side effects on read-only
+  paths.
+- **Option B** — extract only the proven-common steps (WAL recovery,
+  resident-authority shortcut) as shared helpers, keep the 12 named
+  functions as thin per-site wrappers. Less code reduction, but avoids
+  concentrating the flag-plumbing risk into one function's option surface.
+- **Option C** — complete the `swCoordinatorQueueWal.js` wrapper (the
+  `appendMutation`/`appendBatchMutation` methods from the correction
+  above), independent of A/B. Closest to a pure extraction with an
+  existing test safety net (Group 1's tests already assert on the
+  byte-level outcomes this would preserve) — the agent doing this recon
+  flagged it as the most tractable of the three on its own, without being
+  asked to rank them.
+
+No code changes made at recon time. This is design input for whenever
+Phase 4 is scheduled, per the plan's original framing ("needs its own
+design pass").
+
+## Phase 4, Option C — implemented (2026-09-10)
+
+User approved Option C now, holding Options A and B (the read-side
+consolidation) for later. Implemented as a mechanical, behavior-preserving
+extraction:
+
+- `swCoordinatorQueueWal.js` gained two new functions,
+  `prepareCoordinatorQueueWalAppend(storedWal, records, options)` and
+  `verifyAppendedCoordinatorQueueWalReplay(append)`, encapsulating exactly
+  the two chunks of logic that were byte-for-byte identical between
+  `persistCoordinatorAuthorityQueueWalMutation` and its batch sibling in
+  `sw.js`: the append-primitive call + physical-payload build + hard-limit
+  boolean check, and the post-append replay-verify + ignored-record
+  filtering. Both new functions import `appendWalRecordsToGeneration`/
+  `recoverProjectedState` directly from `./swstorage` (matching this
+  file's existing plain-`require` pattern for storage primitives — no new
+  capability-injection surface needed).
+- Deliberately scoped narrower than "everything" in the recon's
+  description: diagnostic-event recording, metric-name selection, and
+  reconcile/checkpoint-switch scheduling stay in each caller, since those
+  differ in wording ("append" vs "batch append") and metric-name infixes
+  between the two callers — extracting them would have required either
+  threading scheduling capabilities into a currently-pure data module or
+  papering over legitimately-different diagnostic text. The new functions
+  are data-in/data-out; callers still decide what to do with a
+  not-`ok` result.
+- One accepted, called-out side effect: the two callers previously timed
+  the append call and the physical-payload build as two separate metric
+  phases (`queueWalAppendPrepare`, `queueWalPhysicalPayload`); now that
+  they're one function call, both got collapsed under the
+  `queueWalAppendPrepare` label. A minor loss of timing granularity, not a
+  correctness change.
+- Verified two real behavioral asymmetries between the single and batch
+  callers were preserved exactly, not accidentally unified: the single
+  mutation's extra `if(!authoritativeProjectionQueue)` diagnostic-only
+  block (present only in the single-row path) and the batch-only
+  `storageContext.coordinatorAuthorityQueueMutationApplied` side effect
+  and shadow-WAL sync call — none of these were touched.
+- Full `npm run test:parallel` green with no test changes needed at all
+  (including `p1-contract.test.js`'s source-shape assertions on these two
+  functions' call sites, and `swSynthetic.test.js`'s WAL segment/checkpoint
+  tests that exercise this path end-to-end through real message handling)
+  — strong signal the extraction is genuinely behavior-preserving, not
+  just superficially passing. Rebuilt and reloaded as `1.6.1229`, zero
+  manifest/runtime errors, dashboard loads cleanly.
+- Options A and B (the read-side `load*` function consolidation) remain
+  fully deferred, per user decision, with their tradeoffs documented above
+  for whenever that work is picked up.

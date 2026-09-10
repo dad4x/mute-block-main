@@ -2433,12 +2433,12 @@ test('manual failed requeue requests reconcile after durable storage', () => {
     assert.match(retryMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
     assert.match(retryMutationBody, /operationKind: 'retry'/)
     assert.match(retryMutationBody, /removedRows/)
-    assert.match(retryMutationBody, /deleteProfileNukeProgressRowProjection\(Array\.from\(progressProjectionRemovalHrefs\)/)
+    assert.match(retryMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
     assert.match(retryMutationBody, /queueOperation: 'retry-derived'/)
     assert.match(requeueMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
     assert.match(requeueMutationBody, /operationKind: 'requeue'/)
     assert.match(requeueMutationBody, /removedRows/)
-    assert.match(requeueMutationBody, /deleteProfileNukeProgressRowProjection\(Array\.from\(progressProjectionRemovalHrefs\)/)
+    assert.match(requeueMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
     assert.match(requeueMutationBody, /queueOperation: 'requeue-derived'/)
     assert.doesNotMatch(retryMutationBody, /queue: true/)
     assert.doesNotMatch(requeueMutationBody, /queue: true/)
@@ -4954,4 +4954,28 @@ test('stored-work recovery is queue-authority-only and uses alarm-backed earlies
     assert.doesNotMatch(recoverBody, /reconcileCoordinatorStorageBestEffort/)
     assert.doesNotMatch(restoreBody, /if\(!hasStoredCoordinatorWork\(queue\)\)/)
     assert.match(restoreBody, /recoverStoredCoordinatorWork\('coordinator-page-restore'/)
+})
+
+// Entropy-reduction Phase 2 tripwire (see entropy-reduction-action-plan-2026-09-09.md):
+// isExplicitSecurityVerificationRecord is independently declared in both
+// jobState.js and swProfileNukeRecordClassification.js with an identical
+// body rather than one importing it from the other. Nothing enforces they
+// stay in sync -- if a future session edits the security-verification
+// detection regex or field list in one file without the other, the content
+// script and service worker would silently disagree about whether a
+// profile-progress record represents a security-verification interruption.
+// This asserts the two bodies stay textually identical (modulo
+// indentation) so that drift fails loudly here instead of silently.
+test('isExplicitSecurityVerificationRecord stays identical across its two independent declarations', () => {
+    const jobStateBody = extractFunction(
+        readRepoFile('shared/js/jobState.js'),
+        'function isExplicitSecurityVerificationRecord(record = null)'
+    )
+    const classificationBody = extractFunction(
+        readRepoFile('shared/js/swProfileNukeRecordClassification.js'),
+        'function isExplicitSecurityVerificationRecord(record = null)'
+    )
+    const normalize = body => body.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
+
+    assert.equal(normalize(jobStateBody), normalize(classificationBody))
 })
