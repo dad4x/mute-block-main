@@ -106,6 +106,7 @@ function registerServiceWorkerListeners(deps = {}) {
         reconcileCoordinatorStorageBestEffort,
         reconcileReleasedActiveCoordinatorTab,
         recordCoordinatorJobProgressViaQueueMachine,
+        recordDirectProfileProgressFromRequest,
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
@@ -754,6 +755,9 @@ function registerServiceWorkerListeners(deps = {}) {
             return recordJobProgressFromRequest(request, sender, {
                 expectTerminal: true
             })
+        }
+        else if(request.action === 'record-direct-profile-progress') {
+            return recordDirectProfileProgressFromRequest(request)
         }
         else if(request.action === 'clear-profile-nuke-state') {
             return applyCoordinatorQueueMachineEvent({

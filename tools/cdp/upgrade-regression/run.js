@@ -6,7 +6,7 @@ const path = require('path')
 
 const {
     cdpCommand,
-    DEFAULT_REMOTE_CHROME_DEV_PATH,
+    DEFAULT_CHROME_DEV_PATH,
     evaluate,
     getJson,
     getTargets,
@@ -23,7 +23,7 @@ const {
 const DEFAULT_EXTENSION_ID = 'auto'
 const DEFAULT_PROFILE_LABEL = 'dev-current'
 const DEFAULT_HOST = '127.0.0.1'
-const DEFAULT_PORT = 9223
+const DEFAULT_PORT = 9222
 const PHASE1 = 'phase1-non-work-starting-smoke'
 const PHASE2 = 'phase2-content-smoke'
 const PHASE3_SPACE = 'phase3-space-discovery-smoke'
@@ -81,7 +81,7 @@ const PHASE10_SEARCH_FALLBACK_URLS = [
 const DEFAULT_BENIGN_QUORA_URL = 'https://www.quora.com/'
 const DEFAULT_SPACE_MARK_URL = 'https://instantblock.quora.com/'
 const DEFAULT_SPACE_MARK_CATEGORY = 'asset'
-const DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH = DEFAULT_REMOTE_CHROME_DEV_PATH
+const DEFAULT_UNPACKED_EXTENSION_PATH = DEFAULT_CHROME_DEV_PATH
 const PHASE10_HARNESS_WATCHDOG_MS = 180000
 const PHASE10_TARGET_SELECTION_TIMEOUT_MS = 180000
 const PHASE10_FLIGHT_RECORDER_LIMIT = 2000
@@ -123,7 +123,7 @@ const CURRENT_ACTIONS = [
 ]
 
 const OPERATOR_LOAD_UNPACKED_PROMPT =
-    `>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select ${DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH}, and report the listed extension ID/version or the exact visible Chrome error text.`
+    `>>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select ${DEFAULT_UNPACKED_EXTENSION_PATH}, and report the listed extension ID/version or the exact visible Chrome error text.`
 const OPERATOR_QUORA_LOGIN_PROMPT =
     '>>>>>> OPERATOR INTERVENTION: do sign in to Quora in the visible regression Chrome profile, then rerun the requested non-work-starting smoke.'
 
@@ -235,7 +235,7 @@ function parseArgs(argv) {
         host: DEFAULT_HOST,
         port: DEFAULT_PORT,
         extensionId: DEFAULT_EXTENSION_ID,
-        extensionPath: DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH,
+        extensionPath: DEFAULT_UNPACKED_EXTENSION_PATH,
         extensionVersion: '',
         profileLabel: DEFAULT_PROFILE_LABEL,
         writeBaseline: '',
@@ -384,13 +384,13 @@ function parseArgs(argv) {
 function printUsage() {
     console.log([
         'Usage:',
-        '  node tools/cdp/upgrade-regression/run.js --extension-id auto --extension-path "C:\\\\Users\\\\DBROWER\\\\Documents\\\\src\\\\mute-block-main\\\\chrome-dev"',
+        '  node tools/cdp/upgrade-regression/run.js --extension-id auto',
         '',
         'Options:',
         '  --host 127.0.0.1',
-        '  --port 9223',
+        '  --port 9222',
         '  --extension-id auto',
-        `  --extension-path ${DEFAULT_WINDOWS_UNPACKED_EXTENSION_PATH}`,
+        `  --extension-path ${DEFAULT_UNPACKED_EXTENSION_PATH}`,
         '  --extension-version 1.6.x',
         '  --profile-label store-1.4-to-current',
         `  --phase ${SUPPORTED_PHASES.join('|')}`,

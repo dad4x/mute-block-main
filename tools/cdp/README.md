@@ -1,23 +1,44 @@
 # CDP Helper Dictionary
 
-Use these helpers for live Windows Chrome validation through the reverse CDP
-tunnel. Do not regenerate one-off versions in `/tmp` unless a probe is truly
-experimental and not worth preserving.
+Use these helpers for live Chrome validation against a Chrome instance running
+directly on this machine, over its local remote-debugging port. There is no
+tunnel and no separate regression host in this mode: source, browser, and
+CDP endpoint are all local. Do not regenerate one-off versions in `/tmp`
+unless a probe is truly experimental and not worth preserving.
 
 Defaults:
 
-- CDP endpoint: `127.0.0.1:9223`
+- CDP endpoint: `127.0.0.1:9222`
 - Extension id: use `--extension-id auto` for normal live iteration.
-- Dev unpacked path: `C:\Users\DBROWER\Documents\src\mute-block-main\chrome-dev`
-- Manual shell CDP probes must bypass proxy configuration:
-  `timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version`.
-  Plain `curl` can hang even when the tunnel and browser are healthy. The Node
-  CDP helpers use direct `http` calls and are not expected to need this curl
-  flag.
+- Dev unpacked path: `<repo>/chrome-dev`
+- Manual shell CDP probes: `curl -sS http://127.0.0.1:9222/json/version`. The
+  Node CDP helpers use direct `http` calls.
 - Override with `--host`, `--port`, `--extension-id`, `--extension-path`,
   `--extension-version`, or the matching `MB_CDP_HOST`, `MB_CDP_PORT`,
   `MB_EXTENSION_ID`, `MB_EXTENSION_PATH`, `MB_EXTENSION_VERSION` environment
   variables.
+
+## Local Chrome Launch
+
+Build the dev unpacked extension, then launch a local Chrome instance with it
+loaded and CDP listening on `127.0.0.1:9222`:
+
+```bash
+npm run prod
+npm run build:chrome-dev
+npm run launch:chrome-dev
+```
+
+`tools/cdp/launch-local-chrome.sh` starts `google-chrome` with a dedicated
+`--user-data-dir` (so it doesn't disturb your normal logged-in Chrome profile
+or another debug cycle), `--load-extension=chrome-dev`, and
+`--remote-debugging-port=9222`. It is persistent by default
+(`~/.local/share/mute-block-chrome-dev-profile`); override with `MB_CHROME_PROFILE`,
+`MB_CDP_PORT`, `MB_CHROME_BIN`, or `MB_EXTENSION_PATH`. A fresh profile needs a
+one-time manual Quora login before authenticated regression phases can run.
+
+Leave that Chrome instance running in its own terminal/background job; drive
+it from the CDP helpers below in separate commands.
 
 ## Dev-Unpacked Live Loop
 
@@ -26,16 +47,8 @@ store-keyed `nlmmkoljofpgbmlcojebolmniineboah` ID. The dev output is generated
 from `chrome/` with the manifest `key` stripped, so Chrome assigns a separate
 unpacked extension ID that can be discovered and reloaded by path/version.
 
-Build and copy the dev unpacked directory:
-
-```bash
-npm run prod
-npm run build:chrome-dev
-npm run sync:chrome-dev
-```
-
-First-time setup still requires loading `chrome-dev` once from the visible
-Chrome extensions page. After that, reload and discovery are scripted:
+Reload and discovery are scripted once Chrome is running with `chrome-dev`
+loaded (see Local Chrome Launch above):
 
 ```bash
 npm run reload:chrome-dev
@@ -67,7 +80,8 @@ node tools/cdp/upgrade-regression/run.js \
   --allow-work-producing
 ```
 
-Or run the build/copy/reload/phase sequence as one repo-local helper:
+Or run the build/reload/phase sequence as one repo-local helper (Chrome must
+already be running with `chrome-dev` loaded):
 
 ```bash
 node tools/cdp/live-test-loop.js \
@@ -78,122 +92,19 @@ node tools/cdp/live-test-loop.js \
 
 Use the keyed store ID only for explicit store/distribution upgrade tests.
 
-## Windows Chrome Profile Launcher
+## Keyed Store-Build Upgrade Testing
 
-Use `tools/cdp/windows-chrome-profile.js` when a test needs a fresh or
-controlled Windows Chrome profile behind Cygwin SSH. It avoids PowerShell and
-uses remote `cmd.exe` only.
+Testing the keyed Chrome Web Store extension id
+(`nlmmkoljofpgbmlcojebolmniineboah`) instead of the dev-unpacked id needs a
+manually loaded `chrome/` build, since that id is store-registered and
+`chrome://extensions` Update can silently replace it with the latest published
+store version instead of your local build. Launch Chrome (see Local Chrome
+Launch above, pointing `MB_EXTENSION_PATH` at `chrome/` if you want the
+launcher to preload it), then in the visible browser:
 
-Launch a new disposable profile on the Windows host:
-
-```bash
-node tools/cdp/windows-chrome-profile.js \
-  --ssh USER@WINDOWS_HOST \
-  --remote-port 9224 \
-  --local-port 9224 \
-  --new-profile
-```
-
-Then keep the CDP tunnel open as a separate command:
-
-```bash
-ssh -N -L 9224:127.0.0.1:9224 USER@WINDOWS_HOST
-```
-
-Check the local endpoint:
-
-```bash
-timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9224/json/version
-```
-
-To reuse an existing Windows profile, pass its user-data-dir:
-
-```bash
-node tools/cdp/windows-chrome-profile.js \
-  --ssh USER@WINDOWS_HOST \
-  --remote-port 9224 \
-  --profile-dir 'C:\Users\DBROWER\AppData\Local\Temp\mb-existing-profile'
-```
-
-By default, the launcher kills only the listener on the requested remote debug
-port before starting Chrome. Add repeated `--kill-port PORT` options to clear
-other known debug ports. A new disposable profile needs a fresh Quora login
-before authenticated Quora tests can run.
-
-### DBROWER-X40-J Regression Browser
-
-The current Windows laptop setup has two separate tunnels:
-
-- CDP reverse tunnel: local `127.0.0.1:9223` reaches laptop Chrome
-  `127.0.0.1:9222`.
-- SSH/copy tunnel: local `127.0.0.1:10022` reaches laptop SSH port `22`.
-
-Codex agents have standing permission to use the established tunneled SSH
-route for this repo's live-browser workflow. Do not ask again before running
-bounded `ssh` or `rsync` commands through `127.0.0.1:10022` to inspect the
-Windows regression browser state, clean stale delivery directories, or copy the
-rebuilt unpacked extension into the canonical Windows delivery path.
-
-Use the current logged-in debug profile when the regression needs existing
-Quora authentication:
-
-```text
-C:\Users\DBROWER\AppData\Local\Temp\mb-chrome-debug
-```
-
-Use a fresh profile only for clean upgrade/install tests. A fresh profile will
-not be logged in to Quora; authenticate it manually before running any
-regression phase that needs Quora pages or account state.
-
-Plain SSH launches can create an invisible Windows session-0 Chrome. For a
-visible regression browser, launch through the logged-in desktop session. Check
-the active console session first:
-
-```bash
-ssh -F /home/dbrower/.ssh/config -p 10022 -o BatchMode=yes \
-  'DBROWER-X40-J+DBROWER@127.0.0.1' \
-  'cmd.exe /d /c query user'
-```
-
-The expected visible browser process is in Windows Console session `1`. A
-debug-profile Chrome in Services/session `0` is a stale invisible launch and
-should not be used for regression.
-
-For the keyed current Chrome build, use a load-only launch. Do not add
-`--disable-extensions-except`; in the managed Chrome environment it can hide
-the normal extension registry and make Web Store installs report that
-installation is not allowed. The known-good pattern is:
-
-1. Write a temporary `.cmd` on the laptop that starts Chrome with:
-   - `--user-data-dir=<profile>`
-   - `--remote-debugging-address=127.0.0.1`
-   - `--remote-debugging-port=9222`
-   - `--load-extension=<unpacked chrome build>`
-2. Run that `.cmd` via an interactive scheduled task:
-
-```bash
-ssh -F /home/dbrower/.ssh/config -p 10022 -o BatchMode=yes \
-  'DBROWER-X40-J+DBROWER@127.0.0.1' \
-  'cmd.exe /d /c "schtasks /Create /TN MBChromeDebug /SC ONCE /ST 23:59 /TR C:\Users\DBROWER\AppData\Local\Temp\mb-launch-debug.cmd /F /IT && schtasks /Run /TN MBChromeDebug"'
-```
-
-Then verify CDP locally:
-
-```bash
-timeout 10 curl --noproxy '*' -sS http://127.0.0.1:9223/json/version
-```
-
-Command-line `--load-extension` may not register the unpacked Mute Block build
-by itself. If `chrome.developerPrivate.getExtensionsInfo()` or `/json/list`
-does not show a live service worker for
-`chrome-extension://nlmmkoljofpgbmlcojebolmniineboah/`, use the visible browser
-UI:
-
-```text
->>>>>> OPERATOR INTERVENTION: do open chrome://extensions, enable Developer mode, click Load unpacked, select C:\Users\DBROWER\Documents\src\mute-block-main\chrome, and report the listed extension ID/version or the exact visible Chrome error text.
-```
-
-After manual load, verify that Mute Block is listed with:
+1. Open `chrome://extensions`, enable Developer mode.
+2. Click `Load unpacked`, select the repo's `chrome/` directory.
+3. Verify Mute Block is listed with:
 
 - id: `nlmmkoljofpgbmlcojebolmniineboah`
 - version: the current repo build
@@ -222,7 +133,7 @@ node tools/cdp/upgrade-regression/run.js \
 
 For the keyed Chrome Web Store upgrade profile, the known-good sequence is:
 
-1. Launch visible Windows session-1 Chrome with `--load-extension` only.
+1. Launch local Chrome with `--load-extension` only.
 2. If command-line load does not register Mute Block, use manual
    `chrome://extensions` Developer mode -> Load unpacked.
 3. Verify the post-load extension registry:
@@ -322,12 +233,11 @@ For small literal source edits where apply_patch is unavailable, use npm run dev
 | Script | Purpose | Typical command |
 | --- | --- | --- |
 | `tools/build-chrome-dev.js` | Generate `chrome-dev/` from `chrome/` with the manifest key stripped for a separate unpacked dev ID. | `npm run build:chrome-dev` |
-| `tools/cdp/sync-windows-build.js` | Copy `chrome-dev/` to the Windows regression machine through the SSH tunnel, with bounded rsync and fallback copy. | `npm run sync:chrome-dev` |
-| `tools/cdp/reload-windows-extension.js` | Discover the loaded unpacked dev extension by path/version and reload it through `chrome.developerPrivate.reload`. | `npm run reload:chrome-dev` |
-| `tools/cdp/reset-windows-tabs.js` | Keep `chrome://extensions/` plus an existing dashboard for the dev extension and close search/profile/other page tabs. Does not create the dashboard. | `npm run reset:chrome-dev-tabs` |
-| `tools/cdp/live-test-loop.js` | Build, sync, reload, reset tabs, discover ID, and optionally run one regression phase against the dev extension. | `node tools/cdp/live-test-loop.js --phase phase5-dashboard-readonly-authority-smoke` |
-| `tools/cdp/windows-chrome-profile.js` | Stop an existing Windows Chrome/CDP listener on selected debug ports and launch Windows Chrome through Cygwin SSH with either a disposable or existing profile. Prints the separate `ssh -N -L` tunnel command. | `node tools/cdp/windows-chrome-profile.js --ssh USER@WINDOWS_HOST --remote-port 9224 --new-profile` |
-| `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. Prefer `reload-windows-extension.js` for the dev loop. | `node tools/cdp/reload-extension.js --extension-id auto` |
+| `tools/cdp/launch-local-chrome.sh` | Launch local Chrome with a dedicated profile, the dev unpacked extension loaded, and CDP on `127.0.0.1:9222`. | `npm run launch:chrome-dev` |
+| `tools/cdp/reload-chrome-dev.js` | Discover the loaded unpacked dev extension by path/version and reload it through `chrome.developerPrivate.reload`. | `npm run reload:chrome-dev` |
+| `tools/cdp/reset-chrome-dev-tabs.js` | Keep `chrome://extensions/` plus an existing dashboard for the dev extension and close search/profile/other page tabs. Does not create the dashboard. | `npm run reset:chrome-dev-tabs` |
+| `tools/cdp/live-test-loop.js` | Build, reload, reset tabs, discover ID, and optionally run one regression phase against the dev extension. | `node tools/cdp/live-test-loop.js --phase phase5-dashboard-readonly-authority-smoke` |
+| `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. Prefer `reload-chrome-dev.js` for the dev loop. | `node tools/cdp/reload-extension.js --extension-id auto` |
 | `tools/cdp/space-summary.js` | Summarize all open Quora space tabs and service-worker space/queue state. | `node tools/cdp/space-summary.js` |
 | `tools/cdp/reload-space-tabs.js` | Reload all open Quora space tabs without creating new tabs. | `node tools/cdp/reload-space-tabs.js` |
 | `tools/cdp/inspect-space-state.js` | Inspect one space by URL/title substring, including source-page controls, pending post records, queue rows, and worker ownership. | `node tools/cdp/inspect-space-state.js --needle theobvioustrollshootinggallery` |

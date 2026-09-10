@@ -34,6 +34,8 @@ class StripArchitectureCommentsPlugin {
     }
 }
 
+mix.disableNotifications()
+
 mix.options({
     terser: {
         extractComments: false,

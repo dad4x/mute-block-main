@@ -2,9 +2,9 @@ const http = require('http')
 const path = require('path')
 
 const DEFAULT_HOST = '127.0.0.1'
-const DEFAULT_PORT = 9223
+const DEFAULT_PORT = 9222
 const DEFAULT_EXTENSION_ID = 'ajcjckiafbnhioeafaejlaehkmdcdeha'
-const DEFAULT_REMOTE_CHROME_DEV_PATH = 'C:\\Users\\DBROWER\\Documents\\src\\mute-block-main\\chrome-dev'
+const DEFAULT_CHROME_DEV_PATH = path.resolve(__dirname, '..', '..', '..', 'chrome-dev')
 
 function getOption(name, fallback = '') {
     const prefix = `--${name}=`
@@ -120,7 +120,7 @@ async function resolveExtensionId(config = getCdpConfig(), options = {}) {
 
     const normalizedConfig = {
         ...config,
-        extensionPath: config.extensionPath || options.extensionPath || DEFAULT_REMOTE_CHROME_DEV_PATH,
+        extensionPath: config.extensionPath || options.extensionPath || DEFAULT_CHROME_DEV_PATH,
         extensionVersion: config.extensionVersion || options.extensionVersion || ''
     }
     const extensions = await getInstalledExtensions(normalizedConfig)
@@ -141,7 +141,7 @@ async function resolveExtensionId(config = getCdpConfig(), options = {}) {
 async function resolveCdpConfig(config = getCdpConfig(), options = {}) {
     if(config.extensionId && config.extensionId !== 'auto') return config
 
-    const extensionPath = config.extensionPath || options.extensionPath || DEFAULT_REMOTE_CHROME_DEV_PATH
+    const extensionPath = config.extensionPath || options.extensionPath || DEFAULT_CHROME_DEV_PATH
     const extensionVersion = config.extensionVersion || options.extensionVersion || ''
     const extensionId = await resolveExtensionId({
         ...config,
@@ -403,7 +403,7 @@ async function runMain(main) {
 
 module.exports = {
     DEFAULT_EXTENSION_ID,
-    DEFAULT_REMOTE_CHROME_DEV_PATH,
+    DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
     cdpGet,
     evaluate,

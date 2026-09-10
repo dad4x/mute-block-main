@@ -4,20 +4,33 @@ const {
     evaluate,
     getCdpConfig,
     getTargets,
+    sleep,
     runMain
 } = require('./lib/cdp')
 
-runMain(async () => {
-    const config = getCdpConfig()
+const MAX_ATTEMPTS = 4
+const RETRY_DELAY_MS = 1500
+
+async function readPausedFlag(config) {
+    const targets = await getTargets(config)
+    const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
+    const target = targets.find(candidate => candidate.type === 'page' && candidate.url === dashboardUrl) ||
+        targets.find(candidate => candidate.type === 'service_worker' && (candidate.url || '').includes(config.extensionId))
+    if(!target) return null
+
+    return evaluate(target.webSocketDebuggerUrl, `new Promise(resolve => {
+        chrome.storage.local.get({mbCoordinatorPaused: false}, stored => resolve(!!stored?.mbCoordinatorPaused))
+    })`, 15000).catch(() => null)
+}
+
+async function attemptResume(config) {
     const targets = await getTargets(config)
     const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
     const serviceWorker = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))
     const dashboard = targets.find(target => target.type === 'page' && target.url === dashboardUrl)
     const target = serviceWorker || dashboard
     if(!target) {
-        console.log(JSON.stringify({dashboard: false, serviceWorker: false}, null, 2))
-        process.exitCode = 1
-        return
+        return {dashboard: !!dashboard, serviceWorker: !!serviceWorker, ok: false}
     }
 
     const result = await evaluate(target.webSocketDebuggerUrl, `new Promise(resolve => {
@@ -28,48 +41,12 @@ runMain(async () => {
             settled = true
             resolve(value)
         }
-        const scheduleAlarmFallback = (lastError = '', options = {}) => {
-            if(typeof chrome?.alarms?.create !== 'function') return false
-
-            const schedule = () => {
-                const done = () => finish({
-                    action: options.clearPause ? 'service-worker-resume-paused-storage-alarm' : 'service-worker-resume-alarm',
-                    response: {scheduled: true, clearedPause: !!options.clearPause},
-                    lastError
-                })
-                try {
-                    const result = chrome.alarms.create('mb-coordinator-resume', {when: Date.now() + 500})
-                    if(result && typeof result.then === 'function') {
-                        result.then(done).catch(done)
-                    }
-                    else {
-                        done()
-                    }
-                }
-                catch {
-                    done()
-                }
-            }
-            schedule()
-            return true
-        }
         const sendResumeMessage = action => {
             chrome.runtime.sendMessage({action}, response => {
                 const lastError = chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
-                if(response || !lastError) {
-                    finish({
-                        action,
-                        response: response || null,
-                        lastError
-                    })
-                    return
-                }
-
-                if(scheduleAlarmFallback(lastError, {clearPause: action === 'resume-paused-coordinator-nukes'})) return
-
                 finish({
                     action,
-                    response: null,
+                    response: response || null,
                     lastError
                 })
             })
@@ -78,9 +55,8 @@ runMain(async () => {
             const action = paused
                 ? 'resume-paused-coordinator-nukes'
                 : 'resume-coordinator-queue'
-            const fallbackMs = allowDirectServiceWorkerCall ? 65000 : 5000
+            const fallbackMs = allowDirectServiceWorkerCall ? 20000 : 8000
             setTimeout(() => {
-                if(scheduleAlarmFallback('resume message did not receive a callback', {clearPause: paused})) return
                 finish({
                     action,
                     response: null,
@@ -161,6 +137,45 @@ runMain(async () => {
         }
         readPaused()
             return
-    })`, 70000)
-    console.log(JSON.stringify(result, null, 2))
+    })`, 25000)
+
+    return {...result, ok: true}
+}
+
+runMain(async () => {
+    const config = getCdpConfig()
+
+    // resumePausedCoordinatorNukes()/resume-coordinator-queue both go
+    // through the same "click Resume in the dashboard" code path when
+    // called directly against a live service worker, but under load the
+    // service worker can go idle again between our attempt and its
+    // response (a plain content-script/page-side chrome.runtime.sendMessage
+    // has no reliable way to force it to stay awake). Rather than trust the
+    // browser-side script's own optimistic response -- it previously
+    // reported clearedPause:true from a raw chrome.alarms.create() fallback
+    // that bypasses the service worker's own alarm-staleness bookkeeping in
+    // swSchedulerAlarmBookkeeping.js and can be silently suppressed as a
+    // stale alarm -- verify the persisted mbCoordinatorPaused flag directly
+    // after each attempt and retry with fresh target discovery (the service
+    // worker may have gone from asleep to awake, or vice versa, between
+    // attempts) until it's actually confirmed cleared.
+    let lastResult = null
+    for(let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+        lastResult = await attemptResume(config).catch(error => ({
+            ok: false,
+            error: error?.message || String(error || '')
+        }))
+
+        await sleep(500)
+        const stillPaused = await readPausedFlag(config)
+        if(stillPaused === false) {
+            console.log(JSON.stringify({...lastResult, verifiedPaused: false, attempts: attempt}, null, 2))
+            return
+        }
+
+        if(attempt < MAX_ATTEMPTS) await sleep(RETRY_DELAY_MS)
+    }
+
+    console.log(JSON.stringify({...lastResult, verifiedPaused: true, attempts: MAX_ATTEMPTS}, null, 2))
+    process.exitCode = 1
 })

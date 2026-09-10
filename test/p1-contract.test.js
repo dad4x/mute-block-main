@@ -38,7 +38,7 @@ function listRepoTextFiles(relativeRoots = [], options = {}) {
         const stat = fs.statSync(absolutePath)
         if(stat.isDirectory()) {
             for(const entry of fs.readdirSync(absolutePath).sort()) {
-                walk(path.join(relativePath, entry))
+                walk(relativePath ? `${relativePath}/${entry}` : entry)
             }
             return
         }
@@ -336,6 +336,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'pause-owner-nukes',
         'promote-queued-tab',
         'reconcile-coordinator-storage',
+        'record-direct-profile-progress',
         'record-job-milestone',
         'record-job-terminal',
         'refresh-coordinator-queue-view',
@@ -4156,7 +4157,13 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(cancelBody, /coordinatorPauseRequested = true/)
     assert.match(cancelBody, /setCoordinatorPauseControlState\(true, pauseGeneration, 'ordinaryMutation'\)/)
     assert.match(cancelBody, /shouldContinueSync: \(\) => isCoordinatorPauseGenerationLocallyCurrent\(pauseGeneration\)/)
-    assert.doesNotMatch(cancelBody, /setCoordinatorPauseControlState\(false, pauseGeneration, 'ordinaryMutation'\)/)
+    // Cancel Queue stops the *current* work; it should not leave the
+    // coordinator indefinitely unable to pick up anything new afterward.
+    // The pause set above is only a teardown-safety guard for the duration
+    // of the cancel itself (so a resume/new-queue race can't sneak in
+    // mid-teardown) -- it's cleared again once the cancel finishes, on
+    // every exit path including failure.
+    assert.match(cancelBody, /setCoordinatorPauseControlState\(false, pauseGeneration, 'ordinaryMutation'\)/)
     assert.match(resumeBody, /COORDINATOR_PAUSED_KEY/)
     assert.match(storedPausedOutcomeBody, /reason: 'coordinator-paused'/)
 })
@@ -4705,17 +4712,25 @@ test('legacy profile progress writes are deleted from service-worker progress pa
 test('terminal settlement separates authority stamping from derived materialization', () => {
     const source = readRepoFile('shared/js/sw.js')
     const settlementBody = extractFunction(source, 'async function settleTerminalCoordinatorItemsLocked(options = {})')
-    const authorityBody = extractFunction(source, 'async function applyTerminalCoordinatorAuthoritySettlementLocked(options = {})')
     const derivedBody = extractFunction(readRepoFile('shared/js/swCoordinatorTerminalSettlement.js'), 'function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {})')
 
-    assert.match(settlementBody, /applyTerminalCoordinatorAuthoritySettlementLocked\(\{[\s\S]*settlementKey,[\s\S]*sourceSettlementOutcome,[\s\S]*currentAuthorityState/)
+    // Terminal settlement stages every qualifying row's mutation in memory
+    // and persists them all in one batched WAL write
+    // (persistCoordinatorAuthorityQueueWalBatchMutation) instead of one
+    // applyWithinStorageUpdate round-trip per row -- the latter measured as
+    // a multi-second-per-row cost on a large batch during live testing
+    // (2026-09-09), since each row was its own separate storage read/write
+    // cycle. There's no dedicated per-row authority-apply function anymore;
+    // the mutation and its guard checks are inline in the loop below.
+    assert.doesNotMatch(source, /async function applyTerminalCoordinatorAuthoritySettlementLocked/)
+    assert.match(settlementBody, /const settlementResults = \[\]/)
+    assert.match(settlementBody, /const nextQueueForSettlement = \{\.\.\.queue\}/)
+    assert.match(settlementBody, /makeCoordinatorAuthorityApplyResult\(\{[\s\S]*operationKind: 'terminal-settlement',[\s\S]*rowKey: itemKey/)
+    assert.match(settlementBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(\s*settlementResults,\s*nextProjection/)
     assert.match(settlementBody, /buildTerminalCoordinatorSettlementDerivedPayload\(stored, progress, \{[\s\S]*confirmedHrefs,[\s\S]*clearedHrefs,[\s\S]*progressChanged/)
     assert.match(settlementBody, /getProfileNukeProgressProjectionDefaults\(requestedHrefs\)/)
     assert.match(settlementBody, /getProfileNukeProgressRecordsFromProjection\(stored, requestedHrefs\)/)
     assert.doesNotMatch(settlementBody, /PROFILE_NUKE_PROGRESS_KEY|getProfileNukeProgressRecordsFromStorage/)
-    assert.match(authorityBody, /coordinatorAuthority\.applyWithinStorageUpdate/)
-    assert.match(authorityBody, /operationKind: 'terminal-settlement'/)
-    assert.doesNotMatch(authorityBody, /SPACE_PENDING_NUKED_POSTS_KEY|SPACE_NUKED_POSTS_KEY|PROFILE_NUKE_PROGRESS_KEY|metricStorageSet/)
     assert.match(derivedBody, /SPACE_PENDING_NUKED_POSTS_KEY/)
     assert.match(derivedBody, /SPACE_NUKED_POSTS_KEY/)
     assert.match(derivedBody, /progressRecords/)

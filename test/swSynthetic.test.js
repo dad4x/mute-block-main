@@ -1457,7 +1457,7 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
                 [runId]: {
                     id: runId,
                     sourceType: 'space-feed',
-                    status: 'active',
+                    status: 'running',
                     targetProfileHrefs: [hrefA, hrefB, hrefDone],
                     targetWorkKeys: [hrefA, hrefB, hrefDone]
                 }
@@ -1475,8 +1475,8 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
     }), timers)
 
     assert.equal(result.canceledUrls.length, 2)
-    assert.equal(result.paused, true)
-    assert.equal(storage.mbCoordinatorPaused, true)
+    assert.equal(result.paused, false)
+    assert.equal(storage.mbCoordinatorPaused, false)
     assert.equal(result.canceledUrls.includes(hrefA), true)
     assert.equal(result.canceledUrls.includes(hrefB), true)
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
@@ -1504,7 +1504,7 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
         awaitFill: true,
         reason: 'synthetic-after-cancel-resume'
     })
-    assert.equal(resume.reason, 'coordinator-paused')
+    assert.equal(resume.reason, 'no-pending-items')
 })
 
 test('queue accounting audit explains raw WAL drift without writing storage', async () => {
@@ -2230,7 +2230,7 @@ test('runs paused update uses queue-runs projection without loading progress', a
     const result = await sw.setCoordinatorRunsPaused(false)
 
     assert.equal(result.changed, true)
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'active')
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
     assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false)
@@ -2284,7 +2284,7 @@ test('runs paused update failure schedules reconcile without throwing', async ()
     const reconcileResult = await sw.reconcileCoordinatorStorage()
 
     assert.equal(reconcileResult.runsChanged, true)
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'active')
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
     assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
 })
 
@@ -4679,7 +4679,12 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     const nextSeqBeforeCheckpoint = getStoredCoordinatorQueueWal(storage).meta.nextSeq
     assert.equal(nextSeqBeforeCheckpoint, checkpointedRecordCount + 1)
     const oldActiveGeneration = getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
-    const oldSegmentKeys = [0, 1, 2, 3].map(segmentNo =>
+    // 3 segments, not 4: the 2 terminal-progress rows still append separately
+    // (one segment each), but terminal settlement now batches all qualifying
+    // rows into a single persistCoordinatorAuthorityQueueWalBatchMutation
+    // call -- one segment holding both settlement records, instead of one
+    // segment per record.
+    const oldSegmentKeys = [0, 1, 2].map(segmentNo =>
         getSegmentedWalSegmentKey('mbCoordinatorQueueWal', oldActiveGeneration, segmentNo))
     assert.equal(oldSegmentKeys.every(key => Object.prototype.hasOwnProperty.call(storage, key)), true)
     storage.mbCoordinatorQueueWal = getStoredCoordinatorQueueWal(storage)
@@ -7139,7 +7144,7 @@ test('terminal progress projection save recomputes runs from WAL authority over 
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
 
     await waitFor(
-        () => storage.mbCoordinatorRuns[runId]?.status === 'complete',
+        () => storage.mbCoordinatorRuns[runId]?.status === 'empty',
         'terminal progress projection save did not recompute runs from WAL authority',
         {attempts: 40}
     )
@@ -7467,9 +7472,20 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href], undefined)
     assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
-    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
-    assert.equal(sw.state().profileNukeProgress[href], undefined)
+    // clearProfileNukeState tombstones rather than deletes the row (a blank
+    // record with a fresh clearedAt/directProgressClientUpdatedAt), so the
+    // service worker's out-of-order-write guard has something durable to
+    // compare a straggling checkpoint write against -- see
+    // recordDirectProfileProgressFromRequest.
+    assert.ok(storage.mbProfileNukeProgressView.records[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
+    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
+    const clearedShardRecord = getProgressShardRecord(storage, href)
+    assert.ok(clearedShardRecord)
+    assert.equal(clearedShardRecord.status, '')
+    assert.ok(clearedShardRecord.clearedAt > 0)
+    assert.ok(sw.state().profileNukeProgress[href])
+    assert.ok(sw.state().profileNukeProgress[href].clearedAt > 0)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
     assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
@@ -7583,8 +7599,19 @@ test('clear profile state derived failure materializes cleanup without resurrect
     assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
-    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
+    // The injected failure only targets the combined runs/pending/nuked
+    // "derived" payload -- the progress tombstone is a separate save
+    // (saveProfileNukeProgressRowProjection) that isn't part of that
+    // payload, so it still succeeds independently. See the sibling "clear
+    // profile state derived failure" comment above for why this is a
+    // tombstone rather than an absent record.
+    assert.ok(storage.mbProfileNukeProgressView.records[href])
+    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
+    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
+    const derivedFailureShardRecord = getProgressShardRecord(storage, href)
+    assert.ok(derivedFailureShardRecord)
+    assert.equal(derivedFailureShardRecord.status, '')
+    assert.ok(derivedFailureShardRecord.clearedAt > 0)
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
     assert.ok(storage.mbSpacePendingNukedPosts[postKey])
@@ -11205,7 +11232,7 @@ test('key-only terminalization derived failure does not poison authority termina
         storage.mbCoordinatorEvents.some(event => event?.itemId === key && event?.details?.coordinatorKey === key),
         true
     )
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'complete')
+    assert.equal(storage.mbCoordinatorRuns[runId].status, 'empty')
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
 })
 
