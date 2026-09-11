@@ -23,6 +23,7 @@ const {
     getActionKindForRequestedAction,
     getExecutorTabActionForActionKind,
     getQueueItemExecutorTabAction,
+    isExplicitSecurityVerificationRecord: isExplicitSecurityVerificationRecordFromJobState,
     isRetryableJobFailure,
     isRetryableJobFailureFromProgress,
     isTerminalJobStatus,
@@ -914,10 +915,16 @@ const {
 // scope; a `const` destructured from a factory call is in the temporal
 // dead zone until that line executes -- so this module must construct
 // before the earliest of those eager references, i.e. before
-// coordinatorRuns. UNBLOCK_UNMUTE_ACTION_KIND (top-of-file jobState.js
-// require), isActiveCoordinatorStatus/isCoordinatorQueueAuthoritativeItem
-// (coordinatorStatusRules), and normalizeTabId (tabIdUtils, just above)
-// are all already available bare consts by this point.
+// coordinatorRuns. UNBLOCK_UNMUTE_ACTION_KIND and
+// isExplicitSecurityVerificationRecordFromJobState (top-of-file jobState.js
+// require -- aliased on import since this module's own
+// isExplicitSecurityVerificationRecord export, destructured below, already
+// occupies that name in this scope; see entropy-reduction-action-plan-2026-09-09.md's
+// Pattern 6 for why this module now sources the function from jobState.js
+// instead of keeping an independent duplicate), isActiveCoordinatorStatus/
+// isCoordinatorQueueAuthoritativeItem (coordinatorStatusRules), and
+// normalizeTabId (tabIdUtils, just above) are all already available bare
+// consts by this point.
 // hasMismatchedCoordinatorAttempt (coordinatorAttemptIdentity, constructed
 // further below still) is not available yet, so it's threaded through as
 // a thunk. See swProfileNukeRecordClassification.js's header comment for
@@ -930,7 +937,8 @@ const profileNukeRecordClassification = createProfileNukeRecordClassification({
         isActiveCoordinatorStatus,
         isCoordinatorQueueAuthoritativeItem,
         hasMismatchedCoordinatorAttempt: (...args) => hasMismatchedCoordinatorAttempt(...args),
-        normalizeTabId
+        normalizeTabId,
+        isExplicitSecurityVerificationRecord: isExplicitSecurityVerificationRecordFromJobState
     }
 })
 const {
