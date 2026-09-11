@@ -505,3 +505,93 @@ extraction:
 - Options A and B (the read-side `load*` function consolidation) remain
   fully deferred, per user decision, with their tradeoffs documented above
   for whenever that work is picked up.
+
+## Phase 6 (2026-09-10) — beyond the original 5-phase plan
+
+No Phase 6 existed in the original plan; user asked to look past Phase 5.
+Rather than invent one unprompted, presented candidates and got direction
+on three:
+
+1. **Deduplicated `isExplicitSecurityVerificationRecord`** (Pattern 6's
+   remaining instance). It was tripwire-guarded in Phase 2, not yet fixed
+   at the source. Now a single implementation in `jobState.js`, threaded
+   into `swProfileNukeRecordClassification.js` via `deps.handlers`
+   (imported into `sw.js` under an alias,
+   `isExplicitSecurityVerificationRecordFromJobState`, since that module's
+   own re-export of the unaliased name already occupies it in `sw.js`'s
+   scope) and re-exported unchanged so no existing `sw.js` call site
+   needed to change. The now-obsolete Phase 2 tripwire (which compared two
+   independent function bodies) was replaced with a test asserting the
+   duplication doesn't come back — the body should exist in `jobState.js`
+   only, and the classification module should source it from
+   `deps.handlers`. Full test suite green, rebuilt/reloaded as `1.6.1230`,
+   zero runtime errors.
+2. **Extending the audit's file coverage** to `coordinator.js` (the
+   dashboard UI) and `popup.js`, which Phase 1's three tasks never looked
+   at for any of the 8 named patterns. Recon complete, no code changes.
+   Patterns 0, 1, 2, 5: none found — clean on those. Notable findings on
+   the rest:
+   - **Pattern 3, a visible symptom of an already-tracked gap**:
+     `coordinator.js`'s `getQueueActionLabel` falls through to `'Mute
+     Block'` when `actionKind` is blank — meaning the content.js
+     "already-unblocked, just unmute" `actionKind`-never-set gap (fixed
+     earlier tonight for the *persisted record*, but this dashboard code
+     reads the same blank field) can render a reverse/unblock-unmute queue
+     item mislabeled as "Mute Block" in the UI.
+   - **Pattern 4**: two full-map storage overwrites in `popup.js`
+     (`clearNukedPosts`, `updateSpaceCategory`) race independent
+     read-merge-write cycles `sw.js` does on the same keys — medium and
+     low risk respectively, narrow windows, not yet observed live.
+   - **Pattern 6, confirmed drift (same severity class as the two already
+     fixed tonight)**: `coordinator.js`'s own
+     `isTerminalQueueStatus`/`isActiveQueueItem`/`isPendingQueueStatus`
+     independently reimplement `swCoordinatorStatusRules.js`'s canonical
+     versions, and coordinator.js's terminal-status list includes
+     `'complete'` where the canonical `TERMINAL_JOB_STATUSES` doesn't —
+     currently harmless (nothing actually emits `'complete'` in this
+     pipeline) but proof the lists aren't kept in sync, feeding almost
+     every render/control-sync function in the file. Also:
+     `isRetryableFailedQueueItem` (coordinator.js) near-duplicates
+     `isRetryableJobFailure` (jobState.js) with a whitespace-trim
+     difference; `RETRY_FAILED_LIMIT = 2` duplicates a scattered literal
+     default used in three places in `sw.js`; six storage-key constants
+     duplicate `swdashboard.js`/`swprefs.js`'s canonical ones (currently in
+     sync, lower risk). None fixed in this pass — same "needs the same
+     import-instead-of-duplicate treatment already proven twice tonight"
+     shape, just not yet applied here.
+   - **Pattern 8**: `coordinator.js` has ten scattered inline
+     `10000`/`5000` timeout literals across `sendRuntimeMessageWithTimeout`
+     call sites, inconsistent with this *same file* already promoting
+     other timeouts (`COORDINATOR_RESUME_INTERVAL_MS`,
+     `CURRENT_WORK_MUTATION_TIMEOUT_MS`) to named constants.
+3. **Making Phase 5 enforceable**, not just a doc pointer a future session
+   might not read. Added a new, generic `p1-contract.test.js` test scanning
+   `content.js`/`sw.js`/`jobState.js` for `SCREAMING_SNAKE_CASE` string
+   constants declared as a literal in more than one file — unlike the two
+   hand-written Pattern-6 tripwires earlier this session, this one doesn't
+   need to know about any specific constant in advance, so it catches
+   *new* duplication automatically. **Validated hard by immediately finding
+   4 real, previously-unnoticed pre-existing instances** on its first run:
+   `SERVICE_WORKER_QUEUE_OWNER_ID` (`'service-worker-queue-owner'`),
+   `QUEUED_PROFILE_RESOLUTION_MODE` (`'author-profile'`),
+   `SPACE_PENDING_NUKED_POSTS_KEY` (`'mbSpacePendingNukedPosts'`), and
+   `PROFILE_NUKE_PROGRESS_VIEW_KEY` (`'mbProfileNukeProgressView'`), each
+   independently declared in both `content.js` and `sw.js`. Not fixed in
+   this pass — unlike the two constants fixed earlier tonight,
+   `content.js` and `sw.js` don't already share a common module that owns
+   these values (`jobState.js` was a ready-made home for the earlier two;
+   these four would need a new or different shared home, a small design
+   decision rather than a one-line import swap). Allowlisted by value in
+   the new test (with a comment pointing here) so the test still catches
+   any further-new duplicate while these four remain open. **Follow-up
+   candidate for a future pass**: pick or create a shared constants module
+   both files import from, and dedupe these four the same way
+   `UNBLOCK_UNMUTE_ACTION_KIND`/`TRANSIENT_PROGRESS_STATUSES` were fixed
+   earlier tonight.
+
+Commit hygiene note: two commits landed for this session's work
+(`3508304` for the bug fixes + Option C, `8fac43b` for the recurring
+Windows/Cygwin executable-bit regression) before Phase 6 started. The
+exec-bit issue is confirmed recurring on every `git add -A` on this
+checkout, not a one-time fluke — `git config core.fileMode false` would
+stop it, left for the user to decide.

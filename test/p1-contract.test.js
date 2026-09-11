@@ -4956,26 +4956,91 @@ test('stored-work recovery is queue-authority-only and uses alarm-backed earlies
     assert.match(restoreBody, /recoverStoredCoordinatorWork\('coordinator-page-restore'/)
 })
 
-// Entropy-reduction Phase 2 tripwire (see entropy-reduction-action-plan-2026-09-09.md):
-// isExplicitSecurityVerificationRecord is independently declared in both
-// jobState.js and swProfileNukeRecordClassification.js with an identical
-// body rather than one importing it from the other. Nothing enforces they
-// stay in sync -- if a future session edits the security-verification
-// detection regex or field list in one file without the other, the content
-// script and service worker would silently disagree about whether a
-// profile-progress record represents a security-verification interruption.
-// This asserts the two bodies stay textually identical (modulo
-// indentation) so that drift fails loudly here instead of silently.
-test('isExplicitSecurityVerificationRecord stays identical across its two independent declarations', () => {
-    const jobStateBody = extractFunction(
-        readRepoFile('shared/js/jobState.js'),
-        'function isExplicitSecurityVerificationRecord(record = null)'
-    )
-    const classificationBody = extractFunction(
-        readRepoFile('shared/js/swProfileNukeRecordClassification.js'),
-        'function isExplicitSecurityVerificationRecord(record = null)'
-    )
-    const normalize = body => body.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
+// Entropy-reduction Phase 6 (see entropy-reduction-action-plan-2026-09-09.md):
+// isExplicitSecurityVerificationRecord used to be independently declared in
+// both jobState.js and swProfileNukeRecordClassification.js with an
+// identical body (a Phase 2 tripwire briefly guarded that duplication
+// before this fix). It's now a single implementation in jobState.js,
+// threaded into swProfileNukeRecordClassification.js's factory via
+// `deps.handlers` (aliased to isExplicitSecurityVerificationRecordFromJobState
+// on import in sw.js, since that module's own re-export of the same name
+// already occupies it in sw.js's scope) and re-exported unchanged from
+// there. This asserts the duplication doesn't come back: the function body
+// should exist in jobState.js only, and swProfileNukeRecordClassification.js
+// should source it from deps.handlers instead.
+test('isExplicitSecurityVerificationRecord has a single implementation, sourced from jobState.js', () => {
+    const jobStateSource = readRepoFile('shared/js/jobState.js')
+    const classificationSource = readRepoFile('shared/js/swProfileNukeRecordClassification.js')
+    const swSource = readRepoFile('shared/js/sw.js')
 
-    assert.equal(normalize(jobStateBody), normalize(classificationBody))
+    assert.match(jobStateSource, /function isExplicitSecurityVerificationRecord\(record = null\)/)
+    assert.doesNotMatch(classificationSource, /function isExplicitSecurityVerificationRecord\(/)
+    assert.match(classificationSource, /const\s*\{[\s\S]*?isExplicitSecurityVerificationRecord[\s\S]*?\}\s*=\s*deps\.handlers/)
+
+    const jobStateDestructureStart = swSource.lastIndexOf('const {', swSource.indexOf('require(\'./jobState\')'))
+    const jobStateDestructure = swSource.slice(jobStateDestructureStart, swSource.indexOf('require(\'./jobState\')'))
+    assert.match(jobStateDestructure, /isExplicitSecurityVerificationRecord:\s*isExplicitSecurityVerificationRecordFromJobState/)
+
+    const classificationCallBody = extractCallExpression(swSource, swSource.indexOf('createProfileNukeRecordClassification({'))
+    assert.match(classificationCallBody, /isExplicitSecurityVerificationRecord:\s*isExplicitSecurityVerificationRecordFromJobState/)
+})
+
+// Entropy-reduction Phase 6 (see entropy-reduction-action-plan-2026-09-09.md,
+// "Make Phase 5 enforceable, not just readable"): a generic, mechanical
+// tripwire for Pattern 6 (duplicated constants across files) that doesn't
+// need to know about any specific constant in advance, unlike the two
+// hand-written tripwires above (isExplicitSecurityVerificationRecord,
+// and the earlier transient-status/action-kind fixes). Scans for
+// SCREAMING_SNAKE_CASE `const NAME = 'literal string'` declarations --
+// this codebase's established naming convention for action-kind/status/
+// reason-type domain constants -- across the three files most central to
+// the client/service-worker boundary this session's bugs were about, and
+// fails if the same literal value is independently declared this way in
+// more than one of them. A constant correctly shared via
+// `const {NAME} = require(...)` destructuring, as content.js now does for
+// UNBLOCK_UNMUTE_ACTION_KIND, isn't a `const NAME = 'literal'` assignment
+// at all, so it doesn't trip this check -- only a *second independent*
+// literal declaration would. Deliberately narrow (single-line simple
+// string literals only, three files only) to keep false positives near
+// zero; broadening scope is easy later if it proves valuable.
+test('no SCREAMING_SNAKE_CASE string constant is independently declared as a literal in more than one of content.js/sw.js/jobState.js', () => {
+    // Pre-existing duplicates this check found the first time it ran
+    // (2026-09-10) -- real instances of Pattern 6, not newly introduced by
+    // this test. Fixing them properly needs a shared module both
+    // content.js and sw.js already import from (neither currently owns
+    // these values the way jobState.js already did for the two constants
+    // fixed earlier this session), which is a small design decision, not
+    // a one-line import swap -- left as a documented follow-up in
+    // entropy-reduction-action-plan-2026-09-09.md rather than guessed at
+    // here. Allowlisted by value so this test still catches any *new*
+    // duplicate going forward.
+    const knownPreexistingDuplicateValues = new Set([
+        'service-worker-queue-owner',
+        'author-profile',
+        'mbSpacePendingNukedPosts',
+        'mbProfileNukeProgressView'
+    ])
+
+    const files = ['shared/js/content.js', 'shared/js/sw.js', 'shared/js/jobState.js']
+    const declarationPattern = /^const\s+([A-Z][A-Z0-9_]*)\s*=\s*'([^'\\]*)'\s*$/gm
+    const locationsByValue = new Map()
+
+    for(const file of files) {
+        const source = readRepoFile(file)
+        for(const match of source.matchAll(declarationPattern)) {
+            const [, name, value] = match
+            if(!value) continue
+            const lineNumber = source.slice(0, match.index).split('\n').length
+            const locations = locationsByValue.get(value) || []
+            locations.push(`${file}:${lineNumber} (${name})`)
+            locationsByValue.set(value, locations)
+        }
+    }
+
+    const duplicated = Array.from(locationsByValue.entries())
+        .filter(([value, locations]) => !knownPreexistingDuplicateValues.has(value) &&
+            new Set(locations.map(location => location.split(':')[0])).size > 1)
+        .map(([value, locations]) => `'${value}' declared independently at: ${locations.join(', ')}`)
+
+    assert.deepEqual(duplicated, [])
 })

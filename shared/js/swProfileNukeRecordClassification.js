@@ -43,6 +43,17 @@
 // synchronous data-in/data-out predicates throughout -- so this module
 // needs no clock dependency and carries no realm-crossing risk per
 // architecture.md's Slice-7 refinement.
+//
+// 2026-09-10 update: isExplicitSecurityVerificationRecord is no longer one
+// of this module's own bodies. It used to be an independently-maintained
+// duplicate of jobState.js's function of the same name (identical body,
+// two sources of truth) -- see entropy-reduction-action-plan-2026-09-09.md's
+// Pattern 6. It's now threaded through `deps.handlers` from jobState.js's
+// export (aliased to isExplicitSecurityVerificationRecordFromJobState on
+// import in sw.js, since this module's own re-export of the same name,
+// destructured from its return value below, already occupies that name in
+// sw.js's scope) and this module just re-exports it unchanged, so every
+// existing sw.js call site keeps working without modification.
 
 function createProfileNukeRecordClassification(deps = {}) {
     const {
@@ -52,7 +63,8 @@ function createProfileNukeRecordClassification(deps = {}) {
         isActiveCoordinatorStatus,
         isCoordinatorQueueAuthoritativeItem,
         hasMismatchedCoordinatorAttempt,
-        normalizeTabId
+        normalizeTabId,
+        isExplicitSecurityVerificationRecord
     } = deps.handlers || {}
 
     function isTerminalProfileNukeRecord(record) {
@@ -159,20 +171,6 @@ function createProfileNukeRecordClassification(deps = {}) {
         const senderTabId = normalizeTabId(options.senderTabId || record?.tabId || null)
         const itemTabId = normalizeTabId(item?.tabId || item?.activeTabId || null)
         return !senderTabId || !itemTabId || senderTabId === itemTabId
-    }
-
-    function isExplicitSecurityVerificationRecord(record = null) {
-        if(!record?.securityVerification) return false
-
-        const text = [
-            record.securityVerificationReason,
-            record.finalError,
-            record.errorPageUrl,
-            record.lastUrl,
-            ...(Array.isArray(record.events) ? record.events : [])
-        ].join(' ')
-
-        return /security verification|verify you are human|just a moment|performing security verification|challenge-platform|cdn-cgi|turnstile/i.test(text)
     }
 
     function isTransientProfileNukeStatus(status) {
