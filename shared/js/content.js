@@ -176,6 +176,7 @@ let spacePendingNukedPosts = {}
 let profileNukeProgress = {}
 let coordinatorQueue = {}
 let coordinatorQueueLoaded = false
+let cloudflareChallengeReported = false
 let contentPageStateRefreshPromise = null
 let contentPageStateRefreshAt = 0
 let spaceFeedScopedStateRefreshPromise = null
@@ -2762,6 +2763,38 @@ function getSecurityVerificationReason() {
 
 function isSecurityVerificationPage() {
     return !!getSecurityVerificationReason()
+}
+
+// The __cf_chl_tk query parameter is Cloudflare's own challenge-token
+// marker, present on the interstitial URL itself -- unlike
+// getSecurityVerificationReason's title/body-text heuristics, this fires
+// immediately (even before the challenge page's DOM has rendered) and is
+// specific to Cloudflare rather than Quora's other security-verification
+// interstitials. Confirmed as the definitive signal during the 2026-09-12
+// incident: profiles that looked "stuck" for ~30-90s (Ray-Savage-52 and
+// others) were sitting on this interstitial the whole time, not failing
+// inside the extension.
+function isCloudflareChallengePage() {
+    try {
+        return new URLSearchParams(location.search).has('__cf_chl_tk')
+    }
+    catch {
+        return false
+    }
+}
+
+// Fire-and-forget, once per content-script lifetime (a solved challenge
+// navigates/reloads the real page, which reinjects a fresh content script
+// with its own fresh flag) -- callers can check this cheaply on every retry
+// tick of a stuck page without spamming the SW with a message per tick.
+function maybeReportCloudflareChallenge() {
+    if(cloudflareChallengeReported) return
+    if(!isCloudflareChallengePage()) return
+    cloudflareChallengeReported = true
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'cloudflare-challenge-detected',
+        href: location.href
+    }, null, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
 }
 
 function isSecurityVerificationProgressRecord(record) {
@@ -10681,6 +10714,8 @@ async function nukeModalProfiles() {
 
 async function maybeRunAutoProfileAction() {
     if(autoProfileActionPending || autoProfileActionClaimPending) return
+
+    maybeReportCloudflareChallenge()
 
     if(autoProfileAction === undefined) {
         autoProfileActionAttempts += 1

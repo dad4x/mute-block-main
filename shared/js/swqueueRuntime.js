@@ -520,6 +520,20 @@ function createQueueRuntimeState() {
     // leftover keys the index doesn't know about yet, in their natural
     // object order. Correctness never depends on the index being perfectly
     // fresh; only the ordering quality does.
+    //
+    // Entropy-reduction Phase 7 audit finding (2026-09-12, see
+    // entropy-reduction-action-plan-2026-09-09.md item 7): this function is
+    // meant to be the cheap alternative to a raw `Object.entries(queue)`
+    // scan, but as originally written it unconditionally paid for a SECOND
+    // full `Object.entries(queue)` pass (the leftover-key check) on every
+    // call, on top of the walk over `orderedQueueKeys` -- i.e. it cost
+    // *more* than the raw scan it was meant to replace, in the common case
+    // where the index is fully fresh (no staleness) and there's nothing to
+    // find. Fast path: if every key visited via `orderedQueueKeys` produced
+    // an item (`items.length`) and that count equals the queue's total own
+    // key count, the two key sets must be identical (each visited key is
+    // drawn from `queue` itself and is unique), so there are no leftover
+    // keys and the second pass can't find anything -- skip it.
     function getOrderedQueueItems(queue = {}) {
         const items = []
         const seen = new Set()
@@ -529,6 +543,8 @@ function createQueueRuntimeState() {
             items.push([key, item])
             seen.add(key)
         }
+        const queueKeyCount = queue ? Object.keys(queue).length : 0
+        if(items.length === queueKeyCount) return items
         for(const [key, item] of Object.entries(queue || {})) {
             if(seen.has(key)) continue
             items.push([key, item])

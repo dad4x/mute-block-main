@@ -323,6 +323,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'cleanup-owned-nuke-status',
         'clear-profile-nuke-state',
         'close-tab',
+        'cloudflare-challenge-detected',
         'confirm-space-feed-profiles-blocked',
         'coordinator-page-ready',
         'create-tab',
@@ -4319,6 +4320,39 @@ test('queued action claim retries the durable queue sync instead of waiting on a
     assert.notEqual(retryTimeoutIndex, -1)
     assert.ok(gateIndex < refreshCallIndex)
     assert.ok(refreshCallIndex < retryTimeoutIndex)
+})
+
+test('content script detects Cloudflare challenge pages and reports them once per load', () => {
+    // Regression for the 2026-09-12 incident: several profiles (Ray-Savage-52
+    // among them) looked "stuck" for 30-90s with the content script never
+    // engaging. The actual cause was a Cloudflare bot-challenge interstitial
+    // (confirmed via a __cf_chl_tk= query param in the progress record's
+    // lastUrl), not an extension bug -- the extension correctly cannot act
+    // on a page that isn't the real profile page yet. This checks the
+    // detection is wired up: a URL-param-based check (fires even before the
+    // challenge page's DOM/title renders), reported once per content-script
+    // lifetime, hooked into the same retry loop that was stuck during the
+    // incident.
+    const source = readRepoFile('shared/js/content.js')
+
+    const detectBody = extractFunction(source, 'function isCloudflareChallengePage()')
+    assert.match(detectBody, /__cf_chl_tk/)
+
+    const reportBody = extractFunction(source, 'function maybeReportCloudflareChallenge()')
+    assert.match(reportBody, /cloudflareChallengeReported/)
+    assert.match(reportBody, /isCloudflareChallengePage\(\)/)
+    assert.match(reportBody, /action:\s*'cloudflare-challenge-detected'/)
+
+    const actionBody = extractFunction(source, 'async function maybeRunAutoProfileAction()')
+    assert.match(actionBody, /maybeReportCloudflareChallenge\(\)/)
+})
+
+test('service worker records a cloudflareChallenge.detected stat for reported Cloudflare challenges', () => {
+    const source = readRepoFile('shared/js/swBootstrap.js')
+    const handlerIndex = source.indexOf("request.action === 'cloudflare-challenge-detected'")
+    assert.notEqual(handlerIndex, -1)
+    const handlerBody = source.slice(handlerIndex, handlerIndex + 400)
+    assert.match(handlerBody, /incrementQueueWakeupMetric\('cloudflareChallenge\.detected'\)/)
 })
 
 test('profile block click path does not await nonterminal progress breadcrumbs', () => {

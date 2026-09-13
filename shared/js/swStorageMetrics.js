@@ -109,6 +109,37 @@ function createStorageMetrics(deps = {}) {
         return value === undefined ? 0 : 1
     }
 
+    // Single-use handoff slot shared by `recordStoragePayloadMetrics` and
+    // `recordQueueWriteOperationMetrics`. `metricStorageSet` always calls
+    // these two back-to-back, synchronously, for the very same payload on
+    // every single storage write -- and both independently re-derived byte
+    // size/row count for the coordinator queue value (when present), the
+    // single largest thing that payload can contain, via a full
+    // `JSON.stringify` (`getJsonByteSize`). `recordStoragePayloadMetrics`
+    // runs first, computes it once, and stashes the result here keyed by
+    // object reference; `recordQueueWriteOperationMetrics` immediately
+    // consumes (and clears) it instead of stringifying the same queue again.
+    // The slot is cleared on every read, so it can never survive past the
+    // one synchronous pair of calls it was written for -- a miss (empty
+    // slot, or a different object reference, e.g. a direct/isolated call to
+    // one of these functions from a test) just falls back to computing
+    // fresh. Pure perf optimization: no observable effect on the metric
+    // values recorded.
+    let pendingQueuePayloadByteMetrics = null
+
+    function getOrCacheQueuePayloadByteMetrics(queue) {
+        if(pendingQueuePayloadByteMetrics && pendingQueuePayloadByteMetrics.value === queue) {
+            const {bytes, rows} = pendingQueuePayloadByteMetrics
+            pendingQueuePayloadByteMetrics = null
+            return {bytes, rows}
+        }
+        return {bytes: getJsonByteSize(queue), rows: getStoragePayloadRowCount(queue)}
+    }
+
+    function cacheQueuePayloadByteMetrics(queue, bytes, rows) {
+        pendingQueuePayloadByteMetrics = {value: queue, bytes, rows}
+    }
+
     function normalizeStorageMetricPathName(pathName = '') {
         const normalized = `${pathName || ''}`.trim()
             .replace(/[^A-Za-z0-9_.-]+/g, '-')
@@ -201,8 +232,7 @@ function createStorageMetrics(deps = {}) {
         if(!payload || typeof payload !== 'object' || !payload[COORDINATOR_QUEUE_KEY]) return
 
         const queue = payload[COORDINATOR_QUEUE_KEY]
-        const bytes = getJsonByteSize(queue)
-        const rows = getStoragePayloadRowCount(queue)
+        const {bytes, rows} = getOrCacheQueuePayloadByteMetrics(queue)
         const changedRows = Math.max(0, Number.parseInt(options.queueChangedRows, 10) || 0)
         const operation = normalizeQueueWriteOperationName(options.queueOperation)
         const reason = getQueueWriteMetricReason(options)
@@ -235,6 +265,7 @@ function createStorageMetrics(deps = {}) {
             const metricKey = getStorageMetricKeyName(key)
             const bytes = getJsonByteSize(value)
             const rows = getStoragePayloadRowCount(value)
+            if(key === COORDINATOR_QUEUE_KEY) cacheQueuePayloadByteMetrics(value, bytes, rows)
             totalBytes += bytes
             totalRows += rows
             keyNames.push(metricKey)
