@@ -45,7 +45,8 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "tab-action-claim",
     "tab-action-release",
     "close-if-blocked-sent",
-    "close-if-blocked-response"
+    "close-if-blocked-response",
+    "cloudflare-challenge-detected"
 ])
 
 let flightRecorderSeq = 0

@@ -859,8 +859,20 @@ function projectSnapshot(checkpoint = {}, records = [], options = {}) {
         maxSeq,
         applied,
         ignored,
-        appliedIds: Array.from(appliedIds),
-        stateHash: hashState(state)
+        appliedIds: Array.from(appliedIds)
+        // No `stateHash` here on purpose: this used to run `hashState`
+        // (a hand-rolled recursive key-sorting stringify, pricier than plain
+        // JSON.stringify) over the entire post-replay state on every single
+        // `projectSnapshot`/`recoverProjectedState` call -- WAL recovery on
+        // load, every checkpoint switch (which itself calls this multiple
+        // times), and every CLI recovery tool. Repo-wide grep confirmed no
+        // caller (production or test) ever reads `.stateHash` off this
+        // return value -- it was write-only. Checkpoint-level integrity
+        // verification is unaffected: `verifyCheckpoint` (used by
+        // `activateCheckpoint`/`recoverActiveCheckpoint`) still calls
+        // `hashState` on the decoded checkpoint and compares it against the
+        // stored `checkpoint.stateHash`, and still rejects a mismatch --
+        // see the fuzz-test case `activate-hash-mismatch-checkpoint`.
     }
 }
 

@@ -4439,6 +4439,133 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
 })
 
+test('genuine block terminal progress records a reallyBlocked profileAction stat with duration', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Really-Blocked-Stat'
+    const runId = 'run-really-blocked-stat'
+    const attemptId = 'attempt-really-blocked-stat'
+    const tabId = 505
+    const {sw} = loadServiceWorkerHarness({
+        now: 250000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 249500
+                }
+            }
+        }
+    })
+
+    const before = sw.state().queueWakeupCounters
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: 250100,
+        terminalAt: 250100,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, true, JSON.stringify(result))
+    assert.equal(result.terminal, true, JSON.stringify(result))
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
+    assert.equal(
+        (after['profileAction.reallyBlocked.count'] || 0) -
+            (before['profileAction.reallyBlocked.count'] || 0),
+        1
+    )
+    assert.ok(
+        (after['profileAction.reallyBlocked.totalDurationMs'] || 0) -
+            (before['profileAction.reallyBlocked.totalDurationMs'] || 0) > 0
+    )
+    assert.ok((after['profileAction.reallyBlocked.maxDurationMs'] || 0) > 0)
+    assert.equal(after['profileAction.alreadyBlocked.count'] || 0, before['profileAction.alreadyBlocked.count'] || 0)
+})
+
+test('already-blocked terminal progress records an alreadyBlocked profileAction stat, not reallyBlocked', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Already-Blocked-Stat'
+    const runId = 'run-already-blocked-stat'
+    const attemptId = 'attempt-already-blocked-stat'
+    const tabId = 506
+    const {sw} = loadServiceWorkerHarness({
+        now: 250000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 249500
+                }
+            }
+        }
+    })
+
+    const before = sw.state().queueWakeupCounters
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'already-blocked',
+        blockedAt: 250100,
+        terminalAt: 250100,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, true, JSON.stringify(result))
+    assert.equal(result.terminal, true, JSON.stringify(result))
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
+    assert.equal(
+        (after['profileAction.alreadyBlocked.count'] || 0) -
+            (before['profileAction.alreadyBlocked.count'] || 0),
+        1
+    )
+    assert.ok(
+        (after['profileAction.alreadyBlocked.totalDurationMs'] || 0) -
+            (before['profileAction.alreadyBlocked.totalDurationMs'] || 0) > 0
+    )
+    assert.ok((after['profileAction.alreadyBlocked.maxDurationMs'] || 0) > 0)
+    assert.equal(after['profileAction.reallyBlocked.count'] || 0, before['profileAction.reallyBlocked.count'] || 0)
+})
+
 test('duplicate terminal progress for terminal row does not append duplicate queue WAL', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Duplicate-Noop'
     const runId = 'run-terminal-duplicate-noop'
@@ -6555,7 +6682,7 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     const otherAttemptId = 'attempt-lease-expired-other'
     const tabId = 620
     const now = 260000
-    const {storage, sw} = loadServiceWorkerHarness({
+    const {storage, sw, timers} = loadServiceWorkerHarness({
         now,
         storage: {
             mbCoordinatorPaused: false,
@@ -6611,6 +6738,13 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     assert.equal(storage.mbCoordinatorQueue[href].actionLease.heartbeatAt, now - 1000)
     assert.equal(storage.mbCoordinatorQueue[otherHref].actionLease.reason, 'expired-other')
     assert.ok(getStoredCoordinatorQueueWal(storage))
+    // The queue-view projection save is now deferred (see the
+    // deferProjectionSave comment on mutateCoordinatorActionLeaseHeartbeat in
+    // sw.js) since a heartbeat never changes anything the view summarizes --
+    // tick the deferred setTimeout(0) before reading it back, matching the
+    // action-lease-request test's pattern above.
+    await timers.tick(0)
+    await flushAsync(50)
     assert.equal(storage.mbCoordinatorQueueView.counts.active, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.heartbeatAt, now)
     assert.equal(sw.coordinatorAuthority.current().queue[otherHref].actionLease.reason, 'expired-other')
@@ -6629,6 +6763,79 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].actionLease.heartbeatAt, now)
     assert.equal(hydrated.queue[otherHref].actionLease.reason, 'expired-other')
+})
+
+test('action lease heartbeat never rebuilds the content-queue-index/source-index projections', async () => {
+    // Regression for the entropy-reduction Phase 7 cost-multiplier finding
+    // (2026-09-12): every authority row mutation used to fall through to
+    // buildCoordinatorQueueDerivedProjectionPayload by default -- a full
+    // O(queue) rebuild of the queue view AND the content-queue-index AND all
+    // content-source-index shards -- synchronously, on the WAL-write path.
+    // Action-lease heartbeats fire every QUEUED_ACTION_HEARTBEAT_MS (5s,
+    // content.js) for as long as an item stays active, making them by far
+    // the highest-frequency authority mutation, yet a heartbeat only ever
+    // touches actionLease bookkeeping, never anything the content-queue-index
+    // or source-index shards summarize. This asserts the fix: those two
+    // projections are left completely untouched (same reference) by a
+    // heartbeat, synchronously AND after its deferred queue-view save fires,
+    // while the queue view and the WAL row itself are still updated.
+    const href = 'https://www.quora.com/profile/Synthetic-Lease-Heartbeat-Cost'
+    const runId = 'run-lease-heartbeat-cost'
+    const attemptId = 'attempt-lease-heartbeat-cost'
+    const tabId = 623
+    const now = 260500
+    const sentinelContentQueueIndex = {version: 2, updatedAt: now - 1000, total: 0, indexed: 0, itemLimit: 500, truncated: false, items: []}
+    const {storage, sw, timers} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now}),
+                    actionLease: {
+                        kind: 'profile-menu',
+                        actionKind: 'mute-block',
+                        profileHref: href,
+                        tabId,
+                        attemptId,
+                        attemptNumber: 1,
+                        grantedAt: now - 5000,
+                        heartbeatAt: now - 1000,
+                        expiresAt: now + 10000,
+                        reason: 'test'
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbCoordinatorContentQueueIndex: sentinelContentQueueIndex
+        }
+    })
+
+    const result = await sw.heartbeatCoordinatorActionLease({
+        profileHref: href,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        tab: {id: tabId}
+    })
+
+    assert.equal(result.heartbeat, true)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.heartbeatAt, now)
+    assert.ok(getStoredCoordinatorQueueWal(storage))
+    // A rebuild would call buildCoordinatorContentQueueIndex(queue, now) and
+    // stamp the fresh `now` (260500) as updatedAt -- the storage mock clones
+    // on write/read, so reference equality can't be used here; the stale
+    // updatedAt from the sentinel is the tell.
+    assert.equal(storage.mbCoordinatorContentQueueIndex.updatedAt, now - 1000)
+
+    await timers.tick(0)
+    await flushAsync(50)
+
+    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(storage.mbCoordinatorContentQueueIndex.updatedAt, now - 1000)
 })
 
 test('action lease release is WAL-backed and recovers after restart', async () => {
@@ -6968,7 +7175,7 @@ test('action lease release projection failure does not poison durable acknowledg
     const attemptId = 'attempt-lease-release-projection-failure'
     const tabId = 624
     const now = 263000
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw, timers} = loadServiceWorkerHarness({
         now,
         storage: {
             mbCoordinatorPaused: false,
@@ -7016,6 +7223,13 @@ test('action lease release projection failure does not poison durable acknowledg
     assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
+    // action-lease-release now defers its projection save (see the
+    // deferProjectionSave comment on mutateCoordinatorActionLeaseRelease in
+    // sw.js), so the failure this test injects is only observed once the
+    // deferred setTimeout(0) fires.
+    await timers.tick(0)
+    await flushAsync(50)
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
     assert.ok(
         sw.state().hasCoordinatorReconcileTimeout ||
@@ -12102,8 +12316,16 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpacePendingNukedPosts'), false)
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpaceNukedPosts'), false)
 
+    // current() returns a shallow copy, not a full deep clone (see the
+    // comment on current() in sw.js, and entropy-reduction-action-plan
+    // Phase 7): nested rows are shared with the resident projection, not
+    // isolated per call, so mutating a row through one call's result IS
+    // visible through a later call. This intentionally narrows the old
+    // "isolated deep clone" contract -- go through apply()/
+    // seedResidentProjection() to mutate the authority, never by mutating
+    // current()'s return value directly.
     current.queue[href].status = 'mutated-outside-authority'
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'mutated-outside-authority')
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.state().queueWakeupCounters.storageSetCalls, undefined)
 })
@@ -34659,6 +34881,228 @@ test('detached active authority clears stale coordinator reconcile promise befor
 
     await timers.tick(1000)
     await flushAsync(200)
+})
+
+// Regression coverage for the entropy-reduction-action-plan-2026-09-09.md
+// "sw.js:19301" pattern-9 finding: runCoordinatorReconcileTickOnce used to
+// decide whether a loaded queue needed raw-compatibility normalization via
+// `JSON.stringify(normalizedQueue) !== JSON.stringify(rawQueue)` -- a full
+// double-serialization of the whole queue on every reconcile tick, even
+// though almost every tick finds nothing to normalize. It was replaced with
+// coordinatorRawQueueNormalizationChangedRows, which is structurally
+// equivalent (same key-set/order requirement, same per-row deep-equality)
+// but skips serialization entirely for reference-identical rows and stops
+// scanning as soon as a real difference is found. These tests pin down that
+// equivalence directly against the function it replaced.
+test('coordinatorRawQueueNormalizationChangedRows agrees with the old double-JSON.stringify check on already-normalized queues', () => {
+    const {sw} = loadServiceWorkerHarness()
+    const runId = 'run-raw-queue-diff-noop'
+    const rawQueue = {
+        'https://www.quora.com/profile/Raw-Queue-Diff-One': makeQueuedCoordinatorRow({
+            href: 'https://www.quora.com/profile/Raw-Queue-Diff-One',
+            runId,
+            attemptId: 'attempt-raw-queue-diff-one'
+        }),
+        'https://www.quora.com/profile/Raw-Queue-Diff-Two': makeActiveCoordinatorRow({
+            href: 'https://www.quora.com/profile/Raw-Queue-Diff-Two',
+            runId,
+            attemptId: 'attempt-raw-queue-diff-two',
+            tabId: 909001
+        })
+    }
+    // Normalization adds envelope fields (attempt/jobKey/scope/canonicalSubject/
+    // etc.) that a hand-built fixture row doesn't carry, so a *freshly built*
+    // row is never a fair "already normalized" example. The real reconcile
+    // call site's queue has already been through this same normalization at
+    // least once (via the enqueue path or an earlier reconcile tick), so the
+    // realistic no-op case is: normalizing an *already-normalized* queue
+    // again is idempotent, exactly like the queue this check runs against on
+    // almost every tick in practice.
+    const queue = sw.normalizeRawCoordinatorQueueForReconcileFallback(rawQueue)
+
+    const normalizedQueue = sw.normalizeRawCoordinatorQueueForReconcileFallback(queue)
+    const oldWayChanged = JSON.stringify(normalizedQueue) !== JSON.stringify(queue)
+    const newWayChanged = sw.coordinatorRawQueueNormalizationChangedRows(normalizedQueue, queue)
+
+    assert.equal(oldWayChanged, false)
+    assert.equal(newWayChanged, false)
+    assert.equal(newWayChanged, oldWayChanged)
+})
+
+test('coordinatorRawQueueNormalizationChangedRows agrees with the old double-JSON.stringify check on a malformed raw row', () => {
+    const {sw} = loadServiceWorkerHarness()
+    const href = 'https://www.quora.com/profile/Raw-Queue-Diff-Malformed'
+    // A minimal/legacy-shaped row missing the normalized fields
+    // (coordinatorKey, dedupeKey, executorTabAction, etc.) that
+    // normalizeRawCoordinatorQueueForReconcileFallback fills in -- this is
+    // the shape that actually needs the raw-compatibility fallback.
+    // serviceWorkerOwned makes it an "authoritative" item (see
+    // isCoordinatorQueueAuthoritativeItem), which is what routes it through
+    // the rebuild branch instead of the pass-through branch.
+    const queue = {
+        [href]: {
+            status: 'queued',
+            targetProfileHref: href,
+            queuedAt: 1000,
+            updatedAt: 1000,
+            serviceWorkerOwned: true
+        }
+    }
+
+    const normalizedQueue = sw.normalizeRawCoordinatorQueueForReconcileFallback(queue)
+    const oldWayChanged = JSON.stringify(normalizedQueue) !== JSON.stringify(queue)
+    const newWayChanged = sw.coordinatorRawQueueNormalizationChangedRows(normalizedQueue, queue)
+
+    assert.equal(oldWayChanged, true)
+    assert.equal(newWayChanged, true)
+    assert.equal(newWayChanged, oldWayChanged)
+})
+
+test('coordinatorRawQueueNormalizationChangedRows detects added/removed/reordered keys like the old check did', () => {
+    const {sw} = loadServiceWorkerHarness()
+    const base = {
+        a: {status: 'queued', targetProfileHref: 'https://www.quora.com/profile/A'},
+        b: {status: 'active', targetProfileHref: 'https://www.quora.com/profile/B'}
+    }
+    const addedKey = {...base, c: {status: 'queued', targetProfileHref: 'https://www.quora.com/profile/C'}}
+    const removedKey = {a: base.a}
+    const reorderedKeys = {b: base.b, a: base.a}
+    const sameShapeNewObjects = {
+        a: {status: 'queued', targetProfileHref: 'https://www.quora.com/profile/A'},
+        b: {status: 'active', targetProfileHref: 'https://www.quora.com/profile/B'}
+    }
+
+    for(const candidate of [addedKey, removedKey, reorderedKeys]) {
+        const oldWayChanged = JSON.stringify(candidate) !== JSON.stringify(base)
+        const newWayChanged = sw.coordinatorRawQueueNormalizationChangedRows(candidate, base)
+        assert.equal(oldWayChanged, true)
+        assert.equal(newWayChanged, oldWayChanged)
+    }
+
+    // Different object references but identical serialized content/order:
+    // neither the old nor the new check should consider this "changed".
+    const oldWayChanged = JSON.stringify(sameShapeNewObjects) !== JSON.stringify(base)
+    const newWayChanged = sw.coordinatorRawQueueNormalizationChangedRows(sameShapeNewObjects, base)
+    assert.equal(oldWayChanged, false)
+    assert.equal(newWayChanged, false)
+})
+
+test('coordinatorRawQueueNormalizationChangedRows skips re-serializing reference-identical rows', () => {
+    const {sw} = loadServiceWorkerHarness()
+    const sharedRow = {status: 'queued', targetProfileHref: 'https://www.quora.com/profile/Raw-Queue-Diff-Shared'}
+    const queueA = {shared: sharedRow}
+    const queueB = {shared: sharedRow}
+
+    let stringifyCalls = 0
+    const originalStringify = JSON.stringify
+    JSON.stringify = (...args) => {
+        stringifyCalls += 1
+        return originalStringify(...args)
+    }
+    try {
+        const changed = sw.coordinatorRawQueueNormalizationChangedRows(queueA, queueB)
+        assert.equal(changed, false)
+        assert.equal(stringifyCalls, 0)
+    }
+    finally {
+        JSON.stringify = originalStringify
+    }
+})
+
+// Regression coverage for entropy-reduction-action-plan-2026-09-09.md item 6
+// (getOwnedNukeStatus): content.js's waitForOwnedNukeTabsToDrain polls this
+// once per second for up to 180s during any active nuke run, always passing
+// a runId. It used to unconditionally call loadCoordinatorQueueProjection
+// (a fresh chrome.storage.local read + WAL replay) on every poll instead of
+// reusing the already-hydrated resident authority state, which
+// refreshResidentCoordinatorAuthorityState keeps current across coordinator
+// mutations anyway. These tests confirm the resident-state fast path is
+// used when hydrated (and produces the same counts), and that the original
+// storage-projection fallback still works correctly when it is not.
+test('getOwnedNukeStatus uses resident authority state instead of reloading the queue from storage when hydrated', async () => {
+    const activeHref = 'https://www.quora.com/profile/Owned-Nuke-Status-Active'
+    const queuedHref = 'https://www.quora.com/profile/Owned-Nuke-Status-Queued'
+    const runId = 'run-owned-nuke-status-resident'
+    const {sw} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [activeHref]: makeActiveCoordinatorRow({
+                    href: activeHref,
+                    runId,
+                    attemptId: 'attempt-owned-nuke-active',
+                    tabId: 601,
+                    now: 5000
+                }),
+                [queuedHref]: makeQueuedCoordinatorRow({
+                    href: queuedHref,
+                    runId,
+                    attemptId: 'attempt-owned-nuke-queued',
+                    now: 5000
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: activeHref, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    await sw.coordinatorAuthority.hydrate()
+
+    const storageGetCallsBefore = sw.state().queueWakeupCounters['storageGetCalls'] || 0
+    const status = await sw.getOwnedNukeStatus(null, {runId})
+    const storageGetCallsAfter = sw.state().queueWakeupCounters['storageGetCalls'] || 0
+
+    assert.equal(status.active, 1)
+    assert.equal(status.queued, 1)
+    assert.equal((sw.state().queueWakeupCounters['ownedNukeStatus.queue.usedResidentAuthority'] || 0) >= 1, true)
+    assert.equal(storageGetCallsAfter, storageGetCallsBefore)
+})
+
+test('getOwnedNukeStatus falls back to loading the queue projection when authority is not hydrated', async () => {
+    const activeHref = 'https://www.quora.com/profile/Owned-Nuke-Status-Cold-Active'
+    const queuedHref = 'https://www.quora.com/profile/Owned-Nuke-Status-Cold-Queued'
+    const runId = 'run-owned-nuke-status-cold'
+    const {sw} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [activeHref]: makeActiveCoordinatorRow({
+                    href: activeHref,
+                    runId,
+                    attemptId: 'attempt-owned-nuke-cold-active',
+                    tabId: 602,
+                    now: 5000
+                }),
+                [queuedHref]: makeQueuedCoordinatorRow({
+                    href: queuedHref,
+                    runId,
+                    attemptId: 'attempt-owned-nuke-cold-queued',
+                    now: 5000
+                })
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: activeHref, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+
+    // Deliberately not hydrating coordinatorAuthority first, so
+    // getHydratedCoordinatorAuthorityState returns null and the function
+    // must fall back to loadCoordinatorQueueProjection, exactly like before
+    // this change.
+    const storageGetCallsBefore = sw.state().queueWakeupCounters['storageGetCalls'] || 0
+    const status = await sw.getOwnedNukeStatus(null, {runId})
+    const storageGetCallsAfter = sw.state().queueWakeupCounters['storageGetCalls'] || 0
+
+    assert.equal(status.active, 1)
+    assert.equal(status.queued, 1)
+    assert.equal(sw.state().queueWakeupCounters['ownedNukeStatus.queue.usedResidentAuthority'] || 0, 0)
+    assert.equal(storageGetCallsAfter > storageGetCallsBefore, true)
 })
 
 ;(async () => {

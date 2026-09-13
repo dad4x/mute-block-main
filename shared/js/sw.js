@@ -1341,7 +1341,9 @@ const coordinatorProgressReducer = createCoordinatorProgressReducer({
         isSuccessfulProfileNukeRecord,
         getCoordinatorStatusFromProgress,
         shouldApplyProgressToCoordinatorItem,
-        buildCoordinatorFailureClassification: (...args) => buildCoordinatorFailureClassification(...args)
+        buildCoordinatorFailureClassification: (...args) => buildCoordinatorFailureClassification(...args),
+        incrementQueueWakeupMetric,
+        recordQueueWakeupMetricMax
     }
 })
 const {
@@ -7517,8 +7519,22 @@ function createCoordinatorAuthority() {
         return current()
     }
 
+    // Shallow copy, not a full deep clone: current() is called ~140+ times
+    // across this file, and makeCoordinatorAuthorityProjection's recursive
+    // cloneCoordinatorAuthorityValue clone of the whole
+    // queue/runs/events/progress on every single call is the same
+    // O(total queue size) cost already fixed once in absorbPersistedSnapshot
+    // (see entropy-reduction-action-plan-2026-09-09.md, Phase 7). Every
+    // production call site either only reads the result or replaces
+    // queue/runs/events wholesale via copy-on-write before handing it back
+    // to apply()/seedResidentProjection() -- none mutate a row in place. The
+    // contract this narrows: callers get a fresh top-level object each call,
+    // but nested rows are shared with the resident projection, so mutating
+    // `current().queue[href].foo = x` now DOES affect resident state -- it
+    // no longer silently vanishes into a throwaway clone. Don't do that;
+    // go through apply()/seedResidentProjection() instead.
     function current() {
-        return makeCoordinatorAuthorityProjection(projection)
+        return {...projection}
     }
 
     function seedResidentProjection(state = {}) {
@@ -19235,6 +19251,34 @@ async function runScheduledCoordinatorQueueResume(reason = '', options = {}) {
     return reconcileResult
 }
 
+// Pattern-9 fix (entropy-reduction-action-plan-2026-09-09.md, "sw.js:19301"):
+// this used to be `JSON.stringify(normalizedQueue) !== JSON.stringify(rawQueue)`,
+// a full-queue double-serialization on every reconcile tick even though the
+// vast majority of ticks find nothing to normalize (most rows are already
+// normalized, or pass straight through unchanged). Structurally equivalent to
+// the old check -- same key set/order requirement, same per-row deep-equality
+// via JSON.stringify -- but a same-reference row (the common case for rows
+// `normalizeRawCoordinatorQueueForReconcileFallback` passes through
+// untouched) skips serialization entirely, and any real difference short-
+// circuits the scan instead of always building two full-map JSON strings
+// first. Cost still scales with queue size when nothing has changed, but
+// avoids the guaranteed double full-map stringify that ran unconditionally
+// on every tick regardless of queue size or whether anything differed.
+function coordinatorRawQueueNormalizationChangedRows(normalizedQueue = {}, rawQueue = {}) {
+    const normalizedKeys = Object.keys(normalizedQueue || {})
+    const rawKeys = Object.keys(rawQueue || {})
+    if(normalizedKeys.length !== rawKeys.length) return true
+    for(let index = 0; index < normalizedKeys.length; index += 1) {
+        const key = normalizedKeys[index]
+        if(key !== rawKeys[index]) return true
+        const normalizedRow = normalizedQueue[key]
+        const rawRow = rawQueue[key]
+        if(normalizedRow === rawRow) continue
+        if(JSON.stringify(normalizedRow) !== JSON.stringify(rawRow)) return true
+    }
+    return false
+}
+
 async function runCoordinatorReconcileTick(reason = 'coordinator-reconcile', options = {}) {
     if(coordinatorReconcilePromise) {
         if(clearStaleCoordinatorReconcilePromise(reason)) {
@@ -19298,7 +19342,7 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
             .catch(() => coordinatorAuthority.current())
         if(Object.keys(pruneAuthorityState?.queue || {}).length) {
             const normalizedQueue = normalizeRawCoordinatorQueueForReconcileFallback(pruneAuthorityState.queue)
-            if(JSON.stringify(normalizedQueue) !== JSON.stringify(pruneAuthorityState.queue || {})) {
+            if(coordinatorRawQueueNormalizationChangedRows(normalizedQueue, pruneAuthorityState.queue || {})) {
                 pruneAuthorityState = {
                     ...(pruneAuthorityState || {}),
                     rawQueueFallback: true,
@@ -22670,6 +22714,18 @@ async function mutateCoordinatorActionLeaseHeartbeat(operation = {}) {
         reason: 'ordinaryMutation',
         metricPath: 'actionLease.heartbeat.save',
         currentAuthorityState,
+        // Heartbeats only touch actionLease bookkeeping (not status/outcome/
+        // attempt identity), so they never change anything the queue view or
+        // content-queue-index actually summarize. They also fire every
+        // QUEUED_ACTION_HEARTBEAT_MS (content.js, 5s) for as long as an item
+        // stays active -- by far the highest-frequency authority mutation --
+        // so deferring the projection rebuild (matching the action-lease-
+        // request precedent above) avoids paying the full derived-projection
+        // cost (queue view + content-queue-index + source-index shards, each
+        // an O(queue) pass) synchronously on every tick.
+        deferProjectionSave: true,
+        projectionPayload: 'queueViewOnly',
+        projectionReconcileDelayMs: 30000,
         mutate(currentItem, context) {
             const currentLease = normalizeCoordinatorActionLease(currentItem?.actionLease)
             if(!currentLease || isCoordinatorActionLeaseExpired(currentLease, now) || !isCoordinatorActionLeaseHolder(currentLease, tabId, attemptId)) {
@@ -22748,6 +22804,13 @@ async function mutateCoordinatorActionLeaseRelease(operation = {}) {
         metricPath: 'actionLease.release.save',
         currentAuthorityState,
         allowCurrentAuthorityState: true,
+        // Same reasoning as the action-lease-heartbeat mutation just above:
+        // this only clears actionLease bookkeeping, not status/outcome, so
+        // it doesn't affect the queue view or content-queue-index contents
+        // and can defer the derived-projection rebuild.
+        deferProjectionSave: true,
+        projectionPayload: 'queueViewOnly',
+        projectionReconcileDelayMs: 30000,
         mutate(currentItem, context) {
             const currentLease = normalizeCoordinatorActionLease(currentItem?.actionLease)
             if(!currentLease || isCoordinatorActionLeaseExpired(currentLease, now) || !isCoordinatorActionLeaseHolder(currentLease, tabId, attemptId)) {
@@ -22806,6 +22869,13 @@ async function mutateCoordinatorActionLeasesForTabRelease(operation = {}) {
             reason: 'ordinaryMutation',
             metricPath: 'actionLease.tabRelease.save',
             currentAuthorityState: null,
+            // Same reasoning as the action-lease-heartbeat/release mutations
+            // above: only actionLease bookkeeping changes here, so the
+            // derived-projection rebuild can defer. Also avoids paying that
+            // cost once per lease when a single tab close releases several.
+            deferProjectionSave: true,
+            projectionPayload: 'queueViewOnly',
+            projectionReconcileDelayMs: 30000,
             mutate(currentItem, context) {
                 const currentLease = normalizeCoordinatorActionLease(currentItem?.actionLease)
                 if(!currentLease || currentLease.tabId !== tabId) {
@@ -26444,9 +26514,20 @@ async function getOwnedNukeStatus(parentTabId, options = {}) {
     }
 
     if(runId) {
-        const currentAuthorityState = await loadCoordinatorQueueProjection({
-            metricPath: 'ownedNukeStatus.queue.load'
-        }).catch(() => null)
+        // Prefer the already-hydrated resident authority state over a fresh
+        // chrome.storage.local read + WAL replay (see
+        // entropy-reduction-action-plan-2026-09-09.md pattern 9): this is
+        // reached from content.js's waitForOwnedNukeTabsToDrain polling loop
+        // once per second for up to 180s during any active nuke run, and the
+        // resident state is already kept current by
+        // refreshResidentCoordinatorAuthorityState after coordinator
+        // mutations, so re-loading from storage on every poll was pure
+        // waste. Same fallback pattern already used by
+        // recoverPendingTabActionFromCoordinatorQueue and others.
+        const currentAuthorityState = getHydratedCoordinatorAuthorityState('ownedNukeStatus.queue.usedResidentAuthority') ||
+            await loadCoordinatorQueueProjection({
+                metricPath: 'ownedNukeStatus.queue.load'
+            }).catch(() => null)
         const queue = currentAuthorityState?.queue || {}
         for(const [itemKey, item] of Object.entries(queue)) {
             if(item?.runId !== runId) continue

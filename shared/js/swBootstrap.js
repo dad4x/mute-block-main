@@ -646,6 +646,18 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'claim-tab-action') {
             return claimPendingTabAction(sender)
         }
+        else if(request.action === 'cloudflare-challenge-detected') {
+            incrementQueueWakeupMetric('cloudflareChallenge.detected')
+            recordFlightRecorderEvent({
+                kind: 'cloudflare-challenge-detected',
+                source: 'content-script',
+                targetUrl: `${request.href || ''}`,
+                tabId: sender.tab?.id || null,
+                accepted: true,
+                reason: 'cf-chl-tk-query-param'
+            })
+            return Promise.resolve({recorded: true})
+        }
         else if(request.action === 'resolve-queued-profile-target') {
             return resolveQueuedProfileTarget(request, sender)
         }

@@ -110,8 +110,52 @@ function createCoordinatorProgressReducer(deps = {}) {
         isSuccessfulProfileNukeRecord,
         getCoordinatorStatusFromProgress,
         shouldApplyProgressToCoordinatorItem,
-        buildCoordinatorFailureClassification
+        buildCoordinatorFailureClassification,
+        incrementQueueWakeupMetric,
+        recordQueueWakeupMetricMax
     } = deps.handlers || {}
+
+    // Distinguishes "was already blocked before we did anything" from "we
+    // actually performed the block action" -- both share mapped.status ===
+    // 'succeeded' (see mapProgressToJobState, jobState.js), only
+    // mapped.outcome differs ('already-blocked' vs 'blocked'). Recorded once
+    // per row, right at the transition into terminal (guarded by the
+    // caller's !isTerminalCoordinatorStatus(item.status) check), so a
+    // duplicate/repeat progress report for an already-terminal row can't
+    // double-count it. Duration is measured from activeAt (when a tab
+    // actually started working the row), not queuedAt, so it reflects the
+    // action itself rather than however long the row sat waiting its turn.
+    //
+    // Every call site of transitionCoordinatorItemFromProgress in sw.js
+    // invokes it twice for one logical transition: once as a side-effect-free
+    // "preview" (to decide whether anything changed before touching storage)
+    // and again for real inside the applyWithinStorageUpdate mutate()
+    // callback, passing the *same* `mapped` object reference both times. A
+    // WeakSet keyed on that reference collapses the pair into a single stat
+    // recording without needing every call site to track its own dedup
+    // state.
+    const recordedProfileActionOutcomeMappedRecords = new WeakSet()
+    function recordCoordinatorProfileActionOutcomeStat(item = {}, mapped = {}, nowMs = now()) {
+        if(typeof incrementQueueWakeupMetric !== 'function') return
+        if(mapped && typeof mapped === 'object') {
+            if(recordedProfileActionOutcomeMappedRecords.has(mapped)) return
+            recordedProfileActionOutcomeMappedRecords.add(mapped)
+        }
+        const actionKind = `${item?.actionKind || ''}`.trim()
+        if(actionKind !== 'mute-block') return
+        const outcome = `${mapped?.outcome || ''}`.trim()
+        const bucket = outcome === 'already-blocked' ? 'alreadyBlocked'
+            : outcome === 'blocked' ? 'reallyBlocked'
+            : ''
+        if(!bucket) return
+        const activeAt = Number.parseInt(item?.activeAt, 10) || 0
+        const durationMs = activeAt > 0 ? Math.max(0, nowMs - activeAt) : 0
+        incrementQueueWakeupMetric(`profileAction.${bucket}.count`)
+        incrementQueueWakeupMetric(`profileAction.${bucket}.totalDurationMs`, durationMs)
+        if(typeof recordQueueWakeupMetricMax === 'function') {
+            recordQueueWakeupMetricMax(`profileAction.${bucket}.maxDurationMs`, durationMs)
+        }
+    }
 
     function getCoordinatorTransitionTerminalAt(item = {}, record = {}, nowMs = now(), options = {}) {
         if(options.terminalAtFallback === 'record') {
@@ -322,6 +366,10 @@ function createCoordinatorProgressReducer(deps = {}) {
                 return projectedItem
             }
             return resetRetry ? projectedItem : item
+        }
+
+        if(mappedTerminal && !isTerminalCoordinatorStatus(item.status)) {
+            recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
         }
 
         return mergeReducedCoordinatorProgressItem(item, reduced.item, projectedItem, mapped, record, {

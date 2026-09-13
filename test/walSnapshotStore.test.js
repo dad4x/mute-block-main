@@ -113,6 +113,31 @@ test('projects snapshot plus ordered WAL records into current state', () => {
     assert.deepEqual(projected.ignored, [])
 })
 
+test('projectSnapshot does not attach a stateHash (unused, expensive full-state rehash)', () => {
+    // `projectSnapshot` used to run `hashState` (a hand-rolled recursive
+    // key-sorting stringify) over the entire post-replay state on every
+    // call -- WAL recovery on load, every checkpoint switch, every CLI
+    // recovery tool -- even though nothing in the codebase ever reads the
+    // resulting `.stateHash`. Pins the removal so it isn't silently
+    // reintroduced; checkpoint-level integrity verification (which DOES
+    // matter) is separately covered by "refuses to activate corrupted
+    // inactive checkpoint" below, which goes through `verifyCheckpoint`
+    // and is unaffected by this.
+    const checkpoint = makeCheckpoint(baseState(), {
+        id: CHECKPOINT_A,
+        snapshotSeq: 10,
+        snapshotEpoch: 1,
+        createdAt: 1000
+    })
+
+    const projected = projectSnapshot(checkpoint, [])
+
+    assert.equal('stateHash' in projected, false)
+
+    const recovered = recoverProjectedState(makePairedCheckpointStore(baseState(), {snapshotSeq: 10}), [])
+    assert.equal('stateHash' in recovered.projected, false)
+})
+
 test('applyWalRecord shallow-copies state instead of deep-cloning untouched rows and areas', () => {
     // Regression for the 2026-09-12 replay-cost incident: applyWalRecord
     // used to do `cloneJson(state)` -- a full JSON.stringify/parse

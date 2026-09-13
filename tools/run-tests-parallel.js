@@ -16,11 +16,13 @@ const lanes = [
     commands: [
       ['node', 'test/subject.test.js'],
       ['node', 'test/jobState.test.js'],
+      ['node', 'test/swQueueRuntime.test.js'],
       ['node', 'test/storageInvariants.test.js'],
       ['node', 'test/rawReportPages.test.js'],
       ['node', 'test/sharedModeration.test.js'],
       ['node', 'test/contentActionSelectors.test.js'],
-      ['node', 'test/contentSpaceScopedState.test.js']
+      ['node', 'test/contentSpaceScopedState.test.js'],
+      ['node', 'test/swStorageMetrics.test.js']
     ]
   },
   {

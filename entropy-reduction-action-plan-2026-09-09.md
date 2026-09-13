@@ -852,3 +852,318 @@ profile: 6641ms -> 0ms (button already present at the instant of injection).
 Full `npm run test:parallel` green both before and after. Rebuilt/reloaded
 live at `1.6.1235`; `chrome.management` reload report showed 0 manifest/
 runtime errors both times.
+
+## Phase 7 (2026-09-12/13) — coordinator queue stability incident, and a new named pattern
+
+Live-testing incident, not from the audit. A CPU-storm/duplicate-tab crisis
+(carried over from an earlier session) turned out to have several
+compounding root causes, all instances of one new pattern worth naming
+alongside the five in the "Named patterns" section above:
+
+**9. Global recompute where the call site only changed one thing.** A
+function takes the whole authority state / queue / progress map as input and
+does a full deep clone, full JSON stringify, or full `Object.entries` scan
+of all of it, even though the caller changed (or wants) exactly one row.
+Cheap at test scale, silently O(total accumulated rows) at real scale --
+and because "total accumulated rows" only grows over a long session, code
+that was fine in every unit test can still degrade over hours of live use.
+Two confirmed, fixed instances this session:
+
+- `applyWalRecord` (`walSnapshotStore.js`) called `cloneJson(state)` --
+  a full `JSON.stringify`/`parse` round-trip of the entire authority state
+  -- on every single WAL record application, even though every branch only
+  ever replaces one `area`/row wholesale. Replaying N records against a
+  queue that has accumulated hundreds of already-terminal rows cost
+  O(N * totalQueueSize), not O(N). Fixed: shallow copy (`{...state}`);
+  every branch already does proper copy-on-write at the area/row level, so
+  nothing deeper was needed. Regression test:
+  `test/walSnapshotStore.test.js`, "applyWalRecord shallow-copies state
+  instead of deep-cloning untouched rows and areas" (asserts object
+  identity survives for untouched rows/areas).
+- `absorbPersistedSnapshot` (`sw.js`) called
+  `makeCoordinatorAuthorityProjection(projection)` -- a full 5-way deep
+  clone of stored/queue/runs/events/progress via the hand-rolled recursive
+  `cloneCoordinatorAuthorityValue` -- unconditionally at the top, before
+  even checking whether the incoming payload touched anything relevant.
+  This function runs on *every* `chrome.storage.local.set()` call
+  extension-wide (via `metricStorageSet` ->
+  `notifyCoordinatorAuthorityPersistedSnapshot`), so most calls paid the
+  full clone for nothing. Fixed: shallow copy of `stored` (the only field
+  ever mutated key-by-key in place) plus shared references for
+  queue/runs/events/progress (every branch only ever reassigns those
+  wholesale, never mutates nested contents).
+
+Two more compounding bugs in the same incident, not instances of pattern 9
+but worth recording here since they hit the same code paths:
+
+- `getRetiredCoordinatorQueueWalPhysicalKeys` (`swCoordinatorQueueWal.js`)
+  excluded the just-retired generation from physical-key cleanup on every
+  checkpoint switch (an inverted condition -- it should exclude only the
+  *new* active generation), permanently orphaning that generation's WAL
+  segments in storage on every single switch, forever. Compounded with the
+  checkpoint-switch itself deferring indefinitely whenever the queue had any
+  active/queued work (which a long-running batch always does), this drove
+  `chrome.storage.local` to its 10MB default quota, at which point writes
+  started failing outright. Fixed the inverted condition; added a
+  `COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT` knob so the switch forces
+  through once growth clearly outruns normal amortization instead of
+  deferring forever; added `unlimitedStorage` plus a self-imposed 100MB soft
+  quota with an 80% early-warning diagnostic event (`swflightRecorder.js`
+  gained `close-if-blocked-sent`/`close-if-blocked-response` kinds and
+  `sw.js` gained `maybeCheckCoordinatorStorageQuotaHealth`), so a future
+  leak surfaces long before it becomes an outage.
+- `content.js`'s queued-action claim loop (`maybeRunAutoProfileAction`)
+  waited on `coordinatorQueueLoaded` becoming `true` but never retried the
+  sync (`refreshContentPageCoordinatorStateFromRuntime`) that sets it --
+  that sync runs exactly once, in `init()`, with a 3s budget. If the SW was
+  busy at that exact moment (e.g. mid-reconcile of a large backlog),
+  `coordinatorQueueLoaded` stayed `false` for the rest of that page's life
+  and the queued action was never claimed or attempted -- while unrelated
+  message handlers (`close-if-blocked`) kept responding normally, since they
+  don't depend on this flag, masking the failure. Fixed: the retry branch
+  now re-kicks the sync each cycle (it has its own throttle/dedup, so this
+  is safe). Not confirmed against a live reproduction of the original
+  symptom -- shipped on the strength of the code-level diagnosis and
+  existing/new contract-test coverage, not a live before/after trace.
+
+All of the above: full regression-test coverage added, `npm run
+test:parallel` green. Shipped as `1.6.1236` through `1.6.1242`.
+
+### Audit: other likely instances of pattern 9, not yet investigated
+
+Prompted by the two confirmed instances above, a grep sweep across
+`shared/js/` for the same shape (a function taking the full `queue`/
+authority-state object and doing `Object.entries`/`Object.values`/
+`Object.keys` over all of it, a full `JSON.stringify`/`cloneJson`, or a
+`hashState`/`stableStringify` pass) turned up a much larger surface. None of
+these are confirmed bugs -- they may well be fine, especially if the queue
+argument at that call site is already a small scoped subset rather than the
+full authoritative map, or if the call site itself is inherently rare
+(a one-off dashboard button, not a per-tick path). Each needs its own
+"is this actually hot, and is `queue` actually large here" check before
+deciding whether it's worth fixing. This list is meant to be split across
+agents -- one agent per file (or small file group) is a reasonable unit of
+work, since each file's hits share the same module and the same `queue`
+plumbing.
+
+**Not yet audited, in priority order (highest suspected hotness first):**
+
+1. **`coordinatorAuthority.current()`** (`sw.js:7520`) -- calls
+   `makeCoordinatorAuthorityProjection(projection)`, the exact same full
+   5-way deep clone fixed in `absorbPersistedSnapshot` above, on *every*
+   call, unconditionally. 112 direct call sites in `sw.js` plus 31 more via
+   the `getHydratedCoordinatorAuthorityState` wrapper. This is the single
+   largest remaining suspect: same shape as a confirmed bug, much bigger
+   blast radius. Fixing it safely requires auditing call sites for any that
+   rely on the clone for mutation isolation (i.e. mutate the returned object
+   expecting the resident state to be unaffected) before switching to a
+   shared reference or a cheaper copy.
+2. **`hashState`/`stableStringify`** (`walSnapshotStore.js:48-51`, used at
+   `:293` inside `decodeCheckpointSnapshot` and `:863` inside
+   `projectSnapshot`) -- a hand-rolled recursive stringify that sorts keys
+   at *every* nesting level (more expensive than plain `JSON.stringify`),
+   run over the *entire* resulting state on every WAL replay and every
+   checkpoint load/verify. Stacks on top of the replay cost already fixed
+   in `applyWalRecord`. Worth checking whether this can be skipped when the
+   caller doesn't need integrity verification, or memoized against a
+   "nothing changed since last hash" flag.
+3. **`runCoordinatorExecutorApplyPhase`** (`sw.js:14973`) -- full
+   `Object.entries(queue)` scan (`queueProfileHrefs = Object.entries(queue
+   || {})` at :14973) in what is very likely the single hottest path in the
+   whole coordinator (the executor's own per-tick apply phase).
+4. **`runCoordinatorAuthorityReconcileActions`** (`sw.js:4545`) and
+   **`applyCoordinatorReconcileQueueAuthorityTransitionPhase`**
+   (`sw.js:8706`) -- full queue scans in the reconcile tick, which runs
+   reactively/periodically, not just on user action.
+5. **`recoverPendingTabActionFromCoordinatorQueue`** (`sw.js:27012`) --
+   the claim-recovery path investigated live this session (see the
+   `coordinatorQueueLoaded` fix above): a full linear scan over the whole
+   queue with an `await coordinatorItemMatchesTab(...)` per row, to find one
+   tab's match. `coordinatorItemMatchesTab` itself fast-rejects terminal
+   rows cheaply, so this is likely fine at current scale, but it's an
+   unindexed O(queue size) scan on a path that's already been implicated in
+   one live incident.
+6. **`getOwnedNukeStatus`** (`sw.js:26451`) -- frequency not yet checked;
+   do that first before deciding if the full scan here matters.
+7. **`swqueueRuntime.js`'s `getOrderedQueueItems`/`rebuildQueueOrder`**
+   (`:501`, `:532`) -- these are the *intended* fix for exactly this pattern
+   (an incrementally-maintained ordered index, rebuilt only when
+   `refreshResidentCoordinatorAuthorityState` determines the state actually
+   changed) -- but only 3 of the ~50 raw-scan call sites in this list
+   actually go through them (`sw.js:4499`, `:12910`, `:15189`). Worth
+   checking whether more of the hot ones below could route through this
+   instead of re-deriving their own scan.
+8. **`swCoordinatorReconcileInputs.js`**: `getCoordinatorQueueWorkCounts`
+   (`:107`, called from 17 sites in `sw.js` per an earlier grep) and
+   `getCoordinatorAuthorityMismatchCounts` (`:123`) -- both full scans,
+   used throughout reconcile/scheduling decisions.
+9. **`swQueuedTabMetadataAndActionLease.js`**: `clearExpiredCoordinatorActionLeases`
+   (`:229`), `findActiveCoordinatorActionLease` (`:249`),
+   `findCoordinatorStoredWorkCancelTarget` (`:284`) -- lease bookkeeping is
+   plausibly on a hot-ish path (every queued tab action touches a lease);
+   the cancel-target one is likely rare (user-triggered cancel).
+10. **`swCoordinatorQueueView.js`** (5 hits: `:110`, `:148`, `:254`,
+    `:312`\*2) -- `summarizeCoordinatorActualBlockTiming`,
+    `summarizeCoordinatorActivationHandoffTiming`,
+    `filterCoordinatorQueueForCompactView`,
+    `makeCoordinatorQueueAccountingCounts` -- this module builds the
+    dashboard's queue view; several of these run from the write/persist
+    path (`buildCoordinatorQueueView`, 6 call sites in `sw.js`, some inside
+    `persistCoordinatorAuthorityQueueWalMutation`'s write path), not just
+    on-demand dashboard reads.
+11. **`swCoordinatorRuns.js`** (3 hits: `:93`, `:141`, `:170`) --
+    `materializeCoordinatorRunsPausedStateFromControl`,
+    `getCoordinatorRunItems`, `recomputeCoordinatorRuns` -- likely bounded
+    by run count rather than queue count in practice, but each iterates the
+    full `queue` to find rows belonging to a run rather than maintaining a
+    per-run index.
+12. **Remaining single-hit files, likely lower priority / more clearly
+    bounded or rare, but not checked**: `jobState.js:254`
+    (`getNextCoordinatorQueueSequence`, already small/cheap by design --
+    just a max-scan), `swCoordinatorContentQueueIndex.js` (`:91`, `:107`,
+    `:188`), `swCoordinatorExecutorClassification.js:110`
+    (`findCoordinatorQueueEntryForHref` -- single-href lookup, called
+    per-tab-action so plausibly hot despite being "just a find"),
+    `swCoordinatorProgressRules.js:274` (`pruneCoordinatorCurrentWork`),
+    `swCoordinatorRetryCandidates.js:116`
+    (`getCoordinatorRetryableFailureCandidates`),
+    `swCoordinatorSourceProvenance.js:233`
+    (`getCoordinatorQueueProfileHrefSet`),
+    `swCoordinatorTerminalSettlement.js:125`
+    (`getCoordinatorTerminalItemEntries`), `swProfileNukeProgress.js:252`
+    (`hasNonterminalCoordinatorAuthorityForProfile`),
+    `swQueuedForegroundLeaseRuntime.js:161`
+    (`restoreQueuedTabRuntimeFromActiveAuthorityForSender`),
+    `swQueuedRuntimeActionMatching.js:143`
+    (`getQueuedRuntimeActionAuthorityEntry`),
+    `swQueuedTabDetachSurfaceDedupe.js:162`
+    (`findAuthorityTabIdForRuntimeSurface`),
+    `swQueuedTabRuntimeStatus.js:393`
+    (`hasDurableQueueMatchForRuntimeTab`),
+    `swQueuedWorkerActionSurfaceState.js:160`
+    (`hasDurableQueuedBacklogForActionSurface`),
+    `swSchedulerAlarmBookkeeping.js:274` (`hasStoredCoordinatorWork` --
+    note this one can short-circuit via `.some()`, so it's not
+    necessarily a full scan in practice).
+
+**Two more categories from the same sweep, not yet broken out by call site:**
+
+- **Storage-metrics serialization tax**: `getJsonByteSize`
+  (`swStorageMetrics.js:89`, `JSON.stringify` + `TextEncoder.encode`) is
+  called from `recordStoragePayloadMetrics`/`recordStorageReadPayloadMetrics`
+  on every key of every storage read/write, purely to produce byte-size
+  counters (16 call sites total between `sw.js` and `swStorageMetrics.js`).
+  If the queue or queue-view is part of that payload -- which it often is --
+  every operation pays a second full serialization solely for
+  instrumentation, on top of whatever the real read/write needed.
+- **`sw.js:19301`**: `JSON.stringify(normalizedQueue) !== JSON.stringify(
+  pruneAuthorityState.queue || {})` -- a genuine full-queue comparison.
+  Stands out because a broader sweep of the ~30 other
+  `JSON.stringify(x) !== JSON.stringify(y)` patterns in `sw.js` found all of
+  them comparing a single row, a single record field, or the small `runs`
+  map (bounded, and fine by the same reasoning as pattern 9's exception
+  case) -- this is the one outlier that compares the whole queue.
+
+**Checked and ruled out** (small/bounded, not instances of pattern 9):
+`decodeCheckpointSnapshot`'s `JSON.parse` of the checkpoint itself
+(necessary, bounded by checkpoint size, which the checkpoint-switch fix
+keeps bounded); `sharedModeration.js`'s `cloneJson`/`stableStringify`/block
+parsing (operates on individual per-post moderation blocks, not coordinator
+state); `content.js`'s per-button dataset `JSON.stringify`/`parse` calls;
+the ~30 single-row/single-field `JSON.stringify` comparisons in `sw.js`
+noted above.
+
+## Phase 7 audit results (2026-09-13) — five parallel agents run down the list
+
+The priority list above was split across five worktree-isolated background
+agents, one per numbered group, each instructed to verify real hotness
+before touching anything and only land a fix backed by a regression test.
+Consolidated into `main` after independent review of each worktree's diff;
+`npm run test:parallel` green after merging all of them together.
+
+**Fixed:**
+- **`coordinatorAuthority.current()`** (priority #1, the biggest suspect):
+  confirmed the same O(total-queue-size)-per-call shape as
+  `absorbPersistedSnapshot`, across ~143 call sites. Found one genuine
+  blocker first: `test/swSynthetic.test.js` had a test relying on `current()`
+  returning an isolated deep clone (mutating the result and asserting the
+  resident state was unaffected). User decision: narrow the contract rather
+  than add `Object.freeze()`/locking to preserve it (see
+  [[feedback-no-freeze-lock-patterns]]) — switched `current()` to a shallow
+  copy, updated that one test to assert the new (correct) shared-reference
+  behavior instead, documented the narrowed contract in a comment on
+  `current()` itself.
+- **`getOrderedQueueItems`** (priority #7): turned out to be doing *more*
+  work than the raw scan it was meant to replace — the cached-order walk
+  plus an unconditional second full `Object.entries(queue)` fallback pass,
+  every call. Added a fast path that skips the second pass when the index is
+  already fully fresh, benefiting its 3 existing call sites (including the
+  executor's hot apply/classify phases) for free.
+- **`hashState` in `projectSnapshot`** (priority #2, WAL replay/checkpoint
+  hashing): confirmed write-only — computed on every WAL replay and
+  checkpoint switch, read by nothing anywhere in the codebase. Removed.
+  The *load-bearing* hash use (`verifyCheckpoint`'s corruption check on
+  checkpoint activation/recovery) is a separate code path and was left
+  untouched, with its own fuzz coverage.
+- **Storage-metrics duplicate serialization**: `metricStorageSet` (wraps
+  every `chrome.storage.local.set()` extension-wide) called two metrics
+  functions back-to-back that each independently ran a full
+  `JSON.stringify` over the queue when present. Added a reference-keyed
+  handoff cache so the byte/row count is computed once and reused, falling
+  back to a fresh computation on any cache miss — no call-site signature
+  changes, identical metric output.
+- **`getOwnedNukeStatus`** (priority #4): confirmed genuinely hot — polled
+  once per second for up to 180s by `content.js` during any active nuke run
+  — and found it was doing a full `chrome.storage.local` read + WAL replay
+  on *every* poll instead of reusing already-hydrated resident authority
+  state, unlike sibling functions that already prefer the resident state.
+  Fixed by adopting that same precedented pattern.
+- **`sw.js`'s full-queue `JSON.stringify` comparison** (the one outlier
+  among ~30 otherwise-bounded comparisons, inside the periodic/scheduled
+  reconcile tick): replaced with a per-row structural-equality check with a
+  same-reference fast path and early exit on first real difference, proven
+  equivalent to the old double-stringify via direct tests.
+- **Priority #10** (`buildCoordinatorQueueDerivedProjectionPayload`'s 3-pass
+  rebuild defaulting on for ~25 of ~37 WAL-mutation call sites) — this one
+  was found independently by the queue-view/long-tail agent and fixed via a
+  separately-spawned background task; full write-up is in its own section
+  above ("Pattern 9 priority item #10").
+
+**Confirmed fine / correctly not fixed** (reported with reasoning rather
+than forced): `getCoordinatorQueueWorkCounts` (17 call sites, genuinely hot,
+but a real fix needs incremental counters, not a scan-order swap — bigger
+change than in scope), `getCoordinatorAuthorityMismatchCounts` (working as
+designed; converting its scan order would be a real behavior change since
+it intentionally evaluates rows in a budget-limited pass), `findActiveCoordinatorActionLease`
+(hot-ish, but the real fix is a maintained index, not an ordering change),
+`findCoordinatorStoredWorkCancelTarget` (rare, user-triggered, fine),
+`runCoordinatorAuthorityReconcileActions`/`applyCoordinatorReconcileQueueAuthorityTransitionPhase`
+(the reconcile-transition-phase one turned out to be gated to user-initiated
+dashboard requests only, not periodic as suspected; the reconcile-actions
+scan has a synchronous per-row early-exit cheap enough not to be worth
+restructuring), `recoverPendingTabActionFromCoordinatorQueue` (confirmed NOT
+periodic — only reached via tab-scoped recovery gated on "no existing
+runtime state," with the row-matching helpers already fast-rejecting
+terminal rows before any `await`), `swCoordinatorRuns.js`'s three functions
+(bounded by scoped `affectedRunIds` in the vast majority of call sites; the
+`recomputeAllRuns: true` reconcile path is a real `O(runCount × queueSize)`
+exception, and `runs` entries are never pruned/GC'd — worth a future look if
+run count ever grows unboundedly, not confirmed hot today), and all ~13
+single-hit long-tail files from priority #12 (each individually triaged —
+direct-key fast paths, `.some()` short-circuits, or genuinely rare/gated
+call sites; one has the worst theoretical shape found,
+`O(progressRecords × queueSize)`, but its only path in is a rare
+missing-projection repair fallback, not a live hot path).
+
+**Dead code found, not acted on** (a decision, not a perf fix):
+`clearExpiredCoordinatorActionLeases` has zero callers anywhere in the
+codebase — destructured but never invoked. Flagged for a human to decide
+whether to wire it up or remove it.
+
+**Environment note for future worktree-isolated agents on this repo**: all
+five agents' assigned worktrees started stale (checked out at ancestor
+commits hundreds of commits behind `main`, missing the very files each
+assignment referenced) and had to self-repair by fast-forwarding to `main`
+before they could do anything — worth refreshing the worktree pool before
+spinning up the next batch, to avoid spending agent budget on repo
+archaeology instead of the actual audit.
