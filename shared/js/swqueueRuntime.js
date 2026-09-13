@@ -17,6 +17,7 @@ function createQueueRuntimeState() {
     const owningParentByChild = new Map()
     const canceledQueuedUrlsByOwner = new Map()
     const pausedQueuedOwners = new Set()
+    let orderedQueueKeys = []
 
     const normalizeIntentSource = value => {
         const source = `${value || ''}`.trim()
@@ -471,8 +472,68 @@ function createQueueRuntimeState() {
             ownedParents: ownedTabIdsByParent.size,
             ownedChildren: owningParentByChild.size,
             canceledQueuedOwners: canceledQueuedUrlsByOwner.size,
-            pausedQueuedOwners: pausedQueuedOwners.size
+            pausedQueuedOwners: pausedQueuedOwners.size,
+            orderedQueueKeys: orderedQueueKeys.length
         }
+    }
+
+    // rebuildQueueOrder/getOrderedQueueKeys/getOrderedQueueItems (second
+    // index, 2026-09-12, see entropy-reduction-action-plan-2026-09-09.md
+    // "queue processing order"): the durable coordinatorQueue map is keyed
+    // by href/coordinatorKey for O(1) lookup by identity, but a plain JS
+    // object never reorders an existing key on reassignment -- so without a
+    // second, explicitly-ordered index, a chronically-retried item stays at
+    // whatever position it first landed at and can starve fresher work
+    // sitting behind it in iteration order. Each item now carries a
+    // `queueSequence` (jobState.js's getNextCoordinatorQueueSequence),
+    // assigned fresh on enqueue and on every retry-to-queued transition.
+    // This structure is that second index: an array of keys sorted by
+    // queueSequence ascending, always fully reconstructible from the
+    // durable queue (never itself the source of truth), so there's no
+    // separate durability/replay story for it -- it's rebuilt whenever the
+    // resident authority state refreshes (see refreshResidentCoordinatorAuthorityState
+    // in sw.js), which already happens after essentially every coordinator
+    // queue mutation. A full O(n log n) sort on each refresh is trivial at
+    // this queue's realistic size (hundreds of items, not millions) --
+    // the cost that mattered in the incident this fixes was repeated full
+    // WAL replay, not an in-memory sort.
+    function rebuildQueueOrder(queue = {}) {
+        orderedQueueKeys = Object.entries(queue || {})
+            .sort(([leftKey, leftItem], [rightKey, rightItem]) => {
+                const leftSequence = Number.parseInt(leftItem?.queueSequence, 10) || 0
+                const rightSequence = Number.parseInt(rightItem?.queueSequence, 10) || 0
+                return leftSequence - rightSequence || leftKey.localeCompare(rightKey)
+            })
+            .map(([key]) => key)
+        return orderedQueueKeys.length
+    }
+
+    function getOrderedQueueKeys() {
+        return orderedQueueKeys.slice()
+    }
+
+    // Defensive against staleness: if the ordered index hasn't been rebuilt
+    // since some key was added to `queue` (e.g. a caller working from a
+    // freshly-loaded projection that never round-tripped through
+    // refreshResidentCoordinatorAuthorityState), every item still gets
+    // visited -- known keys in their intended order first, then any
+    // leftover keys the index doesn't know about yet, in their natural
+    // object order. Correctness never depends on the index being perfectly
+    // fresh; only the ordering quality does.
+    function getOrderedQueueItems(queue = {}) {
+        const items = []
+        const seen = new Set()
+        for(const key of orderedQueueKeys) {
+            const item = queue?.[key]
+            if(!item) continue
+            items.push([key, item])
+            seen.add(key)
+        }
+        for(const [key, item] of Object.entries(queue || {})) {
+            if(seen.has(key)) continue
+            items.push([key, item])
+        }
+        return items
     }
 
     return {
@@ -493,6 +554,8 @@ function createQueueRuntimeState() {
         getActivationIntentCount,
         getActivationIntentAt,
         getActiveQueuedTabCount,
+        getOrderedQueueItems,
+        getOrderedQueueKeys,
         getOwnedTabsForParent,
         getOwningParentForChild,
         getPendingTabAction,
@@ -526,6 +589,7 @@ function createQueueRuntimeState() {
         pauseQueuedOwner,
         pruneProfileOpenReservations,
         rebuildOwningParentByChild,
+        rebuildQueueOrder,
         requeueActivationIntent,
         rememberCanceledQueuedOwnerUrls,
         removeOwnedTab,

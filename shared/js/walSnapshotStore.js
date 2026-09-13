@@ -780,7 +780,16 @@ function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
         return {state, applied: false, reason: 'duplicate-id', record}
     }
 
-    const nextState = cloneJson(state || {})
+    // A shallow copy is sufficient here, not cloneJson's full JSON
+    // round-trip: every branch below replaces nextState[area] wholesale with
+    // a freshly-built map/list (itself copy-on-write per touched row), so no
+    // branch ever mutates a nested object still shared with the caller's
+    // `state`. Replaying N records against a full authority snapshot used to
+    // cost O(N * totalStateSize) -- a full deep clone of the ENTIRE queue
+    // (including every terminal row ever processed) on every single record
+    // -- which is what made replay cost grow without bound as more items
+    // completed, independent of the WAL segment-count fix.
+    const nextState = {...(state || {})}
     const area = record.area
 
     if(record.kind === 'map.remove') {

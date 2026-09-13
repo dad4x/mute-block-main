@@ -460,9 +460,13 @@ function loadServiceWorkerHarness(options = {}) {
         )
     }
     if(options.disableQueueWalCheckpointSwitch === true) {
+        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
+        if(!source.includes(needle)) {
+            throw new Error('disableQueueWalCheckpointSwitch patch target not found in sw.js -- signature drifted, update swHarness.js')
+        }
         source = source.replace(
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)",
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
+            needle,
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
         )
     }
     if(options.fastExecutorResumeTimeoutMs) {

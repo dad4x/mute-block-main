@@ -99,6 +99,7 @@ function createCoordinatorProgressReducer(deps = {}) {
         getPersistedQueuedTabId,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
+        getNextCoordinatorQueueSequence,
         makeEmptyCoordinatorMilestones,
         getCoordinatorMilestonesFromProgress,
         reduceJobEvent,
@@ -290,7 +291,9 @@ function createCoordinatorProgressReducer(deps = {}) {
                 error: '',
                 terminalAt: 0,
                 reason: '',
-                retryCount: item.retryCount || 0
+                retryCount: item.retryCount || 0,
+                queueSequence: Number.parseInt(options.queueSequence, 10) ||
+                    (options.queue ? getNextCoordinatorQueueSequence(options.queue) : item.queueSequence || 0)
             })
             if(!retryResult.accepted) return projectedItem
             reducerItem = retryResult.item

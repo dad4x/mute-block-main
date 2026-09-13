@@ -22,6 +22,7 @@ const {
     getJobMilestonesFromProgress,
     getActionKindForRequestedAction,
     getExecutorTabActionForActionKind,
+    getNextCoordinatorQueueSequence,
     getQueueItemExecutorTabAction,
     isExplicitSecurityVerificationRecord: isExplicitSecurityVerificationRecordFromJobState,
     isRetryableJobFailure,
@@ -40,6 +41,9 @@ const {
     reduceJobEvent,
     UNBLOCK_UNMUTE_ACTION_KIND
 } = require('./jobState')
+const {
+    WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS
+} = require('./timeouts')
 const {
     activateCheckpoint,
     appendWalRecordsToGeneration,
@@ -336,7 +340,27 @@ const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = getSegmentedWalMetaKey(COORDINATOR_QUEUE_WAL_KEY)
 const COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT = 128
 const COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT = 1024
+// Soft-switch (COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT) defers the
+// checkpoint switch while the queue has active/queued work, so a burst of
+// tiny writes gets amortized into one checkpoint instead of switching
+// mid-burst. That's fine for a short burst, but a long-running batch never
+// goes idle, so the switch would defer forever and the WAL would grow
+// straight toward COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT (where appends
+// start getting rejected outright). This second threshold forces the switch
+// through regardless of pending work once growth has clearly outrun normal
+// amortization -- a knob between "wait for idle" and "never wait."
+const COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT = 256
+const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_DEFER_RETRY_MS = 5000
 const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
+// unlimitedStorage removes chrome.storage.local's enforced 10MB cap, but
+// "unlimited" isn't a target -- it just trades a hard failure (kQuotaBytes
+// quota exceeded, the proximate cause of the 2026-09-12 incident) for silent
+// unbounded growth if a leak like the retired-segment cleanup bug recurs.
+// This is a self-imposed ceiling with its own warning threshold, so a leak
+// surfaces as a diagnostic event long before it becomes an outage.
+const COORDINATOR_STORAGE_SOFT_QUOTA_BYTES = 100 * 1024 * 1024
+const COORDINATOR_STORAGE_QUOTA_WARN_RATIO = 0.8
+const COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS = 60000
 const COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'
 const COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex.'
 const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
@@ -495,6 +519,8 @@ let coordinatorAuthorityShadowWalProjectionMaxSeq = 0
 let coordinatorAuthorityShadowWalAppliedIds = new Set()
 let coordinatorQueueWalCheckpointSwitchPromise = null
 let coordinatorQueueWalCheckpointSwitchTimeout = null
+let lastCoordinatorStorageQuotaCheckAt = 0
+let coordinatorStorageQuotaWarned = false
 let progressShadowWalStore = makePairedCheckpointStore({progress: {}}, {
     snapshotSeq: 0,
     createdAt: Date.now()
@@ -1304,6 +1330,7 @@ const coordinatorProgressReducer = createCoordinatorProgressReducer({
         getPersistedQueuedTabId,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
+        getNextCoordinatorQueueSequence,
         makeEmptyCoordinatorMilestones,
         getCoordinatorMilestonesFromProgress,
         reduceJobEvent,
@@ -4469,7 +4496,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
 
     const preTerminalizedExhausted = await applyCoordinatorQueueMachineEvent({
         type: 'EXHAUSTED_ROLLBACK_SETTLE',
-        items: Object.values(queue),
+        items: queueRuntime.getOrderedQueueItems(queue).map(([, item]) => item),
         options: {
             limit: actionBudget,
             recoverReason: 'executor-plan-active-transition-retry-budget-recovered',
@@ -5871,8 +5898,9 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             if(options.suppressCheckpointSwitchSchedule !== true &&
                 activeSegmentCount >= COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT) {
                 incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduledFromRead')
-                scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftRead')
+                scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftRead', activeSegmentCount)
             }
+            void maybeCheckCoordinatorStorageQuotaHealth('queueWal-hydrate')
             stored[COORDINATOR_QUEUE_WAL_KEY] = hydrated.store
             return hydrated.store
         }
@@ -5905,10 +5933,58 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
     return fallback
 }
 
-function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold') {
+// Self-throttled: getBytesInUse is a real async storage call, so this is
+// gated to run at most once per COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS
+// regardless of how often callers invoke it. Callers fire-and-forget this --
+// it is pure observability and must never block or fail a queue mutation.
+async function maybeCheckCoordinatorStorageQuotaHealth(reason = '') {
+    const nowTs = Date.now()
+    if(nowTs - lastCoordinatorStorageQuotaCheckAt < COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS) return
+    lastCoordinatorStorageQuotaCheckAt = nowTs
+
+    let bytesInUse = 0
+    try {
+        bytesInUse = await coordinatorStorageAdapter.getBytesInUse(null)
+    }
+    catch(error) {
+        return
+    }
+
+    recordQueueWakeupMetricMax('coordinatorAuthority.storage.maxBytesInUse', bytesInUse)
+    const warnAtBytes = COORDINATOR_STORAGE_SOFT_QUOTA_BYTES * COORDINATOR_STORAGE_QUOTA_WARN_RATIO
+
+    if(bytesInUse >= COORDINATOR_STORAGE_SOFT_QUOTA_BYTES) {
+        incrementQueueWakeupMetric('coordinatorAuthority.storage.softQuotaExceeded')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-storage-soft-quota-exceeded',
+            `Coordinator storage.local usage (${bytesInUse} bytes) exceeded the ` +
+                `${COORDINATOR_STORAGE_SOFT_QUOTA_BYTES}-byte soft quota (${reason || 'periodic-check'})`
+        )
+        coordinatorStorageQuotaWarned = true
+    }
+    else if(bytesInUse >= warnAtBytes) {
+        incrementQueueWakeupMetric('coordinatorAuthority.storage.softQuotaWarning')
+        if(!coordinatorStorageQuotaWarned) {
+            recordCoordinatorDiagnosticEvent(
+                'coordinator-storage-soft-quota-warning',
+                `Coordinator storage.local usage (${bytesInUse} bytes) crossed ` +
+                    `${Math.round(COORDINATOR_STORAGE_QUOTA_WARN_RATIO * 100)}% of the ` +
+                    `${COORDINATOR_STORAGE_SOFT_QUOTA_BYTES}-byte soft quota (${reason || 'periodic-check'})`
+            )
+            coordinatorStorageQuotaWarned = true
+        }
+    }
+    else {
+        coordinatorStorageQuotaWarned = false
+    }
+}
+
+function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {
     const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'
     const softMaintenance = !/hard/i.test(normalizedReason)
-    if(softMaintenance) {
+    const forceOverQueueWork = (Number.parseInt(committedSegments, 10) || 0) >=
+        COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT
+    if(softMaintenance && !forceOverQueueWork) {
         const residentCounts = getCoordinatorQueueWorkCounts(coordinatorAuthority.current()?.queue || {})
         const runtimeCounts = queueRuntime.getRuntimeCounts()
         const runtimeHasWork = runtimeCounts.activeQueuedTabs > 0 ||
@@ -5921,7 +5997,7 @@ function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-thre
                 coordinatorQueueWalCheckpointSwitchTimeout = setTimeout(() => {
                     coordinatorQueueWalCheckpointSwitchTimeout = null
                     scheduleCoordinatorQueueWalCheckpointSwitch(`${normalizedReason}-deferred`)
-                }, 5000)
+                }, COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_DEFER_RETRY_MS)
             }
             return coordinatorQueueWalCheckpointSwitchPromise || Promise.resolve({
                 checkpointSwitched: false,
@@ -5930,6 +6006,9 @@ function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-thre
                 reason: 'checkpoint-switch-deferred-for-queue-work'
             })
         }
+    }
+    else if(forceOverQueueWork) {
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork')
     }
     if(coordinatorQueueWalCheckpointSwitchPromise) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchCoalesced')
@@ -6208,8 +6287,9 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
     if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
-        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch')
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch', physicalWal.committedSegments)
     }
+    void maybeCheckCoordinatorStorageQuotaHealth('queueWal-append')
 
     const projectionMetricPath = options.projectionMetricPath || `authority.${result.operationKind || 'row-mutation'}.projection.save`
     const projectionQueueOperation = `${result.operationKind || 'authority-row-mutation'}-projection`
@@ -6461,8 +6541,9 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     recordQueueWakeupMetricMax('coordinatorAuthority.queueWal.maxCommittedSegments', physicalWal.committedSegments)
     if(physicalWal.committedSegments >= physicalWal.softSwitchAt) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentSoftSwitchScheduled')
-        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch')
+        scheduleCoordinatorQueueWalCheckpointSwitch('segmentSoftSwitch', physicalWal.committedSegments)
     }
+    void maybeCheckCoordinatorStorageQuotaHealth('queueWal-append')
     const storageContext = getActiveStorageContext()
     if(storageContext) {
         storageContext.coordinatorAuthorityQueueMutationApplied = true
@@ -6715,6 +6796,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             checkpointWal?.payload?.[COORDINATOR_QUEUE_WAL_META_KEY] || null,
             {metricPath: options.cleanupMetricPath || 'queueWal.checkpointSwitch.physicalCleanup.remove'}
         )
+        void maybeCheckCoordinatorStorageQuotaHealth('queueWal-checkpoint-switch')
 
         return {
             checkpointSwitched: true,
@@ -7454,7 +7536,24 @@ function createCoordinatorAuthority() {
     function absorbPersistedSnapshot(payload = {}, options = {}) {
         if(!hydrated || !payload || typeof payload !== 'object') return false
 
-        const next = makeCoordinatorAuthorityProjection(projection)
+        // This used to be `makeCoordinatorAuthorityProjection(projection)` --
+        // a full recursive deep-clone of stored/queue/runs/events/progress,
+        // via cloneCoordinatorAuthorityValue -- on every single call, even
+        // though this function fires on EVERY storage write extension-wide
+        // (via metricStorageSet -> notifyCoordinatorAuthorityPersistedSnapshot)
+        // and most writes touch none of these areas at all. Every branch
+        // below only ever reassigns next.queue/next.runs/next.events
+        // wholesale (never mutates their existing contents in place), so
+        // they can start as shared references with `projection` at no risk;
+        // only next.stored gets mutated key-by-key below, so it alone needs
+        // its own (shallow) copy.
+        const next = {
+            stored: {...(projection.stored || {})},
+            queue: projection.queue || {},
+            runs: projection.runs || {},
+            events: projection.events || [],
+            progress: projection.progress || {}
+        }
         let changed = false
 
         let queueSeededFromPayload = false
@@ -7976,8 +8075,29 @@ function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')
     const changed = coordinatorAuthority.absorbPersistedSnapshot(payload, {
         allowRecoveredAuthorityQueueSeed: !hasWalPayload
     })
+    if(changed) {
+        queueRuntime.rebuildQueueOrder(coordinatorAuthority.current()?.queue || normalized.queue)
+    }
     if(changed && metricName) incrementQueueWakeupMetric(metricName)
     return changed
+}
+
+// Phase 4 entropy-reduction Option B, retry (2026-09-11, see
+// entropy-reduction-action-plan-2026-09-09.md): the previous attempt
+// extracted the WHOLE "hydrate WAL store, then recover queue" recipe into
+// its own async function, which added a microtask tick between "WAL store
+// ready" and "queue available to caller" and broke two fake-timer tests. This
+// version instead extracts only the truly-duplicated SYNCHRONOUS half --
+// turning an already-fetched walStore into a queue -- as a plain (non-async)
+// function. Each call site keeps its own `await loadCoordinatorQueueWalStoreFromStorage(...)`
+// inline, unchanged, so the only async step is exactly where it always was;
+// calling a plain synchronous function never yields to the microtask queue,
+// so this adds zero ticks versus the original inline code.
+function recoverQueueFromWalStore(queueSnapshot, walStore) {
+    return runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+        queueSnapshot,
+        walStore
+    )).queue
 }
 
 async function loadCoordinatorQueueProjection(options = {}) {
@@ -7991,11 +8111,7 @@ async function loadCoordinatorQueueProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         recordActiveStorageWorkSnapshot(queue)
         closeRuntimeTabsReclaimedByAuthority(queue, 'queue-projection-reclaimed-runtime')
 
@@ -8018,11 +8134,7 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         recordActiveStorageWorkSnapshot(queue)
         closeRuntimeTabsReclaimedByAuthority(queue, 'queue-runs-projection-reclaimed-runtime')
@@ -8049,11 +8161,7 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
@@ -8082,11 +8190,7 @@ async function loadCoordinatorQueueRunsScopedProgressProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsScopedProgressProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs, {
             includeView: includeProgressView
@@ -8162,11 +8266,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: 'currentAuthority.load.segments'
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored))
         recordActiveStorageWorkSnapshot(queue)
@@ -8193,11 +8293,7 @@ async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
         recordActiveStorageWorkSnapshot(queue)
@@ -8226,11 +8322,7 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
@@ -8264,11 +8356,7 @@ async function loadCoordinatorReconcileProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'reconcile.projection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const events = runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
@@ -8299,11 +8387,7 @@ async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsPendingProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         recordActiveStorageWorkSnapshot(queue)
 
@@ -8332,11 +8416,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
         const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'}.segments`
         })
-        const queueRecovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
-            queueSnapshot,
-            walStore
-        ))
-        const queue = queueRecovery.queue
+        const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
         const runs = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY]))
         const progress = runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, progressProfileHrefs))
         recordActiveStorageWorkSnapshot(queue)
@@ -12827,7 +12907,7 @@ async function classifyCoordinatorExecutorState(options = {}) {
         }
     }
 
-    for(const [itemKey, item] of Object.entries(queue)) {
+    for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue)) {
         if(!item || typeof item !== 'object') continue
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
@@ -13769,14 +13849,39 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
 
     for(const tab of orderedCandidates) {
         const tabId = normalizeTabId(tab?.id)
+        const pollAttemptId = getAttemptIdFromValue(expectedItem) || getAttemptIdFromValue(expectedRecord)
+        const pollAttemptNumber = getAttemptNumberFromValue(expectedItem) || getAttemptNumberFromValue(expectedRecord)
+        const sentAt = Date.now()
+        recordFlightRecorderEvent({
+            kind: 'close-if-blocked-sent',
+            source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
+            rowKey: itemKey,
+            targetUrl: href,
+            tabId,
+            attemptId: pollAttemptId,
+            attemptNumber: pollAttemptNumber,
+            reason
+        })
         const response = await sendTabMessage(tabId, {
             action: 'close-if-blocked',
             actionKind,
             requestedProfileHref: href,
-            attemptId: getAttemptIdFromValue(expectedItem) || getAttemptIdFromValue(expectedRecord),
-            attemptNumber: getAttemptNumberFromValue(expectedItem) || getAttemptNumberFromValue(expectedRecord)
+            attemptId: pollAttemptId,
+            attemptNumber: pollAttemptNumber
         }).catch(() => null)
         const resolvedProfileHref = normalizeQuoraProfileUrl(response?.resolvedProfileHref || '')
+        recordFlightRecorderEvent({
+            kind: 'close-if-blocked-response',
+            source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
+            rowKey: itemKey,
+            targetUrl: href,
+            tabId,
+            attemptId: pollAttemptId,
+            attemptNumber: pollAttemptNumber,
+            elapsedMs: Date.now() - sentAt,
+            accepted: response?.willClose === true,
+            reason: response ? (response.reason || (response.willClose ? 'will-close' : 'not-blocked')) : 'no-response'
+        })
         if(response?.willClose === true && resolvedProfileHref === href) {
             matches.push({tab, response})
         }
@@ -15081,7 +15186,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         }
     }
 
-    for(const [itemKey, item] of Object.entries(queue)) {
+    for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue)) {
         if(preprocessedActiveMissingKeys.has(itemKey)) continue
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
@@ -17612,7 +17717,7 @@ async function startUserInitiatedCoordinatorQueueResume(reason = 'dashboard-resu
     return lastUserStartQueueResult
 }
 
-async function waitForUserStartDurableActivation(startedActiveRows = 0, timeoutMs = 15000, reason = 'dashboard-resume') {
+async function waitForUserStartDurableActivation(startedActiveRows = 0, timeoutMs = WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS, reason = 'dashboard-resume') {
     const startedAt = Date.now()
     const normalizedStartedActiveRows = Math.max(0, Number.parseInt(startedActiveRows, 10) || 0)
     const deadline = startedAt + Math.max(1000, Number.parseInt(timeoutMs, 10) || 15000)
@@ -19679,6 +19784,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     const authorityResults = []
     const removedRows = []
     const progressProjectionRemovalHrefs = new Set()
+    let nextQueueSequence = getNextCoordinatorQueueSequence(queue)
 
     for(const candidate of selected) {
         const item = candidate.item
@@ -19691,7 +19797,8 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
             lastRetryAt: now,
             retryReason: `${item.outcome || 'failed'}${item.error ? `: ${item.error}` : ''}`,
             requestedUrlMode: 'tab',
-            envelopeSourceType: 'failed-retry'
+            envelopeSourceType: 'failed-retry',
+            queueSequence: nextQueueSequence++
         })
         const previousDestinationRow = queue[reset.coordinatorKey] || null
         nextQueue[reset.coordinatorKey] = reset.nextItem
@@ -19983,6 +20090,7 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     const authorityResults = []
     const removedRows = []
     const progressProjectionRemovalHrefs = new Set()
+    let nextQueueSequence = getNextCoordinatorQueueSequence(queue)
 
     for(const [itemKey, item] of Object.entries(queue)) {
         if(`${item?.status || ''}` !== 'failed') continue
@@ -20013,7 +20121,8 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
             retryReason: '',
             maxConcurrent: Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1),
             requestedUrlMode: 'coordinator',
-            envelopeSourceType: 'manual-requeue'
+            envelopeSourceType: 'manual-requeue',
+            queueSequence: nextQueueSequence++
         })
         const previousDestinationRow = queue[reset.coordinatorKey] || null
 
@@ -20334,6 +20443,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     const runs = normalizeCoordinatorMap(state.runs)
     const events = normalizeCoordinatorEvents(state.events)
     const progress = state.progress
+    let nextQueueSequence = getNextCoordinatorQueueSequence(queue)
     let queued = 0
     let merged = 0
     let progressChanged = false
@@ -20453,6 +20563,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
             status: resetExisting ? 'queued' : existing && terminalExisting ? existing.status : (existing?.status || 'queued'),
             outcome: resetExisting ? '' : existing?.outcome || '',
             error: resetExisting ? '' : existing?.error || '',
+            queueSequence: !existing || resetExisting ? nextQueueSequence++ : existing.queueSequence || 0,
             createdAt: resetExisting ? now : existing?.createdAt || now,
             updatedAt: now,
             queuedAt: resetExisting ? now : existing?.queuedAt || now,
@@ -22096,6 +22207,7 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
     if(!attemptId || !attemptNumber) return false
 
     const at = Number.parseInt(operation.at, 10) || Date.now()
+    const nextQueueSequence = getNextCoordinatorQueueSequence(queue)
     const buildNextRetryItem = currentItem => {
         const loadPressureRequeue = action.loadPressureRequeue === true
         const retryCount = loadPressureRequeue
@@ -22112,6 +22224,7 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
             attemptNumber,
             at,
             retryCount,
+            queueSequence: nextQueueSequence,
             lastRetryAt: loadPressureRequeue ? currentItem.lastRetryAt || 0 : at
         })
         if(!reduced.accepted) return null
@@ -28551,7 +28664,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     !(item.status !== 'queued' && mapped.status === 'queued' && !resetRetryFromTerminalProgress)) {
                     const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
                         now: Date.now(),
-                        resetRetry: resetRetryFromTerminalProgress
+                        resetRetry: resetRetryFromTerminalProgress,
+                        queue
                     })
                     if(JSON.stringify(nextItem) !== JSON.stringify(item)) {
                         const queueOperationKind = mappedTerminal ? 'terminal-progress' : 'direct-progress'
@@ -28574,7 +28688,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                                 }
                                 return transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
                                     now: Date.now(),
-                                    resetRetry: resetRetryFromTerminalProgress
+                                    resetRetry: resetRetryFromTerminalProgress,
+                                    queue
                                 })
                             }
                         })

@@ -44,6 +44,31 @@ const {
     TRANSIENT_PROGRESS_STATUSES,
     UNBLOCK_UNMUTE_ACTION_KIND
 } = require('./jobState')
+const {
+    WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_CONDITION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CONDITION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS,
+    READ_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    READ_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS,
+    ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS,
+    CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS,
+    SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS
+} = require('./timeouts')
 
 const SPACE_FEED_PROFILES_PER_BATCH = 3
 const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
@@ -262,6 +287,31 @@ async function init() {
         return
     }
 
+    if(maybeRedirectToCanonicalProfileUrl()) {
+        return
+    }
+
+    // Mute/block button insertion depends only on this page's own DOM
+    // (getProfileButtonInsertionTarget/isProfileBlocked) -- it has no
+    // dependency on settings, spaceRegistry, or the coordinator queue
+    // fetched below. Firing it here, before that slower sequential chain,
+    // means the button can appear as soon as Quora's own profile menu
+    // renders instead of being needlessly gated behind a coordinator-queue
+    // round trip and reconcileReloadCanceledNukes -- a live trace found
+    // these two steps alone routinely add several seconds before the first
+    // insertion attempt even happens, on a page where Quora's own DOM was
+    // already ready (see entropy-reduction-action-plan-2026-09-09.md,
+    // "profile button insertion delay", 2026-09-11). syncProfileButtons's
+    // coordinator-state-dependent pieces (maybeRecordAlreadyBlockedCoordinatorProfile,
+    // nudgeCurrentProfilePendingClaim) already do their own scoped refresh
+    // or are safely re-invoked by ensureProfileButtons's own retry/follow-up
+    // cycle once the queue arrives, so running this before that data is
+    // loaded is not a functional dependency issue.
+    if(initialPage === 'profile') {
+        ensureProfileButtons()
+        scheduleProfileButtonsFollowUps()
+    }
+
     settings = await safeStorageGet(defaults)
     spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
     const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
@@ -275,17 +325,9 @@ async function init() {
     installNavigationHooks()
     await reconcileReloadCanceledNukes()
 
-    if(maybeRedirectToCanonicalProfileUrl()) {
-        return
-    }
-
     const page = initialPage
 
-    if(page === 'profile') {
-        ensureProfileButtons()
-        scheduleProfileButtonsFollowUps()
-    }
-    else if(page === 'question-log') {
+    if(page === 'question-log') {
         scheduleOriginalPosterRedirect()
     }
     else if(page === 'question') {
@@ -575,7 +617,7 @@ async function safeSendRuntimeMessage(message, fallback = null) {
     }
 }
 
-async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = 12000) {
+async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS) {
     const timeoutMarker = {timedOut: true}
     const timeout = new Promise(resolve => setTimeout(() => resolve(timeoutMarker), timeoutMs))
     const result = await Promise.race([
@@ -1580,7 +1622,7 @@ function syncOwnedNukeDrainButton(button, status = null) {
     setNukeButtonDone(button)
 }
 
-async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalMs = 1000, options = {}) {
+async function waitForOwnedNukeTabsToDrain(button, timeoutMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS, options = {}) {
     const startedAt = Date.now()
     let nextSweepAt = 0
     const allowPause = !!options.allowPause
@@ -4010,7 +4052,7 @@ function getGlobalPrimaryAction(preferredRegex = null) {
     return candidates[0]?.button || null
 }
 
-async function waitForAction(getAction, timeoutMs = 4000, intervalMs = 200) {
+async function waitForAction(getAction, timeoutMs = WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
@@ -4023,7 +4065,7 @@ async function waitForAction(getAction, timeoutMs = 4000, intervalMs = 200) {
     return null
 }
 
-async function waitForCondition(check, timeoutMs = 4000, intervalMs = 200) {
+async function waitForCondition(check, timeoutMs = WAIT_FOR_CONDITION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_CONDITION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
@@ -4034,7 +4076,7 @@ async function waitForCondition(check, timeoutMs = 4000, intervalMs = 200) {
     return false
 }
 
-function waitForConditionOrDomMutation(check, timeoutMs = 4000, intervalMs = 250) {
+function waitForConditionOrDomMutation(check, timeoutMs = WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_INTERVAL_MS) {
     if(check()) return Promise.resolve(true)
 
     return new Promise(resolve => {
@@ -4068,7 +4110,7 @@ function waitForConditionOrDomMutation(check, timeoutMs = 4000, intervalMs = 250
     })
 }
 
-async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = 5000, intervalMs = 250) {
+async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS) {
     const action = await waitForAction(() => {
         const inverse = getMenuAction(inverseRegex)
         if(inverse) return {state: 'inverse', button: inverse}
@@ -4084,8 +4126,8 @@ async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = 5000, in
 
 async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex, options = {}) {
     const {
-        timeoutMs = 5000,
-        intervalMs = 250,
+        timeoutMs = WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS,
+        intervalMs = WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS,
         promotionReason = 'profile-menu-action-not-found',
         silent = false,
         allowForegroundFallback = false
@@ -4118,7 +4160,7 @@ async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex
     return waitForMenuState(primaryRegex, inverseRegex, timeoutMs, intervalMs)
 }
 
-async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = 2500, intervalMs = 200, silent = false, allowForegroundFallback = false) {
+async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = READ_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = READ_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
     const opened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!opened) return null
 
@@ -4134,7 +4176,7 @@ async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = 2500
     return state?.state || null
 }
 
-async function waitForProfileMenuState(expectedState, primaryRegex, inverseRegex, timeoutMs = 8000, intervalMs = 500, silent = false, allowForegroundFallback = false) {
+async function waitForProfileMenuState(expectedState, primaryRegex, inverseRegex, timeoutMs = WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
@@ -4196,7 +4238,7 @@ function isProfileLoadedAndLiveUnblocked() {
         !!getProfileMenuButton()
 }
 
-async function waitForVerifiedProfileUnblocked(timeoutMs = 8000, intervalMs = 250, silent = false, allowForegroundFallback = false) {
+async function waitForVerifiedProfileUnblocked(timeoutMs = WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
     const verified = await waitForConditionOrDomMutation(() => {
         return isProfileVisiblyUnblocked() || !!getMenuAction(isBlockActionLabel)
     }, timeoutMs, intervalMs)
@@ -4297,7 +4339,7 @@ function noteProfileBlockMutation() {
     rememberProfileBlocked()
 }
 
-async function waitForVerifiedProfileBlocked(timeoutMs = 8000, intervalMs = 250) {
+async function waitForVerifiedProfileBlocked(timeoutMs = WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS) {
     const directBlocked = await waitForCondition(() => isProfileBlocked({ignoreHints: true}), timeoutMs, intervalMs)
     if(directBlocked) return true
 
@@ -4408,7 +4450,7 @@ async function requestCloseTab(attempts = 3, delayMs = 150, scheduleFollowUps = 
     return false
 }
 
-async function waitForProfileActionReady(timeoutMs = 5000) {
+async function waitForProfileActionReady(timeoutMs = WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS) {
     if(isProfileBlocked()) return true
     return waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton(), timeoutMs, 100)
 }
@@ -10643,6 +10685,19 @@ async function maybeRunAutoProfileAction() {
     if(autoProfileAction === undefined) {
         autoProfileActionAttempts += 1
         if(getPageType() === 'profile' && !coordinatorQueueLoaded) {
+            // init() only calls refreshCoordinatorQueueFromRuntime once, with
+            // a 3s budget -- if the SW is busy right at page load (e.g. mid
+            // reconcile of a large backlog) that one attempt can time out,
+            // and nothing else ever retries it. Without this, that leaves
+            // coordinatorQueueLoaded permanently false for the rest of this
+            // page's life, so this branch loops forever re-checking the same
+            // stale flag and claim-tab-action is never even attempted --
+            // even though other message handlers (close-if-blocked) keep
+            // responding fine, since they don't depend on this flag. Kicking
+            // the sync again here (it has its own throttle/dedup) gives a
+            // transient SW hiccup a chance to self-heal instead of stranding
+            // the tab for its full retry-budget lifetime.
+            void refreshContentPageCoordinatorStateFromRuntime()
             setTimeout(() => void maybeRunAutoProfileAction(), QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS)
             return
         }
@@ -12344,7 +12399,7 @@ async function unmuteProfileBestEffort(options = {}) {
     return {ok: true, changed: true, reason: 'unmute-clicked-unverified'}
 }
 
-async function waitForCanonicalProfileActionRoute(profileHref, timeoutMs = 5000) {
+async function waitForCanonicalProfileActionRoute(profileHref, timeoutMs = WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS) {
     if(!profileHref) return false
 
     let canonicalPath = ''
@@ -13029,7 +13084,7 @@ function dispatchEscapeKey() {
     document.dispatchEvent(new KeyboardEvent('keyup', eventInit))
 }
 
-async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowForegroundFallback = false) {
+async function ensureProfileMenuOpen(timeoutMs = ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS, silent = false, allowForegroundFallback = false) {
     if(isProfileMenuOpen()) return true
 
     await dismissNonProfileMenuSurface()
@@ -13103,7 +13158,7 @@ async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowFore
     return true
 }
 
-async function closeProfileMenu(timeoutMs = 1500) {
+async function closeProfileMenu(timeoutMs = CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS) {
     if(!isProfileMenuOpen()) return true
 
     dispatchEscapeKey()

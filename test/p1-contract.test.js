@@ -128,6 +128,9 @@ function loadDashboardHarness() {
     const context = {
         require(name) {
             if(name === 'webextension-polyfill') return {}
+            if(name === './jobState') return require(path.join(__dirname, '..', 'shared/js/jobState'))
+            if(name === './swCoordinatorStatusRules') return require(path.join(__dirname, '..', 'shared/js/swCoordinatorStatusRules'))
+            if(name === './timeouts') return require(path.join(__dirname, '..', 'shared/js/timeouts'))
             throw new Error(`unexpected require: ${name}`)
         },
         addEventListener() {},
@@ -2631,7 +2634,7 @@ test('service-worker-owned status is visible to source-page run waits', () => {
     const sweepMessageStart = bootstrap.indexOf("request.action === 'sweep-owned-blocked-profile-tabs'")
     const messageBody = bootstrap.slice(messageStart, cleanupMessageStart)
     const cleanupMessageBody = bootstrap.slice(cleanupMessageStart, sweepMessageStart)
-    const waitBody = extractFunction(contentSource, 'async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalMs = 1000, options = {})')
+    const waitBody = extractFunction(contentSource, 'async function waitForOwnedNukeTabsToDrain(button, timeoutMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS, options = {})')
 
     assert.match(statusBody, /const runId = `\$\{options\?\.runId \|\| ''\}`\.trim\(\)/)
     assert.match(statusBody, /options\?\.cleanup === true/)
@@ -3278,7 +3281,7 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     assert.match(body, /classificationGeneratedAt/)
     assert.ok(
         body.indexOf('const executorClassification = await classifyCoordinatorExecutorState') <
-        body.indexOf('for(const [itemKey, item] of Object.entries(queue))')
+        body.indexOf('for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue))')
     )
     assert.match(body, /let requeued = 0/)
     assert.doesNotMatch(body, /requeuedMissingActiveTabQueuedForFill/)
@@ -4290,6 +4293,34 @@ test('profile queued action claim starts after durable queue state loads', () =>
     assert.match(nudgeBody, /void maybeRunAutoProfileAction\(\)/)
 })
 
+test('queued action claim retries the durable queue sync instead of waiting on a permanently stale flag', () => {
+    // Regression for a live 2026-09-12 incident: init() calls
+    // refreshCoordinatorQueueFromRuntime exactly once, with a 3s budget.
+    // If the SW is busy right at page load (e.g. mid reconcile of a large
+    // backlog) that one attempt can time out, and nothing else was retrying
+    // it -- coordinatorQueueLoaded stayed false for that page's entire
+    // life, so this branch looped forever re-checking the same stale flag
+    // and claim-tab-action was never even attempted, even though other
+    // message handlers (close-if-blocked) kept responding fine since they
+    // don't depend on this flag. A profile could then sit "active" for its
+    // full retry-budget lifetime doing nothing before finally getting
+    // reconciled back to queued. The retry branch must re-kick the sync
+    // (refreshContentPageCoordinatorStateFromRuntime has its own
+    // throttle/dedup, so calling it repeatedly here is safe) so a
+    // transient SW hiccup can self-heal instead of stranding the tab.
+    const source = readRepoFile('shared/js/content.js')
+    const actionBody = extractFunction(source, 'async function maybeRunAutoProfileAction()')
+    const gateIndex = actionBody.indexOf('!coordinatorQueueLoaded')
+    const refreshCallIndex = actionBody.indexOf('refreshContentPageCoordinatorStateFromRuntime()', gateIndex)
+    const retryTimeoutIndex = actionBody.indexOf('setTimeout(() => void maybeRunAutoProfileAction()', gateIndex)
+
+    assert.notEqual(gateIndex, -1)
+    assert.notEqual(refreshCallIndex, -1)
+    assert.notEqual(retryTimeoutIndex, -1)
+    assert.ok(gateIndex < refreshCallIndex)
+    assert.ok(refreshCallIndex < retryTimeoutIndex)
+})
+
 test('profile block click path does not await nonterminal progress breadcrumbs', () => {
     const body = extractFunction(
         readRepoFile('shared/js/content.js'),
@@ -4527,7 +4558,7 @@ test('profile block flow can resume from an open confirmation dialog', () => {
 
 test('profile menu opening tries background before foreground fallback', () => {
     const source = readRepoFile('shared/js/content.js')
-    const body = extractFunction(source, 'async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowForegroundFallback = false)')
+    const body = extractFunction(source, 'async function ensureProfileMenuOpen(timeoutMs = ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS, silent = false, allowForegroundFallback = false)')
 
     assert.match(source, /function dispatchActivationKey\(element, key = 'Enter'\)/)
     assert.match(body, /dispatchActivationKey\(menu, 'Enter'\)/)
@@ -4985,6 +5016,130 @@ test('isExplicitSecurityVerificationRecord has a single implementation, sourced 
     assert.match(classificationCallBody, /isExplicitSecurityVerificationRecord:\s*isExplicitSecurityVerificationRecordFromJobState/)
 })
 
+// Entropy-reduction Phase 6 item 2 (see entropy-reduction-action-plan-2026-09-09.md):
+// coordinator.js used to carry its own copies of the terminal/active/pending/
+// retryable-failure status predicates, independently drifted from
+// swCoordinatorStatusRules.js's canonical versions (its terminal-status array
+// included a dead 'complete' value the canonical TERMINAL_JOB_STATUSES set
+// never had). Fixed by having coordinator.js's own isTerminalQueueStatus/
+// isActiveQueueItem/isPendingQueueStatus/isRetryableFailedQueueItem delegate
+// to createCoordinatorStatusRules (the same factory sw.js uses) instead of
+// re-declaring the status arrays.
+test('coordinator status predicates delegate to swCoordinatorStatusRules instead of re-declaring status arrays', () => {
+    const coordinatorSource = readRepoFile('shared/js/coordinator.js')
+
+    assert.match(coordinatorSource, /require\('\.\/swCoordinatorStatusRules'\)/)
+    assert.match(coordinatorSource, /createCoordinatorStatusRules\(/)
+
+    const isTerminalQueueStatusBody = extractFunction(coordinatorSource, "function isTerminalQueueStatus(status = '')")
+    const isActiveQueueItemBody = extractFunction(coordinatorSource, 'function isActiveQueueItem(item = {})')
+    const isPendingQueueStatusBody = extractFunction(coordinatorSource, "function isPendingQueueStatus(status = '')")
+    const isRetryableFailedQueueItemBody = extractFunction(coordinatorSource, 'function isRetryableFailedQueueItem(item = null)')
+
+    assert.match(isTerminalQueueStatusBody, /return isTerminalCoordinatorStatus\(status\)/)
+    assert.match(isActiveQueueItemBody, /return isActiveCoordinatorStatus\(item\?\.status\)/)
+    assert.match(isPendingQueueStatusBody, /return isPendingCoordinatorStatus\(status\)/)
+    assert.match(isRetryableFailedQueueItemBody, /return isRetryableCoordinatorFailure\(item\)/)
+
+    assert.doesNotMatch(coordinatorSource, /'succeeded',\s*'failed',\s*'skipped',\s*'canceled',\s*'complete'/)
+})
+
+// Entropy-reduction Phase 4, Option B (see entropy-reduction-action-plan-
+// 2026-09-09.md, "retried and landed via a sync/async split"): the 10
+// `load*Projection` functions in sw.js used to each re-declare a
+// byte-identical "hydrate WAL store, then recover queue from it" recipe.
+// An earlier attempt extracted the WHOLE recipe (including the `await`)
+// into one async helper and broke two fake-timer tests by adding a
+// microtask tick; the fix that actually preserved timing extracts only the
+// purely-synchronous "walStore -> queue" half as a plain function, leaving
+// each site's own `await loadCoordinatorQueueWalStoreFromStorage(...)`
+// inline. This tripwire asserts that shape stays in place: the helper
+// exists and is not itself `async`/promise-returning, and each site calls
+// it rather than re-declaring `recoverCoordinatorQueueFromWal(...).queue`
+// inline.
+test('coordinator queue-projection loaders delegate the WAL-to-queue recovery step to a plain (non-async) helper', () => {
+    const source = readRepoFile('shared/js/sw.js')
+
+    const helperBody = extractFunction(source, 'function recoverQueueFromWalStore(queueSnapshot, walStore)')
+    assert.doesNotMatch(source, /async function recoverQueueFromWalStore/)
+    assert.match(helperBody, /recoverCoordinatorQueueFromWal\(/)
+
+    const loaderNames = [
+        'loadCoordinatorQueueProjection',
+        'loadCoordinatorQueueRunsProjection',
+        'loadCoordinatorQueueRunsProgressProjection',
+        'loadCoordinatorQueueRunsScopedProgressProjection',
+        'loadCoordinatorCurrentAuthorityState',
+        'loadCoordinatorQueueRunsEventsProjection',
+        'loadCoordinatorQueueRunsEventsProgressProjection',
+        'loadCoordinatorReconcileProjection',
+        'loadCoordinatorQueueRunsPendingProjection',
+        'loadCoordinatorQueueRunsProgressPendingNukedProjection'
+    ]
+    for(const name of loaderNames) {
+        const signature = name === 'loadCoordinatorCurrentAuthorityState'
+            ? `async function ${name}(defaults = {})`
+            : `async function ${name}(options = {})`
+        const body = extractFunction(source, signature)
+        assert.match(body, /const queue = recoverQueueFromWalStore\(queueSnapshot, walStore\)/, `${name} should delegate to recoverQueueFromWalStore`)
+        assert.doesNotMatch(body, /recoverCoordinatorQueueFromWal\(/, `${name} should not re-declare the WAL recovery call inline`)
+    }
+})
+
+// Queue processing order (2026-09-11/12, see entropy-reduction-action-plan-
+// 2026-09-09.md "queue processing order"): a plain JS object never reorders
+// an existing key on reassignment, so a chronically-failing coordinator
+// queue item stayed at whatever position it first landed at, indefinitely,
+// and could starve fresher work sitting behind it -- confirmed live as the
+// cause of a bulk-campaign item repeatedly reopening tabs while hundreds of
+// untouched items never got a turn. Fixed with a second index: each item
+// carries an explicit `queueSequence` (jobState.js's
+// getNextCoordinatorQueueSequence), assigned fresh on enqueue and on every
+// retry-to-queued transition, and swqueueRuntime.js maintains an in-memory
+// list of queue keys sorted by that sequence, rebuilt whenever the resident
+// authority state refreshes. This tripwire asserts the mechanism stays
+// wired: the sequence helper exists and is monotonic, the reducer threads
+// it through on retry/enqueue, the ordered-index functions exist in
+// swqueueRuntime.js, and the two priority-sensitive executor scans consume
+// it instead of raw `Object.entries(queue)` insertion order.
+test('coordinator queue processing order comes from an explicit queueSequence index, not incidental object insertion order', () => {
+    const jobStateSource = readRepoFile('shared/js/jobState.js')
+    const swSource = readRepoFile('shared/js/sw.js')
+    const queueRuntimeSource = readRepoFile('shared/js/swqueueRuntime.js')
+    const progressReducerSource = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
+
+    const nextSequenceBody = extractFunction(jobStateSource, 'function getNextCoordinatorQueueSequence(queue = {})')
+    assert.match(nextSequenceBody, /return max \+ 1/)
+    assert.match(jobStateSource, /getNextCoordinatorQueueSequence,/)
+
+    const reduceEventBody = extractFunction(jobStateSource, 'function reduceJobEvent(item = {}, event = {})')
+    assert.match(reduceEventBody, /queueSequence: Number\.parseInt\(event\.queueSequence, 10\) \|\| item\.queueSequence \|\| 0/)
+
+    assert.match(swSource, /getNextCoordinatorQueueSequence,\s*\n\s*getQueueItemExecutorTabAction,/)
+
+    const rebuildBody = extractFunction(queueRuntimeSource, 'function rebuildQueueOrder(queue = {})')
+    assert.match(rebuildBody, /leftSequence - rightSequence/)
+    assert.match(queueRuntimeSource, /function getOrderedQueueKeys\(\)/)
+    assert.match(queueRuntimeSource, /function getOrderedQueueItems\(queue = \{\}\)/)
+
+    const refreshBody = extractFunction(swSource, "function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')")
+    assert.match(refreshBody, /queueRuntime\.rebuildQueueOrder\(/)
+
+    const classifyBody = extractFunction(swSource, 'async function classifyCoordinatorExecutorState(options = {})')
+    assert.match(classifyBody, /for\(const \[itemKey, item\] of queueRuntime\.getOrderedQueueItems\(queue\)\)/)
+    assert.doesNotMatch(classifyBody, /for\(const \[itemKey, item\] of Object\.entries\(queue\)\)/)
+
+    const applyPhaseBody = extractFunction(swSource, 'async function runCoordinatorExecutorApplyPhase(reason = \'coordinator-executor-apply\', options = {})')
+    assert.match(applyPhaseBody, /for\(const \[itemKey, item\] of queueRuntime\.getOrderedQueueItems\(queue\)\)/)
+
+    const retryAdvanceBody = extractFunction(swSource, 'async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {})')
+    assert.match(retryAdvanceBody, /const nextQueueSequence = getNextCoordinatorQueueSequence\(queue\)/)
+    assert.match(retryAdvanceBody, /queueSequence: nextQueueSequence/)
+
+    const progressRetryBody = extractFunction(progressReducerSource, 'function transitionCoordinatorItemFromProgress(item = {}, record = {}, mapped = {}, options = {})')
+    assert.match(progressRetryBody, /queueSequence: Number\.parseInt\(options\.queueSequence, 10\) \|\|/)
+})
+
 // Entropy-reduction Phase 6 (see entropy-reduction-action-plan-2026-09-09.md,
 // "Make Phase 5 enforceable, not just readable"): a generic, mechanical
 // tripwire for Pattern 6 (duplicated constants across files) that doesn't
@@ -5003,6 +5158,48 @@ test('isExplicitSecurityVerificationRecord has a single implementation, sourced 
 // literal declaration would. Deliberately narrow (single-line simple
 // string literals only, three files only) to keep false positives near
 // zero; broadening scope is easy later if it proves valuable.
+// Entropy-reduction Pattern 8 (see entropy-reduction-action-plan-2026-09-09.md
+// and ../../memory feedback-symbolic-timeout-registry): content.js's,
+// coordinator.js's, and sw.js's wait-loop-family functions used to invent
+// their own bare numeric `timeoutMs`/`intervalMs` default parameter values,
+// with no shared vocabulary for what a given wait represents. Migrated to
+// named constants in shared/js/timeouts.js. This is a generic, mechanical
+// tripwire (same shape as the duplicate-constant scan below) rather than a
+// hand-written list, so it also catches any *new* wait-loop function added
+// later with a bare literal default instead of a timeouts.js constant.
+test('wait-loop functions in content.js/coordinator.js/sw.js use named timeouts.js constants, not bare numeric defaults', () => {
+    const bareLiteralDefaultPattern = /\b(?:timeoutMs|intervalMs)\s*=\s*[0-9]+\b/
+
+    for(const relativePath of ['shared/js/content.js', 'shared/js/coordinator.js', 'shared/js/sw.js']) {
+        const source = readRepoFile(relativePath)
+        const match = source.match(bareLiteralDefaultPattern)
+        assert.equal(match, null, `${relativePath} has a bare numeric timeoutMs/intervalMs default (${match?.[0]}); add a named constant to shared/js/timeouts.js instead`)
+    }
+
+    const timeoutsSource = readRepoFile('shared/js/timeouts.js')
+    for(const name of [
+        'WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_CONDITION_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS',
+        'READ_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS',
+        'ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS',
+        'WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS',
+        'CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS',
+        'SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS',
+        'COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS',
+        'COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS',
+        'WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS'
+    ]) {
+        assert.match(timeoutsSource, new RegExp(`${name}:\\s*[0-9]+`))
+    }
+})
+
 test('no SCREAMING_SNAKE_CASE string constant is independently declared as a literal in more than one of content.js/sw.js/jobState.js', () => {
     // Pre-existing duplicates this check found the first time it ran
     // (2026-09-10) -- real instances of Pattern 6, not newly introduced by

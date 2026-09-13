@@ -1,4 +1,42 @@
 const browser = require('webextension-polyfill')
+const {
+    isRetryableJobFailure,
+    isRetryableJobFailureFromProgress,
+    isTerminalJobStatus,
+    UNBLOCK_UNMUTE_ACTION_KIND
+} = require('./jobState')
+const {
+    createCoordinatorStatusRules
+} = require('./swCoordinatorStatusRules')
+const {
+    COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS,
+    COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
+} = require('./timeouts')
+
+// coordinatorStatusRules is the same factory sw.js uses, so
+// isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
+// isRetryableFailedQueueItem below delegate to it instead of maintaining
+// their own copies of the status arrays (2026-09-10 entropy-reduction fix:
+// this file's arrays had drifted -- isTerminalQueueStatus's ['succeeded',
+// 'failed', 'skipped', 'canceled', 'complete'] included a dead 'complete'
+// value no queue item status is ever actually set to; canonical
+// TERMINAL_JOB_STATUSES in jobState.js has never included it).
+const coordinatorStatusRules = createCoordinatorStatusRules({
+    constants: {
+        UNBLOCK_UNMUTE_ACTION_KIND
+    },
+    handlers: {
+        isTerminalJobStatus,
+        isRetryableJobFailure,
+        isRetryableJobFailureFromProgress
+    }
+})
+const {
+    isTerminalCoordinatorStatus,
+    isActiveCoordinatorStatus,
+    isPendingCoordinatorStatus,
+    isRetryableCoordinatorFailure
+} = coordinatorStatusRules
 
 const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
 const COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns'
@@ -194,7 +232,7 @@ async function refreshDashboardStateFromCompactStorage() {
     return dashboardCompactRefreshPromise
 }
 
-async function sendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = 5000) {
+async function sendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS) {
     const timeoutMarker = {timedOut: true}
     const timeout = new Promise(resolve => setTimeout(() => resolve(timeoutMarker), timeoutMs))
     const result = await Promise.race([
@@ -263,7 +301,7 @@ async function startCoordinatorQueue() {
         action: 'resume-coordinator-queue',
         allowBeforeQuora: true,
         userInitiated: true
-    }, null, 10000).catch(error => ({
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
 
@@ -281,7 +319,7 @@ async function startCoordinatorQueue() {
 
 async function announceCoordinatorPageReady() {
     try {
-        return await sendRuntimeMessageWithTimeout({action: 'coordinator-page-ready'}, null, 5000)
+        return await sendRuntimeMessageWithTimeout({action: 'coordinator-page-ready'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
     }
     catch {}
     return null
@@ -289,7 +327,7 @@ async function announceCoordinatorPageReady() {
 
 async function resetMetrics() {
     try {
-        const result = await sendRuntimeMessageWithTimeout({action: 'reset-queue-wakeup-metrics'}, null, 5000)
+        const result = await sendRuntimeMessageWithTimeout({action: 'reset-queue-wakeup-metrics'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
         if(result?.reset) {
             await loadState()
             render()
@@ -336,7 +374,7 @@ async function refreshCompactQueueView() {
     const result = await sendRuntimeMessageWithTimeout({
         action: 'refresh-coordinator-queue-view',
         reason: 'dashboard-load-missing-view'
-    }, null, 10000)
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     if(hasCoordinatorQueueView(result?.view)) {
         applyCoordinatorQueueView(result.view)
         return true
@@ -372,7 +410,7 @@ async function refreshCompactMetricsView() {
     const result = await sendRuntimeMessageWithTimeout({
         action: 'refresh-queue-wakeup-metrics-view',
         reason: 'dashboard-load-missing-view'
-    }, null, 10000)
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     if(hasQueueWakeupMetricsView(result?.view)) {
         state.metrics = normalizeMetrics(result.view)
         return true
@@ -609,12 +647,7 @@ function getQueuedCoordinatorQueueCount() {
 }
 
 function isRetryableFailedQueueItem(item = null) {
-    if(`${item?.status || ''}` !== 'failed') return false
-    const outcome = `${item?.outcome || ''}`.trim()
-    if(outcome === 'security-verification') return false
-    if(outcome === 'timeout' || outcome === 'action-error') return true
-
-    return /timeout|timed out|stale|interrupted/i.test(`${item?.error || ''}`)
+    return isRetryableCoordinatorFailure(item)
 }
 
 function getRetryFailedCount(item = null) {
@@ -709,7 +742,7 @@ async function requeueFailed() {
 
     const result = await sendRuntimeMessageWithTimeout({
         action: 'requeue-coordinator-failed'
-    }, null, 10000).catch(error => ({
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
 
@@ -761,7 +794,7 @@ async function requeueFailedItem(item = {}) {
         storageKey,
         coordinatorKey: storageKey,
         profileHref
-    }, null, 10000).catch(error => ({
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
 
@@ -842,7 +875,7 @@ async function toggleCurrentWorkPause() {
     currentWorkPausePending = wasPaused ? 'resume' : 'pause'
     render()
     const action = state.paused ? 'resume-paused-coordinator-nukes' : 'pause-coordinator-nukes'
-    const result = await sendRuntimeMessageWithTimeout({action}, null, 10000).catch(error => ({
+    const result = await sendRuntimeMessageWithTimeout({action}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
     retryFailedLastResult = {
@@ -945,7 +978,7 @@ function syncCoordinatorQueueResume(queueItems = []) {
 async function resumeCoordinatorQueue() {
     if(resumeCoordinatorQueuePromise) return resumeCoordinatorQueuePromise
 
-    resumeCoordinatorQueuePromise = sendRuntimeMessageWithTimeout({action: 'resume-coordinator-queue'}, null, 5000)
+    resumeCoordinatorQueuePromise = sendRuntimeMessageWithTimeout({action: 'resume-coordinator-queue'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
         .catch(() => null)
         .finally(() => {
             resumeCoordinatorQueuePromise = null
@@ -1049,11 +1082,11 @@ function isTerminalQueueItem(item) {
 }
 
 function isTerminalQueueStatus(status = '') {
-    return ['succeeded', 'failed', 'skipped', 'canceled', 'complete'].includes(`${status || ''}`)
+    return isTerminalCoordinatorStatus(status)
 }
 
 function isActiveQueueItem(item = {}) {
-    return ['opening', 'active', 'acting', 'settling'].includes(`${item?.status || ''}`.trim())
+    return isActiveCoordinatorStatus(item?.status)
 }
 
 function isActualBlockSuccess(item = {}) {
@@ -1309,7 +1342,7 @@ function formatSecondsPerBlock(result = null) {
 }
 
 function isPendingQueueStatus(status = '') {
-    return status === 'queued' || ['opening', 'active', 'acting', 'settling'].includes(`${status || ''}`.trim())
+    return isPendingCoordinatorStatus(status)
 }
 
 function setText(id, value) {
