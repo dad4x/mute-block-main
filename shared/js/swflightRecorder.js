@@ -43,7 +43,9 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "blocked-sweep-terminal-result",
     "closed-before-terminal-requeue",
     "tab-action-claim",
-    "tab-action-release"
+    "tab-action-release",
+    "close-if-blocked-sent",
+    "close-if-blocked-response"
 ])
 
 let flightRecorderSeq = 0

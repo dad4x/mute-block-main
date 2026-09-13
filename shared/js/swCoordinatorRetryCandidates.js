@@ -181,7 +181,8 @@ function createCoordinatorRetryCandidates(deps = {}) {
             attemptNumber,
             at: now,
             retryCount,
-            lastRetryAt
+            lastRetryAt,
+            queueSequence: Number.parseInt(options.queueSequence, 10) || item.queueSequence || 0
         })
         const retryBase = reducedRetry.accepted ? reducedRetry.item : item
         const executorMaxConcurrent = Number.parseInt(options.maxConcurrent, 10) || 0

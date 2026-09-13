@@ -595,3 +595,260 @@ Windows/Cygwin executable-bit regression) before Phase 6 started. The
 exec-bit issue is confirmed recurring on every `git add -A` on this
 checkout, not a one-time fluke — `git config core.fileMode false` would
 stop it, left for the user to decide.
+
+### Phase 6 item 2 follow-up (2026-09-10): fixed the confirmed drift
+
+The `isTerminalQueueStatus`/`isActiveQueueItem`/`isPendingQueueStatus`/
+`isRetryableFailedQueueItem` duplication flagged above is fixed. `coordinator.js`
+now requires `./jobState` and `./swCoordinatorStatusRules` and constructs the
+same `createCoordinatorStatusRules` factory `sw.js` uses; the four local
+functions became one-line delegations to `isTerminalCoordinatorStatus`/
+`isActiveCoordinatorStatus`/`isPendingCoordinatorStatus`/
+`isRetryableCoordinatorFailure` instead of re-declaring the status arrays. The
+dead `'complete'` value is gone from the terminal-status check as a result
+(confirmed nothing in the codebase ever emits it — the only other `'complete'`
+usages are unrelated `chrome.tabs.onUpdated` `changeInfo.status` checks in
+`swBootstrap.js`). `test/p1-contract.test.js`'s `loadDashboardHarness()` sandbox
+had a fixed require-allowlist (`webextension-polyfill` only) left over from
+when `coordinator.js` had no local requires beyond that; extended it to also
+resolve `./jobState` and `./swCoordinatorStatusRules` to the real modules
+(not mocks) so the sandboxed dashboard tests still exercise real status logic.
+Added a new tripwire test asserting the delegation stays in place. Full
+`npm run test:parallel` green with zero other test changes needed — same
+strong behavior-preservation signal as the Option C wrapper work.
+
+The `RETRY_FAILED_LIMIT` scattered-literal duplicate and the six storage-key
+duplicates noted in the Phase 6 item 2 findings above are still open —
+narrower, lower-severity, left for a future pass.
+
+## Phase 4, Option B — attempted and reverted (2026-09-10)
+
+User approved starting on Options A/B together with the symbolic timeout
+registry. Attempted Option B's WAL-recovery half first (the lower-risk half
+per the recon): extracted the byte-identical 5-line "hydrate WAL store from
+just-read stored payload, recover queue from it" recipe shared by the 10
+`load*Projection` functions (`loadCoordinatorQueueProjection` through
+`loadCoordinatorQueueRunsProgressPendingNukedProjection`) into one helper,
+`recoverCoordinatorQueueFromStoredProjection(stored, metricPath)`, called
+from each site instead of re-declaring the recipe.
+`closeRuntimeTabsReclaimedByAuthority` was deliberately left out of the
+helper (its 2-of-14 call-site asymmetry, noted in the findings above, is a
+real side effect, not a data-shape detail) — that part of the extraction was
+correct and is not why this was reverted.
+
+**Reverted because it broke two `swSynthetic.test.js` tests**: "executor
+apply defers queued-authority enqueue when capacity is throttled" and
+"executor apply defers queued-authority final open timeout despite unrelated
+runtime surface", both fake-timer tests racing a queue-read-and-recover
+chain against a separately-resolving queued-tab-fill promise. Root cause:
+wrapping the shared recipe in its own function -- even a plain function
+returning a `.then()` chain, not just `async`/`await` -- adds one extra
+microtask tick between "WAL store hydrated" and "queue recovered" versus
+having those two `await` statements inline in the caller's own async body.
+That extra tick was enough to flip which side of a fake-timer-driven race
+resolved first in these two tests. Confirmed by reverting to plain
+`async`/`await` inline in a temp version, then to a `.then()`-chain
+version of the helper -- both still failed the same two tests, so this
+isn't an async/await-style artifact, it's inherent to introducing *any*
+separate function boundary into this particular hot path.
+
+**Why this matters beyond these two tests**: it means the "byte-identical
+recipe" finding from the recon was right about the *data shape* but missed
+a *timing* coupling between this read path and at least one concurrent
+promise elsewhere in the executor-apply flow -- a coupling nothing in the
+recipe's own text reveals, only observable through exactly this kind of
+fake-timer test. Only 2 of 46 synthetic test shards caught it; a codebase
+without this level of fake-timer test coverage would have shipped the
+regression silently. Treat any future attempt at Option A (which touches
+the same recipe, just with more call sites and a bigger option surface) as
+carrying this same risk, not just the flag-auditing risk called out in the
+original findings.
+
+**Current state**: fully reverted (`git diff shared/js/sw.js` is clean
+again after this attempt), full `npm run test:parallel` green. Options A
+and B remain deferred, now with this additional caution attached. The
+symbolic timeout registry (Pattern 8) work is unaffected and proceeds
+separately.
+
+## Phase 4, Option B — retried and landed via a sync/async split (2026-09-11)
+
+The revert above correctly identified *that* any extra function boundary
+between "WAL store hydrated" and "queue recovered" adds a microtask tick,
+but not *why*: the all-async helper wrapped both the genuinely-async step
+(`await loadCoordinatorQueueWalStoreFromStorage(...)`, already a call into
+an existing shared function at every site) and the purely-synchronous step
+after it (`recoverCoordinatorQueueFromWal(...).queue`) inside one new
+`async` function. Returning from *any* async function function costs a
+promise-resolution tick, independent of whether the body uses `await` or
+`.then()` — that tick is what broke the race, not a stylistic choice.
+
+**The fix**: extract only the synchronous half as a plain (non-`async`,
+non-promise-returning) function, and leave each site's own
+`await loadCoordinatorQueueWalStoreFromStorage(...)` inline, unchanged:
+
+```js
+function recoverQueueFromWalStore(queueSnapshot, walStore) {
+    return runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
+        queueSnapshot,
+        walStore
+    )).queue
+}
+```
+
+Each of the 10 `load*Projection` sites now reads:
+```js
+const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {...})
+const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
+```
+A plain synchronous function call never yields to the microtask queue, so
+this is tick-for-tick identical to the original inline code while still
+giving the duplicated recipe (the part that was actually repeated 10 times)
+a single definition. `closeRuntimeTabsReclaimedByAuthority` stays out of
+the helper for the same reason as the first attempt (2-of-14 call-site
+side effect, not a data-shape detail).
+
+**A continuation-passing variant was also tried and empirically failed**,
+worth recording so it isn't retried blind: passing the caller's
+post-recovery logic in as a callback invoked from inside a shared
+`.then()` (so the callback runs in the *same* promise settlement as
+"walStore resolved," rather than a second caller-owned continuation after
+its own `await`) was hypothesized to also avoid the extra tick. It didn't
+— tested against the same two functions, it still broke the identical
+fake-timer race (and one more test besides: 3 failures instead of 2).
+Returning a promise from the outer `async` arrow (`return
+withRecoveredCoordinatorQueue(...)`, deliberately not `await`ed) still
+requires the engine to adopt it as a thenable, which costs its own tick
+regardless of the `await`-vs-`.then()` styling. **The generalizable lesson**:
+in this specific hot path, the only change that is provably tick-neutral is
+one where the shared extraction contains zero `async` functions and zero
+promise-returning functions in the call chain between the caller's
+existing `await` and its next synchronous statement — sync/async
+boundaries matter, not code style.
+
+Verified against both previously-failing tests directly, then the full
+`npm run test:parallel` (all 46 synthetic shards, contract, unit, wal,
+scenario, lint) — fully green, zero other test changes needed.
+
+## Pattern 8 — symbolic timeout registry, built (2026-09-10)
+
+User explicitly triggered this (overriding the reactive-only policy in
+[[feedback-symbolic-timeout-registry]] project memory) after the Option B
+revert, choosing the full-build option over a minimal single-bug seed.
+
+New module `shared/js/timeouts.js` exports named `*_MS` constants, one per
+wait-loop function's own default parameter value (not deduplicated by
+number -- two waits sharing a value today aren't necessarily the same kind
+of wait, so each keeps an independently-tunable name). Scope, precisely:
+
+- **content.js** (14 functions): `waitForAction`, `waitForCondition`,
+  `waitForConditionOrDomMutation`, `waitForMenuState` (and its
+  `WithForegroundFallback` sibling's options default), `readProfileMenuState`,
+  `waitForProfileMenuState`, `ensureProfileMenuOpen`,
+  `waitForVerifiedProfileUnblocked`, `waitForVerifiedProfileBlocked`,
+  `waitForProfileActionReady`, `waitForCanonicalProfileActionRoute`,
+  `waitForOwnedNukeTabsToDrain`, `closeProfileMenu`,
+  `safeSendRuntimeMessageWithTimeout`.
+- **coordinator.js**: `sendRuntimeMessageWithTimeout`'s own default, plus
+  its 9 explicit call-site overrides (6× the `10000` mutation-timeout
+  literal, 3× a redundant explicit `5000` matching the default) collapsed
+  onto two named constants, `COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS`/
+  `COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS`.
+- **sw.js**: one stray instance found while grepping for the pattern,
+  `waitForUserStartDurableActivation`'s `timeoutMs = 15000` default --
+  everything else in sw.js already used named constants (`sendRuntimeMessage
+  WithTimeout`-style helpers weren't the norm there).
+
+**Deliberately out of scope**: the much larger set of explicit per-call-site
+`waitFor*(..., customTimeoutMs, customIntervalMs)` overrides in content.js
+(dozens of one-off calls) -- these stay scattered literals, migrated
+opportunistically as each is independently touched, per the original
+memory note's own migration plan. Forcing every one-off number into a
+uniquely-named, never-reused constant now would relabel entropy rather than
+reduce it; the function defaults are the real shared "dial" every
+unspecified call site inherits.
+
+**Risk profile, contrasted with the Option B revert above**: this is a pure
+value-for-name substitution at the exact same call-site position -- no new
+function-call boundaries, no new `await` points, no control-flow change, so
+none of Option B's microtask-timing risk applies. Confirmed by the full
+`npm run test:parallel` run: all 46 synthetic fake-timer shards passed
+unchanged (the class of test that caught the Option B regression), plus
+`p1-contract`'s two `extractFunction`-based signature-anchor tests updated
+to match the new parameter text. Added a new generic tripwire, `'wait-loop
+functions in content.js/coordinator.js/sw.js use named timeouts.js
+constants, not bare numeric defaults'`, scanning all three files for any
+`timeoutMs`/`intervalMs` bare-literal default -- catches regressions and
+any new wait-loop function added later without a registry entry.
+
+Rebuilt as `1.6.1231` (`npm run prod` and `npm run build:chrome-dev` both
+green); no live CDP smoke test performed this pass -- no Chrome debug
+session was running at the time, and the change's risk profile (proven
+value-identical substitution, not a control-flow change) didn't seem to
+warrant starting one solely for this. Worth a live check next time a
+Chrome-dev session is up anyway.
+
+## Live-testing find: profile button insertion delay (2026-09-11)
+
+Not from the audit -- found during live testing on the freshly-built
+`1.6.1232` extension. User reported the mute/block buttons taking a
+noticeably long time (~8s observed) to appear on profile pages.
+
+**Root-caused with a live trace, not guesswork.** Injected temporary
+`console.log` checkpoints through `content.js`'s `init()` and `sw.js`'s
+`getContentPageCoordinatorState`/`rebuildContentPageStateProjectionFromCurrentState`,
+rebuilt, reloaded, and captured real timestamps from a fresh page reload
+(both from the content-script side and the service-worker side). Confirmed
+via direct DOM-timing trace on two different profiles (one banned, one not
+-- ruling out "banned account" as a special case) that the delay was
+consistently ~6.6-6.8s, and via the injected checkpoints that Quora's own
+profile-menu DOM was already present (`ensureProfileButtons called
+(hasTarget=true)`) by the time our own code finally got around to trying --
+our own code just hadn't tried yet.
+
+**The actual cause**: `content.js`'s `init()` runs its entire page-load
+sequence -- four `chrome.storage.local` reads, `refreshCoordinatorQueueFromRuntime`
+(a runtime message to the service worker, wrapped in its own 3000ms
+timeout), a possible re-save, and `reconcileReloadCanceledNukes()` -- fully
+sequentially and fully `await`ed *before* ever calling `ensureProfileButtons()`
+for the first time on a profile page. None of that work is a real
+dependency of button insertion: `toggleMuteBlockBtn`/`toggleUnblockUnmuteBtn`/
+`injectCloseTabBtn` only read `isProfileBlocked()` and the page's own DOM
+(`getProfileButtonInsertionTarget()`), never `settings`, `coordinatorQueue`,
+or `profileNukeProgress`. The two `syncProfileButtons()` callees that *do*
+touch coordinator state (`maybeRecordAlreadyBlockedCoordinatorProfile`,
+`nudgeCurrentProfilePendingClaim`) either do their own scoped refresh or are
+harmlessly re-invoked by `ensureProfileButtons`'s own retry/follow-up cycle
+once the queue arrives -- so nothing breaks if button insertion fires
+before that slower chain completes.
+
+Live-session note, not part of the fix itself: under this session's heavy
+CDP-testing load, individual `chrome.storage.local` operations and runtime
+messages were themselves observed taking many seconds (once even 30+
+seconds on a raw, un-timeout-wrapped `chrome.runtime.sendMessage`) --
+likely contention from the volume of manual testing/reloading this session,
+not a data-volume problem (the actual on-disk `chrome.storage.local`
+backing store for this profile is only ~2.7MB). This wasn't chased to a
+root cause tonight since it didn't require a code change; the button-timing
+fix below is unaffected by it either way -- it removes a *self-imposed*
+sequential dependency regardless of how fast or slow the underlying storage
+happens to be on a given machine.
+
+**The fix**: in `content.js`'s `init()`, moved `maybeRedirectToCanonicalProfileUrl()`
+(pure URL/DOM check, no dependency on the slow chain either) and the
+`initialPage === 'profile'` branch's `ensureProfileButtons()`/
+`scheduleProfileButtonsFollowUps()` calls to fire immediately after
+page-type detection, *before* the settings/coordinator-queue/
+reconcile-canceled-nukes sequence, instead of after it. The other page
+types' dispatch (question, question-log, space-post, space, profile-search)
+were deliberately left in their original position -- the user's reported
+symptom was specific to profile pages, and reordering those too would be
+unvalidated scope creep. Checked all 5 of `p1-contract.test.js`'s existing
+`init()`-body ordering assertions before making the change; none depend on
+the relative position being moved, all still hold.
+
+**Verified with a live before/after trace**: same DOM-timing methodology as
+the initial diagnosis. Fred Waterford's profile: 6701ms -> 192ms. Awakening's
+profile: 6641ms -> 0ms (button already present at the instant of injection).
+Full `npm run test:parallel` green both before and after. Rebuilt/reloaded
+live at `1.6.1235`; `chrome.management` reload report showed 0 manifest/
+runtime errors both times.

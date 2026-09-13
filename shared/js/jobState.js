@@ -237,6 +237,27 @@ function isTerminalJobStatus(status) {
     return TERMINAL_JOB_STATUSES.has(normalizeString(status))
 }
 
+// getNextCoordinatorQueueSequence computes the processing-order value for a
+// freshly-enqueued or freshly-retried queue item: strictly greater than
+// every queueSequence currently in the map, so the item sorts to the back
+// of processing order instead of keeping whatever position it happened to
+// land at when its key was first inserted into the durable queue object (a
+// plain JS object never reorders an existing key on reassignment, so
+// without an explicit sequence field, a chronically-retried item stays at
+// its original position forever and can starve fresher work sitting behind
+// it -- see entropy-reduction-action-plan-2026-09-09.md, "queue processing
+// order", 2026-09-11/12). No separate persisted counter: the next value is
+// always derived from whatever queue is already in hand, so assigning one
+// costs a read, not an extra durable write beyond the item's own record.
+function getNextCoordinatorQueueSequence(queue = {}) {
+    let max = 0
+    for(const item of Object.values(queue || {})) {
+        const sequence = Number.parseInt(item?.queueSequence, 10) || 0
+        if(sequence > max) max = sequence
+    }
+    return max + 1
+}
+
 function isValidJobStatus(status) {
     return VALID_JOB_STATUSES.has(normalizeString(status))
 }
@@ -429,6 +450,7 @@ function reduceJobEvent(item = {}, event = {}) {
             outcome: '',
             error: '',
             retryCount: Number.parseInt(event.retryCount, 10) || item.retryCount || 0,
+            queueSequence: Number.parseInt(event.queueSequence, 10) || item.queueSequence || 0,
             lastRetryAt: Number.parseInt(event.lastRetryAt, 10) || result.item.queuedAt || 0,
             terminalAt: 0
         })
@@ -578,6 +600,7 @@ module.exports = {
     getActionKindForRequestedAction,
     getExecutorTabActionForActionKind,
     getJobMilestonesFromProgress,
+    getNextCoordinatorQueueSequence,
     getQueueItemExecutorTabAction,
     isExplicitSecurityVerificationRecord,
     isRetryableJobFailure,

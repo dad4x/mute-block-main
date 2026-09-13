@@ -293,7 +293,8 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
             now: Number.parseInt(operation.now, 10) || now(),
             resetRetry: operation.resetRetry === true,
-            terminalAtFallback: operation.terminalAtFallback || 'record'
+            terminalAtFallback: operation.terminalAtFallback || 'record',
+            queue
         })
 
         if(JSON.stringify(nextItem) === JSON.stringify(item)) {

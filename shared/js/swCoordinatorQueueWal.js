@@ -216,9 +216,6 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
 
         const keys = new Set([COORDINATOR_QUEUE_WAL_KEY])
         const nextActiveGenerationId = nextMeta?.activeCheckpoint || ''
-        const previousActiveGenerationId = isSegmentedWalStorageMeta(previousMeta)
-            ? `${previousMeta?.activeCheckpoint || ''}`.trim()
-            : ''
         if(isSegmentedWalStorageMeta(previousMeta)) {
             const previousCommittedSegments = previousMeta?.segmentedStorage?.committedSegments || {}
             const previousGenerations = {
@@ -230,9 +227,12 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
                     ]))
             }
             for(const generationId of Object.keys(previousGenerations)) {
-                if(!generationId ||
-                    generationId === nextActiveGenerationId ||
-                    generationId === previousActiveGenerationId) continue
+                // Only the generation that is active AFTER the switch needs to survive --
+                // previousActiveGenerationId is precisely the generation this switch just
+                // retired, so it (and any other already-abandoned generation) must be
+                // cleaned up here, not skipped. Excluding it left every retired
+                // generation's segments orphaned forever, one switch at a time.
+                if(!generationId || generationId === nextActiveGenerationId) continue
                 const committedSegments = getSegmentedWalCommittedSegmentCount(previousMeta, generationId)
                 for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
                     keys.add(getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, generationId, segmentNo))

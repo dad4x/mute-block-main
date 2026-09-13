@@ -3,6 +3,7 @@ const {
     CHECKPOINT_A,
     CHECKPOINT_B,
     activateCheckpoint,
+    applyWalRecord,
     appendWalRecordsToGeneration,
     buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
@@ -110,6 +111,48 @@ test('projects snapshot plus ordered WAL records into current state', () => {
     assert.equal(projected.state.queue['https://www.quora.com/profile/A'].actionStartedAt, 1100)
     assert.equal(projected.state.queue['https://www.quora.com/profile/A'].terminalAt, 1200)
     assert.deepEqual(projected.ignored, [])
+})
+
+test('applyWalRecord shallow-copies state instead of deep-cloning untouched rows and areas', () => {
+    // Regression for the 2026-09-12 replay-cost incident: applyWalRecord
+    // used to do `cloneJson(state)` -- a full JSON.stringify/parse
+    // round-trip of the ENTIRE state -- on every single record, including
+    // every already-completed row that record had nothing to do with.
+    // Replaying N records against a queue with hundreds of accumulated
+    // terminal rows cost O(N * totalQueueSize), which only got worse the
+    // more items the coordinator successfully finished, independent of the
+    // WAL segment-count fix (which bounds record count, not queue size).
+    // Every branch here already rebuilds only the touched area/row from
+    // scratch, so untouched rows and areas must survive by reference.
+    const rowA = {status: 'queued', attemptId: 'a', attemptNumber: 1}
+    const rowB = {status: 'queued', attemptId: 'b', attemptNumber: 1}
+    const progress = {'https://www.quora.com/profile/A': {status: 'blocking'}}
+    const runs = {'run-1': {id: 'run-1', status: 'active'}}
+    const state = {
+        queue: {
+            'row-a': rowA,
+            'row-b': rowB
+        },
+        progress,
+        runs
+    }
+
+    const result = applyWalRecord(state, {
+        seq: 1,
+        id: 'record-1',
+        kind: 'map.patch',
+        area: 'queue',
+        key: 'row-a',
+        patch: {status: 'acting'}
+    }, {})
+
+    assert.equal(result.applied, true)
+    assert.equal(result.state.queue['row-a'].status, 'acting')
+    assert.equal(result.state.queue['row-b'], rowB)
+    assert.equal(result.state.progress, progress)
+    assert.equal(result.state.runs, runs)
+    assert.equal(state.queue['row-a'], rowA)
+    assert.equal(state.queue['row-a'].status, 'queued')
 })
 
 test('ignores records already covered by the snapshot sequence', () => {

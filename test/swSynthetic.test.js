@@ -3659,6 +3659,188 @@ test('segmented queue WAL authority read schedules checkpoint switch over soft s
     assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= softSwitchAt)
 })
 
+test('segmented queue WAL forces checkpoint switch over active queue work once growth outruns amortization', async () => {
+    // Regression for the 2026-09-12 CPU-storm incident: the soft-switch
+    // defers the checkpoint switch indefinitely while the queue has active
+    // or queued work (see the "schedules checkpoint switch" test above), so
+    // it amortizes a burst of tiny writes into one checkpoint. But a
+    // long-running batch never goes idle, so that deferral never resolves --
+    // the WAL keeps growing straight toward the hard segment limit (where
+    // appends start getting rejected outright) instead of ever rotating.
+    // Once growth has clearly outrun normal amortization, the switch must be
+    // forced through regardless of pending work.
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Force-Switch'
+    const runId = 'run-segmented-wal-force-switch'
+    const attemptId = 'attempt-segmented-wal-force-switch'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'queued',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150700,
+            updatedAt: 150700,
+            attemptId,
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const forceSwitchAt = 256
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, forceSwitchAt - 1, {
+        rowKey: href,
+        createdAt: 150700
+    })
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150710,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150720,
+            runId,
+            tabId: 542,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+
+    assert.equal(recorded.recorded, true)
+    assert.ok(storage[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', 'A', forceSwitchAt - 1)])
+    const counters = sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentSoftSwitchScheduled'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchDeferredForQueueWork'] || 0, 0)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
+    assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= forceSwitchAt)
+})
+
+test('coordinator storage soft quota warns and then flags once usage approaches the self-imposed ceiling', async () => {
+    // The unlimitedStorage permission (added alongside the 2026-09-12 fix)
+    // removes chrome.storage.local's enforced 10MB cap entirely -- but
+    // "unlimited" traded a hard, visible failure for silent unbounded growth
+    // if a leak like the retired-segment cleanup bug recurs. This self
+    // -imposed 100MB soft quota (COORDINATOR_STORAGE_SOFT_QUOTA_BYTES) with
+    // an 80% warning threshold is the replacement early-warning signal.
+    const href = 'https://www.quora.com/profile/Synthetic-Storage-Soft-Quota'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Storage-Soft-Quota-B'
+    const runId = 'run-storage-soft-quota'
+    const attemptId = 'attempt-storage-soft-quota'
+    const attemptIdB = 'attempt-storage-soft-quota-b'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'queued',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150800,
+            updatedAt: 150800,
+            attemptId,
+            attemptNumber: 1,
+            milestones: {}
+        },
+        [hrefB]: {
+            runId,
+            status: 'queued',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: hrefB,
+            requestedUrl: hrefB,
+            dedupeKey: hrefB,
+            coordinatorKey: hrefB,
+            queuedAt: 150800,
+            updatedAt: 150800,
+            attemptId: attemptIdB,
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 1, {
+        rowKey: href,
+        createdAt: 150800
+    })
+    const {browser, sw, timers} = loadServiceWorkerHarness({
+        now: 150810,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    browser.storage.local.getBytesInUse = async () => 85 * 1024 * 1024
+    const warned = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150820,
+            runId,
+            tabId: 543,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+    assert.equal(warned.recorded, true)
+    let counters = sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.storage.softQuotaWarning'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.storage.softQuotaExceeded'] || 0, 0)
+    assert.ok((counters['coordinatorAuthority.storage.maxBytesInUse'] || 0) >= 85 * 1024 * 1024)
+
+    browser.storage.local.getBytesInUse = async () => 101 * 1024 * 1024
+    timers.setNow(150810 + 61000)
+    const exceeded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: hrefB,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 211820,
+            runId,
+            tabId: 544,
+            actionKind: 'mute-block',
+            attemptId: attemptIdB,
+            attemptNumber: 1
+        }
+    })
+    assert.equal(exceeded.recorded, true)
+    counters = sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.storage.softQuotaExceeded'] || 0, 1)
+    assert.ok((counters['coordinatorAuthority.storage.maxBytesInUse'] || 0) >= 101 * 1024 * 1024)
+})
+
 test('batched row event queue WAL mutations compose against updated projection', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Row-Event-Batch-B'
@@ -4711,13 +4893,17 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(checkpointSwitch.checkpointedRecords, checkpointedRecordCount)
     assert.equal(checkpointSwitch.tailLength, 0)
     assert.equal(checkpointSwitch.physicalCleanup?.removed, true)
-    assert.equal(checkpointSwitch.physicalCleanup.keyCount, 1)
+    // 4, not 1: the legacy monolith key plus all 3 of the just-retired
+    // generation's segment keys. getRetiredCoordinatorQueueWalPhysicalKeys
+    // used to skip the previously-active generation, leaving its segments
+    // orphaned forever after every switch -- this pins the fix in place.
+    assert.equal(checkpointSwitch.physicalCleanup.keyCount, 4)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.checkpointed'] || 0, 1)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.checkpointedRecords'] || 0, checkpointedRecordCount)
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemoved'] || 0, 1)
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemovedKeys'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.physicalCleanupRemovedKeys'] || 0, 4)
     assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueWal'), false)
-    assert.equal(oldSegmentKeys.every(key => Object.prototype.hasOwnProperty.call(storage, key)), true)
+    assert.equal(oldSegmentKeys.every(key => !Object.prototype.hasOwnProperty.call(storage, key)), true)
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[hrefC].status, 'active')
