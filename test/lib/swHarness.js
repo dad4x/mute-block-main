@@ -460,13 +460,13 @@ function loadServiceWorkerHarness(options = {}) {
         )
     }
     if(options.disableQueueWalCheckpointSwitch === true) {
-        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
+        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
         if(!source.includes(needle)) {
             throw new Error('disableQueueWalCheckpointSwitch patch target not found in sw.js -- signature drifted, update swHarness.js')
         }
         source = source.replace(
             needle,
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'\n    const softMaintenance = !/hard/i.test(normalizedReason)"
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
         )
     }
     if(options.fastExecutorResumeTimeoutMs) {
@@ -546,6 +546,7 @@ module.exports.__test = {
     getFlightRecorder,
     getFlightRecorderSnapshot,
     getCoordinatorWhyNotRunning,
+    getStorageUpdateQueueSnapshot,
     recoverQueuedAuthorityLiveTabAfterMaterializationFailure,
     isQueuedTabRetryBudgetReleaseReason,
     getExhaustedRolledBackQueuedTabTerminalError,
@@ -579,6 +580,7 @@ module.exports.__test = {
     runScheduledCoordinatorReconcileTick,
     saveCoordinatorState,
     awaitCoordinatorResumeAlarmPersistence,
+    pauseCoordinatorNukes,
     scheduleCoordinatorQueueResume,
     scheduleCoordinatorReconcile,
     sendTabMessage,

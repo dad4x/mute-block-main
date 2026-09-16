@@ -191,6 +191,12 @@ const {
     createTabIdUtils
 } = require('./swTabIdUtils')
 const {
+    createQueuedExecutorTabStatus
+} = require('./swQueuedExecutorTabStatus')
+const {
+    createQueuedTabExecutorPlan
+} = require('./swQueuedTabExecutorPlan')
+const {
     createPersistentRetryExecutorTimers
 } = require('./swPersistentRetryExecutorTimers')
 const {
@@ -340,18 +346,36 @@ const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = getSegmentedWalMetaKey(COORDINATOR_QUEUE_WAL_KEY)
 const COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT = 128
 const COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT = 1024
-// Soft-switch (COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT) defers the
-// checkpoint switch while the queue has active/queued work, so a burst of
-// tiny writes gets amortized into one checkpoint instead of switching
-// mid-burst. That's fine for a short burst, but a long-running batch never
-// goes idle, so the switch would defer forever and the WAL would grow
-// straight toward COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT (where appends
-// start getting rejected outright). This second threshold forces the switch
-// through regardless of pending work once growth has clearly outrun normal
-// amortization -- a knob between "wait for idle" and "never wait."
+// 2026-09-14: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT used to defer the
+// checkpoint switch while the queue had any active/queued work, on the
+// theory that a burst of tiny writes should amortize into one checkpoint
+// instead of switching mid-burst. In practice a long-running batch is never
+// idle until it's done, so "defer while busy" was indistinguishable from
+// "defer until the batch finishes" -- the WAL grew straight toward
+// COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT (where appends start getting
+// rejected outright) or the FORCE_SWITCH_AT threshold below regardless, just
+// under a bigger, riskier forced switch instead of several small ones. A
+// switch at COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT is cheap (bounded
+// replay over one threshold's worth of segments); there was no correctness
+// reason to wait for idle, only a now-disproven assumption that idle was
+// meaningfully safer -- so scheduleCoordinatorQueueWalCheckpointSwitch now
+// switches immediately at every threshold crossing, busy or not.
+// FORCE_SWITCH_AT stays purely as a backstop metric/log distinction in case
+// something upstream ever fails to call the switch at the soft threshold.
 const COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT = 256
-const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_DEFER_RETRY_MS = 5000
 const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
+// 2026-09-14: a single enqueue call used to persist its entire `items` array
+// as one durable mutation -- fine for a handful of rows, but a 500+ item
+// bulk Space-feed nuke could append many WAL segments in one uninterrupted
+// commit, giving a checkpoint-switch threshold crossing (soft at 128,
+// forced at COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT above) no chance
+// to run between rows -- the same danger zone implicated in this project's
+// "missing-segment" WAL corruption incidents (queue-wal-segmented-record-followup-2026-05-27.md's
+// 2026-09-13 TODO). Chunking a large enqueue into several smaller durable
+// commits lets a threshold crossing land between chunks instead of only
+// after the whole batch. Small enqueues (the common case) are left alone.
+const COORDINATOR_ENQUEUE_CHUNK_THRESHOLD = 100
+const COORDINATOR_ENQUEUE_CHUNK_SIZE = 50
 // unlimitedStorage removes chrome.storage.local's enforced 10MB cap, but
 // "unlimited" isn't a target -- it just trades a hard failure (kQuotaBytes
 // quota exceeded, the proximate cause of the 2026-09-12 incident) for silent
@@ -361,6 +385,16 @@ const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 const COORDINATOR_STORAGE_SOFT_QUOTA_BYTES = 100 * 1024 * 1024
 const COORDINATOR_STORAGE_QUOTA_WARN_RATIO = 0.8
 const COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS = 60000
+// Self-imposed alert for the 2026-09-13 incident: the serialized
+// storage-update queue backed up for minutes (a runaway reconcile loop kept
+// piling more work onto it faster than it could drain) with nothing
+// surfacing that to the dashboard -- the only way anyone noticed was
+// watching the same queued rows fail to progress. Checked once per
+// reconcile tick (the mechanism that caused the incident, so it's the
+// natural place to notice it recurring) and throttled so a sustained
+// backlog doesn't spam a diagnostic event per tick.
+const COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS = 30000
+const COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS = 15000
 const COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'
 const COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex.'
 const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
@@ -518,9 +552,10 @@ let coordinatorAuthorityShadowWalProjectionSnapshotSeq = 0
 let coordinatorAuthorityShadowWalProjectionMaxSeq = 0
 let coordinatorAuthorityShadowWalAppliedIds = new Set()
 let coordinatorQueueWalCheckpointSwitchPromise = null
-let coordinatorQueueWalCheckpointSwitchTimeout = null
+let coordinatorQueueWalAutoRecoveryPersistPromise = null
 let lastCoordinatorStorageQuotaCheckAt = 0
 let coordinatorStorageQuotaWarned = false
+let lastCoordinatorStorageUpdateQueueStallCheckAt = 0
 let progressShadowWalStore = makePairedCheckpointStore({progress: {}}, {
     snapshotSeq: 0,
     createdAt: Date.now()
@@ -1019,6 +1054,32 @@ const {
     getCoordinatorRunIdsForHref,
     recomputeCoordinatorRuns
 } = coordinatorRuns
+// queuedExecutorTabStatus is constructed here, well before this cluster's
+// old source-text location (decomposition Part 2 target #15): the
+// makeQueuedTabOpenUrlCommitHelpers construction-call handlers object
+// literal immediately below eagerly references getQueuedExecutorTabStatusWithTimeout
+// bare -- the earliest such eager reference. normalizeTabId (tabIdUtils,
+// destructured above) and incrementQueueWakeupMetric (queueWakeupMetricsShape,
+// destructured further above still) are both already bare consts by this
+// point; promiseWithTimeout is a plain hoisted `function` declaration
+// further below in sw.js and is visible from this scope regardless of
+// textual position.
+const queuedExecutorTabStatus = createQueuedExecutorTabStatus({
+    handlers: {
+        browser,
+        promiseWithTimeout,
+        normalizeTabId,
+        incrementQueueWakeupMetric
+    },
+    constants: {
+        QUEUED_TAB_GET_TIMEOUT_MS
+    }
+})
+const {
+    getQueuedExecutorTabStatusFromTabList,
+    getQueuedExecutorTabStatusWithTimeout,
+    getQueuedExecutorTabWithTimeout
+} = queuedExecutorTabStatus
 const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     browser,
     getQueuedExecutorTabStatusWithTimeout,
@@ -2768,103 +2829,6 @@ const {
     summarizeQueuedTabStatusForRecorder,
     getFreshWorkerWindowStartupProgressAnchor
 } = coordinatorReconcileInputs
-
-async function getQueuedExecutorTabStatusWithTimeout(tabId = null, reason = 'queued-executor-tab-get') {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) {
-        return {
-            tab: null,
-            found: false,
-            missing: false,
-            timedOut: false,
-            error: 'missing-tab-id'
-        }
-    }
-
-    try {
-        const tab = await promiseWithTimeout(
-            browser.tabs.get(normalizedTabId),
-            QUEUED_TAB_GET_TIMEOUT_MS,
-            `${reason || 'queued-executor-tab-get'} ${normalizedTabId}`
-        )
-        return {
-            tab: tab || null,
-            found: !!tab,
-            missing: !tab,
-            timedOut: false,
-            error: ''
-        }
-    }
-    catch(error) {
-        const message = error?.message || `${error || ''}`
-        const timedOut = /timed out/i.test(message)
-        incrementQueueWakeupMetric('job.tabGetFailed')
-        if(timedOut) {
-            incrementQueueWakeupMetric('job.tabGetTimedOut')
-            const queryResult = await getQueuedExecutorTabStatusFromTabList(normalizedTabId, reason)
-            if(queryResult.found || queryResult.missing) {
-                return {
-                    ...queryResult,
-                    timedOut: true,
-                    error: message
-                }
-            }
-        }
-        return {
-            tab: null,
-            found: false,
-            missing: !timedOut && /no tab|no fake tab|invalid tab|cannot find tab|not found/i.test(message),
-            timedOut,
-            error: message
-        }
-    }
-}
-
-async function getQueuedExecutorTabStatusFromTabList(tabId = null, reason = 'queued-executor-tab-list') {
-    const normalizedTabId = normalizeTabId(tabId)
-    if(!normalizedTabId) {
-        return {
-            tab: null,
-            found: false,
-            missing: false,
-            timedOut: false,
-            error: 'missing-tab-id'
-        }
-    }
-
-    try {
-        const tabs = await promiseWithTimeout(
-            browser.tabs.query({}),
-            QUEUED_TAB_GET_TIMEOUT_MS,
-            `${reason || 'queued-executor-tab-list'} tab-list ${normalizedTabId}`
-        )
-        const tab = (tabs || []).find(candidate => normalizeTabId(candidate?.id) === normalizedTabId) || null
-        return {
-            tab,
-            found: !!tab,
-            missing: !tab,
-            timedOut: false,
-            error: ''
-        }
-    }
-    catch(error) {
-        const message = error?.message || `${error || ''}`
-        const timedOut = /timed out/i.test(message)
-        if(timedOut) incrementQueueWakeupMetric('job.tabListTimedOut')
-        return {
-            tab: null,
-            found: false,
-            missing: false,
-            timedOut,
-            error: message
-        }
-    }
-}
-
-async function getQueuedExecutorTabWithTimeout(tabId = null, reason = 'queued-executor-tab-get') {
-    const result = await getQueuedExecutorTabStatusWithTimeout(tabId, reason)
-    return result.tab || null
-}
 
 async function getPersistedLiveTabForCoordinatorItem(item = null, record = null, itemKey = '') {
     const result = await getPersistedLiveTabStatusForCoordinatorItem(item, record, itemKey)
@@ -5264,7 +5228,8 @@ const {
     areCoordinatorAccountingCountsEqual,
     makeCoordinatorQueueAccountingComparison,
     summarizeCoordinatorQueueWalAccounting,
-    makeCoordinatorCurrentWorkAccounting
+    makeCoordinatorCurrentWorkAccounting,
+    buildCoordinatorQueueFromView
 } = coordinatorQueueView
 
 async function getCoordinatorQueueAccounting(request = {}) {
@@ -5906,6 +5871,58 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             stored[COORDINATOR_QUEUE_WAL_KEY] = hydrated.store
             return hydrated.store
         }
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateFailed')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-segmented-hydrate-failed',
+            hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
+        )
+        // 2026-09-15: auto-recover instead of leaving the coordinator dead in
+        // the water -- this used to require someone running
+        // tools/cdp/recover-queue-wal-from-view.js by hand after every
+        // "missing-segment" incident (a hard crash mid checkpoint-switch is
+        // enough to cause one; chrome.storage.local has no cross-key
+        // transaction guarantee). mbCoordinatorQueueView is a materialized
+        // read-model independent of the WAL's own physical segments, so it
+        // survives exactly the corruption that breaks hydrate. Same safety
+        // gate as the manual tool: refuse to apply if the rebuilt row count
+        // doesn't match the view's own item count.
+        //
+        // This MUST run before the 'missing-checkpoint' branch below, not
+        // after -- the first version of this fix put it after, so a
+        // *different* hydrate failure reason ('missing-checkpoint', hit by a
+        // routine SW restart racing the auto-recovery's own durable persist)
+        // fell into that older branch and reset straight to an empty
+        // checkpoint without ever looking at the view, wiping a
+        // just-recovered queue within seconds of recovering it (2026-09-15
+        // incident: 900 rows -> 0, caught only because the other checkpoint
+        // slot happened to survive untouched).
+        const viewRecovery = await attemptCoordinatorQueueWalAutoRecoveryFromView(stored, meta, options)
+        if(viewRecovery?.ok === true && viewRecovery.store) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView')
+            recordCoordinatorDiagnosticEvent(
+                'coordinator-authority-queue-wal-auto-recovered-from-view',
+                `Rebuilt ${viewRecovery.rebuiltRowCount} row(s) from queue view after hydrate failure (${hydrated?.reason || 'hydrate-failed'})`
+            )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-auto-recovery',
+                source: 'loadCoordinatorQueueWalStoreFromStorage',
+                reason: hydrated?.reason || 'hydrate-failed',
+                viewItemCount: viewRecovery.viewItemCount,
+                rebuiltRowCount: viewRecovery.rebuiltRowCount
+            })
+            stored[COORDINATOR_QUEUE_WAL_KEY] = viewRecovery.store
+            scheduleCoordinatorQueueWalAutoRecoveryPersist(
+                viewRecovery.store,
+                stored,
+                hydrated?.reason || 'hydrate-failed'
+            )
+            return viewRecovery.store
+        }
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedAutoRecoveryFromViewFailed')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-authority-queue-wal-auto-recovery-from-view-failed',
+            viewRecovery?.reason || 'no-usable-queue-view'
+        )
         if(hydrated?.reason === 'missing-checkpoint' &&
             !Object.keys(normalizeCoordinatorMap(snapshotQueue || {})).length) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedMissingCheckpointReset')
@@ -5913,11 +5930,6 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             stored[COORDINATOR_QUEUE_WAL_KEY] = fresh
             return fresh
         }
-        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateFailed')
-        recordCoordinatorDiagnosticEvent(
-            'coordinator-authority-queue-wal-segmented-hydrate-failed',
-            hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
-        )
         throw new Error(`segmented queue WAL hydrate failed: ${hydrated?.reason || 'hydrate-failed'}`)
     }
 
@@ -5933,6 +5945,105 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
     const fallback = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
     stored[COORDINATOR_QUEUE_WAL_KEY] = fallback
     return fallback
+}
+
+// In-memory half of the 2026-09-15 WAL auto-recovery (see the call site in
+// loadCoordinatorQueueWalStoreFromStorage): rebuilds a fresh paired-checkpoint
+// store from mbCoordinatorQueueView, mirroring
+// tools/cdp/recover-queue-wal-from-view.js's logic exactly, including its
+// row-count-mismatch safety refusal. Read-only -- callers decide whether/how
+// to persist the result via scheduleCoordinatorQueueWalAutoRecoveryPersist.
+async function attemptCoordinatorQueueWalAutoRecoveryFromView(stored = {}, previousMeta = null, options = {}) {
+    let view = Object.prototype.hasOwnProperty.call(stored || {}, COORDINATOR_QUEUE_VIEW_KEY)
+        ? stored[COORDINATOR_QUEUE_VIEW_KEY]
+        : undefined
+    if(view === undefined) {
+        const viewStored = await metricStorageGet({[COORDINATOR_QUEUE_VIEW_KEY]: null}, {
+            metricPath: options.metricPath
+                ? `${options.metricPath}.autoRecoveryViewRead`
+                : 'coordinatorQueueWal.autoRecovery.viewRead'
+        })
+        view = viewStored?.[COORDINATOR_QUEUE_VIEW_KEY] || null
+        stored[COORDINATOR_QUEUE_VIEW_KEY] = view
+    }
+    const viewItemCount = Array.isArray(view?.items) ? view.items.length : Object.keys(view?.items || {}).length
+    if(!viewItemCount) return {ok: false, reason: 'view-empty', viewItemCount: 0, rebuiltRowCount: 0}
+
+    const rebuiltQueue = buildCoordinatorQueueFromView(view)
+    const rebuiltRowCount = Object.keys(rebuiltQueue).length
+    if(rebuiltRowCount !== viewItemCount) {
+        return {ok: false, reason: 'row-count-mismatch', viewItemCount, rebuiltRowCount}
+    }
+
+    const previousNextSeq = Number.parseInt(previousMeta?.nextSeq, 10) || 1
+    const snapshotSeq = Math.max(0, previousNextSeq - 1)
+    const nextSeq = Math.max(previousNextSeq, snapshotSeq + 1)
+    const store = makePairedCheckpointStore({queue: rebuiltQueue}, {
+        createdAt: Date.now(),
+        snapshotSeq,
+        nextSeq
+    })
+    return {ok: true, store, viewItemCount, rebuiltRowCount}
+}
+
+// Durable half of the 2026-09-15 WAL auto-recovery. Fire-and-forget by
+// design: the in-memory store is already unblocking the caller by the time
+// this runs, so this must never make the caller await a full checkpoint
+// write. Single-flight guarded the same way scheduleCoordinatorQueueWalCheckpointSwitch
+// coalesces concurrent switch attempts -- multiple hydrate call sites can hit
+// the same corruption in the same tick.
+function scheduleCoordinatorQueueWalAutoRecoveryPersist(store, previousStored = {}, reason = 'hydrate-failed') {
+    if(coordinatorQueueWalAutoRecoveryPersistPromise) return coordinatorQueueWalAutoRecoveryPersistPromise
+    const payload = buildSegmentedWalStoragePayload(store, {
+        baseKey: COORDINATOR_QUEUE_WAL_KEY,
+        softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+        hardSegmentLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
+        updatedAt: Date.now()
+    })
+    const payloadKeys = Object.keys(payload)
+    const retiredKeys = Object.keys(previousStored || {})
+        .filter(isCoordinatorQueueWalPhysicalStorageKey)
+        .filter(key => !payloadKeys.includes(key))
+    coordinatorQueueWalAutoRecoveryPersistPromise = (async () => {
+        try {
+            await metricStorageSet(payload, {
+                metricPath: 'queueWal.autoRecoveryFromView.save',
+                queueOperation: 'queue-wal-auto-recovery-from-view',
+                queueChangedRows: payloadKeys.length,
+                coordinatorAuthorityWrite: true
+            })
+            if(retiredKeys.length) {
+                await metricStorageRemove(retiredKeys, {metricPath: 'queueWal.autoRecoveryFromView.cleanup'})
+            }
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.autoRecoveredFromViewPersisted')
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-auto-recovery',
+                source: 'scheduleCoordinatorQueueWalAutoRecoveryPersist',
+                reason,
+                durable: true,
+                retiredKeys: retiredKeys.length
+            })
+        }
+        catch(error) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.autoRecoveredFromViewPersistFailed')
+            recordCoordinatorDiagnosticEvent(
+                'coordinator-authority-queue-wal-auto-recovery-persist-failed',
+                error?.message || 'Coordinator authority queue WAL auto-recovery persist failed'
+            )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-auto-recovery',
+                source: 'scheduleCoordinatorQueueWalAutoRecoveryPersist',
+                reason,
+                durable: false,
+                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            })
+        }
+        finally {
+            coordinatorQueueWalAutoRecoveryPersistPromise = null
+        }
+    })()
+    void coordinatorQueueWalAutoRecoveryPersistPromise
+    return coordinatorQueueWalAutoRecoveryPersistPromise
 }
 
 // Self-throttled: getBytesInUse is a real async storage call, so this is
@@ -5981,35 +6092,43 @@ async function maybeCheckCoordinatorStorageQuotaHealth(reason = '') {
     }
 }
 
+// Self-throttled the same way as maybeCheckCoordinatorStorageQuotaHealth.
+// Called from runCoordinatorReconcileTickOnce rather than from
+// enqueueSpaceFeedStorageUpdate's own hot path: reconcile is both a
+// frequent, natural checkpoint and (per the incident this exists for) the
+// most likely source of a runaway backlog, so a tick already running is
+// where this is cheapest and most relevant to check.
+function maybeWarnCoordinatorStorageUpdateQueueStall(reason = '') {
+    const nowTs = Date.now()
+    if(nowTs - lastCoordinatorStorageUpdateQueueStallCheckAt < COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS) return
+    lastCoordinatorStorageUpdateQueueStallCheckAt = nowTs
+
+    const snapshot = getStorageUpdateQueueSnapshot()
+    const oldestWaitMs = Number.parseInt(snapshot?.oldestWaitMs, 10) || 0
+
+    if(oldestWaitMs >= COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS) {
+        recordQueueWakeupMetricMax('storageUpdate.queueStallMaxWaitMs', oldestWaitMs)
+        incrementQueueWakeupMetric('storageUpdate.queueStallWarning')
+        recordCoordinatorDiagnosticEvent(
+            'coordinator-storage-update-queue-stall',
+            `Coordinator storage-update queue's oldest pending write has been waiting ` +
+                `${oldestWaitMs}ms (>= ${COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS}ms threshold), ` +
+                `currentReason=${snapshot?.currentReason || 'unknown'} (${reason || 'enqueue-check'})`
+        )
+    }
+}
+
+
 function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {
     const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'
-    const softMaintenance = !/hard/i.test(normalizedReason)
+    // 2026-09-14: no more "defer while busy" branch here -- see
+    // COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT's comment above for why.
+    // forceOverQueueWork now only distinguishes the metric/log reason
+    // (segmentHardLimit vs segmentSoftSwitch); every call switches
+    // immediately either way.
     const forceOverQueueWork = (Number.parseInt(committedSegments, 10) || 0) >=
         COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT
-    if(softMaintenance && !forceOverQueueWork) {
-        const residentCounts = getCoordinatorQueueWorkCounts(coordinatorAuthority.current()?.queue || {})
-        const runtimeCounts = queueRuntime.getRuntimeCounts()
-        const runtimeHasWork = runtimeCounts.activeQueuedTabs > 0 ||
-            runtimeCounts.queuedTabActions > 0 ||
-            runtimeCounts.pendingTabActions > 0
-        const durableHasWork = residentCounts.durableActiveRows > 0 || residentCounts.durableQueuedRows > 0
-        if(runtimeHasWork || durableHasWork) {
-            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchDeferredForQueueWork')
-            if(!coordinatorQueueWalCheckpointSwitchTimeout) {
-                coordinatorQueueWalCheckpointSwitchTimeout = setTimeout(() => {
-                    coordinatorQueueWalCheckpointSwitchTimeout = null
-                    scheduleCoordinatorQueueWalCheckpointSwitch(`${normalizedReason}-deferred`)
-                }, COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_DEFER_RETRY_MS)
-            }
-            return coordinatorQueueWalCheckpointSwitchPromise || Promise.resolve({
-                checkpointSwitched: false,
-                saved: false,
-                durable: false,
-                reason: 'checkpoint-switch-deferred-for-queue-work'
-            })
-        }
-    }
-    else if(forceOverQueueWork) {
+    if(forceOverQueueWork) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork')
     }
     if(coordinatorQueueWalCheckpointSwitchPromise) {
@@ -6021,7 +6140,8 @@ function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-thre
         metricPath: `queueWal.${reason}.load`,
         saveMetricPath: `queueWal.${reason}.save`,
         timeoutMs: COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS,
-        suppressCheckpointSwitchSchedule: true
+        suppressCheckpointSwitchSchedule: true,
+        switchReason: normalizedReason
     }).finally(() => {
         coordinatorQueueWalCheckpointSwitchPromise = null
     })
@@ -6670,6 +6790,15 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         }, {
             metricPath: options.metricPath || 'queueWal.checkpointSwitch.load'
         })
+        const preSwitchMeta = stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
+        recordFlightRecorderEvent({
+            kind: 'queue-wal-checkpoint-switch-start',
+            source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+            reason: options.switchReason || 'unknown',
+            generationId: preSwitchMeta?.activeCheckpoint || '',
+            committedSegmentsA: getSegmentedWalCommittedSegmentCount(preSwitchMeta, 'A'),
+            committedSegmentsB: getSegmentedWalCommittedSegmentCount(preSwitchMeta, 'B')
+        })
         const snapshotQueue = {}
         const storedWal = await loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, {
             metricPath: `${options.metricPath || 'queueWal.checkpointSwitch.load'}.segments`,
@@ -6682,6 +6811,12 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 'coordinator-authority-queue-wal-checkpoint-recovery-failed',
                 recovered?.reason || 'Coordinator authority queue WAL checkpoint recovery failed'
             )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-checkpoint-switch-result',
+                source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+                reason: recovered?.reason || 'recovery-failed',
+                durable: false
+            })
             return {
                 checkpointSwitched: false,
                 saved: false,
@@ -6708,6 +6843,14 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 'coordinator-authority-queue-wal-checkpoint-activation-failed',
                 activated?.reason || 'Coordinator authority queue WAL checkpoint activation failed'
             )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-checkpoint-switch-result',
+                source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+                reason: activated?.reason || 'activation-failed',
+                durable: false,
+                snapshotSeq: maxAppliedSeq,
+                checkpointedRecords
+            })
             return {
                 checkpointSwitched: false,
                 saved: false,
@@ -6725,6 +6868,14 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 'coordinator-authority-queue-wal-checkpoint-verify-failed',
                 verify?.reason || 'Coordinator authority queue WAL checkpoint verification failed'
             )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-checkpoint-switch-result',
+                source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+                reason: verify?.reason || 'verification-failed',
+                durable: false,
+                snapshotSeq: maxAppliedSeq,
+                checkpointedRecords
+            })
             return {
                 checkpointSwitched: false,
                 saved: false,
@@ -6763,6 +6914,15 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 'coordinator-authority-queue-wal-checkpoint-save-failed',
                 error?.message || 'Coordinator authority queue WAL checkpoint save failed'
             )
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-checkpoint-switch-result',
+                source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+                reason: 'wal-checkpoint-save-failed',
+                durable: false,
+                snapshotSeq: maxAppliedSeq,
+                checkpointedRecords,
+                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            })
             return {
                 checkpointSwitched: false,
                 saved: false,
@@ -6775,6 +6935,14 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         }
         if(walSaved === false) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointSuppressed')
+            recordFlightRecorderEvent({
+                kind: 'queue-wal-checkpoint-switch-result',
+                source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+                reason: 'wal-checkpoint-storage-suppressed',
+                durable: false,
+                snapshotSeq: maxAppliedSeq,
+                checkpointedRecords
+            })
             return {
                 checkpointSwitched: false,
                 saved: false,
@@ -6799,6 +6967,19 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             {metricPath: options.cleanupMetricPath || 'queueWal.checkpointSwitch.physicalCleanup.remove'}
         )
         void maybeCheckCoordinatorStorageQuotaHealth('queueWal-checkpoint-switch')
+
+        const postSwitchMeta = checkpointWal?.payload?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
+        recordFlightRecorderEvent({
+            kind: 'queue-wal-checkpoint-switch-result',
+            source: 'switchCoordinatorAuthorityQueueWalCheckpoint',
+            reason: 'checkpointed',
+            durable: true,
+            snapshotSeq: maxAppliedSeq,
+            checkpointedRecords,
+            generationId: activated.store?.meta?.activeCheckpoint || '',
+            committedSegmentsA: getSegmentedWalCommittedSegmentCount(postSwitchMeta, 'A'),
+            committedSegmentsB: getSegmentedWalCommittedSegmentCount(postSwitchMeta, 'B')
+        })
 
         return {
             checkpointSwitched: true,
@@ -10158,48 +10339,24 @@ const {
     buildCoordinatorExecutorActionForQueuedItem
 } = rolledBackQueuedTabRetryClassification
 
-async function planQueuedTabExecutorAction(action = {}, options = {}) {
-    const openDecision = await promiseWithTimeout(
-        shouldOpenQueuedTabAction(action, {
-            currentAuthorityState: options.currentAuthorityState || options.authorityState || null
-        }),
-        QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,
-        'queued tab open decision'
-    ).catch(error => ({
-        open: false,
-        reason: 'open-decision-timeout',
-        authorityUnavailable: true,
-        error: error?.message || `${error || ''}`
-    }))
-    recordFlightRecorderEvent({
-        kind: 'queued-tab-open-decision',
-        source: 'planQueuedTabExecutorAction',
-        rowKey: action.coordinatorKey || action.profileHref || action.targetProfileHref || action.url || '',
-        targetUrl: action.profileHref || action.targetProfileHref || action.url || action.requestedUrl || '',
-        attemptId: getAttemptIdFromValue(action),
-        attemptNumber: getAttemptNumberFromValue(action),
-        runId: action.runId || '',
-        accepted: openDecision.open === true,
-        reason: openDecision.reason || openDecision.error || 'open-decision'
-    })
-    if(openDecision.authorityUnavailable === true) {
-        scheduleCoordinatorQueueResume(1000, 'queued-tab-open-decision-authority-unavailable', {
-            allowBeforeQuora: true
-        })
-        scheduleCoordinatorReconcile(1000, {
-            reason: 'queued-tab-open-decision-authority-unavailable',
-            edgeTriggered: true,
-            allowBeforeQuora: true
-        })
+const queuedTabExecutorPlan = createQueuedTabExecutorPlan({
+    handlers: {
+        promiseWithTimeout,
+        shouldOpenQueuedTabAction,
+        recordFlightRecorderEvent,
+        getAttemptIdFromValue,
+        getAttemptNumberFromValue,
+        scheduleCoordinatorQueueResume,
+        scheduleCoordinatorReconcile,
+        markQueuedTabExecutorActionPlanned
+    },
+    constants: {
+        QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS
     }
-    if(!openDecision.open) return null
-
-    return markQueuedTabExecutorActionPlanned(action, {
-        ...openDecision,
-        authorityValidated: !!(options.currentAuthorityState || options.authorityState),
-        authorityState: options.currentAuthorityState || options.authorityState || null
-    }, 'executor-apply-phase')
-}
+})
+const {
+    planQueuedTabExecutorAction
+} = queuedTabExecutorPlan
 
 async function reprimeRecoveredServiceWorkerQueuedAction(item = {}, itemKey = '', options = {}) {
     if(!item || `${item.status || ''}`.trim() !== 'queued') return {reprimed: 0, reason: 'not-queued'}
@@ -18624,6 +18781,19 @@ function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_M
         incrementQueueWakeupMetric('reconcile.deferredBeforeQuora')
         return false
     }
+    // isCoordinatorPauseRequestedLocally is a synchronous in-memory flag
+    // (set the instant a pause request comes in, before the async storage
+    // write even settles) -- checking it here, not just in the reconcile
+    // tick's own post-run continuation logic, closes a real incident:
+    // reconcile ticks that kept reporting "changed" reset their backoff to
+    // the minimum interval every time, and this function (the sole place
+    // that re-arms the next tick's timer/alarm) never checked pause at all,
+    // so the loop kept re-arming itself and piling more work onto the
+    // serialized storage-update queue even after the user paused.
+    if(isCoordinatorPauseRequestedLocally()) {
+        incrementQueueWakeupMetric('reconcile.deferredPaused')
+        return false
+    }
 
     const reason = `${options.reason || 'coordinator-reconcile'}`.trim()
     clearStaleCoordinatorReconcilePromise(reason)
@@ -18661,6 +18831,15 @@ function scheduleCoordinatorReconcile(delayMs = COORDINATOR_RECONCILE_INTERVAL_M
             return
         }
         suppressStaleCoordinatorReconcileAlarm(scheduledDueAt)
+        // Re-check pause here too: this timer can have been armed before a
+        // pause request came in, and by the time it actually fires the
+        // pause flag may already be set -- skip running the tick entirely
+        // rather than doing a full reconcile pass (and its storage reads/
+        // writes) just to have its own post-run logic discover it's paused.
+        if(isCoordinatorPauseRequestedLocally()) {
+            incrementQueueWakeupMetric('reconcile.skippedPaused')
+            return
+        }
         void runScheduledCoordinatorReconcileTick('scheduled-coordinator-reconcile')
     })
 
@@ -19308,6 +19487,12 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
         direct: options.direct === true
     })
     incrementQueueWakeupMetric('reconcile.requested')
+    // Checked here (once per real reconcile tick) rather than inside
+    // enqueueSpaceFeedStorageUpdate's hot path -- reconcile activity is
+    // itself the thing that piles work onto the storage-update queue when
+    // something goes wrong (see the 2026-09-13 incident this alert is for),
+    // so a tick already running is a natural, low-overhead checkpoint.
+    maybeWarnCoordinatorStorageUpdateQueueStall(reason)
 
     if(!quoraRuntimeActivated && options.allowBeforeQuora !== true) {
         await ensureQuoraRuntimeActivatedForScheduler('reconcile-existing-quora-tab')
@@ -20444,6 +20629,14 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
 }
 
 async function enqueueCoordinatorItemsStorage(request = {}) {
+    const rawItems = Array.isArray(request.items) ? request.items : []
+    if(rawItems.length > COORDINATOR_ENQUEUE_CHUNK_THRESHOLD) {
+        return enqueueCoordinatorItemsStorageChunked(request, rawItems)
+    }
+    return enqueueCoordinatorItemsStorageOnce(request)
+}
+
+async function enqueueCoordinatorItemsStorageOnce(request = {}) {
     const runInput = request.run && typeof request.run === 'object' ? request.run : {}
     const hasExecuteInput = request.execute && typeof request.execute === 'object'
     return enqueueSpaceFeedStorageUpdate(() => applyCoordinatorQueueMachineEvent({
@@ -20462,6 +20655,72 @@ async function enqueueCoordinatorItemsStorage(request = {}) {
             storageTimedOut: true
         }
     })
+}
+
+// Splits a large enqueue into COORDINATOR_ENQUEUE_CHUNK_SIZE-item sub-batches,
+// each persisted through the normal single-batch path (its own durable WAL
+// commit, its own chance for a checkpoint-switch threshold check) before the
+// next chunk starts -- see COORDINATOR_ENQUEUE_CHUNK_THRESHOLD's comment
+// above. Every chunk after the first is pinned to the same run id so the
+// whole bulk action still reads as one run, not several. Stops early (rather
+// than continuing to pile more rows onto a queue that's already failing to
+// persist) if a chunk comes back non-durable or timed out; whatever
+// already-durable rows exist by then are left for reconcile to pick up
+// normally, matching how a single-batch storage timeout is already handled.
+async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []) {
+    const runInput = request.run && typeof request.run === 'object' ? request.run : {}
+    const hasExecuteInput = request.execute && typeof request.execute === 'object'
+    let queued = 0
+    let merged = 0
+    let runId = runInput.id || ''
+    let durable = false
+    let storageTimedOut = false
+    let stopReason = ''
+    const resetCleanupTargets = []
+
+    for(let offset = 0; offset < rawItems.length; offset += COORDINATOR_ENQUEUE_CHUNK_SIZE) {
+        const chunkItems = rawItems.slice(offset, offset + COORDINATOR_ENQUEUE_CHUNK_SIZE)
+        const chunkResult = await enqueueCoordinatorItemsStorageOnce({
+            ...request,
+            items: chunkItems,
+            run: runId ? {...runInput, id: runId} : runInput
+        })
+        queued += Number.parseInt(chunkResult?.queued, 10) || 0
+        merged += Number.parseInt(chunkResult?.merged, 10) || 0
+        if(!runId && chunkResult?.runId) runId = chunkResult.runId
+        if(Array.isArray(chunkResult?.resetCleanupTargets)) {
+            resetCleanupTargets.push(...chunkResult.resetCleanupTargets)
+        }
+        if(chunkResult?.durable === true) durable = true
+        if(chunkResult?.storageTimedOut === true) {
+            storageTimedOut = true
+            stopReason = 'chunk-storage-timeout'
+            break
+        }
+        if(chunkResult?.durable === false) {
+            stopReason = chunkResult?.reason || 'chunk-enqueue-save-failed'
+            break
+        }
+    }
+
+    incrementQueueWakeupMetric('enqueue.chunked.batches', Math.ceil(rawItems.length / COORDINATOR_ENQUEUE_CHUNK_SIZE))
+    if(stopReason) incrementQueueWakeupMetric('enqueue.chunked.stoppedEarly')
+
+    return {
+        queued,
+        merged,
+        executionQueued: 0,
+        runId,
+        coordinatorTabId: null,
+        coordinatorWindowId: null,
+        coordinatorReused: false,
+        executionDeferred: !hasExecuteInput,
+        durable,
+        persistence: {saved: durable},
+        resetCleanupTargets,
+        storageTimedOut,
+        reason: stopReason || undefined
+    }
 }
 
 async function enqueueCoordinatorItemsStorageLocked(request = {}) {
@@ -30566,6 +30825,7 @@ registerServiceWorkerListeners({
         releaseQueuedTab,
         rememberBrowserSessionMarker,
         rememberCanceledOwnerUrls,
+        rememberQueueLoadPressure,
         requestCoordinatorActionLease,
         requeueCoordinatorFailedItems,
         resetQueueWakeupMetricsEpochAfterLoad,

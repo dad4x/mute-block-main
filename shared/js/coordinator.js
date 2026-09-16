@@ -53,7 +53,25 @@ const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
 const RETRY_FAILED_LIMIT = 2
 const SECONDS_PER_BLOCK_SAMPLE_LIMIT = 100
+// Mirrors swCoordinatorQueueView.js's COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS
+// -- this client-side computation only runs when the SW-provided view value
+// is missing, but should apply the same outlier protection when it does.
+const TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
 const CURRENT_WORK_MUTATION_TIMEOUT_MS = 70000
+// Outlier detection: a row's active-duration (queue -> tab -> block, live
+// for rows still running) is flagged if it exceeds a flat floor OR is a
+// genuine statistical outlier for this session (mean + N standard
+// deviations over already-terminal rows) -- the floor alone would miss a
+// session that's uniformly slow in a way still worth flagging relative to
+// itself, and the stddev alone would never fire early before enough
+// terminal samples exist. Checked on every render pass against every row
+// (active or terminal), not just at completion, so a row that's stuck and
+// never finishes still gets caught. Deliberately not persisted anywhere --
+// in-memory dashboard state only, reset on page reload, manually clearable.
+const COORDINATOR_OUTLIER_ABSOLUTE_THRESHOLD_MS = 45000
+const COORDINATOR_OUTLIER_STDDEV_MULTIPLIER = 2.5
+const COORDINATOR_OUTLIER_MIN_SAMPLES_FOR_STDDEV = 5
+const COORDINATOR_OUTLIER_MAX_ENTRIES = 50
 
 const state = {
     queue: {},
@@ -72,8 +90,16 @@ const state = {
     requiresQuoraVisit: false,
     requiresQuoraVisitAt: 0,
     quoraActivationCounterBaseline: 0,
-    quoraActivationMetricBaselineKnown: false
+    quoraActivationMetricBaselineKnown: false,
+    outliers: []
 }
+// Keyed by rowKey+attemptId, separate from state.outliers: a terminal row's
+// duration never changes, so without this a manually-cleared outlier would
+// simply get re-detected and reappear on the very next refresh pass. Clearing
+// dismisses that specific attempt permanently for this dashboard session
+// (not persisted, same as everything else here) -- a new attempt (retry) or
+// a different row is unaffected.
+const dismissedOutlierKeys = new Set()
 let resumeCoordinatorQueueTimer = null
 let resumeCoordinatorQueuePromise = null
 let dashboardCompactRefreshTimer = null
@@ -96,6 +122,9 @@ async function init() {
     })
     document.getElementById('clearCompletedRunsButton')?.addEventListener('click', () => {
         void clearCompletedRuns()
+    })
+    document.getElementById('clearOutliersButton')?.addEventListener('click', () => {
+        clearOutliers()
     })
     document.getElementById('resetMetricsButton')?.addEventListener('click', () => {
         void resetMetrics()
@@ -522,6 +551,19 @@ function getQueueTotalCount(queueItems = []) {
     return hasCoordinatorQueueView() ? Number(state.queueTotal) || queueItems.length : queueItems.length
 }
 
+function getBlockOutcomeCounts() {
+    const metricsDocument = state.metrics || {}
+    const counters = (metricsDocument.currentEpoch || metricsDocument).counters || {}
+    const reallyBlockedCount = getMetricCounter(counters, 'profileAction.reallyBlocked.count')
+    const alreadyBlockedCount = getMetricCounter(counters, 'profileAction.alreadyBlocked.count')
+    const total = reallyBlockedCount + alreadyBlockedCount
+    return {reallyBlockedCount, alreadyBlockedCount, total}
+}
+
+function formatBlockOutcomeCount(count = 0, total = 0) {
+    return total > 0 ? `${count} (${formatPercent(count / total)})` : `${count}`
+}
+
 function render() {
     const queueItems = getDisplayQueueItems()
     const runItems = getDisplayRuns(queueItems)
@@ -551,6 +593,9 @@ function render() {
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
     setText('activationHandoffSeconds', formatSecondsPerBlock(activationHandoff))
+    const blockOutcomeCounts = getBlockOutcomeCounts()
+    setText('reallyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.reallyBlockedCount, blockOutcomeCounts.total))
+    setText('alreadyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.alreadyBlockedCount, blockOutcomeCounts.total))
     setText('terminalCount', terminalCount)
     setText('eventCount', state.events.length)
     setText('eventListCount', `${state.events.length} event${state.events.length === 1 ? '' : 's'}`)
@@ -563,6 +608,8 @@ function render() {
     renderEvents()
     renderWakeupMetrics(queueItems)
     renderQueue(queueItems)
+    checkCoordinatorOutliers(queueItems)
+    renderOutliers()
     syncCoordinatorQueueResume(queueItems)
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
     syncRequeueFailedControls(failedCount)
@@ -1220,7 +1267,7 @@ function getSecondsPerActualBlock(queueItems = [], epochStartedAt = 0) {
 
     const durations = completedBlocks
         .map(getQueueItemActiveDurationMs)
-        .filter(duration => duration > 0)
+        .filter(duration => duration > 0 && duration <= TIMING_SAMPLE_MAX_PLAUSIBLE_MS)
     if(!durations.length) return null
 
     const totalDurationMs = durations.reduce((total, duration) => total + duration, 0)
@@ -1285,7 +1332,10 @@ function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
             candidate.runId === terminal.runId &&
             candidate.activeAt > terminal.terminalAt
         )
-        if(nextActivation) gaps.push(nextActivation.activeAt - terminal.terminalAt)
+        if(nextActivation) {
+            const gapMs = nextActivation.activeAt - terminal.terminalAt
+            if(gapMs > 0 && gapMs <= TIMING_SAMPLE_MAX_PLAUSIBLE_MS) gaps.push(gapMs)
+        }
         if(gaps.length >= SECONDS_PER_BLOCK_SAMPLE_LIMIT) break
     }
     if(!gaps.length) return null
@@ -1454,6 +1504,8 @@ function renderWakeupMetrics(queueItems = []) {
     const storageTimeoutGet = getMetricCounter(counters, 'storageUpdate.timeout.duringStorageGet')
     const storageTimeoutSet = getMetricCounter(counters, 'storageUpdate.timeout.duringStorageSet')
     const storageTimeoutUnknown = getMetricCounter(counters, 'storageUpdate.timeout.unknown')
+    const storageQueueStallWarnings = getMetricCounter(counters, 'storageUpdate.queueStallWarning')
+    const storageQueueStallMaxWaitMs = getMetricCounter(counters, 'storageUpdate.queueStallMaxWaitMs')
     const milestoneReceived = getMetricCounter(counters, 'milestone.received')
     const milestoneFlushes = getMetricCounter(counters, 'milestone.flushPerformed')
     const progressReceived = getMetricCounter(counters, 'progress.recordReceived')
@@ -1472,6 +1524,7 @@ function renderWakeupMetrics(queueItems = []) {
     const readMaxBytes = getMetricCounter(counters, 'storagePayload.read.total.maxBytes')
     const topReadPath = getTopStoragePayloadPath(counters, 'read')
     const topWritePath = getTopStoragePayloadPath(counters, 'write')
+    const cloudflareChallenges = getMetricCounter(counters, 'cloudflareChallenge.detected')
     const duplicatePumps = getMetricCounter(counters, 'pump.noop.noPendingItems') +
         getMetricCounter(counters, 'pump.noop.executorAlreadyRunning') +
         getMetricCounter(counters, 'pump.noop.paused')
@@ -1495,6 +1548,9 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Duplicate pumps', pumpRequested ? formatPercent(duplicatePumps / pumpRequested) : '--', `${duplicatePumps} no-op`),
             buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', `${reconcileChanged} reconcile changes`),
             buildMetricCard('Terminal jobs', `${terminalJobs}`, `${stalledQueued} currently queued`),
+            buildMetricCard('Cloudflare challenges', `${cloudflareChallenges}`, jobs
+                ? `${formatPercent(cloudflareChallenges / jobs)} of ${jobs} enqueued jobs hit a bot-challenge interstitial`
+                : 'No challenge interstitials seen yet'),
             buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen)),
             buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted)),
             buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart)),
@@ -1502,6 +1558,11 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Terminal -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease)),
             buildMetricCard('Storage timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : `${storageTimedOut}`, `${storageTimedOut} / ${storageStarted}; ${storageFallbackReturned} fallback returned`),
             buildMetricCard('Storage deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : `${storageDeadlineMissed}`, `${storageDeadlineMissed} missed; ${getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed')} late suppressed`),
+            buildMetricCard('Write queue backlog', storageQueueStallWarnings ? `${storageQueueStallWarnings} alert${storageQueueStallWarnings === 1 ? '' : 's'}` : 'clear',
+                storageQueueStallWarnings
+                    ? `Oldest pending write waited up to ${formatDuration(storageQueueStallMaxWaitMs)} this epoch`
+                    : 'No sustained storage-update backlog this epoch',
+                {alert: storageQueueStallWarnings > 0}),
             buildMetricCard('Timeout buckets', `${storageTimeoutGet}`, `get ${storageTimeoutGet}, set ${storageTimeoutSet}, unknown ${storageTimeoutUnknown}`),
             buildMetricCard('No-work writes', `${storageNoDurableWork}`, `${storageNoRuntimeWork} no runtime; ${storageNoDurableWork} no durable`),
             buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait)),
@@ -1536,9 +1597,9 @@ function renderWakeupMetrics(queueItems = []) {
     }
 }
 
-function buildMetricCard(label = '', value = '', detail = '') {
+function buildMetricCard(label = '', value = '', detail = '', options = {}) {
     const card = document.createElement('div')
-    card.className = 'metric-card'
+    card.className = options.alert ? 'metric-card metric-card--alert' : 'metric-card'
 
     const labelNode = document.createElement('div')
     labelNode.className = 'metric-label'
@@ -1730,7 +1791,7 @@ function renderQueue(items) {
                 subtitleHref: sourcePageUrl
             }),
             buildQueueCancelCell(item),
-            buildBadge(item.status || 'unknown'),
+            buildBadge(item.status || 'unknown', `${item.status || ''}`.trim() === 'failed' ? (item.error || item.outcome || '') : ''),
             buildTextCell(item.outcome || item.error || '', getOutcomeHelp(item.outcome || item.error || '')),
             buildQueueTimingCell(item),
             buildQueueActionCell(item)
@@ -1752,6 +1813,146 @@ function getQueueItemTitleLabel(item = {}, profileLabel = '') {
         return sourceLabel ? `Resolve ${sourceLabel} post` : 'Resolve source post'
     }
     return item.targetProfileHref || item.requestedUrl || item.id || 'Current work item'
+}
+
+function getCoordinatorActiveDurationBaseline(queueItems = []) {
+    const durations = []
+    for(const item of queueItems) {
+        const activeAt = Number.parseInt(item?.activeAt, 10) || 0
+        const terminalAt = Number.parseInt(item?.terminalAt, 10) || 0
+        if(activeAt > 0 && terminalAt > activeAt) durations.push(terminalAt - activeAt)
+    }
+    if(!durations.length) return {mean: 0, stdDev: 0, count: 0}
+
+    const mean = durations.reduce((sum, value) => sum + value, 0) / durations.length
+    const variance = durations.length > 1
+        ? durations.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (durations.length - 1)
+        : 0
+    return {mean, stdDev: Math.sqrt(variance), count: durations.length}
+}
+
+function getCoordinatorOutlierRowKey(item = {}) {
+    return `${item?.storageKey || item?.dedupeKey || item?.targetProfileHref || item?.requestedUrl || ''}`.trim()
+}
+
+// Checked against every row on every render pass (active or terminal), not
+// just at completion, so a row that's stuck and never reaches terminal
+// still gets caught -- the same activeAt/terminalAt fields buildQueueTimingCell
+// already uses to show "running Xs" per row. The stddev baseline is
+// recomputed fresh each pass from already-terminal rows, so a currently
+// slow, still-active row can't inflate the bar it's being measured against.
+function checkCoordinatorOutliers(queueItems = []) {
+    const baseline = getCoordinatorActiveDurationBaseline(queueItems)
+    const stdDevThreshold = baseline.count >= COORDINATOR_OUTLIER_MIN_SAMPLES_FOR_STDDEV
+        ? baseline.mean + COORDINATOR_OUTLIER_STDDEV_MULTIPLIER * baseline.stdDev
+        : Infinity
+
+    for(const item of queueItems) {
+        const activeAt = Number.parseInt(item?.activeAt, 10) || 0
+        if(activeAt <= 0) continue
+        const terminalAt = Number.parseInt(item?.terminalAt, 10) || 0
+        const durationMs = (terminalAt || (isActiveQueueItem(item) ? Date.now() : 0)) - activeAt
+        if(durationMs <= 0) continue
+
+        const exceedsAbsolute = durationMs >= COORDINATOR_OUTLIER_ABSOLUTE_THRESHOLD_MS
+        const exceedsStdDev = durationMs >= stdDevThreshold
+        if(!exceedsAbsolute && !exceedsStdDev) continue
+
+        const rowKey = getCoordinatorOutlierRowKey(item)
+        if(!rowKey) continue
+        const attemptId = `${item?.attemptId || ''}`.trim()
+        const dismissalKey = `${rowKey}|${attemptId}`
+        if(dismissedOutlierKeys.has(dismissalKey)) continue
+        const existing = state.outliers.find(entry => entry.rowKey === rowKey && entry.attemptId === attemptId)
+        const record = {
+            rowKey,
+            targetUrl: item.targetProfileHref || item.requestedUrl || rowKey,
+            runId: item.runId || '',
+            attemptId,
+            attemptNumber: Number.parseInt(item.attemptNumber, 10) || 0,
+            actionKind: item.actionKind || '',
+            status: item.status || '',
+            outcome: item.outcome || item.error || '',
+            activeAt,
+            terminalAt,
+            durationMs,
+            final: terminalAt > 0,
+            thresholdReason: exceedsAbsolute && exceedsStdDev ? 'both' : exceedsAbsolute ? 'absolute' : 'stddev',
+            meanDurationMsAtCapture: Math.round(baseline.mean),
+            stdDevMsAtCapture: Math.round(baseline.stdDev)
+        }
+
+        if(existing) {
+            Object.assign(existing, record)
+        }
+        else {
+            state.outliers.push({...record, capturedAt: Date.now(), flightRecorderEntries: null})
+            void fetchFlightRecorderForOutlier(rowKey, attemptId)
+        }
+    }
+
+    if(state.outliers.length > COORDINATOR_OUTLIER_MAX_ENTRIES) {
+        state.outliers = state.outliers.slice(-COORDINATOR_OUTLIER_MAX_ENTRIES)
+    }
+}
+
+// Flight recorder is a fixed-size ring buffer on the service worker side --
+// fetched once, right when a row first crosses the outlier threshold, so
+// its history is pulled out before a long batch rolls it out of the buffer.
+// Not re-fetched on later passes for the same row/attempt (only the timing
+// fields above get refreshed while it's still active).
+async function fetchFlightRecorderForOutlier(rowKey = '', attemptId = '') {
+    try {
+        const result = await sendRuntimeMessageWithTimeout({
+            action: 'get-flight-recorder',
+            rowKey,
+            limit: 50
+        }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
+        const entry = state.outliers.find(item => item.rowKey === rowKey && item.attemptId === attemptId)
+        if(entry) entry.flightRecorderEntries = Array.isArray(result?.entries) ? result.entries : []
+    }
+    catch {
+        const entry = state.outliers.find(item => item.rowKey === rowKey && item.attemptId === attemptId)
+        if(entry) entry.flightRecorderEntries = []
+    }
+    renderOutliers()
+}
+
+function clearOutliers() {
+    for(const outlier of state.outliers) {
+        dismissedOutlierKeys.add(`${outlier.rowKey}|${outlier.attemptId}`)
+    }
+    state.outliers = []
+    renderOutliers()
+}
+
+function renderOutliers() {
+    const container = document.getElementById('outlierList')
+    const countLabel = document.getElementById('outlierCount')
+    if(countLabel) {
+        countLabel.textContent = `${state.outliers.length} outlier${state.outliers.length === 1 ? '' : 's'}`
+    }
+    if(!container) return
+
+    const sortedOutliers = [...state.outliers].sort((left, right) => right.durationMs - left.durationMs)
+    replaceChildren(container, sortedOutliers.map(outlier => {
+        const profileLabel = outlier.targetUrl ? getProfileLabelFromHref(outlier.targetUrl) : outlier.rowKey
+        const row = document.createElement('div')
+        row.className = 'row row--event'
+        row.append(
+            buildTitleCell(profileLabel || outlier.rowKey, outlier.runId, {
+                titleHref: normalizeExternalHref(outlier.targetUrl),
+                title: JSON.stringify(outlier.flightRecorderEntries || [])
+            }),
+            buildBadge(outlier.final ? (outlier.status || 'unknown') : 'active'),
+            buildTextCell(
+                `${formatDuration(outlier.durationMs)} (${outlier.thresholdReason})`,
+                `mean ${formatDuration(outlier.meanDurationMsAtCapture)}, stddev ${formatDuration(outlier.stdDevMsAtCapture)} at capture`
+            ),
+            buildTextCell(formatDateTime(outlier.capturedAt))
+        )
+        return row
+    }), 'No outliers this session.')
 }
 
 function buildQueueTimingCell(item = {}) {
@@ -2092,12 +2293,13 @@ function normalizeExternalHref(href = '') {
     return ''
 }
 
-function buildBadge(value) {
+function buildBadge(value, detail = '') {
     const badge = document.createElement('span')
     const normalized = `${value || 'unknown'}`.toLowerCase()
     badge.className = `badge badge--${normalized.replace(/[^a-z0-9_-]/g, '-')}`
     badge.textContent = normalized
-    badge.title = getStatusHelp(normalized)
+    const trimmedDetail = `${detail || ''}`.trim()
+    badge.title = trimmedDetail ? `${getStatusHelp(normalized)} ${trimmedDetail}` : getStatusHelp(normalized)
     return badge
 }
 

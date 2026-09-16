@@ -11,7 +11,7 @@ const {
     normalizeTabTargetUrl
 } = require('./subject')
 
-const FLIGHT_RECORDER_CAPACITY = 2000
+const FLIGHT_RECORDER_CAPACITY = 20000 // 2026-09-13: temporarily 10x'd to survive multiple reloads while chasing WAL segment-gap corruption
 const FLIGHT_RECORDER_STRING_MAX = 240
 const FLIGHT_RECORDER_URL_MAX = 500
 const FLIGHT_RECORDER_KINDS = new Set([
@@ -46,7 +46,10 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "tab-action-release",
     "close-if-blocked-sent",
     "close-if-blocked-response",
-    "cloudflare-challenge-detected"
+    "cloudflare-challenge-detected",
+    "queue-wal-checkpoint-switch-start",
+    "queue-wal-checkpoint-switch-result",
+    "queue-wal-auto-recovery"
 ])
 
 let flightRecorderSeq = 0
@@ -98,7 +101,8 @@ function sanitizeFlightRecorderEntry(entry = {}) {
         "enqueueResultReason",
         "fillResultReason",
         "fillError",
-        "error"
+        "error",
+        "generationId"
     ]
     for(const field of stringFields) {
         const value = sanitizeFlightRecorderString(entry?.[field] || "")
@@ -126,7 +130,14 @@ function sanitizeFlightRecorderEntry(entry = {}) {
         "durablyActiveQueuedTabsCount",
         "durableActiveRows",
         "durableQueuedRows",
-        "durableTerminalRows"
+        "durableTerminalRows",
+        "snapshotSeq",
+        "checkpointedRecords",
+        "committedSegmentsA",
+        "committedSegmentsB",
+        "retiredKeys",
+        "viewItemCount",
+        "rebuiltRowCount"
     ]) {
         const value = sanitizeFlightRecorderInteger(entry?.[field])
         if(value !== undefined) sanitized[field] = value

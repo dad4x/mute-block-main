@@ -141,7 +141,15 @@ function createCoordinatorProgressReducer(deps = {}) {
             if(recordedProfileActionOutcomeMappedRecords.has(mapped)) return
             recordedProfileActionOutcomeMappedRecords.add(mapped)
         }
-        const actionKind = `${item?.actionKind || ''}`.trim()
+        // item.actionKind is frequently left unset on ordinary block rows
+        // (getCoordinatorActionKindForItem, swCoordinatorProgressRules.js,
+        // treats a missing value as 'mute-block' rather than requiring it be
+        // stamped on every row) -- defaulting the same way here matters:
+        // treating a missing value as '' instead silently drops every stat
+        // for exactly the common case, which is what happened before this
+        // fix (confirmed live: 2 terminal jobs completed under 1.6.1245,
+        // reallyBlocked/alreadyBlocked both stayed at 0).
+        const actionKind = `${item?.actionKind || 'mute-block'}`.trim()
         if(actionKind !== 'mute-block') return
         const outcome = `${mapped?.outcome || ''}`.trim()
         const bucket = outcome === 'already-blocked' ? 'alreadyBlocked'
@@ -156,6 +164,7 @@ function createCoordinatorProgressReducer(deps = {}) {
             recordQueueWakeupMetricMax(`profileAction.${bucket}.maxDurationMs`, durationMs)
         }
     }
+
 
     function getCoordinatorTransitionTerminalAt(item = {}, record = {}, nowMs = now(), options = {}) {
         if(options.terminalAtFallback === 'record') {

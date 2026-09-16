@@ -369,6 +369,15 @@ h2 {
     min-width: 0;
 }
 
+.metric-card--alert {
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.metric-card--alert .metric-value {
+    color: #991b1b;
+}
+
 .metric-label {
     color: #6b7280;
     font-size: 10px;

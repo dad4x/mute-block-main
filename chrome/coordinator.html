@@ -66,6 +66,14 @@
                     <div class="summary-value" id="activationHandoffSeconds">--</div>
                 </div>
                 <div class="summary-tile">
+                    <div class="summary-label" title="Mute-block jobs that performed a genuine new block action this metrics epoch, with their share of all block outcomes.">Really blocked</div>
+                    <div class="summary-value" id="reallyBlockedCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Mute-block jobs that found the profile already blocked this metrics epoch, with their share of all block outcomes.">Already blocked</div>
+                    <div class="summary-value" id="alreadyBlockedCount">0</div>
+                </div>
+                <div class="summary-tile">
                     <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>
                     <div class="summary-value" id="terminalCount">0</div>
                 </div>
@@ -90,6 +98,20 @@
                     <div class="metrics-grid" id="metricsGrid"></div>
                     <div class="list list--compact metrics-journal" id="metricsJournal"></div>
                 </div>
+            </section>
+
+            <section class="panel" data-panel-scroll-target="outlierList">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers">v</button>
+                        <h2 title="Rows whose active duration exceeded 45s or 2.5 standard deviations above this session's average active duration, captured with their flight-recorder history for inspection. Checked continuously, not just at completion, so a still-running stuck row shows up too. Not persisted -- lives only in this dashboard tab, cleared on reload or manually.">Outliers</h2>
+                    </div>
+                    <div class="panel-actions">
+                        <span id="outlierCount">0 outliers</span>
+                        <button class="clear-button" id="clearOutliersButton" type="button">Clear</button>
+                    </div>
+                </div>
+                <div class="list list--compact" id="outlierList"></div>
             </section>
 
             <section class="panel" data-panel-scroll-target="runList">

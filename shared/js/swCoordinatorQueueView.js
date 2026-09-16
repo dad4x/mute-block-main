@@ -35,6 +35,22 @@
 // existing getter/setter convention used at queueWakeupMetricsShape's own
 // construction call.
 
+// 2026-09-14: a WAL corruption incident left the coordinator unable to
+// persist any state for several hours; once recovered, the one row still
+// mid-flight from before the outage (and the handoff gap to whatever
+// activated right after recovery) each carried a multi-hour duration --
+// technically accurate, but it silently poisoned the "current epoch"
+// secs/block and handoff-sec averages below for as long as that sample
+// stayed within the 100-sample/epoch window, since neither average had any
+// protection against a single implausible outlier. COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS
+// excludes any single block duration or handoff gap above this ceiling from
+// the average (30 minutes -- well above any real slow-but-working sample
+// this project has seen, which top out around 10-12 minutes during a
+// post-incident ramp-up, but far below a multi-hour stall/outage).
+// Excluded samples are still counted (excludedOutliers) so the UI can
+// surface that something was dropped, rather than silently.
+const COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
+
 function createCoordinatorQueueView(deps = {}) {
     const {now} = deps
     const {
@@ -118,13 +134,15 @@ function createCoordinatorQueueView(deps = {}) {
             .sort((left, right) => getCoordinatorActualBlockTerminalTime(right) - getCoordinatorActualBlockTerminalTime(left))
             .slice(0, 100)
 
-        const durations = samples
+        const allDurations = samples
             .map(item => {
                 const startedAt = getCoordinatorActualBlockActiveStartTime(item)
                 const terminalAt = getCoordinatorActualBlockTerminalTime(item)
                 return startedAt > 0 && terminalAt > startedAt ? terminalAt - startedAt : 0
             })
             .filter(duration => duration > 0)
+        const durations = allDurations.filter(duration => duration <= COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS)
+        const excludedOutliers = allDurations.length - durations.length
         const elapsedMs = durations.reduce((total, duration) => total + duration, 0)
         const blocks = durations.length
 
@@ -132,6 +150,7 @@ function createCoordinatorQueueView(deps = {}) {
             epochStartedAt: minimumTerminalAt,
             sampleLimit: 100,
             blocks,
+            excludedOutliers,
             elapsedMs,
             seconds: blocks ? (elapsedMs / 1000) / blocks : 0
         }
@@ -192,10 +211,12 @@ function createCoordinatorQueueView(deps = {}) {
             if(samples.length >= 100) break
         }
 
-        const gaps = samples
+        const allGaps = samples
             .map(sample => Number.parseInt(sample.gapMs, 10) || 0)
             .filter(gap => gap > 0)
             .sort((left, right) => left - right)
+        const gaps = allGaps.filter(gap => gap <= COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS)
+        const excludedOutliers = allGaps.length - gaps.length
         const elapsedMs = gaps.reduce((total, gap) => total + gap, 0)
         const handoffs = gaps.length
         const p95Index = handoffs ? Math.min(handoffs - 1, Math.ceil(handoffs * 0.95) - 1) : 0
@@ -204,6 +225,7 @@ function createCoordinatorQueueView(deps = {}) {
             epochStartedAt: minimumTerminalAt,
             sampleLimit: 100,
             handoffs,
+            excludedOutliers,
             elapsedMs,
             seconds: handoffs ? (elapsedMs / 1000) / handoffs : 0,
             maxMs: handoffs ? gaps[handoffs - 1] : 0,
@@ -251,6 +273,29 @@ function createCoordinatorQueueView(deps = {}) {
         }
     }
 
+    // Inverse of summarizeCoordinatorQueueViewItem: rebuilds a queue map from
+    // a persisted mbCoordinatorQueueView, keyed the same way the live queue
+    // is (storageKey, falling back to dedupeKey/targetProfileHref for older
+    // view shapes). Used only for WAL "missing-segment" recovery -- the view
+    // item isn't a byte-identical copy of the original row (it's the curated
+    // subset summarizeCoordinatorQueueViewItem projects), but it carries
+    // every field the coordinator's own row-processing reads (status,
+    // attempt/retry info, tabId, source, runId, etc.), which is what made
+    // the 2026-09-14 manual recovery (tools/cdp/recover-queue-wal-from-view.js)
+    // work cleanly against a live corrupted store.
+    function buildCoordinatorQueueFromView(view = null) {
+        const items = Array.isArray(view?.items)
+            ? view.items
+            : Object.values(view?.items || {})
+        const queue = {}
+        for(const item of items) {
+            const key = `${item?.storageKey || item?.dedupeKey || item?.targetProfileHref || ''}`.trim()
+            if(!key || !item) continue
+            queue[key] = item
+        }
+        return queue
+    }
+
     function filterCoordinatorQueueForCompactView(queue = {}, runs = {}) {
         const knownRunIds = new Set(
             Object.keys(runs && typeof runs === 'object' ? runs : {})
@@ -290,6 +335,19 @@ function createCoordinatorQueueView(deps = {}) {
                 const rightItem = right[1] || {}
                 return getCoordinatorQueueViewSortRank(leftItem) - getCoordinatorQueueViewSortRank(rightItem) ||
                     getCoordinatorQueueViewTime(rightItem) - getCoordinatorQueueViewTime(leftItem) ||
+                    // 2026-09-14: bulk enqueues stamp every row with the same
+                    // createdAt/queuedAt millisecond, so the time comparison
+                    // above is a wash for an entire batch and this used to
+                    // fall straight to an alphabetical key sort -- which has
+                    // no relation to the order the executor will actually
+                    // run them in (queueRuntime.rebuildQueueOrder picks by
+                    // queueSequence). A row 200+ places back in the real
+                    // queue could render at the top of this list and look
+                    // stuck. queueSequence is assigned to every authoritative
+                    // item on enqueue/requeue, so break same-rank/same-time
+                    // ties by it before falling back to the key.
+                    (Number.parseInt(leftItem?.queueSequence, 10) || 0) -
+                        (Number.parseInt(rightItem?.queueSequence, 10) || 0) ||
                     `${left[0]}`.localeCompare(`${right[0]}`)
             })
             .map(([key, item]) => summarizeCoordinatorQueueViewItem(key, item))
@@ -436,6 +494,7 @@ function createCoordinatorQueueView(deps = {}) {
         getCoordinatorActivationHandoffActiveTime,
         summarizeCoordinatorActivationHandoffTiming,
         summarizeCoordinatorQueueViewItem,
+        buildCoordinatorQueueFromView,
         filterCoordinatorQueueForCompactView,
         buildCoordinatorQueueView,
         makeCoordinatorQueueAccountingCounts,
