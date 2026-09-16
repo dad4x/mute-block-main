@@ -797,7 +797,7 @@ test('stale active reconcile does not let timed out tab lookup wedge actorless r
         'function shouldTreatTimedOutPersistedTabLookupAsMissingForStaleActive(item = null, record = null, status = null, now = getNow())'
     )
     const tabStatusBody = extractFunction(
-        source,
+        readRepoFile('shared/js/swQueuedExecutorTabStatus.js'),
         'async function getQueuedExecutorTabStatusWithTimeout(tabId = null, reason = \'queued-executor-tab-get\')'
     )
     const deferHelperBody = extractFunction(
@@ -1342,7 +1342,7 @@ test('dashboard queued rows expose per-item cancel before status', () => {
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const messageStart = bootstrap.indexOf("request.action === 'cancel-coordinator-current-work-item'")
 
-    assert.match(renderBody, /buildQueueCancelCell\(item\),\s*buildBadge\(item\.status \|\| 'unknown'\)/)
+    assert.match(renderBody, /buildQueueCancelCell\(item\),\s*buildBadge\(item\.status \|\| 'unknown'/)
     assert.match(cancelCellBody, /isPendingQueueStatus/)
     assert.match(cancelCellBody, /button\.textContent = 'Cancel'/)
     assert.match(cancelCellBody, /cancelCurrentWorkItem\(item\)/)
@@ -3200,7 +3200,7 @@ test('queued tab open plan does not carry executor authority state across tab op
 
 test('queued tab fill bounds stale open-decision reads', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const planBody = extractFunction(source, 'async function planQueuedTabExecutorAction(action = {}, options = {})')
+    const planBody = extractFunction(readRepoFile('shared/js/swQueuedTabExecutorPlan.js'), 'async function planQueuedTabExecutorAction(action = {}, options = {})')
     const planLimitBody = extractFunction(readRepoFile('shared/js/swQueuedActivationSubjectKeys.js'), 'function getCoordinatorExecutorPlanBatchLimit(ownerTabId = null, options = {})')
     const finalCheckBody = extractFunction(source, 'async function validateQueuedTabOpenAgainstCurrentAuthority(action = {})')
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
@@ -4347,12 +4347,13 @@ test('content script detects Cloudflare challenge pages and reports them once pe
     assert.match(actionBody, /maybeReportCloudflareChallenge\(\)/)
 })
 
-test('service worker records a cloudflareChallenge.detected stat for reported Cloudflare challenges', () => {
+test('service worker records a cloudflareChallenge.detected stat and throttles for reported Cloudflare challenges', () => {
     const source = readRepoFile('shared/js/swBootstrap.js')
     const handlerIndex = source.indexOf("request.action === 'cloudflare-challenge-detected'")
     assert.notEqual(handlerIndex, -1)
-    const handlerBody = source.slice(handlerIndex, handlerIndex + 400)
+    const handlerBody = source.slice(handlerIndex, handlerIndex + 1100)
     assert.match(handlerBody, /incrementQueueWakeupMetric\('cloudflareChallenge\.detected'\)/)
+    assert.match(handlerBody, /rememberQueueLoadPressure\('cloudflare-challenge'/)
 })
 
 test('profile block click path does not await nonterminal progress breadcrumbs', () => {

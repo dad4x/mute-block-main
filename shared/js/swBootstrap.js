@@ -116,6 +116,7 @@ function registerServiceWorkerListeners(deps = {}) {
         releaseQueuedTab,
         rememberBrowserSessionMarker,
         rememberCanceledOwnerUrls,
+        rememberQueueLoadPressure,
         requestCoordinatorActionLease,
         requeueCoordinatorFailedItems,
         resetQueueWakeupMetricsEpochAfterLoad,
@@ -655,6 +656,16 @@ function registerServiceWorkerListeners(deps = {}) {
                 tabId: sender.tab?.id || null,
                 accepted: true,
                 reason: 'cf-chl-tk-query-param'
+            })
+            // Quora fronts profile pages with Cloudflare once request volume
+            // gets high enough to look automated -- the same load-pressure
+            // throttle used for slow/unscriptable tabs (drop to 1 concurrent
+            // tab, exponential backoff) is the right response here too, so a
+            // run that starts tripping challenges backs off instead of
+            // hammering straight into more of them.
+            rememberQueueLoadPressure('cloudflare-challenge', {
+                href: `${request.href || ''}`,
+                tabId: sender.tab?.id || null
             })
             return Promise.resolve({recorded: true})
         }

@@ -2984,3 +2984,110 @@ earlier this session), and a governing constraint that blocks the 298
 slices. This is a multi-session effort by design -- that's the point of
 sizing it this way, so any single session or context-limited agent can pick
 up exactly one slice, verify it fully, and hand off cleanly to the next.
+
+## 2026-09-13 survey -- next candidates confirmed still valid, none started
+
+Re-verified (grep for each function's current line, not trusting this
+doc's own stale numbers) that every remaining candidate below still exists
+in `sw.js` as of tonight -- nothing here has been picked up since the
+Part 2.5 work above landed.
+
+**Lowest-risk pick: the 4 of the 5 Slice-44 stragglers that were blocked
+specifically by the realm-crossing constraint** (see architecture.md's
+"Module Extraction And The Test Harness Realm Boundary" -- "Resolved
+2026-09"), now likely unblocked:
+- `ensureBrowserSessionStartupMetricsReset` (sw.js:1455)
+- `startQueueWakeupMetricsBackedStartupWork` (sw.js:1488)
+- `scheduleTerminalProgressProjectionFlush` (sw.js:5527)
+- `saveTerminalProgressProjectionAfterAuthority` (sw.js:5579)
+
+Not included: `scheduleQueueWakeupMetricsFlush` (sw.js:5116) -- its
+blocker is a hard test-harness regex-suppression issue, unrelated to the
+realm fix, still blocked.
+
+**Next unclaimed items from the "Next 20 Part 2 targets" list** (items
+1-4 -- `fillQueuedTabsOnce`, `confirmQueuedTabOpenDurableActiveEffect`,
+`runCoordinatorQueueExecutorFastPath`, `resumeCoordinatorQueueExecutionOnce`
+-- are the ones already worked through by Slices P2-1 through P2-21
+above; items 5+ were never picked up):
+5. `sweepStaleQueuedTabs` (~227 lines, sw.js:26321)
+6. `releaseQueuedTab` (~214 lines, sw.js:26798)
+7. `adoptLiveCoordinatorQueuedTab` (~204 lines, sw.js:13349)
+8. `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (~176 lines, sw.js:13877)
+9. `ensureQueuedTabContentScript` (~159 lines, sw.js:24178)
+10. `fillQueuedTabs` (~160 lines, sw.js:29306) -- outer wrapper around
+    already-decomposed `fillQueuedTabsOnce`, may be thin; verify before
+    assuming
+11. `kickCoordinatorQueueResume` (~160 lines, sw.js:17490)
+12. `pruneQueuedTabActions` (~108 lines, sw.js:25954)
+13. `rollbackFailedQueuedTabOpen` (~92 lines, sw.js:12826)
+14. `planQueuedTabExecutorAction` (~43 lines, sw.js:10199)
+15. `getQueuedExecutorTabStatusWithTimeout` (~51 lines, sw.js:2783)
+
+Follow the same discipline every prior slice used: read the full function
+first (an `await` can hide inside what looks like a pure decision span,
+e.g. a diagnostic-recording call), one slice per commit, full
+`npm run test:parallel` plus both production builds green after each.
+
+## 2026-09-14 -- two Part 2 targets extracted, one "unblocked straggler" pair corrected back to blocked
+
+**Correction to the 2026-09-13 survey above**: the 4 "lowest-risk, now
+likely unblocked" Slice-44 stragglers were NOT actually unblocked. Reading
+`ensureBrowserSessionStartupMetricsReset`/`startQueueWakeupMetricsBackedStartupWork`
+in place (sw.js, just after the `browserSessionRuntime` destructure) turned
+up a standing comment explaining that these two were already extracted once,
+produced a confirmed test-visible promise-microtask-ordering change (not a
+production bug -- webpack bundles everything into one realm -- but a real
+change under the test harness's per-module vm realm), and were deliberately
+moved back with a comment instructing future slices to leave them alone.
+The 2026-09-13 survey's "Resolved 2026-09" note about the realm-crossing
+harness constraint was about a *different* blocker (test harness couldn't
+run `async` functions extracted into their own vm-sandboxed realm at all)
+than the one that actually stopped these two (a same-realm-vs-cross-realm
+microtask-ordering difference that surfaces only once a `.then()` chain
+starts inside sw.js and calls into another module vs. starting inside that
+module already). Don't re-attempt these two without a fresh reason to
+believe the underlying microtask-ordering concern no longer applies.
+`scheduleTerminalProgressProjectionFlush`/`saveTerminalProgressProjectionAfterAuthority`
+(the other pair from that "stragglers" note) have the same
+Promise.resolve().then()-chain-into-another-module shape and were not
+attempted this pass for the same reason -- worth revisiting with the same
+minimal-repro discipline the original revert used, not a plain re-read.
+
+**Extracted this pass** (both green through full `npm run test:parallel`,
+including two test/p1-contract.test.js source-extraction assertions updated
+to read the new files instead of sw.js):
+
+- Part 2 target #15 (`getQueuedExecutorTabStatusWithTimeout`, ~51 lines) --
+  pulled out together with its two tightly-coupled siblings
+  `getQueuedExecutorTabStatusFromTabList` and `getQueuedExecutorTabWithTimeout`
+  into [swQueuedExecutorTabStatus.js](shared/js/swQueuedExecutorTabStatus.js).
+  Construction had to move to right after `coordinatorRuns`'s destructure in
+  sw.js, ahead of its old position, because `makeQueuedTabOpenUrlCommitHelpers`'s
+  construction-call handlers object literal eagerly references
+  `getQueuedExecutorTabStatusWithTimeout` bare.
+- Part 2 target #14 (`planQueuedTabExecutorAction`, ~43 lines) -- extracted
+  into [swQueuedTabExecutorPlan.js](shared/js/swQueuedTabExecutorPlan.js),
+  constructed in place (no eager-reference constraint found for this one).
+  Every dependency was already a bare const or hoisted `function`
+  declaration by that point in the file, so nothing needed threading as a
+  thunk.
+
+**Still unclaimed from the "Next 20 Part 2 targets" list**: items 5-13,
+15 is done (listed as 5-15 in the prior survey, corrected here since 14 and
+15 are now done):
+5. `sweepStaleQueuedTabs` (sw.js, ~227 lines)
+6. `releaseQueuedTab` (sw.js, ~214 lines)
+7. `adoptLiveCoordinatorQueuedTab` (sw.js, ~204 lines)
+8. `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (sw.js, ~176 lines)
+9. `ensureQueuedTabContentScript` (sw.js, ~159 lines)
+10. `fillQueuedTabs` (sw.js, ~160 lines) -- outer wrapper around
+    already-decomposed `fillQueuedTabsOnce`, may be thin; verify before
+    assuming
+11. `kickCoordinatorQueueResume` (sw.js, ~160 lines)
+12. `pruneQueuedTabActions` (sw.js, ~108 lines)
+13. `rollbackFailedQueuedTabOpen` (sw.js, ~92 lines)
+
+Re-verify current line numbers with grep before picking one up -- every
+edit this pass shifted everything below it, and line numbers throughout
+this whole document have been stale since it was written regardless.

@@ -53,6 +53,16 @@ body {
     background: rgba(255, 255, 255, 0.16);
 }
 
+.top-actions {
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 10px 14px;
+}
+
+.top-actions .button {
+    width: 100%;
+}
+
 .form {
     padding: 10px;
 }

@@ -79,6 +79,46 @@ test('dashboard queue view includes all rows while content queue index remains c
     assert.equal(storage.mbCoordinatorContentQueueIndex.truncated, true)
 })
 
+test('dashboard queue view orders same-timestamp queued rows by queueSequence, not alphabetically', () => {
+    const {sw} = loadServiceWorkerHarness()
+
+    // A bulk enqueue stamps every row with the same createdAt/queuedAt
+    // millisecond, so the view's time-based sort is a wash across the whole
+    // batch. Before the 2026-09-14 fix, the fallback tiebreak was a plain
+    // alphabetical key sort with no relation to queueSequence -- the order
+    // the executor actually runs rows in -- so a row far back in line could
+    // render at the very top of the dashboard's queue list and look stuck.
+    const queue = {
+        'https://www.quora.com/profile/Zebra': {
+            status: 'queued',
+            queuedAt: 1000,
+            updatedAt: 1000,
+            queueSequence: 1
+        },
+        'https://www.quora.com/profile/Mango': {
+            status: 'queued',
+            queuedAt: 1000,
+            updatedAt: 1000,
+            queueSequence: 2
+        },
+        'https://www.quora.com/profile/Apple': {
+            status: 'queued',
+            queuedAt: 1000,
+            updatedAt: 1000,
+            queueSequence: 3
+        }
+    }
+
+    const queueView = sw.buildCoordinatorQueueView(queue, 5000)
+    const orderedKeys = queueView.items.map(item => item.storageKey)
+
+    assert.deepEqual(orderedKeys, [
+        'https://www.quora.com/profile/Zebra',
+        'https://www.quora.com/profile/Mango',
+        'https://www.quora.com/profile/Apple'
+    ])
+})
+
 test('dashboard queue view summarizes terminal-to-next-active handoff delay', async () => {
     const {sw} = loadServiceWorkerHarness()
     const firstHref = 'https://www.quora.com/profile/Handoff-First'
@@ -137,6 +177,97 @@ test('dashboard queue view summarizes terminal-to-next-active handoff delay', as
     assert.equal(queueView.activationHandoffTiming.samples[0].terminalKey, firstHref)
     assert.equal(queueView.activationHandoffTiming.samples[0].runId, 'run-handoff')
     assert.equal(queueView.activationHandoffTiming.samples[0].nextActiveKey, secondHref)
+})
+
+test('dashboard queue view excludes an implausible multi-hour handoff gap from the average', async () => {
+    // 2026-09-14: a WAL corruption incident left the coordinator unable to
+    // persist state for several hours. Once recovered, the handoff gap
+    // between whatever last terminalized before the outage and whatever
+    // activated right after recovery was technically real but multi-hour --
+    // and with no outlier protection, that single sample poisoned the
+    // "current epoch" handoff-sec average until the epoch aged it out.
+    const {sw} = loadServiceWorkerHarness()
+    const firstHref = 'https://www.quora.com/profile/Handoff-Outlier-First'
+    const secondHref = 'https://www.quora.com/profile/Handoff-Outlier-Second'
+    const thirdHref = 'https://www.quora.com/profile/Handoff-Outlier-Third'
+    const outageGapMs = 2 * 60 * 60 * 1000
+    const outageTerminalAt = 4000
+    const queueView = sw.buildCoordinatorQueueView({
+        [firstHref]: {
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            runId: 'run-handoff-outlier',
+            targetProfileHref: firstHref,
+            queuedAt: 1000,
+            activeAt: 1500,
+            terminalAt: outageTerminalAt,
+            updatedAt: outageTerminalAt
+        },
+        [secondHref]: {
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            runId: 'run-handoff-outlier',
+            targetProfileHref: secondHref,
+            queuedAt: 2000,
+            activeAt: outageTerminalAt + outageGapMs,
+            terminalAt: outageTerminalAt + outageGapMs + 3000,
+            updatedAt: outageTerminalAt + outageGapMs + 3000
+        },
+        [thirdHref]: {
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            runId: 'run-handoff-outlier',
+            targetProfileHref: thirdHref,
+            queuedAt: outageTerminalAt + outageGapMs + 1000,
+            activeAt: outageTerminalAt + outageGapMs + 3500,
+            terminalAt: outageTerminalAt + outageGapMs + 6000,
+            updatedAt: outageTerminalAt + outageGapMs + 6000
+        }
+    }, 0)
+
+    assert.equal(queueView.activationHandoffTiming.handoffs, 1)
+    assert.equal(queueView.activationHandoffTiming.excludedOutliers, 1)
+    assert.equal(queueView.activationHandoffTiming.elapsedMs, 500)
+    assert.equal(queueView.activationHandoffTiming.seconds, 0.5)
+})
+
+test('dashboard queue view excludes an implausible multi-hour block duration from the average', async () => {
+    const {sw} = loadServiceWorkerHarness()
+    const outlierHref = 'https://www.quora.com/profile/Block-Duration-Outlier'
+    const normalHref = 'https://www.quora.com/profile/Block-Duration-Normal'
+    const outageGapMs = 3 * 60 * 60 * 1000
+    const queueView = sw.buildCoordinatorQueueView({
+        [outlierHref]: {
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            runId: 'run-block-outlier',
+            targetProfileHref: outlierHref,
+            queuedAt: 1000,
+            activeAt: 1000,
+            terminalAt: 1000 + outageGapMs,
+            updatedAt: 1000 + outageGapMs
+        },
+        [normalHref]: {
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            runId: 'run-block-outlier',
+            targetProfileHref: normalHref,
+            queuedAt: 2000 + outageGapMs,
+            activeAt: 2000 + outageGapMs,
+            terminalAt: 15000 + outageGapMs,
+            updatedAt: 15000 + outageGapMs
+        }
+    }, 0)
+
+    assert.equal(queueView.actualBlockTiming.blocks, 1)
+    assert.equal(queueView.actualBlockTiming.excludedOutliers, 1)
+    assert.equal(queueView.actualBlockTiming.elapsedMs, 13000)
+    assert.equal(queueView.actualBlockTiming.seconds, 13)
 })
 
 function trackServiceWorkerHarness(harness) {
@@ -3353,13 +3484,77 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
         storage
     })
 
+    // 2026-09-15: a segmented-WAL hydrate failure no longer throws -- it
+    // auto-recovers from mbCoordinatorQueueView (a derived read-model that
+    // survives the corruption because it isn't stored as WAL segments). The
+    // test's original point stands either way: the recovered row must come
+    // from the view's correct 'active' status, never from the stale
+    // mbCoordinatorQueue raw mirror (still 'queued' below), which is what
+    // "does not fall back to stale raw queue" means now.
+    const recoveredState = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(recoveredState.queue[href].status, 'active')
+    assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 1)
+})
+
+test('segmented queue WAL hydrate failure still throws when no queue view is available to recover from', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Missing-Segment-No-View'
+    const runId = 'run-segmented-wal-missing-segment-no-view'
+    const attemptId = 'attempt-segmented-wal-missing-segment-no-view'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150300,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 150300}),
+                    status: 'queued',
+                    activeAt: 0,
+                    tabId: null
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150310,
+            runId,
+            tabId: 505,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+    assert.equal(recorded.recorded, true)
+
+    // No queue view to recover from (deleted here even though the row event
+    // above would normally have written one) -- the auto-recovery guard must
+    // refuse silently guessing and still surface the failure, exactly like
+    // it did before 2026-09-15's auto-recovery was added.
+    delete storage.mbCoordinatorQueueView
+    delete storage['mbCoordinatorQueueWal.segment.A.0000']
+    const restarted = loadServiceWorkerHarness({
+        now: 150320,
+        storage
+    })
+
     await assert.rejects(
         () => restarted.sw.coordinatorAuthority.hydrate(),
         /segmented queue WAL hydrate failed: missing-segment/
     )
-    await restarted.sw.enqueueSpaceFeedStorageUpdate(async () => true)
-    assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 0)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveryFromViewFailed'] || 0, 1)
 })
 
 test('segmented queue WAL missing checkpoint residue hydrates as empty authority', async () => {
@@ -3463,7 +3658,88 @@ test('segmented queue WAL missing checkpoint with segment residue hydrates as em
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 1)
 })
 
-test('segmented queue WAL soft threshold records lifecycle metrics and schedules checkpoint switch', async () => {
+// 2026-09-15 live incident: a WAL auto-recovery (from the queue view)
+// durably persisted a good checkpoint, and within seconds a second,
+// unrelated hydrate call (a routine SW restart, not a crash) got a
+// *different* failure reason -- 'missing-checkpoint' rather than
+// 'missing-segment' -- against stale-but-not-yet-caught-up storage. That
+// reason used to be handled by the older segmentedMissingCheckpointReset
+// branch alone, which resets straight to an empty checkpoint whenever the
+// legacy raw mbCoordinatorQueue mirror is empty (true by default once
+// everything moved onto the WAL) -- it never consulted the queue view, so it
+// silently wiped 900 real rows seconds after they were recovered. The fix
+// reorders view-based auto-recovery to run before this reset branch for
+// every failure reason, not just the ones that reach the final throw.
+test('segmented queue WAL missing checkpoint recovers from queue view instead of resetting to empty', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Missing-Checkpoint-View-Recovery'
+    const runId = 'run-segmented-missing-checkpoint-view-recovery'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150340,
+            terminalAt: 150341,
+            updatedAt: 150341,
+            attemptId: 'attempt-segmented-missing-checkpoint-view-recovery',
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 1, {
+        rowKey: href,
+        createdAt: 150340
+    })
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 150350,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbCoordinatorQueueView: {
+                version: 1,
+                updatedAt: 150341,
+                total: 1,
+                items: [{
+                    storageKey: href,
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    actionKind: 'mute-block',
+                    runId,
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    dedupeKey: href,
+                    attemptId: 'attempt-segmented-missing-checkpoint-view-recovery',
+                    attemptNumber: 1,
+                    terminalAt: 150341,
+                    updatedAt: 150341
+                }]
+            },
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const activeCheckpoint = storage['mbCoordinatorQueueWal.meta']?.activeCheckpoint
+    delete storage[`mbCoordinatorQueueWal.checkpoint.${activeCheckpoint}`]
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href]?.status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 0)
+})
+
+test('segmented queue WAL soft threshold records lifecycle metrics and switches the checkpoint immediately', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Soft-Threshold'
     const runId = 'run-segmented-wal-soft-threshold'
     const attemptId = 'attempt-segmented-wal-soft-threshold'
@@ -3523,8 +3799,8 @@ test('segmented queue WAL soft threshold records lifecycle metrics and schedules
     assert.ok(storage[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', 'A', softSwitchAt - 1)])
     const counters = sw.state().queueWakeupCounters
     assert.equal(counters['coordinatorAuthority.queueWal.segmentSoftSwitchScheduled'] || 0, 1)
-    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 0)
-    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchDeferredForQueueWork'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork'] || 0, 0)
     assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= softSwitchAt)
     assert.ok((counters['coordinatorAuthority.queueWal.manifestBytes'] || 0) > 0)
     assert.ok((counters['coordinatorAuthority.queueWal.physicalSegmentBytes'] || 0) > 0)
@@ -3660,15 +3936,18 @@ test('segmented queue WAL authority read schedules checkpoint switch over soft s
 })
 
 test('segmented queue WAL forces checkpoint switch over active queue work once growth outruns amortization', async () => {
-    // Regression for the 2026-09-12 CPU-storm incident: the soft-switch
-    // defers the checkpoint switch indefinitely while the queue has active
-    // or queued work (see the "schedules checkpoint switch" test above), so
-    // it amortizes a burst of tiny writes into one checkpoint. But a
-    // long-running batch never goes idle, so that deferral never resolves --
-    // the WAL keeps growing straight toward the hard segment limit (where
-    // appends start getting rejected outright) instead of ever rotating.
-    // Once growth has clearly outrun normal amortization, the switch must be
-    // forced through regardless of pending work.
+    // Regression for the 2026-09-12 CPU-storm incident, later reinforced by
+    // the 2026-09-14 fix that removed the soft-switch's "defer while busy"
+    // branch entirely (see the "switches the checkpoint immediately" test
+    // above, and COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT's comment in
+    // sw.js): a long-running batch never goes idle, so deferring until idle
+    // was indistinguishable from deferring until the batch finished, and the
+    // WAL kept growing straight toward the hard segment limit (where appends
+    // start getting rejected outright) instead of ever rotating. The soft
+    // switch now always proceeds immediately regardless of pending work; this
+    // test covers the FORCE_SWITCH_AT threshold specifically, which remains
+    // as a backstop in case something upstream ever fails to call the switch
+    // at the soft threshold in the first place.
     const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Force-Switch'
     const runId = 'run-segmented-wal-force-switch'
     const attemptId = 'attempt-segmented-wal-force-switch'
@@ -3728,7 +4007,6 @@ test('segmented queue WAL forces checkpoint switch over active queue work once g
     assert.ok(storage[getSegmentedWalSegmentKey('mbCoordinatorQueueWal', 'A', forceSwitchAt - 1)])
     const counters = sw.state().queueWakeupCounters
     assert.equal(counters['coordinatorAuthority.queueWal.segmentSoftSwitchScheduled'] || 0, 1)
-    assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchDeferredForQueueWork'] || 0, 0)
     assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork'] || 0, 1)
     assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
     assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= forceSwitchAt)
@@ -4564,6 +4842,76 @@ test('already-blocked terminal progress records an alreadyBlocked profileAction 
     )
     assert.ok((after['profileAction.alreadyBlocked.maxDurationMs'] || 0) > 0)
     assert.equal(after['profileAction.reallyBlocked.count'] || 0, before['profileAction.reallyBlocked.count'] || 0)
+})
+
+test('block terminal progress records a reallyBlocked stat even when the queue row has no actionKind stamped', async () => {
+    // Regression for a live bug found right after shipping the stats:
+    // makeActiveCoordinatorRow (every other test here) stamps
+    // actionKind: 'mute-block' on the row, which happened to mask a bug --
+    // getCoordinatorActionKindForItem (swCoordinatorProgressRules.js)
+    // treats a *missing* item.actionKind as 'mute-block' by default, but
+    // recordCoordinatorProfileActionOutcomeStat originally treated a
+    // missing value as '' and silently dropped the stat. Confirmed live:
+    // after queuing ~300 real profiles, 2 completed under 1.6.1245 and
+    // neither reallyBlocked nor alreadyBlocked moved off zero. This test
+    // omits actionKind from the row (as real enqueue paths sometimes leave
+    // it) to catch that gap.
+    const href = 'https://www.quora.com/profile/Synthetic-No-ActionKind-Stat'
+    const runId = 'run-no-actionkind-stat'
+    const attemptId = 'attempt-no-actionkind-stat'
+    const tabId = 507
+    const {sw} = loadServiceWorkerHarness({
+        now: 250000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: (() => {
+                    const row = makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250000})
+                    delete row.actionKind
+                    return row
+                })()
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 249500
+                }
+            }
+        }
+    })
+
+    const before = sw.state().queueWakeupCounters
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: 250100,
+        terminalAt: 250100,
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, true, JSON.stringify(result))
+    assert.equal(result.terminal, true, JSON.stringify(result))
+    assert.equal(
+        (after['profileAction.reallyBlocked.count'] || 0) -
+            (before['profileAction.reallyBlocked.count'] || 0),
+        1
+    )
 })
 
 test('duplicate terminal progress for terminal row does not append duplicate queue WAL', async () => {
@@ -11909,6 +12257,61 @@ test('coordinator reconcile scheduler coalesces and backs off no-op reconcile', 
     assert.deepEqual(timers.pending().map(timer => timer.dueAt), [edgeTriggeredDueAt])
 })
 
+test('coordinator reconcile scheduler refuses to arm a new tick while paused', async () => {
+    // Regression for a live 2026-09-13 incident: scheduleCoordinatorReconcile
+    // (the sole place that re-arms the next reconcile timer/alarm) checked
+    // quoraRuntimeActivated but never checked pause. A reconcile tick that
+    // kept reporting "changed" reset its backoff to the minimum interval
+    // every time, so the loop kept re-arming itself and piling more work
+    // onto the serialized storage-update queue even after the user paused
+    // -- confirmed live via why-not-running showing a 60s+ stuck reconcile
+    // promise and a storage-update queue backlog that never stopped growing
+    // while paused: true.
+    const {sw, timers} = loadServiceWorkerHarness({
+        now: 1000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const pauseResult = await sw.pauseCoordinatorNukes()
+    assert.equal(pauseResult.paused, true)
+
+    const before = sw.state().queueWakeupCounters['reconcile.deferredPaused'] || 0
+    assert.equal(sw.scheduleCoordinatorReconcile(1000, {allowBeforeQuora: true}), false)
+    assert.equal(timers.pending().length, 0)
+    assert.equal((sw.state().queueWakeupCounters['reconcile.deferredPaused'] || 0) - before, 1)
+})
+
+test('a reconcile tick already armed before pause is skipped instead of running when it fires', async () => {
+    const {sw, timers} = loadServiceWorkerHarness({
+        now: 1000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    assert.equal(sw.scheduleCoordinatorReconcile(1000, {allowBeforeQuora: true}), true)
+    assert.equal(timers.pending().length, 1)
+
+    await sw.pauseCoordinatorNukes()
+
+    const before = sw.state().queueWakeupCounters
+    await timers.tick(1000)
+
+    const after = sw.state().queueWakeupCounters
+    assert.equal((after['reconcile.skippedPaused'] || 0) - (before['reconcile.skippedPaused'] || 0), 1)
+    assert.equal((after['reconcile.requested'] || 0) - (before['reconcile.requested'] || 0), 0)
+})
+
 test('stored-work reconcile hands queued-only durable work to fast executor', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Queued-Only-Fast-Resume'
     const runId = 'run-reconcile-queued-only-fast-resume'
@@ -12067,6 +12470,42 @@ test('storage update timeout abandons queued updates before they start', async (
     )
     assert.equal(await third, 'third-ok')
     assert.equal(thirdRan, true)
+})
+
+test('a stalled storage-update queue records a backlog alert visible on the dashboard', async () => {
+    // Regression for a live 2026-09-13 incident: a runaway reconcile loop
+    // backed up the serialized storage-update queue for minutes (the oldest
+    // pending write waited 190s+), and nothing surfaced that anywhere --
+    // the only symptom visible to a user was the same queued rows never
+    // progressing. This checks the new self-imposed alert: once the oldest
+    // pending item's age crosses the stall threshold, a metric/diagnostic
+    // event fires so it shows up on the dashboard's metrics grid.
+    const {sw, timers} = loadServiceWorkerHarness({now: 1000})
+    let finishFirst = null
+
+    sw.enqueueSpaceFeedStorageUpdate(
+        () => new Promise(resolve => {
+            finishFirst = () => resolve('first-ok')
+        }),
+        {timeoutMs: 60000}
+    )
+    await flushAsync(20)
+    assert.equal(typeof finishFirst, 'function')
+
+    await timers.tick(31000)
+
+    const before = sw.state().queueWakeupCounters['storageUpdate.queueStallWarning'] || 0
+    await settleWithFakeTimers(
+        sw.runCoordinatorReconcileTick('synthetic-stall-check', {allowBeforeQuora: true}),
+        timers
+    )
+
+    const after = sw.state().queueWakeupCounters
+    assert.equal((after['storageUpdate.queueStallWarning'] || 0) - before, 1)
+    assert.ok((after['storageUpdate.queueStallMaxWaitMs'] || 0) >= 30000)
+
+    finishFirst()
+    await flushAsync(20)
 })
 
 test('storageGet timeout detaches serialized tail and suppresses late continuation writes', async () => {
@@ -17080,6 +17519,85 @@ test('manual failed requeue preserves no-foreground executor policy when claimed
     )
 
     assert.equal(claim.noForegroundFallback, true)
+})
+
+test('a large bulk enqueue is durably persisted in chunks, not one giant commit', async () => {
+    // 2026-09-14: a single enqueue call used to persist its whole `items`
+    // array as one durable WAL mutation. A 500+ item bulk Space-feed nuke
+    // could then append many WAL segments in one uninterrupted commit, so a
+    // checkpoint-switch threshold crossing never got a chance to run between
+    // rows -- the same danger zone implicated in this project's
+    // "missing-segment" WAL corruption incidents. This test proves the fix:
+    // a batch over COORDINATOR_ENQUEUE_CHUNK_THRESHOLD is split into several
+    // separate durable commits (counted via the enqueue.chunked.batches
+    // wakeup metric, since each chunk goes through its own
+    // enqueueSpaceFeedStorageUpdate call), while every row still lands in
+    // the queue, durable, under the same run.
+    const runId = 'run-bulk-chunk-durability'
+    const itemCount = 150
+    const hrefs = Array.from({length: itemCount}, (_, index) =>
+        `https://www.quora.com/profile/Synthetic-Bulk-Chunk-${index}`)
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, sw} = loadServiceWorkerHarness()
+
+    const result = await browser.runtime.sendMessage({
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: runId,
+            sourceType: 'space-feed'
+        },
+        source: {
+            type: 'space-feed',
+            pageUrl: 'https://www.quora.com/space/example'
+        },
+        items: hrefs.map(href => ({
+            runId,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href
+        }))
+    }, sourceSender)
+
+    assert.equal(result.queued, itemCount)
+    assert.equal(result.durable, true)
+
+    const queue = sw.coordinatorAuthority.current().queue
+    for(const href of hrefs) {
+        assert.equal(queue[href]?.status, 'queued')
+        assert.equal(queue[href]?.runId, runId)
+    }
+
+    const expectedChunks = Math.ceil(itemCount / 50)
+    assert.ok(expectedChunks > 1, 'test setup should exercise more than one chunk')
+    assert.equal(sw.state().queueWakeupCounters['enqueue.chunked.batches'], expectedChunks)
+})
+
+test('a small enqueue below the chunk threshold is not chunked', async () => {
+    const runId = 'run-small-enqueue-unchunked'
+    const hrefs = ['https://www.quora.com/profile/Synthetic-Small-Enqueue-1', 'https://www.quora.com/profile/Synthetic-Small-Enqueue-2']
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, sw} = loadServiceWorkerHarness()
+
+    const result = await browser.runtime.sendMessage({
+        action: 'enqueue-coordinator-items',
+        run: {
+            id: runId,
+            sourceType: 'space-feed'
+        },
+        source: {
+            type: 'space-feed',
+            pageUrl: 'https://www.quora.com/space/example'
+        },
+        items: hrefs.map(href => ({
+            runId,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href
+        }))
+    }, sourceSender)
+
+    assert.equal(result.queued, hrefs.length)
+    assert.equal(sw.state().queueWakeupCounters['enqueue.chunked.batches'] || 0, 0)
 })
 
 test('queued profile actions are throttled and opened background', async () => {
@@ -30245,6 +30763,43 @@ test('claim-tab-action promotes matching queued storage rows before returning wo
     assert.equal(sw.state().activeQueuedTabs.includes(tabId), true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, tabId)
+})
+
+test('cloudflare-challenge-detected message records a stat and activates the queue-load throttle', async () => {
+    // Regression for the 2026-09-12 incident: Quora fronted several profile
+    // pages with a Cloudflare bot-challenge interstitial once request volume
+    // looked automated. The content script reports this once per page load
+    // (see the p1-contract "content script detects Cloudflare challenge
+    // pages" test); the service worker side of that wire-up should both
+    // count it and back off the same way it already does for other
+    // load-pressure signals (slow/unscriptable tabs), so a run that starts
+    // tripping challenges doesn't keep hammering straight into more of them.
+    const href = 'https://www.quora.com/profile/Synthetic-Cloudflare-Challenge'
+    const tabId = 909
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    assert.equal(sw.state().queueLoadThrottle.active, false)
+
+    const result = await browser.runtime.sendMessage({
+        action: 'cloudflare-challenge-detected',
+        href: `${href}?__cf_chl_tk=abc123`
+    }, {
+        tab: {id: tabId, windowId: 1, url: href}
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(sw.state().queueWakeupCounters['cloudflareChallenge.detected'] || 0, 1)
+    assert.equal(sw.state().queueLoadThrottle.active, true)
+    assert.equal(sw.state().queueLoadThrottle.reason, 'cloudflare-challenge')
 })
 
 test('claim-tab-action recovers active resident authority without full projection read', async () => {
