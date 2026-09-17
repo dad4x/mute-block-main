@@ -167,8 +167,20 @@ function createQueuedWorkerActionSurfaceState(deps = {}) {
         return queuedItems.some(item => {
             const itemWindowId = Number.parseInt(item?.actionSurfaceWindowId, 10) || 0
             if(itemWindowId) return itemWindowId === normalizedWindowId
+            // A freshly-queued item that hasn't been dispatched yet carries
+            // no actionSurfaceWindowId/actionSurfaceMode tag at all -- those
+            // are only set at dispatch time (tagActionWithQueuedWorkerSurface).
+            // Live incident (2026-09-17): this used to treat such an item as
+            // "not this surface's problem", so in the gap between one queued
+            // tab releasing and the next being claimed, this check saw no
+            // recognized backlog and closed the window, which then had to be
+            // recreated moments later for the next item. isForegroundQueuedTabWork
+            // is a pure data check on the item's own actionKind (independent
+            // of dispatch-time tagging), so it can tell -- before the item is
+            // ever claimed -- whether it will need this surface at all.
             return `${item?.actionSurfaceMode || ''}`.trim() === 'worker-window' ||
-                getQueuedActionNoForegroundFallback(item)
+                getQueuedActionNoForegroundFallback(item) ||
+                isForegroundQueuedTabWork(null, item)
         })
     }
 

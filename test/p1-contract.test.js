@@ -2276,6 +2276,20 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(recordSweepBody, /enqueueSpaceFeedStorageUpdate\(async \(\) => \{/)
     assert.match(recordSweepBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: 'backgroundBlockedSweepTerminal\.load'/)
     assert.match(recordSweepBody, /coordinatorItemMatchesQueuedTabRuntime\(item, rowKey, metadata, normalizedTabId\)/)
+    // Live incident (2026-09-17): this sweep can legitimately catch either
+    // a block our own direct action caused (confirmation was just slow) or
+    // a genuinely pre-existing block (we never got to clicking) -- the
+    // willClose DOM signal alone can't tell these apart. It used to
+    // hardcode status: 'already-blocked' / foundBlockedBeforeQueue: true
+    // unconditionally, mislabeling every directly-caused block this
+    // fallback ever caught as pre-existing and hiding it from the
+    // reallyBlocked tally. Fixed via the shared classifyBlockConfirmationFromItem
+    // helper (extracted after the same bug turned up a second time in
+    // terminalizeActiveCoordinatorItemFromBlockedLiveTab's own fallback --
+    // see activeBlockedLiveBody assertions below), which branches on
+    // item.milestones.blockAttemptedAt.
+    assert.match(recordSweepBody, /status: classification\.status,[\s\S]{0,120}foundBlockedBeforeQueue: classification\.foundBlockedBeforeQueue/)
+    assert.match(recordSweepBody, /buildSweepConfirmedRecord\(classifyBlockConfirmationFromItem\(item\)\)/)
     assert.match(recordSweepBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'background-blocked-sweep-terminal'/)
     assert.match(recordSweepBody, /deferProjectionSave: true/)
     assert.match(recordSweepBody, /scheduleQueuedWorkContinuation\('background-blocked-sweep-terminal'\)[\s\S]*const nextQueue = coordinatorAuthority\.current\(\)\.queue/)
@@ -2287,10 +2301,31 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(scheduleSweepBody, /queueRuntime\.getOwningParentForChild\(tabId\)/)
     assert.match(scheduleSweepBody, /scheduleOwnedBlockedProfileSweep\(parentTabId, 5000\)/)
     assert.match(activeBlockedLiveBody, /action: 'close-if-blocked'/)
+    // Live incident (2026-09-17): this function's close-if-blocked
+    // send-and-await used to run with no in-flight guard at all -- two
+    // independent callers (the periodic blocked-profile sweep and the
+    // executor's own active-with-tab-and-pending-action classifier) could
+    // and did probe the same tab concurrently with no coordination
+    // (confirmed live: 16 sends to one tab in under 2 seconds, alternating
+    // between both callers' reasons). closeIfBlockedProbeInFlightByTabId
+    // coalesces concurrent probes for the same tabId onto one in-flight
+    // send instead of each caller firing its own.
+    assert.match(activeBlockedLiveBody, /closeIfBlockedProbeInFlightByTabId\.get\(tabId\)/)
+    assert.match(activeBlockedLiveBody, /closeIfBlockedProbeInFlightByTabId\.set\(tabId, probePromise\)/)
+    assert.match(activeBlockedLiveBody, /closeIfBlockedProbeInFlightByTabId\.delete\(tabId\)/)
     assert.doesNotMatch(activeBlockedLiveBody, /matches\.length !== 1/)
     assert.match(activeBlockedLiveBody, /const persistedMatch = persistedTabId[\s\S]*matches\.find/)
     assert.match(activeBlockedLiveBody, /const match = persistedMatch \|\| matches\[0\] \|\| null/)
-    assert.match(activeBlockedLiveBody, /recordCoordinatorJobProgressViaQueueMachine\(href, \{[\s\S]*status: 'already-blocked'[\s\S]*blockSucceeded: true/)
+    // Live incident (2026-09-17, second occurrence): this fallback also
+    // hardcoded status: 'already-blocked' unconditionally -- 11 of 13
+    // sweep terminalizations this session went through this exact shape
+    // and were all misclassified, accounting for most of the "I've seen
+    // ~10 real blocks but the dashboard shows 2" discrepancy the user
+    // reported. Fixed by extracting classifyBlockConfirmationFromItem
+    // (shared with recordOwnedBlockedSweepTerminal above) instead of
+    // duplicating the same branch a second time.
+    assert.match(activeBlockedLiveBody, /const fallbackClassification = classifyBlockConfirmationFromItem\(expectedItem\)/)
+    assert.match(activeBlockedLiveBody, /recordCoordinatorJobProgressViaQueueMachine\(href, \{[\s\S]*status: fallbackClassification\.status,[\s\S]*foundBlockedBeforeQueue: fallbackClassification\.foundBlockedBeforeQueue,[\s\S]*blockSucceeded: true/)
     assert.match(activeBlockedLiveBody, /allowBlockedLiveTabSender: true/)
     assert.match(activeBlockedLiveBody, /for\(const closeCandidate of matches\.length > 1 \? matches : \[\{tab: match\.tab, response: match\.response\}\]\)/)
     assert.match(activeBlockedLiveBody, /await releaseQueuedTabAndCleanup\(closeTabId, \{awaitFill: closeTabId === tabId\}\)/)

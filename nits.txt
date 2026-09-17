@@ -264,6 +264,160 @@ crash, but there's no guaranteed reconciliation deadline -- a view row can
 stay stale indefinitely if the retry keeps losing the race under sustained
 backlog.
 
+[2026-09-17, later same morning: four more live findings from a 115-item
+batch, all root-caused and fixed same session, v1.6.1266]
+
+1. Worker-window flicker (nits.txt item 8's earlier fix was real but
+incomplete). hasDurableQueuedBacklogForActionSurface
+(swQueuedWorkerActionSurfaceState.js) only recognized a queued item as
+"needs this surface" once it already carried an actionSurfaceWindowId/
+actionSurfaceMode tag -- set only at dispatch time. A freshly-queued item
+sitting in backlog (most of any batch, at any moment) carried neither tag,
+so in the gap between one tab releasing and the next being claimed, this
+check saw no recognized backlog and closed the window, which then had to
+reopen for the very next item. Fixed: also treat an untagged item as
+belonging to this surface via isForegroundQueuedTabWork(null, item) -- a
+pure data check on the item's own actionKind, independent of dispatch-time
+tagging. Regression test added (swSynthetic.test.js).
+
+2. Pause doesn't atomically stop an in-flight active-transition.
+Pausing parks any currently-active row back to 'queued' immediately
+(operationKind 'stored-work-pause'), but a queued-tab-open sequence
+already in flight when the pause landed had no way to see that --
+transitionCoordinatorItemForQueuedTabLocked committed 'active' regardless,
+only to be caught seconds later by a separate rollback pass. Confirmed
+live: two rows briefly flipped queued->active->queued after an explicit
+pause, and one (Chpster) came out of the scramble 'failed' instead of
+cleanly 'queued'. Fixed: check isCoordinatorPauseRequestedLocally() (the
+same synchronous in-memory flag every other queued-tab entry point already
+checks) at the top of the commit function and reject instead of
+committing. Regression test added.
+
+3. background-blocked-sweep-terminal mislabeled directly-caused blocks as
+"already blocked", hiding them from the reallyBlocked tally.
+recordOwnedBlockedSweepTerminal (a fallback for when the primary
+close-if-blocked confirmation times out) hardcoded
+foundBlockedBeforeQueue: true / status: 'already-blocked' unconditionally.
+Confirmed live: Barbara-5930 took ~35s of failed close-if-blocked polling
+before this sweep caught it, and landed as "already blocked" despite our
+own action having caused it. Root-caused precisely (not just patched):
+item.milestones.blockAttemptedAt -- set only once a direct block click is
+actually dispatched, already used elsewhere in the codebase for the same
+kind of distinction -- is now checked to decide 'blocked' vs
+'already-blocked' per call, since this sweep can legitimately catch either
+case (confirmation just slow, vs. genuinely pre-existing) and the DOM
+signal alone can't tell them apart. Caught my own first draft being wrong
+here: an unconditional flip to 'blocked' broke an existing test
+representing the genuine already-blocked case, which is how the real
+per-call signal got found instead of just forcing the tests to agree.
+p1-contract.test.js contract assertions updated to match.
+
+4. terminalizeActiveCoordinatorItemFromBlockedLiveTab -- the exact
+resend-loop bug flagged last night (Vivian-Christian-21, 11 sends in 1.3s)
+and never fixed -- confirmed STILL LIVE this session, worse: Barbara-5930
+took 16 close-if-blocked sends in under 2 seconds. Root cause: this
+function already had an in-flight coalescing wrapper
+(withBlockedLiveTabTerminalization, keyed by tabId) but it only wrapped
+the *final* terminalize-this-tab step -- the actual close-if-blocked
+send-and-await loop ran entirely before that wrapper, with zero
+protection. Two independent callers (the periodic blocked-profile sweep,
+reason profile-tabs-active-authority-blocked-live-tab, and the executor's
+own active-with-tab-and-pending-action classifier, reason
+active-with-pending-action-already-blocked) were probing the same tab
+concurrently with no coordination, confirmed by the alternating reason
+strings in the flight recorder burst. Fixed: a dedicated
+closeIfBlockedProbeInFlightByTabId map coalesces concurrent probes for the
+same tabId onto one in-flight send. Kept separate from
+blockedLiveTabTerminalizationPromises (different return shapes; coalescing
+across them would leak one caller's result into another's).
+
+All four verified: full test suite green (857 tests), built, reloaded live
+as v1.6.1266 with 0 manifest/runtime errors.
+
+[2026-09-17, later: fallow/similar-code + jscpd added as tooling, first
+findings triaged]
+
+Added jscpd (npm run lint:duplicates, .jscpd.json) and fallow (.fallowrc.json,
+npx fallow dead-code / similar-code) for code-similarity and dead-code
+analysis, per user request after tonight's duplicate hardcoded-classification
+bug turned up twice. fallow similar-code needs a one-time local model setup
+(fallow similar-code setup --local) that only a human can approve -- done.
+
+Reviewed the top 3 fallow similar-code candidates fallow flagged (0.80-0.81
+similarity), verdict: no action needed on any of them --
+  1. getJobAttemptId (jobState.js) vs getAttemptIdFromValue (content.js AND
+     swCoordinatorAttemptIdentity.js, sw.js-side) -- genuinely a 3-way
+     duplicate of a trivial attemptId-extraction utility, but the sw.js-side
+     copy alone has 251+ external references. Real duplication, but not
+     worth the regression risk of consolidating for a ~2-line utility with
+     no actual bug behind it.
+  2. mutateCoordinatorKeyOnlyItemTerminalize vs mutateCoordinatorActiveFromTerminalProgress
+     (sw.js) -- false positive. Both follow this codebase's standard
+     mutator template (load -> validate attempt -> build terminal item ->
+     applyWithinStorageUpdate) but solve different problems (finalizing an
+     active row from real progress vs. force-failing a never-resolved
+     key-only row). Similarity is architectural convention, not logic
+     duplication.
+  3. getQueueableSpaceFeedEntries vs getQueueableSpaceFeedEntryUrls
+     (content.js) -- false positive. The former directly calls the latter;
+     it's composition, not duplication. Same relationship as the earlier-
+     diagnosed getLiveSpaceFeedEntries/getLiveSpaceFeedEntryUrls pair.
+
+Fallow's own dead-code pass also caught one real, fixed issue: eslint was
+require()'d directly by tools/lint-correctness.js but never listed in
+package.json -- it only worked because something else pulled it in
+transitively. Pinned explicitly at 8.56.0. web-ext-plugin flagged as a
+genuinely unused devDependency (confirmed via grep -- only appears in
+package.json/package-lock.json, nothing requires it); left in place pending
+the user's call on removing it.
+
+[2026-09-17, same session: the actual live write-queue-backlog root cause,
+found from real diagnostic data and fixed]
+
+Root-caused the "6 write-queue-backlog alerts" the user saw live, using the
+mbCoordinatorEvents diagnostic log's real timestamps (not just cumulative
+epoch counters, which had wrongly suggested a multi-hour spread -- the user
+correctly pushed back that it looked concentrated in the last ~55-item
+batch, and the real data proved them right: two tight ~70-second bursts of
+3 stalls each, not a background rate).
+
+During both bursts, one specific row cycled continuously through
+authority-mutation recover-exhausted-rolled-back-queued -> retry-budget-
+recovery -> queued-coordinator-item, roughly once per second, for the
+entire ~70+ second window, without ever making real progress. That tight
+loop was hammering the serialized write queue, starving unrelated writes
+(the rowEvent.queued-progress-milestone writes for other rows) behind it --
+matching the stall diagnostic's currentReason exactly.
+
+Root cause: shouldRecoverExhaustedRolledBackQueuedTabRetry
+(swRolledBackQueuedTabRetryClassification.js) had no limit on how many
+times the same row could be rescued. buildForcedRolledBackQueuedTabRetryItem
+bumps maxRetries by exactly nextRetryAttempt + 1 on every recovery -- enough
+to allow exactly one more attempt, never a real ceiling -- so a row that
+keeps genuinely, persistently failing (not a transient blip) never reaches
+the terminalize path: every fast-executor tick (which passes
+queueOnlyAuthority: true) re-approves it unconditionally. Also found while
+fixing this: runCoordinatorAuthorityReconcileActions hardcodes
+recoverActiveTransitionFailures: true on its own EXHAUSTED_ROLLBACK_SETTLE
+dispatch regardless of what its own caller asked for, so even closing off
+just the queueOnlyAuthority shortcut wouldn't have been enough -- the
+reason-based branch below it (matching actionLeaseReleaseReason values like
+'active-transition-failed') would have kept rescuing the row too. The fix
+(COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT, a new
+exhaustedRolledBackRecoveryCount field on the item) gates every recovery
+branch uniformly, not just one of them.
+
+The row in question did eventually resolve on its own -- but only ~15
+minutes later, as a completely fresh attempt, not through that loop. The
+loop itself never converged; something else eventually broke it out.
+
+Regression test added (swSynthetic.test.js): drives a row through the cap
+via the real runCoordinatorAuthorityReconcileActions path, simulating
+genuine repeated failure between calls, and confirms the row terminalizes
+once the limit is reached instead of being rescued forever. Full suite
+green (858 tests). Not yet deployed live -- pending the same extension
+reload that was already queued up from the earlier fixes tonight.
+
 Raised while discussing this: why does mbCoordinatorQueueView need to be
 persisted (chrome.storage.local) at all, rather than computed on demand?
 The only two real justifications found: (1) chrome.storage.local writes

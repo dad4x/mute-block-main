@@ -12596,7 +12596,7 @@ async function muteProfile(options = {}) {
     // persisted record's actionKind blank forever: harmless behaviorally
     // (nothing branches on it for the mute-block path), but useless for the
     // recorded history this exists to support.
-    noteCurrentProfileNukeProgress({
+    await recordCurrentProfileNukeProgress({
         actionKind: 'mute-block',
         status: 'muting',
         muteAttempted: true,
@@ -12624,7 +12624,7 @@ async function muteProfile(options = {}) {
         allowForegroundFallback
     })
     if(muteState?.state === 'inverse') {
-        noteCurrentProfileNukeProgress({
+        await recordCurrentProfileNukeProgress({
             muteSucceeded: true,
             mutedAt: Date.now(),
             event: 'Profile was already muted'
@@ -12744,7 +12744,7 @@ async function blockProfile(options = {}) {
 
     const pendingBlockConfirm = getBlockConfirmAction()
     if(pendingBlockConfirm) {
-        noteCurrentProfileNukeProgress({
+        await recordCurrentProfileNukeProgress({
             status: 'blocking',
             blockAttempted: true,
             blockAttemptedAt: Date.now(),
@@ -12754,7 +12754,7 @@ async function blockProfile(options = {}) {
         if(await completePendingBlockConfirmation(pendingBlockConfirm, silent)) return true
     }
 
-    noteCurrentProfileNukeProgress({
+    await recordCurrentProfileNukeProgress({
         status: 'blocking',
         blockAttempted: true,
         blockAttemptedAt: Date.now(),

@@ -31,8 +31,66 @@ Use a Safari Web Extension packaged inside an iOS app.
 
 Why:
 
-- Firefox iOS and Chrome iOS do not support desktop-style extensions
-- Safari is the only realistic browser path for iPhone extension behavior
+- Firefox iOS and Chrome iOS do not support desktop-style extensions, and this
+  is still true even after EU DMA-mandated alternative browser engines
+  (iOS 17.4+): that change lets Chrome/Firefox ship their own rendering
+  engine, it does not add extension support.
+- Lack of Manifest V3 support is not and never was the blocker here: Safari
+  has supported `manifest_version: 3` since Safari 15.4 / iOS 15.4 (2022).
+  The real constraints are (a) Safari Web Extensions must be packaged in a
+  native iOS app via Xcode and distributed through the App Store (no
+  standalone JS-only distribution the way Chrome/Firefox stores work), and
+  (b) iOS Safari drops several APIs regardless of manifest version —
+  `webRequest`, `contextMenus`/`menus`, and most `windows.*` — see
+  Research Notes below.
+- Safari is the only realistic *first-party* browser path for iPhone
+  extension behavior. See "Alternative Considered: Orion Browser" for a
+  non-Safari option that was researched and is not yet recommended as a
+  substitute.
+
+## Alternative Considered: Orion Browser
+
+Researched 2026-09-17 in response to a question about whether the "no MV3"
+premise still held. It doesn't, but the research surfaced a genuinely
+different option worth recording.
+
+[Orion](https://orionbrowser.com) (by Kagi) is a third-party WebKit-based
+browser for iOS/iPadOS that implements a Chrome/Firefox WebExtensions
+compatibility layer on top of WebKit, and lets users one-click install real
+Chrome/Firefox extensions from their respective web stores — no Xcode
+project, no App Store review of our own extension, no native app wrapper.
+This would, in principle, let the existing Chrome/Firefox build run on an
+iPhone largely unmodified.
+
+Why it is not recommended as a replacement for the Safari Web Extension plan
+yet:
+
+- Apple restricts which WebExtensions APIs any non-Safari browser can expose,
+  so Orion's iOS extension support is explicitly narrower than its own macOS
+  support, which itself is only ~70% of the WebExtensions API surface.
+- Orion's own docs and release notes describe iOS extension support as
+  "preliminary"/beta, with only a curated set of extensions confirmed
+  reliable (uBlock Origin, 1Password, Dark Reader were cited) — these lean
+  toward network filtering and page styling, not the simulate-a-click,
+  wait-for-a-dialog, DOM-automation pattern mute-block needs.
+- Known iOS-specific issues directly relevant to mute-block's approach:
+  extensions relying on `executeScript` can open a blank tab and stop working
+  (tracked as Orion iOS issue #8239), and at least one content-script
+  extension was reported as installed but never running, with no diagnosed
+  cause. Separately, a extension built with the CRXJS bundler failed to load
+  at all on Orion iOS (div-injection content script) while the same kind of
+  content script built with plain HTML/CSS or Plasmo worked — suggesting the
+  failure can depend on build/bundler output shape, not just API coverage.
+- It's a third-party niche browser, not Apple's own Safari — different
+  install base, discovery, and long-term support risk than a Safari Web
+  Extension.
+
+Recommendation: treat Orion as a cheap, low-commitment spike (install the
+existing Chrome build via its Chrome Web Store one-click install path in
+Orion on a real iPhone, see if the profile-page interaction works at all)
+before investing in the Xcode/Safari Web Extension path, not as a substitute
+for it. If it works reliably enough, it could shortcut most of the
+Workstreams below; if not, the Safari Web Extension plan stands as scoped.
 
 ## Deliverable Shape
 
