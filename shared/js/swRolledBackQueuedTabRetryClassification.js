@@ -62,6 +62,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
     const {
         QUEUE_LOAD_THROTTLE_MAX_MS,
         STALE_QUEUED_TAB_MAX_RETRIES,
+        COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
         JOB_EVENT_RETRY
     } = deps.constants || {}
     const {
@@ -154,6 +155,10 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         )
     }
 
+    function getExhaustedRolledBackRecoveryCount(item = null) {
+        return Number.parseInt(item?.exhaustedRolledBackRecoveryCount, 10) || 0
+    }
+
     function isExhaustedRolledBackQueuedTabRetry(item = null) {
         if(!shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) return false
         return getRolledBackQueuedTabRetryAttempt(item) >= getQueuedTabMaxRetries(item)
@@ -208,6 +213,19 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
 
     function shouldRecoverExhaustedRolledBackQueuedTabRetry(item = null, options = {}) {
         if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
+        // Gates every branch below, not just queueOnlyAuthority's shortcut:
+        // runCoordinatorAuthorityReconcileActions hardcodes
+        // recoverActiveTransitionFailures: true on its own EXHAUSTED_ROLLBACK_SETTLE
+        // dispatch regardless of what ITS caller asked for, so a row whose
+        // actionLeaseReleaseReason matches isActiveTransitionRolledBackQueuedTabRetry
+        // (or the runtime-disappeared/transient-open checks below) would sail
+        // through that branch uncapped even with the queueOnlyAuthority
+        // shortcut closed off. A row that keeps genuinely, persistently
+        // failing needs to actually reach the terminalize path eventually,
+        // through whichever branch would otherwise keep rescuing it.
+        if(getExhaustedRolledBackRecoveryCount(item) >= COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT) {
+            return false
+        }
         if(options.queueOnlyAuthority === true) return true
         if(options.recoverActiveTransitionFailures !== true) return false
         const activeTransitionRetry = isActiveTransitionRolledBackQueuedTabRetry(item)
@@ -316,7 +334,8 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             actionLease: null,
             actionLeaseReleasedAt: now,
             actionLeaseReleaseReason: reason,
-            milestones: makeEmptyCoordinatorMilestones()
+            milestones: makeEmptyCoordinatorMilestones(),
+            exhaustedRolledBackRecoveryCount: getExhaustedRolledBackRecoveryCount(item) + 1
         }, {
             runInput: {id: item.runId || '', sourceType: item.source?.type || item.scope?.type || ''},
             source: item.source || {},

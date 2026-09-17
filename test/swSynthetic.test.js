@@ -1065,13 +1065,20 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
         storage: {
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({
-                    href,
-                    runId,
-                    attemptId,
-                    tabId: 501,
-                    now: 10070
-                })
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId,
+                        tabId: 501,
+                        now: 10070
+                    }),
+                    // Matches the legacy progress mirror's blockAttemptedAt
+                    // below: a direct block click was already attempted, so
+                    // the sweep confirming it below is a really-blocked
+                    // outcome, not a pre-existing-block discovery.
+                    milestones: {blockAttemptedAt: 10065}
+                }
             },
             mbCoordinatorRuns: {
                 [runId]: makeCoordinatorRun({href, runId})
@@ -1130,7 +1137,15 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     assert.equal(result.signaled, 1)
     assert.equal(browser.__tabs.has(tab.id), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
-    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
+    // This sweep only ever fires for a row we already have active (we were
+    // directly blocking it ourselves) -- it is a fallback for a missed
+    // close-if-blocked confirmation, not a detector of a pre-existing
+    // block, so the outcome is 'blocked' (really blocked, counted toward
+    // reallyBlocked), not 'already-blocked'. Fixed 2026-09-17: this used to
+    // hardcode foundBlockedBeforeQueue: true and land here as
+    // 'already-blocked', hiding every sweep-caught block from the
+    // reallyBlocked tally.
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
@@ -1146,13 +1161,18 @@ test('service-worker blocked sweep uses scripting probe when close message times
         storage: {
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({
-                    href,
-                    runId,
-                    attemptId,
-                    tabId: 502,
-                    now: 10075
-                })
+                [href]: {
+                    ...makeActiveCoordinatorRow({
+                        href,
+                        runId,
+                        attemptId,
+                        tabId: 502,
+                        now: 10075
+                    }),
+                    // Matches the legacy progress mirror's blockAttemptedAt
+                    // below: a direct block click was already attempted.
+                    milestones: {blockAttemptedAt: 10070}
+                }
             },
             mbCoordinatorRuns: {
                 [runId]: makeCoordinatorRun({href, runId})
@@ -1231,7 +1251,9 @@ test('service-worker blocked sweep uses scripting probe when close message times
     assert.equal(probeCalls, 1)
     assert.equal(browser.__tabs.has(tab.id), false)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
-    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
+    // See the sibling test above: the sweep's own missed-confirmation
+    // fallback always means we caused this block ourselves.
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
 })
 
 test('row event records same-attempt nonterminal queued progress without rereading full progress', async () => {
@@ -17527,6 +17549,52 @@ test('service-worker worker window stays open while durable queued work remains'
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy.durableQueued'] > 0, true)
 })
 
+test('worker action surface stays up for durable queued backlog that has not been dispatched to it yet', async () => {
+    // Live incident (2026-09-17): hasDurableQueuedBacklogForActionSurface
+    // only recognized a queued item as belonging to this surface once it
+    // already carried an actionSurfaceWindowId/actionSurfaceMode tag --
+    // which is only set at dispatch time (tagActionWithQueuedWorkerSurface).
+    // A freshly-queued item sitting in the backlog (the normal case for
+    // most of a batch) carries neither tag yet, so in the gap between one
+    // queued tab releasing and the next being claimed, this check saw no
+    // recognized backlog, the window closed, and had to be recreated
+    // moments later for the very next item. Confirmed live via
+    // actionSurface.workerWindow.created/closed.idle-after-release
+    // counters both incrementing within the same short batch.
+    const href = 'https://www.quora.com/profile/Synthetic-Worker-Surface-Undispatched-Backlog'
+    const {sw, browser} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    coordinatorKey: href,
+                    queuedAt: 5000,
+                    updatedAt: 5000,
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const workerWindowId = 555
+    browser.__windows.set(workerWindowId, {id: workerWindowId, focused: false, type: 'normal'})
+
+    const closed = await sw.closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
+        windowId: workerWindowId
+    })
+
+    assert.equal(closed, false)
+    assert.equal(browser.__windows.has(workerWindowId), true)
+    assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy.durableQueued'] > 0, true)
+})
+
 test('worker action surface with tracked runtime work is not torn down just because its tab has not shown a profile url yet', async () => {
     // Regression for a live 2026-09-16 incident under the
     // 'idle-after-active-missing-tab-prepass-requeue' cleanup reason: the
@@ -29850,6 +29918,62 @@ test('active transition does not require runtime queued tab maps', async () => {
     assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
 })
 
+test('active transition is rejected while paused instead of racing the pause rollback', async () => {
+    // Live incident (2026-09-17): pausing parks any currently-active row
+    // back to 'queued' immediately, but a queued-tab-open sequence already
+    // in flight when the pause lands has no way to see that -- it finishes
+    // navigating and calls transitionCoordinatorItemForQueuedTab to commit
+    // 'active' regardless. That commit used to go through unchecked, only
+    // to be caught seconds later by a separate rollback pass, producing a
+    // visible active/queued flip and, in at least one observed case, the
+    // row landing 'failed' instead of cleanly 'queued'. The fix rejects the
+    // transition at the source when isCoordinatorPauseRequestedLocally()
+    // is true, instead of relying entirely on the later rollback.
+    const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Paused-Race'
+    const runId = 'run-active-transition-paused-race'
+    const attemptId = 'attempt-active-transition-paused-race'
+    const tabId = 6308
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 431700,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 431700})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    await sw.pauseCoordinatorNukes()
+
+    const result = await sw.transitionCoordinatorItemForQueuedTab({
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1
+    }, {
+        id: tabId
+    }, {
+        openedAt: 431710,
+        attemptId,
+        attemptNumber: 1,
+        retryAttempt: 0,
+        maxRetries: 2
+    })
+
+    assert.equal(result, false)
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
+})
+
 test('active transition projection failure does not poison durable acknowledgement', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Projection-Failure'
     const runId = 'run-active-transition-projection-failure'
@@ -34500,6 +34624,84 @@ test('concurrent exhausted rolled-back terminalization writes one WAL record', a
         record.operationKind === 'terminalize-exhausted-rolled-back-queued' &&
         record.key === batchHref
     ).length, 1)
+})
+
+test('exhausted rolled-back queued row stops being recovered after repeated rescues and terminalizes', async () => {
+    // Live incident (2026-09-17): shouldRecoverExhaustedRolledBackQueuedTabRetry's
+    // queueOnlyAuthority branch unconditionally approved recovery with no
+    // limit on how many times the same row could be rescued.
+    // buildForcedRolledBackQueuedTabRetryItem bumps maxRetries by exactly
+    // nextRetryAttempt + 1 each recovery, so a row that keeps genuinely,
+    // persistently failing (not a transient blip) never reached the
+    // terminalize path -- every fast-executor tick (which passes
+    // queueOnlyAuthority: true) re-approved it, confirmed live cycling for
+    // 70+ seconds and starving unrelated writes behind it in the
+    // serialized queue. This proves the new
+    // COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT cap: the same row can
+    // only be rescued that many times before it's left to terminalize.
+    const href = 'https://www.quora.com/profile/Synthetic-Exhausted-Recovery-Limit'
+    const runId = 'run-exhausted-recovery-limit'
+    const attemptId = 'attempt-exhausted-recovery-limit'
+    const {storage, sw} = loadServiceWorkerHarness({
+        now: 4000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 4000}),
+                    actionLeaseReleaseReason: 'active-transition-failed',
+                    retryAttempt: 1,
+                    maxRetries: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const recoveryLimit = 3
+    for(let attempt = 1; attempt <= recoveryLimit; attempt += 1) {
+        const result = await sw.runCoordinatorAuthorityReconcileActions('synthetic-fast-executor-preflight', {
+            queueOnlyAuthority: true
+        })
+        assert.equal(result.requeued, 1, `expected recovery #${attempt} to requeue the row`)
+        assert.equal(result.terminalized, 0, `expected recovery #${attempt} not to terminalize the row`)
+        const recoveredRow = sw.coordinatorAuthority.current().queue[href]
+        assert.equal(recoveredRow.status, 'queued')
+        assert.equal(recoveredRow.exhaustedRolledBackRecoveryCount, attempt)
+
+        // Simulate the row genuinely, persistently failing again (not a
+        // transient blip resolving) so it re-exhausts its (now bumped)
+        // retry budget before the next reconcile tick. The authoritative
+        // state lives in the segmented WAL, not the raw mbCoordinatorQueue
+        // mirror -- clear it first so hydrate() actually picks up this
+        // direct mutation instead of replaying the WAL's recovered state.
+        storage.mbCoordinatorQueue = {
+            [href]: {
+                ...recoveredRow,
+                actionLeaseReleaseReason: 'active-transition-failed',
+                retryAttempt: recoveredRow.maxRetries
+            }
+        }
+        storage.mbCoordinatorRuns = {
+            [runId]: makeCoordinatorRun({href, runId})
+        }
+        for(const key of Object.keys(storage)) {
+            if(key.startsWith('mbCoordinatorQueueWal')) delete storage[key]
+        }
+        await sw.coordinatorAuthority.hydrate()
+    }
+
+    const finalResult = await sw.runCoordinatorAuthorityReconcileActions('synthetic-fast-executor-preflight', {
+        queueOnlyAuthority: true
+    })
+    assert.equal(finalResult.requeued, 0, 'expected the recovery limit to stop further rescues')
+    assert.equal(finalResult.terminalized, 1, 'expected the row to terminalize once the limit is reached')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'failed')
+    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
 })
 
 test('authority reconcile terminalizes active row from same-attempt terminal progress through WAL', async () => {

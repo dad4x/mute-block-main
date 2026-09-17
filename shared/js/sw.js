@@ -522,6 +522,26 @@ const PERSISTED_EXECUTOR_TRANSIENT_URL_MAX_AGE_MS = 15000
 const ACTION_LEASE_MS = 90000
 const STALE_CLOSE_REQUESTED_QUEUED_TAB_MS = 8000
 const STALE_QUEUED_TAB_MAX_RETRIES = 1
+// shouldRecoverExhaustedRolledBackQueuedTabRetry's queueOnlyAuthority branch
+// unconditionally approves recovery for a lightweight/fast reconcile pass.
+// buildForcedRolledBackQueuedTabRetryItem bumps maxRetries by exactly
+// nextRetryAttempt + 1 each time it recovers a row, so with nothing
+// counting how many times ANY approval branch has already rescued the same
+// row, a row that keeps genuinely, persistently failing (not a transient
+// blip) never reaches the terminalize path -- every fast-executor tick
+// (which passes queueOnlyAuthority: true) re-approves it. This isn't just
+// the queueOnlyAuthority shortcut's problem: runCoordinatorAuthorityReconcileActions
+// hardcodes recoverActiveTransitionFailures: true on its own
+// EXHAUSTED_ROLLBACK_SETTLE dispatch regardless of what its own caller
+// asked for, so the reason-based branch below the shortcut (matching
+// actionLeaseReleaseReason values like 'active-transition-failed') would
+// keep rescuing the row too even with the shortcut capped alone.
+// Confirmed live 2026-09-17: one row cycled recover-exhausted-rolled-back
+// -> retry-budget-recovery -> re-exhausted for 70+ seconds, starving
+// unrelated writes behind it in the serialized queue. This caps how many
+// times any recovery branch will rescue the same row before it's finally
+// allowed to fall through to genuine termination.
+const COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = 3
 const FOREGROUND_LEASE_WAIT_EVENT_MS = 5000
 const COORDINATOR_RECONCILE_INTERVAL_MS = 5000
 const COORDINATOR_RECONCILE_BACKOFF_BASE_MS = 5000
@@ -686,6 +706,19 @@ const missingActionLeaseReleasePromises = new Map()
 const queuedTabActiveTransitionPromises = new Map()
 const backgroundBlockedSweepTerminalPromises = new Map()
 const blockedLiveTabTerminalizationPromises = new Map()
+// Distinct from blockedLiveTabTerminalizationPromises above: that one
+// coalesces the *terminalize this tab* step, but terminalizeActiveCoordinatorItemFromBlockedLiveTab's
+// own close-if-blocked probe send-and-await ran entirely before that
+// wrapper ever gets involved, so nothing stopped two independent callers
+// (e.g. the periodic blocked-profile sweep and the executor's own
+// active-with-tab-and-pending-action classifier) from probing the same
+// tab concurrently. Confirmed live (2026-09-17): a single tab took 16
+// close-if-blocked sends in under 2 seconds, alternating between two
+// different caller reasons. Keyed separately (not reusing
+// blockedLiveTabTerminalizationPromises) because the two wrappers return
+// different shapes and coalescing across them would leak one caller's
+// return value into another's.
+const closeIfBlockedProbeInFlightByTabId = new Map()
 const staleRetryAdvancePromises = new Map()
 const staleRetryAdvancedWakeKeys = new Map()
 const coordinatorProgressInFlightPromises = new Map()
@@ -10706,6 +10739,7 @@ const rolledBackQueuedTabRetryClassification = createRolledBackQueuedTabRetryCla
     constants: {
         QUEUE_LOAD_THROTTLE_MAX_MS,
         STALE_QUEUED_TAB_MAX_RETRIES,
+        COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
         JOB_EVENT_RETRY
     },
     handlers: {
@@ -13165,6 +13199,35 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
         })
         return false
     }
+    // Live incident (2026-09-17): pause parks any currently-active row back
+    // to 'queued' via pauseStoredCoordinatorWork (operationKind
+    // 'stored-work-pause'), but a queued-tab-open sequence already in
+    // flight when the pause request lands has no way to see that -- it
+    // finishes navigating and calls this function to commit 'active'
+    // regardless. That commit used to go through unchecked, only to be
+    // caught seconds later by a separate rollback pass (reason
+    // 'service-worker-coordinator-pause-request'), producing a visible
+    // active/queued flip and, in at least one observed case, the row
+    // landing 'failed' instead of cleanly 'queued'. Checking the same
+    // synchronous in-memory pause flag every other queued-tab entry point
+    // already checks (see planQueuedActivationIntentForSlotEvent above)
+    // stops the wasted write and the flip at the source instead of relying
+    // entirely on the rollback to clean it up after the fact.
+    if(isCoordinatorPauseRequestedLocally()) {
+        recordFlightRecorderEvent({
+            kind: 'active-transition',
+            source: 'transitionCoordinatorItemForQueuedTabLocked',
+            rowKey: coordinatorKey || href,
+            targetUrl: href,
+            attemptId: getAttemptIdFromValue(details) || getAttemptIdFromValue(action),
+            attemptNumber: getAttemptNumberFromValue(details) || getAttemptNumberFromValue(action),
+            runId: action?.runId || '',
+            tabId,
+            accepted: false,
+            reason: 'coordinator-paused'
+        })
+        return false
+    }
     const metadata = getQueuedTabMetadata(tabId)
 
     const record = {
@@ -14413,6 +14476,24 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
     }) === true
 }
 
+// Shared by every close-if-blocked-derived confirmation path
+// (recordOwnedBlockedSweepTerminal, terminalizeActiveCoordinatorItemFromBlockedLiveTab's
+// fallback below) that can legitimately catch either a block our own
+// direct action caused (confirmation was just slow) or a genuinely
+// pre-existing block (we never got to clicking) -- the willClose DOM
+// signal alone can't tell these apart. item.milestones.blockAttemptedAt,
+// set only once a direct block click is actually dispatched, is the one
+// durable record of which case this is. Extracted 2026-09-17 after fixing
+// the same hardcoded-'already-blocked' bug in two separate places.
+function classifyBlockConfirmationFromItem(item = null) {
+    const wasBlockAttempted = (Number.parseInt(item?.milestones?.blockAttemptedAt, 10) || 0) > 0
+    return {
+        wasBlockAttempted,
+        status: wasBlockAttempted ? 'blocked' : 'already-blocked',
+        foundBlockedBeforeQueue: !wasBlockAttempted
+    }
+}
+
 async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', expectedItem = null, expectedRecord = null, liveProfileTabsByHref = new Map(), reason = 'active-blocked-live-tab') {
     if(!expectedItem || typeof expectedItem !== 'object') return {changed: false, reason: 'invalid-item'}
     if(!isActiveCoordinatorStatus(expectedItem.status)) return {changed: false, reason: 'inactive-item'}
@@ -14444,37 +14525,54 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         const tabId = normalizeTabId(tab?.id)
         const pollAttemptId = getAttemptIdFromValue(expectedItem) || getAttemptIdFromValue(expectedRecord)
         const pollAttemptNumber = getAttemptNumberFromValue(expectedItem) || getAttemptNumberFromValue(expectedRecord)
-        const sentAt = Date.now()
-        recordFlightRecorderEvent({
-            kind: 'close-if-blocked-sent',
-            source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
-            rowKey: itemKey,
-            targetUrl: href,
-            tabId,
-            attemptId: pollAttemptId,
-            attemptNumber: pollAttemptNumber,
-            reason
-        })
-        const response = await sendTabMessage(tabId, {
-            action: 'close-if-blocked',
-            actionKind,
-            requestedProfileHref: href,
-            attemptId: pollAttemptId,
-            attemptNumber: pollAttemptNumber
-        }).catch(() => null)
+
+        const existingProbe = closeIfBlockedProbeInFlightByTabId.get(tabId)
+        const probePromise = existingProbe || (async () => {
+            const sentAt = Date.now()
+            recordFlightRecorderEvent({
+                kind: 'close-if-blocked-sent',
+                source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
+                rowKey: itemKey,
+                targetUrl: href,
+                tabId,
+                attemptId: pollAttemptId,
+                attemptNumber: pollAttemptNumber,
+                reason
+            })
+            const response = await sendTabMessage(tabId, {
+                action: 'close-if-blocked',
+                actionKind,
+                requestedProfileHref: href,
+                attemptId: pollAttemptId,
+                attemptNumber: pollAttemptNumber
+            }).catch(() => null)
+            recordFlightRecorderEvent({
+                kind: 'close-if-blocked-response',
+                source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
+                rowKey: itemKey,
+                targetUrl: href,
+                tabId,
+                attemptId: pollAttemptId,
+                attemptNumber: pollAttemptNumber,
+                elapsedMs: Date.now() - sentAt,
+                accepted: response?.willClose === true,
+                reason: response ? (response.reason || (response.willClose ? 'will-close' : 'not-blocked')) : 'no-response'
+            })
+            return response
+        })()
+        if(!existingProbe) {
+            closeIfBlockedProbeInFlightByTabId.set(tabId, probePromise)
+            probePromise.finally(() => {
+                if(closeIfBlockedProbeInFlightByTabId.get(tabId) === probePromise) {
+                    closeIfBlockedProbeInFlightByTabId.delete(tabId)
+                }
+            })
+        }
+        else {
+            incrementQueueWakeupMetric('closeIfBlockedProbe.coalesced')
+        }
+        const response = await probePromise
         const resolvedProfileHref = normalizeQuoraProfileUrl(response?.resolvedProfileHref || '')
-        recordFlightRecorderEvent({
-            kind: 'close-if-blocked-response',
-            source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
-            rowKey: itemKey,
-            targetUrl: href,
-            tabId,
-            attemptId: pollAttemptId,
-            attemptNumber: pollAttemptNumber,
-            elapsedMs: Date.now() - sentAt,
-            accepted: response?.willClose === true,
-            reason: response ? (response.reason || (response.willClose ? 'will-close' : 'not-blocked')) : 'no-response'
-        })
         if(response?.willClose === true && resolvedProfileHref === href) {
             matches.push({tab, response})
         }
@@ -14553,14 +14651,15 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
             status: sweepRecorded?.status || '',
             error: sweepRecorded?.error || ''
         })
+        const fallbackClassification = classifyBlockConfirmationFromItem(expectedItem)
         const recorded = sweepRecorded?.terminal
             ? sweepRecorded
             : await recordCoordinatorJobProgressViaQueueMachine(href, {
                 actionKind,
                 runId: expectedItem.runId || expectedRecord?.runId || '',
-                status: 'already-blocked',
+                status: fallbackClassification.status,
                 openedViablePage: true,
-                foundBlockedBeforeQueue: true,
+                foundBlockedBeforeQueue: fallbackClassification.foundBlockedBeforeQueue,
                 blockSucceeded: true,
                 blockedAt: Date.now(),
                 tabId,
@@ -25762,12 +25861,18 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
     if(actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return {recorded: false, terminal: false, reason: 'reverse-action'}
     if(!attemptId) return {recorded: false, terminal: false, reason: 'missing-attempt'}
 
-    const record = normalizeProgressPatch(normalizedProfileHref, {
+    // This sweep is a fallback for when the primary close-if-blocked
+    // confirmation times out or never arrives -- it can legitimately catch
+    // either a block our own direct action just caused (the confirmation
+    // was simply slow) or a profile that was already blocked before we
+    // ever got to clicking. See classifyBlockConfirmationFromItem for why
+    // this is decided per call rather than hardcoded.
+    const buildSweepConfirmedRecord = classification => normalizeProgressPatch(normalizedProfileHref, {
         actionKind,
         runId: metadata?.runId || '',
-        status: 'already-blocked',
+        status: classification.status,
         openedViablePage: true,
-        foundBlockedBeforeQueue: true,
+        foundBlockedBeforeQueue: classification.foundBlockedBeforeQueue,
         blockSucceeded: true,
         blockedAt: Date.now(),
         tabId: normalizedTabId,
@@ -25777,10 +25882,16 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
         resolvedProfileHref,
         remappedFromRequested: false,
         finalError: '',
-        event: 'Profile confirmed blocked by background sweep'
+        event: classification.wasBlockAttempted
+            ? 'Profile confirmed blocked by background sweep'
+            : 'Profile confirmed already blocked by background sweep'
     })
-    const mapped = getCoordinatorStatusFromProgress(record)
-    if(!record || !isTerminalCoordinatorStatus(mapped.status)) {
+    // Both branches of buildSweepConfirmedRecord map to a terminal status,
+    // so which one is passed here doesn't matter for this early structural
+    // sanity check -- the branch that actually determines the outcome is
+    // decided below, once the authoritative item (and its milestones) is
+    // loaded.
+    if(!isTerminalCoordinatorStatus(getCoordinatorStatusFromProgress(buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(null))).status)) {
         return {recorded: false, terminal: false, reason: 'non-terminal-sweep-record'}
     }
 
@@ -25808,6 +25919,8 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
         if(!coordinatorItemMatchesQueuedTabRuntime(item, rowKey, metadata, normalizedTabId)) {
             return {recorded: false, terminal: false, reason: 'active-runtime-mismatch'}
         }
+        const record = buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(item))
+        const mapped = getCoordinatorStatusFromProgress(record)
         if(hasMismatchedCoordinatorAttempt(item, record)) {
             return {recorded: false, terminal: false, reason: 'stale-attempt'}
         }

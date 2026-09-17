@@ -13,6 +13,17 @@ extracted. Priority target #5 (`sweepStaleQueuedTabs`) is next on the
 "Next 20 Part 2 targets" list below, pending explicit direction to
 continue.
 
+**2026-09-17: read the "redirected toward one shared state machine" section
+before continuing Part 2, and see the new "Part 3" section.** Extracting a
+`decide*` function is no longer sufficient on its own -- `architecture.md`
+now names a single canonical decision core (`jobState.js`'s
+`reduceJobEvent`), and Part 3 below defines convergence work that routes
+each fragmented decider (block-confirmation classification, exhausted-retry
+recovery approval, and others) through it instead of leaving ~29+ separately
+implemented `decide*` functions that never talk to each other or the
+reducer. Part 2's remaining targets are reordered accordingly; #8 and #5 are
+now next, not just #5.
+
 **Phase 0 is done** (see "Phase 0" section below for the full design and
 execution history; commits `db12da9`, `372f5c9`, `f845a99`). `sw.js` and
 every module it (transitively) requires now execute in one shared `vm`
@@ -1044,6 +1055,53 @@ on a real function before deciding whether/how to eventually move such
 functions into their own module (which would still need the same
 realm-crossing scrutiny as any Part 1 slice, since these decide functions
 would then be called across a module boundary from the async shell).
+
+## 2026-09-17 -- redirected toward one shared state machine
+
+Read this before picking up any item below. `architecture.md`'s new "Single
+Decision Core (State Machine)" section is now the bar this plan's Part 2
+slices must clear, not just readability/testability.
+
+**What changes:** a Part 2 slice used to be done once its decide spans were
+pulled into named `decide*` sync functions. That is necessary but no longer
+sufficient. A slice is only converged once the extracted decision is reached
+by constructing a `JOB_EVENT_*` and calling `jobState.js`'s `reduceJobEvent`
+(or the `swQueueMachine*` dispatcher that applies it), instead of staying a
+same-shaped-but-separately-implemented `decide*` function living in its own
+module next to a dozen siblings that never talk to each other or to the
+reducer. Extracting first and wiring second, as two separate commits, is
+fine and probably safer than doing both at once -- but both steps are now
+part of "done," not just the extraction.
+
+**Why now:** this session found and fixed three live bugs that were each a
+symptom of exactly this fragmentation -- two independent classifiers
+deciding "already-blocked vs. we-blocked-it" (sweep-terminal and the
+close-if-blocked fallback), three independent approval branches for
+recovering an exhausted rolled-back row, and a fire-and-forget
+content-script write racing the service worker's own confirmation of the
+same terminal fact. Each got a local, DRY'd-but-still-separate fix. None of
+them got consolidated into the reducer, because there wasn't yet a plan
+section saying that's where consolidation should land. See
+`architecture.md`'s "Single Decision Core" section for the full list of
+known fragmentation points, and Part 3 below for how this plan's remaining
+targets map onto them.
+
+**Priority reorder.** Of the still-unclaimed items in the "Next 20" list
+just below, two now outrank the rest because they are confirmed live
+violators (not just large functions):
+
+- **#8, `terminalizeActiveCoordinatorItemFromBlockedLiveTab`** -- one of the
+  two block-confirmation classifiers named above. Its extraction should
+  produce a decide function whose output is a `JOB_EVENT_TERMINAL`-shaped
+  value consumed by the reducer, not a `classifyBlockConfirmationFromItem`
+  call relocated into a new module.
+- **#5, `sweepStaleQueuedTabs`** -- contains the other classifier
+  (`recordOwnedBlockedSweepTerminal`'s sweep-terminal path). Should converge
+  on the same `JOB_EVENT_TERMINAL` construction #8 uses, so there is
+  provably one classifier, not two that happen to agree today.
+
+Everything else in the "Next 20" list is unchanged; do the reorder above,
+then resume in the existing order.
 
 ### Next 20 Part 2 targets (function-level priority list, 2026-09)
 
@@ -3091,3 +3149,195 @@ to read the new files instead of sw.js):
 Re-verify current line numbers with grep before picking one up -- every
 edit this pass shifted everything below it, and line numbers throughout
 this whole document have been stale since it was written regardless.
+
+## Part 3 -- converge fragmented deciders into the one shared state machine (2026-09-17)
+
+Part 1 and Part 2/2.5 make `sw.js` smaller and its decision spans
+individually readable and testable. Neither, on its own, gets to "one state
+machine" -- that requires the decisions those spans make to be reached
+through a single shared reducer instead of staying N independently
+implemented `decide*` functions that happen to agree today. Part 3 is that
+convergence work. It is additive to Part 2, not a replacement: extract
+first (Part 2 discipline), then converge (Part 3 discipline), as separate
+commits per target.
+
+**Definition of done, per target:** the target's decision is expressed as a
+`JOB_EVENT_*` constructed from the target's local data, handed to
+`jobState.js`'s `reduceJobEvent` (or the `swQueueMachine*` dispatcher that
+wraps it), and the target's own `decide*` function either becomes the event
+constructor or is deleted in favor of calling the reducer directly.
+Behavior must stay byte-identical for existing tests; a reducer gap found
+while converging a target (an event shape the reducer can't yet express) is
+its own separate, reviewed commit to `jobState.js`, not a workaround in the
+target.
+
+**Ordered convergence targets**, mapped to `architecture.md`'s "Single
+Decision Core" fragmentation list:
+
+1. **Block-confirmation classification** (`architecture.md` item 1). Targets:
+   `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (Part 2 target #8)
+   and the sweep-terminal path inside `sweepStaleQueuedTabs` (Part 2 target
+   #5, via `recordOwnedBlockedSweepTerminal`). Converge both onto one
+   `JOB_EVENT_TERMINAL` construction fed by `classifyBlockConfirmationFromItem`,
+   so the reducer -- not two call sites calling the same helper -- is the
+   single place "already-blocked vs. we-blocked-it" is decided. Do these two
+   together; converging one without the other leaves the fragmentation this
+   was meant to close.
+2. **`mbProfileNukeProgress` as a second terminal-state writer**
+   (`architecture.md` item 2). Not a Part 2 target (it's `content.js`, not
+   `sw.js`), so it needs its own slice outside this list. Concretely:
+   `blockProfile()`'s two `noteCurrentProfileNukeProgress(...)` calls
+   (fire-and-forget) should become `await recordCurrentProfileNukeProgress(...)`
+   with the existing `result?.recorded` check already used elsewhere in that
+   file, so the milestone is durably acknowledged by the service worker
+   before `blockProfile()` proceeds, instead of racing the SW's independent
+   sweep confirmation. This closes the race for fresh, single-attempt rows;
+   it does not retroactively fix historical rows misclassified by
+   already-fixed bugs (exhausted-rollback loop, pause race, write-queue
+   backlog) earlier in this project's life.
+3. **Retry/recovery budget approval** (`architecture.md` item 3). Target:
+   `shouldRecoverExhaustedRolledBackQueuedTabRetry`
+   (`shared/js/swRolledBackQueuedTabRetryClassification.js`). Converge its
+   three approval branches (`queueOnlyAuthority` shortcut,
+   `recoverActiveTransitionFailures` reason-match, queue-pressure recovery)
+   into a single `JOB_EVENT_RETRY`-shaped decision the reducer approves or
+   rejects, with `COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT` enforced
+   inside that one path rather than as an outer gate wrapping three
+   still-separate branches.
+4. **Storage-layer triplication** (`architecture.md` item 4). Not a
+   decide-function target -- this is a materialization-ownership change.
+   `mbCoordinatorQueue` and `mbCoordinatorQueueView` should be rewritten as
+   pure projections computed from WAL-replayed reducer state (the same
+   projection `coordinatorAuthority.current()` already builds), not written
+   independently at their current call sites. Scope this as its own plan
+   once items 1-3 land and the reducer's event coverage is wide enough to
+   be trusted as the sole source those projections replay from.
+
+**Sequencing relative to Part 2:** items 1 and 3 above are also Part 2
+targets (#8/#5 and general retry-classification cleanup respectively) --
+do them as combined extract+converge slices, per the priority reorder in
+the 2026-09-17 section above. Item 2 can proceed independently at any time
+(it touches `content.js`, not the `sw.js` decomposition surface). Item 4
+should wait until 1-3 are converged, since it depends on the reducer being
+a trustworthy replay source for the rows those projections currently get
+from elsewhere.
+
+**Non-goal:** Part 3 does not require every one of the ~29 already-extracted
+`decide*` functions to move behind the reducer. Many decide real UI/runtime
+plumbing (tab lifecycle, scheduling gates, capacity checks) that never
+competes with another decider for the same fact and is not on
+`architecture.md`'s fragmentation list. Converge only the targets listed
+above; extend this list (and `architecture.md`'s) if a future review finds
+another genuine competing decider, rather than routing everything through
+the reducer on principle.
+
+### Part 3 dispatch plan -- slices a fresh session can pick up cold (2026-09-17)
+
+Same discipline as every Part 1/Part 2 slice: one slice per commit, full
+`npm run test:parallel` plus both production builds green after each,
+mechanical/behavior-preserving unless the slice explicitly says otherwise.
+Re-verify current line numbers and function shapes with grep before
+trusting anything below -- this plan doc's own numbers go stale fast.
+
+**P3-1 -- audit/extend `reduceJobEvent`'s terminal-classification event
+shape (prerequisite for P3-2/P3-3, do first).**
+Read `shared/js/jobState.js`'s `JOB_EVENT_TERMINAL` handling and
+`test/jobState.test.js`'s coverage of it. Determine whether it can already
+express "terminal because we attempted the block" vs. "terminal because it
+was already blocked before we queued it" -- i.e. whether it can take
+`classifyBlockConfirmationFromItem`'s `{wasBlockAttempted, status,
+foundBlockedBeforeQueue}` shape (or equivalent event fields) and produce
+the right reduced state. If yes: document the exact event shape to use in
+P3-2/P3-3 (add a short note to this section). If no: extend
+`JOB_EVENT_TERMINAL` (or add a new event type) to accept it, with new
+`jobState.test.js` cases for both branches, as its own reviewed commit --
+do not let P3-2/P3-3 invent a workaround instead. No `sw.js` changes in
+this slice.
+Depends on: nothing. Blocks: P3-2, P3-3.
+
+**P3-2 -- converge `terminalizeActiveCoordinatorItemFromBlockedLiveTab`
+(Part 2 target #8) onto the reducer.**
+Extract per Part 2 discipline if not already a standalone `decide*`
+(check first -- Part 2.5 may have touched this already), then change its
+`classifyBlockConfirmationFromItem(expectedItem)` call site so the
+classification is delivered to the caller via the event shape P3-1
+defined, constructing a `JOB_EVENT_TERMINAL`-style event and calling
+`reduceJobEvent`/the queue-machine dispatcher instead of building the
+`status`/`foundBlockedBeforeQueue` fields directly. Existing
+`swSynthetic.test.js` and `p1-contract.test.js` assertions on this
+function's static shape will need updating to match. Behavior must stay
+identical for every existing test.
+Depends on: P3-1. Blocks: nothing (P3-3 is independent once P3-1 lands,
+but doing them in the same session catches drift between the two call
+sites early).
+
+**P3-3 -- converge `sweepStaleQueuedTabs`'s `recordOwnedBlockedSweepTerminal`
+path (Part 2 target #5) onto the same reducer event.**
+Same treatment as P3-2, applied to `recordOwnedBlockedSweepTerminal`'s
+`buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(item))` call.
+Use the identical event shape P3-1 defined and P3-2 wired up -- the point
+of this slice is that both call sites end up constructing the same event
+type the same way, provably, not just producing the same-looking output
+independently. If P3-2 already extracted a shared helper for building the
+event, reuse it rather than re-deriving it.
+Depends on: P3-1 (and ideally P3-2, to reuse its event-construction
+helper rather than duplicating it).
+
+**P3-4 -- `blockProfile()` await-fix (`content.js`, fully independent of
+P3-1..3, safe to dispatch any time, in parallel with the others).**
+In `shared/js/content.js`'s `blockProfile()` (two call sites, currently
+~line 12747 and ~12757 per this session's earlier read -- re-grep for
+`noteCurrentProfileNukeProgress` to confirm), change
+`noteCurrentProfileNukeProgress({blockAttempted: true, blockAttemptedAt:
+Date.now(), ...})` to `await recordCurrentProfileNukeProgress(...)`,
+checking `result?.recorded` the same way other call sites in this file
+already do, and handling the not-recorded case the way its sibling
+call sites do (retry or surface failure -- match existing convention,
+don't invent a new one). Add a regression test exercising the race this
+closes: a block confirmation sweep arriving before the milestone write
+would previously see stale `milestones`, should now see it because the
+write is awaited. Does not fix historical rows (see architecture.md item
+2's note) -- do not attempt to backfill those as part of this slice.
+Depends on: nothing.
+
+**P3-5 -- audit `reduceJobEvent`'s retry-approval event shape (prerequisite
+for P3-6, do after P3-1..4 or in parallel -- independent surface).**
+Same audit pattern as P3-1, but for `shouldRecoverExhaustedRolledBackQueuedTabRetry`'s
+three approval branches (`queueOnlyAuthority` shortcut,
+`recoverActiveTransitionFailures` reason-match, queue-pressure recovery) in
+`shared/js/swRolledBackQueuedTabRetryClassification.js`. Determine the
+`JOB_EVENT_RETRY` (or equivalent) shape needed to express "is this
+exhausted rolled-back row allowed to retry" as one reducer-decided
+question, including where `COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT`
+enforcement lives. Extend `jobState.js` with tests if the current event
+vocabulary can't express it. No changes to
+`swRolledBackQueuedTabRetryClassification.js` in this slice.
+Depends on: nothing. Blocks: P3-6.
+
+**P3-6 -- converge `shouldRecoverExhaustedRolledBackQueuedTabRetry` onto
+the reducer.**
+Replace the three independent approval branches with one call into
+`reduceJobEvent`/the dispatcher using the event shape P3-5 defined,
+keeping `buildForcedRolledBackQueuedTabRetryItem`'s
+`exhaustedRolledBackRecoveryCount` bookkeeping intact (move it into the
+reducer path if that's where the count check now lives). The existing
+"exhausted rolled-back queued row stops being recovered after repeated
+rescues and terminalizes" test in `swSynthetic.test.js` must keep passing
+unchanged -- it's the regression guard for the bug this whole branch
+structure was patched to fix.
+Depends on: P3-5.
+
+**Not yet dispatchable: storage-layer triplication (architecture.md item
+4).** Explicitly deferred until P3-1 through P3-6 land and the reducer's
+event coverage is wide enough to trust as the sole replay source for
+`mbCoordinatorQueue`/`mbCoordinatorQueueView` projections. Scope it as its
+own plan doc when that time comes rather than folding it in here.
+
+**Suggested dispatch order for maximum parallelism across sessions:**
+P3-1 and P3-5 can start immediately and in parallel (independent reducer
+audits). P3-4 can start immediately in parallel with either (independent
+file). Once P3-1 lands: P3-2 then P3-3 (same session preferred, to catch
+drift between the two call sites). Once P3-5 lands: P3-6. Do not start
+P3-2/P3-3 before P3-1 merges, or P3-6 before P3-5 merges -- both are
+audit-then-build pairs specifically so a reducer gap gets fixed once, in
+`jobState.js`, instead of twice as two different workarounds.

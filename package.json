@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.6.1265",
+  "version": "1.6.1269",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -21,16 +21,20 @@
     "test:wal-fuzz:long": "WAL_FUZZ_PROFILE=long WAL_FUZZ_SEEDS=200 WAL_FUZZ_ROUNDS=300 WAL_FUZZ_ACTORS_MAX=8 node test/walSnapshotStoreFuzz.test.js",
     "test:sw-fuzz": "node test/swScenarioFuzz.test.js",
     "lint:correctness": "node tools/lint-correctness.js",
-    "lint:queue-boundary": "node tools/lint-sw-queue-boundary.js"
+    "lint:queue-boundary": "node tools/lint-sw-queue-boundary.js",
+    "lint:duplicates": "jscpd --config .jscpd.json",
+    "lint:block-classification": "node tools/lint-block-confirmation-classification.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "eslint": "^8.56.0",
+    "fallow": "^3.27.0",
+    "jscpd": "^5.2.1",
     "laravel-mix": "^6.0.49",
     "web-ext-plugin": "^2.9.0",
     "webextension-polyfill": "^0.12.0"
-  },
-  "dependencies": {}
+  }
 }

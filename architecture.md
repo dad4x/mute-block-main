@@ -25,6 +25,79 @@ durable queue state + live browser observations
 Direct actions are allowed to reduce latency. They are not allowed to become a
 second authority path.
 
+## Single Decision Core (State Machine)
+
+The two-phase tick below ("Observe" then "Decide and apply") is a state
+machine by design: durable state plus observations produce one decision step,
+which produces durable transitions plus effects. That decision step must have
+exactly one implementation, not one per call site or per orchestrator.
+
+Canonical decision core: [jobState.js](shared/js/jobState.js)'s
+`reduceJobEvent`, plus the `swQueueMachine*` dispatcher
+(`swQueueMachineDispatcher.js`, `swQueueMachineEvents.js`,
+`swQueueMachineHandlers.js`) that applies its output. This is what
+[top-level-rethink-1.5.md](top-level-rethink-1.5.md)'s "First Implementation
+Candidate" called for, and it exists and is tested (`test/jobState.test.js`).
+Converged means: every place that decides a row's status, retry eligibility,
+or terminal classification does so by constructing a `JOB_EVENT_*` and calling
+`reduceJobEvent`/the queue-machine dispatcher, not by independently branching
+on `item.milestones`/`item.status`/attempt counters inline.
+
+This is a stricter bar than the `sw.js` decomposition effort in
+[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md).
+That plan extracts each large orchestrator's inline decision spans into named
+`decide*` sync functions and moves them into their own modules -- valuable for
+readability and unit-testing, but by itself it produces one local decider per
+orchestrator, not one shared decider. A `decide*` extraction only counts as
+converged for this purpose when its output is a call into (or a value
+consumed by) the shared reducer, not a same-shaped-but-separately-implemented
+decision living in its own module.
+
+Known fragmentation points that violate this today (tracked here until each
+is converged into the shared reducer; do not add a new one without recording
+it here):
+
+1. **Block-confirmation classification, two entry points.**
+   `recordOwnedBlockedSweepTerminal` and
+   `terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback (both
+   `shared/js/sw.js`) each independently decide "already-blocked vs.
+   we-blocked-it." As of 2026-09-17 both call the shared
+   `classifyBlockConfirmationFromItem(item)` helper, which stopped the two
+   call sites from diverging from each other, but the decision still lives
+   outside `reduceJobEvent` and is reached from two call sites instead of one
+   terminal-classification event. `terminalizeActiveCoordinatorItemFromBlockedLiveTab`
+   is Part 2 target #8 in the decomposition plan; its extraction should route
+   through the reducer, not just relocate the helper call.
+2. **`mbProfileNukeProgress` as a second terminal-state writer.**
+   Content-script `noteCurrentProfileNukeProgress` (fire-and-forget) writes
+   block-attempt/terminal-adjacent milestones from `shared/js/content.js`,
+   racing the service worker's own sweep-based confirmation of the same fact.
+   This is the case Migration Slice 10 below calls out: `mbProfileNukeProgress`
+   must become a compatibility mirror only, not a competing source of truth.
+   Not yet done.
+3. **Retry/recovery budget approval, three branches.**
+   `shouldRecoverExhaustedRolledBackQueuedTabRetry`
+   (`shared/js/swRolledBackQueuedTabRetryClassification.js`) has three
+   independent conditions that can approve recovering an exhausted row. As of
+   2026-09-17 all three are gated by one shared
+   `COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT` counter, closing the
+   infinite-recovery-loop bug, but there are still three separate approval
+   branches rather than one recovery-policy decision reachable from a single
+   job event.
+4. **Storage-layer triplication.** WAL (`mbCoordinatorQueueWal*`, true
+   authority) vs. `mbCoordinatorQueue` (legacy mirror, silently drops terminal
+   rows) vs. `mbCoordinatorQueueView` (denormalized snapshot, written by a
+   separate non-atomic `storage.local.set`). Three representations of the same
+   row that can diverge under load; see "Storage Authority" cleanup end-state
+   below. `mbCoordinatorQueue` and `mbCoordinatorQueueView` should become pure
+   derived materializations of WAL-replayed reducer state, never independently
+   decided.
+
+New code must not add a fifth. A change that needs to decide a row's status,
+retry eligibility, or terminal outcome should go through `reduceJobEvent`/the
+queue-machine dispatcher, or be added to this list as a new tracked violation
+with the reason it couldn't yet.
+
 ## Scheduler / Reconciler
 
 The live-debug work has shown that "repair" is increasingly the normal
@@ -444,6 +517,7 @@ Tests should exercise state snapshots directly:
 - [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable
   job model that informed the current line.
 - [sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md):
-  proposed plan for splitting the remaining `sw.js` reconcile core into
-  sync policy/builder modules now and an async orchestration layer once the
-  test harness realm boundary is addressed.
+  plan for splitting `sw.js`'s remaining decide/act spans into modules. As of
+  2026-09-17, redirected by that plan's "Part 3" section to converge into the
+  single decision core above rather than stop at one `decide*` module per
+  orchestrator.

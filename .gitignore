@@ -9,3 +9,4 @@ chrome-dev
 firefox
 tmp/upgrade-regression/
 tmp/mix-shared/
+.fallow/
