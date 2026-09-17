@@ -3255,6 +3255,61 @@ do not let P3-2/P3-3 invent a workaround instead. No `sw.js` changes in
 this slice.
 Depends on: nothing. Blocks: P3-2, P3-3.
 
+**P3-1 finding (2026-09-17): the existing vocabulary already suffices, no
+`jobState.js` change.** `JOB_EVENT_TERMINAL` already stores whatever
+`event.outcome` it's given verbatim onto the item
+(`applyJobStatusTransition`'s `outcome: terminal ? normalizeString(event.outcome
+|| item.outcome || '') : ''`), and `mapProgressToJobState` already uses the
+exact same two outcome strings this classification needs
+(`outcome: status === 'already-blocked' ? 'already-blocked' : 'blocked'`).
+So `classifyBlockConfirmationFromItem`'s three fields collapse onto the
+existing item shape with no new field:
+- `status` ('blocked' | 'already-blocked') -> `event.outcome`, unchanged.
+- `wasBlockAttempted` -> not a separate field; it's `event.outcome ===
+  'blocked'`, or equivalently `item.milestones.blockAttemptedAt > 0` once
+  set (already one of `JOB_MILESTONE_FIELDS`, merged in by any event that
+  carries it in `event.milestones`, terminal or not).
+- `foundBlockedBeforeQueue` -> not a separate field; it's `event.outcome
+  === 'already-blocked'`.
+
+Event shape for P3-2/P3-3 to construct at both call sites, replacing their
+`classifyBlockConfirmationFromItem(item)` + `normalizeProgressPatch`/
+`recordCoordinatorJobProgressViaQueueMachine` detour with a direct
+`reduceJobEvent` call:
+
+```js
+const wasBlockAttempted = (Number.parseInt(item?.milestones?.blockAttemptedAt, 10) || 0) > 0
+const event = {
+    type: JOB_EVENT_TERMINAL,
+    status: 'succeeded',
+    outcome: wasBlockAttempted ? 'blocked' : 'already-blocked',
+    attemptId,       // must match item.attempt.id or shouldAcceptJobEventAttempt rejects as 'stale-attempt'
+    attemptNumber,
+    tabId,
+    at: Date.now()   // or an explicit terminalAt
+}
+const {item: nextItem, accepted, changed, reason} = reduceJobEvent(item, event)
+```
+
+`nextItem.status` is `'succeeded'`, `nextItem.outcome` is `'blocked'` or
+`'already-blocked'` (verify via `nextItem.outcome === 'already-blocked'`
+wherever a caller currently reads `foundBlockedBeforeQueue`), and
+`nextItem.milestones.blockAttemptedAt` carries forward unchanged from
+whatever the item already had (confirmed by `jobState.test.js`'s new
+"terminal event preserves the blockAttemptedAt milestone an earlier event
+set" case) -- the terminal event does not need to repeat it. Verified with
+two new `test/jobState.test.js` cases (both committed with this note, no
+`reduceJobEvent`/`applyJobStatusTransition` logic touched): one for the
+`already-blocked` outcome, one confirming `blockAttemptedAt` survives a
+terminal transition. `npm run test:parallel` is green.
+
+Both call sites still need `item` in hand to read
+`item.milestones.blockAttemptedAt` before constructing the event -- that
+part of `classifyBlockConfirmationFromItem` (or the function itself,
+inlined) stays as plain data lookup in `sw.js`, feeding the event rather
+than independently deciding the outcome string; only the outcome-to-status
+mapping and the actual state transition move behind `reduceJobEvent`.
+
 **P3-2 -- converge `terminalizeActiveCoordinatorItemFromBlockedLiveTab`
 (Part 2 target #8) onto the reducer.**
 Extract per Part 2 discipline if not already a standalone `decide*`

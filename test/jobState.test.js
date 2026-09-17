@@ -303,6 +303,51 @@ test('terminal success does not imply the browser tab is closed', () => {
     assert.equal(result.item.milestones.tabClosedAt, 0)
 })
 
+test('terminal event carries the already-blocked outcome the same way it carries blocked', () => {
+    const result = reduceJobEvent({
+        status: 'active',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        tabId: 42,
+        milestones: {
+            blockAttemptedAt: 0
+        }
+    }, {
+        type: JOB_EVENT_TERMINAL,
+        status: 'succeeded',
+        outcome: 'already-blocked',
+        attemptId: 'attempt-1',
+        at: 3000
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'succeeded')
+    assert.equal(result.item.outcome, 'already-blocked')
+    assert.equal(result.item.milestones.blockAttemptedAt, 0)
+})
+
+test('terminal event preserves the blockAttemptedAt milestone an earlier event set', () => {
+    const result = reduceJobEvent({
+        status: 'acting',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        tabId: 42,
+        milestones: {
+            blockAttemptedAt: 2500
+        }
+    }, {
+        type: JOB_EVENT_TERMINAL,
+        status: 'succeeded',
+        outcome: 'blocked',
+        attemptId: 'attempt-1',
+        at: 3000
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.outcome, 'blocked')
+    assert.equal(result.item.milestones.blockAttemptedAt, 2500)
+})
+
 test('pause cancels acting and settling work through the reducer', () => {
     for(const status of ['acting', 'settling']) {
         const result = reduceJobEvent({
