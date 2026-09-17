@@ -160,6 +160,8 @@ function createCoordinatorJobMilestoneBookkeeping(deps = {}) {
     } = deps.state || {}
 
     const terminalProgressSettlementPromises = new Map()
+    let terminalProgressContinuationFastExecutorPromise = null
+    let terminalProgressContinuationPendingReason = null
 
     function scheduleTerminalProgressSettlement(profileHrefs = []) {
         const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
@@ -229,18 +231,34 @@ function createCoordinatorJobMilestoneBookkeeping(deps = {}) {
             allowBeforeQuora: true
         })
         void closeTerminalOwnedProfileTabs().catch(() => null)
-        void runCoordinatorQueueExecutorFastPath(reason, {
+
+        if(terminalProgressContinuationFastExecutorPromise) {
+            terminalProgressContinuationPendingReason = reason
+            incrementQueueWakeupMetric('terminalProgress.continuationFastExecutorCoalescedInFlight')
+            return
+        }
+
+        terminalProgressContinuationFastExecutorPromise = runCoordinatorQueueExecutorFastPath(reason, {
             awaitFill: true,
             returnAfterDurableActive: true,
             allowBeforeQuora: true,
             skipAuthorityReconcile: true,
             forceDurableQueueReload: false
-        }).catch(error => {
-            recordCoordinatorDiagnosticEvent(
-                'terminal-progress-continuation-fast-executor-failed',
-                error?.message || 'Terminal progress continuation fast executor failed'
-            )
         })
+            .catch(error => {
+                recordCoordinatorDiagnosticEvent(
+                    'terminal-progress-continuation-fast-executor-failed',
+                    error?.message || 'Terminal progress continuation fast executor failed'
+                )
+            })
+            .finally(() => {
+                terminalProgressContinuationFastExecutorPromise = null
+                if(terminalProgressContinuationPendingReason) {
+                    const nextReason = terminalProgressContinuationPendingReason
+                    terminalProgressContinuationPendingReason = null
+                    scheduleTerminalProgressContinuation(nextReason)
+                }
+            })
     }
 
     function clearPendingCoordinatorJobMilestone(profileHref = '') {

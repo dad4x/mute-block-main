@@ -7770,6 +7770,8 @@ function createCoordinatorJobMilestoneBookkeeping() {
     getCoordinatorJobMilestoneFlushPromise = _ref3.getCoordinatorJobMilestoneFlushPromise,
     getCoordinatorJobMilestonePendingRecords = _ref3.getCoordinatorJobMilestonePendingRecords;
   var terminalProgressSettlementPromises = new Map();
+  var terminalProgressContinuationFastExecutorPromise = null;
+  var terminalProgressContinuationPendingReason = null;
   function scheduleTerminalProgressSettlement() {
     var profileHrefs = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : [];
     var hrefs = getNormalizedProfileHrefList(profileHrefs || []);
@@ -7854,7 +7856,12 @@ function createCoordinatorJobMilestoneBookkeeping() {
     void closeTerminalOwnedProfileTabs()["catch"](function () {
       return null;
     });
-    void runCoordinatorQueueExecutorFastPath(reason, {
+    if (terminalProgressContinuationFastExecutorPromise) {
+      terminalProgressContinuationPendingReason = reason;
+      incrementQueueWakeupMetric('terminalProgress.continuationFastExecutorCoalescedInFlight');
+      return;
+    }
+    terminalProgressContinuationFastExecutorPromise = runCoordinatorQueueExecutorFastPath(reason, {
       awaitFill: true,
       returnAfterDurableActive: true,
       allowBeforeQuora: true,
@@ -7862,6 +7869,13 @@ function createCoordinatorJobMilestoneBookkeeping() {
       forceDurableQueueReload: false
     })["catch"](function (error) {
       recordCoordinatorDiagnosticEvent('terminal-progress-continuation-fast-executor-failed', (error === null || error === void 0 ? void 0 : error.message) || 'Terminal progress continuation fast executor failed');
+    })["finally"](function () {
+      terminalProgressContinuationFastExecutorPromise = null;
+      if (terminalProgressContinuationPendingReason) {
+        var nextReason = terminalProgressContinuationPendingReason;
+        terminalProgressContinuationPendingReason = null;
+        scheduleTerminalProgressContinuation(nextReason);
+      }
     });
   }
   function clearPendingCoordinatorJobMilestone() {
