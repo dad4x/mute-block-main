@@ -3356,17 +3356,76 @@ write is awaited. Does not fix historical rows (see architecture.md item
 Depends on: nothing.
 
 **P3-5 -- audit `reduceJobEvent`'s retry-approval event shape (prerequisite
-for P3-6, do after P3-1..4 or in parallel -- independent surface).**
-Same audit pattern as P3-1, but for `shouldRecoverExhaustedRolledBackQueuedTabRetry`'s
-three approval branches (`queueOnlyAuthority` shortcut,
-`recoverActiveTransitionFailures` reason-match, queue-pressure recovery) in
-`shared/js/swRolledBackQueuedTabRetryClassification.js`. Determine the
-`JOB_EVENT_RETRY` (or equivalent) shape needed to express "is this
-exhausted rolled-back row allowed to retry" as one reducer-decided
-question, including where `COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT`
-enforcement lives. Extend `jobState.js` with tests if the current event
-vocabulary can't express it. No changes to
-`swRolledBackQueuedTabRetryClassification.js` in this slice.
+for P3-6, do after P3-1..4 or in parallel -- independent surface).** DONE
+(2026-09-17). The existing bare `JOB_EVENT_RETRY` shape did not suffice --
+it only gates on `shouldAcceptRetrySourceAttempt` and then unconditionally
+transitions to `queued`; it had no notion of exhaustion, recovery-count
+caps, reason-matching, or queue-authority/ownership. Extended `jobState.js`:
+`reduceJobEvent` now accepts an optional `event.exhaustedRolledBackRecovery`
+object on `JOB_EVENT_RETRY` events, checked via a new internal
+`isExhaustedRollbackRecoveryApproved(item, recovery)` helper that mirrors
+`shouldRecoverExhaustedRolledBackQueuedTabRetry`'s exact precedence
+(cap check, then `queueOnlyAuthority` shortcut, then
+`recoverActiveTransitionFailures` reason-match with queue-pressure nested
+inside it). The recovery-count cap is enforced inside this one reducer
+path -- not as an outer gate -- and on approval the reducer itself
+increments `item.exhaustedRolledBackRecoveryCount` (the field
+`buildForcedRolledBackQueuedTabRetryItem` currently bumps by hand), so
+P3-6 no longer needs to do that bookkeeping at the call site. When
+`event.exhaustedRolledBackRecovery` is omitted, behavior is byte-identical
+to before (existing `JOB_EVENT_RETRY`/`JOB_EVENT_ENQUEUED` callers are
+unaffected).
+
+Event shape for P3-6 to construct (the caller still owns computing the
+reason-pattern/authority/ownership facts via the existing
+`isActiveTransitionRolledBackQueuedTabRetry` /
+`isRuntimeDisappearedRolledBackQueuedTabRetry` /
+`isTransientOpenRolledBackQueuedTabRetry` /
+`shouldRecoverExhaustedOpenRetryUnderQueuePressure` /
+`isCoordinatorQueueAuthoritativeItem` helpers and the deps-injected
+`COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT` -- the reducer has no
+access to those deps or to live queue-throttle telemetry, so it only
+applies the policy over facts handed to it):
+
+```js
+reduceJobEvent(item, {
+    type: JOB_EVENT_RETRY,
+    attemptId, attemptNumber,       // fresh attempt identity, as today
+    sourceAttemptId, sourceAttemptNumber, // as today, for stale-retry rejection
+    at, retryCount, lastRetryAt,    // as today
+    exhaustedRolledBackRecovery: {
+        isExhausted: isExhaustedRolledBackQueuedTabRetry(item),        // required; false/absent always denies
+        recoveryLimit: COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,  // deps-injected constant
+        queueOnlyAuthority: options.queueOnlyAuthority === true,
+        recoverActiveTransitionFailures: options.recoverActiveTransitionFailures === true,
+        activeTransitionRetry: isActiveTransitionRolledBackQueuedTabRetry(item),
+        runtimeDisappearedRetry: isRuntimeDisappearedRolledBackQueuedTabRetry(item),
+        transientOpenRetry: isTransientOpenRolledBackQueuedTabRetry(item),
+        recoverTransientOpenRetry: options.recoverTransientOpenRetry === true,
+        pressureOpenRetry: shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options),
+        queueAuthoritative: isCoordinatorQueueAuthoritativeItem(item),
+        serviceWorkerOwned: options.serviceWorkerOwned === true ||
+            item?.serviceWorkerOwned === true ||
+            item?.executorOwner === 'service-worker'
+    }
+})
+```
+
+`result.accepted === false` with `result.reason === 'exhausted-rollback-recovery-denied'`
+is the reject case (item unchanged) -- this is the direct replacement for
+`shouldRecoverExhaustedRolledBackQueuedTabRetry(item, options) === false`.
+`result.accepted === true` (status `'queued'`, fresh attempt identity,
+`exhaustedRolledBackRecoveryCount` incremented) is the direct replacement
+for `=== true` followed by `buildForcedRolledBackQueuedTabRetryItem`'s
+manual counter bump. New coverage: `test/jobState.test.js` gained four
+cases -- the `queueOnlyAuthority` shortcut, the active-transition
+reason-match branch, the queue-pressure-nested transient-open branch, and
+the cap rejecting regardless of which branch would otherwise approve.
+`npm run test:parallel` is green including the existing
+`swSynthetic.test.js` regression guard ("exhausted rolled-back queued row
+stops being recovered after repeated rescues and terminalizes").
+No changes to `swRolledBackQueuedTabRetryClassification.js` or `sw.js` in
+this slice -- wiring the actual call sites onto this event shape is P3-6.
 Depends on: nothing. Blocks: P3-6.
 
 **P3-6 -- converge `shouldRecoverExhaustedRolledBackQueuedTabRetry` onto
