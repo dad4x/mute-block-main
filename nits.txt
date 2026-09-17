@@ -191,3 +191,100 @@ and whatever tracks "is a close-if-blocked message already in flight for
 this attemptId" -- the pattern (many identical sends, same tabId, sub-2-second
 span) suggests that in-flight tracking either isn't checked before sending,
 or isn't being set/cleared correctly around the message round-trip.
+
+[2026-09-17 morning: resumed the same batch (v1.6.1263, 1317/1322) and hit a
+live, actively-worsening incident within minutes -- resolved same session,
+root cause confirmed, fix shipped as v1.6.1264]
+
+Resumed the paused queue (5 remaining + soft/hard-fail retries queued) and
+within ~3 minutes the reallyBlocked/alreadyBlocked epoch tiles were reading
+107+79 completions against only ~7 actually-resumed rows, terminalCount
+briefly ticked backwards, and 4 write-queue-backlog alerts fired. Paused
+again and dug in with the flight recorder rather than guessing.
+
+Root cause, confirmed against live storage.local data (not just log
+inference): scheduleTerminalProgressContinuation (moved to
+swCoordinatorJobMilestoneBookkeeping.js in decomposition Slice 40) fires
+three continuation mechanisms -- scheduleQueuedWorkContinuation,
+scheduleCoordinatorQueueResume, and a direct runCoordinatorQueueExecutorFastPath
+call -- unconditionally on every successful terminal-progress settlement,
+with no in-flight coalescing. Its sibling three lines up,
+scheduleTerminalProgressSettlement, already does exactly this coalescing
+(a terminalProgressSettlementPromises Map keyed by href) -- this one didn't.
+The two scheduler calls self-throttle already (scheduleCoordinatorQueueResume
+has its own alarm-coalescing scheduler; scheduleQueuedWorkContinuation has
+isKeyedThrottleCoalesced), but the direct runCoordinatorQueueExecutorFastPath
+call did not, so every settlement could spawn another full executor pass,
+which (for a handful of specific rows -- Vivian-Christian-21, Vivian-Robert-25,
+Victoria-Lane-214, Wills-Alira-1 this run) re-discovered the same
+already-eligible row via the "queued-authority-without-executor-surface"
+self-settlement path (sw.js's runCoordinatorExecutorApplyPhase,
+terminalRecordSettlesQueuedAuthority check, ~line 15782) and re-settled it,
+spawning more continuations. Confirmed via epoch counters:
+terminalProgress.queuedSettlement.save fired 167 times in ~10 minutes vs.
+5 for the normal single-row terminalProgress.save path -- i.e. this specific
+self-settlement loop, not live tab progress reports, was the amplifier.
+
+Not data loss: current storage.local confirmed Vivian-Christian-21 and
+Victoria-Lane-214 both correctly landed status:"succeeded". Wasted,
+redundant writes amplifying write-queue backlog and epoch counters, not
+corruption.
+
+Fix shipped (v1.6.1264): added the same in-flight coalescing
+scheduleTerminalProgressSettlement already had to
+scheduleTerminalProgressContinuation's runCoordinatorQueueExecutorFastPath
+call specifically (the two already-self-throttling scheduler calls were left
+untouched) -- a shared promise + trailing-edge reason, same shape as
+flushCoordinatorJobMilestones's own coalescing. Full test suite green
+(swCoordinatorJobMilestoneBookkeeping.js, p1-contract.test.js's "terminal
+queued progress schedules stored work continuation" specifically). Built,
+reloaded live as v1.6.1264, verified clean (0 manifest/runtime errors).
+Not yet re-tested against a live resumed batch under real backlog -- next
+session should watch for recurrence of the reallyBlocked/alreadyBlocked
+epoch-counter inflation pattern specifically.
+
+Separate, NOT fixed, real finding from the same investigation: while
+tracing why the row kept re-reading as "queued", found that
+mbCoordinatorQueueView (the durable, denormalized queue snapshot the
+dashboard/popup/CDP tools all read directly via chrome.storage.local,
+distinct from both the WAL and the coordinatorAuthority module's own
+in-memory resident projection) can silently diverge from the WAL under
+load: its write is a separate, non-atomic storage.local.set inside
+persistCoordinatorAuthorityQueueWalMutation (sw.js ~line 6806-6837) that
+can fail independently of the WAL append it's supposed to mirror, with only
+a best-effort scheduleCoordinatorReconcile(1000, {reason:
+'queue-wal-projection-failed'}) as catch-up -- itself competing for the
+same backlogged write queue. Caught live: Wills-Alira-1 had a flight-recorder
+entry claiming a persisted terminal-settlement WAL write, but its
+mbCoordinatorQueueView record was untouched (status still "queued",
+updatedAt == original queuedAt) at the time. This is a known, tested
+degrade path (see test/*.test.js: "terminal job progress reports durable
+terminal queue despite projection save failure") rather than an unhandled
+crash, but there's no guaranteed reconciliation deadline -- a view row can
+stay stale indefinitely if the retry keeps losing the race under sustained
+backlog.
+
+Raised while discussing this: why does mbCoordinatorQueueView need to be
+persisted (chrome.storage.local) at all, rather than computed on demand?
+The only two real justifications found: (1) chrome.storage.local writes
+push storage.onChanged to every open extension page for free, which is
+how the dashboard/popup get reactive updates without an open message port;
+(2) it gives instant reads to short-lived/lightweight contexts (popup, CDP
+debugging tools) without a message round-trip that has to wake a possibly-
+idle service worker and wait for a live WAL-replay-derived answer.
+"Durability across restarts" is NOT a real justification -- the WAL is
+already the durable source of truth and the SW rehydrates from that, not
+from the view, on cold start.
+
+A real alternative worth considering: drop the persisted view entirely,
+have readers ask the SW directly (chrome.runtime.sendMessage, which wakes
+it if asleep) for a freshly-computed snapshot, and have the SW broadcast a
+change notification to currently-open pages on mutation instead of relying
+on storage.onChanged. That removes the second non-atomic write and the
+whole divergence class of bug outright, at the cost of a message round-trip
+per read and losing push-updates to pages that aren't open yet (acceptable --
+they'd just ask fresh on open). This is a real simplification, not just
+cleanup, but it touches every consumer of mbCoordinatorQueueView (dashboard,
+popup, all the CDP tooling built up this week) and deserves its own careful
+pass rather than being folded into a bug-fix session. Worth scoping properly
+next time before touching it.
