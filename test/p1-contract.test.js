@@ -1319,6 +1319,34 @@ test('dashboard retry status separates active busy from queued waiting states', 
     assert.equal(result.activeBusy, 'Soft-fail retry off; waiting for current work to idle')
 })
 
+test('dashboard current-work list shows queued rows in real dispatch order, not most-recently-added first', () => {
+    // 2026-09-16 nit: renderQueue always re-sorts the already-server-sorted
+    // queue view with its own compareCurrentWorkItems before painting rows,
+    // so this client-side comparator -- not buildCoordinatorQueueView's --
+    // is what the user actually sees. It used to break 'queued'-rank ties
+    // by time descending, same as every other rank: fine for surfacing
+    // recent activity in 'active', backwards for 'queued', where the row
+    // that's actually about to run next (the front of the executor's real
+    // FIFO dispatch order, queueRuntime.rebuildQueueOrder's queueSequence
+    // ascending) should be the one shown first, not whichever was queued
+    // most recently.
+    const evaluate = loadDashboardHarness()
+    // JSON round-tripped: the vm context is a separate realm, so an array
+    // built there has a different Array.prototype than this file's -- an
+    // assert.deepEqual (strict mode -> deepStrictEqual) on the raw
+    // cross-realm value fails on prototype identity alone even when every
+    // element matches.
+    const orderedKeys = JSON.parse(evaluate(`
+        const items = [
+            {storageKey: 'recently-added', status: 'queued', queuedAt: 5000, updatedAt: 5000, queueSequence: 9},
+            {storageKey: 'front-of-line', status: 'queued', queuedAt: 1000, updatedAt: 1000, queueSequence: 1}
+        ]
+        JSON.stringify(items.slice().sort(compareCurrentWorkItems).map(item => item.storageKey))
+    `))
+
+    assert.deepEqual(orderedKeys, ['front-of-line', 'recently-added'])
+})
+
 test('dashboard bulk requeue uses compact failed count beyond displayed rows', () => {
     const dashboard = readRepoFile('shared/js/coordinator.js')
     const body = extractFunction(dashboard, 'async function requeueFailed()')

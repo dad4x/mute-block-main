@@ -2337,6 +2337,8 @@ var COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView';
 var COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns';
 var COORDINATOR_EVENTS_KEY = 'mbCoordinatorEvents';
 var QUEUE_WAKEUP_METRICS_VIEW_KEY = 'mbQueueWakeupMetricsView';
+var LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary';
+var LAST_ENQUEUE_SUMMARY_MAX_AGE_MS = 30 * 60 * 1000;
 var SPACE_REGISTRY_KEY = 'mbSpaceRegistry';
 var HIDDEN_RUNS_KEY = 'mbCoordinatorHiddenRunIds';
 var COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled';
@@ -2385,7 +2387,8 @@ var state = {
   requiresQuoraVisitAt: 0,
   quoraActivationCounterBaseline: 0,
   quoraActivationMetricBaselineKnown: false,
-  outliers: []
+  outliers: [],
+  lastEnqueueSummary: null
 };
 // Keyed by rowKey+attemptId, separate from state.outliers: a terminal row's
 // duration never changes, so without this a manually-cleared outlier would
@@ -2864,7 +2867,7 @@ function _loadState() {
       while (1) switch (_context9.prev = _context9.next) {
         case 0:
           _context9.next = 2;
-          return browser.storage.local.get(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty({}, COORDINATOR_QUEUE_VIEW_KEY, {}), COORDINATOR_RUNS_KEY, {}), COORDINATOR_EVENTS_KEY, []), QUEUE_WAKEUP_METRICS_VIEW_KEY, {}), SPACE_REGISTRY_KEY, {}), HIDDEN_RUNS_KEY, []), COORDINATOR_RETRY_FAILED_ENABLED_KEY, false), COORDINATOR_PAUSED_KEY, false));
+          return browser.storage.local.get(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty({}, COORDINATOR_QUEUE_VIEW_KEY, {}), COORDINATOR_RUNS_KEY, {}), COORDINATOR_EVENTS_KEY, []), QUEUE_WAKEUP_METRICS_VIEW_KEY, {}), SPACE_REGISTRY_KEY, {}), HIDDEN_RUNS_KEY, []), COORDINATOR_RETRY_FAILED_ENABLED_KEY, false), COORDINATOR_PAUSED_KEY, false), LAST_ENQUEUE_SUMMARY_KEY, null));
         case 2:
           stored = _context9.sent;
           if (!hasCoordinatorQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY])) {
@@ -2895,7 +2898,8 @@ function _loadState() {
           state.hiddenRunIds = normalizeStringList(stored[HIDDEN_RUNS_KEY]);
           retryFailedActive = !!stored[COORDINATOR_RETRY_FAILED_ENABLED_KEY];
           state.paused = !!stored[COORDINATOR_PAUSED_KEY];
-        case 21:
+          state.lastEnqueueSummary = stored[LAST_ENQUEUE_SUMMARY_KEY] || null;
+        case 22:
         case "end":
           return _context9.stop();
       }
@@ -3122,13 +3126,28 @@ function getBlockOutcomeCounts() {
   return {
     reallyBlockedCount: reallyBlockedCount,
     alreadyBlockedCount: alreadyBlockedCount,
-    total: total
+    total: total,
+    // Recorded by recordCoordinatorProfileActionOutcomeStat
+    // (swCoordinatorProgressReducer.js) alongside the counts above, one
+    // pair per outcome bucket -- see formatBlockOutcomeDuration for how
+    // these become an avg/max on the summary tile.
+    reallyBlockedTotalDurationMs: getMetricCounter(counters, 'profileAction.reallyBlocked.totalDurationMs'),
+    reallyBlockedMaxDurationMs: getMetricCounter(counters, 'profileAction.reallyBlocked.maxDurationMs'),
+    alreadyBlockedTotalDurationMs: getMetricCounter(counters, 'profileAction.alreadyBlocked.totalDurationMs'),
+    alreadyBlockedMaxDurationMs: getMetricCounter(counters, 'profileAction.alreadyBlocked.maxDurationMs')
   };
 }
 function formatBlockOutcomeCount() {
   var count = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
   var total = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
   return total > 0 ? "".concat(count, " (").concat(formatPercent(count / total), ")") : "".concat(count);
+}
+function formatBlockOutcomeDuration() {
+  var count = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var totalDurationMs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var maxDurationMs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 0;
+  if (!count) return 'no completions yet this epoch';
+  return "avg ".concat(formatDuration(totalDurationMs / count), ", max ").concat(formatDuration(maxDurationMs), " active-to-terminal");
 }
 function render() {
   var queueItems = getDisplayQueueItems();
@@ -3158,6 +3177,8 @@ function render() {
   var blockOutcomeCounts = getBlockOutcomeCounts();
   setText('reallyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.reallyBlockedCount, blockOutcomeCounts.total));
   setText('alreadyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.alreadyBlockedCount, blockOutcomeCounts.total));
+  setText('reallyBlockedDuration', formatBlockOutcomeDuration(blockOutcomeCounts.reallyBlockedCount, blockOutcomeCounts.reallyBlockedTotalDurationMs, blockOutcomeCounts.reallyBlockedMaxDurationMs));
+  setText('alreadyBlockedDuration', formatBlockOutcomeDuration(blockOutcomeCounts.alreadyBlockedCount, blockOutcomeCounts.alreadyBlockedTotalDurationMs, blockOutcomeCounts.alreadyBlockedMaxDurationMs));
   setText('terminalCount', terminalCount);
   setText('eventCount', state.events.length);
   setText('eventListCount', "".concat(state.events.length, " event").concat(state.events.length === 1 ? '' : 's'));
@@ -3176,6 +3197,31 @@ function render() {
   syncRequeueFailedControls(failedCount);
   syncCurrentWorkPauseControls(queueItems);
   syncStartCoordinatorControls();
+  syncLastEnqueueSummary();
+}
+
+// Durable counterpart to the transient nuke-button notice: shows the most
+// recent enqueue's requested/queued/merged breakdown so a big submission
+// that mostly deduped against already-known rows (currently queued, or a
+// past terminal outcome) doesn't look like most of it silently vanished --
+// this was previously only visible as free text buried in the capped
+// mbCoordinatorEvents log. Self-expires after LAST_ENQUEUE_SUMMARY_MAX_AGE_MS
+// so it doesn't linger indefinitely as stale context from a much earlier add.
+function syncLastEnqueueSummary() {
+  var element = document.getElementById('lastEnqueueSummary');
+  if (!element) return;
+  var summary = state.lastEnqueueSummary;
+  var at = Number.parseInt(summary === null || summary === void 0 ? void 0 : summary.at, 10) || 0;
+  if (!summary || !at || Date.now() - at > LAST_ENQUEUE_SUMMARY_MAX_AGE_MS) {
+    element.hidden = true;
+    element.textContent = '';
+    return;
+  }
+  var requested = Number.parseInt(summary.requested, 10) || 0;
+  var queued = Number.parseInt(summary.queued, 10) || 0;
+  var merged = Number.parseInt(summary.merged, 10) || 0;
+  element.hidden = false;
+  element.textContent = merged > 0 ? "Last add: ".concat(requested, " requested -> ").concat(queued, " new, ").concat(merged, " already known") : "Last add: ".concat(requested, " requested -> ").concat(queued, " new");
 }
 function getCurrentWorkSummaryText() {
   var queueItems = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : [];
@@ -3537,11 +3583,11 @@ function syncCurrentWorkPauseControls() {
   var resumePending = currentWorkPausePending === 'resume';
   if (pauseButton) {
     pauseButton.textContent = pausePending ? 'Pausing...' : resumePending ? 'Resuming...' : state.paused ? 'Resume' : 'Pause';
-    pauseButton.disabled = pausePending || resumePending || !state.paused && pendingCount <= 0;
+    pauseButton.disabled = pausePending || resumePending;
     pauseButton.setAttribute('aria-pressed', state.paused ? 'true' : 'false');
     pauseButton.setAttribute('aria-busy', pausePending || resumePending ? 'true' : 'false');
     pauseButton.classList.toggle('clear-button--pause-active', state.paused);
-    pauseButton.title = pausePending ? 'Pause request sent; waiting for Current Work to stop' : resumePending ? 'Resume request sent; waiting for Current Work to continue' : state.paused ? 'Resume paused Current Work' : pendingCount > 0 ? 'Pause Current Work without canceling jobs' : 'No pending Current Work to pause';
+    pauseButton.title = pausePending ? 'Pause request sent; waiting for Current Work to stop' : resumePending ? 'Resume request sent; waiting for Current Work to continue' : state.paused ? 'Resume paused Current Work' : pendingCount > 0 ? 'Pause Current Work without canceling jobs' : 'Pause now, before queueing more work';
   }
   if (pauseState) {
     pauseState.textContent = pausePending ? 'Pausing...' : resumePending ? 'Resuming...' : state.paused ? 'Paused' : 'Running';
@@ -4247,6 +4293,25 @@ function renderWakeupMetrics() {
   var cloudflareChallenges = getMetricCounter(counters, 'cloudflareChallenge.detected');
   var duplicatePumps = getMetricCounter(counters, 'pump.noop.noPendingItems') + getMetricCounter(counters, 'pump.noop.executorAlreadyRunning') + getMetricCounter(counters, 'pump.noop.paused');
   var wakeups = nudgeSent + pumpRequested + reconcileRequested;
+  // Cache-hit vs genuine-read split for the segmented WAL's resident-store
+  // cache (this week's fix chain: a dead cache meant every hydrate was a
+  // real storage read). residentStoreUsed should dominate once the queue
+  // is warm; segmentedHydrated is a true chrome.storage.local read.
+  var walResidentStoreUsed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.residentStoreUsed');
+  var walSegmentedHydrated = getMetricCounter(counters, 'coordinatorAuthority.queueWal.segmentedHydrated');
+  var walCacheAttempts = walResidentStoreUsed + walSegmentedHydrated;
+  var storageGetCalls = getMetricCounter(counters, 'storageGetCalls');
+  // WAL append/checkpoint-switch frequency (same fix chain: a checkpoint
+  // switch folds the WAL's accumulated segments back into a single
+  // snapshot). Checkpoint switches are triggered once committed segments
+  // reach COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT (128); the hard
+  // limit that blocks further appends until one succeeds is
+  // COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT (1024).
+  var walAppended = getMetricCounter(counters, 'coordinatorAuthority.queueWal.appended');
+  var walAppendBytes = getMetricCounter(counters, 'coordinatorAuthority.queueWal.appendBytes');
+  var walCheckpointed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointed');
+  var walCheckpointedRecords = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointedRecords');
+  var walCheckpointFailed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointFailed');
   var stalledQueued = queueItems.filter(function (item) {
     return "".concat((item === null || item === void 0 ? void 0 : item.status) || '') === 'queued';
   }).length;
@@ -4254,9 +4319,74 @@ function renderWakeupMetrics() {
   var epochStarted = metrics.startedAt ? "Epoch ".concat(formatTime(metrics.startedAt)).concat(epochReason) : 'No metrics yet';
   setText('metricsUpdated', metrics.updatedAt ? "".concat(epochStarted, "; updated ").concat(formatTime(metrics.updatedAt)) : epochStarted);
   if (metricsGrid) {
-    replaceChildren(metricsGrid, [buildMetricCard('Current epoch', metrics.resetReason || '--', "".concat(metrics.epochId || '')), buildMetricCard('Previous epochs', "".concat(previousEpochs.length), formatPreviousEpochSummary(previousEpochs[previousEpochs.length - 1])), buildMetricCard('Queue throttle', throttle.active ? 'active' : 'idle', throttle.active ? "level ".concat(throttle.level, "; retry ").concat(formatDuration(throttle.until - Date.now()), "; ").concat(throttle.reason || '') : throttle.lastProgressAt ? "recovered ".concat(formatTime(throttle.lastProgressAt)) : 'No page-load throttle active'), buildMetricCard('Wakeups/job', jobs ? formatRatio(wakeups / jobs) : '--', "".concat(wakeups, " wakeups / ").concat(jobs, " enqueued")), buildMetricCard('Nudge accept', nudgeSent ? formatPercent(nudgeAccepted / nudgeSent) : '--', "".concat(nudgeAccepted, " / ").concat(nudgeSent)), buildMetricCard('Pump yield', pumpRequested ? formatPercent(pumpChanged / pumpRequested) : '--', "".concat(pumpChanged, " changed / ").concat(pumpRequested)), buildMetricCard('Duplicate pumps', pumpRequested ? formatPercent(duplicatePumps / pumpRequested) : '--', "".concat(duplicatePumps, " no-op")), buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', "".concat(reconcileChanged, " reconcile changes")), buildMetricCard('Terminal jobs', "".concat(terminalJobs), "".concat(stalledQueued, " currently queued")), buildMetricCard('Cloudflare challenges', "".concat(cloudflareChallenges), jobs ? "".concat(formatPercent(cloudflareChallenges / jobs), " of ").concat(jobs, " enqueued jobs hit a bot-challenge interstitial") : 'No challenge interstitials seen yet'), buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen)), buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted)), buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart)), buildMetricCard('Action -> terminal', formatPhaseAverage(phases.actionStartToTerminal), formatPhaseDetail(phases.actionStartToTerminal)), buildMetricCard('Terminal -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease)), buildMetricCard('Storage timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : "".concat(storageTimedOut), "".concat(storageTimedOut, " / ").concat(storageStarted, "; ").concat(storageFallbackReturned, " fallback returned")), buildMetricCard('Storage deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : "".concat(storageDeadlineMissed), "".concat(storageDeadlineMissed, " missed; ").concat(getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed'), " late suppressed")), buildMetricCard('Write queue backlog', storageQueueStallWarnings ? "".concat(storageQueueStallWarnings, " alert").concat(storageQueueStallWarnings === 1 ? '' : 's') : 'clear', storageQueueStallWarnings ? "Oldest pending write waited up to ".concat(formatDuration(storageQueueStallMaxWaitMs), " this epoch") : 'No sustained storage-update backlog this epoch', {
-      alert: storageQueueStallWarnings > 0
-    }), buildMetricCard('Timeout buckets', "".concat(storageTimeoutGet), "get ".concat(storageTimeoutGet, ", set ").concat(storageTimeoutSet, ", unknown ").concat(storageTimeoutUnknown)), buildMetricCard('No-work writes', "".concat(storageNoDurableWork), "".concat(storageNoRuntimeWork, " no runtime; ").concat(storageNoDurableWork, " no durable")), buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait)), buildMetricCard('Storage get', formatPhaseAverage(phases.storageGet), "".concat(getMetricCounter(counters, 'storageGetCalls'), " calls")), buildMetricCard('Storage set', formatPhaseAverage(phases.storageSet), "".concat(getMetricCounter(counters, 'storageSetCalls'), " calls")), buildMetricCard('Read payload avg', readCalls ? formatBytes(readBytes / readCalls) : '--', "".concat(formatBytes(readBytes), " total; max ").concat(formatBytes(readMaxBytes))), buildMetricCard('Read payload keys', formatBytes(readQueueBytes), "queue ".concat(formatBytes(readQueueBytes), ", view ").concat(formatBytes(readQueueViewBytes), ", progress ").concat(formatBytes(readProgressBytes))), buildMetricCard('Read hot path', topReadPath.path || '--', formatStoragePayloadPathDetail(topReadPath)), buildMetricCard('Payload avg', payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--', "".concat(formatBytes(payloadBytes), " total; max ").concat(formatBytes(payloadMaxBytes))), buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), "queue ".concat(formatBytes(payloadQueueBytes), ", runs ").concat(formatBytes(payloadRunsBytes), ", progress ").concat(formatBytes(payloadProgressBytes))), buildMetricCard('Write hot path', topWritePath.path || '--', formatStoragePayloadPathDetail(topWritePath)), buildMetricCard('Milestone batch', milestoneFlushes ? formatRatio(milestoneReceived / milestoneFlushes) : '--', "".concat(milestoneReceived, " records / ").concat(milestoneFlushes, " flushes")), buildMetricCard('Progress events', "".concat(progressReceived), "pending max ".concat(progressPendingMax))], state.loading ? 'Loading history...' : 'No wakeup metrics yet.');
+    replaceChildren(metricsGrid, [buildMetricCard('Current epoch', metrics.resetReason || '--', "".concat(metrics.epochId || ''), {
+      title: 'Why the current metrics epoch was reset (extension reload, browser restart, manual reset). Not itself a health signal -- just labels which stretch of history the cards below cover.'
+    }), buildMetricCard('Previous epochs', "".concat(previousEpochs.length), formatPreviousEpochSummary(previousEpochs[previousEpochs.length - 1]), {
+      title: 'How many prior metrics epochs are retained, and a summary of the most recent one. Concerning only if the prior epoch shows a much worse timeout rate or write volume than the current one -- otherwise this is just history.'
+    }), buildMetricCard('Queue throttle', throttle.active ? 'active' : 'idle', throttle.active ? "level ".concat(throttle.level, "; retry ").concat(formatDuration(throttle.until - Date.now()), "; ").concat(throttle.reason || '') : throttle.lastProgressAt ? "recovered ".concat(formatTime(throttle.lastProgressAt)) : 'No page-load throttle active', {
+      title: 'Whether the scheduler is deliberately backing off queued-tab activity (e.g. after slow/unscriptable tabs or Cloudflare challenges). Concerning if this stays "active" for more than a couple of QUEUE_LOAD_THROTTLE_MAX_MS windows (120s each, escalating) -- that means whatever tripped it keeps recurring rather than clearing.'
+    }), buildMetricCard('Wakeups/job', jobs ? formatRatio(wakeups / jobs) : '--', "".concat(wakeups, " wakeups / ").concat(jobs, " enqueued"), {
+      title: 'Nudges + pump requests + reconciles per enqueued job -- how many scheduler wakeups it takes to move work through the queue. Concerning if this trends well above 2-3x enqueued jobs; that suggests the scheduler is being woken repeatedly without making proportional progress.'
+    }), buildMetricCard('Nudge accept', nudgeSent ? formatPercent(nudgeAccepted / nudgeSent) : '--', "".concat(nudgeAccepted, " / ").concat(nudgeSent), {
+      title: 'Share of claim nudges (sent to a queued tab to accept its action claim) that were actually accepted. Concerning if well under 100% -- rejected/ignored nudges usually mean a tab is slow, unresponsive, or already claimed by something else, and will show up as retried/escalated claims.'
+    }), buildMetricCard('Pump yield', pumpRequested ? formatPercent(pumpChanged / pumpRequested) : '--', "".concat(pumpChanged, " changed / ").concat(pumpRequested), {
+      title: 'Share of executor pump cycles that actually changed something. Concerning if this stays low (lots of no-op pumps) while Queued > 0 -- see Duplicate pumps below for the specific no-op reasons.'
+    }), buildMetricCard('Duplicate pumps', pumpRequested ? formatPercent(duplicatePumps / pumpRequested) : '--', "".concat(duplicatePumps, " no-op"), {
+      title: 'Pump cycles that no-opped because there was nothing pending, the executor was already running, or the queue is paused. Concerning if this is high AND Pump yield is low AND the queue is not paused -- that combination means pumps are being requested faster than there is new work to justify them.'
+    }), buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', "".concat(reconcileChanged, " reconcile changes"), {
+      title: 'Reconcile passes (the periodic sweep that repairs drifted/stuck rows) per enqueued job. Concerning if this climbs steadily -- COORDINATOR_RECONCILE_BACKOFF_MAX_MS (60s) is the ceiling between reconciles once backed off, so a high rate here means something keeps re-triggering reconcile at its minimum interval instead of backing off.'
+    }), buildMetricCard('Terminal jobs', "".concat(terminalJobs), "".concat(stalledQueued, " currently queued"), {
+      title: 'Total jobs that reached a terminal state (succeeded/failed/skipped/canceled) this epoch, plus how many are still queued right now. Not concerning on its own -- cross-check against Really/Already blocked and the failed-row badges for what those terminal jobs actually were.'
+    }), buildMetricCard('Cloudflare challenges', "".concat(cloudflareChallenges), jobs ? "".concat(formatPercent(cloudflareChallenges / jobs), " of ").concat(jobs, " enqueued jobs hit a bot-challenge interstitial") : 'No challenge interstitials seen yet', {
+      title: 'Profile loads that hit a Cloudflare bot-challenge interstitial instead of the real page. Concerning at any sustained rate above isolated one-offs -- each one also trips the queue-load throttle, so a rising count here explains a queue that keeps backing off.'
+    }), buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen), {
+      title: 'Time from a row becoming durably queued to its tab actually opening. Concerning if the average approaches this project\'s queued-tab-open staleness windows (STALE_BACKGROUND_OPENING_QUEUED_TAB_MS 20s, QUEUED_TAB_CREATE_TIMEOUT_MS 10s) -- rows that slow to open that tab are the ones that end up reclaimed as stale.'
+    }), buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted), {
+      title: 'Time from tab open to the content script\'s action claim being accepted. Concerning if the average approaches QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS (15s) or QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS (15s) -- both are staleness/timeout windows keyed to roughly this transition.'
+    }), buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart), {
+      title: 'Time from claim accepted to the mute/block action actually starting. Concerning if the average approaches STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s) -- that\'s this project\'s threshold for treating an active-action tab as stalled.'
+    }), buildMetricCard('Action -> terminal', formatPhaseAverage(phases.actionStartToTerminal), formatPhaseDetail(phases.actionStartToTerminal), {
+      title: 'Time from the action starting to the row reaching a terminal state. Concerning if the average approaches COORDINATOR_ACTIVE_JOB_MAX_MS (45s) or COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS (60s) -- both bound how long this project lets a job stay active before treating it as stuck.'
+    }), buildMetricCard('Terminal -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease), {
+      title: 'Time from a row going terminal to its worker slot actually being released for reuse. Concerning if the average approaches TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s) -- slow releases here are the direct cause of a rising "handoff sec" summary tile above.'
+    }), buildMetricCard('Storage timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : "".concat(storageTimedOut), "".concat(storageTimedOut, " / ").concat(storageStarted, "; ").concat(storageFallbackReturned, " fallback returned"), {
+      title: 'Share of durable storage updates that timed out before completing. Concerning at any sustained nonzero rate -- a timed-out update falls back to a stale read/no-op rather than the intended mutation, which is exactly the class of bug behind this week\'s WAL hydrate fixes.'
+    }), buildMetricCard('Storage deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : "".concat(storageDeadlineMissed), "".concat(storageDeadlineMissed, " missed; ").concat(getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed'), " late suppressed"), {
+      title: 'Storage updates that missed their intended deadline (whether or not they eventually timed out outright). Concerning if this is nonzero and growing -- it is an early symptom of the same write-queue backlog the "Write queue backlog" card below alerts on directly.'
+    }), buildMetricCard('Write queue backlog', storageQueueStallWarnings ? "".concat(storageQueueStallWarnings, " alert").concat(storageQueueStallWarnings === 1 ? '' : 's') : 'clear', storageQueueStallWarnings ? "Oldest pending write waited up to ".concat(formatDuration(storageQueueStallMaxWaitMs), " this epoch") : 'No sustained storage-update backlog this epoch', {
+      alert: storageQueueStallWarnings > 0,
+      title: 'Fires once the oldest pending durable write has waited at least COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s), checked every COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS (15s). Any alert here is concerning by definition -- it is this project\'s own self-imposed threshold for "the serialized storage-update queue is backing up," added after a live incident where a runaway reconcile loop backed it up for minutes.'
+    }), buildMetricCard('Timeout buckets', "".concat(storageTimeoutGet), "get ".concat(storageTimeoutGet, ", set ").concat(storageTimeoutSet, ", unknown ").concat(storageTimeoutUnknown), {
+      title: 'Breaks Storage timeouts down by where in the read/write cycle they happened. Concerning if "unknown" is a large share -- that means a timeout is happening somewhere this breakdown can\'t attribute, which is itself worth investigating.'
+    }), buildMetricCard('No-work writes', "".concat(storageNoDurableWork), "".concat(storageNoRuntimeWork, " no runtime; ").concat(storageNoDurableWork, " no durable"), {
+      title: 'Storage updates that ran and found nothing durable to persist. A handful is normal (a pump can race a change that already landed); concerning only if this dominates total storage updates, since each one still pays the full serialized-queue cost for no benefit.'
+    }), buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait), {
+      title: 'Average time a storage update spent waiting in the serialized queue before it got to run. Concerning if this rises toward COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s) -- that\'s the same threshold "Write queue backlog" alerts on for the single oldest pending write.'
+    }), buildMetricCard('Storage get', formatPhaseAverage(phases.storageGet), "".concat(storageGetCalls, " calls"), {
+      title: 'Average latency of a chrome.storage.local.get call, and how many were made this epoch. Concerning if the call count keeps climbing well past startup with the queue otherwise idle -- see the Queue cache hit rate card, which answers exactly that "are we still re-reading needlessly" question directly.'
+    }), buildMetricCard('Storage set', formatPhaseAverage(phases.storageSet), "".concat(getMetricCounter(counters, 'storageSetCalls'), " calls"), {
+      title: 'Average latency of a chrome.storage.local.set call, and how many were made this epoch. Concerning if the average latency climbs alongside growing write payload sizes (see Payload avg) -- that\'s consistent with the queue snapshot itself getting large enough to slow every write.'
+    }), buildMetricCard('Queue cache hit rate', walCacheAttempts ? formatPercent(walResidentStoreUsed / walCacheAttempts) : '--', "".concat(walResidentStoreUsed, " resident-store hits / ").concat(walSegmentedHydrated, " genuine storage reads (").concat(storageGetCalls, " storage.get calls total)"), {
+      title: 'Of the segmented WAL\'s hydrate attempts, the share served from the in-memory resident-store cache (residentStoreUsed) rather than a real chrome.storage.local read (segmentedHydrated). This week\'s fix chain found this cache dead (residentStoreUsed sat at 0) -- concerning if this rate is low or falling after startup, since reads should be rare once the queue is warm and resident.'
+    }), buildMetricCard('WAL writes', "".concat(walAppended), "".concat(formatBytes(walAppendBytes), " appended; ").concat(walCheckpointed, " checkpoint switch").concat(walCheckpointed === 1 ? '' : 'es', " folding in ").concat(walCheckpointedRecords, " record").concat(walCheckpointedRecords === 1 ? '' : 's').concat(walCheckpointFailed ? "; ".concat(walCheckpointFailed, " checkpoint failure").concat(walCheckpointFailed === 1 ? '' : 's') : ''), {
+      title: 'How often the coordinator queue\'s write-ahead log is appended to, and how often it checkpoint-switches (folds accumulated segments back into one snapshot). A checkpoint switch is expected roughly every COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT (128) committed segments; concerning if switches are far less frequent than that under heavy write volume (segments piling up toward the COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT of 1024, which blocks further appends) or if any checkpoint failures show up at all.'
+    }), buildMetricCard('Read payload avg', readCalls ? formatBytes(readBytes / readCalls) : '--', "".concat(formatBytes(readBytes), " total; max ").concat(formatBytes(readMaxBytes)), {
+      title: 'Average and largest single-read payload size across all storage reads this epoch. Concerning if this grows steadily over a long-running session -- it usually tracks queue/progress size, and a large max next to a much smaller average flags one unusually expensive read worth finding via Read hot path.'
+    }), buildMetricCard('Read payload keys', formatBytes(readQueueBytes), "queue ".concat(formatBytes(readQueueBytes), ", view ").concat(formatBytes(readQueueViewBytes), ", progress ").concat(formatBytes(readProgressBytes)), {
+      title: 'Read bytes broken down by which storage key they came from. Concerning if "queue" (the raw authoritative queue, as opposed to the cheaper "view" projection) dominates read volume long after startup -- that\'s a sign something is bypassing the queue-view/resident-cache path and reading the full queue directly.'
+    }), buildMetricCard('Read hot path', topReadPath.path || '--', formatStoragePayloadPathDetail(topReadPath), {
+      title: 'Which named code path (metricPath, e.g. "reconcile.load") is responsible for the most read bytes this epoch. Concerning if a path you would not expect to read often (anything outside startup/reconcile) shows up here with a high call count -- that usually means a cache that should be short-circuiting it is not.'
+    }), buildMetricCard('Payload avg', payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--', "".concat(formatBytes(payloadBytes), " total; max ").concat(formatBytes(payloadMaxBytes)), {
+      title: 'Average and largest single-write payload size across all storage writes this epoch. Concerning if this trends upward over a long session -- larger writes mean longer Storage set latency and a bigger blast radius if one gets interrupted mid-write.'
+    }), buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), "queue ".concat(formatBytes(payloadQueueBytes), ", runs ").concat(formatBytes(payloadRunsBytes), ", progress ").concat(formatBytes(payloadProgressBytes)), {
+      title: 'Write bytes broken down by which storage key they went to. Not concerning by itself -- "queue" naturally dominates on a large batch -- but useful alongside Write hot path to see which code path is driving that volume.'
+    }), buildMetricCard('Write hot path', topWritePath.path || '--', formatStoragePayloadPathDetail(topWritePath), {
+      title: 'Which named code path is responsible for the most write bytes this epoch -- the write-side equivalent of Read hot path. Concerning if a path outside normal enqueue/reconcile/terminal-settlement activity dominates, or if its average latency (shown in the detail line) is high relative to its byte size.'
+    }), buildMetricCard('Milestone batch', milestoneFlushes ? formatRatio(milestoneReceived / milestoneFlushes) : '--', "".concat(milestoneReceived, " records / ").concat(milestoneFlushes, " flushes"), {
+      title: 'How many milestone records get batched into each flush (flushed at most once every COORDINATOR_JOB_MILESTONE_FLUSH_MS, 3s). Concerning only if flushes are happening far more often than every 3s with a low records-per-flush ratio -- that would mean batching isn\'t actually coalescing anything.'
+    }), buildMetricCard('Progress events', "".concat(progressReceived), "pending max ".concat(progressPendingMax), {
+      title: 'Total profile-progress records received this epoch, and the largest pending backlog seen at once. Concerning if "pending max" stays elevated rather than draining back toward zero -- that means progress records are arriving faster than they\'re being applied.'
+    })], state.loading ? 'Loading history...' : 'No wakeup metrics yet.');
   }
   if (journal) {
     var recentEntries = _toConsumableArray(entries).sort(function (left, right) {
@@ -4279,6 +4409,12 @@ function buildMetricCard() {
   var options = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
   var card = document.createElement('div');
   card.className = options.alert ? 'metric-card metric-card--alert' : 'metric-card';
+  // options.title carries a fuller explanation (what this measures, plus
+  // a rough "this is concerning if..." threshold) than the one-line
+  // detail text has room for. Falls back to detail alone when a card
+  // hasn't been given one yet, same as before this option existed.
+  var fullTitle = options.title || detail;
+  card.title = fullTitle;
   var labelNode = document.createElement('div');
   labelNode.className = 'metric-label';
   labelNode.textContent = label;
@@ -4288,7 +4424,7 @@ function buildMetricCard() {
   var detailNode = document.createElement('div');
   detailNode.className = 'metric-detail';
   detailNode.textContent = detail;
-  detailNode.title = detail;
+  detailNode.title = fullTitle;
   card.append(labelNode, valueNode, detailNode);
   return card;
 }
@@ -4752,7 +4888,29 @@ function buildQueueActionCell() {
 function compareCurrentWorkItems() {
   var left = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
   var right = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-  return getCurrentWorkSortRank(left) - getCurrentWorkSortRank(right) || getTime(right) - getTime(left) || "".concat(getQueueItemHref('', left) || (left === null || left === void 0 ? void 0 : left.storageKey) || (left === null || left === void 0 ? void 0 : left.id) || '').localeCompare("".concat(getQueueItemHref('', right) || (right === null || right === void 0 ? void 0 : right.storageKey) || (right === null || right === void 0 ? void 0 : right.id) || ''));
+  var rankDiff = getCurrentWorkSortRank(left) - getCurrentWorkSortRank(right);
+  if (rankDiff) return rankDiff;
+  var leftHref = function leftHref() {
+    return "".concat(getQueueItemHref('', left) || (left === null || left === void 0 ? void 0 : left.storageKey) || (left === null || left === void 0 ? void 0 : left.id) || '');
+  };
+  var rightHref = function rightHref() {
+    return "".concat(getQueueItemHref('', right) || (right === null || right === void 0 ? void 0 : right.storageKey) || (right === null || right === void 0 ? void 0 : right.id) || '');
+  };
+
+  // 2026-09-16: 'queued' rows used to break ties by time descending, same
+  // as every other rank -- but that puts the most-recently-added row at
+  // the top and the row nearest the front of the real dispatch line at
+  // the bottom, backwards from what "what's about to become active" is
+  // supposed to show. The real executor's base traversal order
+  // (queueRuntime.rebuildQueueOrder, before its own backoff/fairness/
+  // concurrency filtering) walks queued rows by queueSequence ascending,
+  // so this sorts the same way. See the matching fix in
+  // swCoordinatorQueueView.js's buildCoordinatorQueueView, which this
+  // client-side re-sort otherwise clobbers every render.
+  if (getCurrentWorkSortRank(left) === 1) {
+    return (Number.parseInt(left === null || left === void 0 ? void 0 : left.queueSequence, 10) || 0) - (Number.parseInt(right === null || right === void 0 ? void 0 : right.queueSequence, 10) || 0) || getTime(left) - getTime(right) || leftHref().localeCompare(rightHref());
+  }
+  return getTime(right) - getTime(left) || leftHref().localeCompare(rightHref());
 }
 function getCurrentWorkSortRank() {
   var item = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};

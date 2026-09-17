@@ -48,13 +48,15 @@ const {
     activateCheckpoint,
     appendWalRecordsToGeneration,
     applyWalRecord,
-    buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
+    CHECKPOINT_A,
+    CHECKPOINT_B,
     createChromeLocalStorageAdapter,
     createSerializedStorageUpdateQueue,
     createSerializedStorageUpdateState,
     createStorageUpdateAccessors,
     getWalRecordsForGeneration,
+    getSegmentedWalCheckpointKey,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     getSegmentedWalMetaKey,
@@ -72,6 +74,7 @@ const {
     COORDINATOR_RUNS_KEY,
     COORDINATOR_EVENTS_KEY,
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
+    COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     makeCoordinatorDashboardStateKeys
 } = require('./swdashboard')
 const {
@@ -363,6 +366,20 @@ const COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT = 1024
 // FORCE_SWITCH_AT stays purely as a backstop metric/log distinction in case
 // something upstream ever fails to call the switch at the soft threshold.
 const COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT = 256
+// 2026-09-15 atomic-read fix (see loadCoordinatorQueueWalStoreFromStorage):
+// the default number of segment keys to request, per checkpoint generation,
+// in the single atomic storage read that replaces the old
+// stale-meta-decides-what-to-fetch-later design. Sized at FORCE_SWITCH_AT
+// because scheduleCoordinatorQueueWalCheckpointSwitch now switches
+// immediately at every threshold crossing (see that constant's comment
+// above) -- in steady state committed segments on the active checkpoint
+// should rarely exceed the SOFT_SWITCH_AT threshold by much, and never
+// exceed FORCE_SWITCH_AT except in the brief window before a forced switch
+// completes. When the freshly-read meta says segments exceed this, the rare
+// fallback path (metric: coordinatorAuthority.queueWal.atomicReadUndersized)
+// does one more read, now sized exactly from that just-fetched meta instead
+// of a stale one.
+const COORDINATOR_QUEUE_WAL_ATOMIC_READ_SEGMENT_SUPERSET = COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT
 const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 // 2026-09-14: a single enqueue call used to persist its entire `items` array
 // as one durable mutation -- fine for a handful of rows, but a 500+ item
@@ -376,6 +393,75 @@ const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 // after the whole batch. Small enqueues (the common case) are left alone.
 const COORDINATOR_ENQUEUE_CHUNK_THRESHOLD = 100
 const COORDINATOR_ENQUEUE_CHUNK_SIZE = 50
+// 2026-09-16: settleTerminalCoordinatorItemsLocked processes its hrefs one at
+// a time, awaiting a full settlement round-trip per href, inside ONE
+// enqueueSpaceFeedStorageUpdate cycle -- fine for the single-href call sites,
+// but reconcile's own call passes every href that became terminal-eligible
+// since the last pass (ctx.terminalSettlementHrefs), which can grow large
+// after any backlog (e.g. resuming a long-paused queue). One such call was
+// observed live holding the write-queue's head for 265 seconds, backing up
+// everything else queued behind it (write-queue-backlog alerts, storage
+// timeouts, and hydrate calls timing out during their own reads). Capping
+// how many hrefs one reconcile-triggered pass will settle, and promptly
+// scheduling another reconcile for the remainder, bounds how long any one
+// pass can hold the queue -- the same shape as the enqueue chunking above,
+// applied to a different unbounded-batch call site.
+const COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE = 25
+// 2026-09-16: the settle-terminal cap above shipped, and within the hour the
+// exact same symptom recurred (write-queue stalls up to 286s) with
+// currentReason pointing one phase earlier in the same reconcile pipeline --
+// applyCoordinatorReconcileQueueAuthorityTransitionPhase's own per-item loop
+// awaits a real browser.tabs lookup for every row still claimed
+// active/settling (shouldImmediatelyReconcileMissingPersistedActiveTab,
+// getMissingActiveCoordinatorReconcileDecision -> getPersistedLiveTabForCoordinatorItem),
+// and separately for any queue-authoritative row whose progress record now
+// maps to terminal but still carries a persisted tabId (the
+// queueAuthoritative branch's own getPersistedLiveTabForCoordinatorItem
+// call) -- with no cap on how many such rows one tick will chase down. A
+// paused-then-resumed queue can have hundreds of rows whose persisted tabs
+// are long gone, turning "await a quick tab check" into hundreds of
+// sequential lookups inside the same enqueueSpaceFeedStorageUpdate cycle the
+// settle-terminal call above already learned this lesson in. Same fix, one
+// phase earlier: cap how many rows run the tab-querying reconcile tail per
+// tick and schedule a prompt follow-up reconcile for whatever didn't fit.
+// Unlike settle-terminal's hrefs (a caller-supplied list that's simply
+// sliced), this loop walks the same Object.keys(queue) order every tick, so
+// a plain "first N" cap would starve anything past the first chunk forever
+// if those first N rows happen to already be resolved -- capped via a
+// rotating window (progressReconcileTailResumeKey) instead, so the window
+// advances every tick regardless of how many rows in it actually needed
+// work. Deferred rows keep getting their cheap, non-awaiting derived-state
+// materialization every pass regardless -- only the tab-status-driven tail
+// waits its turn. Matches COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE's
+// value: both phases share the same worst-case per-item cost ceiling
+// (QUEUED_TAB_GET_TIMEOUT_MS) and the same write-queue this blocks.
+const COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE = 25
+// 2026-09-16: a third instance of the same shape, found by following where
+// flushCoordinatorJobMilestones's deferredMilestoneFlush call actually goes
+// -- recordCoordinatorJobProgressRecords({deferredMilestoneFlush:true})
+// short-circuits straight into applyCoordinatorRowEvents, which has its own
+// for(const event of normalizedEvents) loop awaiting a real
+// coordinatorAuthority.applyWithinStorageUpdate() WAL write per event, all
+// inside one enqueueSpaceFeedStorageUpdate call. coordinatorJobMilestonePendingRecords
+// (recordDeferredCoordinatorJobMilestone) is explicitly designed to
+// accumulate one record per distinct href while hasActiveCoordinatorMilestoneWork()
+// is true, deferring its own flush via scheduleCoordinatorJobMilestoneFlush()
+// the whole time -- and that gate stays true for as long as anything is
+// active/queued/pending, which for a busy queue (especially the first burst
+// of concurrent tab opens right after resuming a long-paused batch, each
+// posting several milestones as it progresses) can be the entire ramp-up.
+// The batch this accumulates is bounded only by how many distinct hrefs are
+// mid-flight when the gate finally clears, which is exactly what a
+// paused-then-resumed queue maximizes. Same fix, third call site: cap how
+// many records one flushCoordinatorJobMilestones() while-loop iteration
+// drains into a single recordCoordinatorJobProgressRecords/applyCoordinatorRowEvents
+// call. Unlike the other two, no separate reschedule is needed here -- the
+// while loop already re-checks coordinatorJobMilestonePendingRecords after
+// each iteration, so putting the excess back onto it (merged with whatever
+// arrived during the awaited chunk) just makes the existing loop drain it in
+// however many more enqueueSpaceFeedStorageUpdate-bounded chunks it takes,
+// each one still yielding the write-queue lock in between.
+const COORDINATOR_MILESTONE_FLUSH_CHUNK_SIZE = 25
 // unlimitedStorage removes chrome.storage.local's enforced 10MB cap, but
 // "unlimited" isn't a target -- it just trades a hard failure (kQuotaBytes
 // quota exceeded, the proximate cause of the 2026-09-12 incident) for silent
@@ -553,9 +639,34 @@ let coordinatorAuthorityShadowWalProjectionMaxSeq = 0
 let coordinatorAuthorityShadowWalAppliedIds = new Set()
 let coordinatorQueueWalCheckpointSwitchPromise = null
 let coordinatorQueueWalAutoRecoveryPersistPromise = null
+// 2026-09-15 resident WAL store cache: canUseResidentCoordinatorQueueWalStoreForMeta
+// (swCoordinatorQueueWal.js) has always been correct -- given a candidate
+// store and the current meta, it tells you whether the candidate is still
+// safe to reuse -- but nothing ever gave it a real candidate. Every hydrate
+// built `stored` from its own fresh metricStorageGet, so
+// `stored[COORDINATOR_QUEUE_WAL_KEY]` was always absent, and
+// coordinatorAuthority.queueWal.residentStoreUsed sat at exactly 0 across
+// roughly 8800 hydrate calls tonight: every single one paid for a full
+// storage round-trip, even back-to-back with nothing changed in between.
+// This is the missing candidate -- the last WAL store this process itself
+// successfully hydrated, durably wrote, or recovered -- kept only as a
+// hint. canUseResidentCoordinatorQueueWalStoreForMeta remains the sole judge
+// of whether it's still safe to use against whatever meta a caller is
+// hydrating against; this cache never bypasses that check.
+let coordinatorQueueWalResidentStoreCache = null
 let lastCoordinatorStorageQuotaCheckAt = 0
 let coordinatorStorageQuotaWarned = false
 let lastCoordinatorStorageUpdateQueueStallCheckAt = 0
+// Rotating cursor for applyCoordinatorReconcileQueueAuthorityTransitionPhase's
+// tab-querying reconcile tail (see COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE's
+// comment). A plain "first N items encountered" cap would starve: queue key
+// order is stable across ticks, so if the first N items in the queue happen
+// to be old, already-resolved rows, every tick would burn its whole budget
+// re-confirming those same N rows and never reach the ones further back that
+// actually need work. Remembering which queue key to resume from keeps the
+// window moving across ticks so every row eventually gets a turn. Reset
+// implicitly (falls back to index 0) if that key is no longer in the queue.
+let progressReconcileTailResumeKey = null
 let progressShadowWalStore = makePairedCheckpointStore({progress: {}}, {
     snapshotSeq: 0,
     createdAt: Date.now()
@@ -5241,7 +5352,7 @@ async function getCoordinatorQueueAccounting(request = {}) {
     }, {metricPath: 'queueAccounting.read'})
     const rawQueue = normalizeCoordinatorMap(stored[COORDINATOR_QUEUE_KEY] || {})
     const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
-    const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, rawQueue, {
+    const walStore = await loadCoordinatorQueueWalProjection(stored, rawQueue, {
         metricPath: 'queueAccounting.read.segments'
     })
     const recovery = recoverCoordinatorQueueFromWal(rawQueue, walStore)
@@ -5833,24 +5944,152 @@ function makeCoordinatorAuthorityShadowWalRecord(result = {}) {
     }
 }
 
+// Populates coordinatorQueueWalResidentStoreCache (see its declaration
+// above) from a store this process just read or wrote. `store` is whatever
+// this call site already has in hand -- never re-read for this purpose --
+// so this costs nothing extra.
+//
+// Deliberately skips caching a store whose active checkpoint has zero
+// committed WAL segments: a checkpoint with nothing layered on top of it
+// yet is exactly the case where the atomic read this cache exists to skip
+// is already cheap (a small meta + one checkpoint blob, not 35+ segment
+// reads), so there's little to gain -- and it's the case
+// canUseResidentCoordinatorQueueWalStoreForMeta struggles most to fingerprint
+// safely, since a checkpoint-only store's nextSeq/activeCheckpoint/segment-
+// count baseline looks identical regardless of what state it was actually
+// built from (only checkpoints[id].stateHash differs). Restricting the
+// cache to stores with real accumulated WAL activity keeps it out of that
+// ambiguous territory entirely, for the cases where skipping the read
+// actually matters.
+function setCoordinatorQueueWalResidentStoreCache(store = null) {
+    if(!store || typeof store !== 'object') {
+        coordinatorQueueWalResidentStoreCache = null
+        return
+    }
+    const activeCheckpoint = store.meta?.activeCheckpoint || ''
+    coordinatorQueueWalResidentStoreCache = getSegmentedWalCommittedSegmentCount(store.meta, activeCheckpoint) > 0
+        ? store
+        : null
+}
+
+// Same idea as setCoordinatorQueueWalResidentStoreCache, but for a store
+// that was just durably written rather than just read: `store` here is the
+// caller's own in-memory result of a mutation (append/checkpoint-activate),
+// whose `.meta` was updated incrementally in place and is NOT guaranteed to
+// carry the same `segmentedStorage.committedSegments` bookkeeping that only
+// gets (re)computed when the physical storage payload is actually built
+// (buildSegmentedWalStoragePayload's makeSegmentedWalStorageMeta). Caching
+// `store.meta` as-is here risks the cache privately disagreeing with the
+// meta this same write just put in storage -- the exact meta that a later
+// hydrate's `staleMeta` will read back. Substituting the payload's own meta
+// key removes that risk: the cached store's meta is then, by construction,
+// identical to what's now durably in storage.
+function cacheCoordinatorQueueWalResidentStoreFromWrite(store = null, payload = {}) {
+    const writtenMeta = payload?.[COORDINATOR_QUEUE_WAL_META_KEY]
+    if(!store || typeof store !== 'object' || !writtenMeta) return
+    setCoordinatorQueueWalResidentStoreCache({...store, meta: writtenMeta})
+}
+
 async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueue = {}, options = {}) {
-    const meta = stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
-    if(isSegmentedWalStorageMeta(meta)) {
-        const residentStore = stored?.[COORDINATOR_QUEUE_WAL_KEY] || null
-        if(canUseResidentCoordinatorQueueWalStoreForMeta(residentStore, meta)) {
+    const staleMeta = stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
+    if(isSegmentedWalStorageMeta(staleMeta)) {
+        // No caller has ever actually populated stored[COORDINATOR_QUEUE_WAL_KEY]
+        // with a genuine previously-hydrated store (see
+        // coordinatorQueueWalResidentStoreCache's declaration comment above)
+        // -- it falls back to our own cache of the last store this process
+        // itself hydrated or durably wrote, which is what actually makes
+        // canUseResidentCoordinatorQueueWalStoreForMeta's check meaningful.
+        const residentStore = stored?.[COORDINATOR_QUEUE_WAL_KEY] || coordinatorQueueWalResidentStoreCache || null
+        if(canUseResidentCoordinatorQueueWalStoreForMeta(residentStore, staleMeta)) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.residentStoreUsed')
+            // Every other branch below mirrors its result back into the
+            // caller's own `stored` object before returning (that's how
+            // callers building a coordinatorAuthority snapshot payload from
+            // `stored` -- e.g. refreshResidentCoordinatorAuthorityState --
+            // learn a WAL store is present at all). This fast path returned
+            // early without doing that, so a cache hit silently looked to
+            // those callers like "no WAL data here", routing them into the
+            // raw-queue-reseed fallback with stale pre-mutation data instead
+            // of the resident store this cache exists to serve.
+            stored[COORDINATOR_QUEUE_WAL_KEY] = residentStore
             return residentStore
         }
-        const defaults = buildSegmentedWalStorageDefaults(meta, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
-        const missingKeys = Object.keys(defaults).filter(key => !Object.prototype.hasOwnProperty.call(stored, key))
-        let segmentStored = {}
-        if(missingKeys.length) {
-            segmentStored = await metricStorageGet(Object.fromEntries(missingKeys.map(key => [key, defaults[key]])), {
-                metricPath: options.metricPath || 'coordinatorQueueWal.segmented.load',
-                phase: 'queueWalSegmentStorageGet'
-            })
-            Object.assign(stored, segmentStored)
+
+        // 2026-09-15 atomic-read fix for the "missing-segment" hydrate-failure
+        // storm (see the comment on COORDINATOR_QUEUE_WAL_ATOMIC_READ_SEGMENT_SUPERSET
+        // above): the caller's `staleMeta` was fetched separately (and
+        // earlier) than this function runs, so trusting it to decide which
+        // segment keys "should" exist -- and fetching exactly those, in a
+        // SEPARATE later call -- left a real await gap where a concurrent
+        // checkpoint switch or auto-recovery rewrite could retire/replace
+        // those keys before the second read landed. This function no longer
+        // does that: it fetches meta + BOTH checkpoints + a generous superset
+        // of segment keys in ONE metricStorageGet call, which is one
+        // chrome.storage.local.get() resolving from a single consistent
+        // point-in-time snapshot. `staleMeta` is used only to GUESS which
+        // checkpoint is active and how many segments to ask for -- sizing
+        // hints, never ground truth. The meta this function actually hydrates
+        // against is whatever comes back from THIS read (re-read fresh below,
+        // and again inside hydrateSegmentedWalStore itself).
+        const guessedActiveCheckpoint = staleMeta.activeCheckpoint === CHECKPOINT_B ? CHECKPOINT_B : CHECKPOINT_A
+        // Deliberately NOT widened by staleMeta's own claimed committed-segment
+        // count -- if that count were trusted for sizing too, a queue that
+        // legitimately grew past the fixed superset below would have its
+        // (accurate) stale meta already reflect that, silently absorbing the
+        // undersized case into the "normal" one and leaving the rare fallback
+        // path below untested by anything short of an actual race. Keeping
+        // this a fixed default means the fallback path is reachable
+        // deterministically, from meta alone, whenever real growth outruns it.
+        const guessedSegmentCount = Math.min(
+            COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
+            COORDINATOR_QUEUE_WAL_ATOMIC_READ_SEGMENT_SUPERSET
+        )
+        const atomicReadKeys = {
+            [COORDINATOR_QUEUE_WAL_META_KEY]: null,
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_A)]: null,
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_B)]: null
         }
+        for(let segmentNo = 0; segmentNo < guessedSegmentCount; segmentNo += 1) {
+            atomicReadKeys[getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, guessedActiveCheckpoint, segmentNo)] = null
+        }
+        const atomicRead = await metricStorageGet(atomicReadKeys, {
+            metricPath: options.metricPath || 'coordinatorQueueWal.segmented.load',
+            phase: 'queueWalSegmentAtomicStorageGet'
+        })
+        Object.assign(stored, atomicRead)
+
+        const freshMeta = isSegmentedWalStorageMeta(stored[COORDINATOR_QUEUE_WAL_META_KEY])
+            ? stored[COORDINATOR_QUEUE_WAL_META_KEY]
+            : null
+        if(freshMeta) {
+            const freshActiveCheckpoint = freshMeta.activeCheckpoint === CHECKPOINT_B ? CHECKPOINT_B : CHECKPOINT_A
+            const freshCommittedSegments = getSegmentedWalCommittedSegmentCount(freshMeta, freshActiveCheckpoint)
+            const alreadyFetchedSegmentCount = freshActiveCheckpoint === guessedActiveCheckpoint ? guessedSegmentCount : 0
+            if(freshCommittedSegments > alreadyFetchedSegmentCount) {
+                // Rare: either the superset undersized the real segment
+                // count, or the active checkpoint flipped between our guess
+                // and this same read's own fresh meta (a switch landed
+                // concurrently). One more read, sized EXACTLY from the meta
+                // this function just fetched a moment ago -- not the
+                // caller's stale one -- so the residual race window is
+                // between two awaits inside this one function call, not
+                // across the caller's separate, earlier fetch.
+                incrementQueueWakeupMetric('coordinatorAuthority.queueWal.atomicReadUndersized')
+                const fallbackReadKeys = {}
+                for(let segmentNo = alreadyFetchedSegmentCount; segmentNo < freshCommittedSegments; segmentNo += 1) {
+                    fallbackReadKeys[getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, freshActiveCheckpoint, segmentNo)] = null
+                }
+                const fallbackRead = await metricStorageGet(fallbackReadKeys, {
+                    metricPath: options.metricPath
+                        ? `${options.metricPath}.atomicReadFallback`
+                        : 'coordinatorQueueWal.segmented.load.atomicReadFallback',
+                    phase: 'queueWalSegmentAtomicReadFallback'
+                })
+                Object.assign(stored, fallbackRead)
+            }
+        }
+        const meta = freshMeta || staleMeta
+
         const hydrated = runQueueWakeupMetricPhase('queueWalHydrate', () => hydrateSegmentedWalStore(stored, {
             baseKey: COORDINATOR_QUEUE_WAL_KEY,
             fallbackStore: stored[COORDINATOR_QUEUE_WAL_KEY] || null
@@ -5869,6 +6108,7 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             }
             void maybeCheckCoordinatorStorageQuotaHealth('queueWal-hydrate')
             stored[COORDINATOR_QUEUE_WAL_KEY] = hydrated.store
+            setCoordinatorQueueWalResidentStoreCache(hydrated.store)
             return hydrated.store
         }
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateFailed')
@@ -5896,7 +6136,28 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
         // just-recovered queue within seconds of recovering it (2026-09-15
         // incident: 900 rows -> 0, caught only because the other checkpoint
         // slot happened to survive untouched).
-        const viewRecovery = await attemptCoordinatorQueueWalAutoRecoveryFromView(stored, meta, options)
+        // 2026-09-16: under severe write-queue backlog (the settle-terminal
+        // bottleneck found live this morning, ~30s-265s stalls), this
+        // function's own storage read can itself hit the serialized-update
+        // queue's timeout-recovery/abandon mechanism and throw ("abandoned
+        // storage update suppressed...") instead of returning a normal
+        // {ok:false} result. Uncaught, that exception used to propagate raw
+        // out of loadCoordinatorQueueWalStoreFromStorage, skipping every
+        // counter below (segmentedAutoRecoveredFromView,
+        // segmentedAutoRecoveryFromViewFailed, segmentedMissingCheckpointReset
+        // all stayed at 0 even while segmentedHydrateFailed climbed into the
+        // dozens) and handing whatever called hydrate an unexpected timeout
+        // error instead of the documented hydrate-failure contract. Treating
+        // a thrown recovery attempt the same as an unsuccessful one keeps the
+        // contract intact -- and correctly counted -- no matter how backed up
+        // storage is.
+        let viewRecovery = null
+        try {
+            viewRecovery = await attemptCoordinatorQueueWalAutoRecoveryFromView(stored, meta, options)
+        }
+        catch(error) {
+            viewRecovery = {ok: false, reason: `auto-recovery-threw: ${error?.message || error || 'unknown error'}`.slice(0, 240)}
+        }
         if(viewRecovery?.ok === true && viewRecovery.store) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView')
             recordCoordinatorDiagnosticEvent(
@@ -5911,6 +6172,13 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
                 rebuiltRowCount: viewRecovery.rebuiltRowCount
             })
             stored[COORDINATOR_QUEUE_WAL_KEY] = viewRecovery.store
+            // Cached optimistically, ahead of the durable persist below (which
+            // is fire-and-forget): if that persist never lands, storage keeps
+            // its old (corrupt) meta, which won't match this recovered store's
+            // meta -- canUseResidentCoordinatorQueueWalStoreForMeta rejects the
+            // mismatch on the next hydrate, so this can't serve stale data
+            // either way.
+            setCoordinatorQueueWalResidentStoreCache(viewRecovery.store)
             scheduleCoordinatorQueueWalAutoRecoveryPersist(
                 viewRecovery.store,
                 stored,
@@ -5945,6 +6213,39 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
     const fallback = normalizeCoordinatorQueueWalStore(stored[COORDINATOR_QUEUE_WAL_KEY], snapshotQueue)
     stored[COORDINATOR_QUEUE_WAL_KEY] = fallback
     return fallback
+}
+
+// 2026-09-15 queue-WAL-race investigation (see "missing-segment" hydrate
+// failures in loadCoordinatorQueueWalStoreFromStorage above): every one of the
+// 14 call sites that need a hydrated queue WAL called
+// `loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, options)`
+// directly, right after building its own metricStorageGet payload around
+// getCoordinatorQueueWalStorageDefaults(). This is the single seam between
+// "caller has fetched stored" and "caller has a hydrated walStore", so the
+// follow-up atomic-read fix (closing the gap between "fetch meta" and "fetch
+// the segments meta says should exist" that produces the missing-segment
+// races) has exactly one place to change instead of 14.
+//
+// This does NOT also fold each call site's own metricStorageGet(...) fetch in
+// here, even though that fetch is duplicated too -- an earlier version of this
+// refactor tried exactly that and it is empirically impossible to do without
+// shifting timing: any additional promise layer sitting between two
+// genuinely-dependent sequential async steps (fetch, then hydrate) costs one
+// extra microtask tick versus the caller's original two inline `await`s, no
+// matter whether the layer is built with async/await or with `.then()` --
+// and that tick broke 3 fake-timer tests in test/swSynthetic.test.js
+// (executor-apply enqueue/timeout races going through
+// runCoordinatorAuthorityReconcileActions -> loadCoordinatorQueueRunsProjection).
+// This is the same failure mode the Phase 4 entropy-reduction comment above
+// recoverQueueFromWalStore already documents for the hydrate-then-recover
+// boundary. So, same fix: keep this function to exactly the part that doesn't
+// need bridging. It is deliberately NOT `async` and does nothing but tail-
+// return loadCoordinatorQueueWalStoreFromStorage's own promise untouched, so
+// `await loadCoordinatorQueueWalProjection(...)` costs the caller exactly what
+// `await loadCoordinatorQueueWalStoreFromStorage(...)` used to -- zero added
+// ticks, verified against test/swSynthetic.test.js and test/swScenarioFuzz.test.js.
+function loadCoordinatorQueueWalProjection(stored, snapshotQueue, options = {}) {
+    return loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, options)
 }
 
 // In-memory half of the 2026-09-15 WAL auto-recovery (see the call site in
@@ -6015,6 +6316,11 @@ function scheduleCoordinatorQueueWalAutoRecoveryPersist(store, previousStored = 
             if(retiredKeys.length) {
                 await metricStorageRemove(retiredKeys, {metricPath: 'queueWal.autoRecoveryFromView.cleanup'})
             }
+            // Re-affirm the resident cache (already set optimistically at
+            // read time, before this durable write even started) against the
+            // exact meta this write just put in storage, same as every other
+            // write-completion site -- see cacheCoordinatorQueueWalResidentStoreFromWrite.
+            cacheCoordinatorQueueWalResidentStoreFromWrite(store, payload)
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.autoRecoveredFromViewPersisted')
             recordFlightRecorderEvent({
                 kind: 'queue-wal-auto-recovery',
@@ -6401,6 +6707,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
             append
         }
     }
+    cacheCoordinatorQueueWalResidentStoreFromWrite(append.store, physicalWal.payload)
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended')
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
@@ -6655,6 +6962,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
             append
         }
     }
+    cacheCoordinatorQueueWalResidentStoreFromWrite(append.store, physicalWal.payload)
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended', records.length)
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
@@ -6800,7 +7108,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             committedSegmentsB: getSegmentedWalCommittedSegmentCount(preSwitchMeta, 'B')
         })
         const snapshotQueue = {}
-        const storedWal = await loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, {
+        const storedWal = await loadCoordinatorQueueWalProjection(stored, snapshotQueue, {
             metricPath: `${options.metricPath || 'queueWal.checkpointSwitch.load'}.segments`,
             suppressCheckpointSwitchSchedule: options.suppressCheckpointSwitchSchedule === true
         })
@@ -6952,6 +7260,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
                 checkpointedRecords
             }
         }
+        cacheCoordinatorQueueWalResidentStoreFromWrite(activated.store, checkpointWal?.payload || {})
 
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointed')
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointedRecords', checkpointedRecords)
@@ -7754,14 +8063,43 @@ function createCoordinatorAuthority() {
         let changed = false
 
         let queueSeededFromPayload = false
+        // Prefer an already-hydrated, WAL-backed resident queue over a raw
+        // legacy mirror: mbCoordinatorQueue is a compatibility snapshot
+        // that's never kept in sync with WAL-based mutations (by design --
+        // a row can move through queued/active/canceled/failed/etc. via WAL
+        // appends while the raw key sits untouched), so once authority
+        // already has real WAL data, a raw-queue-seed payload is *older*
+        // than what's resident, not a legitimate correction. Without this
+        // guard, any caller passing allowRecoveredAuthorityQueueSeed (e.g.
+        // resumeCoordinatorQueueExecutionOnce's raw-queue-fallback safety
+        // net, which fires for plenty of reasons short of "authority is
+        // actually stale") would silently roll a fully WAL-hydrated queue
+        // back to its pre-mutation raw snapshot.
+        const residentWalStore = next.stored[COORDINATOR_QUEUE_WAL_KEY]
+        const hasTrustedResidentWalStore = !!(residentWalStore &&
+            typeof residentWalStore === 'object' &&
+            residentWalStore.meta &&
+            residentWalStore.checkpoints &&
+            residentWalStore.wal)
         if(options.allowRecoveredAuthorityQueueSeed === true &&
+            !hasTrustedResidentWalStore &&
             Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY)) {
             next.queue = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_KEY] || {}))
             next.stored[COORDINATOR_QUEUE_KEY] = cloneCoordinatorAuthorityValue(payload[COORDINATOR_QUEUE_KEY] || {})
             changed = true
             queueSeededFromPayload = true
         }
-        let physicalWalKeys = Object.keys(payload || {}).filter(isCoordinatorQueueWalPhysicalStorageKey)
+        let physicalWalKeys = Object.keys(payload || {})
+            .filter(isCoordinatorQueueWalPhysicalStorageKey)
+            // A present-but-falsy legacy WAL key (the bare COORDINATOR_QUEUE_WAL_KEY,
+            // not a dotted physical sub-key) is how normalizeCoordinatorAuthorityStateInput
+            // marks "this caller had no WAL context to offer" -- that field
+            // is always present in the assembled payload unconditionally,
+            // it's not a caller assertion that WAL data should be cleared.
+            // Treating it as a real physical key wipes an already-good
+            // resident WAL store for no reason (see hasTrustedResidentWalStore
+            // above).
+            .filter(key => key !== COORDINATOR_QUEUE_WAL_KEY || !!payload[key])
         let hasLegacyWalPayload = payload[COORDINATOR_QUEUE_WAL_KEY] &&
             typeof payload[COORDINATOR_QUEUE_WAL_KEY] === 'object'
         const incomingWalMeta = payload[`${COORDINATOR_QUEUE_WAL_KEY}.meta`] ||
@@ -8305,7 +8643,7 @@ async function loadCoordinatorQueueProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8328,7 +8666,7 @@ async function loadCoordinatorQueueRunsProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8355,7 +8693,7 @@ async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8384,7 +8722,7 @@ async function loadCoordinatorQueueRunsScopedProgressProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsScopedProgressProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsScopedProgressProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8460,7 +8798,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}) {
             metricPath: 'currentAuthority.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: 'currentAuthority.load.segments'
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8487,7 +8825,7 @@ async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8516,7 +8854,7 @@ async function loadCoordinatorQueueRunsEventsProgressProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsEventsProgressProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8550,7 +8888,7 @@ async function loadCoordinatorReconcileProjection(options = {}) {
             metricPath: options.metricPath || 'reconcile.projection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'reconcile.projection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8581,7 +8919,7 @@ async function loadCoordinatorQueueRunsPendingProjection(options = {}) {
             metricPath: options.metricPath || 'coordinatorQueueRunsPendingProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsPendingProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8610,7 +8948,7 @@ async function loadCoordinatorQueueRunsProgressPendingNukedProjection(options = 
             metricPath: options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'
         })
         const queueSnapshot = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: `${options.metricPath || 'coordinatorQueueRunsProgressPendingNukedProjection.load'}.segments`
         })
         const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
@@ -8878,7 +9216,8 @@ async function loadCoordinatorReconcileAuthorityPhase(options = {}) {
         recomputeAllRuns: false,
         affectedRunIds: new Set(),
         terminalSettlementHrefs: new Set(),
-        tabsToCloseAfterReconcile: new Set()
+        tabsToCloseAfterReconcile: new Set(),
+        progressReconcileDeferredKeys: new Set()
     }
 }
 
@@ -8898,6 +9237,23 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
     if(pruneCoordinatorCurrentWork(queue, now)) {
         ctx.changed = true
         ctx.recomputeAllRuns = true
+    }
+
+    const progressReconcileQueueKeys = Object.keys(queue)
+    const progressReconcileTailWindowKeys = new Set()
+    if(progressReconcileQueueKeys.length) {
+        const resumeIndex = progressReconcileTailResumeKey
+            ? progressReconcileQueueKeys.indexOf(progressReconcileTailResumeKey)
+            : 0
+        const startIndex = resumeIndex >= 0 ? resumeIndex : 0
+        const windowSize = Math.min(COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE, progressReconcileQueueKeys.length)
+        for(let offset = 0; offset < windowSize; offset += 1) {
+            progressReconcileTailWindowKeys.add(progressReconcileQueueKeys[(startIndex + offset) % progressReconcileQueueKeys.length])
+        }
+        progressReconcileTailResumeKey = progressReconcileQueueKeys[(startIndex + windowSize) % progressReconcileQueueKeys.length]
+    }
+    else {
+        progressReconcileTailResumeKey = null
     }
 
     for(const [itemKey, rawItem] of Object.entries(queue)) {
@@ -8961,6 +9317,29 @@ async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {}) 
             })
             record = null
         }
+
+        // Everything from here down can await a real browser.tabs lookup
+        // (shouldImmediatelyReconcileMissingPersistedActiveTab, getMissingActiveCoordinatorReconcileDecision,
+        // getPersistedLiveTabForCoordinatorItem) for rows still claimed
+        // active/settling, or for queue-authoritative rows whose progress
+        // record now maps to terminal but which still carry a persisted
+        // tabId -- exactly the rows a paused-then-resumed batch accumulates
+        // by the hundreds once their persisted tabs are long gone. See
+        // COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE's comment: cap how many
+        // rows run this tail per tick (via the rotating window built above,
+        // so the same already-resolved rows can't monopolize every tick's
+        // budget) and defer the rest to a follow-up reconcile rather than
+        // holding the write-queue lock for the whole backlog in one pass.
+        // Deferred rows still got their cheap, non-awaiting derived-state
+        // materialization above this point on every pass, so nothing about
+        // them goes stale -- only this tail's tab-status-driven transition
+        // waits for a later tick.
+        if(!progressReconcileTailWindowKeys.has(itemKey)) {
+            ctx.progressReconcileDeferredKeys.add(itemKey)
+            incrementQueueWakeupMetric('reconcile.progressReconcileChunked')
+            continue
+        }
+
         const invalidProfileResolutionFailure = getInvalidProfileResolutionFailure(item, itemKey)
         const invalidTerminalResolutionNeedsReconcile = isTerminalCoordinatorStatus(item.status) &&
             item.status === 'failed' &&
@@ -9241,8 +9620,30 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
         if(stateSaved === false) saved = false
     }
     if(ctx.terminalSettlementHrefs.size) {
+        const terminalSettlementHrefs = Array.from(ctx.terminalSettlementHrefs)
+        const terminalSettlementHrefsThisPass = terminalSettlementHrefs.slice(0, COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE)
         await settleTerminalCoordinatorItemsLocked({
-            profileHrefs: Array.from(ctx.terminalSettlementHrefs)
+            profileHrefs: terminalSettlementHrefsThisPass
+        })
+        if(terminalSettlementHrefs.length > terminalSettlementHrefsThisPass.length) {
+            incrementQueueWakeupMetric('reconcile.terminalSettlementChunked')
+            scheduleCoordinatorReconcile(1000, {
+                reason: 'terminal-settlement-remainder',
+                edgeTriggered: true
+            })
+        }
+    }
+    if(ctx.progressReconcileDeferredKeys.size) {
+        // Rows whose tab-status-driven reconcile tail didn't fit in this
+        // tick's COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE window (see that
+        // constant's comment). They're left exactly as-is -- no partial
+        // mutation happened for them -- and progressReconcileTailResumeKey
+        // already points a follow-up tick's window at wherever this one left
+        // off, so a prompt reconcile is enough to keep the rotation moving
+        // through the backlog.
+        scheduleCoordinatorReconcile(1000, {
+            reason: 'progress-reconcile-remainder',
+            edgeTriggered: true
         })
     }
     for(const tabId of saved !== false ? ctx.tabsToCloseAfterReconcile : []) {
@@ -9289,7 +9690,26 @@ async function settleTerminalCoordinatorItems(options = {}) {
 }
 
 async function settleTerminalCoordinatorItemsLocked(options = {}) {
-    const requestedHrefs = getNormalizedProfileHrefList(options.profileHrefs || [])
+    // COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE's own comment describes this
+    // function as "fine for the single-href call sites" -- true for the
+    // 'settle-terminal-coordinator-items' runtime-message route's normal
+    // per-tab-completion calls, but content.js's space-feed reconciliation
+    // (reconcileStaleSpaceFeedProgress / scheduleSpaceFeedProgressReconciliation)
+    // sends whatever candidate/pending profile hrefs it currently has for the
+    // whole page in one message, unbounded, straight into this function's own
+    // per-href await loop below -- bypassing the cap reconcile's own call
+    // site already applies to itself. Capping here too closes that gap for
+    // every caller at once. No explicit follow-up reschedule is needed for
+    // the dropped remainder: content.js already re-sends its still-pending
+    // href list on its own periodic reconciliation cadence, and the
+    // pendingPosts this call returns will still list anything not settled
+    // this pass, so the next natural call picks up right where this one left
+    // off.
+    const normalizedRequestedHrefs = getNormalizedProfileHrefList(options.profileHrefs || [])
+    const requestedHrefs = normalizedRequestedHrefs.slice(0, COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE)
+    if(normalizedRequestedHrefs.length > requestedHrefs.length) {
+        incrementQueueWakeupMetric('terminalSettlement.requestedHrefsChunked')
+    }
 
     const residentAuthority = getHydratedCoordinatorAuthorityState('terminalSettlement.usedResidentAuthority')
     const stored = residentAuthority
@@ -9315,7 +9735,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
     let queue = residentAuthority?.queue || null
     if(!queue) {
         const snapshotQueue = {}
-        const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, {
+        const walStore = await loadCoordinatorQueueWalProjection(stored, snapshotQueue, {
             metricPath: 'terminalSettlement.load.segments'
         })
         const queueRecovery = recoverCoordinatorQueueFromWal(
@@ -18674,7 +19094,7 @@ async function hasUnpausedStoredCoordinatorWorkInDurableQueue(reason = 'stored-w
     if(!stored || stored[COORDINATOR_PAUSED_KEY] === true) return false
 
     const queueSnapshot = {}
-    const walStore = await loadCoordinatorQueueWalStoreFromStorage(stored, queueSnapshot, {
+    const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
         metricPath: `${metricPath}.segments`
     }).catch(() => null)
     if(!walStore) return false
@@ -20621,11 +21041,37 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
     const result = await coordinatorEnqueuePromise
     const acceptedItems = (Number.parseInt(result?.queued, 10) || 0) + (Number.parseInt(result?.merged, 10) || 0)
     if(acceptedItems > 0) incrementQueueWakeupMetric('job.enqueued', acceptedItems)
+    void persistLastCoordinatorEnqueueSummary(storageRequest, result)
+        .catch(error => console.info('Mute Block last-enqueue summary persist failed', error))
     void finishCoordinatorEnqueue(request, sender, result)
         .catch(error => console.info('Mute Block coordinator execution setup failed after durable enqueue', error))
     void pruneMissingQueuedTabRuntimeState('post-enqueue-runtime-prune')
         .catch(error => console.info('Mute Block post-enqueue runtime prune failed', error))
     return result
+}
+
+// Fire-and-forget, purely informational (2026-09-15): "requested" is what the
+// caller actually asked to enqueue this call, independent of whatever
+// COORDINATOR_ENQUEUE_CHUNK_SIZE splits it into internally, so a dashboard
+// reading this back sees "500 requested" for one big submission, not the
+// per-chunk breakdown. queued/merged come straight from the same result the
+// caller already got -- this just gives the dashboard a durable place to
+// read them from later, since they were previously only visible in the
+// capped mbCoordinatorEvents log's free-text message.
+async function persistLastCoordinatorEnqueueSummary(storageRequest = {}, result = {}) {
+    const requested = Array.isArray(storageRequest.items) ? storageRequest.items.length : 0
+    if(!requested) return
+    const summary = {
+        requested,
+        queued: Number.parseInt(result?.queued, 10) || 0,
+        merged: Number.parseInt(result?.merged, 10) || 0,
+        runId: result?.runId || storageRequest.run?.id || '',
+        sourceType: storageRequest.source?.type || storageRequest.sourceType || '',
+        at: Date.now()
+    }
+    await metricStorageSet({[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: summary}, {
+        metricPath: 'enqueue.lastSummary.save'
+    })
 }
 
 async function enqueueCoordinatorItemsStorage(request = {}) {
@@ -23882,7 +24328,23 @@ async function closeQueuedWorkerActionSurfaceIfIdle(reason = 'idle', options = {
     const tabs = Array.isArray(win.tabs) ? win.tabs : []
     const hasRuntimeWork = hasQueuedWorkerActionSurfaceRuntimeWork(windowId)
     const hasProfileTab = tabs.some(candidate => /^https:\/\/www\.quora\.com\/profile\//i.test(candidate?.url || ''))
-    if(hasRuntimeWork && hasProfileTab) {
+    // Live incident (2026-09-16, reason 'idle-after-active-missing-tab-
+    // prepass-requeue'): this used to require hasRuntimeWork *and*
+    // hasProfileTab before treating the surface as busy. hasRuntimeWork
+    // alone (a queued tab or pending tab action genuinely tracked against
+    // this window/mode) is the reliable signal -- it comes from
+    // queueRuntime's own bookkeeping, not from reading the tab's current
+    // url. hasProfileTab is a *url* heuristic, and urls lag reality: right
+    // after an active-missing-tab requeue gets refilled, the freshly
+    // (re)opened tab can sit on about:blank for a beat while it navigates --
+    // which isIdleQueuedWorkerActionSurfaceTab also treats as idle -- so the
+    // AND let real, tracked work fall through and the window closed out
+    // from under it (confirmed live: the cleanupBusy counter undercounted
+    // the closed counter by 6 in one run). hasRuntimeWork is sufficient on
+    // its own; hasProfileTab remains its own separate check below purely as
+    // a defensive fallback for a profile tab that's live but somehow lost
+    // its runtime tracking.
+    if(hasRuntimeWork) {
         incrementQueueWakeupMetric('actionSurface.workerWindow.cleanupBusy')
         return false
     }
@@ -29272,11 +29734,19 @@ async function flushCoordinatorJobMilestones() {
             results: {}
         }
         while(Object.keys(coordinatorJobMilestonePendingRecords).length) {
-            const pending = coordinatorJobMilestonePendingRecords
-            coordinatorJobMilestonePendingRecords = {}
-            const pendingCount = Object.keys(pending).length
+            const pendingHrefs = Object.keys(coordinatorJobMilestonePendingRecords)
+            const chunkHrefs = pendingHrefs.slice(0, COORDINATOR_MILESTONE_FLUSH_CHUNK_SIZE)
+            const pending = {}
+            for(const href of chunkHrefs) {
+                pending[href] = coordinatorJobMilestonePendingRecords[href]
+                delete coordinatorJobMilestonePendingRecords[href]
+            }
+            const pendingCount = chunkHrefs.length
             incrementQueueWakeupMetric('milestone.flushPerformed')
             incrementQueueWakeupMetric('milestone.recordsPerFlush', pendingCount)
+            if(pendingHrefs.length > chunkHrefs.length) {
+                incrementQueueWakeupMetric('milestone.flushChunked')
+            }
             const result = await recordCoordinatorJobProgressRecords(pending, {
                 deferredMilestoneFlush: true
             })

@@ -115,6 +115,15 @@ h2 {
     text-overflow: ellipsis;
 }
 
+.summary-detail {
+    color: #6b7280;
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .panel {
     display: flex;
     flex-direction: column;

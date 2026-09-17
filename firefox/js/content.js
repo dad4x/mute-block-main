@@ -12978,7 +12978,7 @@ function nukeSpaceFeedEntries(_x39, _x40) {
 function _nukeSpaceFeedEntries() {
   _nukeSpaceFeedEntries = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee65(button, entries) {
     var _ownedNukeStatusCache;
-    var space, unfinishedEntries, profileAssociations, resolverAssociations, workAssociations, urls, runId, _iterator85, _step85, _entry, result, sweep, _iterator86, _step86, entry;
+    var space, unfinishedEntries, profileAssociations, resolverAssociations, workAssociations, urls, runId, _iterator85, _step85, _entry, result, enqueueQueuedCount, enqueueMergedCount, workingLabel, sweep, _iterator86, _step86, entry;
     return _regeneratorRuntime().wrap(function _callee65$(_context66) {
       while (1) switch (_context66.prev = _context66.next) {
         case 0:
@@ -13053,33 +13053,45 @@ function _nukeSpaceFeedEntries() {
           return enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations);
         case 30:
           result = _context66.sent;
-          if (!(((result === null || result === void 0 ? void 0 : result.executionQueued) || (result === null || result === void 0 ? void 0 : result.queued) || (result === null || result === void 0 ? void 0 : result.merged) || 0) > 0)) {
-            _context66.next = 35;
+          enqueueQueuedCount = Number.parseInt(result === null || result === void 0 ? void 0 : result.queued, 10) || 0;
+          enqueueMergedCount = Number.parseInt(result === null || result === void 0 ? void 0 : result.merged, 10) || 0;
+          if (!(((result === null || result === void 0 ? void 0 : result.executionQueued) || enqueueQueuedCount || enqueueMergedCount || 0) > 0)) {
+            _context66.next = 38;
             break;
           }
           syncSpaceFeedNukeControls();
-          setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())));
+          workingLabel = formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())); // Merged rows (already-known key: currently queued, or a past
+          // terminal outcome) are silently absorbed into the existing row
+          // rather than added as new work -- surface that breakdown for a
+          // beat instead of jumping straight to the generic working label,
+          // so a big submission that mostly deduped doesn't look like most
+          // of it silently vanished.
+          if (enqueueMergedCount > 0) {
+            setNukeButtonNotice(button, "Queued ".concat(enqueueQueuedCount, " new (").concat(enqueueMergedCount, " already known)"), workingLabel);
+          } else {
+            setNukeButtonWorking(button, workingLabel);
+          }
           return _context66.abrupt("return", true);
-        case 35:
-          _context66.next = 37;
+        case 38:
+          _context66.next = 40;
           return sweepBlockedProfileTabs();
-        case 37:
+        case 40:
           sweep = _context66.sent;
           if (!(sweep.owned > 0)) {
-            _context66.next = 42;
+            _context66.next = 45;
             break;
           }
           syncSpaceFeedNukeControls();
           setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())));
           return _context66.abrupt("return", true);
-        case 42:
-          _context66.next = 44;
+        case 45:
+          _context66.next = 47;
           return removePendingSpaceFeedEntries(unfinishedEntries);
-        case 44:
+        case 47:
           setNukeButtonNotice(button, 'Nothing queued');
           return _context66.abrupt("return", false);
-        case 46:
-          _context66.prev = 46;
+        case 49:
+          _context66.prev = 49;
           delete button.dataset.mbQueueing;
           _iterator86 = _createForOfIteratorHelper(unfinishedEntries);
           try {
@@ -13095,20 +13107,20 @@ function _nukeSpaceFeedEntries() {
             _iterator86.f();
           }
           _context66.t0 = updateOwnedNukeStatusCache;
-          _context66.next = 53;
+          _context66.next = 56;
           return getOwnedNukeStatus();
-        case 53:
+        case 56:
           _context66.t1 = _context66.sent;
           (0, _context66.t0)(_context66.t1);
           clearInactiveSpaceFeedNukeMode();
           syncSpaceFeedNukeControls();
           scheduleSpaceAssetNukeControls(0);
-          return _context66.finish(46);
-        case 59:
+          return _context66.finish(49);
+        case 62:
         case "end":
           return _context66.stop();
       }
-    }, _callee65, null, [[23,, 46, 59]]);
+    }, _callee65, null, [[23,, 49, 62]]);
   }));
   return _nukeSpaceFeedEntries.apply(this, arguments);
 }

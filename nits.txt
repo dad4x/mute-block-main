@@ -1,0 +1,193 @@
+Some nits to follow up
+
+[2026-09-16: being worked on in the background while the live batch runs.
+Not built/reloaded/committed yet -- changes will land in the working tree
+for review once the agent finishes.]
+
+- hover help on metrics and cards explaining what the terms mean and what would be bad.
+
+- order of display in the queue on dash isn't showing the next things that are going to become active, as one would expect.
+
+- cards for real blocks and already blocks don't have time/operation which sould be nice -- small numbers.
+
+- not clear if already-blocked is discovered from quora query or from our pre-knowledge.  We should be able to distinguish.
+
+- write payload sizes would be good to have, and frequency of checkpoing and wal writes.
+
+- actual reads and reads/time are useful.   We should have few reads after startup, right?
+
+- revisit background window
+
+- background window gets destroyed and re-created more than it should.  If there's work pending, keep it up.
+
+[2026-09-16 status on the items above -- what shipped vs. what's still open]
+
+1 (hover help): done. Extended/added title tooltips on every summary tile
+and metrics-grid card (shared/coordinator.html, buildMetricCard calls in
+shared/js/coordinator.js) with both what each measures and a rough
+"concerning if" threshold, grounded in this codebase's own named constants
+(COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS, STALE_*_QUEUED_TAB_MS,
+COORDINATOR_ACTIVE_JOB_MAX_MS, COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+etc.) rather than invented numbers.
+
+2 (queue order): partially done, and the rest is a real, scoped-down
+deferral, not an oversight.
+  - Fixed the part that was a straightforward bug: for 'queued'-rank rows,
+    both the server-side sort (buildCoordinatorQueueView in
+    swCoordinatorQueueView.js) and the dashboard's own client-side re-sort
+    (compareCurrentWorkItems in coordinator.js, which runs on every render
+    and was clobbering the server's order anyway) broke ties by time
+    descending -- correct for 'active' rows, backwards for 'queued', where
+    it put the most-recently-added row at the top instead of the row
+    nearest the front of the real dispatch line. Both now sort 'queued'
+    rows by queueSequence ascending, matching queueRuntime.rebuildQueueOrder
+    -- the real executor's base FIFO traversal order.
+  - NOT implemented: a true "here are the actual next N the executor would
+    pick" preview. Investigated the gap between that base FIFO order and
+    the executor's real pick, which layers per-run fairness, retry backoff
+    timers, and concurrency throttling on top (swFillQueuedTabsOnceDecisions.js's
+    ~12 decide* functions, swFastExecutorDecisions.js). These aren't pure
+    functions over the queue: they read live module-level state (activation
+    guards, profile-open reservations, queuedTabFillOpeningActionKeys,
+    per-window/per-run concurrency counters) and several make their
+    decisions by actually attempting side-effecting steps (claiming a
+    guard, reserving a profile-open slot) rather than just checking a
+    condition. Building a side-effect-free preview would mean either (a)
+    forking a large fraction of that decision tree into a read-only mode --
+    a correctness risk every time the real path changes, since the two
+    would drift -- or (b) actually running the real selection and then
+    rolling it back, which risks the exact class of side effects (tab
+    creation, guard claims) the preview is supposed to avoid. Given the
+    base-FIFO-order fix above closes the specific complaint ("shows what's
+    about to become active, as one would expect") for the common case,
+    this was left as a known limitation rather than forced.
+
+3 (timing on really/already-blocked cards): done. Both summary tiles now
+show an avg/max active-to-terminal duration line under the count, computed
+from the existing profileAction.{reallyBlocked,alreadyBlocked}.{count,
+totalDurationMs,maxDurationMs} counters (already written by
+recordCoordinatorProfileActionOutcomeStat), same total/count-average pattern
+the existing secs/block card already used.
+
+4 (already-blocked: live check vs. pre-knowledge): investigated, and it
+turned out to be a non-issue rather than a hidden gap. Traced every code
+path that can produce an 'already-blocked' outcome (content.js's
+isProfileBlocked() checks during a queued tab's own flow; the background
+sweep's close-if-blocked message to a live tab in
+terminalizeAlreadyBlockedQueuedTab / terminalizeActiveCoordinatorItemFromBlockedLiveTab)
+-- every one of them requires a fresh DOM read of an actually-open Quora
+profile page (or a live tab probed the same way) before it will set
+foundBlockedBeforeQueue/already-blocked. There is no path in this codebase
+that marks a row already-blocked from cached/prior knowledge without a
+fresh page load, so there's no live-vs-inferred distinction to surface.
+Documented this directly in the "Already blocked" tile's tooltip instead of
+adding a badge for a distinction that doesn't exist in the data.
+
+5 (write payload sizes, checkpoint/WAL write frequency): mostly already
+existed (Payload avg/sources, Write hot path cards, aggregating across the
+~90+ distinct storagePayload.write.path.* names rather than one card per
+path, per your own judgment call). Added the missing half: a "WAL writes"
+card showing coordinatorAuthority.queueWal.appended/appendBytes and
+.checkpointed/.checkpointedRecords (plus any .checkpointFailed), with a
+tooltip noting the expected ~128-committed-segment cadence
+(COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT) and the 1024 hard limit.
+
+6 (read count / rate): added a "Queue cache hit rate" card:
+residentStoreUsed / (residentStoreUsed + segmentedHydrated), i.e. the
+segmented-WAL resident-store cache hit ratio this week's fix chain
+specifically fixed (it was dead, sitting at 0), alongside the total
+storageGetCalls count for overall read volume.
+
+7 (revisit background window): folded into 8, no separate action.
+
+8 (background window closes too eagerly): found and fixed a real gap.
+closeQueuedWorkerActionSurfaceIfIdle (sw.js) required *both*
+hasQueuedWorkerActionSurfaceRuntimeWork (real tracked queued-tab/pending-
+action bookkeeping) *and* a tab whose current *url* already matched the
+Quora profile pattern before treating the window as busy. Right after an
+active-missing-tab requeue gets refilled, the freshly (re)opened tab can
+sit on about:blank for a beat while it navigates -- which
+isIdleQueuedWorkerActionSurfaceTab also treats as idle -- so real, tracked
+work fell through and the window closed anyway. hasRuntimeWork alone is now
+sufficient to block the close; hasProfileTab remains as its own separate
+defensive check below for a live profile tab that's somehow lost its
+runtime tracking. Regression test added in test/swSynthetic.test.js.
+
+[2026-09-16, later same night: write-queue-backlog investigation, separate
+from the 8 items above]
+
+The live batch developed severe write-queue-backlog stalls (up to 265-286
+SECONDS for the oldest pending write, thousands of storage timeouts, and
+the reallyBlocked/alreadyBlocked epoch counters running 2-9x ahead of real
+completions) on three separate occasions after the segmented-WAL hydrate
+race fix shipped. Root cause each time: an unbounded per-item loop doing
+real awaited storage/tab work, entirely inside one
+enqueueSpaceFeedStorageUpdate critical section, so a large batch (the
+common trigger: resuming a long-paused queue, which lets a backlog of
+terminal-eligible/milestone-bearing rows accumulate) holds the single
+serialized write queue's head for as long as the whole batch takes,
+blocking everything else queued behind it.
+
+Three confirmed instances found and fixed (all in shared/js/sw.js, same
+chunk-and-reschedule shape as COORDINATOR_ENQUEUE_CHUNK_SIZE's original
+fix):
+  1. reconcileCoordinatorStorageLocked's progress-reconcile tail (tab-query
+     loop) -- capped at COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE (25) via a
+     rotating resume-key window (not a naive first-N, which would starve --
+     queue key order is stable, so the same already-resolved rows would eat
+     the whole budget every tick and the rows further back would never get
+     reached).
+  2. settleTerminalCoordinatorItemsLocked's href list -- capped inside the
+     function itself (protects every caller, including content.js's
+     space-feed reconciliation, which was sending an unbounded pending list
+     to the one caller-side cap that existed before).
+  3. applyCoordinatorRowEvents, fed by coordinatorJobMilestonePendingRecords
+     (a global accumulator explicitly designed to pile up milestone records
+     from many tabs while the coordinator is busy, then burst-flush
+     everything in one shot once the busy-gate clears) -- flushCoordinatorJobMilestones
+     now drains COORDINATOR_MILESTONE_FLUSH_CHUNK_SIZE (25) records per
+     iteration of its existing while loop instead of grabbing and clearing
+     the whole accumulator at once.
+
+Important open question, not resolved: fix #1 lives behind
+reconcileCoordinatorStorage, which turns out to be reachable ONLY via a
+manual, explicit 'reconcile-coordinator-storage' user-initiated message
+(gated by userInitiated === true, checked directly in swBootstrap.js) --
+there is no automatic/scheduled caller anywhere in the codebase. Neither of
+us knowingly triggered that action during the incidents, so fix #1, while a
+real bug, most likely did NOT cause what was observed live. Fix #3 is fully
+automatic (fires on ordinary tab milestone reporting) and is the better
+mechanistic match, but the literal 'terminal-progress'/'direct-progress'
+reason strings seen in the live stall messages were traced to a *different*,
+always-single-href call site (recordCoordinatorJobProgressRecords's
+non-deferred branch), not to fix #3's code path -- so even that match isn't
+clean. Net: three real bugs fixed, all independently worth having, but no
+single one has a fully confirmed causal link to the specific incidents
+observed. If backlog stalls recur even with all three fixes live, that's
+the signal this is actually a throughput/backpressure problem (many small,
+individually-fast operations arriving faster than the serialized queue can
+drain them after a resume) rather than any one unbounded batch, and needs a
+different class of fix (e.g. rate-limiting how fast new critical-section
+work can be enqueued after a pause, not just capping individual batch
+sizes).
+
+[2026-09-16, near end of the same live batch (1317/1322 done): a second,
+different-shaped bug, NOT investigated yet]
+
+Flight-recorder evidence (tools/cdp/flight-recorder.js) showed a single row
+(https://www.quora.com/profile/Vivian-Christian-21, one specific attemptId)
+firing the identical 'close-if-blocked-sent' event from
+terminalizeActiveCoordinatorItemFromBlockedLiveTab 11 times in about 1.3
+seconds, same tabId throughout, before finally resolving (terminal count
+did eventually advance by one). This is NOT the same shape as the three
+batch-loop bugs above -- it's a single row/attempt resending the identical
+message far faster than any real tab-close/DOM round-trip could plausibly
+complete, suggesting whatever gate is supposed to prevent re-sending while
+a prior send is still in flight isn't holding for this code path. Did not
+cause a permanent stall (the row did eventually terminalize), but from the
+dashboard it looks exactly like "nothing is happening" while it's spamming.
+Worth investigating fresh: start from terminalizeActiveCoordinatorItemFromBlockedLiveTab
+and whatever tracks "is a close-if-blocked message already in flight for
+this attemptId" -- the pattern (many identical sends, same tabId, sub-2-second
+span) suggests that in-flight tracking either isn't checked before sending,
+or isn't being set/cleared correctly around the message round-trip.

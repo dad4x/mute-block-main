@@ -104,6 +104,22 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
 
         const activeCheckpoint = meta.activeCheckpoint
         if(!residentStore.checkpoints?.[activeCheckpoint]) return false
+        // 2026-09-15: a fresh checkpoint (no WAL segments layered on top yet)
+        // always reports the same nextSeq/activeCheckpoint/committed-segment-
+        // count baseline regardless of what state it was actually built
+        // from -- so two INDEPENDENTLY-built checkpoints for entirely
+        // different underlying data (e.g. two hydrates of a queue that
+        // changed in between, or two migrations from a raw queue snapshot)
+        // are structurally indistinguishable by those fields alone. Caught
+        // live by feeding this function real data for the first time: a
+        // resident store cached from one hydrate was wrongly accepted for a
+        // later hydrate of genuinely different data because every field
+        // above still matched. checkpoints[id].stateHash is the one field
+        // that actually fingerprints what's IN the checkpoint, so it's the
+        // last line of defense against exactly this false-positive class.
+        if(residentMeta.checkpoints?.[activeCheckpoint]?.stateHash !== meta.checkpoints?.[activeCheckpoint]?.stateHash) {
+            return false
+        }
         const requiredSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
         const residentSegments = getSegmentedWalCommittedSegmentCount(residentMeta, activeCheckpoint)
         if(residentSegments < requiredSegments) return false

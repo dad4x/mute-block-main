@@ -10,6 +10,7 @@ const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
 const COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns'
 const COORDINATOR_EVENTS_KEY = 'mbCoordinatorEvents'
 const QUEUE_WAKEUP_METRICS_VIEW_KEY = 'mbQueueWakeupMetricsView'
+const COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
 
 function makeCoordinatorDashboardStateKeys(extraKeys = []) {
     return new Set([
@@ -17,6 +18,7 @@ function makeCoordinatorDashboardStateKeys(extraKeys = []) {
         COORDINATOR_RUNS_KEY,
         COORDINATOR_EVENTS_KEY,
         QUEUE_WAKEUP_METRICS_VIEW_KEY,
+        COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
         ...extraKeys
     ])
 }
@@ -26,5 +28,6 @@ module.exports = {
     COORDINATOR_RUNS_KEY,
     COORDINATOR_EVENTS_KEY,
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
+    COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     makeCoordinatorDashboardStateKeys
 }
