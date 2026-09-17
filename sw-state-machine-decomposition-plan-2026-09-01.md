@@ -3311,7 +3311,8 @@ than independently deciding the outcome string; only the outcome-to-status
 mapping and the actual state transition move behind `reduceJobEvent`.
 
 **P3-2 -- converge `terminalizeActiveCoordinatorItemFromBlockedLiveTab`
-(Part 2 target #8) onto the reducer.**
+(Part 2 target #8) onto the reducer.** BLOCKED (2026-09-17, continued
+session -- see "P3-2/P3-3 finding" below).
 Extract per Part 2 discipline if not already a standalone `decide*`
 (check first -- Part 2.5 may have touched this already), then change its
 `classifyBlockConfirmationFromItem(expectedItem)` call site so the
@@ -3327,7 +3328,8 @@ but doing them in the same session catches drift between the two call
 sites early).
 
 **P3-3 -- converge `sweepStaleQueuedTabs`'s `recordOwnedBlockedSweepTerminal`
-path (Part 2 target #5) onto the same reducer event.**
+path (Part 2 target #5) onto the same reducer event.** BLOCKED (2026-09-17,
+continued session -- see "P3-2/P3-3 finding" below).
 Same treatment as P3-2, applied to `recordOwnedBlockedSweepTerminal`'s
 `buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(item))` call.
 Use the identical event shape P3-1 defined and P3-2 wired up -- the point
@@ -3337,6 +3339,101 @@ independently. If P3-2 already extracted a shared helper for building the
 event, reuse it rather than re-deriving it.
 Depends on: P3-1 (and ideally P3-2, to reuse its event-construction
 helper rather than duplicating it).
+
+**P3-2/P3-3 finding (2026-09-17, continued session): both call sites'
+actual write paths are richer than a bare `reduceJobEvent` call, and
+bypassing them risks silently reintroducing the exact bug
+`classifyBlockConfirmationFromItem` was extracted to fix. Not attempted;
+documented here for a human to decide the next move.**
+
+P3-1 correctly confirmed `reduceJobEvent`'s `JOB_EVENT_TERMINAL` event
+*vocabulary* already suffices. What P3-1 didn't audit -- because it was
+scoped to `jobState.js` only, per its own "No `sw.js` changes in this
+slice" instruction -- is what currently sits *between* each call site's
+classification and any call into `reduceJobEvent`. Neither call site
+calls `reduceJobEvent` directly today; both go through a heavier
+orchestration layer that itself happens to call `reduceJobEvent`
+internally, and that layer does real work beyond the outcome-string
+decision:
+
+1. **`recordOwnedBlockedSweepTerminal`** (sw.js ~L25849) builds a
+   progress-patch record from the classification and feeds it through
+   `transitionCoordinatorItemFromProgress` (`swCoordinatorProgressReducer.js`
+   ~L308), which internally constructs the `JOB_EVENT_TERMINAL` event and
+   calls `reduceJobEvent` -- but *also*, on that same call, invokes the
+   private (unexported) `recordCoordinatorProfileActionOutcomeStat`
+   helper, which buckets `profileAction.reallyBlocked`/`alreadyBlocked`
+   count and duration metrics off `mapped.outcome`. This is not a minor
+   side effect: it's the exact stat that was stuck at zero in the live
+   incident (2026-09-17) that motivated `classifyBlockConfirmationFromItem`
+   in the first place ("I've seen ~10 real blocks but the dashboard shows
+   2" -- see the `p1-contract.test.js` comments at the `recordSweepBody`/
+   `activeBlockedLiveBody` assertions). Replacing this call site's path
+   with a bare `reduceJobEvent(item, event)` + a hand-rolled
+   `coordinatorAuthority.applyWithinStorageUpdate` write would drop that
+   stat call entirely unless it's separately exported/duplicated at the
+   call site -- and there is **no existing behavioral test** that
+   exercises the stat specifically through `recordOwnedBlockedSweepTerminal`
+   or `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (the only
+   coverage, `swSynthetic.test.js` ~L5156/L5220, drives the stat through
+   the generic direct-progress-record path, not through either sweep/live-
+   tab fallback). A regression here would ship silently.
+2. **`terminalizeActiveCoordinatorItemFromBlockedLiveTab`**'s fallback
+   (sw.js ~L14654) has no direct authority-write access at all -- its
+   only write path is `recordCoordinatorJobProgressViaQueueMachine` ->
+   `applyCoordinatorQueueMachineEvent({type: 'PROGRESS_PATCH_RECORD', ...})`
+   -> `recordCoordinatorJobProgress` -> `recordCoordinatorJobProgressRecords`
+   (sw.js ~L29385), a large batched, multi-profile-href pipeline with
+   substantial logic that has nothing to do with block classification:
+   stale-sender-tab mismatch diagnostics, active-sender-tab gating,
+   `shouldRecoverQueuedDirectBlockActionTerminalProgress`/
+   `shouldRecoverQueuedProfileActionGateTerminalProgress` retry-recovery
+   detours, terminal-progress restoration/drift fallbacks
+   (`makeTerminalProgressRecordFromCoordinatorItem`,
+   `shouldPreferSuccessfulProgressOverTerminalCoordinatorItem`), and its
+   own WAL row-event batching. Unlike `coordinatorAuthority.applyWithinStorageUpdate`,
+   this pipeline has no "hand back `nextItem`, I'll persist it" seam a
+   caller can slot a directly-constructed `reduceJobEvent` result into --
+   it owns the whole load-decide-write cycle itself, across every
+   in-flight profile href in the batch. Bypassing it means either
+   duplicating a meaningful slice of that guard/recovery logic at this
+   one call site (reintroducing the kind of fragmented-decider risk this
+   whole Part 3 effort exists to eliminate) or silently dropping it.
+3. Converging only `recordOwnedBlockedSweepTerminal` (the one call site
+   with direct authority-write access) while leaving
+   `terminalizeActiveCoordinatorItemFromBlockedLiveTab` on the
+   progress-patch pipeline would recreate precisely the
+   two-call-sites-diverging risk `classifyBlockConfirmationFromItem` was
+   extracted to close -- the plan's own item-1 text says "Do these two
+   together; converging one without the other leaves the fragmentation
+   this was meant to close."
+
+None of this means `reduceJobEvent`'s event shape is wrong (P3-1's
+finding stands). It means the *integration surface* at these two call
+sites is not "swap a helper call for a `reduceJobEvent` call" -- it's
+"replace two different, already-load-bearing orchestration layers
+(one with an undertested stat side effect, one with an entire batched
+recovery pipeline) with a hand-rolled equivalent," which is a much larger
+and riskier change than P3-2/P3-3's scoped description implies, with
+no existing regression net for the part most likely to break quietly.
+Per this plan's own Part 3 "Definition of done" note ("a reducer gap
+found while converging a target is its own separate, reviewed commit"),
+this needs a deliberate, reviewed decision, not a same-session refactor:
+either (a) add dedicated behavioral coverage for
+`profileAction.reallyBlocked`/`alreadyBlocked` through both real call
+sites first (so a future attempt has a net), and decide whether
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback can
+safely skip `recordCoordinatorJobProgressRecords`'s guard/recovery
+branches for this specific already-confirmed-blocked scenario (a
+domain call, not a mechanical one), or (b) accept that this decision
+stays expressed through the progress-patch/`transitionCoordinatorItemFromProgress`
+detour -- which already funnels into `reduceJobEvent`'s `JOB_EVENT_TERMINAL`
+one level removed, via `mapProgressToJobState`'s identical
+`'blocked'`/`'already-blocked'` outcome strings -- and treat
+`classifyBlockConfirmationFromItem` as the converged state for this
+target. No `sw.js`, `jobState.js`, test, or lint-guard changes made in
+this session; `npm run test:parallel` and `npm run lint:block-classification`
+were verified green beforehand and left untouched.
 
 **P3-4 -- `blockProfile()` await-fix (`content.js`, fully independent of
 P3-1..3, safe to dispatch any time, in parallel with the others).**
@@ -3455,3 +3552,8 @@ drift between the two call sites). Once P3-5 lands: P3-6. Do not start
 P3-2/P3-3 before P3-1 merges, or P3-6 before P3-5 merges -- both are
 audit-then-build pairs specifically so a reducer gap gets fixed once, in
 `jobState.js`, instead of twice as two different workarounds.
+P3-2/P3-3 are currently BLOCKED (see the "P3-2/P3-3 finding" above) --
+do not dispatch them again until that finding's two prerequisites (stat
+test coverage; a domain decision on skipping
+`recordCoordinatorJobProgressRecords`'s guard/recovery branches for the
+live-tab-blocked fallback) are resolved.
