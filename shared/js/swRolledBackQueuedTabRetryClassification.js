@@ -211,36 +211,58 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)
     }
 
+    // Converged onto jobState.js's reduceJobEvent per P3-6
+    // (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3 dispatch
+    // plan"): the three approval paths this function used to branch on by
+    // hand -- queueOnlyAuthority's shortcut, the recoverActiveTransitionFailures
+    // reason-match, and the queue-pressure check nested inside it -- plus the
+    // shared exhaustedRolledBackRecoveryCount cap that closed the
+    // infinite-recovery-loop incident, are now one policy,
+    // isExhaustedRollbackRecoveryApproved, that reduceJobEvent applies over
+    // the exact same facts (mirrored precedence, audited in P3-5). This
+    // function still owns computing those facts -- reason-pattern matches,
+    // queue-authority/ownership, live queue-throttle telemetry -- since the
+    // reducer has no access to deps-injected config or runtime throttle
+    // state; it only decides given the facts handed to it.
+    //
+    // This call is a dry run: reduceJobEvent's returned item is discarded,
+    // only `accepted` is read. The actual mutation -- and the
+    // exhaustedRolledBackRecoveryCount bump on approval -- still happens
+    // separately in buildForcedRolledBackQueuedTabRetryItem, which was
+    // deliberately NOT switched onto the same exhaustedRolledBackRecovery
+    // fact bundle in this slice; see that function's header comment for why.
     function shouldRecoverExhaustedRolledBackQueuedTabRetry(item = null, options = {}) {
         if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
-        // Gates every branch below, not just queueOnlyAuthority's shortcut:
-        // runCoordinatorAuthorityReconcileActions hardcodes
-        // recoverActiveTransitionFailures: true on its own EXHAUSTED_ROLLBACK_SETTLE
-        // dispatch regardless of what ITS caller asked for, so a row whose
-        // actionLeaseReleaseReason matches isActiveTransitionRolledBackQueuedTabRetry
-        // (or the runtime-disappeared/transient-open checks below) would sail
-        // through that branch uncapped even with the queueOnlyAuthority
-        // shortcut closed off. A row that keeps genuinely, persistently
-        // failing needs to actually reach the terminalize path eventually,
-        // through whichever branch would otherwise keep rescuing it.
-        if(getExhaustedRolledBackRecoveryCount(item) >= COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT) {
-            return false
-        }
-        if(options.queueOnlyAuthority === true) return true
-        if(options.recoverActiveTransitionFailures !== true) return false
-        const activeTransitionRetry = isActiveTransitionRolledBackQueuedTabRetry(item)
-        const runtimeDisappearedRetry = isRuntimeDisappearedRolledBackQueuedTabRetry(item)
-        const transientOpenRetry = isTransientOpenRolledBackQueuedTabRetry(item)
-        const pressureOpenRetry = shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options)
-        if(!activeTransitionRetry &&
-            !runtimeDisappearedRetry &&
-            !(transientOpenRetry && (options.recoverTransientOpenRetry === true || pressureOpenRetry))) {
-            return false
-        }
-        return isCoordinatorQueueAuthoritativeItem(item) &&
-            (options.serviceWorkerOwned === true ||
-                item?.serviceWorkerOwned === true ||
-                item?.executorOwner === 'service-worker')
+
+        const attemptId = getAttemptIdFromValue(item)
+        const attemptNumber = getAttemptNumberFromValue(item)
+        const now = getNow()
+        const reduced = reduceJobEvent(item, {
+            type: JOB_EVENT_RETRY,
+            attemptId,
+            attemptNumber,
+            sourceAttemptId: attemptId,
+            sourceAttemptNumber: attemptNumber,
+            at: now,
+            retryCount: getCoordinatorFailureRetryCount(item),
+            lastRetryAt: now,
+            exhaustedRolledBackRecovery: {
+                isExhausted: isExhaustedRolledBackQueuedTabRetry(item),
+                recoveryLimit: COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
+                queueOnlyAuthority: options.queueOnlyAuthority === true,
+                recoverActiveTransitionFailures: options.recoverActiveTransitionFailures === true,
+                activeTransitionRetry: isActiveTransitionRolledBackQueuedTabRetry(item),
+                runtimeDisappearedRetry: isRuntimeDisappearedRolledBackQueuedTabRetry(item),
+                transientOpenRetry: isTransientOpenRolledBackQueuedTabRetry(item),
+                recoverTransientOpenRetry: options.recoverTransientOpenRetry === true,
+                pressureOpenRetry: shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options),
+                queueAuthoritative: isCoordinatorQueueAuthoritativeItem(item),
+                serviceWorkerOwned: options.serviceWorkerOwned === true ||
+                    item?.serviceWorkerOwned === true ||
+                    item?.executorOwner === 'service-worker'
+            }
+        })
+        return reduced.accepted === true
     }
 
     function wouldActiveMissingTabRequeueExhaustRetryBudget(item = null) {
@@ -282,6 +304,37 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         }
     }
 
+    // P3-6 note (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3
+    // dispatch plan"): this function's own reduceJobEvent call below was
+    // deliberately NOT given an event.exhaustedRolledBackRecovery fact
+    // bundle in that slice, so it still bumps exhaustedRolledBackRecoveryCount
+    // by hand rather than letting the reducer own the increment (as
+    // shouldRecoverExhaustedRolledBackQueuedTabRetry above now does for its
+    // own approval decision). Reasons found while auditing that convergence:
+    // (1) this function has no `options` parameter -- none of its five call
+    // sites (mutateCoordinatorStaleRetryQueuedTabAdvance,
+    // recoverExhaustedRolledBackQueuedCoordinatorItem[s],
+    // recoverQueuedStaleRuntimeMissingQueuedAction, and the two inline
+    // ACTIVE_MISSING_TAB requeue-then-recover sites in sw.js) thread the
+    // queueOnlyAuthority/recoverActiveTransitionFailures/serviceWorkerOwned/
+    // recoverQueueLoadPressure/recoverTransientOpenRetry flags the earlier
+    // shouldRecoverExhaustedRolledBackQueuedTabRetry decision used past
+    // `applyCoordinatorQueueMachineEvent`'s `options: {currentAuthorityState,
+    // reason}` envelope -- wiring them through would mean widening that
+    // function's signature plus every call site plus the
+    // EXHAUSTED_ROLLBACK_RECOVER handler in swQueueMachineHandlers.js.
+    // (2) more importantly, shouldRecoverExhaustedOpenRetryUnderQueuePressure
+    // reads live, mutable queue-throttle state (getQueueLoadThrottle(),
+    // getNow()) -- re-evaluating it a second time here, inside
+    // coordinatorAuthority.applyWithinStorageUpdate's asynchronous
+    // lock/storage-update queue, could observe a different throttle snapshot
+    // than the one the original decision saw moments earlier, and reject a
+    // recovery the caller already committed to (falling back to
+    // scheduleCoordinatorQueueResume, not a hang, but a new source of
+    // nondeterminism in a production-incident fix path that wasn't there
+    // before). Left as a blocker for a human to decide whether that
+    // TOCTOU risk and the call-site fan-out are worth taking on, rather than
+    // forcing it through in this slice.
     function buildForcedRolledBackQueuedTabRetryItem(item = {}, now = getNow(), reason = 'executor-plan-active-transition-retry-budget-recovered') {
         const sourceAttemptId = getAttemptIdFromValue(item)
         const sourceAttemptNumber = getAttemptNumberFromValue(item)
