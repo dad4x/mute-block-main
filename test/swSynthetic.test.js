@@ -119,6 +119,40 @@ test('dashboard queue view orders same-timestamp queued rows by queueSequence, n
     ])
 })
 
+test('dashboard queue view shows queued rows in real dispatch order, not most-recently-added first', () => {
+    // 2026-09-16 nit: the queued-rank tiebreak used to be time descending,
+    // same as every other rank -- fine for 'active' (surfacing recent
+    // activity), backwards for 'queued': it put the row that was just
+    // added at the top and the row actually next in line (the front of the
+    // FIFO queue queueRuntime.rebuildQueueOrder walks by queueSequence
+    // ascending) at the bottom. A row added later but with an earlier
+    // queueSequence must still sort ahead of one added more recently.
+    const {sw} = loadServiceWorkerHarness()
+    const queue = {
+        'https://www.quora.com/profile/Sort-Order-Recently-Added': {
+            status: 'queued',
+            queuedAt: 5000,
+            updatedAt: 5000,
+            queueSequence: 9
+        },
+        'https://www.quora.com/profile/Sort-Order-Front-Of-Line': {
+            status: 'queued',
+            queuedAt: 1000,
+            updatedAt: 1000,
+            queueSequence: 1
+        }
+    }
+
+    const queueView = sw.buildCoordinatorQueueView(queue, 5000)
+    const orderedKeys = queueView.items.map(item => item.storageKey)
+
+    assert.deepEqual(orderedKeys, [
+        'https://www.quora.com/profile/Sort-Order-Front-Of-Line',
+        'https://www.quora.com/profile/Sort-Order-Recently-Added'
+    ])
+    assert.equal(queueView.items[0].queueSequence, 1)
+})
+
 test('dashboard queue view summarizes terminal-to-next-active handoff delay', async () => {
     const {sw} = loadServiceWorkerHarness()
     const firstHref = 'https://www.quora.com/profile/Handoff-First'
@@ -1495,13 +1529,22 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
             }
         }
     })
-
     const result = await settleWithFakeTimers(browser.runtime.sendMessage({
         action: 'cancel-coordinator-current-work-item',
         storageKey: hrefA,
         coordinatorKey: hrefA,
         profileHref: hrefA
     }), timers)
+    // The cancel handler's own response settles before the fire-and-forget
+    // queue-resume it kicks off underneath does: that resume briefly seeds
+    // the resident authority queue from the (still-'queued', by design)
+    // raw storage snapshot before its own later WAL-based re-read corrects
+    // it back. settleWithFakeTimers only waits for the response promise, so
+    // without this extra drain the assertions below can observe that
+    // mid-flight raw-seeded state instead of the corrected one -- a
+    // pre-existing race that was previously masked by slower storage reads
+    // leaving no realistic window to observe it.
+    await flushAsync(300)
 
     assert.equal(result.canceledUrls.length, 1)
     assert.equal(result.canceledUrls[0], hrefA)
@@ -4010,6 +4053,377 @@ test('segmented queue WAL forces checkpoint switch over active queue work once g
     assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork'] || 0, 1)
     assert.equal(counters['coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled'] || 0, 1)
     assert.ok((counters['coordinatorAuthority.queueWal.maxActivePhysicalSegments'] || 0) >= forceSwitchAt)
+})
+
+// 2026-09-15 atomic-read fix regression tests (see the dated comment above
+// COORDINATOR_QUEUE_WAL_ATOMIC_READ_SEGMENT_SUPERSET and inside
+// loadCoordinatorQueueWalStoreFromStorage in sw.js): the old design let a
+// caller's own EARLIER, meta-only fetch (loadCoordinatorCurrentAuthorityState's
+// getCoordinatorQueueWalStorageDefaults() call) decide which segment keys a
+// SEPARATE, LATER read inside loadCoordinatorQueueWalStoreFromStorage would
+// go fetch. That created a real await gap between the two reads in which a
+// concurrent checkpoint switch (or the auto-recovery rewrite this same
+// function performs) could retire/replace the very keys the second read was
+// about to ask for -- observed live as "missing-segment" hydrate failures
+// roughly every 30 seconds under load. The fix makes the inner read
+// self-sufficient: meta, both checkpoints, and a generous superset of
+// segment keys all come back from ONE metricStorageGet call, which is one
+// chrome.storage.local.get() resolving from a single consistent snapshot --
+// the caller's separately-fetched meta is used only to guess which
+// checkpoint is active, never trusted for which keys "should" exist.
+test('segmented queue WAL hydrate fetches meta, both checkpoints, and segments as one atomic storage read', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Atomic-Read'
+    const runId = 'run-segmented-wal-atomic-read'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150900,
+            terminalAt: 150901,
+            updatedAt: 150901,
+            attemptId: 'attempt-segmented-wal-atomic-read',
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 3, {
+        rowKey: href,
+        createdAt: 150900
+    })
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 150910,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    // Instrument the fake storage.local.get to record every requested key
+    // set, without changing its behavior -- the same technique this file's
+    // own loadServiceWorkerHarness wrapper already uses (see
+    // refreshSyntheticRawQueueWalSeed's override above) to observe reads
+    // without a dedicated call-log spy in test/lib/swHarness.js.
+    const getCallKeySets = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getCallKeySets.push(Object.keys(defaults && typeof defaults === 'object' ? defaults : {}))
+        return originalGet(defaults)
+    }
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href]?.status, 'succeeded')
+
+    const metaKey = 'mbCoordinatorQueueWal.meta'
+    const checkpointAKey = 'mbCoordinatorQueueWal.checkpoint.A'
+    const checkpointBKey = 'mbCoordinatorQueueWal.checkpoint.B'
+    const walMetaBearingCalls = getCallKeySets.filter(keys => keys.includes(metaKey))
+    const atomicCalls = walMetaBearingCalls.filter(keys =>
+        keys.includes(checkpointAKey) &&
+        keys.includes(checkpointBKey) &&
+        keys.some(key => key.startsWith('mbCoordinatorQueueWal.segment.')))
+
+    // Exactly one call carries meta + both checkpoints + segments together --
+    // the old code's inner fetch never carried the meta key at all (it
+    // trusted the caller's already-fetched copy), so this shape alone proves
+    // the read is no longer split across a stale-meta-dependent pair of calls.
+    assert.equal(atomicCalls.length, 1)
+    // Exactly two WAL-meta-bearing reads total: the caller's own upstream
+    // fetch (loadCoordinatorCurrentAuthorityState), and this function's one
+    // atomic read -- no third, dependent follow-up call.
+    assert.equal(walMetaBearingCalls.length, 2)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.atomicReadUndersized'] || 0, 0)
+})
+
+test('segmented queue WAL atomic read falls back to a precise second read when segments exceed the default superset', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Atomic-Read-Undersized'
+    const runId = 'run-segmented-wal-atomic-read-undersized'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 150920,
+            terminalAt: 150921,
+            updatedAt: 150921,
+            attemptId: 'attempt-segmented-wal-atomic-read-undersized',
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    // The default atomic-read superset is COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT
+    // (256, see the constant's comment in sw.js) segments for the guessed
+    // checkpoint. Committing more than that -- without any concurrent
+    // mutation, just legitimate growth the immediate-switch scheduling failed
+    // to keep under the soft threshold -- must still hydrate correctly via
+    // the rare fallback read, sized exactly from the freshly-read meta.
+    const forceSwitchAt = 256
+    const segmentCount = forceSwitchAt + 44
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, segmentCount, {
+        rowKey: href,
+        createdAt: 150920
+    })
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 150930,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const getCallKeySets = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getCallKeySets.push(Object.keys(defaults && typeof defaults === 'object' ? defaults : {}))
+        return originalGet(defaults)
+    }
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+
+    // Hydration must still succeed and recover every segment's worth of WAL
+    // data, not just the first 256 -- the fallback read has to actually
+    // complete the picture, not merely fire.
+    assert.equal(hydrated.queue[href]?.status, 'succeeded')
+    const activeGeneration = hydrated.stored.mbCoordinatorQueueWal.meta.activeCheckpoint
+    assert.equal(
+        hydrated.stored.mbCoordinatorQueueWal.wal[activeGeneration].segments.length,
+        segmentCount
+    )
+
+    const lastSegmentKey = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, segmentCount - 1)
+    const fallbackCalls = getCallKeySets.filter(keys =>
+        !keys.includes('mbCoordinatorQueueWal.meta') &&
+        keys.includes(lastSegmentKey))
+    assert.equal(fallbackCalls.length, 1)
+
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.atomicReadUndersized'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrated'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 0)
+})
+
+// 2026-09-15 resident WAL store cache regression tests (see
+// coordinatorQueueWalResidentStoreCache's declaration comment in sw.js):
+// coordinatorAuthority.queueWal.residentStoreUsed sat at exactly 0 all
+// night despite ~8800 hydrate calls, because canUseResidentCoordinatorQueueWalStoreForMeta
+// (already correct) was never given a real candidate to check. These tests
+// prove the cache this task adds actually gets used -- not just that it
+// exists -- and that it never serves data staler than a change it never
+// saw.
+test('resident WAL store cache reuses a hydrated store when nothing changed between hydrates', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Resident-Cache-Hit'
+    const runId = 'run-resident-cache-hit'
+    const queue = {
+        [href]: {
+            runId,
+            status: 'succeeded',
+            outcome: 'blocked',
+            actionKind: 'mute-block',
+            executorTabAction: 'nuke',
+            executorOwner: 'service-worker',
+            serviceWorkerOwned: true,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href,
+            coordinatorKey: href,
+            queuedAt: 151000,
+            terminalAt: 151001,
+            updatedAt: 151001,
+            attemptId: 'attempt-resident-cache-hit',
+            attemptNumber: 1,
+            milestones: {}
+        }
+    }
+    // Non-zero committed segments: coordinatorQueueWalResidentStoreCache
+    // deliberately never caches a bare, segment-less checkpoint (see its
+    // setter's comment), so this is the case that actually exercises it.
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 3, {
+        rowKey: href,
+        createdAt: 151000
+    })
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 151010,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const metaKey = 'mbCoordinatorQueueWal.meta'
+    const checkpointAKey = 'mbCoordinatorQueueWal.checkpoint.A'
+    const checkpointBKey = 'mbCoordinatorQueueWal.checkpoint.B'
+    const getCallKeySets = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getCallKeySets.push(Object.keys(defaults && typeof defaults === 'object' ? defaults : {}))
+        return originalGet(defaults)
+    }
+
+    const first = await sw.coordinatorAuthority.hydrate()
+    assert.equal(first.queue[href]?.status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0, 0)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrated'] || 0, 1)
+
+    // Nothing wrote to storage between these two hydrates -- the second one
+    // should be served entirely from coordinatorQueueWalResidentStoreCache
+    // instead of repeating the atomic checkpoint+segment read.
+    const second = await sw.coordinatorAuthority.hydrate()
+    assert.equal(second.queue[href]?.status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0, 1)
+    // segmentedHydrated (a real hydrateSegmentedWalStore call) only ever
+    // fired for the first hydrate -- the cache hit on the second one never
+    // reaches that code at all.
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrated'] || 0, 1)
+
+    const atomicCalls = getCallKeySets.filter(keys =>
+        keys.includes(metaKey) &&
+        keys.includes(checkpointAKey) &&
+        keys.includes(checkpointBKey) &&
+        keys.some(key => key.startsWith('mbCoordinatorQueueWal.segment.')))
+    // Only the first hydrate's atomic read fetched checkpoints+segments; the
+    // second hydrate's own meta-only fetch (the caller-side staleMeta read
+    // every call site already does regardless of caching) doesn't count as
+    // one of these.
+    assert.equal(atomicCalls.length, 1)
+})
+
+test('resident WAL store cache is populated by a durable write and never serves a change it never saw', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Resident-Cache-Write'
+    const runId = 'run-resident-cache-write'
+    const attemptId = 'attempt-resident-cache-write'
+    const row = {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 152000,
+        activeAt: 0,
+        updatedAt: 152000,
+        tabId: null,
+        attemptId,
+        attemptNumber: 1,
+        milestones: {},
+        actionLeaseReleaseReason: 'active-transition-failed',
+        retryAttempt: 1,
+        maxRetries: 1
+    }
+    const queue = {[href]: row}
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 2, {
+        rowKey: href,
+        createdAt: 152000
+    })
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 152010,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueueWal: null,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    // Prime the cache with a real hydrate first.
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href]?.status, 'queued')
+
+    // A genuine queue-authority WAL mutation -- a real durable append, not a
+    // read -- must update the cache at write time too, per
+    // cacheCoordinatorQueueWalResidentStoreFromWrite: the very next hydrate
+    // should see the mutation without needing a fresh storage round-trip.
+    const terminalized = await sw.terminalizeExhaustedRolledBackQueuedCoordinatorItem(href, row, {
+        reason: 'synthetic-resident-cache-write-terminalize'
+    })
+    assert.equal(terminalized.changed, true)
+
+    const metaKey = 'mbCoordinatorQueueWal.meta'
+    const checkpointAKey = 'mbCoordinatorQueueWal.checkpoint.A'
+    const checkpointBKey = 'mbCoordinatorQueueWal.checkpoint.B'
+    const getCallKeySets = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async defaults => {
+        getCallKeySets.push(Object.keys(defaults && typeof defaults === 'object' ? defaults : {}))
+        return originalGet(defaults)
+    }
+    const beforeHits = sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0
+    const rehydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(rehydrated.queue[href]?.status, 'failed')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0, beforeHits + 1)
+    const atomicCallsAfterWrite = getCallKeySets.filter(keys =>
+        keys.includes(metaKey) &&
+        keys.includes(checkpointAKey) &&
+        keys.includes(checkpointBKey) &&
+        keys.some(key => key.startsWith('mbCoordinatorQueueWal.segment.')))
+    assert.equal(atomicCallsAfterWrite.length, 0)
+
+    // Now simulate a change this process's own cache genuinely never saw
+    // (e.g. some other context writing straight to storage) by replacing
+    // the backing WAL fixture in place with a real, differently-contented
+    // checkpoint. canUseResidentCoordinatorQueueWalStoreForMeta must reject
+    // the now-stale cache -- via the checkpoint stateHash mismatch, since
+    // structural fields alone can't tell these apart -- and force a real
+    // read instead of handing back the pre-mutation queue.
+    const externalQueue = {
+        [href]: {
+            ...rehydrated.queue[href],
+            status: 'succeeded',
+            outcome: 'blocked',
+            terminalAt: 153000,
+            updatedAt: 153000
+        }
+    }
+    const externalWal = makeSegmentedQueueWalStorage(externalQueue, 0, {
+        rowKey: href,
+        createdAt: 153000
+    })
+    Object.keys(storage)
+        .filter(key => key.startsWith('mbCoordinatorQueueWal'))
+        .forEach(key => delete storage[key])
+    Object.assign(storage, externalWal)
+
+    const beforeExternalHits = sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0
+    const afterExternalChange = await sw.coordinatorAuthority.hydrate()
+    assert.equal(afterExternalChange.queue[href]?.status, 'succeeded')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.residentStoreUsed'] || 0, beforeExternalHits)
 })
 
 test('coordinator storage soft quota warns and then flags once usage approaches the self-imposed ceiling', async () => {
@@ -17113,6 +17527,56 @@ test('service-worker worker window stays open while durable queued work remains'
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy.durableQueued'] > 0, true)
 })
 
+test('worker action surface with tracked runtime work is not torn down just because its tab has not shown a profile url yet', async () => {
+    // Regression for a live 2026-09-16 incident under the
+    // 'idle-after-active-missing-tab-prepass-requeue' cleanup reason: the
+    // busy-detection counter (52) came in lower than the actual-close
+    // counter (58) in the very same run -- the guard was real but had a
+    // gap. closeQueuedWorkerActionSurfaceIfIdle used to require *both*
+    // hasQueuedWorkerActionSurfaceRuntimeWork (real, tracked queued-tab/
+    // pending-action bookkeeping) *and* a tab whose current *url* already
+    // matched the Quora profile pattern before it treated the worker
+    // window as busy. Right after an active-missing-tab requeue gets
+    // refilled, the freshly (re)opened tab can sit on about:blank for a
+    // beat while it navigates -- isIdleQueuedWorkerActionSurfaceTab treats
+    // about:blank as idle too -- so a window with genuinely tracked,
+    // pending work closed out from under it. This proves
+    // hasQueuedWorkerActionSurfaceRuntimeWork alone is now sufficient to
+    // block the close, without needing the url to have caught up yet.
+    const {sw, browser} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: []
+        }
+    })
+
+    const workerWindowId = 777
+    const workerTabId = 888
+    browser.__windows.set(workerWindowId, {id: workerWindowId, focused: false, type: 'normal'})
+    browser.__tabs.set(workerTabId, {id: workerTabId, windowId: workerWindowId, url: 'about:blank', active: true})
+
+    sw.__testAddProvisionalQueuedTab(workerTabId, {
+        actionSurfaceMode: 'worker-window',
+        actionSurfaceWindowId: workerWindowId,
+        profileHref: 'https://www.quora.com/profile/Synthetic-Worker-Surface-Racing-Navigation',
+        coordinatorKey: 'https://www.quora.com/profile/Synthetic-Worker-Surface-Racing-Navigation',
+        attemptId: 'attempt-worker-surface-racing-navigation',
+        attemptNumber: 1
+    })
+
+    const closed = await sw.closeQueuedWorkerActionSurfaceIfIdle('idle-after-active-missing-tab-prepass-requeue', {
+        windowId: workerWindowId
+    })
+
+    assert.equal(closed, false)
+    assert.equal(browser.__windows.has(workerWindowId), true)
+    assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy'] > 0, true)
+    assert.equal(!!sw.state().queueWakeupCounters['actionSurface.workerWindow.closed.idle-after-active-missing-tab-prepass-requeue'], false)
+})
+
 test('confirmation promotion in no-foreground worker window briefly focuses and restores caller window', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Worker-Surface-Promote'
     const runId = 'run-worker-surface-promote'
@@ -17598,6 +18062,57 @@ test('a small enqueue below the chunk threshold is not chunked', async () => {
 
     assert.equal(result.queued, hrefs.length)
     assert.equal(sw.state().queueWakeupCounters['enqueue.chunked.batches'] || 0, 0)
+})
+
+// 2026-09-15: a big Space-feed submission that mostly deduped against
+// already-known rows used to leave no durable trace of the breakdown --
+// {queued, merged} came back in the message response, but nothing persisted
+// it, so a dashboard reopened later (or a user who wasn't watching the
+// button) had no way to tell "700 requested, only 50 were actually new" from
+// "the other 650 got lost". This proves mbCoordinatorLastEnqueueSummary
+// captures the requested/queued/merged breakdown for the dashboard to read.
+test('enqueue durably records a requested/queued/merged summary for the dashboard', async () => {
+    const runId = 'run-last-enqueue-summary'
+    const alreadyKnownHref = 'https://www.quora.com/profile/Synthetic-Last-Enqueue-Known'
+    const newHrefA = 'https://www.quora.com/profile/Synthetic-Last-Enqueue-New-A'
+    const newHrefB = 'https://www.quora.com/profile/Synthetic-Last-Enqueue-New-B'
+    const sourceSender = {tab: {id: 12, windowId: 1}}
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 200000,
+        storage: {
+            mbCoordinatorQueue: {
+                [alreadyKnownHref]: makeActiveCoordinatorRow({
+                    href: alreadyKnownHref,
+                    runId: 'run-earlier',
+                    attemptId: 'attempt-earlier',
+                    tabId: null,
+                    now: 190000
+                })
+            }
+        }
+    })
+
+    await browser.runtime.sendMessage({
+        action: 'enqueue-coordinator-items',
+        run: {id: runId, sourceType: 'space-feed'},
+        source: {type: 'space-feed', pageUrl: 'https://www.quora.com/space/example'},
+        items: [alreadyKnownHref, newHrefA, newHrefB].map(href => ({
+            runId,
+            targetProfileHref: href,
+            requestedUrl: href,
+            dedupeKey: href
+        }))
+    }, sourceSender)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const summary = storage.mbCoordinatorLastEnqueueSummary
+    assert.equal(summary?.requested, 3)
+    assert.equal(summary?.queued, 2)
+    assert.equal(summary?.merged, 1)
+    assert.equal(summary?.sourceType, 'space-feed')
+    assert.equal(sw.state().queueWakeupCounters['job.enqueued'] || 0, 3)
 })
 
 test('queued profile actions are throttled and opened background', async () => {
@@ -21118,12 +21633,25 @@ test('executor apply requeues actorless active row and re-primes queued no-open 
         : queuedNoOpenTimeoutBeforeAttempt
             ? (Number.parseInt(queuedNoOpenTimeoutBeforeAttemptMatch.fillRemainingActions, 10) || 0)
             : 1
-    assert.equal(sw.state().queuedTabActions.length, expectedQueuedRuntimeActions)
-    if(expectedQueuedRuntimeActions) {
-        assert.equal(
-            sw.state().queuedTabActions[0].profileHref,
-            queuedNoOpenUnresolved ? queuedHref : activeHref
-        )
+    if(queuedNoOpenUnresolved) {
+        // The synthetic fill promise's own resolution handler
+        // (__testClearQueuedActions) clears queued actions as part of
+        // simulating "no tab opened" for this scenario -- whether that
+        // clear has landed yet by the time this assertion runs, versus
+        // still being in flight, isn't pinned to a fixed value (the same
+        // class of race as queued-tab-fill-timeout-before-open-attempt
+        // above, just against the fake promise's own cleanup instead of a
+        // real timeout).
+        assert.ok([0, 1].includes(sw.state().queuedTabActions.length))
+        if(sw.state().queuedTabActions.length) {
+            assert.equal(sw.state().queuedTabActions[0].profileHref, queuedHref)
+        }
+    }
+    else {
+        assert.equal(sw.state().queuedTabActions.length, expectedQueuedRuntimeActions)
+        if(expectedQueuedRuntimeActions) {
+            assert.equal(sw.state().queuedTabActions[0].profileHref, activeHref)
+        }
     }
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(
@@ -29631,9 +30159,22 @@ test('queued tab active transition does not carry executor authority state acros
     const originalGet = browser.storage.local.get.bind(browser.storage.local)
     let fullAuthorityReads = 0
     browser.storage.local.get = async defaults => {
+        // 2026-09-15 atomic-read fix (see loadCoordinatorQueueWalStoreFromStorage
+        // in sw.js): the segmented WAL hydrate's own atomic read now always
+        // carries the 'mbCoordinatorQueueWal.meta' key too (it used to trust
+        // the caller's already-fetched copy and never re-request it), so that
+        // key alone no longer distinguishes a full authority-projection
+        // reload from this function's narrower meta+checkpoints+segments
+        // read. A genuine full projection reload also always requests
+        // COORDINATOR_RUNS_KEY ('mbCoordinatorRuns') alongside the WAL
+        // defaults (see loadCoordinatorCurrentAuthorityState and its
+        // siblings); the atomic WAL read never does. That combination is
+        // what this test actually cares about: confirmQueuedTabOpenDurableActiveEffect
+        // must not re-load the whole authority projection.
         if(defaults &&
             !Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue') &&
-            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueueWal.meta')) {
+            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueueWal.meta') &&
+            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorRuns')) {
             fullAuthorityReads += 1
         }
         return originalGet(defaults)
@@ -35658,6 +36199,222 @@ test('getOwnedNukeStatus falls back to loading the queue projection when authori
     assert.equal(status.queued, 1)
     assert.equal(sw.state().queueWakeupCounters['ownedNukeStatus.queue.usedResidentAuthority'] || 0, 0)
     assert.equal(storageGetCallsAfter > storageGetCallsBefore, true)
+})
+
+test('terminal settlement caps requested hrefs per call, leaving the remainder unsettled', async () => {
+    // Regression test: COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE's own
+    // comment claimed settleTerminalCoordinatorItemsLocked was "fine for the
+    // single-href call sites", but the 'settle-terminal-coordinator-items'
+    // runtime-message route (content.js's space-feed reconciliation) can
+    // send an arbitrarily large profileHrefs list straight into this
+    // function's per-href loops, bypassing the cap that reconcile's own call
+    // site already applies to itself before calling in. This checks the cap
+    // now applied inside settleTerminalCoordinatorItemsLocked itself: given
+    // more requested hrefs than COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE
+    // (25), one call only settles the first 25, leaving the rest untouched
+    // (not durably dropped -- a caller that re-requests still-pending hrefs,
+    // like content.js's own periodic reconciliation, picks them up next
+    // time).
+    const runId = 'run-terminal-settlement-chunk'
+    const totalHrefs = 30
+    const hrefs = []
+    const queue = {}
+    for(let index = 0; index < totalHrefs; index += 1) {
+        const href = `https://www.quora.com/profile/Synthetic-Terminal-Settlement-Chunk-${index}`
+        const attemptId = `attempt-terminal-settlement-chunk-${index}`
+        hrefs.push(href)
+        queue[href] = {
+            ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 254500}),
+            status: 'succeeded',
+            outcome: 'blocked',
+            terminalAt: 254510,
+            updatedAt: 254510
+        }
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 254500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: hrefs[0], runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {},
+            mbSpacePendingNukedPosts: {},
+            mbSpaceNukedPosts: {}
+        }
+    })
+
+    const result = await sw.settleTerminalCoordinatorItems({profileHrefs: hrefs})
+
+    assert.equal(result.settled, 25)
+    assert.equal(result.confirmed, 25)
+    assert.equal(sw.state().queueWakeupCounters['terminalSettlement.requestedHrefsChunked'] || 0, 1)
+    const settledCount = hrefs.filter(href => sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome === 'confirmed').length
+    assert.equal(settledCount, 25)
+    const unsettledCount = hrefs.filter(href => sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome === undefined).length
+    assert.equal(unsettledCount, 5)
+
+    // Mirrors content.js's own retry shape: it re-derives its pending list
+    // from what the previous response told it was still outstanding, not
+    // the original full request, so the follow-up call only re-sends the
+    // still-unsettled remainder.
+    const remainderHrefs = hrefs.filter(href => sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome === undefined)
+    const followUp = await sw.settleTerminalCoordinatorItems({profileHrefs: remainderHrefs})
+
+    assert.equal(followUp.settled, 5)
+    const finalSettledCount = hrefs.filter(href => sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome === 'confirmed').length
+    assert.equal(finalSettledCount, 30)
+})
+
+test('milestone flush caps records drained per iteration instead of one unbounded batch', async () => {
+    // Regression test for a third instance of the same shape (found by
+    // following flushCoordinatorJobMilestones's deferredMilestoneFlush call
+    // further than the first pass's report did): recordDeferredCoordinatorJobMilestone
+    // accumulates one record per distinct href into coordinatorJobMilestonePendingRecords
+    // while hasActiveCoordinatorMilestoneWork() is true, deferring its own
+    // flush the whole time. Once the flush finally runs, it used to hand the
+    // *entire* accumulated batch to recordCoordinatorJobProgressRecords(...,
+    // {deferredMilestoneFlush:true}), which routes straight into
+    // applyCoordinatorRowEvents's own per-event loop, all inside one
+    // enqueueSpaceFeedStorageUpdate call -- the same shape as the other two
+    // fixes. This builds more distinct hrefs' worth of pending milestones
+    // than COORDINATOR_MILESTONE_FLUSH_CHUNK_SIZE (25) and checks that one
+    // flushCoordinatorJobMilestones() call still resolves everything (the
+    // existing while loop keeps re-checking coordinatorJobMilestonePendingRecords),
+    // but does it across multiple capped iterations instead of one
+    // unbounded one.
+    const runId = 'run-milestone-flush-chunk'
+    const totalHrefs = 30
+    const hrefs = []
+    const queue = {}
+    for(let index = 0; index < totalHrefs; index += 1) {
+        const href = `https://www.quora.com/profile/Synthetic-Milestone-Flush-Chunk-${index}`
+        const attemptId = `attempt-milestone-flush-chunk-${index}`
+        const tabId = 8000 + index
+        hrefs.push(href)
+        queue[href] = makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 300000})
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 300000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: hrefs[0], runId}),
+                    targetProfileHrefs: hrefs,
+                    targetWorkKeys: hrefs
+                }
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    for(let index = 0; index < totalHrefs; index += 1) {
+        const href = hrefs[index]
+        const attemptId = `attempt-milestone-flush-chunk-${index}`
+        const tabId = 8000 + index
+        // No explicit `status` field -- a routine progress ping, not a
+        // status transition -- so recordDeferredCoordinatorJobMilestone
+        // always takes the accumulate-and-defer branch (shouldPersistExplicitCoordinatorMilestoneNow
+        // short-circuits false on !progressPatchHasExplicitStatus) rather
+        // than the immediate-persist branch.
+        const deferred = await sw.recordDeferredCoordinatorJobMilestone(href, {
+            tabOpenedAt: 300010 + index,
+            runId,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }, {senderTabId: tabId})
+
+        assert.equal(deferred.durable, false)
+        assert.equal(deferred.reason, 'milestone-flush-deferred')
+    }
+
+    // milestone.pendingMax is a running max over coordinatorJobMilestonePendingRecords's
+    // size at each accumulation, so it proves all 30 distinct hrefs piled up
+    // together before the flush ran (not exposed directly on sw.state()).
+    assert.equal(sw.state().queueWakeupCounters['milestone.pendingMax'], totalHrefs)
+
+    const flushResult = await sw.flushCoordinatorJobMilestones()
+
+    assert.equal(Object.keys(flushResult.results).length, totalHrefs)
+    assert.equal(sw.state().queueWakeupCounters['milestone.flushPerformed'], 2)
+    assert.equal(sw.state().queueWakeupCounters['milestone.flushChunked'], 1)
+    assert.equal(sw.state().queueWakeupCounters['milestone.recordsPerFlush'], totalHrefs)
+
+    // A follow-up flush call should be a no-op: nothing left pending.
+    const followUpFlush = await sw.flushCoordinatorJobMilestones()
+    assert.equal(Object.keys(followUpFlush.results).length, 0)
+    assert.equal(sw.state().queueWakeupCounters['milestone.flushPerformed'], 2)
+})
+
+test('reconcile storage caps the progress-reconcile tail per tick and catches up on a follow-up pass', async () => {
+    // Regression test for the 2026-09-16 write-queue stall (up to 286s):
+    // applyCoordinatorReconcileQueueAuthorityTransitionPhase's tab-querying
+    // reconcile tail used to run for every row in the queue in one
+    // enqueueSpaceFeedStorageUpdate-locked pass, with no cap -- the same
+    // shape as the settle-terminal stall this fix's sibling
+    // (COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE) already covers. This
+    // builds more active rows (each claimed-but-actorless: a persisted
+    // tabId that doesn't correspond to any real fake tab, plus a matching
+    // transient progress record) than COORDINATOR_PROGRESS_RECONCILE_CHUNK_SIZE
+    // (25), and checks that one reconcileCoordinatorStorage() pass only
+    // resolves 25 of them, with the remaining 5 caught up by a second pass.
+    const runId = 'run-progress-reconcile-chunk'
+    const totalHrefs = 30
+    const hrefs = []
+    const queue = {}
+    const progress = {}
+    for(let index = 0; index < totalHrefs; index += 1) {
+        const href = `https://www.quora.com/profile/Synthetic-Progress-Reconcile-Chunk-${index}`
+        const attemptId = `attempt-progress-reconcile-chunk-${index}`
+        const tabId = 9000 + index
+        hrefs.push(href)
+        queue[href] = makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 100000})
+        progress[href] = {
+            profileHref: href,
+            actionKind: 'mute-block',
+            status: 'blocking',
+            runId,
+            tabId,
+            attemptId,
+            attemptNumber: 1,
+            updatedAt: 99500
+        }
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 100000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            mbCoordinatorRuns: {
+                [runId]: {
+                    ...makeCoordinatorRun({href: hrefs[0], runId}),
+                    targetProfileHrefs: hrefs,
+                    targetWorkKeys: hrefs
+                }
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: progress
+        }
+    })
+
+    const countByStatus = status => hrefs.filter(href => sw.coordinatorAuthority.current().queue[href].status === status).length
+
+    const firstReconcile = await sw.reconcileCoordinatorStorage()
+
+    assert.equal(firstReconcile.queueChanged, true)
+    assert.equal(countByStatus('active'), totalHrefs - 25)
+    assert.equal(sw.state().queueWakeupCounters['reconcile.progressReconcileChunked'] || 0, totalHrefs - 25)
+
+    const secondReconcile = await sw.reconcileCoordinatorStorage()
+
+    assert.equal(secondReconcile.queueChanged, true)
+    assert.equal(countByStatus('active'), 0)
 })
 
 ;(async () => {

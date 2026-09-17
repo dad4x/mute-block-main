@@ -9242,10 +9242,28 @@ async function nukeSpaceFeedEntries(button, entries) {
         setNukeButtonWorking(button, formatSpaceFeedNukingLabel(unfinishedEntries))
 
         const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations)
+        const enqueueQueuedCount = Number.parseInt(result?.queued, 10) || 0
+        const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
 
-        if((result?.executionQueued || result?.queued || result?.merged || 0) > 0) {
+        if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
-            setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())))
+            const workingLabel = formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries()))
+            // Merged rows (already-known key: currently queued, or a past
+            // terminal outcome) are silently absorbed into the existing row
+            // rather than added as new work -- surface that breakdown for a
+            // beat instead of jumping straight to the generic working label,
+            // so a big submission that mostly deduped doesn't look like most
+            // of it silently vanished.
+            if(enqueueMergedCount > 0) {
+                setNukeButtonNotice(
+                    button,
+                    `Queued ${enqueueQueuedCount} new (${enqueueMergedCount} already known)`,
+                    workingLabel
+                )
+            }
+            else {
+                setNukeButtonWorking(button, workingLabel)
+            }
             return true
         }
 

@@ -43,6 +43,7 @@
                             </div>
                         </div>
                         <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
+                        <div class="panel-action-state" id="lastEnqueueSummary" hidden></div>
                     </div>
                 </div>
                 <div class="list" id="queueList"></div>
@@ -50,28 +51,30 @@
 
             <section class="summary-grid" aria-label="Dashboard summary">
                 <div class="summary-tile">
-                    <div class="summary-label" title="Current Work jobs ready for a worker slot.">Queued</div>
+                    <div class="summary-label" title="Current Work jobs ready for a worker slot. Concerning if this climbs steadily while Active stays flat or zero -- that means work is arriving faster than it's being drained (check Queue throttle and Write queue backlog in Metrics below for why).">Queued</div>
                     <div class="summary-value" id="queuedCount">0</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Jobs currently opening, active, acting, or settling.">Active</div>
+                    <div class="summary-label" title="Jobs currently opening, active, acting, or settling. Concerning if this sits above your configured concurrency for more than a minute or two with Queued > 0 -- rows may be stuck rather than actually progressing; check the Outliers panel.">Active</div>
                     <div class="summary-value" id="activeCount">0</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Average active seconds per successful block completed in the current metrics epoch. Already-blocked rows are excluded.">secs / block</div>
+                    <div class="summary-label" title="Average active seconds per successful block completed in the current metrics epoch. Already-blocked rows are excluded. Concerning if this creeps well past your normal per-profile time (most runs land in the single digits to ~10-12s) -- single implausible samples above COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS (30 minutes, e.g. from an outage) are excluded automatically, so a rising average here reflects a real, sustained slowdown.">secs / block</div>
                     <div class="summary-value" id="secondsPerBlock">--</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Average seconds from one terminal Current Work row to the next row activation in the current metrics epoch.">handoff sec</div>
+                    <div class="summary-label" title="Average seconds from one terminal Current Work row to the next row activation in the current metrics epoch. Concerning if this is large relative to secs/block -- it means worker slots are sitting idle between jobs instead of picking up queued work immediately (check for queue throttling or a backed-up write queue).">handoff sec</div>
                     <div class="summary-value" id="activationHandoffSeconds">--</div>
                 </div>
                 <div class="summary-tile">
                     <div class="summary-label" title="Mute-block jobs that performed a genuine new block action this metrics epoch, with their share of all block outcomes.">Really blocked</div>
                     <div class="summary-value" id="reallyBlockedCount">0</div>
+                    <div class="summary-detail" id="reallyBlockedDuration">no completions yet this epoch</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Mute-block jobs that found the profile already blocked this metrics epoch, with their share of all block outcomes.">Already blocked</div>
+                    <div class="summary-label" title="Mute-block jobs that found the profile already blocked this metrics epoch, with their share of all block outcomes. This is always confirmed by actually loading the profile page (or messaging a live tab for a fresh DOM check) and observing the blocked state -- this codebase has no shortcut that marks a row already-blocked from cached/prior knowledge without a fresh page read.">Already blocked</div>
                     <div class="summary-value" id="alreadyBlockedCount">0</div>
+                    <div class="summary-detail" id="alreadyBlockedDuration">no completions yet this epoch</div>
                 </div>
                 <div class="summary-tile">
                     <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>

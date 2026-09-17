@@ -263,6 +263,14 @@ function createCoordinatorQueueView(deps = {}) {
             terminalAt: Number.parseInt(source.terminalAt, 10) || 0,
             updatedAt: Number.parseInt(source.updatedAt || source.createdAt || source.queuedAt, 10) || 0,
             retryCount: Number.parseInt(source.retryCount, 10) || 0,
+            // Needed by the dashboard's own client-side re-sort
+            // (compareCurrentWorkItems in coordinator.js), which runs after
+            // this summarized view is already in hand and has no other way
+            // to recover the real FIFO dispatch order for 'queued' rows --
+            // see the 2026-09-16 sort-order fix in this file's own
+            // buildCoordinatorQueueView for why time-descending is wrong
+            // for that rank.
+            queueSequence: Number.parseInt(source.queueSequence, 10) || 0,
             provenance: normalizeCoordinatorItemProvenance(source.provenance) || null,
             source: {
                 type: source.source?.type || source.sourceType || '',
@@ -333,8 +341,31 @@ function createCoordinatorQueueView(deps = {}) {
             .sort((left, right) => {
                 const leftItem = left[1] || {}
                 const rightItem = right[1] || {}
-                return getCoordinatorQueueViewSortRank(leftItem) - getCoordinatorQueueViewSortRank(rightItem) ||
-                    getCoordinatorQueueViewTime(rightItem) - getCoordinatorQueueViewTime(leftItem) ||
+                const rankDiff = getCoordinatorQueueViewSortRank(leftItem) - getCoordinatorQueueViewSortRank(rightItem)
+                if(rankDiff) return rankDiff
+
+                // 2026-09-16: within the 'queued' rank, this used to break
+                // ties by time descending (most-recently-queued first) --
+                // the right ordering for the *active* rank, where "most
+                // recent activity" is the interesting thing to surface, but
+                // backwards for 'queued': it put the newest arrival at the
+                // top and the row that's actually about to be picked up
+                // next (the front of the FIFO line) at the bottom, which is
+                // exactly the opposite of what "what's about to become
+                // active" means. queueRuntime.rebuildQueueOrder (the real
+                // executor's base traversal order, before its own
+                // backoff/fairness/concurrency filtering) walks queued rows
+                // by queueSequence ascending -- so queued rows here sort the
+                // same way, ascending, putting the row nearest the front of
+                // the real dispatch order at the top.
+                if(getCoordinatorQueueViewSortRank(leftItem) === 1) {
+                    return (Number.parseInt(leftItem?.queueSequence, 10) || 0) -
+                            (Number.parseInt(rightItem?.queueSequence, 10) || 0) ||
+                        getCoordinatorQueueViewTime(leftItem) - getCoordinatorQueueViewTime(rightItem) ||
+                        `${left[0]}`.localeCompare(`${right[0]}`)
+                }
+
+                return getCoordinatorQueueViewTime(rightItem) - getCoordinatorQueueViewTime(leftItem) ||
                     // 2026-09-14: bulk enqueues stamp every row with the same
                     // createdAt/queuedAt millisecond, so the time comparison
                     // above is a wash for an entire batch and this used to
