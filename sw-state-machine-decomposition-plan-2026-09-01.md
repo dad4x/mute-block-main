@@ -3429,16 +3429,67 @@ this slice -- wiring the actual call sites onto this event shape is P3-6.
 Depends on: nothing. Blocks: P3-6.
 
 **P3-6 -- converge `shouldRecoverExhaustedRolledBackQueuedTabRetry` onto
-the reducer.**
-Replace the three independent approval branches with one call into
-`reduceJobEvent`/the dispatcher using the event shape P3-5 defined,
-keeping `buildForcedRolledBackQueuedTabRetryItem`'s
-`exhaustedRolledBackRecoveryCount` bookkeeping intact (move it into the
-reducer path if that's where the count check now lives). The existing
-"exhausted rolled-back queued row stops being recovered after repeated
-rescues and terminalizes" test in `swSynthetic.test.js` must keep passing
-unchanged -- it's the regression guard for the bug this whole branch
-structure was patched to fix.
+the reducer.** PARTIALLY DONE (2026-09-17).
+`shouldRecoverExhaustedRolledBackQueuedTabRetry` in
+`swRolledBackQueuedTabRetryClassification.js` now replaces its three
+independent approval branches (queueOnlyAuthority shortcut,
+recoverActiveTransitionFailures reason-match, queue-pressure nested
+inside it) plus the standalone recovery-count-cap gate with one call into
+`reduceJobEvent` using the exact event shape P3-5 defined, reading
+`accepted` back from the result. It still computes the individual boolean
+facts itself (reason-pattern matches, queue-authority/ownership, live
+queue-throttle telemetry) since the reducer has no access to those deps
+or to live throttle state -- it only hands the reducer the fact bundle.
+This half is a pure dry run: the item `reduceJobEvent` would build is
+discarded, only `accepted` is read.
+
+**Not done, left as a blocker for a human decision:**
+`buildForcedRolledBackQueuedTabRetryItem`'s own (pre-existing)
+`reduceJobEvent` call was deliberately NOT given the same
+`event.exhaustedRolledBackRecovery` fact bundle, so it still bumps
+`exhaustedRolledBackRecoveryCount` by hand instead of letting the reducer
+own the increment. Two concrete obstacles found while auditing this
+half of the convergence:
+
+1. **Call-site fan-out.** `buildForcedRolledBackQueuedTabRetryItem(item,
+   now, reason)` has no `options` parameter, and none of its five call
+   sites (`mutateCoordinatorStaleRetryQueuedTabAdvance`,
+   `recoverExhaustedRolledBackQueuedCoordinatorItem`[s],
+   `recoverQueuedStaleRuntimeMissingQueuedAction`, and two inline
+   ACTIVE_MISSING_TAB requeue-then-recover call sites in `sw.js`) thread
+   the `queueOnlyAuthority`/`recoverActiveTransitionFailures`/
+   `serviceWorkerOwned`/`recoverQueueLoadPressure`/`recoverTransientOpenRetry`
+   flags the earlier `shouldRecoverExhaustedRolledBackQueuedTabRetry`
+   decision used past `applyCoordinatorQueueMachineEvent`'s `options:
+   {currentAuthorityState, reason}` envelope. Wiring them through means
+   widening that function's signature, all five call sites, and the
+   `EXHAUSTED_ROLLBACK_RECOVER` handler in `swQueueMachineHandlers.js`.
+2. **A new TOCTOU risk, not just extra plumbing.**
+   `shouldRecoverExhaustedOpenRetryUnderQueuePressure` reads live, mutable
+   queue-throttle state (`getQueueLoadThrottle()`, `getNow()`).
+   `buildForcedRolledBackQueuedTabRetryItem` runs inside
+   `coordinatorAuthority.applyWithinStorageUpdate`'s asynchronous
+   lock/storage-update queue (`enqueueApplyLocked`, genuinely awaited, not
+   synchronous) -- re-evaluating that helper a second time there could see
+   a different throttle snapshot than the one the original decision saw
+   moments earlier, and reject a recovery the caller already committed to.
+   The fallback is `scheduleCoordinatorQueueResume` (a delayed retry, not
+   a hang), but it's still new nondeterminism in the exact file this
+   branch structure exists to make more predictable, not less.
+
+Given this is a production-incident fix (live write-queue-backlog stall),
+the fan-out plus the TOCTOU risk were judged not worth forcing through in
+this slice. Full detail is in `buildForcedRolledBackQueuedTabRetryItem`'s
+header comment in `swRolledBackQueuedTabRetryClassification.js`. A human
+should decide whether to (a) do the full option-threading anyway, (b)
+accept a documented, intentional "trust the caller, only re-check the
+cap" shortcut in the build-time call instead of exact fact parity, or (c)
+leave the manual bump in place indefinitely as an accepted, deliberately
+duplicated bit of bookkeeping.
+
+The existing "exhausted rolled-back queued row stops being recovered
+after repeated rescues and terminalizes" test in `swSynthetic.test.js`
+was left unchanged and still passes -- `npm run test:parallel` is green.
 Depends on: P3-5.
 
 **Not yet dispatchable: storage-layer triplication (architecture.md item
