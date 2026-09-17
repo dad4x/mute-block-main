@@ -1609,6 +1609,28 @@ function renderWakeupMetrics(queueItems = []) {
     const walCheckpointed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointed')
     const walCheckpointedRecords = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointedRecords')
     const walCheckpointFailed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointFailed')
+    // Physical WAL segment writes and checkpoint-switch writes are tracked
+    // separately from the logical appended/checkpointed counters above --
+    // these are actual chrome.storage.local.set byte sizes for the WAL's
+    // on-disk representation, recorded by
+    // recordCoordinatorQueueWalPhysicalPayloadMetrics but never surfaced
+    // on the dashboard before now.
+    const walSegmentWrites = getMetricCounter(counters, 'coordinatorAuthority.queueWal.physicalSegmentWrites')
+    const walSegmentBytes = getMetricCounter(counters, 'coordinatorAuthority.queueWal.physicalSegmentBytes')
+    const walSegmentMaxBytes = getMetricCounter(counters, 'coordinatorAuthority.queueWal.maxPhysicalSegmentBytes')
+    const walCheckpointWrites = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointWrites')
+    const walCheckpointBytes = getMetricCounter(counters, 'coordinatorAuthority.queueWal.checkpointBytes')
+    const walCheckpointMaxBytes = getMetricCounter(counters, 'coordinatorAuthority.queueWal.maxCheckpointBytes')
+    // The durable queue-view snapshot (mbCoordinatorQueueView -- what the
+    // dashboard/popup/CDP tools actually read) is written by a SEPARATE,
+    // non-atomic storage.set from the WAL append it is supposed to mirror.
+    // It can fail independently under load with no guaranteed catch-up
+    // deadline (see queue-wal-segmented-record-followup-2026-05-27.md's
+    // 2026-09-17 entry) -- projectionSaved/projectionFailed are the only
+    // signal that divergence is happening, so surface them directly rather
+    // than leaving them buried in raw counters.
+    const viewProjectionSaved = getMetricCounter(counters, 'coordinatorAuthority.queueWal.projectionSaved')
+    const viewProjectionFailed = getMetricCounter(counters, 'coordinatorAuthority.queueWal.projectionFailed')
     const stalledQueued = queueItems.filter(item => `${item?.status || ''}` === 'queued').length
 
     const epochReason = metrics.resetReason ? `, ${metrics.resetReason}` : ''
@@ -1702,6 +1724,19 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('WAL writes', `${walAppended}`,
                 `${formatBytes(walAppendBytes)} appended; ${walCheckpointed} checkpoint switch${walCheckpointed === 1 ? '' : 'es'} folding in ${walCheckpointedRecords} record${walCheckpointedRecords === 1 ? '' : 's'}${walCheckpointFailed ? `; ${walCheckpointFailed} checkpoint failure${walCheckpointFailed === 1 ? '' : 's'}` : ''}`, {
                 title: 'How often the coordinator queue\'s write-ahead log is appended to, and how often it checkpoint-switches (folds accumulated segments back into one snapshot). A checkpoint switch is expected roughly every COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT (128) committed segments; concerning if switches are far less frequent than that under heavy write volume (segments piling up toward the COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT of 1024, which blocks further appends) or if any checkpoint failures show up at all.'
+            }),
+            buildMetricCard('WAL segment writes', `${walSegmentWrites}`,
+                `${formatBytes(walSegmentBytes)} written; max ${formatBytes(walSegmentMaxBytes)}`, {
+                title: 'Physical chrome.storage.local writes to WAL segment keys (mbCoordinatorQueueWal.segment.*) -- the incremental append-side storage cost, separate from the logical "WAL writes" append count above. Concerning if the per-write size trends upward over a session; segments should stay small individually until a checkpoint switch folds them back down.'
+            }),
+            buildMetricCard('Checkpoint writes', `${walCheckpointWrites}`,
+                `${formatBytes(walCheckpointBytes)} written; max ${formatBytes(walCheckpointMaxBytes)}`, {
+                title: 'Physical chrome.storage.local writes for a checkpoint switch (folding accumulated segments back into one snapshot) -- the actual byte cost of that fold, separate from the "WAL writes" card\'s checkpoint switch count. Concerning if this grows large enough to make Storage set latency spike during a switch, since a checkpoint write blocks the same serialized write queue as everything else.'
+            }),
+            buildMetricCard('Queue view writes', `${viewProjectionSaved}`,
+                `${viewProjectionFailed} failure${viewProjectionFailed === 1 ? '' : 's'} this epoch`, {
+                alert: viewProjectionFailed > 0,
+                title: 'The durable mbCoordinatorQueueView snapshot -- what the dashboard, popup, and CDP tools actually read -- is written by a separate storage.set from the WAL append it is supposed to mirror, and can fail independently under load. Any failure here means the view can show stale status (e.g. "queued") for a row the WAL already has as terminal, with only a best-effort reconcile as catch-up and no guaranteed deadline. Concerning if this is ever nonzero.'
             }),
             buildMetricCard('Read payload avg', readCalls ? formatBytes(readBytes / readCalls) : '--', `${formatBytes(readBytes)} total; max ${formatBytes(readMaxBytes)}`, {
                 title: 'Average and largest single-read payload size across all storage reads this epoch. Concerning if this grows steadily over a long-running session -- it usually tracks queue/progress size, and a large max next to a much smaller average flags one unusually expensive read worth finding via Read hot path.'
