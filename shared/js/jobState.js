@@ -426,6 +426,40 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
     return buildJobReducerResult(item, nextItem)
 }
 
+// isExhaustedRollbackRecoveryApproved centralizes the
+// shouldRecoverExhaustedRolledBackQueuedTabRetry policy (three approval
+// paths -- queueOnlyAuthority shortcut, recoverActiveTransitionFailures
+// reason-match, queue-pressure recovery nested inside the reason-match
+// branch -- plus the exhaustedRolledBackRecoveryCount cap that closed the
+// infinite-recovery-loop bug) as one reducer-decided question instead of
+// three independently-branching call sites. The caller still owns
+// classifying the item (reason-pattern matches, queue-load-pressure
+// telemetry, queue authority/ownership checks) since those depend on
+// deps-injected config and live throttle state the reducer has no access
+// to -- it hands the reducer only the resulting facts via
+// event.exhaustedRolledBackRecovery, and the reducer applies the same
+// precedence the original function used. See
+// swRolledBackQueuedTabRetryClassification.js's
+// shouldRecoverExhaustedRolledBackQueuedTabRetry for the source of truth
+// this mirrors (P3-5/P3-6, sw-state-machine-decomposition-plan-2026-09-01.md).
+function isExhaustedRollbackRecoveryApproved(item = {}, recovery = {}) {
+    if(recovery.isExhausted !== true) return false
+
+    const count = Number.parseInt(item?.exhaustedRolledBackRecoveryCount, 10) || 0
+    const limit = Number.parseInt(recovery.recoveryLimit, 10) || 0
+    if(count >= limit) return false
+    if(recovery.queueOnlyAuthority === true) return true
+    if(recovery.recoverActiveTransitionFailures !== true) return false
+
+    const reasonMatched = recovery.activeTransitionRetry === true ||
+        recovery.runtimeDisappearedRetry === true ||
+        (recovery.transientOpenRetry === true &&
+            (recovery.recoverTransientOpenRetry === true || recovery.pressureOpenRetry === true))
+    if(!reasonMatched) return false
+
+    return recovery.queueAuthoritative === true && recovery.serviceWorkerOwned === true
+}
+
 function reduceJobEvent(item = {}, event = {}) {
     const type = normalizeString(event.type)
     if(!type) return buildJobReducerResult(item, item, false, 'missing-event-type')
@@ -433,6 +467,10 @@ function reduceJobEvent(item = {}, event = {}) {
     if(type === JOB_EVENT_ENQUEUED || type === JOB_EVENT_RETRY) {
         if(type === JOB_EVENT_RETRY && !shouldAcceptRetrySourceAttempt(item, event)) {
             return buildJobReducerResult(item, item, false, 'stale-retry-source-attempt')
+        }
+        if(type === JOB_EVENT_RETRY && event.exhaustedRolledBackRecovery &&
+            !isExhaustedRollbackRecoveryApproved(item, event.exhaustedRolledBackRecovery)) {
+            return buildJobReducerResult(item, item, false, 'exhausted-rollback-recovery-denied')
         }
 
         const nextAttemptId = normalizeString(event.attemptId || event.attempt?.id || getJobAttemptId(item))
@@ -452,7 +490,10 @@ function reduceJobEvent(item = {}, event = {}) {
             retryCount: Number.parseInt(event.retryCount, 10) || item.retryCount || 0,
             queueSequence: Number.parseInt(event.queueSequence, 10) || item.queueSequence || 0,
             lastRetryAt: Number.parseInt(event.lastRetryAt, 10) || result.item.queuedAt || 0,
-            terminalAt: 0
+            terminalAt: 0,
+            ...(event.exhaustedRolledBackRecovery ? {
+                exhaustedRolledBackRecoveryCount: (Number.parseInt(item.exhaustedRolledBackRecoveryCount, 10) || 0) + 1
+            } : {})
         })
     }
     if(!shouldAcceptJobEventAttempt(item, event)) {

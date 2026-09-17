@@ -393,6 +393,110 @@ test('retry accepts matching source attempt and advances to fresh identity', () 
     assert.equal(result.item.attemptNumber, 3)
 })
 
+test('exhausted rollback recovery approves via the queueOnlyAuthority shortcut', () => {
+    const result = reduceJobEvent({
+        status: 'failed',
+        attemptId: 'old-attempt',
+        attemptNumber: 1,
+        exhaustedRolledBackRecoveryCount: 2
+    }, {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            isExhausted: true,
+            recoveryLimit: 3,
+            queueOnlyAuthority: true
+        }
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'queued')
+    assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
+test('exhausted rollback recovery approves via the active-transition reason-match branch', () => {
+    const result = reduceJobEvent({
+        status: 'failed',
+        attemptId: 'old-attempt',
+        attemptNumber: 1,
+        exhaustedRolledBackRecoveryCount: 2
+    }, {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            isExhausted: true,
+            recoveryLimit: 3,
+            recoverActiveTransitionFailures: true,
+            activeTransitionRetry: true,
+            queueAuthoritative: true,
+            serviceWorkerOwned: true
+        }
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'queued')
+    assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
+test('exhausted rollback recovery approves a transient-open retry under queue-load pressure', () => {
+    const result = reduceJobEvent({
+        status: 'failed',
+        attemptId: 'old-attempt',
+        attemptNumber: 1,
+        exhaustedRolledBackRecoveryCount: 2
+    }, {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            isExhausted: true,
+            recoveryLimit: 3,
+            recoverActiveTransitionFailures: true,
+            transientOpenRetry: true,
+            pressureOpenRetry: true,
+            queueAuthoritative: true,
+            serviceWorkerOwned: true
+        }
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'queued')
+    assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
+test('exhausted rollback recovery count cap rejects regardless of which branch would otherwise approve', () => {
+    const result = reduceJobEvent({
+        status: 'failed',
+        attemptId: 'old-attempt',
+        attemptNumber: 1,
+        exhaustedRolledBackRecoveryCount: 3
+    }, {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            isExhausted: true,
+            recoveryLimit: 3,
+            queueOnlyAuthority: true
+        }
+    })
+
+    assert.equal(result.accepted, false)
+    assert.equal(result.reason, 'exhausted-rollback-recovery-denied')
+    assert.equal(result.item.status, 'failed')
+    assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
 test('classifies stale security-verification rows as retryable only with fresh transient progress', () => {
     assert.equal(isRetryableJobFailureFromProgress({
         status: 'failed',
