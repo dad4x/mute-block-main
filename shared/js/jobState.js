@@ -426,38 +426,181 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
     return buildJobReducerResult(item, nextItem)
 }
 
+// --- Rolled-back queued tab retry classification -------------------------
+// Promoted from swRolledBackQueuedTabRetryClassification.js into the reducer
+// core (P3-5/P3-6 design correction, 2026-09-17, see
+// sw-state-machine-decomposition-plan-2026-09-01.md): every predicate below
+// is a pure, single-argument function of a queue item alone, so
+// reduceJobEvent computes them itself instead of trusting a caller-built
+// copy that could go stale (a caller reads the item at one point in time,
+// then the item can change again before its computed facts reach the
+// reducer) or simply disagree with the item's own fields due to a bug at
+// one of several call sites. swRolledBackQueuedTabRetryClassification.js no
+// longer defines these itself -- sw.js (the composition root) threads them
+// from here into that module's deps.handlers instead, so its own remaining
+// exports (and its five callers in sw.js, plus the harness's direct
+// sw.isQueuedTabRetryBudgetReleaseReason/shouldAdvanceRolledBackQueuedTabBeforeOpen
+// test hooks) keep working under the same names.
+//
+// isCoordinatorQueueAuthoritativeItem is deliberately NOT re-exported here:
+// its canonical home stays swCoordinatorStatusRules.js (used far beyond this
+// one policy), and duplicating its one-line body locally -- rather than
+// wiring a new cross-module dependency into this reducer core -- is the
+// cheaper, lower-risk way to let the reducer compute it itself. See the
+// decomposition plan for the fuller rationale.
+const ACTIVE_JOB_STATUSES = new Set(['opening', 'active', 'acting', 'settling'])
+const DEFAULT_QUEUED_TAB_MAX_RETRIES = 1 // mirrors sw.js's STALE_QUEUED_TAB_MAX_RETRIES
+const EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = 3 // mirrors sw.js's COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT
+const QUEUE_LOAD_PRESSURE_RECOVERY_WINDOW_MS = 120000 // mirrors sw.js's QUEUE_LOAD_THROTTLE_MAX_MS
+const QUEUE_LOAD_PRESSURE_REASON_PATTERN = /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i
+
+function isActiveJobStatus(status = '') {
+    return ACTIVE_JOB_STATUSES.has(normalizeString(status))
+}
+
+function isCoordinatorQueueAuthoritativeItem(item = null) {
+    return item?.serviceWorkerOwned === true || `${item?.executorOwner || ''}` === 'service-worker'
+}
+
+function isQueuedTabRetryBudgetReleaseReason(reason = '') {
+    const normalized = `${reason || ''}`.trim()
+    return normalized === 'active-transition-failed' ||
+        normalized === 'queued-tab-release-fast-executor-preflight' ||
+        normalized === 'executor-plan-active-transition-retry-budget-exhausted' ||
+        /(?:^|-)active-missing-tab(?:-|$)/.test(normalized) ||
+        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(normalized) ||
+        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(normalized) ||
+        /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized) ||
+        /(?:^|-)content-script-(?:ensure-failed|unscriptable|version-mismatch)(?:-|$)/.test(normalized) ||
+        /(?:^|-)claim-nudge-not-accepted(?:-|$)/.test(normalized) ||
+        /(?:^|-)fresh-content-script-recovery(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-tab-final-open-decision-timeout(?:-|$)/.test(normalized) ||
+        /(?:^|-)queued-stale-runtime-(?:missing-metadata|missing-queued-action|action-already-pruned|action-drained-before-authority|action-pruned-after-fill-timeout)(?:-|$)/.test(normalized)
+}
+
+function shouldAdvanceRolledBackQueuedTabBeforeOpen(item = null) {
+    if(!item || isTerminalJobStatus(item.status) || isActiveJobStatus(item.status)) return false
+    return isQueuedTabRetryBudgetReleaseReason(item.actionLeaseReleaseReason) &&
+        !!getJobAttemptId(item) &&
+        !!getJobAttemptNumber(item)
+}
+
+function getRolledBackQueuedTabRetryAttempt(item = {}) {
+    return Math.max(
+        Number.parseInt(item?.retryCount, 10) || 0,
+        Number.parseInt(item?.retryAttempt, 10) || 0
+    )
+}
+
+function getJobQueuedTabMaxRetries(item = null) {
+    const configured = Number.parseInt(item?.maxRetries, 10)
+    return Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_QUEUED_TAB_MAX_RETRIES
+}
+
+function isExhaustedRolledBackQueuedTabRetry(item = null) {
+    if(!shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) return false
+    return getRolledBackQueuedTabRetryAttempt(item) >= getJobQueuedTabMaxRetries(item)
+}
+
+function isActiveTransitionRolledBackQueuedTabRetry(item = null) {
+    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
+    return reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)
+}
+
+function isRuntimeDisappearedRolledBackQueuedTabRetry(item = null) {
+    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
+    return /(?:^|-)active-missing-tab(?:-|$)/.test(reason) ||
+        /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(reason) ||
+        /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(reason)
+}
+
+function isTransientOpenRolledBackQueuedTabRetry(item = null) {
+    const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
+    if(!reason) return false
+    if(isActiveTransitionRolledBackQueuedTabRetry(item)) return false
+    if(isRuntimeDisappearedRolledBackQueuedTabRetry(item)) return false
+    return isQueuedTabRetryBudgetReleaseReason(reason)
+}
+
+function hasLiveQueuedTabRuntimeSignal(item = null) {
+    const tabId = Number.parseInt(item?.tabId || item?.activeTabId || 0, 10)
+    if(Number.isFinite(tabId) && tabId > 0) return true
+    return (Number.parseInt(item?.activeAt, 10) || 0) > 0
+}
+
+// isRecentQueueLoadPressureReading interprets a RAW, point-in-time
+// queue-load-throttle reading (intent.queueLoadPressure: {active, reason,
+// lastPressureAt}, captured by the caller from live, mutable throttle
+// state) -- the regex/window policy check itself lives here, in the
+// reducer, rather than at each call site, so every caller that hands the
+// reducer the same raw reading gets the same answer.
+function isRecentQueueLoadPressureReading(pressure = null, now = Date.now()) {
+    const reason = normalizeString(pressure?.reason)
+    if(!reason || !QUEUE_LOAD_PRESSURE_REASON_PATTERN.test(reason)) return false
+    if(pressure?.active === true) return true
+
+    const lastPressureAt = Number.parseInt(pressure?.lastPressureAt, 10) || 0
+    if(!lastPressureAt) return false
+    const windowMs = Number.parseInt(pressure?.windowMs, 10) || QUEUE_LOAD_PRESSURE_RECOVERY_WINDOW_MS
+    return (Number.parseInt(now, 10) || Date.now()) - lastPressureAt <= windowMs
+}
+
 // isExhaustedRollbackRecoveryApproved centralizes the
 // shouldRecoverExhaustedRolledBackQueuedTabRetry policy (three approval
 // paths -- queueOnlyAuthority shortcut, recoverActiveTransitionFailures
 // reason-match, queue-pressure recovery nested inside the reason-match
 // branch -- plus the exhaustedRolledBackRecoveryCount cap that closed the
 // infinite-recovery-loop bug) as one reducer-decided question instead of
-// three independently-branching call sites. The caller still owns
-// classifying the item (reason-pattern matches, queue-load-pressure
-// telemetry, queue authority/ownership checks) since those depend on
-// deps-injected config and live throttle state the reducer has no access
-// to -- it hands the reducer only the resulting facts via
-// event.exhaustedRolledBackRecovery, and the reducer applies the same
-// precedence the original function used. See
+// three independently-branching call sites.
+//
+// `intent` carries only what the reducer genuinely cannot derive from
+// `item` itself: the caller's own recovery-mode flags (queueOnlyAuthority,
+// recoverActiveTransitionFailures, recoverTransientOpenRetry,
+// recoverQueueLoadPressure, and serviceWorkerOwned's caller-side override)
+// plus a raw, point-in-time queue-load-pressure reading
+// (intent.queueLoadPressure). Every other fact the approval decision used
+// to require from a caller-built bundle -- isExhausted, activeTransitionRetry,
+// runtimeDisappearedRetry, transientOpenRetry, queueAuthoritative, and
+// serviceWorkerOwned's item-derived half -- is computed here, directly from
+// `item`, so a caller can no longer approve a recovery the item's own
+// fields don't actually support. `intent.recoveryLimit` is an optional
+// override of EXHAUSTED_ROLLBACK_RECOVERY_LIMIT for callers/tests that need
+// a different cap; ordinary callers can omit it entirely. See
 // swRolledBackQueuedTabRetryClassification.js's
-// shouldRecoverExhaustedRolledBackQueuedTabRetry for the source of truth
-// this mirrors (P3-5/P3-6, sw-state-machine-decomposition-plan-2026-09-01.md).
-function isExhaustedRollbackRecoveryApproved(item = {}, recovery = {}) {
-    if(recovery.isExhausted !== true) return false
+// shouldRecoverExhaustedRolledBackQueuedTabRetry and
+// buildForcedRolledBackQueuedTabRetryItem for the two call sites that now
+// build this same narrow intent from the same caller options
+// (P3-5/P3-6, sw-state-machine-decomposition-plan-2026-09-01.md).
+function isExhaustedRollbackRecoveryApproved(item = {}, intent = {}, now = Date.now()) {
+    if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
 
     const count = Number.parseInt(item?.exhaustedRolledBackRecoveryCount, 10) || 0
-    const limit = Number.parseInt(recovery.recoveryLimit, 10) || 0
+    const limit = Number.parseInt(intent.recoveryLimit, 10) || EXHAUSTED_ROLLBACK_RECOVERY_LIMIT
     if(count >= limit) return false
-    if(recovery.queueOnlyAuthority === true) return true
-    if(recovery.recoverActiveTransitionFailures !== true) return false
+    if(intent.queueOnlyAuthority === true) return true
+    if(intent.recoverActiveTransitionFailures !== true) return false
 
-    const reasonMatched = recovery.activeTransitionRetry === true ||
-        recovery.runtimeDisappearedRetry === true ||
-        (recovery.transientOpenRetry === true &&
-            (recovery.recoverTransientOpenRetry === true || recovery.pressureOpenRetry === true))
+    const activeTransitionRetry = isActiveTransitionRolledBackQueuedTabRetry(item)
+    const runtimeDisappearedRetry = isRuntimeDisappearedRolledBackQueuedTabRetry(item)
+    const transientOpenRetry = isTransientOpenRolledBackQueuedTabRetry(item)
+    const queueAuthoritative = isCoordinatorQueueAuthoritativeItem(item)
+    const serviceWorkerOwned = intent.serviceWorkerOwned === true ||
+        item?.serviceWorkerOwned === true ||
+        item?.executorOwner === 'service-worker'
+    const pressureOpenRetry = intent.recoverQueueLoadPressure === true &&
+        transientOpenRetry &&
+        queueAuthoritative &&
+        serviceWorkerOwned &&
+        !hasLiveQueuedTabRuntimeSignal(item) &&
+        isRecentQueueLoadPressureReading(intent.queueLoadPressure, now)
+
+    const reasonMatched = activeTransitionRetry ||
+        runtimeDisappearedRetry ||
+        (transientOpenRetry && (intent.recoverTransientOpenRetry === true || pressureOpenRetry))
     if(!reasonMatched) return false
 
-    return recovery.queueAuthoritative === true && recovery.serviceWorkerOwned === true
+    return queueAuthoritative === true && serviceWorkerOwned === true
 }
 
 function reduceJobEvent(item = {}, event = {}) {
@@ -469,7 +612,7 @@ function reduceJobEvent(item = {}, event = {}) {
             return buildJobReducerResult(item, item, false, 'stale-retry-source-attempt')
         }
         if(type === JOB_EVENT_RETRY && event.exhaustedRolledBackRecovery &&
-            !isExhaustedRollbackRecoveryApproved(item, event.exhaustedRolledBackRecovery)) {
+            !isExhaustedRollbackRecoveryApproved(item, event.exhaustedRolledBackRecovery, getJobEventTime(event))) {
             return buildJobReducerResult(item, item, false, 'exhausted-rollback-recovery-denied')
         }
 
@@ -643,10 +786,16 @@ module.exports = {
     getJobMilestonesFromProgress,
     getNextCoordinatorQueueSequence,
     getQueueItemExecutorTabAction,
+    getRolledBackQueuedTabRetryAttempt,
+    isActiveTransitionRolledBackQueuedTabRetry,
+    isExhaustedRolledBackQueuedTabRetry,
     isExplicitSecurityVerificationRecord,
+    isQueuedTabRetryBudgetReleaseReason,
     isRetryableJobFailure,
     isRetryableJobFailureFromProgress,
+    isRuntimeDisappearedRolledBackQueuedTabRetry,
     isTerminalJobStatus,
+    isTransientOpenRolledBackQueuedTabRetry,
     isTransientProgressStatus,
     makeCanonicalSubject,
     makeEmptyJobMilestones,
@@ -654,5 +803,6 @@ module.exports = {
     mapProgressToCoordinatorState,
     mapProgressToJobState,
     reduceJobEvent,
+    shouldAdvanceRolledBackQueuedTabBeforeOpen,
     upgradeCoordinatorQueueItem
 }
