@@ -595,6 +595,7 @@ module.exports.__test = {
     closeQueuedWorkerActionSurfaceIfIdle,
     terminalizeCoordinatorKeyOnlyItem,
     terminalizeActiveCoordinatorNonProfileLanding,
+    terminalizeActiveCoordinatorItemFromBlockedLiveTab,
     terminalizeExhaustedRolledBackQueuedCoordinatorItem,
     terminalizeExhaustedRolledBackQueuedCoordinatorItems,
     __testResetFlightRecorder,

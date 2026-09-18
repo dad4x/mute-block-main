@@ -41,6 +41,7 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "enqueue-failure-terminalization",
     "already-blocked-observation",
     "blocked-sweep-terminal-result",
+    "blocked-live-tab-terminal-result",
     "closed-before-terminal-requeue",
     "tab-action-claim",
     "tab-action-release",
