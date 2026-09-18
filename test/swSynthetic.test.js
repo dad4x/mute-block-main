@@ -5280,6 +5280,125 @@ test('already-blocked terminal progress records an alreadyBlocked profileAction 
     assert.equal(after['profileAction.reallyBlocked.count'] || 0, before['profileAction.reallyBlocked.count'] || 0)
 })
 
+// The two tests below exercise the P3-2/P3-3 convergence
+// (sw-state-machine-decomposition-plan-2026-09-01.md): before this fix,
+// terminalizeActiveCoordinatorItemFromBlockedLiveTab's fallback had no
+// direct behavioral test for the profileAction.reallyBlocked/alreadyBlocked
+// stat at all -- the only coverage (the two tests above) drove the stat
+// through the generic recordCoordinatorJobProgress path, not through this
+// function. The live tab confirmed here deliberately has a *different*
+// tabId than the queue row's own tracked tabId, matching every real call
+// site of this function (the runtime's tracked tab is missing, stale, or
+// mismatched -- that's why this fallback exists), which is exactly the
+// case recordOwnedBlockedSweepTerminal's own tab-identity match can't
+// handle and BLOCKED_LIVE_TAB_TERMINAL_RECORD was added for.
+test('genuine block confirmed via a live tab the runtime lost track of records a reallyBlocked stat through terminalizeActiveCoordinatorItemFromBlockedLiveTab', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Live-Tab-Really-Blocked-Stat'
+    const runId = 'run-live-tab-really-blocked-stat'
+    const attemptId = 'attempt-live-tab-really-blocked-stat'
+    const trackedTabId = 601
+    const liveTabId = 602
+    const row = {
+        ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: trackedTabId, now: 260000}),
+        milestones: {blockAttemptedAt: 259800}
+    }
+    const {sw, browser} = loadServiceWorkerHarness({
+        now: 260000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: row
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    browser.tabs.sendMessage = async (tabId, message) => {
+        if(message?.action === 'close-if-blocked') {
+            return {willClose: true, resolvedProfileHref: href, lastUrl: href}
+        }
+        return {}
+    }
+
+    const before = sw.state().queueWakeupCounters
+    const liveProfileTabsByHref = new Map([[href, [{id: liveTabId, windowId: 1, url: href}]]])
+    const result = await sw.terminalizeActiveCoordinatorItemFromBlockedLiveTab(
+        href,
+        row,
+        null,
+        liveProfileTabsByHref,
+        'test-active-without-actor-really-blocked'
+    )
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.changed, true, JSON.stringify(result))
+    assert.equal(result.terminalized, true, JSON.stringify(result))
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'blocked')
+    assert.equal(
+        (after['profileAction.reallyBlocked.count'] || 0) -
+            (before['profileAction.reallyBlocked.count'] || 0),
+        1
+    )
+    assert.ok(
+        (after['profileAction.reallyBlocked.totalDurationMs'] || 0) -
+            (before['profileAction.reallyBlocked.totalDurationMs'] || 0) > 0
+    )
+    assert.equal(after['profileAction.alreadyBlocked.count'] || 0, before['profileAction.alreadyBlocked.count'] || 0)
+})
+
+test('already-blocked confirmation via a live tab the runtime lost track of records an alreadyBlocked stat, not reallyBlocked', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Live-Tab-Already-Blocked-Stat'
+    const runId = 'run-live-tab-already-blocked-stat'
+    const attemptId = 'attempt-live-tab-already-blocked-stat'
+    const trackedTabId = 603
+    const liveTabId = 604
+    const row = makeActiveCoordinatorRow({href, runId, attemptId, tabId: trackedTabId, now: 260000})
+    const {sw, browser} = loadServiceWorkerHarness({
+        now: 260000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: row
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    browser.tabs.sendMessage = async (tabId, message) => {
+        if(message?.action === 'close-if-blocked') {
+            return {willClose: true, resolvedProfileHref: href, lastUrl: href}
+        }
+        return {}
+    }
+
+    const before = sw.state().queueWakeupCounters
+    const liveProfileTabsByHref = new Map([[href, [{id: liveTabId, windowId: 1, url: href}]]])
+    const result = await sw.terminalizeActiveCoordinatorItemFromBlockedLiveTab(
+        href,
+        row,
+        null,
+        liveProfileTabsByHref,
+        'test-active-without-actor-already-blocked'
+    )
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.changed, true, JSON.stringify(result))
+    assert.equal(result.terminalized, true, JSON.stringify(result))
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'succeeded')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'already-blocked')
+    assert.equal(
+        (after['profileAction.alreadyBlocked.count'] || 0) -
+            (before['profileAction.alreadyBlocked.count'] || 0),
+        1
+    )
+    assert.equal(after['profileAction.reallyBlocked.count'] || 0, before['profileAction.reallyBlocked.count'] || 0)
+})
+
 test('block terminal progress records a reallyBlocked stat even when the queue row has no actionKind stamped', async () => {
     // Regression for a live bug found right after shipping the stats:
     // makeActiveCoordinatorRow (every other test here) stamps
