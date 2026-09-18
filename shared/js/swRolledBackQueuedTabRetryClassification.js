@@ -54,6 +54,21 @@
 // bare `Date` reference here would resolve to the real Node clock instead
 // of the harness's fake one, even for these synchronous, non-timer call
 // sites.
+//
+// 2026-09-17 design correction (P3-5/P3-6, see
+// sw-state-machine-decomposition-plan-2026-09-01.md): isQueuedTabRetryBudgetReleaseReason,
+// shouldAdvanceRolledBackQueuedTabBeforeOpen, getRolledBackQueuedTabRetryAttempt,
+// isExhaustedRolledBackQueuedTabRetry, isActiveTransitionRolledBackQueuedTabRetry,
+// isRuntimeDisappearedRolledBackQueuedTabRetry, and isTransientOpenRolledBackQueuedTabRetry
+// moved to jobState.js -- they are pure, single-argument functions of a
+// queue item alone, so reduceJobEvent's JOB_EVENT_RETRY handling now
+// computes them itself instead of trusting a caller-built copy. sw.js (the
+// composition root) threads them back into this module's deps.handlers, so
+// this module's own exports of the same names are unchanged pass-throughs.
+// isCoordinatorQueueAuthoritativeItem stayed in swCoordinatorStatusRules.js
+// (its existing canonical home) -- jobState.js keeps its own tiny private
+// copy of that one-line check for the reducer's internal use rather than
+// taking on a new cross-module dependency.
 
 function createRolledBackQueuedTabRetryClassification(deps = {}) {
     const {
@@ -62,7 +77,6 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
     const {
         QUEUE_LOAD_THROTTLE_MAX_MS,
         STALE_QUEUED_TAB_MAX_RETRIES,
-        COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
         JOB_EVENT_RETRY
     } = deps.constants || {}
     const {
@@ -91,7 +105,14 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         getCoordinatorItemOpenUrl,
         getCoordinatorItemQueueKey,
         normalizeCoordinatorRequestedUrl,
-        isProfileResolutionItem
+        isProfileResolutionItem,
+        isQueuedTabRetryBudgetReleaseReason,
+        shouldAdvanceRolledBackQueuedTabBeforeOpen,
+        getRolledBackQueuedTabRetryAttempt,
+        isExhaustedRolledBackQueuedTabRetry,
+        isActiveTransitionRolledBackQueuedTabRetry,
+        isRuntimeDisappearedRolledBackQueuedTabRetry,
+        isTransientOpenRolledBackQueuedTabRetry
     } = deps.handlers || {}
 
     function getQueuedActionNoForegroundFallback(item = null, options = {}) {
@@ -111,23 +132,6 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         }
     }
 
-    function isQueuedTabRetryBudgetReleaseReason(reason = '') {
-        const normalized = `${reason || ''}`.trim()
-        return normalized === 'active-transition-failed' ||
-            normalized === 'queued-tab-release-fast-executor-preflight' ||
-            normalized === 'executor-plan-active-transition-retry-budget-exhausted' ||
-            /(?:^|-)active-missing-tab(?:-|$)/.test(normalized) ||
-            /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(normalized) ||
-            /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(normalized) ||
-            /(?:^|-)fast-executor-preflight(?:-|$)/.test(normalized) ||
-            /(?:^|-)content-script-(?:ensure-failed|unscriptable|version-mismatch)(?:-|$)/.test(normalized) ||
-            /(?:^|-)claim-nudge-not-accepted(?:-|$)/.test(normalized) ||
-            /(?:^|-)fresh-content-script-recovery(?:-|$)/.test(normalized) ||
-            /(?:^|-)queued-live-tab-adoption-load-pressure(?:-|$)/.test(normalized) ||
-            /(?:^|-)queued-tab-final-open-decision-timeout(?:-|$)/.test(normalized) ||
-            /(?:^|-)queued-stale-runtime-(?:missing-metadata|missing-queued-action|action-already-pruned|action-drained-before-authority|action-pruned-after-fill-timeout)(?:-|$)/.test(normalized)
-    }
-
     function getExhaustedRolledBackQueuedTabTerminalError(item = null) {
         const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
         if(reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)) {
@@ -141,49 +145,42 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         return 'Queued tab failed to open after exhausting retry budget'
     }
 
-    function shouldAdvanceRolledBackQueuedTabBeforeOpen(item = null) {
-        if(!item || isTerminalCoordinatorStatus(item.status) || isActiveCoordinatorStatus(item.status)) return false
-        return isQueuedTabRetryBudgetReleaseReason(item.actionLeaseReleaseReason) &&
-            !!getAttemptIdFromValue(item) &&
-            !!getAttemptNumberFromValue(item)
-    }
-
-    function getRolledBackQueuedTabRetryAttempt(item = {}) {
-        return Math.max(
-            getCoordinatorFailureRetryCount(item),
-            Number.parseInt(item?.retryAttempt, 10) || 0
-        )
-    }
-
-    function getExhaustedRolledBackRecoveryCount(item = null) {
-        return Number.parseInt(item?.exhaustedRolledBackRecoveryCount, 10) || 0
-    }
-
-    function isExhaustedRolledBackQueuedTabRetry(item = null) {
-        if(!shouldAdvanceRolledBackQueuedTabBeforeOpen(item)) return false
-        return getRolledBackQueuedTabRetryAttempt(item) >= getQueuedTabMaxRetries(item)
-    }
-
-    function isActiveTransitionRolledBackQueuedTabRetry(item = null) {
-        const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-        return reason === 'active-transition-failed' || /(?:^|-)active-transition(?:-|$)/.test(reason)
-    }
-
-    function isRuntimeDisappearedRolledBackQueuedTabRetry(item = null) {
-        const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-        return /(?:^|-)active-missing-tab(?:-|$)/.test(reason) ||
-            /(?:^|-)profile-tabs-without-active-authority(?:-|$)/.test(reason) ||
-            /(?:^|-)runtime-authority-missing-active-row(?:-|$)/.test(reason)
-    }
-
-    function isTransientOpenRolledBackQueuedTabRetry(item = null) {
-        const reason = `${item?.actionLeaseReleaseReason || ''}`.trim()
-        if(!reason) return false
-        if(isActiveTransitionRolledBackQueuedTabRetry(item)) return false
-        if(isRuntimeDisappearedRolledBackQueuedTabRetry(item)) {
-            return false
+    // captureQueueLoadPressureReading snapshots the raw, point-in-time
+    // queue-load-throttle facts ONCE. Callers that want queue-pressure-based
+    // recovery pass the SAME captured reading into both the classification
+    // dry run (shouldRecoverExhaustedRolledBackQueuedTabRetry) and the
+    // eventual mutation (buildForcedRolledBackQueuedTabRetryItem) via
+    // options.queueLoadPressureSnapshot, instead of each re-reading live
+    // throttle state moments apart and risking two different answers to the
+    // same question (the TOCTOU risk P3-6 flagged as a blocker). The
+    // regex/window interpretation of this raw reading now lives in
+    // jobState.js's isRecentQueueLoadPressureReading, not here.
+    function captureQueueLoadPressureReading() {
+        const throttle = getQueueLoadThrottle()
+        return {
+            active: throttle?.active === true,
+            reason: `${throttle?.reason || ''}`.trim(),
+            lastPressureAt: Number.parseInt(throttle?.lastPressureAt, 10) || 0
         }
-        return isQueuedTabRetryBudgetReleaseReason(reason)
+    }
+
+    // buildExhaustedRollbackRecoveryIntent builds the narrow JOB_EVENT_RETRY
+    // event.exhaustedRolledBackRecovery payload from this module's own
+    // caller-supplied `options` shape: only the caller's recovery-mode
+    // intent flags and a raw queue-load-pressure reading travel on the
+    // event -- everything else jobState.js's isExhaustedRollbackRecoveryApproved
+    // now derives from the item itself. Both call sites below (the
+    // classification dry run and the actual recovery mutation) build this
+    // same shape from the same `options`, so they always agree.
+    function buildExhaustedRollbackRecoveryIntent(options = {}) {
+        return {
+            queueOnlyAuthority: options.queueOnlyAuthority === true,
+            recoverActiveTransitionFailures: options.recoverActiveTransitionFailures === true,
+            recoverTransientOpenRetry: options.recoverTransientOpenRetry === true,
+            recoverQueueLoadPressure: options.recoverQueueLoadPressure === true,
+            serviceWorkerOwned: options.serviceWorkerOwned === true,
+            queueLoadPressure: options.queueLoadPressureSnapshot || captureQueueLoadPressureReading()
+        }
     }
 
     function shouldRecoverExhaustedOpenRetryUnderQueuePressure(item = null, options = {}) {
@@ -211,26 +208,28 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i.test(pressureReason)
     }
 
-    // Converged onto jobState.js's reduceJobEvent per P3-6
+    // Converged onto jobState.js's reduceJobEvent per P3-5/P3-6
     // (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3 dispatch
-    // plan"): the three approval paths this function used to branch on by
-    // hand -- queueOnlyAuthority's shortcut, the recoverActiveTransitionFailures
-    // reason-match, and the queue-pressure check nested inside it -- plus the
-    // shared exhaustedRolledBackRecoveryCount cap that closed the
+    // plan", corrected design 2026-09-17): the three approval paths this
+    // function used to branch on by hand -- queueOnlyAuthority's shortcut,
+    // the recoverActiveTransitionFailures reason-match, and the
+    // queue-pressure check nested inside it -- plus the shared
+    // exhaustedRolledBackRecoveryCount cap that closed the
     // infinite-recovery-loop incident, are now one policy,
-    // isExhaustedRollbackRecoveryApproved, that reduceJobEvent applies over
-    // the exact same facts (mirrored precedence, audited in P3-5). This
-    // function still owns computing those facts -- reason-pattern matches,
-    // queue-authority/ownership, live queue-throttle telemetry -- since the
-    // reducer has no access to deps-injected config or runtime throttle
-    // state; it only decides given the facts handed to it.
+    // isExhaustedRollbackRecoveryApproved, that reduceJobEvent applies. That
+    // policy now computes every item-derived fact itself (isExhausted,
+    // reason-pattern matches, queue authority/ownership) directly from
+    // `item` -- this function hands it only the caller's own recovery-mode
+    // intent flags and a raw queue-load-pressure reading via
+    // buildExhaustedRollbackRecoveryIntent, since those are the only things
+    // that genuinely can't come from the item.
     //
     // This call is a dry run: reduceJobEvent's returned item is discarded,
-    // only `accepted` is read. The actual mutation -- and the
-    // exhaustedRolledBackRecoveryCount bump on approval -- still happens
-    // separately in buildForcedRolledBackQueuedTabRetryItem, which was
-    // deliberately NOT switched onto the same exhaustedRolledBackRecovery
-    // fact bundle in this slice; see that function's header comment for why.
+    // only `accepted` is read. buildForcedRolledBackQueuedTabRetryItem below
+    // builds this exact same intent shape from the same `options` for its
+    // own (real) reduceJobEvent call, so the decision and the mutation now
+    // agree by construction instead of by (previously incomplete)
+    // convention -- see that function's header comment.
     function shouldRecoverExhaustedRolledBackQueuedTabRetry(item = null, options = {}) {
         if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
 
@@ -246,21 +245,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             at: now,
             retryCount: getCoordinatorFailureRetryCount(item),
             lastRetryAt: now,
-            exhaustedRolledBackRecovery: {
-                isExhausted: isExhaustedRolledBackQueuedTabRetry(item),
-                recoveryLimit: COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
-                queueOnlyAuthority: options.queueOnlyAuthority === true,
-                recoverActiveTransitionFailures: options.recoverActiveTransitionFailures === true,
-                activeTransitionRetry: isActiveTransitionRolledBackQueuedTabRetry(item),
-                runtimeDisappearedRetry: isRuntimeDisappearedRolledBackQueuedTabRetry(item),
-                transientOpenRetry: isTransientOpenRolledBackQueuedTabRetry(item),
-                recoverTransientOpenRetry: options.recoverTransientOpenRetry === true,
-                pressureOpenRetry: shouldRecoverExhaustedOpenRetryUnderQueuePressure(item, options),
-                queueAuthoritative: isCoordinatorQueueAuthoritativeItem(item),
-                serviceWorkerOwned: options.serviceWorkerOwned === true ||
-                    item?.serviceWorkerOwned === true ||
-                    item?.executorOwner === 'service-worker'
-            }
+            exhaustedRolledBackRecovery: buildExhaustedRollbackRecoveryIntent(options)
         })
         return reduced.accepted === true
     }
@@ -304,38 +289,42 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         }
     }
 
-    // P3-6 note (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3
-    // dispatch plan"): this function's own reduceJobEvent call below was
-    // deliberately NOT given an event.exhaustedRolledBackRecovery fact
-    // bundle in that slice, so it still bumps exhaustedRolledBackRecoveryCount
-    // by hand rather than letting the reducer own the increment (as
-    // shouldRecoverExhaustedRolledBackQueuedTabRetry above now does for its
-    // own approval decision). Reasons found while auditing that convergence:
-    // (1) this function has no `options` parameter -- none of its five call
-    // sites (mutateCoordinatorStaleRetryQueuedTabAdvance,
-    // recoverExhaustedRolledBackQueuedCoordinatorItem[s],
-    // recoverQueuedStaleRuntimeMissingQueuedAction, and the two inline
-    // ACTIVE_MISSING_TAB requeue-then-recover sites in sw.js) thread the
+    // P3-6 (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3
+    // dispatch plan") originally left this function bumping
+    // exhaustedRolledBackRecoveryCount by hand instead of letting the
+    // reducer own the increment, blocked on two things: (1) this function
+    // had no `options` parameter, and none of its callers threaded the
     // queueOnlyAuthority/recoverActiveTransitionFailures/serviceWorkerOwned/
-    // recoverQueueLoadPressure/recoverTransientOpenRetry flags the earlier
-    // shouldRecoverExhaustedRolledBackQueuedTabRetry decision used past
-    // `applyCoordinatorQueueMachineEvent`'s `options: {currentAuthorityState,
-    // reason}` envelope -- wiring them through would mean widening that
-    // function's signature plus every call site plus the
-    // EXHAUSTED_ROLLBACK_RECOVER handler in swQueueMachineHandlers.js.
-    // (2) more importantly, shouldRecoverExhaustedOpenRetryUnderQueuePressure
-    // reads live, mutable queue-throttle state (getQueueLoadThrottle(),
-    // getNow()) -- re-evaluating it a second time here, inside
-    // coordinatorAuthority.applyWithinStorageUpdate's asynchronous
-    // lock/storage-update queue, could observe a different throttle snapshot
-    // than the one the original decision saw moments earlier, and reject a
-    // recovery the caller already committed to (falling back to
-    // scheduleCoordinatorQueueResume, not a hang, but a new source of
-    // nondeterminism in a production-incident fix path that wasn't there
-    // before). Left as a blocker for a human to decide whether that
-    // TOCTOU risk and the call-site fan-out are worth taking on, rather than
-    // forcing it through in this slice.
-    function buildForcedRolledBackQueuedTabRetryItem(item = {}, now = getNow(), reason = 'executor-plan-active-transition-retry-budget-recovered') {
+    // recoverQueueLoadPressure/recoverTransientOpenRetry flags past
+    // `applyCoordinatorQueueMachineEvent`'s options envelope; (2)
+    // shouldRecoverExhaustedOpenRetryUnderQueuePressure read live, mutable
+    // queue-throttle state a second time, so re-deriving the decision here
+    // could disagree with the one made moments earlier (TOCTOU).
+    //
+    // The corrected P3-5/P3-6 design (2026-09-17) resolves both: the event
+    // shape shrank from an 11-field, mostly item-derived fact bundle down to
+    // five caller-intent flags plus one raw queue-load-pressure reading
+    // (see jobState.js's isExhaustedRollbackRecoveryApproved), so threading
+    // it through is now a five-call-site `options` widening, not a
+    // structural change -- see sw.js's recoverExhaustedRolledBackQueuedCoordinatorItem
+    // and its five callers. And callers that enable queue-load-pressure
+    // recovery now capture the raw reading ONCE (captureQueueLoadPressureReading,
+    // above) and thread that same snapshot through options.queueLoadPressureSnapshot
+    // to both the classification dry run and this mutation, closing the
+    // TOCTOU gap instead of re-reading live state twice.
+    //
+    // This function now takes the same `options` its caller already has in
+    // scope and builds the identical exhaustedRolledBackRecovery intent
+    // shouldRecoverExhaustedRolledBackQueuedTabRetry used for the earlier
+    // decision, via the shared buildExhaustedRollbackRecoveryIntent helper.
+    // reduceJobEvent re-validates approval against the freshest `item`
+    // (which may differ from what the outer decision saw, since this runs
+    // inside coordinatorAuthority.applyWithinStorageUpdate's mutate
+    // callback) and, on approval, owns the exhaustedRolledBackRecoveryCount
+    // increment itself -- the decision and the mutation are now genuinely
+    // one reduceJobEvent call applied twice to the same inputs, not two
+    // independently-drifting evaluations.
+    function buildForcedRolledBackQueuedTabRetryItem(item = {}, now = getNow(), reason = 'executor-plan-active-transition-retry-budget-recovered', options = {}) {
         const sourceAttemptId = getAttemptIdFromValue(item)
         const sourceAttemptNumber = getAttemptNumberFromValue(item)
         if(!sourceAttemptId || !sourceAttemptNumber) return null
@@ -358,7 +347,8 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             attemptNumber,
             at: now,
             retryCount: nextRetryAttempt,
-            lastRetryAt: now
+            lastRetryAt: now,
+            exhaustedRolledBackRecovery: buildExhaustedRollbackRecoveryIntent(options)
         })
         if(!reduced.accepted) return null
 
@@ -387,8 +377,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
             actionLease: null,
             actionLeaseReleasedAt: now,
             actionLeaseReleaseReason: reason,
-            milestones: makeEmptyCoordinatorMilestones(),
-            exhaustedRolledBackRecoveryCount: getExhaustedRolledBackRecoveryCount(item) + 1
+            milestones: makeEmptyCoordinatorMilestones()
         }, {
             runInput: {id: item.runId || '', sourceType: item.source?.type || item.scope?.type || ''},
             source: item.source || {},
@@ -496,6 +485,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         getQueuedActionNoForegroundFallback,
         markQueuedTabExecutorActionPlanned,
         isQueuedTabRetryBudgetReleaseReason,
+        captureQueueLoadPressureReading,
         getExhaustedRolledBackQueuedTabTerminalError,
         shouldAdvanceRolledBackQueuedTabBeforeOpen,
         getRolledBackQueuedTabRetryAttempt,

@@ -24,10 +24,16 @@ const {
     getExecutorTabActionForActionKind,
     getNextCoordinatorQueueSequence,
     getQueueItemExecutorTabAction,
+    getRolledBackQueuedTabRetryAttempt: getRolledBackQueuedTabRetryAttemptFromJobState,
+    isActiveTransitionRolledBackQueuedTabRetry: isActiveTransitionRolledBackQueuedTabRetryFromJobState,
+    isExhaustedRolledBackQueuedTabRetry: isExhaustedRolledBackQueuedTabRetryFromJobState,
     isExplicitSecurityVerificationRecord: isExplicitSecurityVerificationRecordFromJobState,
+    isQueuedTabRetryBudgetReleaseReason: isQueuedTabRetryBudgetReleaseReasonFromJobState,
     isRetryableJobFailure,
     isRetryableJobFailureFromProgress,
+    isRuntimeDisappearedRolledBackQueuedTabRetry: isRuntimeDisappearedRolledBackQueuedTabRetryFromJobState,
     isTerminalJobStatus,
+    isTransientOpenRolledBackQueuedTabRetry: isTransientOpenRolledBackQueuedTabRetryFromJobState,
     JOB_EVENT_ENQUEUED,
     JOB_EVENT_MILESTONE,
     JOB_EVENT_PAUSE,
@@ -39,6 +45,7 @@ const {
     makeEmptyJobMilestones,
     mapProgressToCoordinatorState,
     reduceJobEvent,
+    shouldAdvanceRolledBackQueuedTabBeforeOpen: shouldAdvanceRolledBackQueuedTabBeforeOpenFromJobState,
     UNBLOCK_UNMUTE_ACTION_KIND
 } = require('./jobState')
 const {
@@ -541,6 +548,13 @@ const STALE_QUEUED_TAB_MAX_RETRIES = 1
 // unrelated writes behind it in the serialized queue. This caps how many
 // times any recovery branch will rescue the same row before it's finally
 // allowed to fall through to genuine termination.
+//
+// Superseded 2026-09-17 (P3-5/P3-6 design correction): the cap now lives as
+// EXHAUSTED_ROLLBACK_RECOVERY_LIMIT in jobState.js, alongside the
+// isExhaustedRollbackRecoveryApproved policy it gates -- reducer-side
+// config the reducer applies itself rather than a value callers must
+// remember to thread onto every JOB_EVENT_RETRY event. This constant is no
+// longer wired anywhere; kept for the incident history above.
 const COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = 3
 const FOREGROUND_LEASE_WAIT_EVENT_MS = 5000
 const COORDINATOR_RECONCILE_INTERVAL_MS = 5000
@@ -4802,25 +4816,33 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                             requeueResult.item ||
                             null
                         if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
+                            // exhaustedRollbackRecoveryIntent is captured once and reused for
+                            // both the classification dry run and (on approval) the
+                            // EXHAUSTED_ROLLBACK_RECOVER dispatch's own options, including a
+                            // single queueLoadPressureSnapshot reading -- so the eventual
+                            // mutation (buildForcedRolledBackQueuedTabRetryItem) re-validates
+                            // against the exact same inputs instead of re-reading live,
+                            // mutable throttle state a second time (see that function's header
+                            // comment for the TOCTOU risk this avoids).
+                            const exhaustedRollbackRecoveryIntent = {
+                                recoverActiveTransitionFailures: true,
+                                recoverQueueLoadPressure: true,
+                                serviceWorkerOwned: true,
+                                queueLoadPressureSnapshot: captureQueueLoadPressureReading()
+                            }
+                            const shouldRecoverRolledBack = shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, exhaustedRollbackRecoveryIntent)
                             const terminalizeResult = await applyCoordinatorQueueMachineEvent({
-                                type: shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, {
-                                    recoverActiveTransitionFailures: true,
-                                    recoverQueueLoadPressure: true,
-                                    serviceWorkerOwned: true
-                                })
+                                type: shouldRecoverRolledBack
                                     ? 'EXHAUSTED_ROLLBACK_RECOVER'
                                     : 'EXHAUSTED_ROLLBACK_TERMINATE',
                                 itemKey: requeueResult.itemKey || itemKey,
                                 item: requeuedItem,
                                 options: {
                                     currentAuthorityState,
-                                    reason: shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, {
-                                        recoverActiveTransitionFailures: true,
-                                        recoverQueueLoadPressure: true,
-                                        serviceWorkerOwned: true
-                                    })
+                                    reason: shouldRecoverRolledBack
                                         ? 'executor-plan-active-transition-retry-budget-recovered'
-                                        : 'executor-plan-active-transition-retry-budget-exhausted'
+                                        : 'executor-plan-active-transition-retry-budget-exhausted',
+                                    ...(shouldRecoverRolledBack ? exhaustedRollbackRecoveryIntent : {})
                                 }
                             }).catch(error => ({
                                 changed: false,
@@ -4979,17 +5001,19 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
                 result.item ||
                 null
             if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
+                const queueOnlyAuthorityRecover = options.queueOnlyAuthority === true
                 const terminalizeResult = await applyCoordinatorQueueMachineEvent({
-                    type: options.queueOnlyAuthority === true
+                    type: queueOnlyAuthorityRecover
                         ? 'EXHAUSTED_ROLLBACK_RECOVER'
                         : 'EXHAUSTED_ROLLBACK_TERMINATE',
                     itemKey: result.itemKey || itemKey,
                     item: requeuedItem,
                     options: {
                         currentAuthorityState,
-                        reason: options.queueOnlyAuthority === true
+                        reason: queueOnlyAuthorityRecover
                             ? 'executor-plan-active-transition-retry-budget-recovered'
-                            : 'executor-plan-active-transition-retry-budget-exhausted'
+                            : 'executor-plan-active-transition-retry-budget-exhausted',
+                        ...(queueOnlyAuthorityRecover ? {queueOnlyAuthority: true} : {})
                     }
                 }).catch(error => ({
                     changed: false,
@@ -10742,7 +10766,6 @@ const rolledBackQueuedTabRetryClassification = createRolledBackQueuedTabRetryCla
     constants: {
         QUEUE_LOAD_THROTTLE_MAX_MS,
         STALE_QUEUED_TAB_MAX_RETRIES,
-        COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
         JOB_EVENT_RETRY
     },
     handlers: {
@@ -10771,13 +10794,21 @@ const rolledBackQueuedTabRetryClassification = createRolledBackQueuedTabRetryCla
         getCoordinatorItemOpenUrl,
         getCoordinatorItemQueueKey,
         normalizeCoordinatorRequestedUrl,
-        isProfileResolutionItem
+        isProfileResolutionItem,
+        isQueuedTabRetryBudgetReleaseReason: isQueuedTabRetryBudgetReleaseReasonFromJobState,
+        shouldAdvanceRolledBackQueuedTabBeforeOpen: shouldAdvanceRolledBackQueuedTabBeforeOpenFromJobState,
+        getRolledBackQueuedTabRetryAttempt: getRolledBackQueuedTabRetryAttemptFromJobState,
+        isExhaustedRolledBackQueuedTabRetry: isExhaustedRolledBackQueuedTabRetryFromJobState,
+        isActiveTransitionRolledBackQueuedTabRetry: isActiveTransitionRolledBackQueuedTabRetryFromJobState,
+        isRuntimeDisappearedRolledBackQueuedTabRetry: isRuntimeDisappearedRolledBackQueuedTabRetryFromJobState,
+        isTransientOpenRolledBackQueuedTabRetry: isTransientOpenRolledBackQueuedTabRetryFromJobState
     }
 })
 const {
     getQueuedActionNoForegroundFallback,
     markQueuedTabExecutorActionPlanned,
     isQueuedTabRetryBudgetReleaseReason,
+    captureQueueLoadPressureReading,
     getExhaustedRolledBackQueuedTabTerminalError,
     shouldAdvanceRolledBackQueuedTabBeforeOpen,
     getRolledBackQueuedTabRetryAttempt,
@@ -11161,7 +11192,7 @@ async function recoverExhaustedRolledBackQueuedCoordinatorItem(itemKey = '', exp
             if(!isExhaustedRolledBackQueuedTabRetry(currentItem)) {
                 return context.reject('not-exhausted-rolled-back-row')
             }
-            const nextItem = buildForcedRolledBackQueuedTabRetryItem(currentItem, now, recoverReason)
+            const nextItem = buildForcedRolledBackQueuedTabRetryItem(currentItem, now, recoverReason, options)
             if(!nextItem) return context.reject('recovery-reducer-rejected')
             return nextItem
         }
@@ -11394,6 +11425,17 @@ async function recoverExhaustedRolledBackQueuedCoordinatorItems(items = [], opti
 }
 
 async function settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(items = [], options = {}) {
+    // Capture the queue-load-pressure reading ONCE for this whole batch
+    // (rather than letting each item's classification, and later the
+    // recovery mutation for each recovered item, each read live throttle
+    // state independently): every item in this batch, and the eventual
+    // buildForcedRolledBackQueuedTabRetryItem call for each recovered one,
+    // shares this same options object (or a shallow copy of it), so they
+    // all see the identical snapshot instead of risking a different answer
+    // moments apart (the TOCTOU risk noted on buildForcedRolledBackQueuedTabRetryItem).
+    const scopedOptions = options.recoverQueueLoadPressure === true && !options.queueLoadPressureSnapshot
+        ? {...options, queueLoadPressureSnapshot: captureQueueLoadPressureReading()}
+        : options
     const recoverable = []
     const terminalizable = []
     const seenRecoverable = new Set()
@@ -11402,7 +11444,7 @@ async function settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(items 
         if(!isExhaustedRolledBackQueuedTabRetry(item)) continue
         const itemKey = getCoordinatorItemHref(item) || getCoordinatorItemQueueKey(item)
         if(!itemKey) continue
-        if(shouldRecoverExhaustedRolledBackQueuedTabRetry(item, options)) {
+        if(shouldRecoverExhaustedRolledBackQueuedTabRetry(item, scopedOptions)) {
             if(seenRecoverable.has(itemKey)) continue
             seenRecoverable.add(itemKey)
             recoverable.push(item)
@@ -11419,7 +11461,7 @@ async function settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor(items 
     const terminalizeLimit = Math.max(0, limit - Math.min(recoverable.length, recoverLimit))
     const recoveredResult = recoverable.length
         ? await recoverExhaustedRolledBackQueuedCoordinatorItems(recoverable, {
-            ...options,
+            ...scopedOptions,
             limit: recoverLimit,
             reason: options.recoverReason || options.reason || 'executor-plan-active-transition-retry-budget-recovered'
         })
@@ -12380,11 +12422,12 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
                 }
                 else if(terminalizedExhausted < COORDINATOR_EXHAUSTED_ROLLBACK_TERMINATE_BATCH_LIMIT &&
                     isExhaustedRolledBackQueuedTabRetry(item)) {
-                    const shouldRecoverRolledBack = shouldRecoverExhaustedRolledBackQueuedTabRetry(item, {
+                    const exhaustedRollbackRecoveryIntent = {
                         queueOnlyAuthority: options.queueOnlyAuthority === true,
                         recoverActiveTransitionFailures: true,
                         serviceWorkerOwned
-                    })
+                    }
+                    const shouldRecoverRolledBack = shouldRecoverExhaustedRolledBackQueuedTabRetry(item, exhaustedRollbackRecoveryIntent)
                     const terminalizeResult = await applyCoordinatorQueueMachineEvent({
                         type: shouldRecoverRolledBack
                             ? 'EXHAUSTED_ROLLBACK_RECOVER'
@@ -12395,7 +12438,8 @@ async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator
                             currentAuthorityState: planAuthorityState,
                             reason: shouldRecoverRolledBack
                                 ? 'executor-plan-active-transition-retry-budget-recovered'
-                                : 'executor-plan-active-transition-retry-budget-exhausted'
+                                : 'executor-plan-active-transition-retry-budget-exhausted',
+                            ...(shouldRecoverRolledBack ? exhaustedRollbackRecoveryIntent : {})
                         }
                     }).catch(error => ({
                         changed: false,
@@ -14726,11 +14770,12 @@ async function resumeCoordinatorQueueExecution(coordinator = {}, options = {}) {
 
 async function recoverQueuedStaleRuntimeMissingQueuedAction(itemKey = '', item = null, options = {}, staleReason = 'queued-stale-runtime-missing-queued-action') {
     if(!itemKey || !item) return null
-    if(!shouldRecoverExhaustedRolledBackQueuedTabRetry(item, {
+    const exhaustedRollbackRecoveryIntent = {
         queueOnlyAuthority: options.queueOnlyAuthority === true,
         recoverActiveTransitionFailures: true,
         serviceWorkerOwned: options.serviceWorkerOwned === true
-    })) {
+    }
+    if(!shouldRecoverExhaustedRolledBackQueuedTabRetry(item, exhaustedRollbackRecoveryIntent)) {
         return null
     }
 
@@ -14740,7 +14785,8 @@ async function recoverQueuedStaleRuntimeMissingQueuedAction(itemKey = '', item =
         item,
         options: {
             currentAuthorityState: options.currentAuthorityState || null,
-            reason: `${staleReason || 'queued-stale-runtime-missing-queued-action'}-retry-budget-recovered`
+            reason: `${staleReason || 'queued-stale-runtime-missing-queued-action'}-retry-budget-recovered`,
+            ...exhaustedRollbackRecoveryIntent
         }
     }).catch(error => ({
         changed: false,
@@ -16345,11 +16391,12 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                             currentAuthorityState?.queue?.[itemKey] ||
                             null
                         if(isExhaustedRolledBackQueuedTabRetry(requeuedItem)) {
-                            const shouldRecoverRolledBack = shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, {
+                            const exhaustedRollbackRecoveryIntent = {
                                 queueOnlyAuthority: options.queueOnlyAuthority === true,
                                 recoverActiveTransitionFailures: true,
                                 serviceWorkerOwned
-                            })
+                            }
+                            const shouldRecoverRolledBack = shouldRecoverExhaustedRolledBackQueuedTabRetry(requeuedItem, exhaustedRollbackRecoveryIntent)
                             const terminalizeResult = await applyCoordinatorQueueMachineEvent({
                                 type: shouldRecoverRolledBack
                                     ? 'EXHAUSTED_ROLLBACK_RECOVER'
@@ -16360,7 +16407,8 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                                     currentAuthorityState,
                                     reason: shouldRecoverRolledBack
                                         ? 'executor-plan-active-transition-retry-budget-recovered'
-                                        : 'executor-plan-active-transition-retry-budget-exhausted'
+                                        : 'executor-plan-active-transition-retry-budget-exhausted',
+                                    ...(shouldRecoverRolledBack ? exhaustedRollbackRecoveryIntent : {})
                                 }
                             }).catch(error => ({
                                 changed: false,
