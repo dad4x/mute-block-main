@@ -146,14 +146,6 @@ function createCoordinatorProgressRules(deps = {}) {
         const senderTabId = normalizeTabId(options.senderTabId || patch?.tabId || null)
         if(!senderTabId) return ''
 
-        if(options.allowBlockedLiveTabSender === true &&
-            patch?.blockSucceeded === true &&
-            `${patch?.status || ''}`.trim() === 'already-blocked') {
-            const itemHref = getCoordinatorItemHref(item)
-            const patchHref = normalizeQuoraProfileUrl(patch?.resolvedProfileHref || patch?.profileHref || '')
-            if(itemHref && patchHref === itemHref) return ''
-        }
-
         const lease = normalizeCoordinatorActionLease(item?.actionLease)
         const leaseTabId = normalizeTabId(lease?.tabId || null)
         if(leaseTabId && senderTabId !== leaseTabId) {

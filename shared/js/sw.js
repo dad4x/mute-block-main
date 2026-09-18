@@ -564,6 +564,7 @@ const COORDINATOR_IDLE_RECONCILE_PROMISE_STALE_MS = 30000
 const COORDINATOR_IDLE_EXECUTOR_START_PROMISE_STALE_MS = 1500
 const COORDINATOR_DETACHED_EXECUTOR_START_PROMISE_STALE_MS = 250
 const BACKGROUND_BLOCKED_SWEEP_TERMINAL_TIMEOUT_MS = 30000
+const ACTIVE_BLOCKED_LIVE_TAB_TERMINAL_TIMEOUT_MS = 30000
 const COORDINATOR_EXECUTOR_PLAN_BATCH_FALLBACK_LIMIT = 1
 const COORDINATOR_EXHAUSTED_ROLLBACK_TERMINATE_BATCH_LIMIT = 25
 const COORDINATOR_ACTIVE_RECONCILE_STORAGE_UPDATE_TIMEOUT_MS = 120000
@@ -635,7 +636,8 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'resolver-remap',
     'enqueue',
     'clear-profile',
-    'background-blocked-sweep-terminal'
+    'background-blocked-sweep-terminal',
+    'active-blocked-live-tab-terminal'
 ])
 let persistOwnedTabIdsTimeout = null
 let persistentRetryFailedPromise = null
@@ -705,6 +707,7 @@ const activeWithoutActorReconcilePromises = new Map()
 const missingActionLeaseReleasePromises = new Map()
 const queuedTabActiveTransitionPromises = new Map()
 const backgroundBlockedSweepTerminalPromises = new Map()
+const activeBlockedLiveTabTerminalPromises = new Map()
 const blockedLiveTabTerminalizationPromises = new Map()
 // Distinct from blockedLiveTabTerminalizationPromises above: that one
 // coalesces the *terminalize this tab* step, but terminalizeActiveCoordinatorItemFromBlockedLiveTab's
@@ -13057,6 +13060,7 @@ const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher
             mutateCoordinatorQueuedProfileTargetResolve,
             mutateCoordinatorQueuedTabActiveTransition,
             mutateCoordinatorQueuedTabOpenRollback,
+            recordActiveBlockedLiveTabTerminal,
             recordCoordinatorJobProgress,
             recordOwnedBlockedSweepTerminal,
             recoverExhaustedRolledBackQueuedCoordinatorItem,
@@ -14627,54 +14631,39 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
             resolvedProfileHref: href,
             lastUrl: match.response?.lastUrl || match.tab?.url || href
         }
-        const sweepRecorded = await applyCoordinatorQueueMachineEvent({
-            type: 'BLOCKED_SWEEP_TERMINAL_RECORD',
+        // Dedicated live-tab terminal event, deliberately not the sweep
+        // flow's terminal-record event: the sweep flow's match requires the
+        // confirming tab to be the item's own tracked tabId, which is never
+        // true here -- every call site of this function exists specifically
+        // because that tracked tab is missing, stale, or mismatched and a
+        // different live tab was independently confirmed blocked instead.
+        // See recordActiveBlockedLiveTabTerminal's own comment for the full
+        // history (P3-2/P3-3 finding in
+        // sw-state-machine-decomposition-plan-2026-09-01.md).
+        const recorded = await applyCoordinatorQueueMachineEvent({
+            type: 'BLOCKED_LIVE_TAB_TERMINAL_RECORD',
             tabId,
             metadata: terminalMetadata,
             response: terminalResponse
         }).catch(error => ({
             recorded: false,
             terminal: false,
-            reason: 'blocked-live-tab-sweep-terminal-error',
+            reason: 'blocked-live-tab-terminal-record-error',
             error: error?.message || `${error}`
         }))
         recordFlightRecorderEvent({
-            kind: 'blocked-sweep-terminal-result',
+            kind: 'blocked-live-tab-terminal-result',
             source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
             rowKey: itemKey,
             targetUrl: href,
             tabId,
             attemptId,
             attemptNumber,
-            accepted: !!sweepRecorded?.terminal,
-            reason: sweepRecorded?.reason || '',
-            status: sweepRecorded?.status || '',
-            error: sweepRecorded?.error || ''
+            accepted: !!recorded?.terminal,
+            reason: recorded?.reason || '',
+            status: recorded?.status || '',
+            error: recorded?.error || ''
         })
-        const fallbackClassification = classifyBlockConfirmationFromItem(expectedItem)
-        const recorded = sweepRecorded?.terminal
-            ? sweepRecorded
-            : await recordCoordinatorJobProgressViaQueueMachine(href, {
-                actionKind,
-                runId: expectedItem.runId || expectedRecord?.runId || '',
-                status: fallbackClassification.status,
-                openedViablePage: true,
-                foundBlockedBeforeQueue: fallbackClassification.foundBlockedBeforeQueue,
-                blockSucceeded: true,
-                blockedAt: Date.now(),
-                tabId,
-                attemptId,
-                attemptNumber,
-                lastUrl: match.response?.lastUrl || match.tab?.url || href,
-                resolvedProfileHref: href,
-                remappedFromRequested: false,
-                finalError: '',
-                event: 'Profile confirmed blocked during active actorless reconcile'
-            }, {
-                senderTabId: tabId,
-                expectTerminal: true,
-                allowBlockedLiveTabSender: true
-            })
         if(!recorded?.terminal) {
             return {
                 changed: false,
@@ -26024,6 +26013,200 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
     const result = await resultPromise
 
     if(result?.terminal) scheduleQueuedWorkContinuation('background-blocked-sweep-terminal')
+    return result
+}
+
+// Sibling to recordOwnedBlockedSweepTerminal's BLOCKED_SWEEP_TERMINAL_RECORD
+// event, for terminalizeActiveCoordinatorItemFromBlockedLiveTab's fallback --
+// added 2026-09-17 to close the gap the P3-2/P3-3 finding above
+// (sw-state-machine-decomposition-plan-2026-09-01.md) documented. Both
+// functions do the same classify -> transition -> authority-write -> stat
+// shape, but recordOwnedBlockedSweepTerminal's match
+// (coordinatorItemMatchesQueuedTabRuntime) requires the confirming tab to
+// *be* the item's own tracked tabId/activeTabId -- true for the sweep flow
+// (it only ever probes queue-runtime-owned tabs), but false by construction
+// for every real call site of terminalizeActiveCoordinatorItemFromBlockedLiveTab
+// (active-without-actor reconcile, action-lease tab gone, runtime-authority
+// mismatch, active-with-pending-action profile mismatch): those call sites
+// exist specifically because the item's own tracked tab is missing, stale,
+// or mismatched, and a *different* live tab -- found via
+// liveProfileTabsByHref, not queue-runtime bookkeeping -- was independently
+// probed and confirmed blocked. Dispatching BLOCKED_SWEEP_TERMINAL_RECORD
+// from that fallback (as it did before this function existed) therefore
+// always failed the tab-identity check and fell through to the
+// PROGRESS_PATCH_RECORD pipeline's allowBlockedLiveTabSender escape hatch --
+// dead-weight extra work, not a real second attempt. So this matches by
+// href + attempt identity only (hasMismatchedCoordinatorAttempt), the same
+// staleness guard recordOwnedBlockedSweepTerminal applies *alongside* its
+// tab-identity check, not in place of it -- weakening that stricter check
+// for the sweep flow too was rejected as changing a different guarantee.
+async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, response = {}) {
+    const normalizedTabId = normalizeTabId(tabId)
+    const normalizedProfileHref = normalizeQuoraProfileUrl(metadata?.profileHref || '')
+    const resolvedProfileHref = normalizeQuoraProfileUrl(response?.resolvedProfileHref || '')
+    const actionKind = getCoordinatorActionKindForRequestedAction(metadata?.actionKind || metadata?.tabAction || 'mute-block')
+    const attemptId = getAttemptIdFromValue(metadata)
+    const attemptNumber = getAttemptNumberFromValue(metadata)
+
+    if(!normalizedTabId) return {recorded: false, terminal: false, reason: 'missing-tab-id'}
+    if(!normalizedProfileHref || !resolvedProfileHref || normalizedProfileHref !== resolvedProfileHref) {
+        return {recorded: false, terminal: false, reason: 'profile-mismatch'}
+    }
+    if(actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return {recorded: false, terminal: false, reason: 'reverse-action'}
+    if(!attemptId) return {recorded: false, terminal: false, reason: 'missing-attempt'}
+
+    // See classifyBlockConfirmationFromItem for why this is decided per
+    // call rather than hardcoded -- this fallback can legitimately catch
+    // either a block our own direct action just caused (confirmation was
+    // simply slow/lost with the runtime actor) or a profile that was
+    // already blocked before we ever got to clicking.
+    const buildLiveTabConfirmedRecord = classification => normalizeProgressPatch(normalizedProfileHref, {
+        actionKind,
+        runId: metadata?.runId || '',
+        status: classification.status,
+        openedViablePage: true,
+        foundBlockedBeforeQueue: classification.foundBlockedBeforeQueue,
+        blockSucceeded: true,
+        blockedAt: Date.now(),
+        tabId: normalizedTabId,
+        attemptId,
+        attemptNumber,
+        lastUrl: response?.lastUrl || '',
+        resolvedProfileHref,
+        remappedFromRequested: false,
+        finalError: '',
+        event: classification.wasBlockAttempted
+            ? 'Profile confirmed blocked during active actorless reconcile'
+            : 'Profile confirmed already blocked during active actorless reconcile'
+    })
+    // Structural sanity check only, matching recordOwnedBlockedSweepTerminal's
+    // own pre-check: which classification branch is passed here doesn't
+    // matter for this check since both map to a terminal status.
+    if(!isTerminalCoordinatorStatus(getCoordinatorStatusFromProgress(buildLiveTabConfirmedRecord(classifyBlockConfirmationFromItem(null))).status)) {
+        return {recorded: false, terminal: false, reason: 'non-terminal-live-tab-record'}
+    }
+
+    const itemKey = `${metadata?.coordinatorKey || ''}`.trim() || normalizedProfileHref
+    const inFlightKey = `${normalizedTabId}:${attemptId}:${attemptNumber || 0}:${itemKey}`
+    const existingPromise = activeBlockedLiveTabTerminalPromises.get(inFlightKey)
+    if(existingPromise) return existingPromise
+
+    const resultPromise = enqueueSpaceFeedStorageUpdate(async () => {
+        const currentAuthorityState = getHydratedCoordinatorAuthorityState(
+            'activeBlockedLiveTabTerminal.usedResidentAuthority'
+        ) || await loadCoordinatorQueueRunsProjection({
+            metricPath: 'activeBlockedLiveTabTerminal.load'
+        })
+        const queue = currentAuthorityState.queue || {}
+        const runs = currentAuthorityState.runs || {}
+        const itemEntry = queue[itemKey]
+            ? {key: itemKey, item: queue[itemKey]}
+            : findCoordinatorQueueEntryForHref(queue, normalizedProfileHref)
+        const item = itemEntry?.item || null
+        const rowKey = itemEntry?.key || itemKey
+        if(!item || !isActiveCoordinatorStatus(item.status)) {
+            return {recorded: false, terminal: false, reason: 'inactive-coordinator-item'}
+        }
+        const record = buildLiveTabConfirmedRecord(classifyBlockConfirmationFromItem(item))
+        const mapped = getCoordinatorStatusFromProgress(record)
+        if(hasMismatchedCoordinatorAttempt(item, record)) {
+            return {recorded: false, terminal: false, reason: 'stale-attempt'}
+        }
+
+        const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
+            now: Date.now(),
+            terminalAtFallback: 'record'
+        })
+        if(!isTerminalCoordinatorStatus(nextItem.status)) {
+            return {recorded: false, terminal: false, reason: 'terminal-transition-rejected'}
+        }
+
+        const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+            operationKind: 'active-blocked-live-tab-terminal',
+            rowKey,
+            expectedAttemptId: attemptId,
+            expectedAttemptNumber: attemptNumber,
+            reason: 'ordinaryMutation',
+            metricPath: 'activeBlockedLiveTabTerminal.save',
+            currentAuthorityState,
+            deferProjectionSave: true,
+            mutate(currentItem, context) {
+                if(!isActiveCoordinatorStatus(currentItem?.status)) return context.reject('row-changed')
+                if(hasMismatchedCoordinatorAttempt(currentItem, record)) return context.reject('stale-attempt')
+                const transitionedItem = transitionCoordinatorItemFromProgress(currentItem, record, mapped, {
+                    now: Date.now(),
+                    terminalAtFallback: 'record'
+                })
+                if(!isTerminalCoordinatorStatus(transitionedItem.status)) return context.reject('terminal-transition-rejected')
+                return transitionedItem
+            }
+        })
+        if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
+            return {
+                recorded: false,
+                terminal: false,
+                reason: authorityResult?.reason || 'authority-apply-failed'
+            }
+        }
+        scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
+        kickQueuedWorkAfterSlotFreed('active-blocked-live-tab-terminal-slot-freed')
+
+        const nextQueue = coordinatorAuthority.current().queue
+        const affectedRunIds = new Set()
+        const durableItem = authorityResult.nextRow || nextQueue[rowKey] || nextItem
+        if(durableItem.runId) affectedRunIds.add(durableItem.runId)
+        if(item.runId) affectedRunIds.add(item.runId)
+        for(const runId of getCoordinatorRunIdsForHref(runs, normalizedProfileHref)) {
+            affectedRunIds.add(runId)
+        }
+        const nextRuns = affectedRunIds.size
+            ? recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds)
+            : runs
+        if(affectedRunIds.size && JSON.stringify(nextRuns) !== JSON.stringify(runs)) {
+            setTimeout(() => {
+                void saveCoordinatorState({
+                    runs: nextRuns
+                }, {
+                    queue: false,
+                    runs: true,
+                    progress: false,
+                    reason: 'ordinaryMutation',
+                    queueOperation: 'active-blocked-live-tab-terminal-derived',
+                    queueChangedRows: 0
+                }).catch(error => {
+                    recordCoordinatorDiagnosticEvent(
+                        'active-blocked-live-tab-terminal-derived-save-failed',
+                        error?.message || 'Active blocked live tab terminal derived runs save failed'
+                    )
+                    scheduleCoordinatorReconcile(1000, {
+                        reason: 'active-blocked-live-tab-terminal-derived-save-failed',
+                        edgeTriggered: true
+                    })
+                    return false
+                })
+            }, 0)
+        }
+
+        return {
+            recorded: true,
+            terminal: true,
+            record,
+            rowKey,
+            status: durableItem.status
+        }
+    }, {
+        reason: 'active-blocked-live-tab-terminal',
+        timeoutMs: ACTIVE_BLOCKED_LIVE_TAB_TERMINAL_TIMEOUT_MS
+    }).finally(() => {
+        if(activeBlockedLiveTabTerminalPromises.get(inFlightKey) === resultPromise) {
+            activeBlockedLiveTabTerminalPromises.delete(inFlightKey)
+        }
+    })
+    activeBlockedLiveTabTerminalPromises.set(inFlightKey, resultPromise)
+
+    const result = await resultPromise
+
+    if(result?.terminal) scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
     return result
 }
 
