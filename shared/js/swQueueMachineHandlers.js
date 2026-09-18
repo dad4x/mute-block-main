@@ -45,6 +45,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorKeyOnlyItemTerminate = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorKeyOnlyItemTerminate')
     const mutateCoordinatorPauseStateSet = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorPauseStateSet')
     const mutateCoordinatorQueuedProfileTargetResolve = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedProfileTargetResolve')
+    const recordActiveBlockedLiveTabTerminal = requireQueueMachineCapability('durable', durable, 'recordActiveBlockedLiveTabTerminal')
     const recordCoordinatorJobProgress = requireQueueMachineCapability('durable', durable, 'recordCoordinatorJobProgress')
     const recordOwnedBlockedSweepTerminal = requireQueueMachineCapability('durable', durable, 'recordOwnedBlockedSweepTerminal')
     const removePendingSpaceFeedEntries = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedEntries')
@@ -134,6 +135,13 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
         },
         [QUEUE_MACHINE_EVENT_TYPES.SPACE_FEED_PROFILES_CONFIRM]: async (event = {}) => {
             return confirmSpaceFeedProfilesBlocked(event.profileHrefs || event.urls || [])
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.BLOCKED_LIVE_TAB_TERMINAL_RECORD]: async (event = {}) => {
+            return recordActiveBlockedLiveTabTerminal(
+                event.tabId || null,
+                event.metadata || null,
+                event.response || {}
+            )
         },
         [QUEUE_MACHINE_EVENT_TYPES.BLOCKED_SWEEP_TERMINAL_RECORD]: async (event = {}) => {
             return recordOwnedBlockedSweepTerminal(

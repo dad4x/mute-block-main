@@ -3435,6 +3435,93 @@ target. No `sw.js`, `jobState.js`, test, or lint-guard changes made in
 this session; `npm run test:parallel` and `npm run lint:block-classification`
 were verified green beforehand and left untouched.
 
+**P3-2/P3-3 resolution (2026-09-17, follow-up session): converged via a
+dedicated sibling event, not a bare `reduceJobEvent` call -- option (a)
+from the finding above, scoped down.** Re-read both call sites in full
+per the finding's own recommendation. Confirmed
+`recordOwnedBlockedSweepTerminal`'s match
+(`coordinatorItemMatchesQueuedTabRuntime`) requires the confirming tab to
+*be* the coordinator item's own tracked `tabId`/`activeTabId` -- true for
+the sweep flow (it only ever probes queue-runtime-owned tabs already
+registered via `queueRuntime.addActiveQueuedTab`), but false by
+construction at every real call site of
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab` (active-without-actor
+reconcile, action-lease tab gone, runtime-authority mismatch,
+active-with-pending-action profile mismatch): those call sites exist
+specifically because the item's own tracked tab is missing, stale, or
+mismatched, and a *different* live tab -- found via
+`liveProfileTabsByHref`, not queue-runtime bookkeeping -- was
+independently probed and confirmed blocked. So the two call sites'
+available data does *not* match closely enough to share one handler: the
+fallback's pre-existing "try `BLOCKED_SWEEP_TERMINAL_RECORD` first" attempt
+(added 2026-07-01, before this finding) always failed that tab-identity
+check and fell through to the `PROGRESS_PATCH_RECORD` detour -- dead-weight
+extra work disguised as a real second attempt.
+
+Fix: added `BLOCKED_LIVE_TAB_TERMINAL_RECORD`, a sibling event registered
+in `swQueueMachineEvents.js` and handled in `swQueueMachineHandlers.js`
+exactly like `BLOCKED_SWEEP_TERMINAL_RECORD`, whose handler is a new
+function, `recordActiveBlockedLiveTabTerminal` (`shared/js/sw.js`, next to
+`recordOwnedBlockedSweepTerminal`). It shares the identical classify ->
+transition -> authority-write -> stat shape (same
+`classifyBlockConfirmationFromItem` call, same
+`transitionCoordinatorItemFromProgress` preview-then-mutate pair so
+`recordCoordinatorProfileActionOutcomeStat`'s existing dedup-by-`mapped`-
+reference logic records the `profileAction.reallyBlocked`/`alreadyBlocked`
+stat exactly once, same `coordinatorAuthority.applyWithinStorageUpdate` +
+derived-runs-save tail as the sweep function), but deliberately drops
+`coordinatorItemMatchesQueuedTabRuntime`/`queueRuntime.hasActiveQueuedTab`
+and matches by href + attempt identity only
+(`hasMismatchedCoordinatorAttempt`) -- the same staleness guard
+`recordOwnedBlockedSweepTerminal` applies *alongside* its stricter
+tab-identity check, not in place of it. Weakening that stricter check for
+the sweep flow too (to let one function serve both) was rejected as
+changing a different call site's guarantee to fit this one.
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback now
+dispatches only `BLOCKED_LIVE_TAB_TERMINAL_RECORD` (no more
+`BLOCKED_SWEEP_TERMINAL_RECORD` pre-attempt, no more
+`recordCoordinatorJobProgressViaQueueMachine`/`PROGRESS_PATCH_RECORD`
+detour); the `allowBlockedLiveTabSender` escape hatch that detour needed
+for this call site's sender-tab mismatch (in
+`swCoordinatorProgressRules.js`'s
+`getActiveCoordinatorProgressSenderTabMismatchReason`) is now dead and was
+removed.
+
+Two operational registrations the finding didn't anticipate, needed to
+make the new write path durable rather than silently rejected:
+`'active-blocked-live-tab-terminal'` added to `sw.js`'s
+`COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS` allowlist (mirrors
+`'background-blocked-sweep-terminal'`), and
+`"blocked-live-tab-terminal-result"` added to `swflightRecorder.js`'s
+`FLIGHT_RECORDER_KINDS` allowlist.
+
+Regression coverage for the gap the finding flagged (item 1): added two
+`test/swSynthetic.test.js` cases exercising the
+`profileAction.reallyBlocked`/`alreadyBlocked` stat specifically through
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab` (previously untested
+via either fallback -- the only prior coverage drove the stat through the
+generic `recordCoordinatorJobProgress` path). Both deliberately confirm
+via a live tab whose id differs from the queue row's own tracked `tabId`,
+proving the tab-identity independence this fix depends on.
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab` and
+`recordOwnedBlockedSweepTerminal`'s sibling
+`recordActiveBlockedLiveTabTerminal` also got new static-shape assertions
+in `test/p1-contract.test.js` (mirroring the existing `recordSweepBody`
+block), and the existing `activeBlockedLiveBody`/`senderGateBody`
+assertions were updated to match the new shape instead of the removed
+detour. `storage-authority-callsite-inventory-2026-05-20.md` got a row for
+`recordActiveBlockedLiveTabTerminal` (required by the "snapshot state
+writes carry inventoried authority reasons" contract test).
+
+Verified: `npm run test:parallel` green (including the two pre-existing
+integration tests that exercise this function through other real call
+sites -- `active-with-pending-action` and `action-lease-tab-still-live`
+scenarios -- which now go through the new event too and still pass),
+`npm run lint:block-classification` green, `npm run lint:queue-boundary`
+green (one false-positive from a comment's phrasing fixed along the way),
+`npm run lint:duplicates` unaffected (`sw.js` is not scanned by the
+current jscpd config regardless of this change).
+
 **P3-4 -- `blockProfile()` await-fix (`content.js`, fully independent of
 P3-1..3, safe to dispatch any time, in parallel with the others).**
 In `shared/js/content.js`'s `blockProfile()` (two call sites, currently
@@ -3603,8 +3690,12 @@ drift between the two call sites). Once P3-5 lands: P3-6. Do not start
 P3-2/P3-3 before P3-1 merges, or P3-6 before P3-5 merges -- both are
 audit-then-build pairs specifically so a reducer gap gets fixed once, in
 `jobState.js`, instead of twice as two different workarounds.
-P3-2/P3-3 are currently BLOCKED (see the "P3-2/P3-3 finding" above) --
-do not dispatch them again until that finding's two prerequisites (stat
-test coverage; a domain decision on skipping
-`recordCoordinatorJobProgressRecords`'s guard/recovery branches for the
-live-tab-blocked fallback) are resolved.
+P3-2/P3-3 are RESOLVED (see the "P3-2/P3-3 resolution" above, 2026-09-17
+follow-up session) -- do not dispatch them again. `recordOwnedBlockedSweepTerminal`
+(P3-3's target) was left as-is (still the direct
+`coordinatorAuthority`/`transitionCoordinatorItemFromProgress` writer it
+already was, per the original finding's option (b) for that call site);
+`terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback (P3-2's
+target) now dispatches its own `BLOCKED_LIVE_TAB_TERMINAL_RECORD` event
+through a sibling handler (`recordActiveBlockedLiveTabTerminal`) instead
+of the `PROGRESS_PATCH_RECORD` detour it used before.

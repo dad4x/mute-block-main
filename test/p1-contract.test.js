@@ -2234,6 +2234,7 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     const sweepBody = extractFunction(swSource, 'async function sweepOwnedBlockedProfileTabs(parentTabId)')
     const serviceWorkerSweepBody = extractFunction(swSource, 'async function sweepServiceWorkerBlockedProfileTabs()')
     const recordSweepBody = extractFunction(swSource, 'async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response = {})')
+    const recordActiveBlockedLiveTabBody = extractFunction(swSource, 'async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, response = {})')
     const scheduleSweepBody = extractFunction(swSource, 'function scheduleOwnedBlockedProfileSweep(parentTabId, delayMs = 3000)')
     const activeBlockedLiveBody = extractFunction(swSource, 'async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = \'\', expectedItem = null, expectedRecord = null, liveProfileTabsByHref = new Map(), reason = \'active-blocked-live-tab\')')
     // shouldApplyExplicitProgressStatusToCoordinatorItem/
@@ -2295,6 +2296,31 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(recordSweepBody, /scheduleQueuedWorkContinuation\('background-blocked-sweep-terminal'\)[\s\S]*const nextQueue = coordinatorAuthority\.current\(\)\.queue/)
     assert.match(recordSweepBody, /saveCoordinatorState\(\{[\s\S]*runs: nextRuns[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*progress: false/)
     assert.match(recordSweepBody, /if\(result\?\.terminal\)/)
+    // recordActiveBlockedLiveTabTerminal (BLOCKED_LIVE_TAB_TERMINAL_RECORD):
+    // the sibling added 2026-09-17 for terminalizeActiveCoordinatorItemFromBlockedLiveTab's
+    // fallback (P3-2/P3-3, sw-state-machine-decomposition-plan-2026-09-01.md).
+    // Same classify -> transition -> authority-write -> stat shape as
+    // recordSweepBody above, but deliberately does NOT gate on
+    // coordinatorItemMatchesQueuedTabRuntime/queueRuntime.hasActiveQueuedTab
+    // -- this call site's confirming tab is never the item's own tracked
+    // tabId (that's why this fallback exists), so it matches by href +
+    // attempt identity (hasMismatchedCoordinatorAttempt) only.
+    assert.doesNotMatch(recordActiveBlockedLiveTabBody, /coordinatorItemMatchesQueuedTabRuntime/)
+    assert.doesNotMatch(recordActiveBlockedLiveTabBody, /queueRuntime\.hasActiveQueuedTab/)
+    assert.match(recordActiveBlockedLiveTabBody, /hasMismatchedCoordinatorAttempt\(item, record\)/)
+    assert.match(recordActiveBlockedLiveTabBody, /hasMismatchedCoordinatorAttempt\(currentItem, record\)/)
+    assert.match(recordActiveBlockedLiveTabBody, /!attemptId/)
+    assert.match(recordActiveBlockedLiveTabBody, /normalizedProfileHref !== resolvedProfileHref/)
+    assert.doesNotMatch(recordActiveBlockedLiveTabBody, /recordCoordinatorJobProgress\(/)
+    assert.match(recordActiveBlockedLiveTabBody, /enqueueSpaceFeedStorageUpdate\(async \(\) => \{/)
+    assert.match(recordActiveBlockedLiveTabBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: 'activeBlockedLiveTabTerminal\.load'/)
+    assert.match(recordActiveBlockedLiveTabBody, /status: classification\.status,[\s\S]{0,120}foundBlockedBeforeQueue: classification\.foundBlockedBeforeQueue/)
+    assert.match(recordActiveBlockedLiveTabBody, /buildLiveTabConfirmedRecord\(classifyBlockConfirmationFromItem\(item\)\)/)
+    assert.match(recordActiveBlockedLiveTabBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'active-blocked-live-tab-terminal'/)
+    assert.match(recordActiveBlockedLiveTabBody, /deferProjectionSave: true/)
+    assert.match(recordActiveBlockedLiveTabBody, /scheduleQueuedWorkContinuation\('active-blocked-live-tab-terminal'\)[\s\S]*const nextQueue = coordinatorAuthority\.current\(\)\.queue/)
+    assert.match(recordActiveBlockedLiveTabBody, /saveCoordinatorState\(\{[\s\S]*runs: nextRuns[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*progress: false/)
+    assert.match(recordActiveBlockedLiveTabBody, /if\(result\?\.terminal\)/)
     assert.match(scheduleSweepBody, /sweepOwnedBlockedProfileTabs\(parentTabId\)/)
     assert.match(scheduleSweepBody, /if\(result\?\.signaled\) return/)
     assert.match(scheduleSweepBody, /queueRuntime\.listActiveQueuedTabIds\(\)/)
@@ -2321,12 +2347,23 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     // sweep terminalizations this session went through this exact shape
     // and were all misclassified, accounting for most of the "I've seen
     // ~10 real blocks but the dashboard shows 2" discrepancy the user
-    // reported. Fixed by extracting classifyBlockConfirmationFromItem
-    // (shared with recordOwnedBlockedSweepTerminal above) instead of
-    // duplicating the same branch a second time.
-    assert.match(activeBlockedLiveBody, /const fallbackClassification = classifyBlockConfirmationFromItem\(expectedItem\)/)
-    assert.match(activeBlockedLiveBody, /recordCoordinatorJobProgressViaQueueMachine\(href, \{[\s\S]*status: fallbackClassification\.status,[\s\S]*foundBlockedBeforeQueue: fallbackClassification\.foundBlockedBeforeQueue,[\s\S]*blockSucceeded: true/)
-    assert.match(activeBlockedLiveBody, /allowBlockedLiveTabSender: true/)
+    // reported. Originally patched via classifyBlockConfirmationFromItem
+    // feeding a recordCoordinatorJobProgressViaQueueMachine detour (with an
+    // allowBlockedLiveTabSender escape hatch for that pipeline's sender-tab
+    // gate); converged 2026-09-17 (P3-2/P3-3,
+    // sw-state-machine-decomposition-plan-2026-09-01.md) onto a dedicated
+    // BLOCKED_LIVE_TAB_TERMINAL_RECORD event/handler
+    // (recordActiveBlockedLiveTabTerminal) instead -- a sibling of
+    // recordOwnedBlockedSweepTerminal's BLOCKED_SWEEP_TERMINAL_RECORD, not
+    // that same handler, because recordOwnedBlockedSweepTerminal's
+    // coordinatorItemMatchesQueuedTabRuntime match requires the confirming
+    // tab to be the item's own tracked tabId -- never true at this call
+    // site, whose whole premise is a live tab found independently of that
+    // tracking.
+    assert.match(activeBlockedLiveBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'BLOCKED_LIVE_TAB_TERMINAL_RECORD'[\s\S]*tabId,[\s\S]*metadata: terminalMetadata,[\s\S]*response: terminalResponse/)
+    assert.doesNotMatch(activeBlockedLiveBody, /BLOCKED_SWEEP_TERMINAL_RECORD/)
+    assert.doesNotMatch(activeBlockedLiveBody, /recordCoordinatorJobProgressViaQueueMachine/)
+    assert.doesNotMatch(activeBlockedLiveBody, /allowBlockedLiveTabSender/)
     assert.match(activeBlockedLiveBody, /for\(const closeCandidate of matches\.length > 1 \? matches : \[\{tab: match\.tab, response: match\.response\}\]\)/)
     assert.match(activeBlockedLiveBody, /await releaseQueuedTabAndCleanup\(closeTabId, \{awaitFill: closeTabId === tabId\}\)/)
     assert.match(activeBlockedLiveBody, /browser\.tabs\.remove\(closeTabId\)/)
@@ -2354,7 +2391,12 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(queuedReclaimReasonBody, /active-transition-failed/)
     assert.match(queuedReclaimReasonBody, /active-missing-tab/)
     assert.match(statusGateBody, /options\.requireActiveSenderTab === true/)
-    assert.match(senderGateBody, /options\.allowBlockedLiveTabSender === true/)
+    // allowBlockedLiveTabSender (the PROGRESS_PATCH_RECORD pipeline's
+    // escape hatch for this call site's sender-tab mismatch) was removed
+    // 2026-09-17 when this call site converged onto its own dedicated
+    // BLOCKED_LIVE_TAB_TERMINAL_RECORD event above instead of routing
+    // through this gate at all.
+    assert.doesNotMatch(senderGateBody, /allowBlockedLiveTabSender/)
     assert.match(statusGateBody, /isActiveCoordinatorStatus\(item\?\.status \|\| ''\)/)
     assert.match(recordBatchBody, /reason: 'inactive-sender-tab'/)
 })
