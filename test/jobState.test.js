@@ -438,21 +438,40 @@ test('retry accepts matching source attempt and advances to fresh identity', () 
     assert.equal(result.item.attemptNumber, 3)
 })
 
-test('exhausted rollback recovery approves via the queueOnlyAuthority shortcut', () => {
-    const result = reduceJobEvent({
-        status: 'failed',
+// The four tests below exercise jobState.js's redesigned JOB_EVENT_RETRY
+// handling (P3-5/P3-6 design correction, 2026-09-17): reduceJobEvent now
+// computes isExhausted, activeTransitionRetry, runtimeDisappearedRetry,
+// transientOpenRetry, and queueAuthoritative itself from `item`, so the
+// fixtures below build a REALISTIC queued row (status, actionLeaseReleaseReason,
+// attempt identity, retryAttempt/maxRetries, serviceWorkerOwned) rather than
+// asserting a caller-claimed isExhausted/queueAuthoritative/etc. boolean the
+// reducer no longer trusts. event.exhaustedRolledBackRecovery now carries
+// only caller intent (queueOnlyAuthority, recoverActiveTransitionFailures,
+// recoverTransientOpenRetry, recoverQueueLoadPressure, serviceWorkerOwned's
+// caller override) plus a raw queueLoadPressure reading -- never a
+// precomputed verdict.
+function makeExhaustedRolledBackQueuedRow(overrides = {}) {
+    return {
+        status: 'queued',
         attemptId: 'old-attempt',
         attemptNumber: 1,
-        exhaustedRolledBackRecoveryCount: 2
-    }, {
+        actionLeaseReleaseReason: 'active-transition-failed',
+        retryAttempt: 1,
+        maxRetries: 1,
+        serviceWorkerOwned: true,
+        exhaustedRolledBackRecoveryCount: 2,
+        ...overrides
+    }
+}
+
+test('exhausted rollback recovery approves via the queueOnlyAuthority shortcut', () => {
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow(), {
         type: JOB_EVENT_RETRY,
         attemptId: 'new-attempt',
         attemptNumber: 2,
         at: 1000,
         retryCount: 1,
         exhaustedRolledBackRecovery: {
-            isExhausted: true,
-            recoveryLimit: 3,
             queueOnlyAuthority: true
         }
     })
@@ -462,25 +481,22 @@ test('exhausted rollback recovery approves via the queueOnlyAuthority shortcut',
     assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
 })
 
-test('exhausted rollback recovery approves via the active-transition reason-match branch', () => {
-    const result = reduceJobEvent({
-        status: 'failed',
-        attemptId: 'old-attempt',
-        attemptNumber: 1,
-        exhaustedRolledBackRecoveryCount: 2
-    }, {
+test('exhausted rollback recovery approves via the active-transition reason-match branch, computed entirely from the item', () => {
+    // The event omits activeTransitionRetry/queueAuthoritative/serviceWorkerOwned
+    // entirely -- only recoverActiveTransitionFailures (a genuine caller
+    // intent flag) travels on the event. The reducer must derive the reason
+    // match from item.actionLeaseReleaseReason and queue authority from
+    // item.serviceWorkerOwned on its own to approve this.
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
+        actionLeaseReleaseReason: 'active-transition-failed'
+    }), {
         type: JOB_EVENT_RETRY,
         attemptId: 'new-attempt',
         attemptNumber: 2,
         at: 1000,
         retryCount: 1,
         exhaustedRolledBackRecovery: {
-            isExhausted: true,
-            recoveryLimit: 3,
-            recoverActiveTransitionFailures: true,
-            activeTransitionRetry: true,
-            queueAuthoritative: true,
-            serviceWorkerOwned: true
+            recoverActiveTransitionFailures: true
         }
     })
 
@@ -489,26 +505,46 @@ test('exhausted rollback recovery approves via the active-transition reason-matc
     assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
 })
 
-test('exhausted rollback recovery approves a transient-open retry under queue-load pressure', () => {
-    const result = reduceJobEvent({
-        status: 'failed',
-        attemptId: 'old-attempt',
-        attemptNumber: 1,
-        exhaustedRolledBackRecoveryCount: 2
-    }, {
+test('exhausted rollback recovery approves via the runtime-disappeared reason-match branch, computed entirely from the item', () => {
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
+        actionLeaseReleaseReason: 'runtime-authority-missing-active-row'
+    }), {
         type: JOB_EVENT_RETRY,
         attemptId: 'new-attempt',
         attemptNumber: 2,
         at: 1000,
         retryCount: 1,
         exhaustedRolledBackRecovery: {
-            isExhausted: true,
-            recoveryLimit: 3,
+            recoverActiveTransitionFailures: true
+        }
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'queued')
+    assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
+test('exhausted rollback recovery approves a transient-open retry under queue-load pressure from a raw throttle reading', () => {
+    // recoverTransientOpenRetry is NOT set -- only the pressure path can
+    // approve here, and it must be earned from a raw, unlabeled throttle
+    // reading (active + reason), which the reducer itself interprets
+    // against its regex/window policy, not a caller-asserted pressureOpenRetry
+    // boolean.
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
+        actionLeaseReleaseReason: 'queued-tab-release-fast-executor-preflight'
+    }), {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
             recoverActiveTransitionFailures: true,
-            transientOpenRetry: true,
-            pressureOpenRetry: true,
-            queueAuthoritative: true,
-            serviceWorkerOwned: true
+            recoverQueueLoadPressure: true,
+            queueLoadPressure: {
+                active: true,
+                reason: 'queue-load-pressure-detected'
+            }
         }
     })
 
@@ -518,28 +554,66 @@ test('exhausted rollback recovery approves a transient-open retry under queue-lo
 })
 
 test('exhausted rollback recovery count cap rejects regardless of which branch would otherwise approve', () => {
-    const result = reduceJobEvent({
-        status: 'failed',
-        attemptId: 'old-attempt',
-        attemptNumber: 1,
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
         exhaustedRolledBackRecoveryCount: 3
-    }, {
+    }), {
         type: JOB_EVENT_RETRY,
         attemptId: 'new-attempt',
         attemptNumber: 2,
         at: 1000,
         retryCount: 1,
         exhaustedRolledBackRecovery: {
-            isExhausted: true,
-            recoveryLimit: 3,
             queueOnlyAuthority: true
         }
     })
 
     assert.equal(result.accepted, false)
     assert.equal(result.reason, 'exhausted-rollback-recovery-denied')
-    assert.equal(result.item.status, 'failed')
+    assert.equal(result.item.status, 'queued')
     assert.equal(result.item.exhaustedRolledBackRecoveryCount, 3)
+})
+
+test('exhausted rollback recovery ignores a queueOnlyAuthority claim when the item is not actually exhausted', () => {
+    // retryAttempt is below maxRetries, so isExhaustedRolledBackQueuedTabRetry
+    // computes false from the item regardless of what the caller claims via
+    // intent -- the reducer no longer trusts a caller-asserted isExhausted.
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
+        retryAttempt: 0,
+        maxRetries: 1
+    }), {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            queueOnlyAuthority: true
+        }
+    })
+
+    assert.equal(result.accepted, false)
+    assert.equal(result.reason, 'exhausted-rollback-recovery-denied')
+})
+
+test('exhausted rollback recovery reason-match branch rejects when the item is not queue-authoritative or service-worker owned', () => {
+    // serviceWorkerOwned is false on the item and the event supplies no
+    // override -- queueAuthoritative/serviceWorkerOwned are item-derived, so
+    // recoverActiveTransitionFailures alone cannot approve this.
+    const result = reduceJobEvent(makeExhaustedRolledBackQueuedRow({
+        serviceWorkerOwned: false
+    }), {
+        type: JOB_EVENT_RETRY,
+        attemptId: 'new-attempt',
+        attemptNumber: 2,
+        at: 1000,
+        retryCount: 1,
+        exhaustedRolledBackRecovery: {
+            recoverActiveTransitionFailures: true
+        }
+    })
+
+    assert.equal(result.accepted, false)
+    assert.equal(result.reason, 'exhausted-rollback-recovery-denied')
 })
 
 test('classifies stale security-verification rows as retryable only with fresh transient progress', () => {
