@@ -77,6 +77,7 @@ function registerServiceWorkerListeners(deps = {}) {
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
         hasStoredCoordinatorWorkInQueueView,
+        recordInitialBlockedStateFromRequest,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
         isBrowserTabId,
@@ -693,6 +694,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'request-action-lease') {
             return requestCoordinatorActionLease(request, sender)
+        }
+        else if(request.action === 'record-initial-blocked-state') {
+            return recordInitialBlockedStateFromRequest(request, sender)
         }
         else if(request.action === 'heartbeat-action-lease') {
             return heartbeatCoordinatorActionLease(request, sender)

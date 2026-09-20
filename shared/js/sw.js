@@ -52,6 +52,9 @@ const {
     WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS
 } = require('./timeouts')
 const {
+    COORDINATOR_ENQUEUE_CHUNK_SIZE
+} = require('./coordinatorEnqueueChunking')
+const {
     activateCheckpoint,
     appendWalRecordsToGeneration,
     applyWalRecord,
@@ -398,8 +401,32 @@ const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 // 2026-09-13 TODO). Chunking a large enqueue into several smaller durable
 // commits lets a threshold crossing land between chunks instead of only
 // after the whole batch. Small enqueues (the common case) are left alone.
+//
+// 2026-09-19: this used to be the ONLY chunking for a large enqueue -- one
+// big message in, split internally into COORDINATOR_ENQUEUE_CHUNK_SIZE
+// sub-batches, each awaited in a tight loop before the next started. That
+// fixed the WAL-segment danger above, but each chunk re-entered the shared
+// serialized write chain via a pure microtask continuation with no real
+// macrotask yield in between, so a big batch still monopolized that chain
+// for its whole duration -- starving every other pending durable write
+// (milestone stamps, terminal settlements) for as long as the batch ran.
+// Confirmed live and root-caused in live-batch-fixes-worklist-2026-09-19.md
+// items 3/4. An artificial timer-based yield between chunks was tried and
+// reverted: it requires every test that exercises this path to know to
+// manually advance the harness's fake clock (test/lib/swHarness.js runs
+// sw.js in a vm sandbox with fully fake, manually-ticked timers), and a
+// test that doesn't do that just hangs forever on the dangling promise --
+// which, since nothing else keeps Node's real event loop alive, exits the
+// whole test process silently at that point with no failure ever reported
+// (swSynthetic.test.js went from 536 to 281 "ok" lines, exit 0, no error).
+// The actual fix moved chunking to the poster instead (content.js's
+// sendCoordinatorEnqueueChunked): each chunk is now its own separate
+// enqueue-coordinator-items message, so the gap between chunks is a real
+// macrotask (message dispatch), giving other writers a genuine turn, with
+// nothing here needing a clock at all. This threshold/size pair stays as a
+// defensive backstop for the WAL-segment danger above, in case anything
+// ever posts an oversized single message despite that.
 const COORDINATOR_ENQUEUE_CHUNK_THRESHOLD = 100
-const COORDINATOR_ENQUEUE_CHUNK_SIZE = 50
 // 2026-09-16: settleTerminalCoordinatorItemsLocked processes its hrefs one at
 // a time, awaiting a full settlement round-trip per href, inside ONE
 // enqueueSpaceFeedStorageUpdate cycle -- fine for the single-href call sites,
@@ -674,6 +701,13 @@ let coordinatorAuthorityShadowWalProjectionSnapshotSeq = 0
 let coordinatorAuthorityShadowWalProjectionMaxSeq = 0
 let coordinatorAuthorityShadowWalAppliedIds = new Set()
 let coordinatorQueueWalCheckpointSwitchPromise = null
+// 2026-09-19: set by scheduleCoordinatorQueueWalCheckpointSwitch when a
+// threshold crossing makes a switch due, and drained by
+// maybeRunDueCoordinatorQueueWalCheckpointSwitchInline as a prefix step on
+// whichever ordinary storage update happens to run next -- see that
+// function's comment for why the switch no longer gets its own position in
+// the shared write queue at all.
+let coordinatorQueueWalCheckpointSwitchDueReason = ''
 let coordinatorQueueWalAutoRecoveryPersistPromise = null
 // 2026-09-15 resident WAL store cache: canUseResidentCoordinatorQueueWalStoreForMeta
 // (swCoordinatorQueueWal.js) has always been correct -- given a candidate
@@ -6492,27 +6526,79 @@ function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-thre
     // forceOverQueueWork now only distinguishes the metric/log reason
     // (segmentHardLimit vs segmentSoftSwitch); every call switches
     // immediately either way.
+    //
+    // 2026-09-19: "switches immediately" used to mean "calls
+    // switchCoordinatorAuthorityQueueWalCheckpoint right now," which itself
+    // joins the shared serialized write queue like any other write -- fine
+    // when that queue is short, but under real concurrent load (many active
+    // tabs each writing their own confirmations) the switch could end up
+    // waiting behind hundreds of queued writes for many minutes. While it
+    // waited, ordinary appends kept growing the WAL tail past its intended
+    // ~128-record checkpoint interval, making every read's replay -- and so
+    // every write's turn -- progressively more expensive, which backed the
+    // queue up further still: confirmed live 2026-09-19 (a 3.4-hour epoch
+    // with exactly one successful checkpoint, a WAL tail that grew to 493
+    // records, and secs/handoff going from ~31s to ~262s as the write queue
+    // wait climbed past 200s average). The switch is a different class of
+    // operation from an ordinary business write -- it doesn't affect which
+    // queue item processes before another, it's pure storage housekeeping --
+    // so instead of giving it its own position in that queue, this just
+    // marks one due. maybeRunDueCoordinatorQueueWalCheckpointSwitchInline
+    // drains it as a prefix step on whichever ordinary write happens to run
+    // next, which is normally far sooner than waiting for a new entry to
+    // reach the tail of an already-long queue, while still running fully
+    // inside that write's own exclusive turn (no separate locking needed,
+    // and no risk of racing a concurrent WAL mutation the way running it
+    // fully unserialized would).
     const forceOverQueueWork = (Number.parseInt(committedSegments, 10) || 0) >=
         COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT
     if(forceOverQueueWork) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork')
     }
-    if(coordinatorQueueWalCheckpointSwitchPromise) {
+    if(coordinatorQueueWalCheckpointSwitchPromise || coordinatorQueueWalCheckpointSwitchDueReason) {
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchCoalesced')
-        return coordinatorQueueWalCheckpointSwitchPromise
+        return coordinatorQueueWalCheckpointSwitchPromise || Promise.resolve({
+            checkpointSwitched: false,
+            saved: false,
+            durable: false,
+            reason: 'switch-due-pending'
+        })
     }
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled')
-    coordinatorQueueWalCheckpointSwitchPromise = switchCoordinatorAuthorityQueueWalCheckpoint({
+    coordinatorQueueWalCheckpointSwitchDueReason = normalizedReason
+    return Promise.resolve({
+        checkpointSwitched: false,
+        saved: false,
+        durable: false,
+        reason: 'switch-due-inline'
+    })
+}
+
+// Drains a due WAL checkpoint-switch (see scheduleCoordinatorQueueWalCheckpointSwitch's
+// comment) as a prefix step inside whichever ordinary storage update is
+// about to run next -- called from enqueueSpaceFeedStorageUpdate, so this
+// always runs already inside that update's own exclusive turn on the
+// shared serialized queue. That's what makes this safe without any locking
+// of its own: performCoordinatorQueueWalCheckpointSwitch reads then writes
+// the same WAL storage keys an ordinary write could also touch, so it must
+// never run concurrently with one -- it just no longer needs its OWN
+// position in the queue to get that guarantee. Plain awaited, not raced
+// against a timeout: unlike a read-only recovery, abandoning a caller here
+// while the write kept running in the background would let a business
+// write start before this one's storage.set actually lands, which is
+// exactly the concurrent-WAL-mutation risk this exists to avoid.
+async function maybeRunDueCoordinatorQueueWalCheckpointSwitchInline() {
+    if(!coordinatorQueueWalCheckpointSwitchDueReason) return
+    const reason = coordinatorQueueWalCheckpointSwitchDueReason
+    coordinatorQueueWalCheckpointSwitchDueReason = ''
+    coordinatorQueueWalCheckpointSwitchPromise = performCoordinatorQueueWalCheckpointSwitch({
         metricPath: `queueWal.${reason}.load`,
         saveMetricPath: `queueWal.${reason}.save`,
-        timeoutMs: COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS,
         suppressCheckpointSwitchSchedule: true,
-        switchReason: normalizedReason
-    }).finally(() => {
-        coordinatorQueueWalCheckpointSwitchPromise = null
-    })
-    void coordinatorQueueWalCheckpointSwitchPromise
-    return coordinatorQueueWalCheckpointSwitchPromise
+        switchReason: reason
+    }).catch(() => null)
+    await coordinatorQueueWalCheckpointSwitchPromise
+    coordinatorQueueWalCheckpointSwitchPromise = null
 }
 
 async function cleanupRetiredCoordinatorQueueWalPhysicalKeys(previousMeta = null, nextMeta = null, options = {}) {
@@ -7144,16 +7230,18 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     }
 }
 
-async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
-    const failureResult = {
-        checkpointSwitched: false,
-        saved: false,
-        durable: false,
-        reason: 'storage-update-fallback'
-    }
-
-    return enqueueSpaceFeedStorageUpdate(async () => {
-        const stored = await metricStorageGet({
+// Extracted 2026-09-19 from switchCoordinatorAuthorityQueueWalCheckpoint so
+// maybeRunDueCoordinatorQueueWalCheckpointSwitchInline can run this same
+// logic as a plain awaited call inside an update that's already executing
+// its own turn on the shared queue, instead of nesting another enqueue()
+// call inside it (which would deadlock -- a nested enqueue() chains onto
+// the tail promise the outer call itself contributed, which can't resolve
+// until the outer call, still waiting on the nested one, returns). Assumes
+// the caller already holds the shared queue's exclusive turn; never call
+// this directly outside that guarantee -- switchCoordinatorAuthorityQueueWalCheckpoint
+// below is the one that provides it.
+async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
+    const stored = await metricStorageGet({
             ...getCoordinatorQueueWalStorageDefaults()
         }, {
             metricPath: options.metricPath || 'queueWal.checkpointSwitch.load'
@@ -7363,7 +7451,24 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
             preSegmentedWalMonolithCleanup,
             queue: recoveredQueue
         }
-    }, {
+}
+
+// Public entry point: gives performCoordinatorQueueWalCheckpointSwitch its
+// required exclusive turn on the shared serialized queue, same as before
+// this was split out -- used directly by tests and available for any other
+// caller that wants a switch right now rather than merely marking one due.
+// The auto-triggered threshold path (scheduleCoordinatorQueueWalCheckpointSwitch)
+// no longer calls this; it just sets the due flag that
+// maybeRunDueCoordinatorQueueWalCheckpointSwitchInline drains instead.
+async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
+    const failureResult = {
+        checkpointSwitched: false,
+        saved: false,
+        durable: false,
+        reason: 'storage-update-fallback'
+    }
+
+    return enqueueSpaceFeedStorageUpdate(() => performCoordinatorQueueWalCheckpointSwitch(options), {
         reason: 'coordinator-authority.queueWal.checkpointSwitch',
         timeoutMs: options.timeoutMs,
         failureValue: failureResult
@@ -13093,6 +13198,7 @@ const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher
             confirmSpaceFeedProfilesBlocked,
             enqueueCoordinatorItemsStorageLocked,
             markQueuedProfileResolutionUnresolved,
+            mutateCoordinatorInitialBlockedState,
             mutateCoordinatorActionLeaseHeartbeat,
             mutateCoordinatorActionLeaseRelease,
             mutateCoordinatorActionLeaseRequest,
@@ -14533,8 +14639,40 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
 // set only once a direct block click is actually dispatched, is the one
 // durable record of which case this is. Extracted 2026-09-17 after fixing
 // the same hardcoded-'already-blocked' bug in two separate places.
-function classifyBlockConfirmationFromItem(item = null) {
-    const wasBlockAttempted = (Number.parseInt(item?.milestones?.blockAttemptedAt, 10) || 0) > 0
+//
+// item.milestones.blockAttemptedAt is durable but not fast: it lands via
+// the same single serialized coordinator storage-update chain as every
+// other write this project makes, so a busy chain (e.g. a large space-feed
+// enqueue in flight) can leave it unset for a while after the block
+// actually happened -- confirmed live 2026-09-19 as the reason "really
+// blocked" stayed near 0% under load despite blocks genuinely succeeding.
+// response.blockAttempted, when the content script sets it, comes straight
+// from that same tab's own in-memory action state with no storage round
+// trip at all, so it's preferred here whenever present; item.milestones is
+// still the fallback for callers that don't have a response to offer.
+//
+// 2026-09-19: both of those signals are scoped to the CURRENT attempt's own
+// tab/content-script realm, so a retry (a fresh tab, fresh in-memory state)
+// has no way to know that an *earlier* attempt was the one that actually
+// clicked block -- if that earlier attempt's confirmation got lost or timed
+// out (forcing the retry that eventually confirms it), the confirming
+// attempt correctly reports "I didn't click anything" and this function
+// used to have no way to disagree, misclassifying a real block as already-
+// blocked. item.initialBlockedState (see mutateCoordinatorInitialBlockedState)
+// is captured once, from whichever attempt is first to observe it, and
+// never overwritten by a later attempt -- so it survives retries. When
+// known, it's authoritative: if the item started out NOT blocked, any later
+// confirmation that it's blocked now must be this extension's own doing,
+// regardless of which attempt happens to be the one that confirms it. Falls
+// back to the per-attempt signals above when it's still unknown (e.g. an
+// item that reaches this function before any attempt ever got a chance to
+// observe blocked-state at all).
+function classifyBlockConfirmationFromItem(item = null, response = null) {
+    const initialBlockedState = `${item?.initialBlockedState || ''}`.trim()
+    const wasBlockAttempted = initialBlockedState === 'not-blocked' ? true
+        : initialBlockedState === 'blocked' ? false
+        : response?.blockAttempted === true ||
+            (Number.parseInt(item?.milestones?.blockAttemptedAt, 10) || 0) > 0
     return {
         wasBlockAttempted,
         status: wasBlockAttempted ? 'blocked' : 'already-blocked',
@@ -21194,15 +21332,55 @@ async function enqueueCoordinatorItems(request = {}, sender = {}) {
 // caller already got -- this just gives the dashboard a durable place to
 // read them from later, since they were previously only visible in the
 // capped mbCoordinatorEvents log's free-text message.
+//
+// "requested" only counts items that actually reached this message -- a
+// space-feed submission can drop candidates (already nuked, no resolvable
+// profile link, several posts by the same author collapsing to one profile)
+// entirely client-side before the request is even built, which used to make
+// a big selection look like most of it silently vanished with nothing to
+// explain why. Optional preFilter breakdown (see formatSpaceFeedPreFilterBreakdown
+// in content.js) carries that pre-request context through so the dashboard
+// can show it too, not just the page that submitted the batch.
+//
+// 2026-09-19: a large batch is now posted as several separate
+// enqueue-coordinator-items messages (see content.js's
+// sendCoordinatorEnqueueChunked, and COORDINATOR_ENQUEUE_CHUNK_THRESHOLD's
+// comment above for why the old single-message internal chunking couldn't
+// stay the whole story). Each chunk arrives here as its own call, so without
+// help this function would only ever see one chunk's small slice --
+// "50 requested" for each piece of a 657-item run, not the run as a whole.
+// The poster already knows the true run-level shape (it's the one that split
+// it), so it hands that back via storageRequest.runSummary on every chunk:
+// the constant total item count, plus how many were queued/merged by prior
+// chunks so this call only needs to add its own result on top. Falls back to
+// deriving purely from this call when runSummary isn't supplied (any
+// non-chunked caller), same as before.
 async function persistLastCoordinatorEnqueueSummary(storageRequest = {}, result = {}) {
-    const requested = Array.isArray(storageRequest.items) ? storageRequest.items.length : 0
+    const runSummary = storageRequest.runSummary && typeof storageRequest.runSummary === 'object'
+        ? storageRequest.runSummary
+        : null
+    const requested = runSummary
+        ? Number.parseInt(runSummary.requested, 10) || 0
+        : (Array.isArray(storageRequest.items) ? storageRequest.items.length : 0)
     if(!requested) return
+    const preFilterSource = runSummary?.preFilter || storageRequest.source?.preFilter
+    const preFilter = preFilterSource && typeof preFilterSource === 'object'
+        ? {
+            totalCandidates: Number.parseInt(preFilterSource.totalCandidates, 10) || 0,
+            alreadyNuked: Number.parseInt(preFilterSource.alreadyNuked, 10) || 0,
+            unqueueable: Number.parseInt(preFilterSource.unqueueable, 10) || 0,
+            duplicateProfile: Number.parseInt(preFilterSource.duplicateProfile, 10) || 0
+        }
+        : null
+    const priorQueued = runSummary ? Number.parseInt(runSummary.priorQueued, 10) || 0 : 0
+    const priorMerged = runSummary ? Number.parseInt(runSummary.priorMerged, 10) || 0 : 0
     const summary = {
         requested,
-        queued: Number.parseInt(result?.queued, 10) || 0,
-        merged: Number.parseInt(result?.merged, 10) || 0,
+        queued: priorQueued + (Number.parseInt(result?.queued, 10) || 0),
+        merged: priorMerged + (Number.parseInt(result?.merged, 10) || 0),
         runId: result?.runId || storageRequest.run?.id || '',
         sourceType: storageRequest.source?.type || storageRequest.sourceType || '',
+        ...(preFilter ? {preFilter} : {}),
         at: Date.now()
     }
     await metricStorageSet({[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: summary}, {
@@ -21741,8 +21919,31 @@ function promiseWithTimeout(promise, timeoutMs = SPACE_FEED_STORAGE_UPDATE_TIMEO
     ])
 }
 
+// Every call funnels through here -- serializedStorageUpdateQueue.enqueue
+// is not called directly anywhere else -- so this is the one place that can
+// guarantee a due WAL checkpoint-switch (see
+// maybeRunDueCoordinatorQueueWalCheckpointSwitchInline and
+// scheduleCoordinatorQueueWalCheckpointSwitch's comment) runs as a prefix
+// on whichever update is about to get its exclusive turn next, without
+// needing its own position in the queue. The due-flag check has to stay a
+// plain synchronous branch, not an `await` ahead of every update: an
+// `await` costs a microtask tick even when nothing is due (the
+// overwhelmingly common case), and this runs on literally every storage
+// update system-wide -- an extra tick per update was enough to shift a
+// handful of fixed-iteration synthetic tests (flushAsync/settle budgets
+// tuned against the old tick count) even though nothing was actually due
+// in those scenarios. Only the rare due case pays for the extra hop.
 function enqueueSpaceFeedStorageUpdate(update, options = {}) {
-    return serializedStorageUpdateQueue.enqueue(update, options)
+    return serializedStorageUpdateQueue.enqueue(() => (
+        coordinatorQueueWalCheckpointSwitchDueReason
+            ? runDueCoordinatorQueueWalCheckpointSwitchThenUpdate(update)
+            : update()
+    ), options)
+}
+
+async function runDueCoordinatorQueueWalCheckpointSwitchThenUpdate(update) {
+    await maybeRunDueCoordinatorQueueWalCheckpointSwitchInline()
+    return update()
 }
 
 async function loadProfileNukeProgress() {
@@ -23520,6 +23721,70 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
     }
 }
 
+// Stamps item.initialBlockedState exactly once per coordinator item, from
+// whichever attempt's tab is first to observe it -- and never overwritten
+// after that by a later attempt. Retries reopen a fresh tab/content-script
+// realm with no memory of what an earlier attempt did, so relying only on
+// "did THIS attempt click block" (classifyBlockConfirmationFromItem's other
+// signal, response.blockAttempted / item.milestones.blockAttemptedAt) loses
+// track of a real block that happened on an earlier attempt whose
+// confirmation got lost or timed out -- the later, confirming attempt
+// correctly reports "I didn't click anything" and gets misclassified as
+// "already blocked" even though this extension did cause the block, just on
+// an earlier attempt. Confirmed live 2026-09-19: three heavily-retried items
+// (retryCount 4, active-to-terminal durations matching a real click-through
+// flow rather than an instant already-blocked skip) all landed as
+// already-blocked. Capturing blocked-state once, from whichever attempt
+// first has a chance to observe it (content.js reports it both from
+// blockProfile's own isProfileBlocked() check and from the close-if-blocked
+// poll, whichever fires first), gives classifyBlockConfirmationFromItem a
+// signal that survives retries: if the item started out NOT blocked, any
+// later confirmation that it's blocked now must be this extension's own
+// doing, regardless of which attempt happens to be the one that confirms it.
+async function mutateCoordinatorInitialBlockedState(operation = {}) {
+    const profileHref = normalizeQuoraProfileUrl(operation.profileHref || '')
+    const blocked = operation.blocked === true
+    const reason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
+    if(reason !== 'ordinaryMutation') return {recorded: false, reason: 'invalid-initial-blocked-state-reason'}
+
+    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
+        operation.currentAuthorityState || operation.authorityState || null
+    ) || getHydratedCoordinatorAuthorityState('initialBlockedState.usedResidentAuthority') ||
+        await loadCoordinatorQueueRunsProjection({
+            metricPath: 'initialBlockedState.load'
+        })
+    const entry = findCoordinatorQueueEntryForHref(currentAuthorityState.queue, profileHref)
+    if(!entry?.item) return {recorded: false, reason: 'unknown-row'}
+    if(entry.item.initialBlockedState) return {recorded: false, reason: 'already-set'}
+
+    const authorityResult = await coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'initial-blocked-state',
+        rowKey: entry.key,
+        reason: 'ordinaryMutation',
+        metricPath: 'initialBlockedState.save',
+        currentAuthorityState,
+        // Pure bookkeeping on one row, same shape as the action-lease
+        // heartbeat precedent just below -- doesn't affect status/outcome/
+        // attempt identity, so the queue view and content-queue-index have
+        // nothing to summarize here either.
+        deferProjectionSave: true,
+        projectionPayload: 'queueViewOnly',
+        mutate(currentItem, context) {
+            if(currentItem?.initialBlockedState) return context.reject('already-set')
+            return {
+                ...currentItem,
+                initialBlockedState: blocked ? 'blocked' : 'not-blocked'
+            }
+        }
+    })
+
+    if(authorityResult?.accepted === true && authorityResult?.durable === true) {
+        return {recorded: true, initialBlockedState: authorityResult.nextRow?.initialBlockedState || ''}
+    }
+    return {recorded: false, reason: authorityResult?.reason || 'authority-apply-failed'}
+}
+
 async function mutateCoordinatorActionLeaseHeartbeat(operation = {}) {
     const profileHref = normalizeQuoraProfileUrl(operation.profileHref || '')
     const tabId = normalizeTabId(operation.tabId || null)
@@ -23783,6 +24048,25 @@ async function requestCoordinatorActionLease(request = {}, sender = {}) {
         })
     }, {
         reason: 'action-lease-request',
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
+    })
+}
+
+async function recordInitialBlockedStateFromRequest(request = {}, sender = {}) {
+    const tabId = sender.tab?.id || null
+    const metadata = tabId ? getQueuedTabMetadata(tabId) : null
+    const profileHref = normalizeQuoraProfileUrl(metadata?.profileHref || request.profileHref || request.href || '')
+    if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
+
+    return enqueueSpaceFeedStorageUpdate(() => {
+        return applyCoordinatorQueueMachineEvent({
+            type: 'INITIAL_BLOCKED_STATE_RECORD',
+            profileHref,
+            blocked: request.blocked === true,
+            currentAuthorityState: getHydratedCoordinatorAuthorityState('initialBlockedState.messageResidentAuthority')
+        })
+    }, {
+        reason: 'initial-blocked-state-record',
         timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
 }
@@ -25956,7 +26240,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
         if(!coordinatorItemMatchesQueuedTabRuntime(item, rowKey, metadata, normalizedTabId)) {
             return {recorded: false, terminal: false, reason: 'active-runtime-mismatch'}
         }
-        const record = buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(item))
+        const record = buildSweepConfirmedRecord(classifyBlockConfirmationFromItem(item, response))
         const mapped = getCoordinatorStatusFromProgress(record)
         if(hasMismatchedCoordinatorAttempt(item, record)) {
             return {recorded: false, terminal: false, reason: 'stale-attempt'}
@@ -26155,7 +26439,7 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
         if(!item || !isActiveCoordinatorStatus(item.status)) {
             return {recorded: false, terminal: false, reason: 'inactive-coordinator-item'}
         }
-        const record = buildLiveTabConfirmedRecord(classifyBlockConfirmationFromItem(item))
+        const record = buildLiveTabConfirmedRecord(classifyBlockConfirmationFromItem(item, response))
         const mapped = getCoordinatorStatusFromProgress(record)
         if(hasMismatchedCoordinatorAttempt(item, record)) {
             return {recorded: false, terminal: false, reason: 'stale-attempt'}
@@ -31600,6 +31884,7 @@ registerServiceWorkerListeners({
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
         hasStoredCoordinatorWorkInQueueView,
+        recordInitialBlockedStateFromRequest,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
         isBrowserTabId,

@@ -50,7 +50,6 @@ const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
 const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
 const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
 const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#worker-window'
-const COORDINATOR_RESUME_INTERVAL_MS = 5000
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
 const RETRY_FAILED_LIMIT = 2
@@ -103,8 +102,6 @@ const state = {
 // (not persisted, same as everything else here) -- a new attempt (retry) or
 // a different row is unaffected.
 const dismissedOutlierKeys = new Set()
-let resumeCoordinatorQueueTimer = null
-let resumeCoordinatorQueuePromise = null
 let dashboardCompactRefreshTimer = null
 let dashboardCompactRefreshScheduledTimer = null
 let dashboardCompactRefreshPromise = null
@@ -642,7 +639,6 @@ function render() {
     renderQueue(queueItems)
     checkCoordinatorOutliers(queueItems)
     renderOutliers()
-    syncCoordinatorQueueResume(queueItems)
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
     syncRequeueFailedControls(failedCount)
     syncCurrentWorkPauseControls(queueItems)
@@ -673,9 +669,27 @@ function syncLastEnqueueSummary() {
     const queued = Number.parseInt(summary.queued, 10) || 0
     const merged = Number.parseInt(summary.merged, 10) || 0
     element.hidden = false
-    element.textContent = merged > 0
-        ? `Last add: ${requested} requested -> ${queued} new, ${merged} already known`
-        : `Last add: ${requested} requested -> ${queued} new`
+
+    const noticeParts = []
+    if(merged > 0) noticeParts.push(`${merged} already known`)
+
+    // preFilter counts candidates a space-feed submission dropped before
+    // "requested" was even built (already nuked, no resolvable profile,
+    // several posts by the same author collapsing to one profile) -- without
+    // this, "requested" alone understates how big the original selection
+    // was and the drop looks unexplained.
+    const preFilter = summary.preFilter
+    const totalCandidates = Number.parseInt(preFilter?.totalCandidates, 10) || 0
+    if(preFilter && totalCandidates > requested) {
+        if(preFilter.alreadyNuked) noticeParts.push(`${preFilter.alreadyNuked} already nuked`)
+        if(preFilter.duplicateProfile) noticeParts.push(`${preFilter.duplicateProfile} duplicate profile`)
+        if(preFilter.unqueueable) noticeParts.push(`${preFilter.unqueueable} unresolvable`)
+    }
+
+    const fromLabel = preFilter && totalCandidates > requested ? totalCandidates : requested
+    element.textContent = noticeParts.length
+        ? `Last add: ${fromLabel} candidates -> ${queued} new (${noticeParts.join(', ')})`
+        : `Last add: ${fromLabel} candidates -> ${queued} new`
 }
 
 function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
@@ -1045,54 +1059,6 @@ function stopRetryFailed(reason = 'idle', {persist = true} = {}) {
     if(persist) {
         void browser.storage.local.set({[COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false})
     }
-}
-
-function syncCoordinatorQueueResume(queueItems = []) {
-    if(state.loading || state.requiresQuoraVisit) {
-        if(resumeCoordinatorQueueTimer) {
-            clearInterval(resumeCoordinatorQueueTimer)
-            resumeCoordinatorQueueTimer = null
-        }
-        return
-    }
-
-    if(state.paused) {
-        if(resumeCoordinatorQueueTimer) {
-            clearInterval(resumeCoordinatorQueueTimer)
-            resumeCoordinatorQueueTimer = null
-        }
-        return
-    }
-
-    const hasPendingDisplayWork = hasPendingCoordinatorQueueWork(queueItems)
-    const hasPendingStoredWork = hasRawPendingCoordinatorQueueWork()
-
-    if(!hasPendingDisplayWork && !hasPendingStoredWork) {
-        if(resumeCoordinatorQueueTimer) {
-            clearInterval(resumeCoordinatorQueueTimer)
-            resumeCoordinatorQueueTimer = null
-        }
-        return
-    }
-
-    if(!resumeCoordinatorQueueTimer) {
-        void resumeCoordinatorQueue()
-        resumeCoordinatorQueueTimer = setInterval(() => {
-            void resumeCoordinatorQueue()
-        }, COORDINATOR_RESUME_INTERVAL_MS)
-    }
-}
-
-async function resumeCoordinatorQueue() {
-    if(resumeCoordinatorQueuePromise) return resumeCoordinatorQueuePromise
-
-    resumeCoordinatorQueuePromise = sendRuntimeMessageWithTimeout({action: 'resume-coordinator-queue'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
-        .catch(() => null)
-        .finally(() => {
-            resumeCoordinatorQueuePromise = null
-        })
-
-    return resumeCoordinatorQueuePromise
 }
 
 function getDisplayQueueItems() {
