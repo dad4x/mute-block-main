@@ -36,6 +36,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const confirmSpaceFeedProfilesBlocked = requireQueueMachineCapability('durable', durable, 'confirmSpaceFeedProfilesBlocked')
     const mutateCoordinatorQueuedTabActiveTransition = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabActiveTransition')
     const mutateCoordinatorQueuedTabOpenRollback = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabOpenRollback')
+    const mutateCoordinatorInitialBlockedState = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorInitialBlockedState')
     const mutateCoordinatorActionLeaseHeartbeat = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseHeartbeat')
     const mutateCoordinatorActionLeaseRelease = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRelease')
     const mutateCoordinatorActionLeaseRequest = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRequest')
@@ -82,6 +83,14 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 attemptNumber: event.attemptNumber || 0,
                 actionKind: event.actionKind || '',
                 requestReason: event.requestReason || event.reason || '',
+                currentAuthorityState: event.currentAuthorityState || null
+            })
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.INITIAL_BLOCKED_STATE_RECORD]: async (event = {}, operation = {}) => {
+            return mutateCoordinatorInitialBlockedState({
+                reason: operation.reason || 'ordinaryMutation',
+                profileHref: event.profileHref || '',
+                blocked: event.blocked === true,
                 currentAuthorityState: event.currentAuthorityState || null
             })
         },

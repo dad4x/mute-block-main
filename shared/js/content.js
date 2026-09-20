@@ -67,8 +67,14 @@ const {
     WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS,
     CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS,
-    SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS
+    SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS
 } = require('./timeouts')
+const {
+    COORDINATOR_ENQUEUE_CHUNK_SIZE
+} = require('./coordinatorEnqueueChunking')
 
 const SPACE_FEED_PROFILES_PER_BATCH = 3
 const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
@@ -105,6 +111,16 @@ const HIDDEN_PROFILE_READY_FAST_PROBE_MS = 3500
 const HIDDEN_PROFILE_READY_NO_FOREGROUND_MS = 12000
 const VISIBLE_PROFILE_READY_MS = 25000
 const SERVICE_WORKER_QUEUE_OWNER_ID = 'service-worker-queue-owner'
+// A host page re-render (or, previously, our own remove-then-recreate of a
+// managed button whose insertion target's parent got replaced) can satisfy
+// shouldRefreshProfileButtons' mutation check again immediately after a
+// refresh runs, scheduling another refresh forever -- this observably
+// flashed the injected buttons/native menu indefinitely on a live profile
+// page with no coordinator work in flight. This caps how many refreshes a
+// single profile visit gets in a short window before giving up until the
+// next genuinely new mutation window or a profile-key change.
+const PROFILE_BUTTONS_REFRESH_BURST_LIMIT = 6
+const PROFILE_BUTTONS_REFRESH_BURST_WINDOW_MS = 3000
 
 let profilesModalTimeout
 let profileButtonsTimeout
@@ -112,6 +128,10 @@ let profileButtonsRefreshTimeout
 let profileButtonsPending = false
 let profileActionInProgress = false
 let profileButtonsFollowUpTimeouts = []
+let profileButtonsRefreshBurstCount = 0
+let profileButtonsRefreshBurstStartedAt = 0
+let profileButtonRail = null
+let profileButtonRailResizeHooked = false
 let autoProfileAction = undefined
 let autoProfileActionPending = false
 let autoProfileActionClaimPending = false
@@ -213,6 +233,7 @@ const SPACE_FEED_CANDIDATE_CONFIDENCE_LOW = 'low'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
 const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
+const COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
 const PENDING_COORDINATOR_STATUSES = new Set(['queued', 'opening', 'active', 'acting', 'settling'])
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
@@ -1264,6 +1285,26 @@ function noteCurrentProfileNukeProgress(patch = {}) {
     void recordCurrentProfileNukeProgress(patch)
 }
 
+// Reports whether this profile was already blocked the moment this tab
+// first got a chance to check -- fire-and-forget, safe to call repeatedly
+// (every attempt/retry calls this, but the service worker only ever keeps
+// the first report: see mutateCoordinatorInitialBlockedState, sw.js). Only
+// meaningful for a coordinator-managed action (activeQueuedAttemptId set);
+// a manual/legacy button click has no coordinator row for this to attach
+// to, and the service worker's own guard would just no-op it anyway, so
+// skip the round trip entirely for that case. See
+// classifyBlockConfirmationFromItem's comment (sw.js) for why this exists:
+// a later retry's own tab has no memory of whether an *earlier* attempt was
+// the one that actually clicked block, so relying only on the current
+// attempt's local state loses that history.
+function reportInitialBlockedStateIfQueued(blocked) {
+    if(!activeQueuedAttemptId) return
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'record-initial-blocked-state',
+        blocked: blocked === true
+    }, null, SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
 function getDirectBlockActionDiagnostic(branch = '', extra = {}) {
     const blockButton = getMenuAction(isBlockActionLabel)
     const unblockButton = getMenuAction(isUnblockActionLabel)
@@ -1666,10 +1707,19 @@ function startObserver() {
             resetProfileSearchControls()
             resetSpaceAssetNukeControls()
             resetSpaceFeedScanCache()
+            if(getPageType() !== 'profile') resetProfileButtonRail()
 
             const nextProfileKey = getProfileKey(currentUrl)
             if(previousProfileKey !== nextProfileKey) {
                 clearProfileBlockHint()
+                resetProfileButtonsRefreshBurstGuard()
+                // Switching from one profile to another without ever leaving
+                // page type 'profile' (e.g. a same-tab navigation) used to
+                // leave the previous profile's rail and buttons in place --
+                // isProfileTargetPlacement only checks parentage, not which
+                // profile the buttons were bound for, so they'd silently
+                // keep working the WRONG profile instead of being rebuilt.
+                resetProfileButtonRail()
             }
         }
 
@@ -1915,6 +1965,7 @@ function syncProfileButtons() {
     toggleUnblockUnmuteBtn()
     toggleMuteBlockBtn()
     toggleMuteBlockCloseBtn()
+    positionProfileButtonRail(getProfileButtonInsertionTarget())
     void maybeClearCurrentProfileNukeStateFromLiveUnblocked()
     void maybeRecordAlreadyBlockedCoordinatorProfile()
     nudgeCurrentProfilePendingClaim()
@@ -1940,7 +1991,7 @@ function areProfileButtonsCorrectlyPlaced(target = getProfileButtonInsertionTarg
     if(muteBtn && !isProfileTargetPlacement(muteBtn, target)) return false
     if(muteCloseBtn && !isProfileTargetPlacement(muteCloseBtn, target)) return false
 
-    return true
+    return isProfileButtonRailPositionCurrent(target)
 }
 
 function shouldRefreshProfileButtons(mutations) {
@@ -1949,7 +2000,7 @@ function shouldRefreshProfileButtons(mutations) {
     const target = getProfileButtonInsertionTarget()
     if(hasProfileButtons() && areProfileButtonsCorrectlyPlaced(target)) return false
 
-    return mutations.some(mutation => {
+    const wantsRefresh = mutations.some(mutation => {
         return Array.from(mutation.removedNodes).some(node => {
             return node.nodeType === Node.ELEMENT_NODE &&
                 (node.matches?.('.mb-ext_close-tab-btn, .mb-ext_unblock-unmute-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn') ||
@@ -1960,6 +2011,31 @@ function shouldRefreshProfileButtons(mutations) {
                     node.querySelector?.('[role="menu"], [data-popper-placement], [aria-haspopup="menu"]'))
         })
     })
+    if(!wantsRefresh) return false
+
+    return admitProfileButtonsRefreshBurst()
+}
+
+// See PROFILE_BUTTONS_REFRESH_BURST_LIMIT above for why this exists: caps
+// how many refreshes a single burst of qualifying mutations can trigger so
+// a host re-render (or our own remove-then-recreate, if the insertion
+// target's identity churns) can't keep re-satisfying
+// shouldRefreshProfileButtons and flash the injected buttons/native menu
+// indefinitely. Resets after a quiet gap, or explicitly on profile-key
+// change (see startObserver).
+function admitProfileButtonsRefreshBurst() {
+    const now = Date.now()
+    if(now - profileButtonsRefreshBurstStartedAt > PROFILE_BUTTONS_REFRESH_BURST_WINDOW_MS) {
+        profileButtonsRefreshBurstStartedAt = now
+        profileButtonsRefreshBurstCount = 0
+    }
+    profileButtonsRefreshBurstCount += 1
+    return profileButtonsRefreshBurstCount <= PROFILE_BUTTONS_REFRESH_BURST_LIMIT
+}
+
+function resetProfileButtonsRefreshBurstGuard() {
+    profileButtonsRefreshBurstCount = 0
+    profileButtonsRefreshBurstStartedAt = 0
 }
 
 function scheduleProfileButtonsRefresh(delay = 400) {
@@ -2033,19 +2109,46 @@ function onMessage(request, sender, sendResponse) {
             return Promise.resolve({willClose: false, reason: 'reverse-action'})
         }
 
-        if(getPageType() === 'profile' && isProfileBlocked()) {
-            const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
-            const resolvedProfileHref = getProfileKey(location.href) || ''
-            if(!requestedProfileHref || !resolvedProfileHref || requestedProfileHref !== resolvedProfileHref) {
+        if(getPageType() === 'profile') {
+            const blocked = isProfileBlocked()
+            // This poll runs continuously (every ~1-2s) against a queued
+            // tab, so it's often the very first thing to observe blocked
+            // state on a given attempt -- earlier even than blockProfile()'s
+            // own check. Reporting here too (in both branches) means the
+            // initial-state stamp (see reportInitialBlockedStateIfQueued's
+            // comment) still lands promptly even when the poll wins that
+            // race.
+            reportInitialBlockedStateIfQueued(blocked)
+
+            if(blocked) {
+                const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
+                const resolvedProfileHref = getProfileKey(location.href) || ''
+                if(!requestedProfileHref || !resolvedProfileHref || requestedProfileHref !== resolvedProfileHref) {
+                    return Promise.resolve({
+                        willClose: false,
+                        reason: 'profile-mismatch',
+                        resolvedProfileHref,
+                        lastUrl: location.href
+                    })
+                }
+
+                // blockAttempted is a plain read of this tab's own in-memory
+                // progress cache, set synchronously the moment blockProfile()
+                // dispatches its click -- no storage round trip, so it's
+                // available immediately here even when the durable
+                // item.milestones.blockAttemptedAt write is still stuck behind
+                // the shared coordinator storage-update queue. Lets the service
+                // worker tell "we just blocked this" apart from "this was
+                // already blocked" without waiting on that slower,
+                // sometimes-backed-up channel (classifyBlockConfirmationFromItem,
+                // sw.js).
                 return Promise.resolve({
-                    willClose: false,
-                    reason: 'profile-mismatch',
+                    willClose: true,
                     resolvedProfileHref,
-                    lastUrl: location.href
+                    lastUrl: location.href,
+                    blockAttempted: profileNukeProgress[resolvedProfileHref]?.blockAttempted === true
                 })
             }
-
-            return Promise.resolve({willClose: true, resolvedProfileHref, lastUrl: location.href})
         }
 
         return Promise.resolve({willClose: false, armed: false})
@@ -2424,6 +2527,7 @@ function installNavigationHooks() {
 
             const page = getPageType()
             setStorageChangeListenerEnabled(page !== 'profile-search')
+            if(page !== 'profile') resetProfileButtonRail()
 
             if(page === 'profile') {
                 ensureProfileButtons()
@@ -3132,18 +3236,18 @@ function getProfileActionAnchor(actionRow = getProfileActionRow()) {
     return secondaryButtons[0] || null
 }
 
+// Buttons live in profileButtonRail (see getOrCreateProfileButtonRail), not
+// as DOM siblings of target.element -- so "correctly placed" just means the
+// button is one of ours and lives in the rail. Whether the rail itself is
+// currently positioned at target's live location is a separate, position-
+// based check (isProfileButtonRailPositionCurrent), because Quora can (and
+// does, on this profile page, roughly every 1-2s) destroy and recreate
+// target.element on its own without the button needing to move at all.
 function isProfileTargetPlacement(button, target) {
     if(!button || !target?.element) return false
-    if(button.parentElement !== target.element.parentElement) return false
     if(!getProfileManagedButtonKind(button)) return false
 
-    if(target.type === 'before-menu') {
-        const sequence = getManagedButtonSequenceBeforeTarget(target)
-        return sequence.join('|') === PROFILE_ACTION_BUTTON_ORDER.filter(kind => sequence.includes(kind)).join('|')
-    }
-
-    const sequence = getManagedButtonSequenceAfterTarget(target)
-    return sequence.join('|') === PROFILE_ACTION_BUTTON_ORDER.filter(kind => sequence.includes(kind)).join('|')
+    return button.parentElement === profileButtonRail
 }
 
 function getQuestionActionMenuButton() {
@@ -3226,7 +3330,12 @@ function getProfileExtensionActionRowMenuButton() {
     const main = document.querySelector('#mainContent, main, [role="main"]')
     if(!main) return null
 
-    const managedButtons = Array.from(main.querySelectorAll(
+    // Managed buttons live in profileButtonRail (appended to document.body,
+    // not main -- see getOrCreateProfileButtonRail), not as descendants of
+    // main any more, so this has to search the rail; their getBoundingClientRect()
+    // still reflects the real on-screen position next to the live menu
+    // button, which is all the distance-scoring below actually needs.
+    const managedButtons = Array.from((profileButtonRail || main).querySelectorAll(
         '.mb-ext_unblock-unmute-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn, .mb-ext_close-tab-btn'
     )).filter(isVisible)
     if(!managedButtons.length) return null
@@ -3373,56 +3482,113 @@ function getProfileManagedButtonKind(button) {
     return null
 }
 
-function getManagedButtonSequenceBeforeTarget(target) {
-    const sequence = []
-    let node = target?.element?.previousElementSibling || null
+const PROFILE_BUTTON_RAIL_GAP_PX = 6
 
-    while(node && getProfileManagedButtonKind(node)) {
-        sequence.unshift(getProfileManagedButtonKind(node))
-        node = node.previousElementSibling
+// Quora periodically destroys and recreates the DOM subtree containing
+// target.element on its own -- confirmed live: it kept happening with our
+// own insertion code fully blocked and zero runtime messages received, so
+// it isn't something our extension triggers. Inserting the buttons as
+// literal siblings inside that subtree meant they got destroyed right along
+// with it, which was not just a visible flash but a real click-hijack risk
+// (bindSinglePressAction fires its action on pointerdown, so a stray press
+// near the target during one of these remounts could land on a
+// just-recreated button and fire an action nobody intended). Keeping the
+// buttons in one persistent element appended to document.body, and only
+// ever repositioning that element, means Quora's remounts never touch them.
+function getOrCreateProfileButtonRail() {
+    // Defense in depth against ever showing two overlapping rails (seen
+    // live 2026-09-19: two of our buttons rendered stacked on top of each
+    // other) -- whatever the exact cause (a stale rail this script instance
+    // lost track of, a bfcache restore, anything else), only one
+    // .mb-ext_profile-button-rail should ever exist on the page at once.
+    // Has to run even when profileButtonRail is already valid: a stray
+    // extra element sitting elsewhere in the DOM is invisible to the
+    // isConnected check below, which only looks at the one rail this
+    // script instance already knows about.
+    for(const stale of document.querySelectorAll('.mb-ext_profile-button-rail')) {
+        if(stale !== profileButtonRail) stale.remove()
     }
 
-    return sequence
-}
+    if(profileButtonRail?.isConnected) return profileButtonRail
 
-function getManagedButtonSequenceAfterTarget(target) {
-    const sequence = []
-    let node = target?.element?.nextElementSibling || null
-
-    while(node && getProfileManagedButtonKind(node)) {
-        sequence.push(getProfileManagedButtonKind(node))
-        node = node.nextElementSibling
+    if(!profileButtonRailResizeHooked) {
+        profileButtonRailResizeHooked = true
+        let resizeTimeout
+        addEventListener('resize', () => {
+            clearTimeout(resizeTimeout)
+            resizeTimeout = setTimeout(() => {
+                if(getPageType() === 'profile') scheduleProfileButtonsRefresh(0)
+            }, 150)
+        })
     }
 
-    return sequence
+    profileButtonRail = document.createElement('span')
+    profileButtonRail.className = 'mb-ext_profile-button-rail'
+    profileButtonRail.style.position = 'absolute'
+    profileButtonRail.style.zIndex = '999999'
+    profileButtonRail.style.display = 'inline-flex'
+    profileButtonRail.style.alignItems = 'center'
+    document.body.appendChild(profileButtonRail)
+    return profileButtonRail
 }
 
-function normalizeProfileActionButtonOrder(target) {
-    const parent = target?.element?.parentElement
-    if(!parent) return
+function resetProfileButtonRail() {
+    profileButtonRail?.remove()
+    profileButtonRail = null
+}
 
+function reorderProfileButtonRail(rail) {
     const buttonsByKind = new Map(
-        Array.from(parent.children)
+        Array.from(rail.children)
             .map(button => [getProfileManagedButtonKind(button), button])
             .filter(([kind]) => !!kind)
     )
 
-    if(target.type === 'before-menu') {
-        for(const kind of PROFILE_ACTION_BUTTON_ORDER) {
-            const button = buttonsByKind.get(kind)
-            if(button) target.element.insertAdjacentElement('beforebegin', button)
-        }
-
-        return
-    }
-
-    let anchor = target.element
     for(const kind of PROFILE_ACTION_BUTTON_ORDER) {
         const button = buttonsByKind.get(kind)
-        if(!button) continue
-        anchor.insertAdjacentElement('afterend', button)
-        anchor = button
+        if(button) rail.appendChild(button)
     }
+}
+
+function positionProfileButtonRail(target) {
+    const rail = getOrCreateProfileButtonRail()
+    const element = target?.element
+    if(!element?.isConnected) return rail
+
+    const rect = element.getBoundingClientRect()
+    rail.style.height = `${rect.height}px`
+    rail.style.top = `${rect.top + window.scrollY}px`
+
+    if(target.type === 'before-menu') {
+        const railWidth = rail.getBoundingClientRect().width
+        rail.style.left = `${rect.left + window.scrollX - PROFILE_BUTTON_RAIL_GAP_PX - railWidth}px`
+    }
+    else {
+        rail.style.left = `${rect.right + window.scrollX + PROFILE_BUTTON_RAIL_GAP_PX}px`
+    }
+
+    return rail
+}
+
+function isProfileButtonRailPositionCurrent(target) {
+    if(!profileButtonRail?.isConnected) return false
+
+    const element = target?.element
+    if(!element?.isConnected) return true
+
+    const rect = element.getBoundingClientRect()
+    const expectedTop = rect.top + window.scrollY
+    if(Math.abs(expectedTop - Number.parseFloat(profileButtonRail.style.top || '0')) > 1) return false
+
+    const railLeft = Number.parseFloat(profileButtonRail.style.left || '0')
+    if(target.type === 'before-menu') {
+        const railWidth = profileButtonRail.getBoundingClientRect().width
+        const expectedLeft = rect.left + window.scrollX - PROFILE_BUTTON_RAIL_GAP_PX - railWidth
+        return Math.abs(expectedLeft - railLeft) <= 1
+    }
+
+    const expectedLeft = rect.right + window.scrollX + PROFILE_BUTTON_RAIL_GAP_PX
+    return Math.abs(expectedLeft - railLeft) <= 1
 }
 
 function getProfilePeopleModal() {
@@ -4495,14 +4661,10 @@ function shouldDeferBlockedCloseTab(target) {
 function insertProfileActionButton(btn, target, kind) {
     btn.dataset.mbProfileBtnKind = kind
 
-    if(target.type === 'before-menu') {
-        target.element.insertAdjacentElement('beforebegin', btn)
-        normalizeProfileActionButtonOrder(target)
-        return
-    }
-
-    target.element.insertAdjacentElement('afterend', btn)
-    normalizeProfileActionButtonOrder(target)
+    const rail = getOrCreateProfileButtonRail()
+    rail.appendChild(btn)
+    reorderProfileButtonRail(rail)
+    positionProfileButtonRail(target)
 }
 
 function bindSinglePressAction(button, action) {
@@ -9089,7 +9251,152 @@ function getSpaceFeedProfilePostAssociations(entries) {
     return Array.from(associations.values())
 }
 
-async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations) {
+function formatSpaceFeedPreFilterBreakdown(preFilter) {
+    const parts = []
+    if(preFilter?.alreadyNuked) parts.push(`${preFilter.alreadyNuked} already nuked`)
+    if(preFilter?.duplicateProfile) parts.push(`${preFilter.duplicateProfile} duplicate profile`)
+    if(preFilter?.unqueueable) parts.push(`${preFilter.unqueueable} unresolvable`)
+    return parts.join(', ')
+}
+
+// The service worker can legitimately outlive a chunk message's own response
+// channel: a busy write chain can take long enough that the SW recycles
+// mid-request. A respawned SW resumes and finishes the durable write
+// (persistLastCoordinatorEnqueueSummary still runs), but nothing can ever
+// call back on the original chrome.runtime.sendMessage connection, so
+// awaiting it directly hangs forever -- confirmed live 2026-09-19 (a
+// 657-candidate batch finished durably while the button stayed on
+// "Nuking..." indefinitely, back when one batch was one message). Falling
+// back to polling that same durable summary by runId once the direct
+// response times out recovers the real outcome instead of leaving the
+// caller stuck. Now used per-chunk by sendCoordinatorEnqueueChunked below,
+// not just once for a whole batch -- the summary it recovers already
+// reflects the durable running total through this chunk (see
+// persistLastCoordinatorEnqueueSummary's runSummary handling in sw.js), not
+// just this one chunk's own contribution.
+async function waitForCoordinatorEnqueueSummary(runId, timeoutMs, intervalMs = SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS) {
+    const deadline = Date.now() + timeoutMs
+    while(Date.now() < deadline) {
+        const stored = await safeStorageGet({[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: null})
+        const summary = stored[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]
+        if(summary?.runId === runId) {
+            return {
+                queued: summary.queued,
+                merged: summary.merged,
+                executionQueued: 0,
+                runId,
+                durable: true,
+                recoveredFromSummary: true
+            }
+        }
+        await sleep(intervalMs)
+    }
+    return null
+}
+
+// Posts a large coordinator-items enqueue as several separate
+// enqueue-coordinator-items messages, COORDINATOR_ENQUEUE_CHUNK_SIZE items
+// at a time, instead of one big message -- see live-batch-fixes-worklist-
+// 2026-09-19.md items 3/4 and coordinatorEnqueueChunking.js's header for
+// why. This used to be sw.js's job: one message in, split internally in a
+// tight awaited loop. That loop's chunks re-entered the shared serialized
+// write chain via a pure microtask continuation with no real yield between
+// them, so a big batch still monopolized that chain for its whole duration
+// and starved every other pending durable write -- and the obvious fix
+// (a timer-based yield between chunks) turned out to need the sw.js test
+// harness's fake clock manually advanced everywhere that path is exercised,
+// with a silent, hard-to-notice failure mode when a test doesn't (see
+// COORDINATOR_ENQUEUE_CHUNK_THRESHOLD's comment in sw.js). Chunking here
+// instead means the gap between two chunks is a real chrome.runtime.sendMessage
+// round trip -- a genuine macrotask in production, and nothing that needs a
+// clock in tests, since it's just two separate calls.
+//
+// payload carries the run/source/execute fields every chunk shares;
+// payload.run.id must already be set by the caller so every chunk pins to
+// the same run (every caller here generates its own runId up front).
+// onProgress(queuedSoFar, mergedSoFar, totalItems), if given, fires after
+// each chunk settles so a caller can show live progress (e.g. the "Nuke 'Em"
+// button's remaining count) instead of only updating once at the very end.
+async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
+    const items = Array.isArray(payload.items) ? payload.items : []
+    const runId = payload.run?.id || ''
+    const totalItems = items.length
+    if(!totalItems) return {queued: 0, merged: 0, executionQueued: 0, runId}
+
+    const chunks = []
+    for(let offset = 0; offset < items.length; offset += COORDINATOR_ENQUEUE_CHUNK_SIZE) {
+        chunks.push(items.slice(offset, offset + COORDINATOR_ENQUEUE_CHUNK_SIZE))
+    }
+
+    let queued = 0
+    let merged = 0
+    let durable = false
+    let storageTimedOut = false
+    let stopReason = ''
+    const resetCleanupTargets = []
+
+    for(let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+        const chunkResult = await safeSendRuntimeMessageWithTimeout({
+            action: 'enqueue-coordinator-items',
+            run: payload.run,
+            source: payload.source,
+            execute: payload.execute,
+            items: chunks[chunkIndex],
+            runSummary: {
+                requested: totalItems,
+                priorQueued: queued,
+                priorMerged: merged,
+                ...(chunkIndex === 0 && payload.source?.preFilter ? {preFilter: payload.source.preFilter} : {})
+            }
+        }, null, SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS)
+
+        const settled = chunkResult || await waitForCoordinatorEnqueueSummary(runId, SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS)
+        if(!settled) {
+            storageTimedOut = true
+            stopReason = 'chunk-enqueue-no-response'
+            break
+        }
+
+        // A recovered summary already carries the durable running total
+        // through this chunk (see waitForCoordinatorEnqueueSummary's own
+        // comment above), so it replaces the tally instead of adding to it;
+        // a direct chunkResult only ever carries this one chunk's own count.
+        if(settled.recoveredFromSummary) {
+            queued = Number.parseInt(settled.queued, 10) || queued
+            merged = Number.parseInt(settled.merged, 10) || merged
+        }
+        else {
+            queued += Number.parseInt(settled.queued, 10) || 0
+            merged += Number.parseInt(settled.merged, 10) || 0
+        }
+        if(Array.isArray(settled.resetCleanupTargets)) resetCleanupTargets.push(...settled.resetCleanupTargets)
+        if(settled.durable === true || settled.recoveredFromSummary) durable = true
+        if(onProgress) onProgress(queued, merged, totalItems)
+
+        if(settled.storageTimedOut === true) {
+            storageTimedOut = true
+            stopReason = 'chunk-storage-timeout'
+            break
+        }
+        if(settled.durable === false) {
+            stopReason = settled.reason || 'chunk-enqueue-save-failed'
+            break
+        }
+    }
+
+    return {
+        queued,
+        merged,
+        executionQueued: 0,
+        runId,
+        durable,
+        storageTimedOut,
+        resetCleanupTargets,
+        reason: stopReason || undefined
+    }
+}
+
+async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations, preFilter = null, onProgress = null) {
     if(!space || !runId || !Array.isArray(profileAssociations) || !profileAssociations.length) {
         return null
     }
@@ -9098,11 +9405,11 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
         type: 'space-feed',
         pageUrl: location.href,
         spaceKey: space.key || '',
-        spaceCategory: getStoredSpaceCategory(space)
+        spaceCategory: getStoredSpaceCategory(space),
+        ...(preFilter ? {preFilter} : {})
     }
 
-    return safeSendRuntimeMessage({
-        action: 'enqueue-coordinator-items',
+    return sendCoordinatorEnqueueChunked({
         run: {
             id: runId,
             sourceType: 'space-feed',
@@ -9141,7 +9448,7 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
                 evidence: association.evidence || []
             }
         })
-    }, null)
+    }, onProgress)
 }
 
 async function enqueueCoordinatorProfileUrls(options = {}) {
@@ -9164,8 +9471,7 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
         ...sourceExtra
     }
 
-    return safeSendRuntimeMessageWithTimeout({
-        action: 'enqueue-coordinator-items',
+    return sendCoordinatorEnqueueChunked({
         run: {
             id: runId,
             sourceType,
@@ -9187,7 +9493,7 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
             requestedUrl: profileHref,
             source
         }))
-    }, {queued: 0, merged: 0, executionQueued: 0, timedOut: true}, 10000)
+    })
 }
 
 async function nukeSpaceFeedEntries(button, entries) {
@@ -9196,12 +9502,20 @@ async function nukeSpaceFeedEntries(button, entries) {
     const space = resolveCurrentSpaceDescriptor()
     if(!space) return false
 
+    let alreadyNukedCount = 0
+    let unqueueableCount = 0
     const unfinishedEntries = entries.flatMap(entry => {
-        if(isSpaceFeedEntryNuked(entry)) return []
+        if(isSpaceFeedEntryNuked(entry)) {
+            alreadyNukedCount += 1
+            return []
+        }
 
         const candidateUrls = getQueueableSpaceFeedEntryUrls(entry)
         const resolveProfileFromPage = !candidateUrls.length && isQueueableSpaceFeedResolverEntry(entry)
-        if(!candidateUrls.length && !resolveProfileFromPage) return []
+        if(!candidateUrls.length && !resolveProfileFromPage) {
+            unqueueableCount += 1
+            return []
+        }
 
         return [{
             ...entry,
@@ -9214,9 +9528,25 @@ async function nukeSpaceFeedEntries(button, entries) {
     const workAssociations = profileAssociations.concat(resolverAssociations)
     const urls = profileAssociations.map(association => association.profileHref)
     const runId = `space-feed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    // getSpaceFeedProfilePostAssociations collapses multiple feed entries
+    // that point at the same profile (the same author's several posts) into
+    // one association -- entries.length routinely looks much bigger than
+    // what actually gets enqueued for reasons that have nothing to do with
+    // dedup-against-already-queued-rows (that part is already surfaced via
+    // enqueueQueuedCount/enqueueMergedCount below). Carrying this breakdown
+    // through to the enqueue summary is what lets both the page that queued
+    // this batch and the dashboard show why a big selection shrank instead
+    // of leaving it looking like most of it silently vanished.
+    const preFilter = {
+        totalCandidates: entries.length,
+        alreadyNuked: alreadyNukedCount,
+        unqueueable: unqueueableCount,
+        duplicateProfile: Math.max(0, unfinishedEntries.length - workAssociations.length)
+    }
     if(!workAssociations.length) {
         syncSpaceFeedNukeControls()
-        setNukeButtonDone(button, 'Done')
+        const skippedBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+        setNukeButtonDone(button, skippedBreakdown ? `Done (${skippedBreakdown})` : 'Done')
         return true
     }
 
@@ -9241,7 +9571,14 @@ async function nukeSpaceFeedEntries(button, entries) {
         syncSpaceFeedNukeControls()
         setNukeButtonWorking(button, formatSpaceFeedNukingLabel(unfinishedEntries))
 
-        const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations)
+        // Each chunk (see sendCoordinatorEnqueueChunked) settles as its own
+        // separate message, so the remaining count can visibly drop chunk by
+        // chunk instead of sitting on one static label until the whole batch
+        // finishes.
+        const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations, preFilter, (queuedSoFar, mergedSoFar, totalItems) => {
+            const remaining = Math.max(0, totalItems - Math.min(totalItems, queuedSoFar + mergedSoFar))
+            setNukeButtonWorking(button, remaining > 0 ? `Queueing... ${remaining} of ${totalItems}` : 'Queueing...')
+        })
         const enqueueQueuedCount = Number.parseInt(result?.queued, 10) || 0
         const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
 
@@ -9250,14 +9587,21 @@ async function nukeSpaceFeedEntries(button, entries) {
             const workingLabel = formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries()))
             // Merged rows (already-known key: currently queued, or a past
             // terminal outcome) are silently absorbed into the existing row
-            // rather than added as new work -- surface that breakdown for a
-            // beat instead of jumping straight to the generic working label,
-            // so a big submission that mostly deduped doesn't look like most
-            // of it silently vanished.
-            if(enqueueMergedCount > 0) {
+            // rather than added as new work, and preFilter's counts (see
+            // above) never even reached the enqueue call at all -- surface
+            // both breakdowns together for a beat instead of jumping
+            // straight to the generic working label, so a big selection
+            // that shrank a lot doesn't look like most of it silently
+            // vanished.
+            const noticeParts = []
+            if(enqueueMergedCount > 0) noticeParts.push(`${enqueueMergedCount} already known`)
+            const preFilterBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+            if(preFilterBreakdown) noticeParts.push(preFilterBreakdown)
+
+            if(noticeParts.length) {
                 setNukeButtonNotice(
                     button,
-                    `Queued ${enqueueQueuedCount} new (${enqueueMergedCount} already known)`,
+                    `Queued ${enqueueQueuedCount} new of ${preFilter.totalCandidates} (${noticeParts.join('; ')})`,
                     workingLabel
                 )
             }
@@ -9275,7 +9619,8 @@ async function nukeSpaceFeedEntries(button, entries) {
         }
 
         await removePendingSpaceFeedEntries(unfinishedEntries)
-        setNukeButtonNotice(button, 'Nothing queued')
+        const nothingQueuedBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+        setNukeButtonNotice(button, nothingQueuedBreakdown ? `Nothing queued (${nothingQueuedBreakdown})` : 'Nothing queued')
         return false
     }
     finally {
@@ -12729,8 +13074,10 @@ async function muteProfile(options = {}) {
 
 async function blockProfile(options = {}) {
     const {silent = false, allowForegroundFallback = false} = options
+    const alreadyBlockedOnEntry = isProfileBlocked()
+    reportInitialBlockedStateIfQueued(alreadyBlockedOnEntry)
 
-    if(isProfileBlocked()) {
+    if(alreadyBlockedOnEntry) {
         await recordCurrentProfileNukeProgress({
             status: 'already-blocked',
             foundBlockedBeforeQueue: true,

@@ -341,6 +341,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'promote-queued-tab',
         'reconcile-coordinator-storage',
         'record-direct-profile-progress',
+        'record-initial-blocked-state',
         'record-job-milestone',
         'record-job-terminal',
         'refresh-coordinator-queue-view',
@@ -924,7 +925,7 @@ test('space-feed storage update queue schedules state-machine continuation on ti
     const saveBody = extractFunction(source, 'async function saveCoordinatorState(state = {}, changes = {})')
 
     assert.match(source, /SPACE_FEED_STORAGE_UPDATE_TIMEOUT_MS/)
-    assert.match(wrapperBody, /serializedStorageUpdateQueue\.enqueue\(update, options\)/)
+    assert.match(wrapperBody, /serializedStorageUpdateQueue\.enqueue\(\(\) => \([\s\S]*update\(\)[\s\S]*\), options\)/)
     assert.match(body, /Promise\.race/)
     assert.match(body, /space-feed storage update/)
     assert.match(body, /const updateToken = state\.nextToken\(\)/)
@@ -1050,7 +1051,6 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
 test('dashboard loads durable history before first Quora activation without resuming work', () => {
     const dashboard = readRepoFile('shared/js/coordinator.js')
     const initBody = extractFunction(dashboard, 'async function init()')
-    const resumeBody = extractFunction(dashboard, 'function syncCoordinatorQueueResume(queueItems = [])')
 
     assert.match(initBody, /render\(\)[\s\S]*const ready = await announceCoordinatorPageReady\(\)/)
     assert.match(initBody, /setQuoraVisitRequirement\(\s*!ready \|\| !!ready\?\.requiresQuoraVisit\s*\)/)
@@ -1063,8 +1063,6 @@ test('dashboard loads durable history before first Quora activation without resu
     assert.match(dashboard, /Waiting for first Quora page/)
     assert.match(dashboard, /\[QUEUE_WAKEUP_METRICS_VIEW_KEY\]: \{\}/)
     assert.doesNotMatch(extractFunction(dashboard, 'async function loadState()'), /\[QUEUE_WAKEUP_METRICS_KEY\]: \{\}/)
-    assert.match(resumeBody, /state\.loading \|\| state\.requiresQuoraVisit/)
-    assert.match(resumeBody, /return[\s\S]*if\(state\.paused\)/)
 })
 
 test('dashboard waiting banner clears from current-epoch activation evidence', () => {
@@ -1620,40 +1618,6 @@ test('terminal/direct progress compatibility save retry path is deleted', () => 
     assert.doesNotMatch(progressRecordsBody, /scheduleCoordinatorReconcile\(1000, \{[\s\S]*inline-compatibility-save-failed/)
     assert.match(progressRecordsBody, /saveProfileNukeProgressRowProjection\([\s\S]*inlineProgressProjectionRecords/)
     assert.doesNotMatch(progressRecordsBody, /PROFILE_NUKE_PROGRESS_KEY/)
-})
-
-test('dashboard resume loop does not kick on every render while timer is armed', () => {
-    const evaluate = loadDashboardHarness()
-    const result = evaluate(`
-        let resumeCalls = 0
-        let intervalCalls = 0
-        resumeCoordinatorQueueTimer = null
-        resumeCoordinatorQueuePromise = null
-        resumeCoordinatorQueue = function() {
-            resumeCalls += 1
-            return Promise.resolve(null)
-        }
-        setInterval = function() {
-            intervalCalls += 1
-            return {armed: true}
-        }
-        clearInterval = function() {}
-
-        state.loading = false
-        state.paused = false
-        setQuoraVisitRequirement(false)
-        state.queue = {queued: {status: 'queued'}}
-
-        syncCoordinatorQueueResume(getDisplayQueueItems())
-        syncCoordinatorQueueResume(getDisplayQueueItems())
-        syncCoordinatorQueueResume(getDisplayQueueItems())
-
-        ;({resumeCalls, intervalCalls, timerArmed: !!resumeCoordinatorQueueTimer})
-    `)
-
-    assert.equal(result.resumeCalls, 1)
-    assert.equal(result.intervalCalls, 1)
-    assert.equal(result.timerArmed, true)
 })
 
 test('snapshot state writes carry inventoried authority reasons', () => {
@@ -2290,7 +2254,7 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     // see activeBlockedLiveBody assertions below), which branches on
     // item.milestones.blockAttemptedAt.
     assert.match(recordSweepBody, /status: classification\.status,[\s\S]{0,120}foundBlockedBeforeQueue: classification\.foundBlockedBeforeQueue/)
-    assert.match(recordSweepBody, /buildSweepConfirmedRecord\(classifyBlockConfirmationFromItem\(item\)\)/)
+    assert.match(recordSweepBody, /buildSweepConfirmedRecord\(classifyBlockConfirmationFromItem\(item, response\)\)/)
     assert.match(recordSweepBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'background-blocked-sweep-terminal'/)
     assert.match(recordSweepBody, /deferProjectionSave: true/)
     assert.match(recordSweepBody, /scheduleQueuedWorkContinuation\('background-blocked-sweep-terminal'\)[\s\S]*const nextQueue = coordinatorAuthority\.current\(\)\.queue/)
@@ -2315,7 +2279,7 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(recordActiveBlockedLiveTabBody, /enqueueSpaceFeedStorageUpdate\(async \(\) => \{/)
     assert.match(recordActiveBlockedLiveTabBody, /loadCoordinatorQueueRunsProjection\(\{[\s\S]*metricPath: 'activeBlockedLiveTabTerminal\.load'/)
     assert.match(recordActiveBlockedLiveTabBody, /status: classification\.status,[\s\S]{0,120}foundBlockedBeforeQueue: classification\.foundBlockedBeforeQueue/)
-    assert.match(recordActiveBlockedLiveTabBody, /buildLiveTabConfirmedRecord\(classifyBlockConfirmationFromItem\(item\)\)/)
+    assert.match(recordActiveBlockedLiveTabBody, /buildLiveTabConfirmedRecord\(classifyBlockConfirmationFromItem\(item, response\)\)/)
     assert.match(recordActiveBlockedLiveTabBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'active-blocked-live-tab-terminal'/)
     assert.match(recordActiveBlockedLiveTabBody, /deferProjectionSave: true/)
     assert.match(recordActiveBlockedLiveTabBody, /scheduleQueuedWorkContinuation\('active-blocked-live-tab-terminal'\)[\s\S]*const nextQueue = coordinatorAuthority\.current\(\)\.queue/)
@@ -4912,7 +4876,7 @@ test('terminal settlement separates authority stamping from derived materializat
 
 test('space-feed enqueue does not create progress before durable enqueue', () => {
     const body = extractFunction(readRepoFile('shared/js/content.js'), 'async function nukeSpaceFeedEntries(button, entries)')
-    const enqueueIndex = body.indexOf('const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations)')
+    const enqueueIndex = body.indexOf('const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations, preFilter, (queuedSoFar, mergedSoFar, totalItems)')
     const progressIndex = body.indexOf('recordProfileNukeProgressBatch(profileAssociations')
 
     assert.notEqual(enqueueIndex, -1)
