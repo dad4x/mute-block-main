@@ -351,12 +351,16 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         const authoritativeProjectionQueue = recoveredAfterAppend?.recovered === true
             ? recoveredAfterAppend?.projected?.state?.queue || recoveredAfterAppend?.state?.queue || null
             : null
+        const authoritativeProjectionCompleted = recoveredAfterAppend?.recovered === true
+            ? recoveredAfterAppend?.projected?.state?.completed || null
+            : null
 
         return {
             ok: !failed,
             recoveredAfterAppend,
             ignoredAppendedRecords,
             authoritativeProjectionQueue,
+            authoritativeProjectionCompleted,
             reason: ignoredAppendedRecords[0]?.reason || recoveredAfterAppend?.reason || null
         }
     }

@@ -49,6 +49,7 @@ async function init() {
     const spaceList = document.getElementById('spaceList')
     const clearNukedPosts = document.getElementById('clearNukedPosts')
     const openCoordinator = document.getElementById('openCoordinator')
+    const openHistory = document.getElementById('openHistory')
     const nukedPostCount = document.getElementById('nukedPostCount')
 
     const fopDelay = document.getElementById('fopDelay')
@@ -56,6 +57,7 @@ async function init() {
     const fopFlipDelay = document.getElementById('fopFlipDelay')
     const coordinatorAutoStartOnBrowserStart = document.getElementById('coordinatorAutoStartOnBrowserStart')
     const profilesPerBatch = document.getElementById('profilesPerBatch')
+    const targetQueuedTabConcurrency = document.getElementById('targetQueuedTabConcurrency')
     const nukedPostRetentionDays = document.getElementById('nukedPostRetentionDays')
     const maxRememberedNukedPosts = document.getElementById('maxRememberedNukedPosts')
 
@@ -64,6 +66,7 @@ async function init() {
     fopFlipDelay.value = settings.fopFlipDelay
     coordinatorAutoStartOnBrowserStart.checked = settings.coordinatorAutoStartOnBrowserStart === true
     profilesPerBatch.value = settings.profilesPerBatch
+    targetQueuedTabConcurrency.value = settings.targetQueuedTabConcurrency
     popupState.nukedPostRetentionDays = normalizeRetentionDays(settings[NUKED_POST_RETENTION_DAYS_KEY], defaults[NUKED_POST_RETENTION_DAYS_KEY])
     popupState.maxRememberedNukedPosts = normalizeMaxRememberedNukedPosts(settings[MAX_REMEMBERED_NUKED_POSTS_KEY], defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
     nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
@@ -90,6 +93,7 @@ async function init() {
             fopFlipDelay: fopFlipDelay.valueAsNumber,
             coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart.checked,
             profilesPerBatch: profilesPerBatch.valueAsNumber,
+            targetQueuedTabConcurrency: targetQueuedTabConcurrency.valueAsNumber,
             [NUKED_POST_RETENTION_DAYS_KEY]: normalizeRetentionDays(nukedPostRetentionDays.valueAsNumber, defaults[NUKED_POST_RETENTION_DAYS_KEY]),
             [MAX_REMEMBERED_NUKED_POSTS_KEY]: normalizeMaxRememberedNukedPosts(maxRememberedNukedPosts.valueAsNumber, defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
         }
@@ -119,6 +123,7 @@ async function init() {
         fopFlipDelay.value = defaults.fopFlipDelay
         coordinatorAutoStartOnBrowserStart.checked = defaults.coordinatorAutoStartOnBrowserStart === true
         profilesPerBatch.value = defaults.profilesPerBatch
+        targetQueuedTabConcurrency.value = defaults.targetQueuedTabConcurrency
         popupState.nukedPostRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY]
         popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
@@ -165,12 +170,30 @@ async function init() {
     })
 
     openCoordinator?.addEventListener('click', async () => {
+        // The popup isn't a tab, so the service worker's message sender has
+        // no sender.tab.windowId to fall back on -- send our own window id
+        // explicitly so the dashboard opens/moves to the window this button
+        // was actually pressed in, rather than wherever an existing
+        // dashboard tab happens to already be.
+        const currentWindow = await browser.windows.getCurrent().catch(() => null)
         const result = await browser.runtime.sendMessage({
             action: 'open-coordinator',
-            active: true
+            active: true,
+            windowId: currentWindow?.id || null
         }).catch(error => ({error: error?.message || `${error || ''}`}))
 
         showStatus(status, result?.error ? 'Dashboard open failed.' : 'Dashboard opened.')
+    })
+
+    openHistory?.addEventListener('click', async () => {
+        const currentWindow = await browser.windows.getCurrent().catch(() => null)
+        const result = await browser.runtime.sendMessage({
+            action: 'open-coordinator-history',
+            active: true,
+            windowId: currentWindow?.id || null
+        }).catch(error => ({error: error?.message || `${error || ''}`}))
+
+        showStatus(status, result?.error ? 'History open failed.' : 'History opened.')
     })
 
     browser.storage.onChanged.addListener(changes => {

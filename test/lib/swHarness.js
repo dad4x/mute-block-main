@@ -195,12 +195,30 @@ function createFakeBrowser(initialStorage = {}) {
                 return true
             }
         },
+        action: {
+            badgeText: '',
+            badgeBackgroundColor: '',
+            title: '',
+            async setBadgeText(details = {}) {
+                this.badgeText = details.text || ''
+            },
+            async setBadgeBackgroundColor(details = {}) {
+                this.badgeBackgroundColor = details.color || ''
+            },
+            async setTitle(details = {}) {
+                this.title = details.title || ''
+            }
+        },
         tabs: {
             onRemoved: makeEvent(),
             onUpdated: makeEvent(),
             async query(queryInfo = {}) {
                 const allTabs = Array.from(tabs.values())
                 let filtered = allTabs
+                if(queryInfo?.windowId !== undefined && queryInfo?.windowId !== null) {
+                    const windowId = Number.parseInt(queryInfo.windowId, 10)
+                    filtered = filtered.filter(tab => tab.windowId === windowId)
+                }
                 if(queryInfo?.active === true) {
                     filtered = filtered.filter(tab => tab.active === true)
                 }
@@ -515,9 +533,11 @@ function loadServiceWorkerHarness(options = {}) {
     source += `
 
 module.exports.__test = {
+    archiveTerminalCoordinatorRow,
     applyCoordinatorRowEvent,
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
+    mergeCoordinatorQueueViewTimingCache,
     buildCoordinatorContentQueueIndex,
     coordinatorRawQueueNormalizationChangedRows,
     normalizeRawCoordinatorQueueForReconcileFallback,
@@ -533,6 +553,7 @@ module.exports.__test = {
     kickCoordinatorQueueResume,
     metricStorageGet,
     metricStorageSet,
+    mutateCoordinatorFailedItemsRequeue,
     recoverStoredCoordinatorWork,
     ensureQueuedTabContentScript,
     handleQueuedTabContentScriptEnsureResult,
@@ -545,8 +566,25 @@ module.exports.__test = {
     recordFlightRecorderEvent,
     getFlightRecorder,
     getFlightRecorderSnapshot,
+    createOwnedTabInQueuedWorkerActionSurface,
     getCoordinatorWhyNotRunning,
     getStorageUpdateQueueSnapshot,
+    getRuntimeSurfaceForCoordinatorItem,
+    buildRuntimeSurfaceIndex,
+    getCoordinatorResumeMaxConcurrent,
+    setTargetQueuedTabConcurrency,
+    getTargetQueuedTabConcurrency: () => targetQueuedTabConcurrency,
+    summarizeCoordinatorActualBlockTiming,
+    summarizeCoordinatorAlreadyBlockedTiming,
+    summarizeCoordinatorActivationHandoffTiming,
+    recordCoordinatorPauseTransition,
+    recordQueueLoadThrottleTransition,
+    queueRuntime,
+    maybeWarnCoordinatorStorageUpdateQueueStall,
+    setCoordinatorWriteQueueBacklogAlertBadge,
+    getCoordinatorWriteQueueBacklogAlertActive() {
+        return coordinatorWriteQueueBacklogAlertActive
+    },
     recoverQueuedAuthorityLiveTabAfterMaterializationFailure,
     isQueuedTabRetryBudgetReleaseReason,
     getExhaustedRolledBackQueuedTabTerminalError,
@@ -554,6 +592,7 @@ module.exports.__test = {
     recordQueuedTabMetadataMilestone,
     getCoordinatorQueueAccounting,
     refreshCoordinatorQueueViewForDashboard,
+    refreshCoordinatorRunsViewForDashboard,
     refreshQueueWakeupMetricsViewForDashboard,
     rememberQueueLoadPressure,
     runCoordinatorExecutorApplyPhase,
@@ -592,6 +631,8 @@ module.exports.__test = {
     startQueueWakeupMetricsBackedStartupWork,
     sweepStaleQueuedTabs,
     switchCoordinatorAuthorityQueueWalCheckpoint,
+    findCompletedWorkRowByKey,
+    getRecentCompletedWorkRows,
     closeQueuedWorkerActionSurfaceIfIdle,
     terminalizeCoordinatorKeyOnlyItem,
     terminalizeActiveCoordinatorNonProfileLanding,
@@ -700,6 +741,8 @@ module.exports.__test = {
             coordinatorQueueResumeDueAt: coordinatorQueueResumeScheduler.getDueAt(),
             hasCoordinatorQueueResumeTimeout: coordinatorQueueResumeScheduler.hasTimeout(),
             queueWakeupCounters: {...getQueueWakeupMetricEpoch().counters},
+            pauseWindows: [...(getQueueWakeupMetricEpoch().pauseWindows || [])],
+            queueLoadThrottleWindows: [...(getQueueWakeupMetricEpoch().queueLoadThrottleWindows || [])],
             profileNukeProgress: {...profileNukeProgress},
             coordinatorAuthorityShadowWalStore: JSON.parse(JSON.stringify(coordinatorAuthorityShadowWalStore)),
             progressShadowWalStore: JSON.parse(JSON.stringify(progressShadowWalStore)),

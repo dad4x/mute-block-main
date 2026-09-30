@@ -83,6 +83,16 @@
 // `.then(`, `.catch(`, `Promise.`, `async`, `setTimeout`, `void` -- none
 // found.
 
+// Mirrors swCoordinatorQueueView.js's COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS
+// (see that file's 2026-09-14 comment for the incident this guards against).
+// profileAction.*.totalDurationMs/maxDurationMs below is a running lifetime
+// total, not a recomputed-per-read average like the queue-view tiles, so it
+// has no equivalent protection on its own -- a single implausible sample
+// (stale-backlog row, WAL-recovery gap) poisons the average permanently
+// instead of just for one epoch. Excluded samples still increment
+// excludedOutliers so the dashboard can surface that something was dropped.
+const PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
+
 function createCoordinatorProgressReducer(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const {
@@ -112,7 +122,8 @@ function createCoordinatorProgressReducer(deps = {}) {
         shouldApplyProgressToCoordinatorItem,
         buildCoordinatorFailureClassification,
         incrementQueueWakeupMetric,
-        recordQueueWakeupMetricMax
+        recordQueueWakeupMetricMax,
+        pushQueueWakeupDiagnosticEvent
     } = deps.handlers || {}
 
     // Distinguishes "was already blocked before we did anything" from "we
@@ -135,6 +146,19 @@ function createCoordinatorProgressReducer(deps = {}) {
     // recording without needing every call site to track its own dedup
     // state.
     const recordedProfileActionOutcomeMappedRecords = new WeakSet()
+    // Guards against a row being counted more than once per SW session --
+    // the `mapped`-keyed WeakSet above only dedupes one logical
+    // transition's own preview+real call pair. A row that cycles through
+    // a terminal-producing transition multiple times within one session
+    // (retried/rolled-back attempts, stale-attempt reconciliation -- see
+    // project_queue_handoff_reliability_investigation.md's stale-attempt-
+    // handler finding) would otherwise re-increment on every pass even
+    // though the real-world outcome never changed. Confirmed live
+    // 2026-09-20: 654 stat increments against only 45 genuinely new
+    // terminal rows in one epoch (~14x overcount). Keyed by run+href
+    // rather than just href, so a legitimately separate later run
+    // re-processing the same profile still counts.
+    const recordedProfileActionOutcomeRowKeys = new Set()
     function recordCoordinatorProfileActionOutcomeStat(item = {}, mapped = {}, nowMs = now()) {
         if(typeof incrementQueueWakeupMetric !== 'function') return
         if(mapped && typeof mapped === 'object') {
@@ -154,11 +178,55 @@ function createCoordinatorProgressReducer(deps = {}) {
         const outcome = `${mapped?.outcome || ''}`.trim()
         const bucket = outcome === 'already-blocked' ? 'alreadyBlocked'
             : outcome === 'blocked' ? 'reallyBlocked'
+            : outcome === 'block-attempt-on-following' ? 'blockAttemptOnFollowing'
             : ''
         if(!bucket) return
+        const rowIdentityKey = `${item?.runId || ''}::${item?.targetProfileHref || item?.requestedUrl || item?.coordinatorKey || ''}`.trim()
+        if(rowIdentityKey !== '::') {
+            if(recordedProfileActionOutcomeRowKeys.has(rowIdentityKey)) return
+            recordedProfileActionOutcomeRowKeys.add(rowIdentityKey)
+        }
         const activeAt = Number.parseInt(item?.activeAt, 10) || 0
         const durationMs = activeAt > 0 ? Math.max(0, nowMs - activeAt) : 0
         incrementQueueWakeupMetric(`profileAction.${bucket}.count`)
+        // 2026-09-28 tracing addition (project_open_issues_2026_09_27.md
+        // issue 2): recordedProfileActionOutcomeRowKeys/-MappedRecords above
+        // are in-memory Sets, reset on every SW restart -- a row that was
+        // already recorded before a restart and gets touched again after
+        // (reconcile revisiting it, a retried/rolled-back attempt) would
+        // pass both dedup checks a second time and double the outcome
+        // stat, which is one live hypothesis for job.terminal (durable,
+        // survives restarts) undercounting reallyBlocked+alreadyBlocked
+        // (also durable) relative to each other. This journal entry is
+        // itself durable across restarts within the epoch -- if the same
+        // rowIdentityKey shows up twice here, that confirms the
+        // restart-reset double-count path directly instead of leaving it
+        // as an untested guess. Pushed to the dedicated diagnosticEvents
+        // sink (pushQueueWakeupDiagnosticEvent), not the shared journal --
+        // confirmed live that the shared journal's high-frequency
+        // pump/reconcile/storage entries evict rare entries like this one
+        // before the next storage flush.
+        if(typeof pushQueueWakeupDiagnosticEvent === 'function') {
+            pushQueueWakeupDiagnosticEvent({
+                kind: 'profile-action-outcome',
+                name: bucket,
+                reason: outcome,
+                result: durationMs > PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS ? 'excluded-outlier' : 'recorded',
+                at: nowMs,
+                durationMs,
+                details: {
+                    rowIdentityKey,
+                    runId: item?.runId || '',
+                    targetProfileHref: item?.targetProfileHref || item?.requestedUrl || '',
+                    activeAt
+                }
+            })
+        }
+        if(durationMs > PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS) {
+            incrementQueueWakeupMetric(`profileAction.${bucket}.excludedOutliers`)
+            return
+        }
+        incrementQueueWakeupMetric(`profileAction.${bucket}.durationSampleCount`)
         incrementQueueWakeupMetric(`profileAction.${bucket}.totalDurationMs`, durationMs)
         if(typeof recordQueueWakeupMetricMax === 'function') {
             recordQueueWakeupMetricMax(`profileAction.${bucket}.maxDurationMs`, durationMs)
@@ -366,12 +434,28 @@ function createCoordinatorProgressReducer(deps = {}) {
                 return projectedItem
             }
             if(shouldPreferSuccessfulProgressOverTerminalCoordinatorItem(item, record, mapped)) {
+                // item is already terminal here (this function's own
+                // precondition) but not 'succeeded' -- this promotion is the
+                // only place that ever corrects it to 'succeeded', so if the
+                // stat isn't recorded here it never gets recorded at all.
+                recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
                 return promoteTerminalCoordinatorItemFromSuccessfulProgress(item, record, mapped, {
                     ...options,
                     now: nowMs
                 })
             }
             if(mappedTerminal) {
+                // reduceJobEvent rejected this terminal event (e.g. a stale-
+                // source-attempt mismatch from a retry), but the item wasn't
+                // already terminal and we're still returning a
+                // terminal-shaped item below -- same real outcome as the
+                // accepted-reducer path a few lines down, so it needs the
+                // same stat recording or every terminal transition that
+                // happens to route through this rejection branch silently
+                // never counts.
+                if(!isTerminalCoordinatorStatus(item.status)) {
+                    recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
+                }
                 return projectedItem
             }
             return resetRetry ? projectedItem : item

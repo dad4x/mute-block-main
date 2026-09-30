@@ -17,7 +17,8 @@
         </header>
 
         <div class="top-actions">
-            <button class="button button-primary" id="openCoordinator" type="button">Dashboard</button>
+            <button class="button button-primary" id="openCoordinator" type="button">Open Dashboard</button>
+            <button class="button button-secondary" id="openHistory" type="button">Open History</button>
         </div>
 
         <form class="form" id="settingsForm">
@@ -74,6 +75,16 @@
             <section class="section">
                 <div class="row">
                     <div>
+                        <div class="label">Target Concurrency</div>
+                        <div class="hint">How many queued tabs the executor tries to run at once. Lowered automatically when Quora pushes back.</div>
+                    </div>
+                    <input class="input" id="targetQueuedTabConcurrency" type="number" min="1" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
                         <div class="label">Recent History Retention (days)</div>
                         <div class="hint">Auto-prune persisted space-post results older than this. Use `0` to disable age pruning.</div>
                     </div>
@@ -92,8 +103,8 @@
             </section>
 
             <div class="actions">
-                <button class="button button-primary" type="submit">Save</button>
-                <button class="button button-secondary" type="reset">Reset</button>
+                <button class="button button-primary" type="submit">Save Preferences</button>
+                <button class="button button-secondary" type="reset">Reset to Defaults</button>
             </div>
 
             <div class="status" id="status" hidden></div>

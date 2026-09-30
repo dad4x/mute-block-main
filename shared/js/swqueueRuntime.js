@@ -13,11 +13,20 @@ function createQueueRuntimeState() {
     const activeQueuedTabs = new Set()
     const queuedProfileOpenReservations = new Map()
     const removedQueuedRuntimeTabIds = new Set()
+    // 2026-09-29 (nudge-accept cleanup, step 1): the removed-tab flag latches
+    // permanently -- once set it blocks all future setQueuedTabMetadata
+    // writes and recoverPendingTabActionFromCoordinatorQueue recovery for
+    // that tabId, forever. ~25 call sites can set it, several of them
+    // speculative (a slow-but-still-loading tab reclaimed by a retry, not a
+    // confirmed close). Recording which reason won lets a live nudge
+    // rejection be traced back to the actual detach call site instead of
+    // guessing across all of them.
+    const removedQueuedRuntimeTabReasons = new Map()
     const ownedTabIdsByParent = new Map()
     const owningParentByChild = new Map()
     const canceledQueuedUrlsByOwner = new Map()
     const pausedQueuedOwners = new Set()
-    let orderedQueueKeys = []
+    let orderedQueueKeys = new Set()
 
     const normalizeIntentSource = value => {
         const source = `${value || ''}`.trim()
@@ -236,21 +245,31 @@ function createQueueRuntimeState() {
         return false
     }
 
-    function markRemovedQueuedRuntimeTab(tabId) {
+    function markRemovedQueuedRuntimeTab(tabId, reason = '') {
         const normalizedTabId = normalizeTabId(tabId)
         if(!normalizedTabId) return false
         removedQueuedRuntimeTabIds.add(normalizedTabId)
+        if(!removedQueuedRuntimeTabReasons.has(normalizedTabId)) {
+            removedQueuedRuntimeTabReasons.set(normalizedTabId, `${reason || ''}`.trim() || 'unknown')
+        }
         return true
     }
 
     function clearRemovedQueuedRuntimeTab(tabId) {
         const normalizedTabId = normalizeTabId(tabId)
-        return normalizedTabId ? removedQueuedRuntimeTabIds.delete(normalizedTabId) : false
+        if(!normalizedTabId) return false
+        removedQueuedRuntimeTabReasons.delete(normalizedTabId)
+        return removedQueuedRuntimeTabIds.delete(normalizedTabId)
     }
 
     function hasRemovedQueuedRuntimeTab(tabId) {
         const normalizedTabId = normalizeTabId(tabId)
         return !!(normalizedTabId && removedQueuedRuntimeTabIds.has(normalizedTabId))
+    }
+
+    function getRemovedQueuedRuntimeTabReason(tabId) {
+        const normalizedTabId = normalizeTabId(tabId)
+        return (normalizedTabId && removedQueuedRuntimeTabReasons.get(normalizedTabId)) || ''
     }
 
     function pauseQueuedOwner(ownerTabId) {
@@ -461,6 +480,47 @@ function createQueueRuntimeState() {
         }
     }
 
+    // 2026-09-27: getRuntimeSurfaceForCoordinatorItem (swCoordinatorExecutorClassification.js)
+    // used to call getRuntimeSurface above -- a full scan of activeQueuedTabs
+    // + pendingTabActions + queuedTabActions -- once per queue row in
+    // classifyCoordinatorExecutorState's main loop. That's O(queue size x
+    // runtime state size) per tick, not just O(queue size): with a ~560-row
+    // live queue and even a modest ~10-20 runtime entries, that's 5,000+
+    // comparisons per classify call, every ~1s tick, confirmed as the
+    // dominant unmeasured cost behind the scan-cost metrics (which only
+    // counted the outer loop). This lets a caller take one flat, unfiltered
+    // snapshot of all three runtime collections ONCE per classify call,
+    // then look candidates up by href/coordinatorKey (see
+    // buildRuntimeSurfaceIndex) instead of re-scanning per row -- same
+    // matching predicate, applied to a pre-filtered candidate set instead
+    // of everything, so the result can't differ except in the one
+    // degenerate case noted on buildRuntimeSurfaceIndex.
+    function listRuntimeSurfaceEntries() {
+        const entries = []
+        for(const tabId of activeQueuedTabs) {
+            entries.push({
+                group: 'activeTabs',
+                tabId: normalizeTabId(tabId),
+                runtime: getQueuedTabMetadata(tabId) || {}
+            })
+        }
+        for(const [tabId, action] of pendingTabActions.entries()) {
+            entries.push({
+                group: 'pendingActions',
+                tabId: normalizeTabId(tabId),
+                runtime: action
+            })
+        }
+        for(const action of queuedTabActions) {
+            entries.push({
+                group: 'queuedActions',
+                tabId: normalizeTabId(action?.tabId || action?.createdTabId || action?.targetTabId),
+                runtime: action
+            })
+        }
+        return entries
+    }
+
     function getRuntimeCounts() {
         return {
             pendingTabActions: pendingTabActions.size,
@@ -498,18 +558,23 @@ function createQueueRuntimeState() {
     // the cost that mattered in the incident this fixes was repeated full
     // WAL replay, not an in-memory sort.
     function rebuildQueueOrder(queue = {}) {
-        orderedQueueKeys = Object.entries(queue || {})
+        const sortedKeys = Object.entries(queue || {})
             .sort(([leftKey, leftItem], [rightKey, rightItem]) => {
                 const leftSequence = Number.parseInt(leftItem?.queueSequence, 10) || 0
                 const rightSequence = Number.parseInt(rightItem?.queueSequence, 10) || 0
                 return leftSequence - rightSequence || leftKey.localeCompare(rightKey)
             })
             .map(([key]) => key)
-        return orderedQueueKeys.length
+        orderedQueueKeys = new Set(sortedKeys)
+        return orderedQueueKeys.size
     }
 
     function getOrderedQueueKeys() {
-        return orderedQueueKeys.slice()
+        return Array.from(orderedQueueKeys)
+    }
+
+    function getOrderedQueueKeyCount() {
+        return orderedQueueKeys.size
     }
 
     // Defensive against staleness: if the ordered index hasn't been rebuilt
@@ -552,6 +617,69 @@ function createQueueRuntimeState() {
         return items
     }
 
+    // O(1) incremental mutations for the Set-backed ordered queue keys index.
+    // Wired into sw.js's refreshResidentCoordinatorAuthorityState via
+    // syncOrderedQueueKeysFromQueueDiff below (2026-09-26) -- see that
+    // function's comment for how they're actually used.
+    //
+    // noteOrderedQueueKeyPresent: moves an existing key to the end
+    // (for enqueue/requeue-to-back where an item re-enters the live queue),
+    // or adds a new key at the end. Returns true if the key was normalized
+    // and processed, false if the key was empty/invalid.
+    //
+    // noteOrderedQueueKeyAbsent: removes a key (for terminal settlement or
+    // other transitions out of the live queue). Returns true if the key was
+    // present and removed, false if the key was invalid or not in the set.
+    // Safe to call multiple times on the same key (idempotent on second call).
+    function noteOrderedQueueKeyPresent(key = '') {
+        const normalized = `${key || ''}`.trim()
+        if(!normalized) return false
+        orderedQueueKeys.delete(normalized)
+        orderedQueueKeys.add(normalized)
+        return true
+    }
+
+    function noteOrderedQueueKeyAbsent(key = '') {
+        const normalized = `${key || ''}`.trim()
+        if(!normalized) return false
+        return orderedQueueKeys.delete(normalized)
+    }
+
+    // Replaces rebuildQueueOrder's O(n log n) full sort on every resident
+    // refresh (2026-09-26) with an O(n) diff against the previously-resident
+    // queue, using the incremental O(1)-per-key primitives above for each
+    // key that actually changed. Only valid when `orderedQueueKeys` is
+    // already correctly ordered from a prior rebuild/sync -- diffing against
+    // an empty or unrelated `previousQueue` can only recover which keys are
+    // present, not their queueSequence order, so the caller must fall back
+    // to rebuildQueueOrder itself the first time (see
+    // getOrderedQueueKeyCount's use at the one call site in sw.js).
+    // Correctness never depends on this being exactly right either way --
+    // getOrderedQueueItems's own staleness fallback (above) still catches
+    // anything this misses -- this only affects ordering quality.
+    function syncOrderedQueueKeysFromQueueDiff(previousQueue = {}, nextQueue = {}) {
+        const previous = previousQueue || {}
+        const next = nextQueue || {}
+        for(const key of Object.keys(previous)) {
+            if(!Object.prototype.hasOwnProperty.call(next, key)) {
+                noteOrderedQueueKeyAbsent(key)
+            }
+        }
+        for(const key of Object.keys(next)) {
+            const previousItem = previous[key]
+            if(!previousItem) {
+                noteOrderedQueueKeyPresent(key)
+                continue
+            }
+            const previousSequence = Number.parseInt(previousItem?.queueSequence, 10) || 0
+            const nextSequence = Number.parseInt(next[key]?.queueSequence, 10) || 0
+            if(nextSequence !== previousSequence) {
+                noteOrderedQueueKeyPresent(key)
+            }
+        }
+        return orderedQueueKeys.size
+    }
+
     return {
         addActiveQueuedTab,
         addOwnedTab,
@@ -571,6 +699,7 @@ function createQueueRuntimeState() {
         getActivationIntentAt,
         getActiveQueuedTabCount,
         getOrderedQueueItems,
+        getOrderedQueueKeyCount,
         getOrderedQueueKeys,
         getOwnedTabsForParent,
         getOwningParentForChild,
@@ -590,10 +719,12 @@ function createQueueRuntimeState() {
         hasPausedQueuedOwner,
         hasQueuedTabMetadata,
         hasRemovedQueuedRuntimeTab,
+        getRemovedQueuedRuntimeTabReason,
         listActiveQueuedTabIds,
         listActivationIntents,
         listOwnedTabParentEntries,
         listPendingTabActionEntries,
+        listRuntimeSurfaceEntries,
         listPendingTabActions,
         listPendingTabActionTabIds,
         listPausedQueuedOwners,
@@ -601,6 +732,8 @@ function createQueueRuntimeState() {
         listQueuedTabMetadataTabIds,
         mapActivationIntents,
         markRemovedQueuedRuntimeTab,
+        noteOrderedQueueKeyAbsent,
+        noteOrderedQueueKeyPresent,
         patchQueuedTabMetadata,
         pauseQueuedOwner,
         pruneProfileOpenReservations,
@@ -616,7 +749,8 @@ function createQueueRuntimeState() {
         setOwnedTabsForParent,
         setPendingTabAction,
         setProfileOpenReservation,
-        someActivationIntent
+        someActivationIntent,
+        syncOrderedQueueKeysFromQueueDiff
     }
 }
 

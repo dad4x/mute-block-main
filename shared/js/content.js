@@ -259,6 +259,15 @@ const SPACE_FEED_ROOT_SELECTOR =
     '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
     'article,' +
     '[role="article"]'
+// Markers for an embedded/quoted sub-post nested inside a post's own DOM
+// (a feature card, a Quora-native embed, or a hyperlink embed) -- distinct
+// from SPACE_FEED_ROOT_SELECTOR's generic "post item container" markers,
+// which also match nested posts and so can't be used to tell embedded
+// content apart from the primary post.
+const SPACE_FEED_EMBED_SCOPE_SELECTOR =
+    '.standalone_featurable,' +
+    '[data-is-quora-embed="true"],' +
+    '[data-type="hyperlink_embed"]'
 const UNMUTE_ACTION_REGEX = /\bun[\s-]*mute\b/i
 const UNBLOCK_ACTION_REGEX = /\bun[\s-]*block\b/i
 const UNMUTE_CONTEXT_REGEX = /\bun[\s-]*mut(?:e|ed|ing)\b/i
@@ -1299,6 +1308,27 @@ function noteCurrentProfileNukeProgress(patch = {}) {
 // attempt's local state loses that history.
 function reportInitialBlockedStateIfQueued(blocked) {
     if(!activeQueuedAttemptId) return
+    reportInitialBlockedStateUnconditionally(blocked)
+}
+
+// 2026-09-29: the close-if-blocked message handler (onMessage below) calls
+// this instead of reportInitialBlockedStateIfQueued above -- that gate
+// exists to skip the round trip for a manual/legacy button click with no
+// coordinator row, but close-if-blocked is a message the coordinator only
+// ever sends to a tab it's already tracking as an active queued row, so the
+// gate is simply wrong there: it's guaranteed coordinator context already.
+// Confirmed live 2026-09-29 (FPT-Camera-3): this poll starts firing the
+// moment the tab opens, well before the claim round trip that sets
+// activeQueuedAttemptId completes (which took ~10s under load in that
+// session, across repeated re-claims) -- every not-blocked observation from
+// that window was silently dropped by the old gate, even though the
+// service worker resolves the row from the tab's already-attached queued-
+// tab metadata (set at tab-open time, independent of the claim) and could
+// have accepted them. The row's true not-blocked starting state lost the
+// "recorded once, first report wins" race to whichever observation reached
+// the service worker first *after* activeQueuedAttemptId was finally set --
+// misclassifying a genuine live block as already-blocked.
+function reportInitialBlockedStateUnconditionally(blocked) {
     void safeSendRuntimeMessageWithTimeout({
         action: 'record-initial-blocked-state',
         blocked: blocked === true
@@ -1590,8 +1620,9 @@ function formatNukeProgressLabel(label, status = null) {
     return `${label} [t:${status.owned} a:${status.active} q:${status.queued}]`
 }
 
-function formatSpaceFeedGlobalWorkLabel() {
-    return 'Nuking...'
+function formatSpaceFeedGlobalWorkLabel(count = 0) {
+    const remaining = Number.parseInt(count, 10) || 0
+    return remaining > 0 ? `Nuking... ${remaining} left` : 'Nuking...'
 }
 
 function formatSpaceFeedPostWorkLabel() {
@@ -2110,15 +2141,15 @@ function onMessage(request, sender, sendResponse) {
         }
 
         if(getPageType() === 'profile') {
+            // getPageType() is URL-only; gate on real readiness (live 2026-09-29).
+            const pageReady = document.readyState !== 'loading' &&
+                (!!getProfileMenuButton() || !!getProfileUnavailableReason())
+            if(!pageReady) return Promise.resolve({willClose: false, reason: 'not-ready', armed: false})
             const blocked = isProfileBlocked()
-            // This poll runs continuously (every ~1-2s) against a queued
-            // tab, so it's often the very first thing to observe blocked
-            // state on a given attempt -- earlier even than blockProfile()'s
-            // own check. Reporting here too (in both branches) means the
-            // initial-state stamp (see reportInitialBlockedStateIfQueued's
-            // comment) still lands promptly even when the poll wins that
-            // race.
-            reportInitialBlockedStateIfQueued(blocked)
+            // Often the first observer of blocked state on an attempt --
+            // unconditional (not gated on activeQueuedAttemptId) since this
+            // call site is always coordinator context already.
+            reportInitialBlockedStateUnconditionally(blocked)
 
             if(blocked) {
                 const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
@@ -2869,18 +2900,31 @@ function isSecurityVerificationPage() {
     return !!getSecurityVerificationReason()
 }
 
-// The __cf_chl_tk query parameter is Cloudflare's own challenge-token
-// marker, present on the interstitial URL itself -- unlike
-// getSecurityVerificationReason's title/body-text heuristics, this fires
-// immediately (even before the challenge page's DOM has rendered) and is
-// specific to Cloudflare rather than Quora's other security-verification
-// interstitials. Confirmed as the definitive signal during the 2026-09-12
-// incident: profiles that looked "stuck" for ~30-90s (Ray-Savage-52 and
-// others) were sitting on this interstitial the whole time, not failing
-// inside the extension.
+// Cloudflare's own challenge-token query parameters, present on the
+// interstitial URL itself -- unlike getSecurityVerificationReason's
+// title/body-text heuristics, this fires immediately (even before the
+// challenge page's DOM has rendered) and is specific to Cloudflare rather
+// than Quora's other security-verification interstitials. Confirmed as the
+// definitive signal during the 2026-09-12 incident: profiles that looked
+// "stuck" for ~30-90s (Ray-Savage-52 and others) were sitting on this
+// interstitial the whole time, not failing inside the extension.
+//
+// 2026-09-25: matching only the exact key `__cf_chl_tk` missed a live
+// incident where Cloudflare was issuing `__cf_chl_rt_tk` instead (a profile,
+// Emily-22838, sat behind an unreported challenge for 2+ minutes with the
+// coordinator endlessly retrying a claim against a page that could never
+// resolve on its own). Cloudflare has used several `__cf_chl_*_tk` variants
+// over time (`__cf_chl_jschl_tk`, `__cf_chl_captcha_tk`, `__cf_chl_rt_tk`,
+// ...) for different challenge types, so matching the shared `__cf_chl`
+// prefix instead of one exact key is the resilient check -- it doesn't
+// depend on knowing every variant Cloudflare currently issues or issues next.
 function isCloudflareChallengePage() {
     try {
-        return new URLSearchParams(location.search).has('__cf_chl_tk')
+        const params = new URLSearchParams(location.search)
+        for(const key of params.keys()) {
+            if(key.startsWith('__cf_chl')) return true
+        }
+        return false
     }
     catch {
         return false
@@ -3067,6 +3111,22 @@ function getProfilePrimaryAction() {
     })
 
     return actionButtons[0] || null
+}
+
+// Cheap, page-DOM-only safety check: a maintained followers list isn't
+// practical to get out of Quora, but the profile's own primary action
+// button already tells us the current relationship at the moment we're
+// about to act -- "Following" means the user deliberately follows this
+// person, which is a strong signal a mute/block here would be a mistake
+// (a miscategorized candidate, e.g. a real contributor whose profile link
+// got swept up from a post as if it were a scam-target link). "Follow" /
+// "Follow back" / "Requested" are not an established follow relationship
+// and don't gate anything. Exact match on "Following" only -- deliberately
+// narrow rather than reusing isProfilePrimaryActionText's broader set.
+function isProfileFollowedByCurrentUser() {
+    const action = getProfilePrimaryAction()
+    if(!action) return false
+    return /^following$/i.test(getElementText(action).trim())
 }
 
 function getVisibleButtons(root) {
@@ -3424,7 +3484,34 @@ function getProfileMenuButtonFallback(anchor = null) {
     return candidates[0]?.button || null
 }
 
+// Quora's own action-row buttons (Follow, notification bell, message, the
+// "..." menu) leave very little horizontal room next to them, which is
+// exactly why anchoring there put our buttons on top of Quora's own controls
+// (live-repro'd 2026-09-26, screenshot showed "Mute Block Close" covering
+// the notification bell). The "X followers * Y following" line sits just
+// below that row with open space to its right, so prefer anchoring there;
+// the button-row anchors in getProfileButtonInsertionTarget below remain a
+// fallback for whatever profile layout doesn't have this line.
+function getProfileFollowStatsAnchor() {
+    const main = getSpaceFeedContentRoot()
+    if(!main) return null
+    const mainRect = main.getBoundingClientRect()
+
+    const candidates = Array.from(main.querySelectorAll('a, span, div, button')).filter(element => {
+        if(!isVisible(element)) return false
+        if(element.children.length) return false
+        if(!/^[\d.,]+[km]?\s+following$/i.test(getElementText(element))) return false
+        return Math.abs(element.getBoundingClientRect().top - mainRect.top) <= 420
+    })
+
+    candidates.sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+    return candidates[0] || null
+}
+
 function getProfileButtonInsertionTarget() {
+    const statsAnchor = getProfileFollowStatsAnchor()
+    if(statsAnchor) return {type: 'after-stats', element: statsAnchor}
+
     const menuButton = getProfileMenuButton()
     if(menuButton) return {type: 'before-menu', element: menuButton}
 
@@ -6959,9 +7046,7 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
     const seen = new Set()
     const timestamps = []
     const posterScopeSelector =
-        '.standalone_featurable,' +
-        '[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
+        `${SPACE_FEED_EMBED_SCOPE_SELECTOR},` +
         '.puppeteer_test_tribe_post_item_feed_story,' +
         '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
         'article,' +
@@ -6986,7 +7071,20 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
 
     addTimestamp(timestamp)
 
+    // 2026-09-27: postRoot.querySelectorAll finds every timestamp nested
+    // inside postRoot, including ones belonging to an embedded/quoted
+    // sub-post (a feature card, Quora-native embed, or hyperlink embed).
+    // Each one used to resolve to that sub-post's own author as a "poster"
+    // -- exactly the failure mode the isTargetSpacePage()/asset-space split
+    // above was added for (see that comment), except this loop still hit
+    // it independently of which branch calls it, because it runs before
+    // either branch sees the result. Skipping embedded timestamps here
+    // fixes it at the source for both branches instead of re-patching each
+    // caller.
     for(const candidate of Array.from(postRoot.querySelectorAll('a.post_timestamp'))) {
+        const embedAncestor = candidate.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)
+        if(embedAncestor instanceof Element && embedAncestor !== postRoot && postRoot.contains(embedAncestor)) continue
+
         addTimestamp(candidate)
     }
 
@@ -7020,71 +7118,6 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
 
                 addPosterHref(href)
             }
-        }
-    }
-
-    return urls
-}
-
-function getSpaceFeedEmbeddedPosterProfileUrls(postRoot) {
-    if(!postRoot) return []
-
-    const urls = []
-    const seen = new Set()
-    const posterScopeSelector =
-        '.standalone_featurable,' +
-        '[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
-        '.puppeteer_test_tribe_post_item_feed_story,' +
-        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
-        'article,' +
-        '[role="article"],' +
-        '.q-box'
-    const embedRoots = []
-    const addEmbedRoot = root => {
-        if(!(root instanceof Element) || !postRoot.contains(root) || embedRoots.includes(root)) return
-        embedRoots.push(root)
-    }
-    const addPosterHref = href => {
-        const normalizedHref = normalizeQuoraProfileHref(href)
-        if(!normalizedHref || seen.has(normalizedHref)) return
-
-        seen.add(normalizedHref)
-        urls.push(normalizedHref)
-    }
-
-    for(const embed of Array.from(postRoot.querySelectorAll(
-        '.standalone_featurable[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
-        'a[href^="https://qr.ae/"]'
-    ))) {
-        addEmbedRoot(embed.closest('.standalone_featurable, [data-is-quora-embed="true"], [data-type="hyperlink_embed"]') || embed)
-    }
-
-    for(const embedRoot of embedRoots) {
-        if(hasVisibleFollowProxy(embedRoot)) {
-            for(const link of getQuoraProfileLinks(embedRoot)) {
-                addPosterHref(link.href)
-            }
-        }
-
-        let scope = embedRoot.closest(posterScopeSelector) || embedRoot.parentElement
-        const scopes = []
-
-        while(scope && scope !== postRoot) {
-            if(postRoot.contains(scope) && !scopes.includes(scope)) {
-                scopes.push(scope)
-            }
-            scope = scope.parentElement
-        }
-
-        if(!scopes.includes(postRoot)) {
-            scopes.push(postRoot)
-        }
-
-        for(const candidateScope of scopes) {
-            if(!hasVisibleFollowProxy(candidateScope)) continue
-            addPosterHref(getSpaceFeedPostHeaderProfileHref(candidateScope, embedRoot))
         }
     }
 
@@ -7146,12 +7179,26 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
 
     const headerProfileHref = getSpaceFeedPostHeaderProfileHref(postRoot, timestamp)
     const posterProfileUrls = getSpaceFeedPosterProfileUrls(postRoot, timestamp)
-    const sharedPosterUrls = posterProfileUrls.filter(href => href !== headerProfileHref)
     if(isTargetSpacePage()) {
         return posterProfileUrls.length
             ? posterProfileUrls
             : getNormalizedProfileHrefList([headerProfileHref])
     }
+    // 2026-09-25: asset-space pages used to also treat any *other* poster
+    // surfaced via an embedded/quoted sub-post (getSpaceFeedEmbeddedPosterProfileUrls,
+    // removed) as a high-confidence candidate, the same tier as a genuine
+    // scam-target link found in a post's own content. That conflated two
+    // different things: "this person authored/posted content" (true of the
+    // primary header author too, which this function already excludes) and
+    // "this profile is being called out within someone else's post" -- a
+    // real incident (Franklin Veaux, a genuine contributor whose post got
+    // embedded/quoted for an unrelated reason) got queued for mute-block
+    // because of this. isTargetSpacePage() above is the deliberate
+    // exception: on that page type, "poster" and "target" genuinely are the
+    // same thing by the space's own design, which is why that branch still
+    // returns posterProfileUrls directly. Asset pages don't have that
+    // property, so a poster there -- however discovered -- is not a
+    // candidate.
 
     const urls = []
     const seen = new Set()
@@ -7164,15 +7211,6 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
         urls.push(href)
         if(evidence) {
             candidateEvidenceByHref[href] = evidence
-        }
-    }
-
-    if(isAssetSpacePage()) {
-        for(const href of [
-            ...sharedPosterUrls,
-            ...getSpaceFeedEmbeddedPosterProfileUrls(postRoot)
-        ]) {
-            addUrl(href, makeSpaceFeedCandidateEvidence('embedded-profile-link', SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH))
         }
     }
 
@@ -9688,6 +9726,21 @@ function syncSpaceFeedTopPauseButton(host, workingButton, model = {}, activeWork
 function syncSpaceFeedTopNukeButton(renderModel) {
     const host = getSpaceFeedTopButtonHost()
     if(!host) return false
+
+    // getSpaceFeedBar's tab row is shared navigation present on every Space
+    // sub-page (About, Members, ...), not just the ones that actually list
+    // posts -- previously this button still showed up (as an inert
+    // "Scanning..." state, see the totalEntries.length === 0 branch below)
+    // on any of them. Reported live by a user (qr.ae/pFJLuz) as a confusing,
+    // unexplained control on a page with no posts to nuke. a.post_timestamp
+    // is the same signal getSpaceFeedContentRoot() already uses to confirm
+    // a page actually has posts; require it here too before showing
+    // anything, rather than only checking it indirectly via this
+    // extension's own (slower) profile-href scan.
+    if(!document.querySelector('a.post_timestamp')) {
+        host.querySelector('.mb-ext_space-feed-nuke-btn')?.remove()
+        return false
+    }
 
     const model = Array.isArray(renderModel) ? buildSpaceFeedRenderModel(renderModel) : renderModel
     const totalEntries = model?.totalEntries || []
@@ -13074,6 +13127,24 @@ async function muteProfile(options = {}) {
 
 async function blockProfile(options = {}) {
     const {silent = false, allowForegroundFallback = false} = options
+
+    // Checked before anything else: a candidate the current user already
+    // follows should never be blocked, regardless of how it got queued (a
+    // maintained followers list isn't practical to get out of Quora, so
+    // this is a page-DOM check at the moment of action, not a lookup).
+    // Terminal and counted, not silently dropped, so a run where this fires
+    // a lot is visible rather than looking like candidates quietly
+    // vanished.
+    if(isProfileFollowedByCurrentUser()) {
+        await recordCurrentProfileNukeProgress({
+            status: 'block-attempt-on-following',
+            blockAttempted: false,
+            blockSucceeded: false,
+            event: 'Block flow skipped because the profile is already followed'
+        })
+        return true
+    }
+
     const alreadyBlockedOnEntry = isProfileBlocked()
     reportInitialBlockedStateIfQueued(alreadyBlockedOnEntry)
 

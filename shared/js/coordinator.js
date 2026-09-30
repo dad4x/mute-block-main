@@ -12,6 +12,13 @@ const {
     COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS,
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
 } = require('./timeouts')
+const {
+    SPACE_NUKED_POSTS_KEY,
+    NUKED_POST_RETENTION_DAYS_KEY,
+    MAX_REMEMBERED_NUKED_POSTS_KEY,
+    getPrunedNukedPosts
+} = require('./nukedPosts')
+const defaults = require('./defaults')
 
 // coordinatorStatusRules is the same factory sw.js uses, so
 // isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
@@ -48,8 +55,17 @@ const SPACE_REGISTRY_KEY = 'mbSpaceRegistry'
 const HIDDEN_RUNS_KEY = 'mbCoordinatorHiddenRunIds'
 const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
 const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
+// Per-viewer UI preference only (like a collapsed panel), not durable
+// coordinator state -- localStorage is the right home for it, same
+// reasoning as dismissedOutlierKeys/eventHistogramClearedAtMs below, except
+// this one is meant to survive a reload.
+const DEV_MODE_STORAGE_KEY = 'mbDashboardDevMode'
+// chrome.storage mirror of the above, readable by the service worker (see
+// setDevModeStoredEnabled) -- must match sw.js's DEV_MODE_SYNC_STORAGE_KEY.
+const DEV_MODE_SYNC_STORAGE_KEY = 'mbDashboardDevModeEnabled'
 const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
 const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#worker-window'
+const COORDINATOR_HISTORY_HASH = '#history'
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
 const RETRY_FAILED_LIMIT = 2
@@ -102,6 +118,19 @@ const state = {
 // (not persisted, same as everything else here) -- a new attempt (retry) or
 // a different row is unaffected.
 const dismissedOutlierKeys = new Set()
+// Recent event counts (renderEventHistogram) re-fetches and re-tallies the
+// flight recorder's full retained window on every render, so a client-only
+// "clear" can't remove entries -- they'd just reappear on the next refresh.
+// Instead this records when Clear was pressed and every render only tallies
+// entries recorded after it, the same "not persisted, this tab only" scope
+// as dismissedOutlierKeys above. The flight recorder itself is a read-only
+// diagnostic journal (swflightRecorder.js) with no production reset action,
+// and this doesn't add one.
+let eventHistogramClearedAtMs = 0
+// Track the previous "Progress events" pending-max reading for trend
+// coloring on that metric card (renderWakeupMetrics) -- null until the
+// first refresh has run.
+let previousProgressPendingMax = null
 let dashboardCompactRefreshTimer = null
 let dashboardCompactRefreshScheduledTimer = null
 let dashboardCompactRefreshPromise = null
@@ -113,10 +142,157 @@ addEventListener('load', () => {
     void init()
 })
 
+// A hash-only navigation (e.g. the service worker reusing this exact tab
+// but switching it from #history to the plain dashboard, or vice versa) is
+// a same-document navigation -- it never fires 'load' and re-runs init(),
+// so the previous view's content and click handlers would otherwise just
+// stay put while the address bar quietly changed underneath them.
+// Confirmed live 2026-09-29: reusing a tab across views left the wrong
+// section(s) visible. Reloading is simpler and safer than trying to
+// re-run init() in place (which would double-register every click handler
+// the previous view's init() already attached).
+addEventListener('hashchange', () => {
+    location.reload()
+})
+
+async function openCoordinatorViewFromHere(action = 'open-coordinator') {
+    const currentWindow = await browser.windows.getCurrent().catch(() => null)
+    await sendRuntimeMessageWithTimeout({
+        action,
+        active: true,
+        windowId: currentWindow?.id || null
+    }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
+async function loadHistoryEntries() {
+    const stored = await browser.storage.local.get({
+        [SPACE_NUKED_POSTS_KEY]: {},
+        [NUKED_POST_RETENTION_DAYS_KEY]: defaults[NUKED_POST_RETENTION_DAYS_KEY],
+        [MAX_REMEMBERED_NUKED_POSTS_KEY]: defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
+    })
+    return getPrunedNukedPosts(stored[SPACE_NUKED_POSTS_KEY] || {}, {
+        retentionDays: stored[NUKED_POST_RETENTION_DAYS_KEY],
+        maxEntries: stored[MAX_REMEMBERED_NUKED_POSTS_KEY]
+    })
+}
+
+async function renderHistoryList() {
+    const entries = await loadHistoryEntries()
+    const rows = Object.entries(entries)
+    const countEl = document.getElementById('historyCount')
+    if(countEl) countEl.textContent = `${rows.length} ${rows.length === 1 ? 'entry' : 'entries'}`
+
+    const list = document.getElementById('historyList')
+    if(!list) return
+
+    replaceChildren(list, rows.map(([postKey, record]) => {
+        const urls = Array.isArray(record?.urls) ? record.urls : []
+        const singleProfileHref = urls.length === 1 ? urls[0] : ''
+        const profileLabel = singleProfileHref ? getProfileLabelFromHref(singleProfileHref) : ''
+        // Matches renderQueue's own title/subtitle pattern (Current Work
+        // listing): title links to the actual profile, subtitle is the
+        // action mode plus the source it came from -- SPACE_NUKED_POSTS_KEY
+        // entries are always mute-block (there's no unblock/unmute
+        // equivalent of a space-feed post nuke), so that half is constant.
+        const titleLabel = profileLabel || (urls.length > 1 ? `${urls.length} profiles` : (postKey || 'Unknown profile'))
+        const titleHref = singleProfileHref || ''
+        const sourceLabel = getSourceLabelFromUrl(record?.postUrl || record?.spaceUrl || '')
+        const when = record?.updatedAt ? formatDateTime(record.updatedAt) : ''
+        const subtitle = ['Mute Block', sourceLabel, when].filter(Boolean).join(' • ')
+        const row = document.createElement('div')
+        row.className = 'row'
+        row.append(buildTitleCell(titleLabel, subtitle, {titleHref, subtitleHref: record?.postUrl || ''}))
+        return row
+    }), 'No history yet.')
+}
+
+async function clearHistory() {
+    if(!window.confirm('Clear all Recent History?')) return
+    await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: {}})
+    await renderHistoryList()
+}
+
+// The three coordinator.html views (default dashboard, #worker-window,
+// #history) each render their own content correctly for their mode, but
+// nothing ever toggled which container is actually visible -- all three
+// sections stayed shown simultaneously regardless of hash. Confirmed live
+// 2026-09-29 (screenshot): the worker bar and the history header both
+// rendered stacked on top of the plain dashboard.
+function applyCoordinatorViewMode() {
+    const dashboardView = document.getElementById('dashboardView')
+    const workerBarView = document.getElementById('workerBarView')
+    const historyView = document.getElementById('historyView')
+    const isWorkerBar = isQueuedWorkerActionSurfacePage()
+    const isHistory = isCoordinatorHistoryPage()
+
+    if(dashboardView) dashboardView.hidden = isWorkerBar || isHistory
+    if(workerBarView) workerBarView.hidden = !isWorkerBar
+    if(historyView) historyView.hidden = !isHistory
+}
+
+async function initHistoryPage() {
+    document.getElementById('clearHistoryButton')?.addEventListener('click', () => {
+        void clearHistory()
+    })
+    document.getElementById('historyDashboardButton')?.addEventListener('click', () => {
+        void openCoordinatorViewFromHere('open-coordinator')
+    })
+    document.getElementById('historyPreferencesButton')?.addEventListener('click', () => {
+        void openPreferences()
+    })
+    // Deliberately no broad storage-change listener here -- this file
+    // avoids that delivery mechanism on purpose elsewhere (see "dashboard
+    // live refresh avoids broad storage change delivery"). This page only
+    // ever changes via its own Clear button, which already re-renders
+    // itself, so a one-time load on open is enough.
+    await renderHistoryList()
+}
+
+async function initWorkerBarPage() {
+    await registerQueuedWorkerActionSurfacePage()
+    const manifest = browser.runtime.getManifest()
+    const versionEl = document.getElementById('workerBarVersion')
+    if(versionEl) versionEl.textContent = `v${manifest.version}`
+    document.getElementById('workerBarPauseResume')?.addEventListener('click', () => {
+        void toggleCurrentWorkPause()
+    })
+    document.getElementById('workerBarCancel')?.addEventListener('click', () => {
+        void cancelCurrentWork()
+    })
+    document.getElementById('workerBarDashboard')?.addEventListener('click', () => {
+        void openCoordinatorViewFromHere('open-coordinator')
+    })
+    document.getElementById('workerBarHistory')?.addEventListener('click', () => {
+        void openCoordinatorViewFromHere('open-coordinator-history')
+    })
+    document.getElementById('workerBarPreferences')?.addEventListener('click', () => {
+        void openPreferences()
+    })
+    installCompactStorageRefreshPolling()
+    installDashboardRuntimeRefreshListener()
+    render()
+    await announceCoordinatorPageReady()
+
+    try {
+        await loadState()
+    }
+    catch {}
+    render()
+}
+
 async function init() {
+    applyCoordinatorViewMode()
+    if(isCoordinatorHistoryPage()) {
+        await initHistoryPage()
+        return
+    }
+    if(isQueuedWorkerActionSurfacePage()) {
+        await initWorkerBarPage()
+        return
+    }
+
     const manifest = browser.runtime.getManifest()
     document.getElementById('appVersion').textContent = `v${manifest.version}`
-    await registerQueuedWorkerActionSurfacePage()
     document.getElementById('clearEventsButton')?.addEventListener('click', () => {
         void clearEvents()
     })
@@ -125,6 +301,12 @@ async function init() {
     })
     document.getElementById('clearOutliersButton')?.addEventListener('click', () => {
         clearOutliers()
+    })
+    document.getElementById('clearScanCostButton')?.addEventListener('click', () => {
+        void resetMetrics()
+    })
+    document.getElementById('clearEventHistogramButton')?.addEventListener('click', () => {
+        clearEventHistogram()
     })
     document.getElementById('resetMetricsButton')?.addEventListener('click', () => {
         void resetMetrics()
@@ -141,15 +323,22 @@ async function init() {
     document.getElementById('cancelCurrentWorkButton')?.addEventListener('click', () => {
         void cancelCurrentWork()
     })
+    document.getElementById('clearCurrentWorkButton')?.addEventListener('click', () => {
+        void clearCurrentWork()
+    })
     document.getElementById('startCoordinatorButton')?.addEventListener('click', () => {
         void startCoordinatorQueue()
     })
     document.getElementById('openPreferencesButton')?.addEventListener('click', () => {
         void openPreferences()
     })
+    document.getElementById('openHistoryButton')?.addEventListener('click', () => {
+        void openCoordinatorViewFromHere('open-coordinator-history')
+    })
     installPanelToggleListeners()
     installPanelWheelScrollListeners()
     installDashboardRuntimeRefreshListener()
+    installDevModeToggle()
 
     installCompactStorageRefreshPolling()
     render()
@@ -173,6 +362,10 @@ async function init() {
 
 function isQueuedWorkerActionSurfacePage() {
     return `${globalThis.location?.hash || ''}` === QUEUED_ACTION_SURFACE_COORDINATOR_HASH
+}
+
+function isCoordinatorHistoryPage() {
+    return `${globalThis.location?.hash || ''}` === COORDINATOR_HISTORY_HASH
 }
 
 async function registerQueuedWorkerActionSurfacePage() {
@@ -204,11 +397,35 @@ async function registerQueuedWorkerActionSurfacePage() {
     return true
 }
 
+// 2026-09-27: this periodic poll used to run unconditionally every
+// DASHBOARD_COMPACT_REFRESH_INTERVAL_MS (2s) for as long as the dashboard
+// tab stayed open, regardless of whether the queue could possibly have
+// changed. Confirmed live via the flight recorder: with the queue paused
+// (or simply with nothing pending) and the dashboard left open, this alone
+// produced thousands of no-op round-trips to the service worker over a
+// few hours -- each one a real (if now skipped, see
+// refreshCoordinatorQueueViewForDashboard) storage-update cycle, and each
+// one inflating storageUpdate.noDurableWork (the "No-work writes" card)
+// for reasons that had nothing to do with the queue actually stalling.
+// Paused, or genuinely nothing pending, means nothing this timer tick
+// could discover will have changed since the last one -- a real change
+// (resume, new work enqueued, pause toggled elsewhere) already reaches
+// this dashboard via installDashboardRuntimeRefreshListener's
+// coordinator-dashboard-state-changed push, independent of this timer.
+const PENDING_QUEUE_VIEW_STATUSES = ['queued', 'opening', 'active', 'acting', 'settling']
+
+function isDashboardQueueDefinitelyIdle() {
+    if(state.paused) return true
+    const counts = state.queueView?.counts || {}
+    return !PENDING_QUEUE_VIEW_STATUSES.some(status => (Number(counts[status]) || 0) > 0)
+}
+
 function installCompactStorageRefreshPolling() {
     if(dashboardCompactRefreshTimer) return
     addEventListener('pagehide', stopCompactStorageRefreshPolling)
     addEventListener('beforeunload', stopCompactStorageRefreshPolling)
     dashboardCompactRefreshTimer = setInterval(() => {
+        if(isDashboardQueueDefinitelyIdle()) return
         scheduleDashboardCompactRefresh()
     }, DASHBOARD_COMPACT_REFRESH_INTERVAL_MS)
 }
@@ -270,6 +487,58 @@ async function sendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs
     ])
 
     return result === timeoutMarker ? fallback : result
+}
+
+function isDevModeStoredEnabled() {
+    try {
+        return localStorage.getItem(DEV_MODE_STORAGE_KEY) === '1'
+    }
+    catch {
+        return false
+    }
+}
+
+function setDevModeStoredEnabled(enabled) {
+    try {
+        localStorage.setItem(DEV_MODE_STORAGE_KEY, enabled ? '1' : '0')
+    }
+    catch {}
+    // localStorage is dashboard-page-local -- the service worker (which is
+    // what actually decides whether to write the pause diagnostic snapshot)
+    // can't read it, so mirror the flag into chrome.storage as well.
+    try {
+        browser.storage.local.set({[DEV_MODE_SYNC_STORAGE_KEY]: !!enabled}).catch(() => {})
+    }
+    catch {}
+}
+
+// Diagnostic panels (Metrics, Scan cost, Recent event counts, Outliers,
+// Runs, Events) are internal-audience clutter for the common case -- hidden
+// entirely behind this toggle regardless of each panel's own expand/collapse
+// state, which stays exactly as the user left it for next time dev mode
+// comes back on.
+function applyDevModeVisibility(enabled) {
+    document.querySelectorAll('[data-dev-mode-panel]').forEach(panel => {
+        panel.hidden = !enabled
+    })
+}
+
+function installDevModeToggle() {
+    const toggle = document.getElementById('devModeToggle')
+    const enabled = isDevModeStoredEnabled()
+    if(toggle) toggle.checked = enabled
+    applyDevModeVisibility(enabled)
+    // Self-heals the chrome.storage mirror the service worker reads (e.g.
+    // this build's first run, or if chrome.storage was cleared) even when
+    // the user never touches the toggle this session.
+    try {
+        browser.storage.local.set({[DEV_MODE_SYNC_STORAGE_KEY]: enabled}).catch(() => {})
+    }
+    catch {}
+    toggle?.addEventListener('change', () => {
+        setDevModeStoredEnabled(toggle.checked)
+        applyDevModeVisibility(toggle.checked)
+    })
 }
 
 function installPanelToggleListeners() {
@@ -369,7 +638,6 @@ async function resetMetrics() {
 
 async function loadState() {
     const stored = await browser.storage.local.get({
-        [COORDINATOR_QUEUE_VIEW_KEY]: {},
         [COORDINATOR_RUNS_KEY]: {},
         [COORDINATOR_EVENTS_KEY]: [],
         [QUEUE_WAKEUP_METRICS_VIEW_KEY]: {},
@@ -380,13 +648,32 @@ async function loadState() {
         [LAST_ENQUEUE_SUMMARY_KEY]: null
     })
 
-    if(hasCoordinatorQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY])) {
-        applyCoordinatorQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY])
+    // Always ask the service worker to build the queue view fresh, rather
+    // than trusting whatever's sitting in storage.mbCoordinatorQueueView --
+    // that storage copy exists for other consumers (the SW's own cheap
+    // startup "is there stored work" check, and as a resilience fallback if
+    // this very message times out), not as something the dashboard should
+    // read directly. Nothing re-filters it against the current set of known
+    // runs until a rebuild actually runs, so a plain storage read can sit
+    // stale indefinitely -- e.g. mixing in terminal rows from runs that no
+    // longer exist -- and periodic dashboard polling (see
+    // refreshDashboardStateFromCompactStorage) would otherwise just keep
+    // re-reading that same stale snapshot forever instead of ever
+    // correcting it.
+    await refreshCompactQueueView()
+    // Same reasoning as the queue view above, for the same underlying reason:
+    // mbCoordinatorRuns[runId]'s itemCount/targetProfileHrefs/targetWorkKeys/
+    // activeCount/terminalCount/status are maintained as a mutated running
+    // total by ~24 independent, unserialized call sites in sw.js (see
+    // architecture.md's "Derived Stats Must Not Be A Mutated Running Total"
+    // and mutated-running-total-audit-todo-2026-09-25.md) and can lose
+    // updates when several of a run's items terminalize in quick succession.
+    // Ask the service worker to compute run stats fresh from current
+    // authority plus the full completed-work log instead of trusting that
+    // storage copy; fall back to it only if the message truly fails.
+    if(!await refreshCompactRunsView()) {
+        state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
     }
-    else {
-        await refreshCompactQueueView()
-    }
-    state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
     state.events = normalizeEvents(stored[COORDINATOR_EVENTS_KEY])
     if(hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
         state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])
@@ -426,6 +713,18 @@ async function refreshCompactQueueView() {
         truncated: false,
         items: []
     })
+    return false
+}
+
+async function refreshCompactRunsView() {
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'refresh-coordinator-runs-view',
+        reason: 'dashboard-load'
+    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
+    if(result?.runs && typeof result.runs === 'object' && !Array.isArray(result.runs)) {
+        state.runs = result.runs
+        return true
+    }
     return false
 }
 
@@ -553,22 +852,66 @@ function getQueueTotalCount(queueItems = []) {
     return hasCoordinatorQueueView() ? Number(state.queueTotal) || queueItems.length : queueItems.length
 }
 
+// The worker window's minimal "idiot light" status bar -- deliberately not
+// the full control-panel dashboard (see nits3.md item 5 discussion): just a
+// window-width progress fill of handled-vs-total Current Work items, a
+// count, and the handful of actions relevant to a background worker window.
+function renderWorkerBar() {
+    const total = getQueueTotalCount()
+    const terminal = getQueueTerminalCount()
+    const fill = document.getElementById('workerBarFill')
+    const count = document.getElementById('workerBarCount')
+    const pauseResumeButton = document.getElementById('workerBarPauseResume')
+    const cancelButton = document.getElementById('workerBarCancel')
+
+    if(fill) fill.style.width = `${total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0}%`
+    if(count) count.textContent = `${terminal} / ${total}`
+
+    if(pauseResumeButton) {
+        const pausePending = currentWorkPausePending === 'pause'
+        const resumePending = currentWorkPausePending === 'resume'
+        pauseResumeButton.textContent = pausePending
+            ? 'Pausing...'
+            : resumePending
+                ? 'Resuming...'
+                : state.paused ? 'Resume' : 'Pause'
+        pauseResumeButton.disabled = pausePending || resumePending
+    }
+
+    if(cancelButton) {
+        const pendingCount = getPendingCurrentWorkItems().length
+        cancelButton.disabled = pendingCount <= 0
+    }
+}
+
 function getBlockOutcomeCounts() {
     const metricsDocument = state.metrics || {}
     const counters = (metricsDocument.currentEpoch || metricsDocument).counters || {}
     const reallyBlockedCount = getMetricCounter(counters, 'profileAction.reallyBlocked.count')
     const alreadyBlockedCount = getMetricCounter(counters, 'profileAction.alreadyBlocked.count')
+    // Not folded into `total`/the really-vs-already-blocked percentages --
+    // this is a different category (skipped, not a block outcome at all),
+    // just reusing the same counted-stat mechanism.
+    const blockAttemptOnFollowingCount = getMetricCounter(counters, 'profileAction.blockAttemptOnFollowing.count')
     const total = reallyBlockedCount + alreadyBlockedCount
     return {
         reallyBlockedCount,
         alreadyBlockedCount,
+        blockAttemptOnFollowingCount,
         total,
         // Recorded by recordCoordinatorProfileActionOutcomeStat
         // (swCoordinatorProgressReducer.js) alongside the counts above, one
         // pair per outcome bucket -- see formatBlockOutcomeDuration for how
-        // these become an avg/max on the summary tile.
+        // these become an avg/max on the summary tile. durationSampleCount is
+        // the avg denominator, not reallyBlockedCount/alreadyBlockedCount --
+        // it excludes any sample over PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS
+        // (a stale-backlog row or WAL-recovery gap), which the *Count fields
+        // above intentionally still include since those feed the outcome
+        // percentage tile, not a duration average.
+        reallyBlockedDurationSampleCount: getMetricCounter(counters, 'profileAction.reallyBlocked.durationSampleCount'),
         reallyBlockedTotalDurationMs: getMetricCounter(counters, 'profileAction.reallyBlocked.totalDurationMs'),
         reallyBlockedMaxDurationMs: getMetricCounter(counters, 'profileAction.reallyBlocked.maxDurationMs'),
+        alreadyBlockedDurationSampleCount: getMetricCounter(counters, 'profileAction.alreadyBlocked.durationSampleCount'),
         alreadyBlockedTotalDurationMs: getMetricCounter(counters, 'profileAction.alreadyBlocked.totalDurationMs'),
         alreadyBlockedMaxDurationMs: getMetricCounter(counters, 'profileAction.alreadyBlocked.maxDurationMs')
     }
@@ -584,6 +927,11 @@ function formatBlockOutcomeDuration(count = 0, totalDurationMs = 0, maxDurationM
 }
 
 function render() {
+    if(isQueuedWorkerActionSurfacePage()) {
+        renderWorkerBar()
+        return
+    }
+
     const queueItems = getDisplayQueueItems()
     const runItems = getDisplayRuns(queueItems)
     refreshQuoraVisitRequirement(queueItems)
@@ -594,8 +942,10 @@ function render() {
         getQueueStatusCount('settling', queueItems)
     const terminalCount = getQueueTerminalCount(queueItems)
     const secondsPerBlock = getSecondsPerActualBlock(queueItems, getCurrentMetricsEpochStartedAt())
+    const secondsPerAlreadyBlocked = getSecondsPerAlreadyBlocked(queueItems, getCurrentMetricsEpochStartedAt())
     const activationHandoff = getActivationHandoffSeconds(queueItems, getCurrentMetricsEpochStartedAt())
     const failedCount = getQueueStatusCount('failed', queueItems)
+    const canceledCount = getQueueStatusCount('canceled', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
     const retryableFailureShapeCount = queueItems.filter(isRetryableFailedQueueItem).length
     const retryableFailedCount = queueItems.filter(isEligibleRetryFailedQueueItem).length
@@ -611,20 +961,22 @@ function render() {
     }))
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
+    setText('secondsPerAlreadyBlocked', formatSecondsPerBlock(secondsPerAlreadyBlocked))
     setText('activationHandoffSeconds', formatSecondsPerBlock(activationHandoff))
     const blockOutcomeCounts = getBlockOutcomeCounts()
     setText('reallyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.reallyBlockedCount, blockOutcomeCounts.total))
     setText('alreadyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.alreadyBlockedCount, blockOutcomeCounts.total))
     setText('reallyBlockedDuration', formatBlockOutcomeDuration(
-        blockOutcomeCounts.reallyBlockedCount,
+        blockOutcomeCounts.reallyBlockedDurationSampleCount,
         blockOutcomeCounts.reallyBlockedTotalDurationMs,
         blockOutcomeCounts.reallyBlockedMaxDurationMs
     ))
     setText('alreadyBlockedDuration', formatBlockOutcomeDuration(
-        blockOutcomeCounts.alreadyBlockedCount,
+        blockOutcomeCounts.alreadyBlockedDurationSampleCount,
         blockOutcomeCounts.alreadyBlockedTotalDurationMs,
         blockOutcomeCounts.alreadyBlockedMaxDurationMs
     ))
+    setText('blockAttemptOnFollowingCount', blockOutcomeCounts.blockAttemptOnFollowingCount)
     setText('terminalCount', terminalCount)
     setText('eventCount', state.events.length)
     setText('eventListCount', `${state.events.length} event${state.events.length === 1 ? '' : 's'}`)
@@ -636,11 +988,13 @@ function render() {
     renderRuns(runItems)
     renderEvents()
     renderWakeupMetrics(queueItems)
+    renderScanCostHistogram()
+    renderEventHistogram()
     renderQueue(queueItems)
     checkCoordinatorOutliers(queueItems)
     renderOutliers()
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
-    syncRequeueFailedControls(failedCount)
+    syncRequeueFailedControls(failedCount + canceledCount)
     syncCurrentWorkPauseControls(queueItems)
     syncStartCoordinatorControls()
     syncLastEnqueueSummary()
@@ -653,22 +1007,18 @@ function render() {
 // this was previously only visible as free text buried in the capped
 // mbCoordinatorEvents log. Self-expires after LAST_ENQUEUE_SUMMARY_MAX_AGE_MS
 // so it doesn't linger indefinitely as stale context from a much earlier add.
-function syncLastEnqueueSummary() {
-    const element = document.getElementById('lastEnqueueSummary')
-    if(!element) return
-
-    const summary = state.lastEnqueueSummary
-    const at = Number.parseInt(summary?.at, 10) || 0
-    if(!summary || !at || (Date.now() - at) > LAST_ENQUEUE_SUMMARY_MAX_AGE_MS) {
-        element.hidden = true
-        element.textContent = ''
-        return
-    }
+// Shared by the transient "last enqueue" banner (below) and each run's own
+// durable subtitle (getRunDisplay) -- same requested/queued/merged/preFilter
+// shape, just sourced from a different summary object (the single global
+// "last enqueue across any run" one vs. a specific run's own accumulated
+// enqueueRequested/enqueueQueued/enqueueMerged/enqueuePreFilter fields).
+function formatCoordinatorEnqueueBreakdown(summary = null) {
+    if(!summary) return ''
 
     const requested = Number.parseInt(summary.requested, 10) || 0
     const queued = Number.parseInt(summary.queued, 10) || 0
     const merged = Number.parseInt(summary.merged, 10) || 0
-    element.hidden = false
+    if(!requested) return ''
 
     const noticeParts = []
     if(merged > 0) noticeParts.push(`${merged} already known`)
@@ -687,9 +1037,26 @@ function syncLastEnqueueSummary() {
     }
 
     const fromLabel = preFilter && totalCandidates > requested ? totalCandidates : requested
-    element.textContent = noticeParts.length
-        ? `Last add: ${fromLabel} candidates -> ${queued} new (${noticeParts.join(', ')})`
-        : `Last add: ${fromLabel} candidates -> ${queued} new`
+    return noticeParts.length
+        ? `${fromLabel} candidates -> ${queued} new (${noticeParts.join(', ')})`
+        : `${fromLabel} candidates -> ${queued} new`
+}
+
+function syncLastEnqueueSummary() {
+    const element = document.getElementById('lastEnqueueSummary')
+    if(!element) return
+
+    const summary = state.lastEnqueueSummary
+    const at = Number.parseInt(summary?.at, 10) || 0
+    if(!summary || !at || (Date.now() - at) > LAST_ENQUEUE_SUMMARY_MAX_AGE_MS) {
+        element.hidden = true
+        element.textContent = ''
+        return
+    }
+
+    const breakdown = formatCoordinatorEnqueueBreakdown(summary)
+    element.hidden = !breakdown
+    element.textContent = breakdown ? `Last add: ${breakdown}` : ''
 }
 
 function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
@@ -839,19 +1206,20 @@ function getRetryFailedWorkWaitText({hasPendingWork = false, hasActiveWork = fal
     return 'queued work is waiting to start'
 }
 
-function syncRequeueFailedControls(failedCount = 0) {
+function syncRequeueFailedControls(requeueableCount = 0) {
     const button = document.getElementById('requeueFailedButton')
     if(!button) return
 
-    button.disabled = failedCount <= 0
-    button.title = failedCount > 0
-        ? `Reset and requeue ${failedCount} failed Current Work job${failedCount === 1 ? '' : 's'}`
-        : 'No failed Current Work jobs to requeue'
+    button.disabled = requeueableCount <= 0
+    button.title = requeueableCount > 0
+        ? `Reset and requeue ${requeueableCount} failed/canceled Current Work job${requeueableCount === 1 ? '' : 's'}`
+        : 'No failed or canceled Current Work jobs to requeue'
 }
 
 async function requeueFailed() {
-    const failedCount = getQueueStatusCount('failed', getDisplayQueueItems())
-    if(failedCount <= 0) {
+    const items = getDisplayQueueItems()
+    const requeueableCount = getQueueStatusCount('failed', items) + getQueueStatusCount('canceled', items)
+    if(requeueableCount <= 0) {
         retryFailedLastResult = {reason: 'no-failed-current-work'}
         render()
         return
@@ -904,7 +1272,8 @@ async function cancelCurrentWorkItem(item = {}) {
 }
 
 async function requeueFailedItem(item = {}) {
-    if(`${item?.status || ''}` !== 'failed') return
+    const itemStatus = `${item?.status || ''}`
+    if(itemStatus !== 'failed' && itemStatus !== 'canceled') return
 
     const storageKey = `${item.storageKey || ''}`.trim()
     const profileHref = getQueueItemHref('', item)
@@ -978,6 +1347,15 @@ function syncCurrentWorkPauseControls(queueItems = []) {
             ? `Cancel ${pendingCount} pending Current Work job${pendingCount === 1 ? '' : 's'}`
             : 'No pending Current Work to cancel'
     }
+
+    const clearButton = document.getElementById('clearCurrentWorkButton')
+    if(clearButton) {
+        const totalCount = queueItems.length
+        clearButton.disabled = totalCount <= 0
+        clearButton.title = totalCount > 0
+            ? `Cancel and remove all ${totalCount} Current Work row${totalCount === 1 ? '' : 's'}`
+            : 'No Current Work to clear'
+    }
 }
 
 function flashButton(button) {
@@ -1033,6 +1411,38 @@ async function cancelCurrentWork() {
         reason: result?.error
             ? 'cancel-current-work-failed'
             : `canceled-${(Number.parseInt(result?.canceledUrls?.length, 10) || 0) + (Number.parseInt(result?.canceledWorkKeys?.length, 10) || 0)}`
+    }
+    await loadState()
+    render()
+}
+
+// Unlike cancelCurrentWork (which only stops pending/active rows -- terminal
+// rows stay in the completed-work log and keep showing up here), this asks
+// the service worker to remove every Current Work row entirely, live or
+// completed, so the list actually empties.
+async function clearCurrentWork() {
+    const totalRowCount = getDisplayQueueItems().length
+    if(totalRowCount <= 0) {
+        retryFailedLastResult = {reason: 'no-current-work-to-clear'}
+        render()
+        return
+    }
+
+    const button = document.getElementById('clearCurrentWorkButton')
+    if(button) button.disabled = true
+    retryFailedLastResult = {reason: 'clearing-current-work'}
+    render()
+
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'clear-coordinator-current-work'
+    }, {error: 'clear-current-work-timeout'}, CURRENT_WORK_MUTATION_TIMEOUT_MS).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+
+    retryFailedLastResult = {
+        reason: result?.error
+            ? 'clear-current-work-failed'
+            : `cleared-${(Number.parseInt(result?.clearedUrls?.length, 10) || 0) + (Number.parseInt(result?.clearedWorkKeys?.length, 10) || 0)}`
     }
     await loadState()
     render()
@@ -1172,6 +1582,13 @@ function isActualBlockSuccess(item = {}) {
     return Number.parseInt(item?.blockAttemptedAt || milestones.blockAttemptedAt, 10) > 0
 }
 
+// The exact complement of isActualBlockSuccess's already-blocked exclusion
+// -- see the matching pair in swCoordinatorQueueView.js.
+function isAlreadyBlockedSuccess(item = {}) {
+    if(`${item?.status || ''}` !== 'succeeded') return false
+    return `${item?.outcome || ''}` === 'already-blocked'
+}
+
 function getCurrentMetricsEpochStartedAt() {
     const metrics = state.metrics || {}
     const currentEpoch = metrics.currentEpoch || metrics
@@ -1277,22 +1694,28 @@ function refreshQuoraVisitRequirement(queueItems = []) {
     }
 }
 
-function getSecondsPerActualBlock(queueItems = [], epochStartedAt = 0) {
-    const viewResult = getQueueViewSecondsPerActualBlock(epochStartedAt)
-    if(viewResult) return viewResult
-
+// Shared by getSecondsPerActualBlock ("secs / real block") and
+// getSecondsPerAlreadyBlocked ("secs / already blocked") -- same
+// sampling/outlier/epoch-floor fallback logic (used only when the
+// service-worker-provided queueView summary is unavailable), differing
+// only in which predicate selects the completed rows.
+function getSecondsPerBlockLike(queueItems = [], epochStartedAt = 0, matchesSuccess = () => false) {
+    // 2026-09-27: floored by epochStartedAt again -- see the matching
+    // comment on summarizeCoordinatorActualBlockTiming in
+    // swCoordinatorQueueView.js for why (epochStartedAt only moves on a
+    // deliberate reset, and this card should read "fresh" right after one).
     const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
-    const completedBlocks = queueItems
+    const completed = queueItems
         .filter(item => {
-            if(!isActualBlockSuccess(item)) return false
+            if(!matchesSuccess(item)) return false
             const terminalAt = getQueueItemTerminalTime(item)
-            return terminalAt > 0 && (!minimumTerminalAt || terminalAt >= minimumTerminalAt)
+            return terminalAt > 0 && terminalAt >= minimumTerminalAt
         })
         .sort((left, right) => getQueueItemTerminalTime(right) - getQueueItemTerminalTime(left))
         .slice(0, SECONDS_PER_BLOCK_SAMPLE_LIMIT)
-    if(!completedBlocks.length) return null
+    if(!completed.length) return null
 
-    const durations = completedBlocks
+    const durations = completed
         .map(getQueueItemActiveDurationMs)
         .filter(duration => duration > 0 && duration <= TIMING_SAMPLE_MAX_PLAUSIBLE_MS)
     if(!durations.length) return null
@@ -1306,15 +1729,32 @@ function getSecondsPerActualBlock(queueItems = [], epochStartedAt = 0) {
     }
 }
 
-function getQueueViewSecondsPerActualBlock(epochStartedAt = 0) {
-    const summary = state.queueView?.actualBlockTiming || null
+function getSecondsPerActualBlock(queueItems = [], epochStartedAt = 0) {
+    const viewResult = getQueueViewSecondsPerActualBlock(epochStartedAt)
+    if(viewResult) return viewResult
+
+    return getSecondsPerBlockLike(queueItems, epochStartedAt, isActualBlockSuccess)
+}
+
+function getSecondsPerAlreadyBlocked(queueItems = [], epochStartedAt = 0) {
+    const viewResult = getQueueViewSecondsPerAlreadyBlocked(epochStartedAt)
+    if(viewResult) return viewResult
+
+    return getSecondsPerBlockLike(queueItems, epochStartedAt, isAlreadyBlockedSuccess)
+}
+
+// Shared by the queueView-summary readers below (real block, already
+// blocked, handoff) -- each SW-provided summary object carries its own
+// epochStartedAt (for the same-epoch-only check) and count under a
+// differently-named field (blocks vs handoffs), passed in as countField.
+function getQueueViewTimingSummarySeconds(summary = null, epochStartedAt = 0, countField = 'blocks') {
     if(!summary || typeof summary !== 'object') return null
 
     const requestedEpochStartedAt = Number.parseInt(epochStartedAt, 10) || 0
     const summaryEpochStartedAt = Number.parseInt(summary.epochStartedAt, 10) || 0
     if(requestedEpochStartedAt && summaryEpochStartedAt && summaryEpochStartedAt !== requestedEpochStartedAt) return null
 
-    const blocks = Number.parseInt(summary.blocks, 10) || 0
+    const blocks = Number.parseInt(summary[countField], 10) || 0
     const elapsedMs = Number.parseInt(summary.elapsedMs, 10) || 0
     const seconds = Number(summary.seconds)
     if(blocks <= 0 || elapsedMs <= 0 || !Number.isFinite(seconds) || seconds <= 0) return null
@@ -1324,6 +1764,14 @@ function getQueueViewSecondsPerActualBlock(epochStartedAt = 0) {
         blocks,
         elapsedMs
     }
+}
+
+function getQueueViewSecondsPerActualBlock(epochStartedAt = 0) {
+    return getQueueViewTimingSummarySeconds(state.queueView?.actualBlockTiming, epochStartedAt, 'blocks')
+}
+
+function getQueueViewSecondsPerAlreadyBlocked(epochStartedAt = 0) {
+    return getQueueViewTimingSummarySeconds(state.queueView?.alreadyBlockedTiming, epochStartedAt, 'blocks')
 }
 
 function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
@@ -1349,7 +1797,8 @@ function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
         }))
         .filter(sample => {
             if(!isTerminalQueueItem(sample.item)) return false
-            return sample.runId && sample.terminalAt > 0 && (!minimumTerminalAt || sample.terminalAt >= minimumTerminalAt)
+            // Floored by epochStartedAt again -- see getSecondsPerActualBlock above.
+            return sample.runId && sample.terminalAt > 0 && sample.terminalAt >= minimumTerminalAt
         })
         .sort((left, right) => left.terminalAt - right.terminalAt)
     const gaps = []
@@ -1376,23 +1825,7 @@ function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
 }
 
 function getQueueViewActivationHandoffSeconds(epochStartedAt = 0) {
-    const summary = state.queueView?.activationHandoffTiming || null
-    if(!summary || typeof summary !== 'object') return null
-
-    const requestedEpochStartedAt = Number.parseInt(epochStartedAt, 10) || 0
-    const summaryEpochStartedAt = Number.parseInt(summary.epochStartedAt, 10) || 0
-    if(requestedEpochStartedAt && summaryEpochStartedAt && summaryEpochStartedAt !== requestedEpochStartedAt) return null
-
-    const handoffs = Number.parseInt(summary.handoffs, 10) || 0
-    const elapsedMs = Number.parseInt(summary.elapsedMs, 10) || 0
-    const seconds = Number(summary.seconds)
-    if(handoffs <= 0 || elapsedMs <= 0 || !Number.isFinite(seconds) || seconds <= 0) return null
-
-    return {
-        seconds,
-        blocks: handoffs,
-        elapsedMs
-    }
+    return getQueueViewTimingSummarySeconds(state.queueView?.activationHandoffTiming, epochStartedAt, 'handoffs')
 }
 
 function getQueueItemActiveStartTime(item = {}) {
@@ -1518,6 +1951,17 @@ function renderWakeupMetrics(queueItems = []) {
     const terminalJobs = getMetricCounter(counters, 'job.terminal')
     const nudgeSent = getMetricCounter(counters, 'nudge.sent')
     const nudgeAccepted = getMetricCounter(counters, 'nudge.accepted')
+    // 2026-09-27: nudge.sent increments on every nudgeQueuedTabActionClaim
+    // call, including ones the coalesce cooldown (isKeyedThrottleCoalesced)
+    // skips before actually messaging a tab -- confirmed live at 444
+    // coalesced out of 749 "sent," each one an intentional, expected skip
+    // (there was already a nudge outstanding for that tab), not a failure.
+    // Dividing accepted by the full sent count made a healthy run look
+    // like it was only accepting ~31% of nudges, when the real rate among
+    // nudges that actually went out was much higher. nudgeDispatched
+    // backs those out of the denominator.
+    const nudgeCoalesced = getMetricCounter(counters, 'nudge.coalesced')
+    const nudgeDispatched = Math.max(0, nudgeSent - nudgeCoalesced)
     const pumpRequested = getMetricCounter(counters, 'pump.requested')
     const pumpChanged = sumMetricCounters(counters, 'pump.changed.')
     const reconcileRequested = getMetricCounter(counters, 'reconcile.requested')
@@ -1537,6 +1981,10 @@ function renderWakeupMetrics(queueItems = []) {
     const milestoneFlushes = getMetricCounter(counters, 'milestone.flushPerformed')
     const progressReceived = getMetricCounter(counters, 'progress.recordReceived')
     const progressPendingMax = getMetricCounter(counters, 'progress.pendingMax')
+    const progressPendingMaxTrend = previousProgressPendingMax === null ? null
+        : progressPendingMax > previousProgressPendingMax ? 'up'
+        : progressPendingMax < previousProgressPendingMax ? 'down' : null
+    previousProgressPendingMax = progressPendingMax
     const payloadBytes = getMetricCounter(counters, 'storagePayload.write.total.bytes')
     const payloadCalls = getMetricCounter(counters, 'storagePayload.write.total.calls')
     const payloadQueueBytes = getMetricCounter(counters, 'storagePayload.write.queue.bytes')
@@ -1552,6 +2000,15 @@ function renderWakeupMetrics(queueItems = []) {
     const topReadPath = getTopStoragePayloadPath(counters, 'read')
     const topWritePath = getTopStoragePayloadPath(counters, 'write')
     const cloudflareChallenges = getMetricCounter(counters, 'cloudflareChallenge.detected')
+    // 2026-09-27: instrumentation for the queued-row self-healing check
+    // (a queued row whose durable progress record already shows terminal,
+    // settled back in runCoordinatorExecutorApplyPhase's per-tick loop) --
+    // added to measure how often it actually fires before deciding whether
+    // it's worth moving off the hot per-tick loop onto a slower periodic
+    // sweep. matched = condition true this tick; settled = matched AND the
+    // authority write actually landed.
+    const queuedTerminalProgressMatched = getMetricCounter(counters, 'queuedTerminalProgressSettlement.matched')
+    const queuedTerminalProgressSettled = getMetricCounter(counters, 'changed.terminalizedQueuedFromTerminalProgress')
     const duplicatePumps = getMetricCounter(counters, 'pump.noop.noPendingItems') +
         getMetricCounter(counters, 'pump.noop.executorAlreadyRunning') +
         getMetricCounter(counters, 'pump.noop.paused')
@@ -1614,18 +2071,29 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Queue throttle', throttle.active ? 'active' : 'idle', throttle.active
                 ? `level ${throttle.level}; retry ${formatDuration(throttle.until - Date.now())}; ${throttle.reason || ''}`
                 : throttle.lastProgressAt ? `recovered ${formatTime(throttle.lastProgressAt)}` : 'No page-load throttle active', {
+                alert: throttle.active && throttle.level >= 2,
                 title: 'Whether the scheduler is deliberately backing off queued-tab activity (e.g. after slow/unscriptable tabs or Cloudflare challenges). Concerning if this stays "active" for more than a couple of QUEUE_LOAD_THROTTLE_MAX_MS windows (120s each, escalating) -- that means whatever tripped it keeps recurring rather than clearing.'
             }),
             buildMetricCard('Wakeups/job', jobs ? formatRatio(wakeups / jobs) : '--', `${wakeups} wakeups / ${jobs} enqueued`, {
+                alert: jobs > 0 && (wakeups / jobs) > 3,
                 title: 'Nudges + pump requests + reconciles per enqueued job -- how many scheduler wakeups it takes to move work through the queue. Concerning if this trends well above 2-3x enqueued jobs; that suggests the scheduler is being woken repeatedly without making proportional progress.'
             }),
-            buildMetricCard('Nudge accept', nudgeSent ? formatPercent(nudgeAccepted / nudgeSent) : '--', `${nudgeAccepted} / ${nudgeSent}`, {
-                title: 'Share of claim nudges (sent to a queued tab to accept its action claim) that were actually accepted. Concerning if well under 100% -- rejected/ignored nudges usually mean a tab is slow, unresponsive, or already claimed by something else, and will show up as retried/escalated claims.'
+            buildMetricCard('Nudge accept', nudgeDispatched ? formatPercent(nudgeAccepted / nudgeDispatched) : '--', `${nudgeAccepted} / ${nudgeDispatched} dispatched (${nudgeCoalesced} coalesced, not counted)`, {
+                // 2026-09-29: traced live -- essentially every rejected nudge
+                // is a tab/row that already resolved through a different path
+                // (closed, or the durable row moved on) by the time the nudge
+                // landed, not a stuck/unresponsive tab. A low percentage here
+                // is normal queue churn, not a signal of trouble, so this no
+                // longer alerts. nudge.failed.message (a tab that responded
+                // but errored) is the actual thing worth watching.
+                title: 'Share of claim nudges that actually reached a tab (excludes ones the coalesce cooldown skipped before sending) that got accepted. Usually well under 100% even when healthy -- a rejected nudge almost always means the tab or row already resolved through a different path before the nudge arrived, not that something is wrong. Watch nudge.failed.message instead for a tab that responded but errored.'
             }),
             buildMetricCard('Pump yield', pumpRequested ? formatPercent(pumpChanged / pumpRequested) : '--', `${pumpChanged} changed / ${pumpRequested}`, {
+                alert: pumpRequested > 0 && stalledQueued > 0 && (pumpChanged / pumpRequested) < 0.3,
                 title: 'Share of executor pump cycles that actually changed something. Concerning if this stays low (lots of no-op pumps) while Queued > 0 -- see Duplicate pumps below for the specific no-op reasons.'
             }),
             buildMetricCard('Duplicate pumps', pumpRequested ? formatPercent(duplicatePumps / pumpRequested) : '--', `${duplicatePumps} no-op`, {
+                alert: !state.paused && pumpRequested > 0 && (duplicatePumps / pumpRequested) > 0.7 && (pumpChanged / pumpRequested) < 0.3,
                 title: 'Pump cycles that no-opped because there was nothing pending, the executor was already running, or the queue is paused. Concerning if this is high AND Pump yield is low AND the queue is not paused -- that combination means pumps are being requested faster than there is new work to justify them.'
             }),
             buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', `${reconcileChanged} reconcile changes`, {
@@ -1634,30 +2102,47 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Terminal jobs', `${terminalJobs}`, `${stalledQueued} currently queued`, {
                 title: 'Total jobs that reached a terminal state (succeeded/failed/skipped/canceled) this epoch, plus how many are still queued right now. Not concerning on its own -- cross-check against Really/Already blocked and the failed-row badges for what those terminal jobs actually were.'
             }),
+            buildMetricCard('Queued self-heal', `${queuedTerminalProgressMatched}`, `${queuedTerminalProgressSettled} settled`, {
+                title: 'How often a queued row\'s own durable progress record already showed terminal (the row\'s live queue status just hadn\'t caught up yet), checked on every executor-apply tick. Purely observational for now -- this decides whether it\'s worth moving off the hot per-tick loop onto a slower periodic sweep instead. A near-zero count here means that move would buy little; a high, steadily climbing count means it would.'
+            }),
             buildMetricCard('Cloudflare challenges', `${cloudflareChallenges}`, jobs
                 ? `${formatPercent(cloudflareChallenges / jobs)} of ${jobs} enqueued jobs hit a bot-challenge interstitial`
                 : 'No challenge interstitials seen yet', {
+                alert: cloudflareChallenges > 1,
                 title: 'Profile loads that hit a Cloudflare bot-challenge interstitial instead of the real page. Concerning at any sustained rate above isolated one-offs -- each one also trips the queue-load throttle, so a rising count here explains a queue that keeps backing off.'
             }),
             buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen), {
+                // Half of the tighter of the two staleness windows this
+                // phase approaches (QUEUED_TAB_CREATE_TIMEOUT_MS 10s).
+                alert: getPhaseAverageMs(phases.durableQueueToTabOpen) >= 5000,
                 title: 'Time from a row becoming durably queued to its tab actually opening. Concerning if the average approaches this project\'s queued-tab-open staleness windows (STALE_BACKGROUND_OPENING_QUEUED_TAB_MS 20s, QUEUED_TAB_CREATE_TIMEOUT_MS 10s) -- rows that slow to open that tab are the ones that end up reclaimed as stale.'
             }),
             buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted), {
+                // Half of QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS / QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS (both 15s).
+                alert: getPhaseAverageMs(phases.tabOpenToClaimAccepted) >= 7500,
                 title: 'Time from tab open to the content script\'s action claim being accepted. Concerning if the average approaches QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS (15s) or QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS (15s) -- both are staleness/timeout windows keyed to roughly this transition.'
             }),
             buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart), {
+                // Half of STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s).
+                alert: getPhaseAverageMs(phases.claimAcceptedToActionStart) >= 15000,
                 title: 'Time from claim accepted to the mute/block action actually starting. Concerning if the average approaches STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s) -- that\'s this project\'s threshold for treating an active-action tab as stalled.'
             }),
             buildMetricCard('Action -> terminal', formatPhaseAverage(phases.actionStartToTerminal), formatPhaseDetail(phases.actionStartToTerminal), {
+                // Half of the tighter of COORDINATOR_ACTIVE_JOB_MAX_MS (45s) / COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS (60s).
+                alert: getPhaseAverageMs(phases.actionStartToTerminal) >= 22500,
                 title: 'Time from the action starting to the row reaching a terminal state. Concerning if the average approaches COORDINATOR_ACTIVE_JOB_MAX_MS (45s) or COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS (60s) -- both bound how long this project lets a job stay active before treating it as stuck.'
             }),
             buildMetricCard('Terminal -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease), {
-                title: 'Time from a row going terminal to its worker slot actually being released for reuse. Concerning if the average approaches TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s) -- slow releases here are the direct cause of a rising "handoff sec" summary tile above.'
+                // Half of TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s).
+                alert: getPhaseAverageMs(phases.terminalToSlotRelease) >= 1250,
+                title: 'Time from a row going terminal to its worker slot actually being released for reuse. Concerning if the average approaches TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s) -- slow releases here are the direct cause of a rising "secs / handoff" summary tile above.'
             }),
             buildMetricCard('Storage timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : `${storageTimedOut}`, `${storageTimedOut} / ${storageStarted}; ${storageFallbackReturned} fallback returned`, {
+                alert: storageTimedOut > 0,
                 title: 'Share of durable storage updates that timed out before completing. Concerning at any sustained nonzero rate -- a timed-out update falls back to a stale read/no-op rather than the intended mutation, which is exactly the class of bug behind this week\'s WAL hydrate fixes.'
             }),
             buildMetricCard('Storage deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : `${storageDeadlineMissed}`, `${storageDeadlineMissed} missed; ${getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed')} late suppressed`, {
+                alert: storageDeadlineMissed > 0,
                 title: 'Storage updates that missed their intended deadline (whether or not they eventually timed out outright). Concerning if this is nonzero and growing -- it is an early symptom of the same write-queue backlog the "Write queue backlog" card below alerts on directly.'
             }),
             buildMetricCard('Write queue backlog', storageQueueStallWarnings ? `${storageQueueStallWarnings} alert${storageQueueStallWarnings === 1 ? '' : 's'}` : 'clear',
@@ -1669,12 +2154,26 @@ function renderWakeupMetrics(queueItems = []) {
                     title: 'Fires once the oldest pending durable write has waited at least COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s), checked every COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS (15s). Any alert here is concerning by definition -- it is this project\'s own self-imposed threshold for "the serialized storage-update queue is backing up," added after a live incident where a runaway reconcile loop backed it up for minutes.'
                 }),
             buildMetricCard('Timeout buckets', `${storageTimeoutGet}`, `get ${storageTimeoutGet}, set ${storageTimeoutSet}, unknown ${storageTimeoutUnknown}`, {
+                alert: (storageTimeoutGet + storageTimeoutSet + storageTimeoutUnknown) > 0 &&
+                    storageTimeoutUnknown / (storageTimeoutGet + storageTimeoutSet + storageTimeoutUnknown) > 0.5,
                 title: 'Breaks Storage timeouts down by where in the read/write cycle they happened. Concerning if "unknown" is a large share -- that means a timeout is happening somewhere this breakdown can\'t attribute, which is itself worth investigating.'
             }),
             buildMetricCard('No-work writes', `${storageNoDurableWork}`, `${storageNoRuntimeWork} no runtime; ${storageNoDurableWork} no durable`, {
-                title: 'Storage updates that ran and found nothing durable to persist. A handful is normal (a pump can race a change that already landed); concerning only if this dominates total storage updates, since each one still pays the full serialized-queue cost for no benefit.'
+                // 2026-09-27: a paused queue (or one with nothing pending)
+                // legitimately racks up "no durable work" cycles just from
+                // periodic polling and reconcile ticks -- that's expected,
+                // not a problem, and lighting this up red while paused was
+                // actively misleading (confirmed live: a several-hour idle
+                // stretch with the dashboard open drove this to a high
+                // ratio on its own, via the dashboard poll fixed above).
+                // Only alert when the queue is actually supposed to be
+                // busy.
+                alert: !state.paused && storageStarted > 0 && (storageNoDurableWork / storageStarted) > 0.5,
+                title: 'Storage updates that ran and found nothing durable to persist. Expect a high share of these whenever the queue is paused or has nothing pending -- that alone drives this up with no problem behind it. Concerning only while the queue is actually running and this still dominates total storage updates, since each one still pays the full serialized-queue cost for no benefit.'
             }),
             buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait), {
+                // Half of COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s).
+                alert: getPhaseAverageMs(phases.storageQueueWait) >= 15000,
                 title: 'Average time a storage update spent waiting in the serialized queue before it got to run. Concerning if this rises toward COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s) -- that\'s the same threshold "Write queue backlog" alerts on for the single oldest pending write.'
             }),
             buildMetricCard('Storage get', formatPhaseAverage(phases.storageGet), `${storageGetCalls} calls`, {
@@ -1685,10 +2184,12 @@ function renderWakeupMetrics(queueItems = []) {
             }),
             buildMetricCard('Queue cache hit rate', walCacheAttempts ? formatPercent(walResidentStoreUsed / walCacheAttempts) : '--',
                 `${walResidentStoreUsed} resident-store hits / ${walSegmentedHydrated} genuine storage reads (${storageGetCalls} storage.get calls total)`, {
+                alert: walCacheAttempts > 5 && (walResidentStoreUsed / walCacheAttempts) < 0.5,
                 title: 'Of the segmented WAL\'s hydrate attempts, the share served from the in-memory resident-store cache (residentStoreUsed) rather than a real chrome.storage.local read (segmentedHydrated). This week\'s fix chain found this cache dead (residentStoreUsed sat at 0) -- concerning if this rate is low or falling after startup, since reads should be rare once the queue is warm and resident.'
             }),
             buildMetricCard('WAL writes', `${walAppended}`,
                 `${formatBytes(walAppendBytes)} appended; ${walCheckpointed} checkpoint switch${walCheckpointed === 1 ? '' : 'es'} folding in ${walCheckpointedRecords} record${walCheckpointedRecords === 1 ? '' : 's'}${walCheckpointFailed ? `; ${walCheckpointFailed} checkpoint failure${walCheckpointFailed === 1 ? '' : 's'}` : ''}`, {
+                alert: walCheckpointFailed > 0,
                 title: 'How often the coordinator queue\'s write-ahead log is appended to, and how often it checkpoint-switches (folds accumulated segments back into one snapshot). A checkpoint switch is expected roughly every COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT (128) committed segments; concerning if switches are far less frequent than that under heavy write volume (segments piling up toward the COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT of 1024, which blocks further appends) or if any checkpoint failures show up at all.'
             }),
             buildMetricCard('WAL segment writes', `${walSegmentWrites}`,
@@ -1726,7 +2227,8 @@ function renderWakeupMetrics(queueItems = []) {
                 title: 'How many milestone records get batched into each flush (flushed at most once every COORDINATOR_JOB_MILESTONE_FLUSH_MS, 3s). Concerning only if flushes are happening far more often than every 3s with a low records-per-flush ratio -- that would mean batching isn\'t actually coalescing anything.'
             }),
             buildMetricCard('Progress events', `${progressReceived}`, `pending max ${progressPendingMax}`, {
-                title: 'Total profile-progress records received this epoch, and the largest pending backlog seen at once. Concerning if "pending max" stays elevated rather than draining back toward zero -- that means progress records are arriving faster than they\'re being applied.'
+                trend: progressPendingMaxTrend,
+                title: 'The big number is a running total of profile-progress records received this epoch -- it only ever increases until the epoch resets, so it climbing on its own is normal, not a backlog. "pending max" (detail line) is the actual backlog signal: the largest number of received-but-not-yet-applied progress records seen at once. Concerning if pending max stays elevated rather than draining back toward zero -- that means progress records are arriving faster than they\'re being applied. Card colors red when pending max grows since the last refresh, green when it falls.'
             })
         ], state.loading ? 'Loading history...' : 'No wakeup metrics yet.')
     }
@@ -1751,7 +2253,15 @@ function renderWakeupMetrics(queueItems = []) {
 
 function buildMetricCard(label = '', value = '', detail = '', options = {}) {
     const card = document.createElement('div')
-    card.className = options.alert ? 'metric-card metric-card--alert' : 'metric-card'
+    const cardClasses = ['metric-card']
+    if(options.alert) {
+        cardClasses.push('metric-card--alert')
+    } else if(options.trend === 'up') {
+        cardClasses.push('metric-card--trend-up')
+    } else if(options.trend === 'down') {
+        cardClasses.push('metric-card--trend-down')
+    }
+    card.className = cardClasses.join(' ')
     // options.title carries a fuller explanation (what this measures, plus
     // a rough "this is concerning if..." threshold) than the one-line
     // detail text has room for. Falls back to detail alone when a card
@@ -1849,6 +2359,11 @@ function formatPreviousEpochSummary(epoch = null) {
 function formatPhaseAverage(phase = null) {
     if(!phase?.count) return '--'
     return formatDuration((Number(phase.totalMs) || 0) / phase.count)
+}
+
+function getPhaseAverageMs(phase = null) {
+    if(!phase?.count) return 0
+    return (Number(phase.totalMs) || 0) / phase.count
 }
 
 function formatPhaseDetail(phase = null) {
@@ -2076,6 +2591,11 @@ async function fetchFlightRecorderForOutlier(rowKey = '', attemptId = '') {
     renderOutliers()
 }
 
+function clearEventHistogram() {
+    eventHistogramClearedAtMs = Date.now()
+    renderEventHistogram()
+}
+
 function clearOutliers() {
     for(const outlier of state.outliers) {
         dismissedOutlierKeys.add(`${outlier.rowKey}|${outlier.attemptId}`)
@@ -2183,13 +2703,14 @@ function buildQueueActionCell(item = {}) {
     const cell = document.createElement('div')
     cell.className = 'row-action-cell'
 
-    if(`${item?.status || ''}` !== 'failed') return cell
+    const itemStatus = `${item?.status || ''}`
+    if(itemStatus !== 'failed' && itemStatus !== 'canceled') return cell
 
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'clear-button row-action-button'
     button.textContent = 'Requeue'
-    button.title = 'Reset and requeue this failed Current Work item'
+    button.title = `Reset and requeue this ${itemStatus} Current Work item`
     button.addEventListener('click', event => {
         event.preventDefault()
         button.disabled = true
@@ -2273,9 +2794,16 @@ function getRunDisplay(run = {}) {
         }
     }
 
+    const enqueueBreakdown = formatCoordinatorEnqueueBreakdown({
+        requested: run.enqueueRequested,
+        queued: run.enqueueQueued,
+        merged: run.enqueueMerged,
+        preFilter: run.enqueuePreFilter
+    })
+
     return {
         title: getRunSourceLabel(run),
-        subtitle: submittedLabel,
+        subtitle: [submittedLabel, enqueueBreakdown].filter(Boolean).join(' • '),
         titleHref: sourcePageUrl
     }
 }
@@ -2565,4 +3093,125 @@ function formatDuration(valueMs) {
     if(hours) return `${hours}h ${String(minutes).padStart(2, '0')}m`
     if(minutes) return `${minutes}m ${String(seconds).padStart(2, '0')}s`
     return `${seconds}s`
+}
+
+function renderScanCostHistogram() {
+    const container = document.getElementById('scanCostHistogram')
+    if(!container) return
+
+    const metricsDocument = state.metrics || {}
+    const counters = (metricsDocument.currentEpoch || metricsDocument).counters || {}
+
+    // Find all scan.<location>.items counters and extract location names
+    const scanData = []
+    const locationSet = new Set()
+
+    Object.keys(counters).forEach(key => {
+        const match = key.match(/^scan\.([^.]+)\.items$/)
+        if(match) {
+            const location = match[1]
+            locationSet.add(location)
+        }
+    })
+
+    // Build data for each location
+    locationSet.forEach(location => {
+        const itemsCount = getMetricCounter(counters, `scan.${location}.items`)
+        const callsCount = getMetricCounter(counters, `scan.${location}.calls`)
+        if(itemsCount > 0 || callsCount > 0) {
+            scanData.push({
+                label: location,
+                value: itemsCount,
+                detail: `${itemsCount} items / ${callsCount} calls`
+            })
+        }
+    })
+
+    scanData.sort((a, b) => b.value - a.value)
+    renderHorizontalHistogram(container, scanData)
+}
+
+function renderEventHistogram() {
+    const container = document.getElementById('eventHistogram')
+    if(!container) return
+
+    // Send message to get flight recorder entries
+    sendRuntimeMessageWithTimeout({
+        action: 'get-flight-recorder',
+        limit: 2000
+    }, {entries: []}, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
+        .then(response => {
+            const entries = (response && Array.isArray(response.entries)) ? response.entries : []
+
+            // Tally occurrences by kind:reason
+            const eventCounts = {}
+            entries.forEach(entry => {
+                if(!entry || typeof entry !== 'object') return
+                if((Number.parseInt(entry.at, 10) || 0) < eventHistogramClearedAtMs) return
+                const label = `${entry.kind || 'unknown'}:${entry.reason || ''}`
+                eventCounts[label] = (eventCounts[label] || 0) + 1
+            })
+
+            // Convert to array and sort by count descending
+            const eventData = Object.entries(eventCounts)
+                .map(([label, count]) => ({label, value: count, detail: `${count}`}))
+                .sort((a, b) => b.value - a.value)
+
+            renderHorizontalHistogram(container, eventData)
+        })
+        .catch(() => {
+            // If message fails, render empty state
+            renderHorizontalHistogram(container, [])
+        })
+}
+
+function renderHorizontalHistogram(container, data = []) {
+    if(!container) return
+
+    container.replaceChildren()
+
+    if(!data || data.length === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'empty'
+        empty.textContent = 'No data'
+        container.append(empty)
+        return
+    }
+
+    // Find max value for scaling
+    const maxValue = Math.max(...data.map(item => item.value), 1)
+    const barMaxWidth = 200 // pixels
+
+    // Create rows for each data item (already sorted descending)
+    data.forEach(item => {
+        const row = document.createElement('div')
+        row.className = 'histogram-row'
+
+        // Label
+        const label = document.createElement('div')
+        label.className = 'histogram-label'
+        label.textContent = item.label
+        label.title = item.label
+
+        // Bar container
+        const barContainer = document.createElement('div')
+        barContainer.className = 'histogram-bar-container'
+
+        // Bar
+        const bar = document.createElement('div')
+        bar.className = 'histogram-bar'
+        const barWidth = (item.value / maxValue) * barMaxWidth
+        bar.style.width = `${barWidth}px`
+        bar.title = item.detail
+
+        // Detail label
+        const detail = document.createElement('div')
+        detail.className = 'histogram-bar-label'
+        detail.textContent = item.detail
+        detail.title = item.detail
+
+        barContainer.append(bar, detail)
+        row.append(label, barContainer)
+        container.append(row)
+    })
 }

@@ -76,6 +76,23 @@ function extractFunction(source, signature) {
     throw new Error(`unterminated ${signature}`)
 }
 
+function extractCssRuleBody(source, selector) {
+    const start = source.indexOf(`${selector} {`)
+    assert.notEqual(start, -1, `missing CSS rule ${selector}`)
+
+    const braceStart = source.indexOf('{', start)
+    let depth = 0
+    for(let index = braceStart; index < source.length; index += 1) {
+        if(source[index] === '{') depth += 1
+        else if(source[index] === '}') {
+            depth -= 1
+            if(depth === 0) return source.slice(braceStart, index + 1)
+        }
+    }
+
+    throw new Error(`unterminated CSS rule ${selector}`)
+}
+
 function extractCallExpression(source, callStart) {
     const parenStart = source.indexOf('(', callStart)
     assert.notEqual(parenStart, -1, 'missing call parenthesis')
@@ -131,6 +148,8 @@ function loadDashboardHarness() {
             if(name === './jobState') return require(path.join(__dirname, '..', 'shared/js/jobState'))
             if(name === './swCoordinatorStatusRules') return require(path.join(__dirname, '..', 'shared/js/swCoordinatorStatusRules'))
             if(name === './timeouts') return require(path.join(__dirname, '..', 'shared/js/timeouts'))
+            if(name === './nukedPosts') return require(path.join(__dirname, '..', 'shared/js/nukedPosts'))
+            if(name === './defaults') return require(path.join(__dirname, '..', 'shared/js/defaults'))
             throw new Error(`unexpected require: ${name}`)
         },
         addEventListener() {},
@@ -321,6 +340,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'cancel-queued-owner-nukes',
         'claim-tab-action',
         'cleanup-owned-nuke-status',
+        'clear-coordinator-current-work',
         'clear-profile-nuke-state',
         'close-tab',
         'cloudflare-challenge-detected',
@@ -336,6 +356,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'get-owned-nuke-status',
         'heartbeat-action-lease',
         'open-coordinator',
+        'open-coordinator-history',
         'pause-coordinator-nukes',
         'pause-owner-nukes',
         'promote-queued-tab',
@@ -345,6 +366,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'record-job-milestone',
         'record-job-terminal',
         'refresh-coordinator-queue-view',
+        'refresh-coordinator-runs-view',
         'refresh-queue-wakeup-metrics-view',
         'release-action-lease',
         'release-job-tab',
@@ -395,20 +417,52 @@ test('content script exposes queued profile action surface state for safe adopti
     assert.match(branch, /profileActionInProgress/)
 })
 
-test('dashboard initial load prefers compact queue view over full queue map', () => {
+test('dashboard initial load always asks the service worker for a fresh compact queue view', () => {
+    // 2026-09-25: loadState() used to trust storage.mbCoordinatorQueueView
+    // as-is whenever it was present and validly shaped, only falling back to
+    // a service-worker rebuild when that storage read came back empty or
+    // malformed. Nothing re-filters a persisted view against the current
+    // set of known runs until a rebuild actually runs, so a stale copy (one
+    // still mixing in terminal rows from runs that no longer exist) could
+    // sit in storage indefinitely and just keep getting re-read on every
+    // periodic dashboard poll. loadState() now always calls
+    // refreshCompactQueueView() unconditionally instead of branching on
+    // whatever's currently in storage.
     const body = extractFunction(
         readRepoFile('shared/js/coordinator.js'),
         'async function loadState()'
     )
     const firstGet = body.slice(
         body.indexOf('const stored = await browser.storage.local.get'),
-        body.indexOf('if(hasCoordinatorQueueView')
+        body.indexOf('await refreshCompactQueueView()')
     )
 
-    assert.match(firstGet, /COORDINATOR_QUEUE_VIEW_KEY/)
+    assert.doesNotMatch(firstGet, /COORDINATOR_QUEUE_VIEW_KEY/)
     assert.doesNotMatch(firstGet, /COORDINATOR_QUEUE_KEY/)
-    assert.match(body, /refreshCompactQueueView\(\)/)
+    assert.doesNotMatch(body, /if\(hasCoordinatorQueueView/)
+    assert.match(body, /await refreshCompactQueueView\(\)/)
     assert.doesNotMatch(body, /browser\.storage\.local\.get\(\{\[COORDINATOR_QUEUE_KEY\]/)
+})
+
+test('dashboard compact refresh polling skips ticks while the queue is paused or has nothing pending', () => {
+    // 2026-09-27: this timer used to fire unconditionally every
+    // DASHBOARD_COMPACT_REFRESH_INTERVAL_MS (2s) for as long as the
+    // dashboard tab stayed open. Confirmed live via the flight recorder:
+    // with the queue paused for hours and the dashboard left open, this
+    // alone produced thousands of no-op service-worker round-trips,
+    // each inflating storageUpdate.noDurableWork (the "No-work writes"
+    // card) for reasons unrelated to the queue actually stalling. A real
+    // change (resume, new work enqueued, pause toggled elsewhere) still
+    // reaches this dashboard via installDashboardRuntimeRefreshListener's
+    // push, independent of this timer, so skipping ticks here while
+    // nothing could possibly have changed is safe.
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const pollBody = extractFunction(dashboard, 'function installCompactStorageRefreshPolling()')
+    const idleBody = extractFunction(dashboard, 'function isDashboardQueueDefinitelyIdle()')
+
+    assert.match(pollBody, /if\(isDashboardQueueDefinitelyIdle\(\)\) return/)
+    assert.match(idleBody, /if\(state\.paused\) return true/)
+    assert.match(idleBody, /PENDING_QUEUE_VIEW_STATUSES\.some/)
 })
 
 test('dashboard live refresh avoids broad storage change delivery', () => {
@@ -426,7 +480,11 @@ test('dashboard live refresh avoids broad storage change delivery', () => {
     assert.match(dashboard, /scheduleDashboardCompactRefresh\(DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS\)/)
     assert.match(refreshBody, /loadState\(\)/)
     assert.doesNotMatch(refreshBody, /browser\.storage\.local\.get/)
-    assert.match(loadBody, /\[COORDINATOR_QUEUE_VIEW_KEY\]: \{\}/)
+    // loadState() no longer reads mbCoordinatorQueueView directly -- see
+    // "dashboard initial load always asks the service worker for a fresh
+    // compact queue view" -- it goes through refreshCompactQueueView()
+    // unconditionally instead.
+    assert.doesNotMatch(loadBody, /\[COORDINATOR_QUEUE_VIEW_KEY\]: \{\}/)
     assert.match(loadBody, /\[QUEUE_WAKEUP_METRICS_VIEW_KEY\]: \{\}/)
 })
 
@@ -486,6 +544,22 @@ test('service worker pushes compact dashboard refresh after compact state writes
     assert.match(notifyBody, /action: 'coordinator-dashboard-state-changed'/)
     assert.doesNotMatch(notifyBody, /COORDINATOR_QUEUE_KEY/)
     assert.doesNotMatch(notifyBody, /PROFILE_NUKE_PROGRESS_KEY/)
+})
+
+test('metricStorageSet skips the dashboard push when the caller marks its own write as self-refreshed', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const setBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
+    const refreshQueueViewBody = extractFunction(source, 'async function refreshCoordinatorQueueViewForDashboard(reason = \'dashboard-refresh\')')
+
+    // Without this gate, refreshCoordinatorQueueViewForDashboard's own save
+    // of mbCoordinatorQueueView (a COORDINATOR_DASHBOARD_STATE_KEYS member)
+    // pushes coordinator-dashboard-state-changed, which schedules another
+    // dashboard refresh that calls straight back into this same function --
+    // a self-sustaining loop with no external trigger (dashboard-refresh
+    // and compact-view-materialized flight-recorder events climbing while
+    // idle, 2026-09-26).
+    assert.match(setBody, /options\.suppressDashboardNotify !== true/)
+    assert.match(refreshQueueViewBody, /suppressDashboardNotify:\s*true/)
 })
 
 test('storage get records read payload metrics', () => {
@@ -1035,6 +1109,13 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(dashboard, /getSecondsPerActualBlock\(queueItems, getCurrentMetricsEpochStartedAt\(\)\)/)
     assert.match(dashboard, /function getCurrentMetricsEpochStartedAt\(\)/)
     assert.match(dashboard, /milestones\.blockAttemptedAt/)
+    // 2026-09-27: floored by epochStartedAt again (reversing the 2026-09-25
+    // change above) -- per explicit user request, reloading the extension
+    // or clicking "Reset metrics" should visibly reset this card instead of
+    // silently continuing to average in rows from before the reset. See the
+    // matching comment on summarizeCoordinatorActualBlockTiming in
+    // swCoordinatorQueueView.js for why this floor only ever excludes rows
+    // from a genuine reset, not a routine same-version restart.
     assert.match(dashboard, /terminalAt >= minimumTerminalAt/)
     assert.match(dashboard, /Storage deadlines/)
     assert.match(dashboard, /Timeout buckets/)
@@ -1046,6 +1127,31 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(dashboard, /function formatMetricDetailValue/)
     assert.match(dashboard, /ownStorageGetMs/)
     assert.match(dashboard, /storageGetCumulativeMs/)
+})
+
+test('secs / block is relabeled secs / real block alongside a new secs / already blocked tile', () => {
+    // 2026-09-27: per explicit user request, splitting genuine block
+    // actions from already-blocked skips at the same summary-tile
+    // prominence "secs / block" and "secs / handoff" already had.
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const sw = readRepoFile('shared/js/sw.js')
+    const queueView = readRepoFile('shared/js/swCoordinatorQueueView.js')
+
+    assert.match(html, />secs \/ real block</)
+    assert.match(html, />secs \/ already blocked</)
+    assert.match(html, /id="secondsPerAlreadyBlocked"/)
+    assert.doesNotMatch(html, />secs \/ block</)
+
+    assert.match(dashboard, /function isAlreadyBlockedSuccess\(item = \{\}\)/)
+    assert.match(dashboard, /function getSecondsPerAlreadyBlocked\(queueItems = \[\], epochStartedAt = 0\)/)
+    assert.match(dashboard, /setText\('secondsPerAlreadyBlocked', formatSecondsPerBlock\(secondsPerAlreadyBlocked\)\)/)
+
+    assert.match(queueView, /function isCoordinatorAlreadyBlockedSuccess\(item = \{\}\)/)
+    assert.match(queueView, /function summarizeCoordinatorAlreadyBlockedTiming\(queue = \{\}, epochStartedAt = 0\)/)
+    assert.match(queueView, /alreadyBlockedTiming: summarizeCoordinatorAlreadyBlockedTiming\(compactQueue, epochStartedAt\)/)
+
+    assert.match(sw, /summarizeCoordinatorAlreadyBlockedTiming,/)
 })
 
 test('dashboard loads durable history before first Quora activation without resuming work', () => {
@@ -1245,7 +1351,7 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.match(html, />Queued<\/div>/)
     assert.doesNotMatch(html, /Ready to Run/)
     assert.match(html, /Start/)
-    assert.match(html, /Queue All-fails/)
+    assert.match(html, />Requeue</)
     assert.match(html, /Cancel Queue/)
     assert.match(html, /Enable Retry Soft-Fails/)
     assert.doesNotMatch(html, /Requeue Failed|Cancel Current Work|Idle Retry/)
@@ -1274,6 +1380,197 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.match(css, /\.panel-stack \.panel\[data-panel-scroll-target="metricsJournal"\]\s*\{[\s\S]*max-height: none;/)
     assert.match(css, /\.metrics-panel\s*\{[\s\S]*flex: 0 0 auto;/)
     assert.match(css, /\.metrics-journal\s*\{[\s\S]*max-height: none;[\s\S]*overflow-y: visible;/)
+})
+
+test('current work clear button cancels and removes every row, and the epoch stat tiles moved into the Metrics panel', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const sw = readRepoFile('shared/js/sw.js')
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const events = readRepoFile('shared/js/swQueueMachineEvents.js')
+    const handlers = readRepoFile('shared/js/swQueueMachineHandlers.js')
+
+    assert.match(html, /id="cancelCurrentWorkButton"[\s\S]*id="clearCurrentWorkButton"/)
+    assert.match(html, /id="clearCurrentWorkButton" type="button"[^>]*>Clear</)
+
+    const clearBody = extractFunction(dashboard, 'async function clearCurrentWork()')
+    assert.match(clearBody, /action: 'clear-coordinator-current-work'/)
+    assert.match(dashboard, /getElementById\('clearCurrentWorkButton'\)\?\.addEventListener\('click', \(\) => \{[\s\S]*void clearCurrentWork\(\)/)
+
+    assert.match(bootstrap, /request\.action === 'clear-coordinator-current-work'/)
+    assert.match(events, /CLEAR_STORED_WORK: 'CLEAR_STORED_WORK'/)
+    assert.match(handlers, /QUEUE_MACHINE_EVENT_TYPES\.CLEAR_STORED_WORK\]: async \(event = \{\}, operation = \{\}\) => \{[\s\S]*mutateCoordinatorStoredWorkClear/)
+
+    const clearMutationBody = extractFunction(sw, 'async function mutateCoordinatorStoredWorkClear(operation = {})')
+    // Clear must remove rows outright (removedRows / removedCompletedRows),
+    // not archive them the way cancel does (completedRows) -- otherwise the
+    // cleared rows would just reappear via refreshCoordinatorQueueViewForDashboard's
+    // recent-completed-rows merge.
+    assert.match(clearMutationBody, /removedCompletedRows/)
+    assert.doesNotMatch(clearMutationBody, /\bcompletedRows,/)
+
+    // The 5 epoch-derived stat tiles (backed by queueWakeupMetrics, reset by
+    // the existing "Reset metrics" button) now live inside the Metrics
+    // panel instead of Current Work's own summary-grid, so Current Work no
+    // longer needs its own separate reset for them.
+    const metricsPanelStart = html.indexOf('data-panel-scroll-target="metricsJournal"')
+    const metricsGridStart = html.indexOf('id="metricsGrid"')
+    assert.ok(metricsPanelStart >= 0 && metricsGridStart > metricsPanelStart)
+    const metricsPanelHtml = html.slice(metricsPanelStart, metricsGridStart)
+    for(const tileId of ['secondsPerBlock', 'activationHandoffSeconds', 'reallyBlockedCount', 'alreadyBlockedCount', 'blockAttemptOnFollowingCount']) {
+        assert.match(metricsPanelHtml, new RegExp(`id="${tileId}"`))
+    }
+
+    const queueListStart = html.indexOf('data-panel-scroll-target="queueList"')
+    const currentWorkSummaryHtml = html.slice(queueListStart, metricsPanelStart)
+    for(const tileId of ['queuedCount', 'activeCount', 'terminalCount', 'eventCount']) {
+        assert.match(currentWorkSummaryHtml, new RegExp(`id="${tileId}"`))
+    }
+    for(const movedTileId of ['secondsPerBlock', 'activationHandoffSeconds', 'reallyBlockedCount', 'alreadyBlockedCount', 'blockAttemptOnFollowingCount']) {
+        assert.doesNotMatch(currentWorkSummaryHtml, new RegExp(`id="${movedTileId}"`))
+    }
+})
+
+test('scan cost and recent event count panels each have their own Clear button', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+
+    assert.match(html, /data-panel-scroll-target="scanCostHistogram"[\s\S]*id="clearScanCostButton"[\s\S]*id="scanCostHistogram"/)
+    assert.match(html, /data-panel-scroll-target="eventHistogram"[\s\S]*id="clearEventHistogramButton"[\s\S]*id="eventHistogram"/)
+
+    // Scan cost reads scan.<location>.items/calls straight out of
+    // queueWakeupMetrics, the same store "Reset metrics" already zeroes --
+    // its Clear button reuses that action instead of inventing a second way
+    // to reset the same counters.
+    assert.match(dashboard, /getElementById\('clearScanCostButton'\)\?\.addEventListener\('click', \(\) => \{[\s\S]*void resetMetrics\(\)/)
+
+    // Recent event counts re-tallies the flight recorder's full retained
+    // window on every render, so a client-only clear has to be a cutoff
+    // timestamp (filtered back in on every render) rather than a one-time
+    // splice -- otherwise the very next render would just repopulate it.
+    const clearHistogramBody = extractFunction(dashboard, 'function clearEventHistogram()')
+    assert.match(clearHistogramBody, /eventHistogramClearedAtMs = Date\.now\(\)/)
+    assert.match(clearHistogramBody, /renderEventHistogram\(\)/)
+    const renderHistogramBody = extractFunction(dashboard, 'function renderEventHistogram()')
+    assert.match(renderHistogramBody, /entry\.at, 10\) \|\| 0\) < eventHistogramClearedAtMs\) return/)
+    assert.match(dashboard, /getElementById\('clearEventHistogramButton'\)\?\.addEventListener\('click', \(\) => \{[\s\S]*clearEventHistogram\(\)/)
+})
+
+test('archiveTerminalCoordinatorRow resyncs resident state without racing applyLocked', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+
+    const archiveBody = extractFunction(sw, "async function archiveTerminalCoordinatorRow(rowKey = '', terminalRow = null, options = {})")
+    assert.match(archiveBody, /await coordinatorAuthority\.enqueueResidentRowRemoval\(rowKey\)/)
+
+    // enqueueResidentRowRemoval must be chained on the SAME applyTail
+    // promise enqueueApplyLocked uses, not an independent hydrate()/reload --
+    // that's what makes it safe against a concurrently in-flight applyLocked
+    // call for a different row (2026-09-26).
+    const removalBody = extractFunction(sw, "function enqueueResidentRowRemoval(rowKey = '')")
+    assert.match(removalBody, /applyTail\s*\n\s*\.catch\(\(\) => null\)/)
+    assert.match(removalBody, /applyTail = run\.catch\(\(\) => null\)/)
+    assert.match(removalBody, /delete nextQueue\[rowKey\]/)
+    assert.doesNotMatch(removalBody, /loadCoordinatorCurrentAuthorityState|metricStorageGet/)
+
+    assert.match(sw, /enqueueResidentRowRemoval,\s*\n\s*persist,/)
+})
+
+test('write-queue-backlog stall warning also mirrors onto the extension icon badge', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+
+    const stallBody = extractFunction(sw, "function maybeWarnCoordinatorStorageUpdateQueueStall(reason = '')")
+    assert.match(stallBody, /setCoordinatorWriteQueueBacklogAlertBadge\(stalled\)/)
+
+    const badgeBody = extractFunction(sw, 'function setCoordinatorWriteQueueBacklogAlertBadge(active = false)')
+    assert.match(badgeBody, /if\(active === coordinatorWriteQueueBacklogAlertActive\) return/)
+    assert.match(badgeBody, /browser\.action\?\.setBadgeText/)
+    assert.match(badgeBody, /setBadgeBackgroundColor/)
+})
+
+test('classify builds the runtime-surface index once per call instead of re-scanning per row', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const classification = readRepoFile('shared/js/swCoordinatorExecutorClassification.js')
+
+    const classifyBody = extractFunction(sw, 'async function classifyCoordinatorExecutorState(options = {})')
+    assert.match(classifyBody, /const runtimeSurfaceIndex = buildRuntimeSurfaceIndex\(queueRuntime\.listRuntimeSurfaceEntries\(\)\)/)
+    // Every per-row getRuntimeSurfaceForCoordinatorItem call in this loop
+    // must pass the shared index -- one without it silently falls back to
+    // a full runtime-state scan, defeating the whole point.
+    const perRowCalls = classifyBody.match(/getRuntimeSurfaceForCoordinatorItem\([^)]*\)/gs) || []
+    assert.ok(perRowCalls.length >= 3, 'expected at least 3 getRuntimeSurfaceForCoordinatorItem call sites in classify')
+    for(const call of perRowCalls) {
+        assert.match(call, /runtimeSurfaceIndex/, `call site missing runtimeSurfaceIndex: ${call}`)
+    }
+
+    const queueRuntimeSource = readRepoFile('shared/js/swqueueRuntime.js')
+    assert.match(queueRuntimeSource, /function listRuntimeSurfaceEntries\(\)/)
+    const indexBody = extractFunction(classification, 'function buildRuntimeSurfaceIndex(entries = [])')
+    assert.match(indexBody, /wildcards\.push\(entry\)/)
+    const lookupBody = extractFunction(classification, "function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '', options = {})")
+    assert.match(lookupBody, /\.\.\.\(index\.wildcards \|\| \[\]\)/)
+})
+
+test('queued self-heal (terminal-progress-settles-queued) match rate is observable on the dashboard', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+
+    assert.match(sw, /incrementMetric\('queuedTerminalProgressSettlement\.matched'\)/)
+    assert.match(dashboard, /getMetricCounter\(counters, 'queuedTerminalProgressSettlement\.matched'\)/)
+    assert.match(dashboard, /getMetricCounter\(counters, 'changed\.terminalizedQueuedFromTerminalProgress'\)/)
+    assert.match(dashboard, /buildMetricCard\('Queued self-heal',/)
+})
+
+test('dev mode toggle hides the internal-audience panels by default and persists across reloads', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const css = readRepoFile('shared/css/coordinator.css')
+
+    assert.match(html, /id="devModeToggle"/)
+    // Every diagnostic panel starts hidden in the markup itself (not just
+    // via JS after load), so there's no flash-of-clutter before init() runs,
+    // and a JS failure fails safe to hidden rather than fails open to shown.
+    for(const scrollTarget of ['metricsJournal', 'scanCostHistogram', 'eventHistogram', 'outlierList', 'runList', 'eventList']) {
+        assert.match(html, new RegExp(`data-panel-scroll-target="${scrollTarget}" data-dev-mode-panel hidden`))
+    }
+    // Current Work and its own summary tiles are end-user relevant and must
+    // never be gated behind dev mode.
+    assert.doesNotMatch(html, /data-panel-scroll-target="queueList"[^>]*data-dev-mode-panel/)
+
+    assert.match(dashboard, /const DEV_MODE_STORAGE_KEY = 'mbDashboardDevMode'/)
+    const isEnabledBody = extractFunction(dashboard, 'function isDevModeStoredEnabled()')
+    assert.match(isEnabledBody, /localStorage\.getItem\(DEV_MODE_STORAGE_KEY\)/)
+    const setEnabledBody = extractFunction(dashboard, 'function setDevModeStoredEnabled(enabled)')
+    assert.match(setEnabledBody, /localStorage\.setItem\(DEV_MODE_STORAGE_KEY,/)
+    // localStorage access is wrapped -- a private window, cleared site data,
+    // or a blocked storage API must not throw and break the dashboard.
+    assert.match(isEnabledBody, /catch \{[\s\S]*return false/)
+    assert.match(setEnabledBody, /catch \{\}/)
+
+    const applyVisibilityBody = extractFunction(dashboard, 'function applyDevModeVisibility(enabled)')
+    assert.match(applyVisibilityBody, /querySelectorAll\('\[data-dev-mode-panel\]'\)/)
+    assert.match(applyVisibilityBody, /panel\.hidden = !enabled/)
+
+    const installBody = extractFunction(dashboard, 'function installDevModeToggle()')
+    assert.match(installBody, /isDevModeStoredEnabled\(\)/)
+    assert.match(installBody, /applyDevModeVisibility\(enabled\)/)
+    assert.match(installBody, /setDevModeStoredEnabled\(toggle\.checked\)/)
+    assert.match(dashboard, /installDevModeToggle\(\)/)
+
+    assert.match(css, /\.dev-mode-toggle\s*\{/)
+    // .panel's own `display: flex` is an author rule, which always beats the
+    // user-agent stylesheet's `[hidden] { display: none }` regardless of
+    // specificity -- without this reassertion, `hidden` on a `.panel`
+    // section (as applyDevModeVisibility sets) renders visible anyway.
+    // Live-repro'd 2026-09-26: the dev mode toggle turned off but every
+    // diagnostic panel still rendered.
+    assert.match(css, /\.panel\[hidden\]\s*\{[\s\S]*display: none;/)
+    // .coordinator's two grid rows are sized "auto", and the container also
+    // has min-height:100vh -- without align-content:start, default grid
+    // alignment stretches "auto" rows to fill any leftover viewport space,
+    // which is invisible while content already exceeds 100vh but produced a
+    // huge blank gap above the header once dev mode hid enough panels to
+    // leave real leftover space (live-repro'd 2026-09-26).
+    assert.match(css, /\.coordinator\s*\{[\s\S]*align-content: start;/)
 })
 
 test('dashboard retry status separates active busy from queued waiting states', () => {
@@ -1349,7 +1646,9 @@ test('dashboard bulk requeue uses compact failed count beyond displayed rows', (
     const dashboard = readRepoFile('shared/js/coordinator.js')
     const body = extractFunction(dashboard, 'async function requeueFailed()')
 
-    assert.match(body, /getQueueStatusCount\('failed', getDisplayQueueItems\(\)\)/)
+    assert.match(body, /const items = getDisplayQueueItems\(\)/)
+    assert.match(body, /getQueueStatusCount\('failed', items\)/)
+    assert.match(body, /getQueueStatusCount\('canceled', items\)/)
     assert.doesNotMatch(body, /filter\(item => item\?\.status === 'failed'\)/)
     assert.match(body, /action: 'requeue-coordinator-failed'/)
 })
@@ -2880,6 +3179,10 @@ test('queued executor actions preserve stored foreground policy', () => {
     assert.doesNotMatch(helperBody, /isForegroundQueuedTabAction/)
     assert.match(activateOnOpenBody, /action\?\.active === true/)
     assert.doesNotMatch(activateOnOpenBody, /isForegroundQueuedTabAction/)
+    // 2026-09-27 removed enqueueExistingExecutorForCoordinatorOnce's own
+    // getQueuedActionNoForegroundFallback-driven concurrency force-to-1,
+    // then 2026-09-29 restored it -- see "queued-tab concurrency is forced
+    // to 1 for worker-window/foreground work" below for why.
     assert.match(enqueueBody, /getQueuedActionNoForegroundFallback\(item, options\) !== true/)
     assert.match(recoverBody, /const noForegroundFallback = getQueuedActionNoForegroundFallback\(item\)/)
     assert.match(adoptBody, /const noForegroundFallback = getQueuedActionNoForegroundFallback\(item\)/)
@@ -2887,6 +3190,31 @@ test('queued executor actions preserve stored foreground policy', () => {
     assert.doesNotMatch(enqueueBody, /noForegroundFallback: true/)
     assert.doesNotMatch(recoverBody, /noForegroundFallback: true/)
     assert.doesNotMatch(adoptBody, /noForegroundFallback: true/)
+})
+
+test('queued-tab concurrency is forced to 1 for worker-window/foreground work', () => {
+    // 2026-09-27 removed this force-to-1 (see the removed test this
+    // replaces, "foreground and unblock-unmute work no longer force
+    // queued-tab concurrency down to 1"), reasoning that foreground actions
+    // run as background tabs within the shared worker-window window via
+    // scripting/page-world injection, so concurrent tabs there weren't
+    // inherently unsafe. 2026-09-29: confirmed live that reasoning was
+    // wrong -- Chrome throttles a tab's own JS timers (including the
+    // content script's close-if-blocked poll) whenever its window lacks OS
+    // focus, and a second profile tab opened in the worker window forces
+    // the first out of the single "active within window" slot, so *both*
+    // ended up throttled. A queued profile tab visibly stalled for over a
+    // minute and only resumed once the user manually raised the worker
+    // window. Per explicit user request, the worker window should only
+    // ever have one tab up (and it foregrounded) at a time, so this force
+    // is back for the same batch shapes as before (foreground 'nuke'/
+    // 'mute-block'/unblock-unmute -- i.e. virtually all real work).
+    const source = readRepoFile('shared/js/sw.js')
+    const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
+
+    assert.match(enqueueBody, /requiresForegroundExecutor/)
+    assert.match(enqueueBody, /includesUnblockUnmute/)
+    assert.match(enqueueBody, /queuedTabConcurrency = serviceWorkerOwned && \(includesUnblockUnmute \|\| requiresForegroundExecutor\)\n\s*\? 1\n\s*: Math\.max\(1, Number\.parseInt\(options\.maxConcurrent, 10\) \|\| 1\)/)
 })
 
 test('queued tab opens wait for target URL before active transition', () => {
@@ -3982,13 +4310,24 @@ test('target-space posts can queue the visible header profile without follow pro
     const source = readRepoFile('shared/js/content.js')
     const body = extractFunction(source, 'function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)')
     const targetIndex = body.indexOf('if(isTargetSpacePage())')
-    const assetIndex = body.indexOf('if(isAssetSpacePage())')
 
     assert.notEqual(targetIndex, -1)
-    assert.notEqual(assetIndex, -1)
-    assert.ok(targetIndex < assetIndex)
-    assert.match(body.slice(targetIndex, assetIndex), /posterProfileUrls\.length/)
-    assert.match(body.slice(targetIndex, assetIndex), /getNormalizedProfileHrefList\(\[headerProfileHref\]\)/)
+    assert.match(body.slice(targetIndex), /posterProfileUrls\.length/)
+    assert.match(body.slice(targetIndex), /getNormalizedProfileHrefList\(\[headerProfileHref\]\)/)
+
+    // 2026-09-25: asset-space pages used to ALSO treat any other poster
+    // surfaced via an embedded/quoted sub-post as a high-confidence
+    // candidate -- the same "poster === target" assumption that's
+    // deliberately correct for isTargetSpacePage() above, but wrong for
+    // asset pages (a real incident: Franklin Veaux, a genuine contributor,
+    // got queued for mute-block this way). Removed entirely rather than
+    // trying to distinguish "this embed shows the actual scam target" from
+    // "this embed shows an unrelated legitimate contributor" -- the
+    // following-status check in blockProfile is the backstop for whatever
+    // this collector still gets wrong.
+    assert.doesNotMatch(source, /function getSpaceFeedEmbeddedPosterProfileUrls/)
+    assert.doesNotMatch(body, /'embedded-profile-link'/)
+    assert.doesNotMatch(body, /sharedPosterUrls/)
 })
 
 test('asset-space source-post resolver rows do not use the visible post author', () => {
@@ -4137,7 +4476,7 @@ test('space feed action buttons keep Nuke Em labels', () => {
     const source = readRepoFile('shared/js/content.js')
     const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
     const postBody = extractFunction(source, 'function syncSpaceFeedPostButtons(renderModel)')
-    const globalWorkLabelBody = extractFunction(source, 'function formatSpaceFeedGlobalWorkLabel()')
+    const globalWorkLabelBody = extractFunction(source, 'function formatSpaceFeedGlobalWorkLabel(count = 0)')
     const postWorkLabelBody = extractFunction(source, 'function formatSpaceFeedPostWorkLabel()')
 
     assert.match(topBody, /Nuke 'Em/)
@@ -4195,8 +4534,9 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(flashButtonBody, /clear-button--flash/)
     assert.match(css, /\.clear-button--flash/)
     assert.match(css, /@keyframes button-flash/)
-    assert.match(css, /\.pause-state\s*\{[\s\S]*border-radius: 3px;/)
-    assert.doesNotMatch(css, /\.pause-state\s*\{[\s\S]*border-radius: 999px;/)
+    const pauseStateRuleBody = extractCssRuleBody(css, '.pause-state')
+    assert.match(pauseStateRuleBody, /border-radius: 3px;/)
+    assert.doesNotMatch(pauseStateRuleBody, /border-radius: 999px;/)
     assert.match(css, /\.pause-state--paused/)
     assert.match(css, /\.pause-state--pending/)
     assert.match(pauseCleanupBody, /pauseStoredCoordinatorWork/)
@@ -4402,10 +4742,17 @@ test('content script detects Cloudflare challenge pages and reports them once pe
     // challenge page's DOM/title renders), reported once per content-script
     // lifetime, hooked into the same retry loop that was stuck during the
     // incident.
+    //
+    // 2026-09-25: a second live incident (Emily-22838) showed Cloudflare
+    // issuing __cf_chl_rt_tk instead of __cf_chl_tk, which the old
+    // exact-key check missed entirely -- the detector now matches the
+    // shared __cf_chl prefix so it isn't tied to one exact variant.
     const source = readRepoFile('shared/js/content.js')
 
     const detectBody = extractFunction(source, 'function isCloudflareChallengePage()')
-    assert.match(detectBody, /__cf_chl_tk/)
+    assert.match(detectBody, /__cf_chl/)
+    assert.match(detectBody, /startsWith/)
+    assert.doesNotMatch(detectBody, /\.has\('__cf_chl_tk'\)/)
 
     const reportBody = extractFunction(source, 'function maybeReportCloudflareChallenge()')
     assert.match(reportBody, /cloudflareChallengeReported/)
@@ -4629,6 +4976,55 @@ test('service-worker queued mute-block work goes straight to block', () => {
 
     assert.notEqual(directBlockIndex, -1)
     assert.match(body.slice(directBlockIndex), /blockProfile\(\{silent: true, allowForegroundFallback\}\)/)
+})
+
+test('block flow skips already-followed profiles before attempting anything else', () => {
+    // 2026-09-25: a real live incident (Franklin Veaux, a genuine
+    // contributor to a space the user follows) got queued for mute-block
+    // because the space-feed "asset page" candidate collector's
+    // shared-poster branch treats any embedded-thread poster as a
+    // high-confidence candidate the same way it treats an actual
+    // scam-target profile link -- it has no concept of "this person is
+    // themselves contributing content" versus "this profile is being
+    // called out within someone else's post" for anyone beyond the single
+    // primary post author. Rather than trying to make that collector
+    // perfectly precise (a maintained followers list isn't practical to
+    // get out of Quora either), blockProfile checks the profile's own
+    // Follow/Following button at the moment of action, before doing
+    // anything else -- a candidate the user already follows is almost
+    // certainly a miscategorization, regardless of how it got queued.
+    const source = readRepoFile('shared/js/content.js')
+    const blockBody = extractFunction(source, 'async function blockProfile(options = {})')
+    const detectBody = extractFunction(source, 'function isProfileFollowedByCurrentUser()')
+
+    const followedCheckIndex = blockBody.indexOf('isProfileFollowedByCurrentUser()')
+    const alreadyBlockedCheckIndex = blockBody.indexOf('const alreadyBlockedOnEntry = isProfileBlocked()')
+    assert.notEqual(followedCheckIndex, -1)
+    assert.notEqual(alreadyBlockedCheckIndex, -1)
+    assert.ok(followedCheckIndex < alreadyBlockedCheckIndex, 'following check runs before anything else in the block flow')
+
+    assert.match(blockBody, /status:\s*'block-attempt-on-following'/)
+    assert.match(blockBody, /blockAttempted:\s*false/)
+    assert.match(blockBody, /blockSucceeded:\s*false/)
+
+    assert.match(detectBody, /getProfilePrimaryAction\(\)/)
+    assert.match(detectBody, /\^following\$/)
+
+    const jobState = readRepoFile('shared/js/jobState.js')
+    const mapBody = extractFunction(jobState, 'function mapProgressToJobState(record = null)')
+    assert.match(mapBody, /status === 'block-attempt-on-following'/)
+    assert.match(mapBody, /outcome:\s*'block-attempt-on-following'/)
+    assert.match(mapBody, /status:\s*'skipped'/)
+
+    const reducer = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
+    assert.match(reducer, /outcome === 'block-attempt-on-following' \? 'blockAttemptOnFollowing'/)
+
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    assert.match(dashboard, /profileAction\.blockAttemptOnFollowing\.count/)
+    assert.match(dashboard, /setText\('blockAttemptOnFollowingCount'/)
+
+    const html = readRepoFile('shared/coordinator.html')
+    assert.match(html, /id="blockAttemptOnFollowingCount"/)
 })
 
 test('profile block flow can resume from an open confirmation dialog', () => {
@@ -5042,7 +5438,14 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     assert.match(profileOpenReservationClaimBody, /reserveQueuedProfileOpen\(next, 'queued-tab-create'\)/)
     assert.match(fillBody, /decideActivationGuardClaim\(\{next\}\)/)
     assert.match(fillBody, /decideProfileOpenReservationClaim\(\{next, openingActionKey\}\)/)
-    assert.match(fillBody, /while\(getCapacityUsed\(\) < getEffectiveQueuedTabConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
+    // 2026-09-27: re-checks coordinatorPauseRequested on every iteration,
+    // not just once before the loop starts -- with concurrency raised
+    // above 1 this loop can open several tabs per call, and a pause
+    // requested mid-loop (coordinatorPauseRequested flips synchronously,
+    // well before the durable write) used to have no way to stop it
+    // before the loop ran out of capacity or activation intents on its
+    // own. Live evidence: rows still going active seconds after Pause.
+    assert.match(fillBody, /while\(!coordinatorPauseRequested && getCapacityUsed\(\) < getEffectiveQueuedTabOpenConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
     // The post-open-failure recovery decision (after the `postOpenRecovery`
     // await inside the tab-create catch's genuine-failure branch, including
     // the loop's last remaining inline `queueRuntime.requeueActivationIntent`
@@ -5228,6 +5631,16 @@ test('coordinator queue processing order comes from an explicit queueSequence in
 
     const refreshBody = extractFunction(swSource, "function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')")
     assert.match(refreshBody, /queueRuntime\.rebuildQueueOrder\(/)
+    // 2026-09-26: rebuildQueueOrder's full O(n log n) sort now only runs the
+    // first time (index not yet seeded) -- every subsequent refresh diffs
+    // against the previously-resident queue with the O(1)-per-key
+    // incremental primitives instead, avoiding a full sort on every single
+    // coordinator queue mutation.
+    assert.match(refreshBody, /queueRuntime\.getOrderedQueueKeyCount\(\) > 0/)
+    assert.match(refreshBody, /queueRuntime\.syncOrderedQueueKeysFromQueueDiff\(previousQueue, nextQueue\)/)
+    const syncDiffBody = extractFunction(queueRuntimeSource, 'function syncOrderedQueueKeysFromQueueDiff(previousQueue = {}, nextQueue = {})')
+    assert.match(syncDiffBody, /noteOrderedQueueKeyAbsent\(key\)/)
+    assert.match(syncDiffBody, /noteOrderedQueueKeyPresent\(key\)/)
 
     const classifyBody = extractFunction(swSource, 'async function classifyCoordinatorExecutorState(options = {})')
     assert.match(classifyBody, /for\(const \[itemKey, item\] of queueRuntime\.getOrderedQueueItems\(queue\)\)/)

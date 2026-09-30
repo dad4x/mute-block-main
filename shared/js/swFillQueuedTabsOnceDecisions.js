@@ -49,7 +49,7 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
         finishQueueWakeupMetricCycle,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
-        getEffectiveQueuedTabConcurrency,
+        getEffectiveQueuedTabOpenConcurrency,
         getQueuedProfileOpenReservationCount,
         getQueuedRuntimeActionFillKey,
         getQueuedTabActionKey,
@@ -412,7 +412,7 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
             clearDetachedQueuedProfileOpenReservations('pre-open-detached-reservation-clear')
         }
         const openReservations = getQueuedProfileOpenReservationCount()
-        if(liveProfileTabs + openReservations + openedTabs >= getEffectiveQueuedTabConcurrency()) {
+        if(liveProfileTabs + openReservations + openedTabs >= getEffectiveQueuedTabOpenConcurrency()) {
             queueRuntime.requeueActivationIntent(next, {
                 source: 'runtime-effect'
             })

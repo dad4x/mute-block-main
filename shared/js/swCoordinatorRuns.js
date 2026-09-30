@@ -226,6 +226,89 @@ function createCoordinatorRuns(deps = {}) {
         })
     }
 
+    // Fresh, on-demand run-stats computation -- the non-mutated-running-total
+    // alternative to recomputeCoordinatorRuns (see architecture.md's "Derived
+    // Stats Must Not Be A Mutated Running Total"). Unlike recomputeCoordinatorRuns,
+    // this never reads a prior persisted itemCount/targetProfileHrefs/
+    // targetWorkKeys value as a seed and never gets written back into
+    // mbCoordinatorRuns -- it takes an already-known, already-complete list of
+    // every item that belongs to one run (both still-live queue rows and
+    // archived completed-work-log rows, matched purely by `item.runId`, no
+    // href-fallback needed once the input list is genuinely complete) and
+    // derives everything from that list alone, every time it's called. There
+    // is nothing to race because there is nothing mutated: two concurrent
+    // callers computing this from the same inputs get the same answer, and
+    // neither one's answer depends on what the other wrote.
+    function summarizeCoordinatorRunFromItems(runId = '', run = {}, items = []) {
+        const targetHrefs = new Set()
+        const targetWorkKeys = new Set()
+        const sourcePages = new Set(Array.isArray(run?.sourcePages) ? run.sourcePages : [])
+        for(const item of items) {
+            const href = getCoordinatorItemHref(item)
+            const workKey = getCoordinatorItemQueueKey(item) || href
+            const sourcePageUrl = `${item?.source?.pageUrl || item?.source?.sourcePageUrl || ''}`.trim()
+            if(href) targetHrefs.add(href)
+            if(workKey) targetWorkKeys.add(workKey)
+            if(sourcePageUrl) sourcePages.add(sourcePageUrl)
+        }
+        const targetProfileHrefs = Array.from(targetHrefs)
+        const targetWorkKeyList = Array.from(targetWorkKeys)
+        const terminalCount = items.filter(item => isTerminalCoordinatorStatus(item?.status)).length
+        const activeCount = items.filter(item => isActiveCoordinatorStatus(item?.status)).length
+        const latestItemUpdatedAt = items.reduce((latest, item) => {
+            const updatedAt = Number.parseInt(item?.updatedAt || item?.terminalAt || item?.createdAt, 10) || 0
+            return Math.max(latest, updatedAt)
+        }, 0)
+
+        return {
+            ...(run || {}),
+            id: runId,
+            sourceType: run?.sourceType || items[0]?.source?.type || 'space-feed',
+            createdAt: Number.parseInt(run?.createdAt, 10) || items[0]?.createdAt || now(),
+            paused: run?.paused === true,
+            sourcePages: Array.from(sourcePages),
+            targetProfileHrefs,
+            targetWorkKeys: targetWorkKeyList,
+            itemCount: targetWorkKeyList.length || targetProfileHrefs.length || items.length || 0,
+            activeCount,
+            terminalCount,
+            status: getCoordinatorRunStatus(items, run),
+            updatedAt: Math.max(Number.parseInt(run?.updatedAt, 10) || 0, latestItemUpdatedAt)
+        }
+    }
+
+    // queue and completedRows are merged here (rather than requiring the
+    // caller to pre-merge) so this stays the one place that knows a
+    // completed-work-log row and a live queue row are both just "an item
+    // that belongs to a run" for this purpose -- a row only ever lives in one
+    // of the two at a time (archiveTerminalCoordinatorRow removes it from the
+    // live queue the same durable write that adds it to the completed log),
+    // so there's no double-count risk to reconcile between them.
+    function buildFreshCoordinatorRunsSummary(runs = {}, queue = {}, completedRows = []) {
+        const itemsByRunId = {}
+        const addItem = item => {
+            const itemRunId = `${item?.runId || ''}`.trim()
+            if(!itemRunId) return
+            if(!itemsByRunId[itemRunId]) itemsByRunId[itemRunId] = []
+            itemsByRunId[itemRunId].push(item)
+        }
+        for(const item of Object.values(queue || {})) addItem(item)
+        for(const item of (Array.isArray(completedRows) ? completedRows : [])) addItem(item)
+
+        const runIds = new Set([
+            ...Object.keys(runs || {}),
+            ...Object.keys(itemsByRunId)
+        ])
+        const summary = {}
+        for(const runId of runIds) {
+            const items = itemsByRunId[runId] || []
+            const run = runs?.[runId] || null
+            if(!items.length && !run) continue
+            summary[runId] = summarizeCoordinatorRunFromItems(runId, run || {id: runId}, items)
+        }
+        return summary
+    }
+
     return {
         makeEmptyCoordinatorMilestones,
         shouldResetCoordinatorFailureFromProgress,
@@ -235,7 +318,9 @@ function createCoordinatorRuns(deps = {}) {
         isCoordinatorRunWorkKeyForProfileHref,
         getCoordinatorRunItems,
         getCoordinatorRunIdsForHref,
-        recomputeCoordinatorRuns
+        recomputeCoordinatorRuns,
+        summarizeCoordinatorRunFromItems,
+        buildFreshCoordinatorRunsSummary
     }
 }
 

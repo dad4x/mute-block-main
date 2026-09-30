@@ -172,11 +172,65 @@ function createQueuedTabActionAuthorityMatching(deps = {}) {
         return false
     }
 
+    // Same action-kind set as sw.js's isForegroundQueuedTabAction (inlined
+    // rather than threaded through as a new dep, to match this module's own
+    // "narrow getter/setter, no new capability surface" convention) --
+    // 'nuke', 'mute-block', and unblock-unmute all run through the shared
+    // worker-window surface.
+    function isForegroundQueuedActionKind(actionKind = '') {
+        return actionKind === 'nuke' || actionKind === 'mute-block' || actionKind === UNBLOCK_UNMUTE_ACTION_KIND
+    }
+
+    function hasQueuedForegroundWork() {
+        if(queueRuntime.someActivationIntent(action => isForegroundQueuedActionKind(getQueuedTabActionKind(action)))) return true
+
+        for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
+            const metadata = getQueuedTabMetadata(tabId)
+            if(isForegroundQueuedActionKind(getQueuedTabActionKind(metadata))) return true
+        }
+
+        return false
+    }
+
     function getEffectiveQueuedTabConcurrency() {
+        // 2026-09-27: this used to also force 1 whenever
+        // hasQueuedUnblockUnmuteWork() was true, on top of the same
+        // unconditional forcing enqueueExistingExecutorForCoordinatorOnce
+        // used to do for any foreground/unblock-unmute batch (see that
+        // function's own comment) -- the user asked to try full
+        // concurrency now that the queue-handoff/scan-scope work is
+        // stable, so this no longer treats unblock-unmute specially
+        // either. Quora-pushback throttling (the check above) still forces
+        // 1 regardless.
+        //
+        // 2026-09-29: NOT reinstating the foreground-work force here --
+        // this function is also getCoordinatorExecutorPlanBatchLimit's
+        // floor (swQueuedActivationSubjectKeys.js), which sizes how many
+        // pending/exhausted rows can be planned/recovered in one executor
+        // pass. That's bookkeeping, not tab-opening, and confirmed live
+        // that forcing it to 1 here broke recovering multiple exhausted
+        // rolled-back rows in a single pass. The actual tab-opening race
+        // (two tabs opened 230ms apart into the single-tab worker window)
+        // is fixed at the tab-opening gates specifically instead --
+        // see getEffectiveQueuedTabOpenConcurrency below.
         if(getQueueLoadThrottle().active) return 1
-        return hasQueuedUnblockUnmuteWork()
-            ? 1
-            : getQueuedTabConcurrency()
+        return getQueuedTabConcurrency()
+    }
+
+    // 2026-09-29: used only at the actual tab-opening gates (fillQueuedTabsOnce's
+    // while-loop and capacity checks, sw.js; decideLiveProfileTabCapacityGate,
+    // swFillQueuedTabsOnceDecisions.js) -- not by getCoordinatorExecutorPlanBatchLimit,
+    // which stays on getEffectiveQueuedTabConcurrency() above. See that
+    // function's comment for why the two needed to split: this one checks
+    // the queue's actual current state directly (hasQueuedForegroundWork)
+    // instead of trusting whichever of enqueueExistingExecutorForCoordinatorOnce's
+    // five call sites last set the shared queuedTabConcurrency variable --
+    // confirmed live that an overlapping call with a non-foreground batch
+    // could reset that variable upward mid-loop, letting a second tab open
+    // into the worker window before anything forced it back down.
+    function getEffectiveQueuedTabOpenConcurrency() {
+        if(hasQueuedForegroundWork()) return 1
+        return getEffectiveQueuedTabConcurrency()
     }
 
     function shouldDropQueuedActionForTerminalProgress(action = null, record = null, queue = {}) {
@@ -298,7 +352,9 @@ function createQueuedTabActionAuthorityMatching(deps = {}) {
         shouldDropQueuedActionForCurrentAuthority,
         getQueuedTabActionKind,
         hasQueuedUnblockUnmuteWork,
+        hasQueuedForegroundWork,
         getEffectiveQueuedTabConcurrency,
+        getEffectiveQueuedTabOpenConcurrency,
         shouldDropQueuedActionForTerminalProgress,
         queuedTabActionMatchesProfile,
         queuedTabMetadataMatchesProfile,
