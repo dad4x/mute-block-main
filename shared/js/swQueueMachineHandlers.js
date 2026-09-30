@@ -58,6 +58,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorRunsPausedSet = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorRunsPausedSet')
     const mutateCoordinatorStaleRetryQueuedTabAdvance = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStaleRetryQueuedTabAdvance')
     const mutateCoordinatorStoredWorkCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkCancel')
+    const mutateCoordinatorStoredWorkClear = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkClear')
     const mutateCoordinatorStoredWorkItemCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkItemCancel')
     const mutateCoordinatorStoredWorkPause = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkPause')
     const terminateDurableActiveCoordinatorItemFromTerminalProgress = requireQueueMachineCapability('durable', durable, 'terminateDurableActiveCoordinatorItemFromTerminalProgress')
@@ -253,6 +254,12 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 coordinatorKey: event.coordinatorKey || '',
                 storageKey: event.storageKey || '',
                 profileHref: event.profileHref || ''
+            })
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.CLEAR_STORED_WORK]: async (event = {}, operation = {}) => {
+            return mutateCoordinatorStoredWorkClear({
+                reason: operation.reason || 'ordinaryMutation',
+                clearReason: event.clearReason || event.reason || 'current-work-clear-request'
             })
         },
         [QUEUE_MACHINE_EVENT_TYPES.KEY_ONLY_TERMINATE]: async (event = {}, operation = {}) => {

@@ -81,6 +81,7 @@ function createTabIdUtils(deps = {}) {
     } = deps
     const {
         QUEUED_ACTION_SURFACE_COORDINATOR_HASH,
+        COORDINATOR_HISTORY_HASH,
         SERVICE_WORKER_QUEUE_OWNER_ID
     } = deps.constants || {}
     const {
@@ -95,6 +96,10 @@ function createTabIdUtils(deps = {}) {
 
     function getQueuedActionSurfaceUrl() {
         return `${getCoordinatorPageUrl()}${QUEUED_ACTION_SURFACE_COORDINATOR_HASH}`
+    }
+
+    function getCoordinatorHistoryPageUrl() {
+        return `${getCoordinatorPageUrl()}${COORDINATOR_HISTORY_HASH}`
     }
 
     function normalizeTabId(value) {
@@ -124,6 +129,7 @@ function createTabIdUtils(deps = {}) {
 
     return {
         getCoordinatorPageUrl,
+        getCoordinatorHistoryPageUrl,
         getQueuedActionSurfaceUrl,
         normalizeTabId,
         normalizeOwnedParentId,

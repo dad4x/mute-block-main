@@ -11,7 +11,18 @@ body {
     min-height: 100vh;
 }
 
+/* .coordinator/.worker-bar both set their own `display`, at the same
+   specificity as the browser's built-in [hidden] rule -- author styles win
+   that tie regardless of source order, so setting element.hidden = true on
+   dashboardView/workerBarView/historyView (applyCoordinatorViewMode) was
+   silently doing nothing and all three views rendered stacked together on
+   every page load. Confirmed live 2026-09-29. */
+[hidden] {
+    display: none !important;
+}
+
 .coordinator {
+    align-content: start;
     box-sizing: border-box;
     display: grid;
     gap: 16px;
@@ -20,6 +31,13 @@ body {
     max-width: 1120px;
     min-height: 100vh;
     padding: 20px;
+}
+
+/* The history page is a short list, not a full control panel -- it
+   shouldn't force itself to fill the viewport height like the real
+   dashboard does. */
+#historyView {
+    min-height: 0;
 }
 
 .coordinator-header {
@@ -82,6 +100,58 @@ h2 {
     padding: 6px 10px;
 }
 
+.dev-mode-toggle {
+    align-items: center;
+    cursor: pointer;
+    display: flex;
+    gap: 8px;
+    color: #374151;
+    font-size: 12px;
+    user-select: none;
+}
+
+.dev-mode-toggle input {
+    height: 0;
+    opacity: 0;
+    position: absolute;
+    width: 0;
+}
+
+.dev-mode-toggle-track {
+    background: #d1d5db;
+    border-radius: 999px;
+    display: inline-block;
+    flex-shrink: 0;
+    height: 18px;
+    position: relative;
+    transition: background 0.15s ease;
+    width: 32px;
+}
+
+.dev-mode-toggle-thumb {
+    background: #fff;
+    border-radius: 50%;
+    height: 14px;
+    left: 2px;
+    position: absolute;
+    top: 2px;
+    transition: transform 0.15s ease;
+    width: 14px;
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track {
+    background: #4f46e5;
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track .dev-mode-toggle-thumb {
+    transform: translateX(14px);
+}
+
+.dev-mode-toggle input:focus-visible ~ .dev-mode-toggle-track {
+    outline: 2px solid #4f46e5;
+    outline-offset: 2px;
+}
+
 .summary-grid {
     display: grid;
     gap: 12px;
@@ -129,6 +199,15 @@ h2 {
     flex-direction: column;
     min-height: 0;
     overflow: hidden;
+}
+
+/* .panel's own `display: flex` (an author rule) otherwise beats the
+   user-agent stylesheet's `[hidden] { display: none }` regardless of
+   specificity, since author styles always win over UA styles in the
+   cascade -- this reasserts it as an author rule so hiding a dev-mode
+   panel (or a collapsed one) actually hides it. */
+.panel[hidden] {
+    display: none;
 }
 
 .panel-stack {
@@ -387,6 +466,24 @@ h2 {
     color: #991b1b;
 }
 
+.metric-card--trend-up {
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.metric-card--trend-up .metric-value {
+    color: #991b1b;
+}
+
+.metric-card--trend-down {
+    background: #dcfce7;
+    border-color: #86efac;
+}
+
+.metric-card--trend-down .metric-value {
+    color: #166534;
+}
+
 .metric-label {
     color: #6b7280;
     font-size: 10px;
@@ -427,6 +524,58 @@ h2 {
 .empty {
     color: #6b7280;
     padding: 18px 14px;
+}
+
+.histogram-container {
+    flex: 0 0 auto;
+    padding: 12px 14px;
+}
+
+.histogram-row {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.histogram-row:last-child {
+    margin-bottom: 0;
+}
+
+.histogram-label {
+    color: #374151;
+    flex: 0 0 150px;
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 150px;
+}
+
+.histogram-bar-container {
+    align-items: center;
+    display: flex;
+    flex: 1 1 auto;
+    gap: 8px;
+    min-width: 0;
+}
+
+.histogram-bar {
+    background: #3b82f6;
+    border-radius: 4px;
+    flex: 0 0 auto;
+    height: 24px;
+    position: relative;
+}
+
+.histogram-bar-label {
+    color: #374151;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 80px;
+    text-align: right;
 }
 
 .row {
@@ -591,4 +740,103 @@ a.row-subtitle:hover {
     .row {
         grid-template-columns: 1fr;
     }
+}
+
+/* Worker window "idiot light" status bar -- deliberately not the full
+   control-panel dashboard: a window-width strip with a progress fill and a
+   handled/total count, plus the handful of actions relevant to a background
+   worker window (pause/resume, cancel, jump to the real dashboard or
+   history). */
+.worker-bar {
+    align-items: center;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    box-sizing: border-box;
+    color: #1f2937;
+    display: flex;
+    gap: 16px;
+    padding: 12px 16px;
+    width: 100%;
+}
+
+.worker-bar-brand {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-logo {
+    display: block;
+    height: 40px;
+    object-fit: contain;
+    width: 40px;
+}
+
+.worker-bar-title {
+    font-size: 13px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-progress {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 999px;
+    flex: 1 1 auto;
+    height: 14px;
+    overflow: hidden;
+    position: relative;
+}
+
+.worker-bar-fill {
+    background: #34d399;
+    height: 100%;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.worker-bar-count {
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-button {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    color: #374151;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 12px;
+    white-space: nowrap;
+}
+
+.worker-bar-button:hover {
+    background: #f9fafb;
+}
+
+.worker-bar-button--danger {
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.worker-bar-button--danger:hover {
+    background: #fef2f2;
+}
+
+.worker-bar-button--danger:hover {
+    background: #450a0a;
 }

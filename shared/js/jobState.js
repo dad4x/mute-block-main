@@ -176,6 +176,14 @@ function mapProgressToJobState(record = null) {
             terminal: true
         }
     }
+    if(status === 'block-attempt-on-following') {
+        return {
+            status: 'skipped',
+            outcome: 'block-attempt-on-following',
+            error: '',
+            terminal: true
+        }
+    }
     if(isExplicitSecurityVerificationRecord(record)) {
         return {
             status: 'failed',

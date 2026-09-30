@@ -1242,6 +1242,7 @@ module.exports = {
   flipToAnswers: true,
   fopFlipDelay: 2000,
   profilesPerBatch: 10,
+  targetQueuedTabConcurrency: 4,
   coordinatorAutoStartOnBrowserStart: false,
   nukedPostRetentionDays: 30,
   maxRememberedNukedPosts: 10000
@@ -1565,16 +1566,16 @@ function init() {
   return _init.apply(this, arguments);
 }
 function _init() {
-  _init = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee6() {
-    var manifest, settings, form, status, spaceSortBy, spaceList, clearNukedPosts, openCoordinator, nukedPostCount, fopDelay, flipToAnswers, fopFlipDelay, coordinatorAutoStartOnBrowserStart, profilesPerBatch, nukedPostRetentionDays, maxRememberedNukedPosts;
-    return _regeneratorRuntime().wrap(function _callee6$(_context6) {
-      while (1) switch (_context6.prev = _context6.next) {
+  _init = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee7() {
+    var manifest, settings, form, status, spaceSortBy, spaceList, clearNukedPosts, openCoordinator, openHistory, nukedPostCount, fopDelay, flipToAnswers, fopFlipDelay, coordinatorAutoStartOnBrowserStart, profilesPerBatch, targetQueuedTabConcurrency, nukedPostRetentionDays, maxRememberedNukedPosts;
+    return _regeneratorRuntime().wrap(function _callee7$(_context7) {
+      while (1) switch (_context7.prev = _context7.next) {
         case 0:
           manifest = browser.runtime.getManifest();
-          _context6.next = 3;
+          _context7.next = 3;
           return browser.storage.local.get(_objectSpread(_objectSpread({}, defaults), {}, _defineProperty(_defineProperty(_defineProperty({}, SPACE_REGISTRY_KEY, {}), SPACE_SORT_KEY, SPACE_SORT_NAME), SPACE_NUKED_POSTS_KEY, {})));
         case 3:
-          settings = _context6.sent;
+          settings = _context7.sent;
           document.getElementById('appName').textContent = manifest.name;
           document.getElementById('appVersion').textContent = "v".concat(manifest.version);
           document.getElementById('closePopup').addEventListener('click', function () {
@@ -1586,12 +1587,14 @@ function _init() {
           spaceList = document.getElementById('spaceList');
           clearNukedPosts = document.getElementById('clearNukedPosts');
           openCoordinator = document.getElementById('openCoordinator');
+          openHistory = document.getElementById('openHistory');
           nukedPostCount = document.getElementById('nukedPostCount');
           fopDelay = document.getElementById('fopDelay');
           flipToAnswers = document.getElementById('flipToAnswers');
           fopFlipDelay = document.getElementById('fopFlipDelay');
           coordinatorAutoStartOnBrowserStart = document.getElementById('coordinatorAutoStartOnBrowserStart');
           profilesPerBatch = document.getElementById('profilesPerBatch');
+          targetQueuedTabConcurrency = document.getElementById('targetQueuedTabConcurrency');
           nukedPostRetentionDays = document.getElementById('nukedPostRetentionDays');
           maxRememberedNukedPosts = document.getElementById('maxRememberedNukedPosts');
           fopDelay.value = settings.fopDelay;
@@ -1599,6 +1602,7 @@ function _init() {
           fopFlipDelay.value = settings.fopFlipDelay;
           coordinatorAutoStartOnBrowserStart.checked = settings.coordinatorAutoStartOnBrowserStart === true;
           profilesPerBatch.value = settings.profilesPerBatch;
+          targetQueuedTabConcurrency.value = settings.targetQueuedTabConcurrency;
           popupState.nukedPostRetentionDays = normalizeRetentionDays(settings[NUKED_POST_RETENTION_DAYS_KEY], defaults[NUKED_POST_RETENTION_DAYS_KEY]);
           popupState.maxRememberedNukedPosts = normalizeMaxRememberedNukedPosts(settings[MAX_REMEMBERED_NUKED_POSTS_KEY], defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]);
           nukedPostRetentionDays.value = popupState.nukedPostRetentionDays;
@@ -1612,12 +1616,12 @@ function _init() {
           spaceSortBy.value = popupState.sortBy;
           renderNukedPostCount(nukedPostCount);
           if (haveSameNukedPostKeys(settings[SPACE_NUKED_POSTS_KEY] || {}, popupState.nukedPosts)) {
-            _context6.next = 38;
+            _context7.next = 41;
             break;
           }
-          _context6.next = 38;
+          _context7.next = 41;
           return browser.storage.local.set(_defineProperty({}, SPACE_NUKED_POSTS_KEY, popupState.nukedPosts));
-        case 38:
+        case 41:
           form.addEventListener('submit', /*#__PURE__*/function () {
             var _ref = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee(event) {
               var nextSettings;
@@ -1630,7 +1634,8 @@ function _init() {
                       flipToAnswers: flipToAnswers.checked,
                       fopFlipDelay: fopFlipDelay.valueAsNumber,
                       coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart.checked,
-                      profilesPerBatch: profilesPerBatch.valueAsNumber
+                      profilesPerBatch: profilesPerBatch.valueAsNumber,
+                      targetQueuedTabConcurrency: targetQueuedTabConcurrency.valueAsNumber
                     }, NUKED_POST_RETENTION_DAYS_KEY, normalizeRetentionDays(nukedPostRetentionDays.valueAsNumber, defaults[NUKED_POST_RETENTION_DAYS_KEY])), MAX_REMEMBERED_NUKED_POSTS_KEY, normalizeMaxRememberedNukedPosts(maxRememberedNukedPosts.valueAsNumber, defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]));
                     popupState.nukedPostRetentionDays = nextSettings[NUKED_POST_RETENTION_DAYS_KEY];
                     popupState.maxRememberedNukedPosts = nextSettings[MAX_REMEMBERED_NUKED_POSTS_KEY];
@@ -1667,6 +1672,7 @@ function _init() {
                   fopFlipDelay.value = defaults.fopFlipDelay;
                   coordinatorAutoStartOnBrowserStart.checked = defaults.coordinatorAutoStartOnBrowserStart === true;
                   profilesPerBatch.value = defaults.profilesPerBatch;
+                  targetQueuedTabConcurrency.value = defaults.targetQueuedTabConcurrency;
                   popupState.nukedPostRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY];
                   popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY];
                   nukedPostRetentionDays.value = popupState.nukedPostRetentionDays;
@@ -1676,11 +1682,11 @@ function _init() {
                     maxEntries: popupState.maxRememberedNukedPosts
                   });
                   renderNukedPostCount(nukedPostCount);
-                  _context2.next = 15;
+                  _context2.next = 16;
                   return browser.storage.local.set(_defineProperty({}, SPACE_NUKED_POSTS_KEY, popupState.nukedPosts));
-                case 15:
-                  showStatus(status, 'Settings reset.');
                 case 16:
+                  showStatus(status, 'Settings reset.');
+                case 17:
                 case "end":
                   return _context2.stop();
               }
@@ -1738,27 +1744,64 @@ function _init() {
             }, _callee4);
           })));
           openCoordinator === null || openCoordinator === void 0 || openCoordinator.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee5() {
-            var result;
+            var currentWindow, result;
             return _regeneratorRuntime().wrap(function _callee5$(_context5) {
               while (1) switch (_context5.prev = _context5.next) {
                 case 0:
                   _context5.next = 2;
+                  return browser.windows.getCurrent()["catch"](function () {
+                    return null;
+                  });
+                case 2:
+                  currentWindow = _context5.sent;
+                  _context5.next = 5;
                   return browser.runtime.sendMessage({
                     action: 'open-coordinator',
-                    active: true
+                    active: true,
+                    windowId: (currentWindow === null || currentWindow === void 0 ? void 0 : currentWindow.id) || null
                   })["catch"](function (error) {
                     return {
                       error: (error === null || error === void 0 ? void 0 : error.message) || "".concat(error || '')
                     };
                   });
-                case 2:
+                case 5:
                   result = _context5.sent;
                   showStatus(status, result !== null && result !== void 0 && result.error ? 'Dashboard open failed.' : 'Dashboard opened.');
-                case 4:
+                case 7:
                 case "end":
                   return _context5.stop();
               }
             }, _callee5);
+          })));
+          openHistory === null || openHistory === void 0 || openHistory.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee6() {
+            var currentWindow, result;
+            return _regeneratorRuntime().wrap(function _callee6$(_context6) {
+              while (1) switch (_context6.prev = _context6.next) {
+                case 0:
+                  _context6.next = 2;
+                  return browser.windows.getCurrent()["catch"](function () {
+                    return null;
+                  });
+                case 2:
+                  currentWindow = _context6.sent;
+                  _context6.next = 5;
+                  return browser.runtime.sendMessage({
+                    action: 'open-coordinator-history',
+                    active: true,
+                    windowId: (currentWindow === null || currentWindow === void 0 ? void 0 : currentWindow.id) || null
+                  })["catch"](function (error) {
+                    return {
+                      error: (error === null || error === void 0 ? void 0 : error.message) || "".concat(error || '')
+                    };
+                  });
+                case 5:
+                  result = _context6.sent;
+                  showStatus(status, result !== null && result !== void 0 && result.error ? 'History open failed.' : 'History opened.');
+                case 7:
+                case "end":
+                  return _context6.stop();
+              }
+            }, _callee6);
           })));
           browser.storage.onChanged.addListener(function (changes) {
             if (changes[SPACE_REGISTRY_KEY]) {
@@ -1784,11 +1827,11 @@ function _init() {
             }
           });
           renderSpaceList(spaceList);
-        case 46:
+        case 50:
         case "end":
-          return _context6.stop();
+          return _context7.stop();
       }
-    }, _callee6);
+    }, _callee7);
   }));
   return _init.apply(this, arguments);
 }
@@ -1809,35 +1852,35 @@ function updateSpaceCategory(_x, _x2, _x3) {
   return _updateSpaceCategory.apply(this, arguments);
 }
 function _updateSpaceCategory() {
-  _updateSpaceCategory = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee7(spaceKey, category, container) {
+  _updateSpaceCategory = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee8(spaceKey, category, container) {
     var _popupState$spaceRegi;
     var existingRecord, nextRecord;
-    return _regeneratorRuntime().wrap(function _callee7$(_context7) {
-      while (1) switch (_context7.prev = _context7.next) {
+    return _regeneratorRuntime().wrap(function _callee8$(_context8) {
+      while (1) switch (_context8.prev = _context8.next) {
         case 0:
           existingRecord = (_popupState$spaceRegi = popupState.spaceRegistry) === null || _popupState$spaceRegi === void 0 ? void 0 : _popupState$spaceRegi[spaceKey];
           if (existingRecord) {
-            _context7.next = 3;
+            _context8.next = 3;
             break;
           }
-          return _context7.abrupt("return");
+          return _context8.abrupt("return");
         case 3:
           nextRecord = buildSpaceRecord(existingRecord, category, existingRecord);
           if (nextRecord) {
-            _context7.next = 6;
+            _context8.next = 6;
             break;
           }
-          return _context7.abrupt("return");
+          return _context8.abrupt("return");
         case 6:
           popupState.spaceRegistry = _objectSpread(_objectSpread({}, popupState.spaceRegistry), {}, _defineProperty({}, spaceKey, nextRecord));
           renderSpaceList(container);
-          _context7.next = 10;
+          _context8.next = 10;
           return browser.storage.local.set(_defineProperty({}, SPACE_REGISTRY_KEY, popupState.spaceRegistry));
         case 10:
         case "end":
-          return _context7.stop();
+          return _context8.stop();
       }
-    }, _callee7);
+    }, _callee8);
   }));
   return _updateSpaceCategory.apply(this, arguments);
 }

@@ -175,8 +175,7 @@ function createQueuedWorkFastResume(deps = {}) {
         return true
     }
 
-    function kickQueuedWorkAfterSlotFreed(reason = 'queued-tab-slot-freed', options = {}) {
-        const normalizedReason = `${reason || 'queued-tab-slot-freed'}`.trim() || 'queued-tab-slot-freed'
+    function scheduleSlotFreedFallbacks(normalizedReason) {
         scheduleQueuedWorkContinuation(normalizedReason)
         scheduleCoordinatorQueueResume(100, normalizedReason, {
             allowBeforeQuora: true
@@ -186,8 +185,22 @@ function createQueuedWorkFastResume(deps = {}) {
             edgeTriggered: true,
             allowBeforeQuora: true
         })
+    }
+
+    // Only the busy/deferred branch schedules the three fallback wake-ups
+    // (queued-work continuation, queue-resume, edge-triggered reconcile) up
+    // front. When the fast path is about to run right here, those three
+    // would otherwise fire unconditionally on every slot-freed event even
+    // though the fast path is the one doing the actual (targeted) work --
+    // duplicate scans racing the fast path instead of backing it up. They
+    // still fire, just deferred until the fast path's own outcome is known,
+    // so a fast path that fails or makes no change keeps the exact same
+    // fallback coverage it had before.
+    function kickQueuedWorkAfterSlotFreed(reason = 'queued-tab-slot-freed', options = {}) {
+        const normalizedReason = `${reason || 'queued-tab-slot-freed'}`.trim() || 'queued-tab-slot-freed'
         if(storageUpdateState.getDepth() > 0 || getQueuedTabFillPromise()) {
             incrementQueueWakeupMetric('pump.slotFreed.fastKickDeferred')
+            scheduleSlotFreedFallbacks(normalizedReason)
             return false
         }
         incrementQueueWakeupMetric('pump.slotFreed.fastKick')
@@ -197,7 +210,15 @@ function createQueuedWorkFastResume(deps = {}) {
             allowBeforeQuora: true,
             skipAuthorityReconcile: true,
             forceDurableQueueReload: false
-        }).catch(() => null)
+        }).then(result => {
+            if(!result || result.changed !== true) {
+                incrementQueueWakeupMetric('pump.slotFreed.fastKickNoChangeFallback')
+                scheduleSlotFreedFallbacks(normalizedReason)
+            }
+        }, () => {
+            incrementQueueWakeupMetric('pump.slotFreed.fastKickErrorFallback')
+            scheduleSlotFreedFallbacks(normalizedReason)
+        })
         return true
     }
 

@@ -23,6 +23,20 @@
 // (two separate factories would need one to inject a not-yet-constructed
 // function into the other).
 
+const MAX_QUEUE_WAKEUP_METRIC_PAUSE_WINDOWS = 50
+const MAX_QUEUE_WAKEUP_METRIC_THROTTLE_WINDOWS = 50
+// 2026-09-28: the shared `journal` array is dominated by high-frequency
+// low-value kinds ('pump' alone fires thousands of times per epoch --
+// pump.coalesced hit 16714 in one live session) and gets truncated to just
+// MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL (30) entries on every storage
+// flush -- confirmed live: rare, high-value diagnostic entries (a profile
+// action outcome, a pause/tab-close mismatch, a nudge failure) were being
+// evicted from the persisted journal within moments of being written,
+// before anyone could ever read them back. diagnosticEvents is a separate,
+// much smaller-volume array (this session's tracing additions push to it
+// exclusively) that isn't subject to that competition.
+const MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS = 80
+
 function createQueueWakeupMetricsShape(deps = {}) {
     const {
         browser,
@@ -87,7 +101,27 @@ function createQueueWakeupMetricsShape(deps = {}) {
             queueLoadThrottle: makeEmptyQueueLoadThrottle(),
             counters: {},
             phases: {},
-            journal: []
+            journal: [],
+            // 2026-09-27: a paused span sitting between a terminal row and
+            // the next row (same run) becoming active used to just count
+            // as "handoff time" in summarizeCoordinatorActivationHandoffTiming
+            // -- confirmed live as a real contaminant, not a hypothetical
+            // one. {pausedAt, resumedAt} windows (resumedAt 0 while still
+            // paused), recorded by recordCoordinatorPauseTransition
+            // wherever COORDINATOR_PAUSED_KEY gets written, let that
+            // computation subtract genuinely-paused time from each gap
+            // instead of counting it as processing latency.
+            pauseWindows: [],
+            // Same fix shape as pauseWindows above, for queueLoadThrottle
+            // (Quora-pushback backoff) instead of a manual pause -- a
+            // throttle-active stretch between two rows was still counting
+            // in full as handoff time, with no durable window-history the
+            // way pause has. {activatedAt, clearedAt} windows (clearedAt 0
+            // while still active), recorded by recordQueueLoadThrottleTransition.
+            queueLoadThrottleWindows: [],
+            // Separate from `journal` above -- see MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS'
+            // comment for why. Written exclusively by pushQueueWakeupDiagnosticEvent.
+            diagnosticEvents: []
         }
     }
 
@@ -134,8 +168,37 @@ function createQueueWakeupMetricsShape(deps = {}) {
             phases: normalizeQueueWakeupPhaseMap(source.phases),
             journal: Array.isArray(source.journal)
                 ? source.journal.filter(entry => entry && typeof entry === 'object').slice(-MAX_QUEUE_WAKEUP_METRIC_JOURNAL)
+                : [],
+            pauseWindows: normalizeCoordinatorPauseWindows(source.pauseWindows),
+            queueLoadThrottleWindows: normalizeQueueLoadThrottleWindows(source.queueLoadThrottleWindows),
+            diagnosticEvents: Array.isArray(source.diagnosticEvents)
+                ? source.diagnosticEvents.filter(entry => entry && typeof entry === 'object').slice(-MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS)
                 : []
         }
+    }
+
+    function normalizeCoordinatorPauseWindows(value = null) {
+        if(!Array.isArray(value)) return []
+        return value
+            .filter(entry => entry && typeof entry === 'object')
+            .map(entry => ({
+                pausedAt: Number.parseInt(entry.pausedAt, 10) || 0,
+                resumedAt: Number.parseInt(entry.resumedAt, 10) || 0
+            }))
+            .filter(entry => entry.pausedAt > 0)
+            .slice(-MAX_QUEUE_WAKEUP_METRIC_PAUSE_WINDOWS)
+    }
+
+    function normalizeQueueLoadThrottleWindows(value = null) {
+        if(!Array.isArray(value)) return []
+        return value
+            .filter(entry => entry && typeof entry === 'object')
+            .map(entry => ({
+                activatedAt: Number.parseInt(entry.activatedAt, 10) || 0,
+                clearedAt: Number.parseInt(entry.clearedAt, 10) || 0
+            }))
+            .filter(entry => entry.activatedAt > 0)
+            .slice(-MAX_QUEUE_WAKEUP_METRIC_THROTTLE_WINDOWS)
     }
 
     function normalizeQueueLoadThrottle(value = null) {
@@ -273,6 +336,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
         setQueueLoadThrottleState(throttle)
         if(throttle.active && throttle.until > now) return throttle
         if(throttle.level || throttle.active || throttle.until) {
+            const wasActive = throttle.active
             throttle = {
                 ...makeEmptyQueueLoadThrottle(),
                 lastPressureAt: throttle.lastPressureAt || 0,
@@ -282,6 +346,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
             }
             setQueueLoadThrottleState(throttle)
             syncQueueLoadThrottleToMetrics()
+            if(wasActive) recordQueueLoadThrottleTransition(false, now)
         }
         return throttle
     }
@@ -322,6 +387,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
             message: `Quora slow: throttled to 1 tab, retrying in ${Math.ceil(delayMs / 1000)}s`
         }
         setQueueLoadThrottleState(throttle)
+        recordQueueLoadThrottleTransition(true, now)
         incrementQueueWakeupMetric(`throttle.pressure.${normalizedReason}`)
         pushQueueWakeupJournalEntry({
             kind: 'state-change',
@@ -344,6 +410,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
         if(!existing.active && !existing.level) return existing
 
         const now = getNow()
+        const wasActive = existing.active
         const throttle = {
             ...makeEmptyQueueLoadThrottle(),
             lastPressureAt: existing.lastPressureAt || 0,
@@ -352,6 +419,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
             message: 'Quora responsive: queue throttle recovering'
         }
         setQueueLoadThrottleState(throttle)
+        if(wasActive) recordQueueLoadThrottleTransition(false, now)
         incrementQueueWakeupMetric('throttle.recovered.actionProgress')
         pushQueueWakeupJournalEntry({
             kind: 'state-change',
@@ -463,7 +531,36 @@ function createQueueWakeupMetricsShape(deps = {}) {
                 completedAfterReconcileRate: getQueueWakeupCounterRatio(completedAfterReconcile, jobsTerminal)
             },
             maxPayloadSize: counters['storagePayload.write.total.maxBytes'] || 0,
-            journalCount: Array.isArray(epoch.journal) ? epoch.journal.length : 0
+            journalCount: Array.isArray(epoch.journal) ? epoch.journal.length : 0,
+            // 2026-09-28 tracing addition (project_open_issues_2026_09_27.md
+            // issue 3): epoch.phases (durableQueueToTabOpen,
+            // tabOpenToClaimAccepted, claimAcceptedToActionStart,
+            // actionReadyToActionStart, actionStartToTerminal,
+            // terminalToSlotRelease -- see recordQueueWakeupPhaseSamplesFromProgress)
+            // previously had no equivalent here, so a reset/reload silently
+            // dropped the only phase-timing breakdown that could explain the
+            // ~20s real-block-time-vs-~5s-by-hand gap. Carrying avg/max/count
+            // per phase into the persisted summary means previousEpochs keeps
+            // it instead of requiring the investigation to catch
+            // currentEpoch.phases before the next reload/reset.
+            phases: Object.fromEntries(
+                Object.entries(epoch.phases || {}).map(([key, phase]) => [key, {
+                    count: phase?.count || 0,
+                    avgMs: phase?.count ? Math.round((phase.totalMs || 0) / phase.count) : 0,
+                    maxMs: phase?.maxMs || 0
+                }])
+            ),
+            // 2026-09-28: diagnosticEvents (pushQueueWakeupDiagnosticEvent)
+            // had the same gap phases did above -- protected from the
+            // shared journal's eviction pressure, but still silently
+            // dropped on an epoch rollover, which happens on every
+            // version-bump reload. That's exactly the reload cadence this
+            // live investigation runs at, so without this the tracing
+            // would only ever be visible in the instant between it firing
+            // and the next reload. Already sanitized to string/number/
+            // boolean-only details (sanitizeQueueWakeupMetricDetails), so
+            // carried through as-is rather than reshaped.
+            diagnosticEvents: Array.isArray(epoch.diagnosticEvents) ? epoch.diagnosticEvents.slice(-MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS) : []
         }
     }
 
@@ -549,6 +646,62 @@ function createQueueWakeupMetricsShape(deps = {}) {
 
     function getQueueWakeupMetricCounter(name = '') {
         return getQueueWakeupMetricEpoch().counters?.[`${name || ''}`.trim()] || 0
+    }
+
+    // 2026-09-27: called wherever COORDINATOR_PAUSED_KEY gets durably
+    // written, regardless of which of this project's many pause/resume
+    // call sites did it -- records a {pausedAt, resumedAt} window on the
+    // current epoch so summarizeCoordinatorActivationHandoffTiming can
+    // subtract genuinely-paused time from a handoff gap instead of
+    // counting it as processing latency. Idempotent against redundant
+    // writes of the same value (e.g. re-persisting paused:true while
+    // already paused) via the open/closed check below.
+    function recordCoordinatorPauseTransition(paused, at = getNow()) {
+        const epoch = getQueueWakeupMetricEpoch()
+        const windows = Array.isArray(epoch.pauseWindows) ? epoch.pauseWindows : []
+        const openWindow = windows.length && windows[windows.length - 1].resumedAt === 0
+            ? windows[windows.length - 1]
+            : null
+
+        if(paused === true) {
+            if(openWindow) return
+            windows.push({pausedAt: Number.parseInt(at, 10) || getNow(), resumedAt: 0})
+        }
+        else {
+            if(!openWindow) return
+            openWindow.resumedAt = Number.parseInt(at, 10) || getNow()
+        }
+
+        epoch.pauseWindows = windows.slice(-MAX_QUEUE_WAKEUP_METRIC_PAUSE_WINDOWS)
+        epoch.updatedAt = getNow()
+        scheduleQueueWakeupMetricsFlush()
+    }
+
+    // Same fix shape as recordCoordinatorPauseTransition above, for
+    // queueLoadThrottle instead of a manual pause -- called wherever the
+    // throttle's active state flips, so summarizeCoordinatorActivationHandoffTiming
+    // can subtract genuinely-throttled time from a handoff gap the same way
+    // it already does for paused time. Idempotent against redundant calls
+    // via the same open/closed check.
+    function recordQueueLoadThrottleTransition(active, at = getNow()) {
+        const epoch = getQueueWakeupMetricEpoch()
+        const windows = Array.isArray(epoch.queueLoadThrottleWindows) ? epoch.queueLoadThrottleWindows : []
+        const openWindow = windows.length && windows[windows.length - 1].clearedAt === 0
+            ? windows[windows.length - 1]
+            : null
+
+        if(active === true) {
+            if(openWindow) return
+            windows.push({activatedAt: Number.parseInt(at, 10) || getNow(), clearedAt: 0})
+        }
+        else {
+            if(!openWindow) return
+            openWindow.clearedAt = Number.parseInt(at, 10) || getNow()
+        }
+
+        epoch.queueLoadThrottleWindows = windows.slice(-MAX_QUEUE_WAKEUP_METRIC_THROTTLE_WINDOWS)
+        epoch.updatedAt = getNow()
+        scheduleQueueWakeupMetricsFlush()
     }
 
     function recordQueueWakeupPhase(name = '', durationMs = 0) {
@@ -772,6 +925,37 @@ function createQueueWakeupMetricsShape(deps = {}) {
         scheduleQueueWakeupMetricsFlush()
     }
 
+    // 2026-09-28: separate sink from pushQueueWakeupJournalEntry above --
+    // see MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS' comment. Confirmed
+    // live: a profile-action-outcome entry pushed through the shared
+    // journal was gone from the persisted/view copy (truncated to
+    // MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL=30 on every storage flush)
+    // within the same minute, crowded out by 'pump'/'reconcile'/'storage'
+    // entries that fire orders of magnitude more often. This array is
+    // written to by nothing else, so it isn't subject to that eviction
+    // pressure, and it isn't truncated down on persist the way `journal` is
+    // (see buildPersistedQueueWakeupMetricEpoch/buildQueueWakeupMetricsView,
+    // both of which spread it through unmodified at its own, larger cap).
+    function pushQueueWakeupDiagnosticEvent(entry = {}) {
+        const now = getNow()
+        const epoch = getQueueWakeupMetricEpoch()
+        if(!Array.isArray(epoch.diagnosticEvents)) epoch.diagnosticEvents = []
+        epoch.diagnosticEvents.push({
+            kind: `${entry.kind || 'diagnostic'}`.trim(),
+            name: `${entry.name || ''}`.trim(),
+            reason: `${entry.reason || ''}`.trim(),
+            result: `${entry.result || ''}`.trim(),
+            at: Number.parseInt(entry.at, 10) || now,
+            durationMs: Math.max(0, Number(entry.durationMs) || 0),
+            details: sanitizeQueueWakeupMetricDetails(entry.details || {})
+        })
+        if(epoch.diagnosticEvents.length > MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS) {
+            epoch.diagnosticEvents = epoch.diagnosticEvents.slice(-MAX_QUEUE_WAKEUP_METRIC_DIAGNOSTIC_EVENTS)
+        }
+        epoch.updatedAt = now
+        scheduleQueueWakeupMetricsFlush()
+    }
+
     function startQueueWakeupMetricCycle(kind = 'cycle', name = '', reason = '', details = {}) {
         const nextSerial = (getQueueWakeupMetricCycleSerial() || 0) + 1
         setQueueWakeupMetricCycleSerial(nextSerial)
@@ -867,6 +1051,8 @@ function createQueueWakeupMetricsShape(deps = {}) {
         ensureQueueWakeupMetricsLoaded,
         incrementQueueWakeupMetric,
         getQueueWakeupMetricCounter,
+        recordCoordinatorPauseTransition,
+        recordQueueLoadThrottleTransition,
         recordQueueWakeupPhase,
         recordQueueWakeupPhaseSamplesFromProgress,
         recordQueueWakeupMetricMax,
@@ -878,6 +1064,7 @@ function createQueueWakeupMetricsShape(deps = {}) {
         runQueueWakeupMetricPhase,
         sanitizeQueueWakeupMetricDetails,
         pushQueueWakeupJournalEntry,
+        pushQueueWakeupDiagnosticEvent,
         startQueueWakeupMetricCycle,
         getQueueWakeupMetricCounterDelta,
         getQueueWakeupMetricRuntimeSnapshot,

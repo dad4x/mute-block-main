@@ -26,7 +26,8 @@ function registerServiceWorkerListeners(deps = {}) {
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
-        PROFILE_NUKE_PROGRESS_VIEW_KEY
+        PROFILE_NUKE_PROGRESS_VIEW_KEY,
+        TARGET_QUEUED_TAB_CONCURRENCY_KEY
     } = deps.constants || {}
     const {
         coordinatorReconcileScheduler,
@@ -48,6 +49,7 @@ function registerServiceWorkerListeners(deps = {}) {
         cancelCoordinatorCurrentWorkItem,
         cancelQueuedOwnerActions,
         claimPendingTabAction,
+        clearCoordinatorCurrentWork,
         clearCoordinatorReconcileAlarms,
         clearPersistentFailedRetry,
         clearSchedulerAlarms,
@@ -102,6 +104,7 @@ function registerServiceWorkerListeners(deps = {}) {
         normalizeRuntimeMessageAction,
         normalizeTabId,
         openCoordinatorPage,
+        openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
         promoteQueuedTab,
         reconcileCoordinatorStorageBestEffort,
@@ -111,6 +114,7 @@ function registerServiceWorkerListeners(deps = {}) {
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
+        refreshCoordinatorRunsViewForDashboard,
         refreshQueueWakeupMetricsViewForDashboard,
         refreshStaleCompactQueueViewIfNeeded,
         releaseCoordinatorActionLease,
@@ -138,6 +142,7 @@ function registerServiceWorkerListeners(deps = {}) {
         scheduleStoredWorkRearmAfterExtensionReload,
         sendTabMessage,
         setQueuedTabMetadata,
+        setTargetQueuedTabConcurrency,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -439,6 +444,9 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(changes?.[COORDINATOR_RETRY_FAILED_ENABLED_KEY]) {
             clearPersistentFailedRetry()
         }
+        if(changes?.[TARGET_QUEUED_TAB_CONCURRENCY_KEY]) {
+            setTargetQueuedTabConcurrency(changes[TARGET_QUEUED_TAB_CONCURRENCY_KEY].newValue)
+        }
         if(hasStoredCoordinatorWorkInQueueView(changes?.[COORDINATOR_QUEUE_VIEW_KEY]?.newValue || null)) {
             scheduleCoordinatorQueueResume(1000, 'storage-queue-view-changed', {
                 allowBeforeQuora: true
@@ -500,8 +508,19 @@ function registerServiceWorkerListeners(deps = {}) {
             return enqueueCoordinatorItems(request, sender)
         }
         else if(request.action === 'open-coordinator') {
+            // sender.tab is only populated for messages from a content
+            // script in a tab -- the popup has no tab of its own, so it
+            // sends its own window id explicitly (see popup.js). Prefer
+            // that when present; sender.tab?.windowId covers any other
+            // caller that IS a content script.
             return openCoordinatorPage({
-                windowId: sender.tab?.windowId || null,
+                windowId: Number.parseInt(request.windowId, 10) || sender.tab?.windowId || null,
+                active: request.active === true
+            })
+        }
+        else if(request.action === 'open-coordinator-history') {
+            return openCoordinatorHistoryPage({
+                windowId: Number.parseInt(request.windowId, 10) || sender.tab?.windowId || null,
                 active: request.active === true
             })
         }
@@ -530,6 +549,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'cancel-coordinator-current-work-item') {
             return cancelCoordinatorCurrentWorkItem(request)
+        }
+        else if(request.action === 'clear-coordinator-current-work') {
+            return clearCoordinatorCurrentWork()
         }
         else if(request.action === 'reconcile-coordinator-storage') {
             if(request.userInitiated !== true) {
@@ -605,6 +627,9 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'refresh-coordinator-queue-view') {
             return refreshCoordinatorQueueViewForDashboard(request.reason || 'dashboard-refresh')
         }
+        else if(request.action === 'refresh-coordinator-runs-view') {
+            return refreshCoordinatorRunsViewForDashboard(request.reason || 'dashboard-refresh')
+        }
         else if(request.action === 'get-coordinator-queue-accounting') {
             return getCoordinatorQueueAccounting(request)
         }
@@ -668,6 +693,20 @@ function registerServiceWorkerListeners(deps = {}) {
                 href: `${request.href || ''}`,
                 tabId: sender.tab?.id || null
             })
+            // 2026-09-29: stamped on the tab's own metadata so
+            // reloadQueuedTabAfterUnresponsiveContentScript (sw.js) can skip
+            // reloading it -- confirmed live that a challenged tab's nudge
+            // never gets accepted (it's not a profile page), which used to
+            // trigger a reload every retry cycle. A Cloudflare "Just a
+            // moment" JS challenge needs uninterrupted time to solve itself;
+            // reloading restarts that clock, so the previous behavior could
+            // keep a tab stuck indefinitely, only ever resolving if the user
+            // happened to intervene manually.
+            if(sender.tab?.id) {
+                setQueuedTabMetadata(sender.tab.id, {
+                    cloudflareChallengeDetectedAt: Date.now()
+                })
+            }
             return Promise.resolve({recorded: true})
         }
         else if(request.action === 'resolve-queued-profile-target') {

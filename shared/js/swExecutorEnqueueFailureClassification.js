@@ -70,7 +70,7 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
         getDurablyActiveQueuedTabCount,
         getSchedulerBlockingQueuedExecutorCount,
         getQueuedProfileOpenReservationCount,
-        getEffectiveQueuedTabConcurrency,
+        getEffectiveQueuedTabOpenConcurrency,
         normalizeTabId,
         isQueuedAuthorityNoSurfaceRetryBudgetExhausted,
         isCoordinatorQueueAuthoritativeItem,
@@ -85,7 +85,7 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
             getSchedulerBlockingQueuedExecutorCount() ||
             getQueuedProfileOpenReservationCount() ||
             getDurablyActiveQueuedTabCount()
-        return activeCount >= getEffectiveQueuedTabConcurrency()
+        return activeCount >= getEffectiveQueuedTabOpenConcurrency()
     }
 
     function isExecutorMaterializationDeferredByCapacity(enqueueResult = {}) {

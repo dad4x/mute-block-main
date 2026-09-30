@@ -201,6 +201,42 @@ service worker passes browser, timing, metric, recorder, and normalization
 capabilities into that module; durable activation, rollback, retry, and
 terminal decisions remain in the machine/service-worker layer.
 
+## Queued Worker Action Surface
+
+Some queued mute/block actions require a genuinely foreground/active tab to
+work at all (`isForegroundQueuedTabWork`) but are owned by the service worker
+rather than by any tab the user is actually looking at
+(`shouldUseQueuedWorkerActionSurface`,
+[swQueuedWorkerActionSurfaceState.js](shared/js/swQueuedWorkerActionSurfaceState.js)).
+For those, the service worker self-provisions a dedicated, separate browser
+window rather than borrowing the user's current window: `getOrCreateQueuedWorkerActionSurface`
+(`sw.js`) opens `coordinator.html#worker-window` via `browser.windows.create`
+with `focused: false`, reuses that window across subsequent queued actions
+while it stays live, and tears it down when idle
+(`scheduleQueuedWorkerActionSurfaceCleanup` /
+`closeQueuedWorkerActionSurfaceIfIdle`). The queued action's own tab is
+created and activated inside that window; `restoreQueuedActionSurfaceCallerFocus`
+restores the user's actual previous tab/window focus afterward so the surface
+window never visibly steals attention. This window is coordinator.html loaded
+in a special mode (it retitles itself "Mute Block Worker") -- it is not the
+human-facing dashboard, even though it is the same HTML file, and a user
+seeing a "Mute Block Worker" window appear on its own is this mechanism, not a
+bug or something they opened.
+
+Known unresolved concern (2026-09-25, not yet root-caused in code):
+recollection from earlier work is that leaving this surface window completely
+unfocused for the whole action sometimes produced a silent no-op -- briefly
+bringing it to the foreground was what made the action actually happen. If
+true, the suspected explanation is that `focused: false` may satisfy
+`document.visibilityState === 'visible'` without the window ever gaining
+real OS-level focus, and whatever gate the queued action's foreground
+requirement actually checks may need true focus, not just visibility. This
+was accepted as a known imperfection rather than fixed at the time, and is
+worth deliberately revisiting (confirm the real gate condition, and whether a
+brief programmatic focus/blur around the action is an acceptable tradeoff
+against the "don't steal user attention" goal this surface exists for) once
+the rest of the coordinator/queue work now in progress lands.
+
 ## Scheduler Boundary
 
 Scheduler timers and browser alarms are non-persistent runtime effects. They
@@ -328,6 +364,54 @@ See
 Terminology: older code, metrics, and notes may still say `compaction`. In the
 architecture, read that as checkpoint generation switching plus later
 old-generation cleanup, not as a garbage-collection model.
+
+### Derived Stats Must Not Be A Mutated Running Total
+
+A derived materialization (see "runs... are derived materializations" above)
+is only actually derived if computing it means *reading authority and
+recomputing from scratch*. If instead some field is read from its own prior
+persisted value, adjusted by a local delta, and written back -- `next = prior +
+delta`, or `next = recompute(existing-as-seed, currently-visible-authority)`
+-- then it is a mutated running total wearing a derived-materialization
+costume, and it inherits every problem a running total has: it is only
+correct if every writer that ever touches it is serialized against every
+other writer, forever, everywhere it's touched.
+
+Confirmed real instance (2026-09-25): `mbCoordinatorRuns[runId]`'s
+`itemCount`/`activeCount`/`terminalCount`/`targetProfileHrefs`/`targetWorkKeys`
+are recomputed via `recomputeCoordinatorRuns`, called from roughly two dozen
+independent call sites across enqueue, requeue, and reconcile-driven
+terminalization (redirect-mismatch, non-profile-landing, exhausted-rollback,
+and others). Each call site does its own unserialized
+read-runs-from-storage -> recompute -> write-runs-to-storage cycle -- the
+per-row queue mutation each of these sits inside of *is* properly serialized
+through `coordinatorAuthority`'s lock, but the follow-up runs-bookkeeping
+write happens after that lock releases, as a separate, un-serialized
+`saveCoordinatorState` call. When several items belonging to the same run
+terminalize in quick succession (routine for e.g. a batch of candidates where
+most fail validation almost immediately), their concurrent runs-updates
+race and lose each other's contributions -- a classic lost update. Live
+evidence: a 13-item run's tracked `itemCount` settled at 4. The same file has
+a second, smaller instance of the identical pattern: `enqueueRequested`/
+`enqueueQueued`/`enqueueMerged` on that same run record are accumulated as
+`priorX + delta` read from `runs[runId]` at the top of the enqueue path,
+subject to the same race.
+
+The fix direction: stop persisting these fields as mutated state at all.
+Compute run-level stats on demand, by scanning current queue authority plus
+the completed-work log for rows matching the run, at the moment something
+needs to display or decide on them -- the same direction the compact queue
+view (`mbCoordinatorQueueView`) is also moving in (see "Dashboard And UI
+Surfaces"): nothing incrementally mutated means nothing to race. A field that
+must persist across restarts and isn't reconstructible from authority (e.g.
+`paused`, `createdAt`, `sourcePages`) is not this pattern and is fine as
+ordinary state.
+
+This was found while chasing one specific dashboard inconsistency; it has not
+been exhaustively audited across the whole file. Any future "N accumulated so
+far" or "recompute onto a seed read moments ago" pattern touching a durable
+key deserves the same scrutiny, especially wherever the read and the eventual
+write are separated by an `await`.
 
 ## Module Extraction And The Test Harness Realm Boundary
 

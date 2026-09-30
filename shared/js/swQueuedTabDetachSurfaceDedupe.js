@@ -99,7 +99,7 @@ function createQueuedTabDetachSurfaceDedupe(deps = {}) {
             }
         }
 
-        queueRuntime.markRemovedQueuedRuntimeTab(tabId)
+        queueRuntime.markRemovedQueuedRuntimeTab(tabId, reason)
         const metadata = getQueuedTabMetadata(tabId)
         releaseQueuedActivationGuardForTab(tabId, metadata)
         const wasActive = queueRuntime.deleteActiveQueuedTab(tabId)

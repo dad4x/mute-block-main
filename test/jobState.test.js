@@ -40,6 +40,24 @@ test('maps successful progress records to terminal succeeded jobs', () => {
     })
 })
 
+test('maps block-attempt-on-following progress as a non-retryable skipped terminal state', () => {
+    // 2026-09-25: a candidate whose profile link was miscategorized (e.g.
+    // swept up from a post as if it were a scam-target link when it was
+    // really a legitimate contributor's own profile) shouldn't get blocked
+    // just because it made it into the queue -- content.js checks the
+    // profile page's own Follow/Following button at the moment of action
+    // and records this status instead of attempting the block.
+    assert.deepEqual(mapProgressToJobState({
+        status: 'block-attempt-on-following'
+    }), {
+        status: 'skipped',
+        outcome: 'block-attempt-on-following',
+        error: '',
+        terminal: true
+    })
+    assert.equal(isRetryableJobFailure(mapProgressToJobState({status: 'block-attempt-on-following'})), false)
+})
+
 test('maps explicit security verification as non-retryable failed state', () => {
     const mapped = mapProgressToJobState({
         status: 'error',

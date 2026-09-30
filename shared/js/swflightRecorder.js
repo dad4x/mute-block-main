@@ -50,7 +50,24 @@ const FLIGHT_RECORDER_KINDS = new Set([
     "cloudflare-challenge-detected",
     "queue-wal-checkpoint-switch-start",
     "queue-wal-checkpoint-switch-result",
-    "queue-wal-auto-recovery"
+    "queue-wal-auto-recovery",
+    // 2026-09-29 tracing addition (project_open_issues_2026_09_27.md issue
+    // 2/classification): item.initialBlockedState (mutateCoordinatorInitialBlockedState,
+    // sw.js) decides reallyBlocked vs alreadyBlocked for the entire life of a
+    // row and is captured exactly once, first-report-wins -- but had no
+    // tracing at all, so a misclassification (confirmed live: FPT-Camera-3
+    // landed alreadyBlocked despite ~23s of active in-session polling that
+    // looks like a genuine live block, not a pre-existing one) couldn't be
+    // traced back to which report won the race, or why the early
+    // not-blocked observations apparently lost it.
+    "initial-blocked-state-record",
+    // 2026-09-29: Zoe-Lyta orphaned-tab incident -- terminalizeActiveCoordinatorItemFromBlockedLiveTab
+    // archived the row as succeeded and reported terminalized:true, but the
+    // live browser tab stayed open (found later with no mbCoordinatorQueue
+    // record at all). browser.tabs.remove() was wrapped in .catch(() => {})
+    // with no trace of the outcome, so a failed/no-op removal was
+    // indistinguishable from a successful one after the fact.
+    "terminal-tab-close-result"
 ])
 
 let flightRecorderSeq = 0
@@ -143,7 +160,7 @@ function sanitizeFlightRecorderEntry(entry = {}) {
         const value = sanitizeFlightRecorderInteger(entry?.[field])
         if(value !== undefined) sanitized[field] = value
     }
-    for(const field of ["accepted", "durable", "changed", "fillTimedOut", "runtimeSurfaceBefore"]) {
+    for(const field of ["accepted", "durable", "changed", "fillTimedOut", "runtimeSurfaceBefore", "blocked"]) {
         const value = sanitizeFlightRecorderBoolean(entry?.[field])
         if(value !== undefined) sanitized[field] = value
     }

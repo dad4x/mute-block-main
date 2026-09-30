@@ -108,6 +108,10 @@ function createQueuedTabMetadataAndActionLease(deps = {}) {
         return queueRuntime.hasRemovedQueuedRuntimeTab(tabId)
     }
 
+    function getRemovedQueuedRuntimeTabReason(tabId) {
+        return queueRuntime.getRemovedQueuedRuntimeTabReason(tabId)
+    }
+
     function setQueuedTabMetadata(tabId, metadata = {}) {
         if(!tabId) return
         if(wasQueuedRuntimeTabRemoved(tabId)) return
@@ -317,6 +321,7 @@ function createQueuedTabMetadataAndActionLease(deps = {}) {
     return {
         getQueuedTabMetadata,
         wasQueuedRuntimeTabRemoved,
+        getRemovedQueuedRuntimeTabReason,
         setQueuedTabMetadata,
         remapQueuedTabToResolvedProfile,
         clearQueuedTabMetadata,

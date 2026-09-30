@@ -104,6 +104,16 @@ function createCoordinatorQueueView(deps = {}) {
         ) > 0
     }
 
+    // The exact complement of isCoordinatorActualBlockSuccess's
+    // already-blocked exclusion -- a completed skip that never performed a
+    // genuine block action, so its active-to-terminal time measures
+    // "confirm already blocked and move on," not "perform a block."
+    function isCoordinatorAlreadyBlockedSuccess(item = {}) {
+        if(`${item?.status || ''}` !== 'succeeded') return false
+        if(`${item?.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) return false
+        return `${item?.outcome || ''}` === 'already-blocked'
+    }
+
     function getCoordinatorActualBlockTerminalTime(item = {}) {
         return getFirstPositiveNumber(item?.terminalAt, item?.blockedAt, item?.updatedAt, item?.createdAt)
     }
@@ -123,13 +133,36 @@ function createCoordinatorQueueView(deps = {}) {
         )
     }
 
-    function summarizeCoordinatorActualBlockTiming(queue = {}, epochStartedAt = 0) {
+    // Shared by summarizeCoordinatorActualBlockTiming ("secs / real block")
+    // and summarizeCoordinatorAlreadyBlockedTiming ("secs / already
+    // blocked") -- same sampling/outlier/epoch-floor logic, differing only
+    // in which of the two (mutually exclusive, see
+    // isCoordinatorActualBlockSuccess / isCoordinatorAlreadyBlockedSuccess)
+    // completed-row predicates selects the samples.
+    function summarizeCoordinatorBlockLikeTiming(queue = {}, epochStartedAt = 0, matchesSuccess = () => false) {
         const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
+        // 2026-09-27: floored by minimumTerminalAt again -- the epoch this
+        // comes from (queueWakeupMetrics' currentEpoch.startedAt) only
+        // actually moves on a genuine reset (an extension-version-bump
+        // reload, or an explicit "Reset metrics" click -- see
+        // resetQueueWakeupMetricsEpoch), never on an ordinary same-version
+        // service-worker restart/idle-eviction. The 2026-09-25 fix that
+        // removed this floor was guarding against exactly the wrong case:
+        // a ROUTINE restart silently hiding a row that had just terminalized
+        // (durable, not stale). But that made these two cards not reset on
+        // a *deliberate* reload/Reset-metrics either, which is confusing --
+        // this tile should read "fresh" right after you ask it to. The
+        // tradeoff accepted here: a row that finishes in the same instant as
+        // a deliberate reset can be excluded from the very next reading,
+        // which is a much smaller cost than never resetting at all.
+        // COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS below (plus the recency
+        // sort + 100-sample cap) still guards against genuinely stale/
+        // implausible data contaminating the average within one epoch.
         const samples = Object.values(queue || {})
             .filter(item => {
-                if(!isCoordinatorActualBlockSuccess(item)) return false
+                if(!matchesSuccess(item)) return false
                 const terminalAt = getCoordinatorActualBlockTerminalTime(item)
-                return terminalAt > 0 && (!minimumTerminalAt || terminalAt >= minimumTerminalAt)
+                return terminalAt > 0 && terminalAt >= minimumTerminalAt
             })
             .sort((left, right) => getCoordinatorActualBlockTerminalTime(right) - getCoordinatorActualBlockTerminalTime(left))
             .slice(0, 100)
@@ -156,6 +189,14 @@ function createCoordinatorQueueView(deps = {}) {
         }
     }
 
+    function summarizeCoordinatorActualBlockTiming(queue = {}, epochStartedAt = 0) {
+        return summarizeCoordinatorBlockLikeTiming(queue, epochStartedAt, isCoordinatorActualBlockSuccess)
+    }
+
+    function summarizeCoordinatorAlreadyBlockedTiming(queue = {}, epochStartedAt = 0) {
+        return summarizeCoordinatorBlockLikeTiming(queue, epochStartedAt, isCoordinatorAlreadyBlockedSuccess)
+    }
+
     function getCoordinatorActivationHandoffTerminalTime(item = {}) {
         return getFirstPositiveNumber(item?.terminalAt, item?.updatedAt, item?.createdAt)
     }
@@ -164,7 +205,43 @@ function createCoordinatorQueueView(deps = {}) {
         return getFirstPositiveNumber(item?.activeAt)
     }
 
-    function summarizeCoordinatorActivationHandoffTiming(queue = {}, epochStartedAt = 0) {
+    function getCoordinatorPauseWindowsOverlapMs(pauseWindows = [], startMs = 0, endMs = 0, nowMs = now()) {
+        if(!Array.isArray(pauseWindows) || !pauseWindows.length || endMs <= startMs) return 0
+
+        let overlap = 0
+        for(const window of pauseWindows) {
+            const pausedAt = Number.parseInt(window?.pausedAt, 10) || 0
+            if(!pausedAt) continue
+            const resumedAt = Number.parseInt(window?.resumedAt, 10) || nowMs
+            const overlapStart = Math.max(startMs, pausedAt)
+            const overlapEnd = Math.min(endMs, resumedAt)
+            if(overlapEnd > overlapStart) overlap += overlapEnd - overlapStart
+        }
+        return overlap
+    }
+
+    // Same fix shape as getCoordinatorPauseWindowsOverlapMs above, for
+    // queueLoadThrottleWindows ({activatedAt, clearedAt}) instead of
+    // pauseWindows ({pausedAt, resumedAt}) -- a queueLoadThrottle-active
+    // stretch (Quora-pushback backoff) between two rows was still counting
+    // in full as handoff time, same contaminant category as an unaccounted
+    // pause.
+    function getCoordinatorQueueLoadThrottleWindowsOverlapMs(queueLoadThrottleWindows = [], startMs = 0, endMs = 0, nowMs = now()) {
+        if(!Array.isArray(queueLoadThrottleWindows) || !queueLoadThrottleWindows.length || endMs <= startMs) return 0
+
+        let overlap = 0
+        for(const window of queueLoadThrottleWindows) {
+            const activatedAt = Number.parseInt(window?.activatedAt, 10) || 0
+            if(!activatedAt) continue
+            const clearedAt = Number.parseInt(window?.clearedAt, 10) || nowMs
+            const overlapStart = Math.max(startMs, activatedAt)
+            const overlapEnd = Math.min(endMs, clearedAt)
+            if(overlapEnd > overlapStart) overlap += overlapEnd - overlapStart
+        }
+        return overlap
+    }
+
+    function summarizeCoordinatorActivationHandoffTiming(queue = {}, epochStartedAt = 0, pauseWindows = [], nowMs = now(), queueLoadThrottleWindows = []) {
         const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
         const entries = Object.entries(queue || {})
         const activations = entries
@@ -185,7 +262,9 @@ function createCoordinatorQueueView(deps = {}) {
             }))
             .filter(sample => {
                 if(!isTerminalCoordinatorStatus(sample.item?.status)) return false
-                return sample.runId && sample.terminalAt > 0 && (!minimumTerminalAt || sample.terminalAt >= minimumTerminalAt)
+                // See the matching comment in summarizeCoordinatorActualBlockTiming
+                // -- floored by minimumTerminalAt again, same reasoning.
+                return sample.runId && sample.terminalAt > 0 && sample.terminalAt >= minimumTerminalAt
             })
             .sort((left, right) => left.terminalAt - right.terminalAt)
 
@@ -197,6 +276,16 @@ function createCoordinatorQueueView(deps = {}) {
                 candidate.activeAt > terminal.terminalAt
             )
             if(!nextActivation) continue
+            // 2026-09-27: a paused span sitting between this terminal row
+            // and the next row (same run) becoming active used to count in
+            // full as "handoff time" -- confirmed live to be a real
+            // contaminant (a several-hour pause inflated this exact
+            // average), not a hypothetical one. Subtracting any recorded
+            // pause-window overlap makes gapMs reflect actual processing
+            // latency instead of however long the queue happened to sit
+            // paused in between.
+            const pausedOverlapMs = getCoordinatorPauseWindowsOverlapMs(pauseWindows, terminal.terminalAt, nextActivation.activeAt, nowMs)
+            const throttledOverlapMs = getCoordinatorQueueLoadThrottleWindowsOverlapMs(queueLoadThrottleWindows, terminal.terminalAt, nextActivation.activeAt, nowMs)
             samples.push({
                 terminalKey: terminal.key,
                 runId: terminal.runId,
@@ -206,7 +295,7 @@ function createCoordinatorQueueView(deps = {}) {
                 nextActiveKey: nextActivation.key,
                 nextActiveStatus: nextActivation.item?.status || '',
                 nextActiveAt: nextActivation.activeAt,
-                gapMs: nextActivation.activeAt - terminal.terminalAt
+                gapMs: Math.max(0, nextActivation.activeAt - terminal.terminalAt - pausedOverlapMs - throttledOverlapMs)
             })
             if(samples.length >= 100) break
         }
@@ -391,7 +480,14 @@ function createCoordinatorQueueView(deps = {}) {
             authoritativeCounts,
             hasAuthoritativeStoredWork,
             actualBlockTiming: summarizeCoordinatorActualBlockTiming(compactQueue, epochStartedAt),
-            activationHandoffTiming: summarizeCoordinatorActivationHandoffTiming(compactQueue, epochStartedAt),
+            alreadyBlockedTiming: summarizeCoordinatorAlreadyBlockedTiming(compactQueue, epochStartedAt),
+            activationHandoffTiming: summarizeCoordinatorActivationHandoffTiming(
+                compactQueue,
+                epochStartedAt,
+                getQueueWakeupMetrics()?.currentEpoch?.pauseWindows || [],
+                nowMs,
+                getQueueWakeupMetrics()?.currentEpoch?.queueLoadThrottleWindows || []
+            ),
             itemLimit: items.length,
             truncated: false,
             items
@@ -518,9 +614,11 @@ function createCoordinatorQueueView(deps = {}) {
         getCoordinatorQueueViewTime,
         getCoordinatorQueueViewEpochStartedAt,
         isCoordinatorActualBlockSuccess,
+        isCoordinatorAlreadyBlockedSuccess,
         getCoordinatorActualBlockTerminalTime,
         getCoordinatorActualBlockActiveStartTime,
         summarizeCoordinatorActualBlockTiming,
+        summarizeCoordinatorAlreadyBlockedTiming,
         getCoordinatorActivationHandoffTerminalTime,
         getCoordinatorActivationHandoffActiveTime,
         summarizeCoordinatorActivationHandoffTiming,

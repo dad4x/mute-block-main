@@ -74,6 +74,8 @@
 // synchronous method call, not a Promise chain, so no realm-crossing
 // concern there.
 
+const DEFAULT_QUEUED_TAB_CONCURRENCY = 4
+
 function createCoordinatorExecutorClassification(deps = {}) {
     const {
         queueRuntime,
@@ -89,7 +91,8 @@ function createCoordinatorExecutorClassification(deps = {}) {
         normalizeTabId
     } = deps.handlers || {}
     const {
-        getQueuedTabConcurrency
+        getQueuedTabConcurrency,
+        getTargetQueuedTabConcurrency
     } = deps.state || {}
 
     function getCoordinatorItemHref(item = {}) {
@@ -143,7 +146,15 @@ function createCoordinatorExecutorClassification(deps = {}) {
             .filter(value => value > 0)
 
         if(values.length) return Math.max(...values)
-        return Math.max(1, getQueuedTabConcurrency() || 3)
+        // Floor at the user's targetQueuedTabConcurrency preference rather
+        // than `getQueuedTabConcurrency() || N`: that old fallback read the
+        // same live state this function seeds, so once it settled at 1 (its
+        // initial value, truthy) the `|| N` fallback could never fire and it
+        // stayed pinned at 1 forever. getTargetQueuedTabConcurrency is
+        // optional in some construction contexts (e.g. tests), hence the
+        // DEFAULT_QUEUED_TAB_CONCURRENCY fallback.
+        const target = getTargetQueuedTabConcurrency ? getTargetQueuedTabConcurrency() : 0
+        return Math.max(target || DEFAULT_QUEUED_TAB_CONCURRENCY, getQueuedTabConcurrency() || 0)
     }
 
     function makeCoordinatorExecutorClassificationCase(caseName = '', rowKey = '', item = null, details = {}) {
@@ -158,6 +169,45 @@ function createCoordinatorExecutorClassification(deps = {}) {
             attemptNumber: getAttemptNumberFromValue(item) || getAttemptNumberFromValue(details.record) || getAttemptNumberFromValue(details.runtime) || 0,
             reason: `${details.reason || caseName || ''}`.trim()
         }
+    }
+
+    // 2026-09-27: getRuntimeSurfaceForCoordinatorItem used to unconditionally
+    // call queueRuntime.getRuntimeSurface, which scans the FULL runtime
+    // state (activeQueuedTabs + pendingTabActions + queuedTabActions) fresh
+    // on every call. classifyCoordinatorExecutorState calls this once PER
+    // QUEUE ROW, so that was O(queue size x runtime state size) per tick --
+    // not just O(queue size), which is all the existing scan-cost metrics
+    // ever counted. buildRuntimeSurfaceIndex lets a caller take that full
+    // scan ONCE per classify call (via queueRuntime.listRuntimeSurfaceEntries)
+    // and reuse it for every row via a plain Map lookup by href/coordinatorKey
+    // instead. A runtime entry with NEITHER an href NOR a coordinatorKey
+    // stamped on it (e.g. a tab whose queued-tab metadata was lost) is a
+    // deliberate, load-bearing case, not a throwaway edge case -- the
+    // original matchesRuntime treats it as matching every item precisely so
+    // stale-runtime pruning can still find and clean it up despite the
+    // missing identity. Indexed separately as `wildcards` and included in
+    // every lookup's candidate set for exactly that reason (live-caught by
+    // "executor apply prunes queued stale runtime tab with missing
+    // metadata" when this was first missed).
+    function buildRuntimeSurfaceIndex(entries = []) {
+        const byHref = new Map()
+        const byCoordinatorKey = new Map()
+        const wildcards = []
+        for(const entry of entries || []) {
+            const runtime = entry?.runtime || {}
+            const href = normalizeQuoraProfileUrl(runtime.profileHref || runtime.targetUrl || runtime.requestedUrl || runtime.url || '')
+            const coordinatorKey = `${runtime.coordinatorKey || ''}`.trim()
+            if(href) {
+                if(!byHref.has(href)) byHref.set(href, [])
+                byHref.get(href).push(entry)
+            }
+            if(coordinatorKey) {
+                if(!byCoordinatorKey.has(coordinatorKey)) byCoordinatorKey.set(coordinatorKey, [])
+                byCoordinatorKey.get(coordinatorKey).push(entry)
+            }
+            if(!href && !coordinatorKey) wildcards.push(entry)
+        }
+        return {byHref, byCoordinatorKey, wildcards}
     }
 
     function getRuntimeSurfaceForCoordinatorItem(item = null, itemKey = '', options = {}) {
@@ -180,11 +230,36 @@ function createCoordinatorExecutorClassification(deps = {}) {
             }
             return !!(itemHref || coordinatorKey)
         }
-        return queueRuntime.getRuntimeSurface({
-            matchesRuntime,
-            getMetadata: tabId => getQueuedTabMetadata(tabId) || {},
-            getActivationTabId: action => normalizeTabId(action?.tabId || action?.createdTabId || action?.targetTabId)
-        })
+
+        const index = options.runtimeSurfaceIndex || null
+        if(!index) {
+            return queueRuntime.getRuntimeSurface({
+                matchesRuntime,
+                getMetadata: tabId => getQueuedTabMetadata(tabId) || {},
+                getActivationTabId: action => normalizeTabId(action?.tabId || action?.createdTabId || action?.targetTabId)
+            })
+        }
+
+        const candidates = new Set([
+            ...(itemHref ? index.byHref.get(itemHref) || [] : []),
+            ...(coordinatorKey ? index.byCoordinatorKey.get(coordinatorKey) || [] : []),
+            ...(index.wildcards || [])
+        ])
+        const activeTabs = []
+        const pendingActions = []
+        const queuedActions = []
+        for(const entry of candidates) {
+            if(!matchesRuntime(entry.runtime)) continue
+            if(entry.group === 'activeTabs') activeTabs.push({tabId: entry.tabId, runtime: entry.runtime})
+            else if(entry.group === 'pendingActions') pendingActions.push({tabId: entry.tabId, runtime: entry.runtime})
+            else if(entry.group === 'queuedActions') queuedActions.push({tabId: entry.tabId, runtime: entry.runtime})
+        }
+        return {
+            activeTabs,
+            pendingActions,
+            queuedActions,
+            hasSurface: activeTabs.length > 0 || pendingActions.length > 0 || queuedActions.length > 0
+        }
     }
 
     return {
@@ -196,7 +271,8 @@ function createCoordinatorExecutorClassification(deps = {}) {
         getCoordinatorItemExecutorMaxConcurrent,
         getCoordinatorResumeMaxConcurrent,
         makeCoordinatorExecutorClassificationCase,
-        getRuntimeSurfaceForCoordinatorItem
+        getRuntimeSurfaceForCoordinatorItem,
+        buildRuntimeSurfaceIndex
     }
 }
 
