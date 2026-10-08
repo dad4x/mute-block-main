@@ -2530,13 +2530,53 @@ module.exports = {
   SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS: 15000,
   SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS: 90000,
   SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS: 1000,
+  // content.js chunk-level retry (sendCoordinatorEnqueueChunked): a chunk
+  // that comes back with no response, a storage timeout, or durable:false
+  // has not landed at all -- this write path has no partial-success state,
+  // so re-sending the same chunk can never double-count. 2026-10-06: a
+  // 491-candidate batch silently lost its last (32-item) chunk this way,
+  // with the old break-on-first-failure loop reporting a numerically
+  // "complete" summary that was actually short by 32 -- user explicitly
+  // ruled out "ask the user to retry" as a fix, so failed chunks now retry
+  // in place with backoff instead of abandoning the rest of the batch.
+  SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS: 5,
+  SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS: 2000,
   // coordinator.js dashboard-to-service-worker message round trips
   // (sendRuntimeMessageWithTimeout's own default, and the heavier
   // mutation-style calls that explicitly opt into a longer budget)
   COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS: 5000,
   COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS: 10000,
   // sw.js
-  WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS: 15000
+  WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS: 15000,
+  // sw.js stale-active-row watchdog (runCoordinatorReconcileTickOnce): a
+  // durable row can sit at status 'active' indefinitely if the specific
+  // combination of conditions that would normally classify and recover it
+  // (classifyCoordinatorExecutorState's 'active-missing-tab' case, handled
+  // in runCoordinatorExecutorApplyPhase) never gets reached -- that deep
+  // classifier only runs when prunedQueuedActions > 0 this tick, which has
+  // nothing to do with whether an unrelated active row's tab is actually
+  // gone. Confirmed live 2026-10-06: one row sat 'active' for over an hour
+  // with zero matching live tabs (getLiveProfileTabsByHref came back
+  // empty for its href) while reconcile ticks kept running normally every
+  // ~60s. This watchdog runs unconditionally on every reconcile tick
+  // (cheap: the full queue is already loaded for the unrelated
+  // queued-action prune step) and force-recovers any active row past this
+  // age with no matching live tab, independent of that gate.
+  STALE_ACTIVE_COORDINATOR_ROW_WATCHDOG_MS: 180000,
+  // sw.js runCoordinatorQueueExecutorFastPath coalescing (2026-10-07): a
+  // burst of distinct reactive triggers (slot-release, active-transition,
+  // queued-authority-enqueue, etc.) can each independently call this
+  // function within milliseconds of each other. Confirmed live: 13 such
+  // calls back to back, each 45-72 real seconds (queued behind the same
+  // serialized storage-update lane), with every call after the first
+  // finding nothing left to do. This window bounds how recently the last
+  // completed call must have finished -- and how little must have changed
+  // since (compared via a cheap in-memory runtime/queue-counts fingerprint,
+  // no storage I/O) -- for a new call to reuse that result instead of
+  // repeating the full pass. Short enough that a call outside this window
+  // is treated as a genuinely new situation, long enough to collapse a
+  // same-moment burst of triggers into one real pass.
+  COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS: 2000
 };
 
 /***/ })
@@ -2579,19 +2619,19 @@ function _toConsumableArray(arr) { return _arrayWithoutHoles(arr) || _iterableTo
 function _nonIterableSpread() { throw new TypeError("Invalid attempt to spread non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
 function _iterableToArray(iter) { if (typeof Symbol !== "undefined" && iter[Symbol.iterator] != null || iter["@@iterator"] != null) return Array.from(iter); }
 function _arrayWithoutHoles(arr) { if (Array.isArray(arr)) return _arrayLikeToArray(arr); }
-function _slicedToArray(arr, i) { return _arrayWithHoles(arr) || _iterableToArrayLimit(arr, i) || _unsupportedIterableToArray(arr, i) || _nonIterableRest(); }
-function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
-function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t["return"] && (u = t["return"](), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
-function _arrayWithHoles(arr) { if (Array.isArray(arr)) return arr; }
 function _createForOfIteratorHelper(o, allowArrayLike) { var it = typeof Symbol !== "undefined" && o[Symbol.iterator] || o["@@iterator"]; if (!it) { if (Array.isArray(o) || (it = _unsupportedIterableToArray(o)) || allowArrayLike && o && typeof o.length === "number") { if (it) o = it; var i = 0; var F = function F() {}; return { s: F, n: function n() { if (i >= o.length) return { done: true }; return { done: false, value: o[i++] }; }, e: function e(_e) { throw _e; }, f: F }; } throw new TypeError("Invalid attempt to iterate non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); } var normalCompletion = true, didErr = false, err; return { s: function s() { it = it.call(o); }, n: function n() { var step = it.next(); normalCompletion = step.done; return step; }, e: function e(_e2) { didErr = true; err = _e2; }, f: function f() { try { if (!normalCompletion && it["return"] != null) it["return"](); } finally { if (didErr) throw err; } } }; }
-function _unsupportedIterableToArray(o, minLen) { if (!o) return; if (typeof o === "string") return _arrayLikeToArray(o, minLen); var n = Object.prototype.toString.call(o).slice(8, -1); if (n === "Object" && o.constructor) n = o.constructor.name; if (n === "Map" || n === "Set") return Array.from(o); if (n === "Arguments" || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(n)) return _arrayLikeToArray(o, minLen); }
-function _arrayLikeToArray(arr, len) { if (len == null || len > arr.length) len = arr.length; for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i]; return arr2; }
 function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
 function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
-function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
 function _defineProperty(obj, key, value) { key = _toPropertyKey(key); if (key in obj) { Object.defineProperty(obj, key, { value: value, enumerable: true, configurable: true, writable: true }); } else { obj[key] = value; } return obj; }
 function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == _typeof(i) ? i : i + ""; }
 function _toPrimitive(t, r) { if ("object" != _typeof(t) || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != _typeof(i)) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
+function _slicedToArray(arr, i) { return _arrayWithHoles(arr) || _iterableToArrayLimit(arr, i) || _unsupportedIterableToArray(arr, i) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(o, minLen) { if (!o) return; if (typeof o === "string") return _arrayLikeToArray(o, minLen); var n = Object.prototype.toString.call(o).slice(8, -1); if (n === "Object" && o.constructor) n = o.constructor.name; if (n === "Map" || n === "Set") return Array.from(o); if (n === "Arguments" || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(n)) return _arrayLikeToArray(o, minLen); }
+function _arrayLikeToArray(arr, len) { if (len == null || len > arr.length) len = arr.length; for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i]; return arr2; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t["return"] && (u = t["return"](), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(arr) { if (Array.isArray(arr)) return arr; }
 function asyncGeneratorStep(gen, resolve, reject, _next, _throw, key, arg) { try { var info = gen[key](arg); var value = info.value; } catch (error) { reject(error); return; } if (info.done) { resolve(value); } else { Promise.resolve(value).then(_next, _throw); } }
 function _asyncToGenerator(fn) { return function () { var self = this, args = arguments; return new Promise(function (resolve, reject) { var gen = fn.apply(self, args); function _next(value) { asyncGeneratorStep(gen, resolve, reject, _next, _throw, "next", value); } function _throw(err) { asyncGeneratorStep(gen, resolve, reject, _next, _throw, "throw", err); } _next(undefined); }); }; }
 var browser = __webpack_require__(/*! webextension-polyfill */ "./node_modules/webextension-polyfill/dist/browser-polyfill.js");
@@ -2653,7 +2693,7 @@ var DEV_MODE_STORAGE_KEY = 'mbDashboardDevMode';
 // setDevModeStoredEnabled) -- must match sw.js's DEV_MODE_SYNC_STORAGE_KEY.
 var DEV_MODE_SYNC_STORAGE_KEY = 'mbDashboardDevModeEnabled';
 var QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState';
-var QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#worker-window';
+var QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#progress';
 var COORDINATOR_HISTORY_HASH = '#history';
 var DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000;
 var DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100;
@@ -2823,10 +2863,10 @@ function _renderHistoryList() {
           }
           return _context3.abrupt("return");
         case 9:
-          replaceChildren(list, rows.map(function (_ref25) {
-            var _ref26 = _slicedToArray(_ref25, 2),
-              postKey = _ref26[0],
-              record = _ref26[1];
+          replaceChildren(list, rows.map(function (_ref31) {
+            var _ref32 = _slicedToArray(_ref31, 2),
+              postKey = _ref32[0],
+              record = _ref32[1];
             var urls = Array.isArray(record === null || record === void 0 ? void 0 : record.urls) ? record.urls : [];
             var singleProfileHref = urls.length === 1 ? urls[0] : '';
             var profileLabel = singleProfileHref ? getProfileLabelFromHref(singleProfileHref) : '';
@@ -2858,7 +2898,7 @@ function _renderHistoryList() {
 }
 function clearHistory() {
   return _clearHistory.apply(this, arguments);
-} // The three coordinator.html views (default dashboard, #worker-window,
+} // The three coordinator.html views (default dashboard, #progress,
 // #history) each render their own content correctly for their mode, but
 // nothing ever toggled which container is actually visible -- all three
 // sections stayed shown simultaneously regardless of hash. Confirmed live
@@ -2892,11 +2932,15 @@ function applyCoordinatorViewMode() {
   var dashboardView = document.getElementById('dashboardView');
   var workerBarView = document.getElementById('workerBarView');
   var historyView = document.getElementById('historyView');
+  var dashboardBottomBar = document.getElementById('dashboardBottomBar');
   var isWorkerBar = isQueuedWorkerActionSurfacePage();
   var isHistory = isCoordinatorHistoryPage();
   if (dashboardView) dashboardView.hidden = isWorkerBar || isHistory;
   if (workerBarView) workerBarView.hidden = !isWorkerBar;
   if (historyView) historyView.hidden = !isHistory;
+  // Only the plain dashboard gets the footer bar -- the worker window has
+  // its own equivalent (.worker-bar) and History is just a short list.
+  if (dashboardBottomBar) dashboardBottomBar.hidden = isWorkerBar || isHistory;
 }
 function initHistoryPage() {
   return _initHistoryPage.apply(this, arguments);
@@ -2907,6 +2951,7 @@ function _initHistoryPage() {
     return _regeneratorRuntime().wrap(function _callee5$(_context5) {
       while (1) switch (_context5.prev = _context5.next) {
         case 0:
+          document.title = 'History';
           (_document$getElementB = document.getElementById('clearHistoryButton')) === null || _document$getElementB === void 0 || _document$getElementB.addEventListener('click', function () {
             void clearHistory();
           });
@@ -2921,9 +2966,9 @@ function _initHistoryPage() {
           // live refresh avoids broad storage change delivery"). This page only
           // ever changes via its own Clear button, which already re-renders
           // itself, so a one-time load on open is enough.
-          _context5.next = 5;
+          _context5.next = 6;
           return renderHistoryList();
-        case 5:
+        case 6:
         case "end":
           return _context5.stop();
       }
@@ -2992,7 +3037,7 @@ function init() {
 }
 function _init() {
   _init = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee7() {
-    var _document$getElementB9, _document$getElementB10, _document$getElementB11, _document$getElementB12, _document$getElementB13, _document$getElementB14, _document$getElementB15, _document$getElementB16, _document$getElementB17, _document$getElementB18, _document$getElementB19, _document$getElementB20, _document$getElementB21, _document$getElementB22;
+    var _document$getElementB9, _document$getElementB10, _document$getElementB11, _document$getElementB12, _document$getElementB13, _document$getElementB14, _document$getElementB15, _document$getElementB16, _document$getElementB17, _document$getElementB18, _document$getElementB19, _document$getElementB20, _document$getElementB21, _document$getElementB22, _document$getElementB23, _document$getElementB24, _document$getElementB25, _document$getElementB26;
     var manifest, ready;
     return _regeneratorRuntime().wrap(function _callee7$(_context7) {
       while (1) switch (_context7.prev = _context7.next) {
@@ -3018,46 +3063,58 @@ function _init() {
         case 9:
           manifest = browser.runtime.getManifest();
           document.getElementById('appVersion').textContent = "v".concat(manifest.version);
-          (_document$getElementB9 = document.getElementById('clearEventsButton')) === null || _document$getElementB9 === void 0 || _document$getElementB9.addEventListener('click', function () {
+          (_document$getElementB9 = document.getElementById('dashboardBottomBarLogo')) === null || _document$getElementB9 === void 0 || _document$getElementB9.addEventListener('click', function () {
+            void openDashboardFromBottomBar();
+          });
+          (_document$getElementB10 = document.getElementById('clearEventsButton')) === null || _document$getElementB10 === void 0 || _document$getElementB10.addEventListener('click', function () {
             void clearEvents();
           });
-          (_document$getElementB10 = document.getElementById('clearCompletedRunsButton')) === null || _document$getElementB10 === void 0 || _document$getElementB10.addEventListener('click', function () {
+          (_document$getElementB11 = document.getElementById('clearCompletedRunsButton')) === null || _document$getElementB11 === void 0 || _document$getElementB11.addEventListener('click', function () {
             void clearCompletedRuns();
           });
-          (_document$getElementB11 = document.getElementById('clearOutliersButton')) === null || _document$getElementB11 === void 0 || _document$getElementB11.addEventListener('click', function () {
+          (_document$getElementB12 = document.getElementById('clearOutliersButton')) === null || _document$getElementB12 === void 0 || _document$getElementB12.addEventListener('click', function () {
             clearOutliers();
           });
-          (_document$getElementB12 = document.getElementById('clearScanCostButton')) === null || _document$getElementB12 === void 0 || _document$getElementB12.addEventListener('click', function () {
+          (_document$getElementB13 = document.getElementById('clearScanCostButton')) === null || _document$getElementB13 === void 0 || _document$getElementB13.addEventListener('click', function () {
             void resetMetrics();
           });
-          (_document$getElementB13 = document.getElementById('clearEventHistogramButton')) === null || _document$getElementB13 === void 0 || _document$getElementB13.addEventListener('click', function () {
+          (_document$getElementB14 = document.getElementById('clearAuthorityLoadHistogramButton')) === null || _document$getElementB14 === void 0 || _document$getElementB14.addEventListener('click', function () {
+            void resetMetrics();
+          });
+          (_document$getElementB15 = document.getElementById('resetPhaseTimingButton')) === null || _document$getElementB15 === void 0 || _document$getElementB15.addEventListener('click', function () {
+            void resetMetrics();
+          });
+          (_document$getElementB16 = document.getElementById('clearEventHistogramButton')) === null || _document$getElementB16 === void 0 || _document$getElementB16.addEventListener('click', function () {
             clearEventHistogram();
           });
-          (_document$getElementB14 = document.getElementById('resetMetricsButton')) === null || _document$getElementB14 === void 0 || _document$getElementB14.addEventListener('click', function () {
+          (_document$getElementB17 = document.getElementById('resetMetricsButton')) === null || _document$getElementB17 === void 0 || _document$getElementB17.addEventListener('click', function () {
             void resetMetrics();
           });
-          (_document$getElementB15 = document.getElementById('retryFailedButton')) === null || _document$getElementB15 === void 0 || _document$getElementB15.addEventListener('click', function () {
+          (_document$getElementB18 = document.getElementById('clearAllStatsButton')) === null || _document$getElementB18 === void 0 || _document$getElementB18.addEventListener('click', function () {
+            void clearAllStats();
+          });
+          (_document$getElementB19 = document.getElementById('retryFailedButton')) === null || _document$getElementB19 === void 0 || _document$getElementB19.addEventListener('click', function () {
             void toggleRetryFailed();
           });
-          (_document$getElementB16 = document.getElementById('requeueFailedButton')) === null || _document$getElementB16 === void 0 || _document$getElementB16.addEventListener('click', function () {
+          (_document$getElementB20 = document.getElementById('requeueFailedButton')) === null || _document$getElementB20 === void 0 || _document$getElementB20.addEventListener('click', function () {
             void requeueFailed();
           });
-          (_document$getElementB17 = document.getElementById('pauseCurrentWorkButton')) === null || _document$getElementB17 === void 0 || _document$getElementB17.addEventListener('click', function () {
+          (_document$getElementB21 = document.getElementById('pauseCurrentWorkButton')) === null || _document$getElementB21 === void 0 || _document$getElementB21.addEventListener('click', function () {
             void toggleCurrentWorkPause();
           });
-          (_document$getElementB18 = document.getElementById('cancelCurrentWorkButton')) === null || _document$getElementB18 === void 0 || _document$getElementB18.addEventListener('click', function () {
+          (_document$getElementB22 = document.getElementById('cancelCurrentWorkButton')) === null || _document$getElementB22 === void 0 || _document$getElementB22.addEventListener('click', function () {
             void cancelCurrentWork();
           });
-          (_document$getElementB19 = document.getElementById('clearCurrentWorkButton')) === null || _document$getElementB19 === void 0 || _document$getElementB19.addEventListener('click', function () {
+          (_document$getElementB23 = document.getElementById('clearCurrentWorkButton')) === null || _document$getElementB23 === void 0 || _document$getElementB23.addEventListener('click', function () {
             void clearCurrentWork();
           });
-          (_document$getElementB20 = document.getElementById('startCoordinatorButton')) === null || _document$getElementB20 === void 0 || _document$getElementB20.addEventListener('click', function () {
+          (_document$getElementB24 = document.getElementById('startCoordinatorButton')) === null || _document$getElementB24 === void 0 || _document$getElementB24.addEventListener('click', function () {
             void startCoordinatorQueue();
           });
-          (_document$getElementB21 = document.getElementById('openPreferencesButton')) === null || _document$getElementB21 === void 0 || _document$getElementB21.addEventListener('click', function () {
+          (_document$getElementB25 = document.getElementById('openPreferencesButton')) === null || _document$getElementB25 === void 0 || _document$getElementB25.addEventListener('click', function () {
             void openPreferences();
           });
-          (_document$getElementB22 = document.getElementById('openHistoryButton')) === null || _document$getElementB22 === void 0 || _document$getElementB22.addEventListener('click', function () {
+          (_document$getElementB26 = document.getElementById('openHistoryButton')) === null || _document$getElementB26 === void 0 || _document$getElementB26.addEventListener('click', function () {
             void openCoordinatorViewFromHere('open-coordinator-history');
           });
           installPanelToggleListeners();
@@ -3066,24 +3123,24 @@ function _init() {
           installDevModeToggle();
           installCompactStorageRefreshPolling();
           render();
-          _context7.next = 33;
+          _context7.next = 37;
           return announceCoordinatorPageReady();
-        case 33:
+        case 37:
           ready = _context7.sent;
           setQuoraVisitRequirement(!ready || !!(ready !== null && ready !== void 0 && ready.requiresQuoraVisit));
-          _context7.prev = 35;
-          _context7.next = 38;
+          _context7.prev = 39;
+          _context7.next = 42;
           return loadState();
-        case 38:
+        case 42:
           captureQuoraActivationMetricBaseline();
           state.loadError = '';
-          _context7.next = 45;
+          _context7.next = 49;
           break;
-        case 42:
-          _context7.prev = 42;
-          _context7.t0 = _context7["catch"](35);
+        case 46:
+          _context7.prev = 46;
+          _context7.t0 = _context7["catch"](39);
           state.loadError = (_context7.t0 === null || _context7.t0 === void 0 ? void 0 : _context7.t0.message) || "".concat(_context7.t0 || '') || 'Dashboard storage load failed';
-        case 45:
+        case 49:
           state.loading = false;
           if (retryFailedActive && !retryFailedLastResult) {
             retryFailedLastResult = {
@@ -3091,11 +3148,11 @@ function _init() {
             };
           }
           render();
-        case 48:
+        case 52:
         case "end":
           return _context7.stop();
       }
-    }, _callee7, null, [[35, 42]]);
+    }, _callee7, null, [[39, 46]]);
   }));
   return _init.apply(this, arguments);
 }
@@ -3138,7 +3195,7 @@ function _registerQueuedWorkerActionSurfacePage() {
           return _context8.abrupt("return", false);
         case 2:
           if (((_browser$storage = browser.storage) === null || _browser$storage === void 0 || (_browser$storage = _browser$storage.session) === null || _browser$storage === void 0 ? void 0 : _browser$storage.set) !== undefined) {
-            document.title = 'Mute Block Worker';
+            document.title = 'Progress';
           }
           _context8.next = 5;
           return (_browser$tabs = browser.tabs) === null || _browser$tabs === void 0 || (_browser$tabs$getCurr = _browser$tabs.getCurrent) === null || _browser$tabs$getCurr === void 0 ? void 0 : _browser$tabs$getCurr.call(_browser$tabs)["catch"](function () {
@@ -3223,11 +3280,87 @@ function stopCompactStorageRefreshPolling() {
     dashboardCompactRefreshScheduledTimer = null;
   }
 }
+
+// 2026-09-30: this used to treat the broadcast as a bare "something
+// changed, go re-read storage" signal -- which meant every push triggered a
+// full loadState() (an 8-key browser.storage.local.get plus a
+// refresh-coordinator-runs-view round trip) just to learn a value the
+// service worker already had in hand at the moment it sent the message
+// (see notifyCoordinatorDashboardStateChanged's own comment). Applying
+// message.state directly here, when present, updates the counts the
+// worker bar/dashboard-bottom-bar/summary tiles read (getQueueStatusCount,
+// getQueueTotalCount, getQueueTerminalCount all prefer state.queueCounts/
+// state.queueTotal once hasCoordinatorQueueView() is true) without any
+// storage round trip at all. Deliberately NOT touched here: state.queue
+// (the Current Work row list) -- this per-write view is the cheap,
+// unmerged one built straight from the live authority queue, missing
+// rows that already archived out from a *previous* transition, and
+// applyCoordinatorQueueView would overwrite the row list with that
+// incomplete set. The counts/total themselves are guarded by the
+// isRegression check below instead: a hot-path mutation's own unmerged
+// rebuild can under-report relative to what this page already has on
+// screen (missing rows that already archived out in a *previous*
+// transition), so a pushed value is only applied when it doesn't regress
+// below what's already displayed. The periodic compact-storage poll below still runs
+// as a slower-cadence correctness net that also refreshes the row list,
+// runs, and metrics -- this is a fast path layered on top of it, not a
+// replacement for it.
+function sumTerminalQueueCounts() {
+  var counts = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+  return Object.entries(counts || {}).filter(function (_ref) {
+    var _ref2 = _slicedToArray(_ref, 1),
+      status = _ref2[0];
+    return isTerminalQueueStatus(status);
+  }).reduce(function (total, _ref3) {
+    var _ref4 = _slicedToArray(_ref3, 2),
+      count = _ref4[1];
+    return total + (Number.parseInt(count, 10) || 0);
+  }, 0);
+}
+function applyCoordinatorDashboardStateFromMessage() {
+  var incomingState = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+  var applied = false;
+  if (Object.prototype.hasOwnProperty.call(incomingState, COORDINATOR_QUEUE_VIEW_KEY)) {
+    var view = incomingState[COORDINATOR_QUEUE_VIEW_KEY];
+    // 2026-10-01: mbCoordinatorQueueView is never persisted to disk (see
+    // refreshCoordinatorQueueViewForDashboard's own comment in sw.js) --
+    // every hot-path mutation broadcasts its own unmerged rebuild (built
+    // straight from the live authority queue, no completed-rows merge),
+    // which can be a dramatic undercount for a batch that's already
+    // archived hundreds of rows into the completed-work log -- confirmed
+    // live (jumped 419/676 -> 10/290 -> back, before this guard existed).
+    // Never let a pushed total or terminal count regress below what this
+    // page already has on screen. A real decrease (cancel/clear) goes
+    // through its own explicit loadState()+render() after the action
+    // completes, not through this push path, so this guard can't block
+    // it.
+    var incomingTotal = Number.parseInt(view === null || view === void 0 ? void 0 : view.total, 10) || 0;
+    var incomingTerminal = sumTerminalQueueCounts(view === null || view === void 0 ? void 0 : view.counts);
+    var currentTerminal = sumTerminalQueueCounts(state.queueCounts);
+    var isRegression = hasCoordinatorQueueView() && (incomingTotal < state.queueTotal || incomingTerminal < currentTerminal);
+    if (hasCoordinatorQueueView() && view && _typeof(view) === 'object' && !isRegression) {
+      state.queueCounts = normalizeObject(view.counts);
+      state.queueTotal = incomingTotal || state.queueTotal;
+      applied = true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(incomingState, COORDINATOR_PAUSED_KEY)) {
+    state.paused = incomingState[COORDINATOR_PAUSED_KEY] === true;
+    applied = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(incomingState, COORDINATOR_RETRY_FAILED_ENABLED_KEY)) {
+    retryFailedActive = incomingState[COORDINATOR_RETRY_FAILED_ENABLED_KEY] === true;
+    applied = true;
+  }
+  if (applied) render();
+  return applied;
+}
 function installDashboardRuntimeRefreshListener() {
   var _browser$runtime;
   if (!((_browser$runtime = browser.runtime) !== null && _browser$runtime !== void 0 && (_browser$runtime = _browser$runtime.onMessage) !== null && _browser$runtime !== void 0 && _browser$runtime.addListener)) return;
   browser.runtime.onMessage.addListener(function (message) {
     if ("".concat((message === null || message === void 0 ? void 0 : message.action) || '') !== 'coordinator-dashboard-state-changed') return;
+    if (applyCoordinatorDashboardStateFromMessage((message === null || message === void 0 ? void 0 : message.state) || {})) return;
     scheduleDashboardCompactRefresh(DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS);
   });
 }
@@ -3538,41 +3671,110 @@ function _resetMetrics() {
   }));
   return _resetMetrics.apply(this, arguments);
 }
+function clearCoordinatorTerminalStats() {
+  return _clearCoordinatorTerminalStats.apply(this, arguments);
+} // One button for the dev-mode panels' individually-scattered clear buttons
+// (Metrics, Scan cost, Authority state reads, Recent event counts,
+// Outliers) plus the Current Work summary row's Terminal/Events tiles --
+// resetMetrics covers the first three (all backed by the same
+// queue-wakeup-metrics storage), clearEventHistogram/clearOutliers are
+// tab-local only, clearCoordinatorTerminalStats stamps the dashboard-side
+// cutoff Terminal reads against (see COORDINATOR_STATS_CLEARED_AT_KEY in
+// sw.js -- nothing is deleted, queued/active rows are never affected), and
+// clearEvents wipes the durable mbCoordinatorEvents log itself, not just its
+// display, so "Clear All Stats" is an unambiguous zeroing of everything
+// shown in that row.
+function _clearCoordinatorTerminalStats() {
+  _clearCoordinatorTerminalStats = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee15() {
+    return _regeneratorRuntime().wrap(function _callee15$(_context15) {
+      while (1) switch (_context15.prev = _context15.next) {
+        case 0:
+          _context15.prev = 0;
+          _context15.next = 3;
+          return sendRuntimeMessageWithTimeout({
+            action: 'clear-coordinator-terminal-stats'
+          }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS);
+        case 3:
+          _context15.next = 8;
+          break;
+        case 5:
+          _context15.prev = 5;
+          _context15.t0 = _context15["catch"](0);
+          console.warn('Failed to clear terminal stats', _context15.t0);
+        case 8:
+        case "end":
+          return _context15.stop();
+      }
+    }, _callee15, null, [[0, 5]]);
+  }));
+  return _clearCoordinatorTerminalStats.apply(this, arguments);
+}
+function clearAllStats() {
+  return _clearAllStats.apply(this, arguments);
+}
+function _clearAllStats() {
+  _clearAllStats = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee16() {
+    return _regeneratorRuntime().wrap(function _callee16$(_context16) {
+      while (1) switch (_context16.prev = _context16.next) {
+        case 0:
+          _context16.next = 2;
+          return resetMetrics();
+        case 2:
+          _context16.next = 4;
+          return clearCoordinatorTerminalStats();
+        case 4:
+          clearEventHistogram();
+          clearOutliers();
+          _context16.next = 8;
+          return clearEvents();
+        case 8:
+          _context16.next = 10;
+          return loadState();
+        case 10:
+          render();
+        case 11:
+        case "end":
+          return _context16.stop();
+      }
+    }, _callee16);
+  }));
+  return _clearAllStats.apply(this, arguments);
+}
 function loadState() {
   return _loadState.apply(this, arguments);
 }
 function _loadState() {
-  _loadState = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee15() {
+  _loadState = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee17() {
     var stored;
-    return _regeneratorRuntime().wrap(function _callee15$(_context15) {
-      while (1) switch (_context15.prev = _context15.next) {
+    return _regeneratorRuntime().wrap(function _callee17$(_context17) {
+      while (1) switch (_context17.prev = _context17.next) {
         case 0:
-          _context15.next = 2;
+          _context17.next = 2;
           return browser.storage.local.get(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty(_defineProperty({}, COORDINATOR_RUNS_KEY, {}), COORDINATOR_EVENTS_KEY, []), QUEUE_WAKEUP_METRICS_VIEW_KEY, {}), SPACE_REGISTRY_KEY, {}), HIDDEN_RUNS_KEY, []), COORDINATOR_RETRY_FAILED_ENABLED_KEY, false), COORDINATOR_PAUSED_KEY, false), LAST_ENQUEUE_SUMMARY_KEY, null));
         case 2:
-          stored = _context15.sent;
-          _context15.next = 5;
+          stored = _context17.sent;
+          _context17.next = 5;
           return refreshCompactQueueView();
         case 5:
-          _context15.next = 7;
+          _context17.next = 7;
           return refreshCompactRunsView();
         case 7:
-          if (_context15.sent) {
-            _context15.next = 9;
+          if (_context17.sent) {
+            _context17.next = 9;
             break;
           }
           state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY]);
         case 9:
           state.events = normalizeEvents(stored[COORDINATOR_EVENTS_KEY]);
           if (!hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
-            _context15.next = 14;
+            _context17.next = 14;
             break;
           }
           state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY]);
-          _context15.next = 16;
+          _context17.next = 16;
           break;
         case 14:
-          _context15.next = 16;
+          _context17.next = 16;
           return refreshCompactMetricsView();
         case 16:
           state.spaceRegistry = normalizeObject(stored[SPACE_REGISTRY_KEY]);
@@ -3582,9 +3784,9 @@ function _loadState() {
           state.lastEnqueueSummary = stored[LAST_ENQUEUE_SUMMARY_KEY] || null;
         case 21:
         case "end":
-          return _context15.stop();
+          return _context17.stop();
       }
-    }, _callee15);
+    }, _callee17);
   }));
   return _loadState.apply(this, arguments);
 }
@@ -3592,36 +3794,28 @@ function refreshCompactQueueView() {
   return _refreshCompactQueueView.apply(this, arguments);
 }
 function _refreshCompactQueueView() {
-  _refreshCompactQueueView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee16() {
-    var result, stored;
-    return _regeneratorRuntime().wrap(function _callee16$(_context16) {
-      while (1) switch (_context16.prev = _context16.next) {
+  _refreshCompactQueueView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee18() {
+    var result;
+    return _regeneratorRuntime().wrap(function _callee18$(_context18) {
+      while (1) switch (_context18.prev = _context18.next) {
         case 0:
-          _context16.next = 2;
+          _context18.next = 2;
           return sendRuntimeMessageWithTimeout({
             action: 'refresh-coordinator-queue-view',
             reason: 'dashboard-load-missing-view'
           }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS);
         case 2:
-          result = _context16.sent;
+          result = _context18.sent;
           if (!hasCoordinatorQueueView(result === null || result === void 0 ? void 0 : result.view)) {
-            _context16.next = 6;
+            _context18.next = 6;
             break;
           }
           applyCoordinatorQueueView(result.view);
-          return _context16.abrupt("return", true);
+          return _context18.abrupt("return", true);
         case 6:
-          _context16.next = 8;
-          return browser.storage.local.get(_defineProperty({}, COORDINATOR_QUEUE_VIEW_KEY, {}));
-        case 8:
-          stored = _context16.sent;
-          if (!hasCoordinatorQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY])) {
-            _context16.next = 12;
-            break;
-          }
-          applyCoordinatorQueueView(stored[COORDINATOR_QUEUE_VIEW_KEY]);
-          return _context16.abrupt("return", true);
-        case 12:
+          // mbCoordinatorQueueView is no longer persisted to disk (see sw.js's
+          // refreshCoordinatorQueueViewForDashboard) -- there's no storage fallback
+          // to read if the message above timed out or came back empty.
           applyCoordinatorQueueView({
             version: 1,
             updatedAt: Date.now(),
@@ -3631,12 +3825,12 @@ function _refreshCompactQueueView() {
             truncated: false,
             items: []
           });
-          return _context16.abrupt("return", false);
-        case 14:
+          return _context18.abrupt("return", false);
+        case 8:
         case "end":
-          return _context16.stop();
+          return _context18.stop();
       }
-    }, _callee16);
+    }, _callee18);
   }));
   return _refreshCompactQueueView.apply(this, arguments);
 }
@@ -3644,31 +3838,31 @@ function refreshCompactRunsView() {
   return _refreshCompactRunsView.apply(this, arguments);
 }
 function _refreshCompactRunsView() {
-  _refreshCompactRunsView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee17() {
+  _refreshCompactRunsView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee19() {
     var result;
-    return _regeneratorRuntime().wrap(function _callee17$(_context17) {
-      while (1) switch (_context17.prev = _context17.next) {
+    return _regeneratorRuntime().wrap(function _callee19$(_context19) {
+      while (1) switch (_context19.prev = _context19.next) {
         case 0:
-          _context17.next = 2;
+          _context19.next = 2;
           return sendRuntimeMessageWithTimeout({
             action: 'refresh-coordinator-runs-view',
             reason: 'dashboard-load'
           }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS);
         case 2:
-          result = _context17.sent;
+          result = _context19.sent;
           if (!(result !== null && result !== void 0 && result.runs && _typeof(result.runs) === 'object' && !Array.isArray(result.runs))) {
-            _context17.next = 6;
+            _context19.next = 6;
             break;
           }
           state.runs = result.runs;
-          return _context17.abrupt("return", true);
+          return _context19.abrupt("return", true);
         case 6:
-          return _context17.abrupt("return", false);
+          return _context19.abrupt("return", false);
         case 7:
         case "end":
-          return _context17.stop();
+          return _context19.stop();
       }
-    }, _callee17);
+    }, _callee19);
   }));
   return _refreshCompactRunsView.apply(this, arguments);
 }
@@ -3680,43 +3874,43 @@ function refreshCompactMetricsView() {
   return _refreshCompactMetricsView.apply(this, arguments);
 }
 function _refreshCompactMetricsView() {
-  _refreshCompactMetricsView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee18() {
+  _refreshCompactMetricsView = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee20() {
     var result, stored;
-    return _regeneratorRuntime().wrap(function _callee18$(_context18) {
-      while (1) switch (_context18.prev = _context18.next) {
+    return _regeneratorRuntime().wrap(function _callee20$(_context20) {
+      while (1) switch (_context20.prev = _context20.next) {
         case 0:
-          _context18.next = 2;
+          _context20.next = 2;
           return sendRuntimeMessageWithTimeout({
             action: 'refresh-queue-wakeup-metrics-view',
             reason: 'dashboard-load-missing-view'
           }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS);
         case 2:
-          result = _context18.sent;
+          result = _context20.sent;
           if (!hasQueueWakeupMetricsView(result === null || result === void 0 ? void 0 : result.view)) {
-            _context18.next = 6;
+            _context20.next = 6;
             break;
           }
           state.metrics = normalizeMetrics(result.view);
-          return _context18.abrupt("return", true);
+          return _context20.abrupt("return", true);
         case 6:
-          _context18.next = 8;
+          _context20.next = 8;
           return browser.storage.local.get(_defineProperty({}, QUEUE_WAKEUP_METRICS_VIEW_KEY, {}));
         case 8:
-          stored = _context18.sent;
+          stored = _context20.sent;
           if (!hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
-            _context18.next = 12;
+            _context20.next = 12;
             break;
           }
           state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY]);
-          return _context18.abrupt("return", true);
+          return _context20.abrupt("return", true);
         case 12:
           state.metrics = normalizeMetrics({});
-          return _context18.abrupt("return", false);
+          return _context20.abrupt("return", false);
         case 14:
         case "end":
-          return _context18.stop();
+          return _context20.stop();
       }
-    }, _callee18);
+    }, _callee20);
   }));
   return _refreshCompactMetricsView.apply(this, arguments);
 }
@@ -3814,13 +4008,13 @@ function getQueueStatusCount() {
 function getQueueTerminalCount() {
   var queueItems = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : [];
   if (hasCoordinatorQueueView()) {
-    return Object.entries(state.queueCounts || {}).filter(function (_ref) {
-      var _ref2 = _slicedToArray(_ref, 1),
-        status = _ref2[0];
+    return Object.entries(state.queueCounts || {}).filter(function (_ref5) {
+      var _ref6 = _slicedToArray(_ref5, 1),
+        status = _ref6[0];
       return isTerminalQueueStatus(status);
-    }).reduce(function (total, _ref3) {
-      var _ref4 = _slicedToArray(_ref3, 2),
-        count = _ref4[1];
+    }).reduce(function (total, _ref7) {
+      var _ref8 = _slicedToArray(_ref7, 2),
+        count = _ref8[1];
       return total + (Number(count) || 0);
     }, 0);
   }
@@ -3854,6 +4048,51 @@ function renderWorkerBar() {
     var pendingCount = getPendingCurrentWorkItems().length;
     cancelButton.disabled = pendingCount <= 0;
   }
+}
+
+// The plain dashboard's own footer strip -- same handled-vs-total fill as
+// renderWorkerBar, but for the real control-panel page itself rather than
+// the worker window. `queueItems` is threaded through so this stays in sync
+// with whatever render() just computed for the summary tiles, instead of
+// re-deriving it from state on its own.
+function renderDashboardBottomBar() {
+  var queueItems = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : [];
+  var total = getQueueTotalCount(queueItems);
+  var terminal = getQueueTerminalCount(queueItems);
+  var fill = document.getElementById('dashboardBottomBarFill');
+  var count = document.getElementById('dashboardBottomBarCount');
+  if (fill) fill.style.width = "".concat(total > 0 ? Math.min(100, Math.round(terminal / total * 100)) : 0, "%");
+  if (count) count.textContent = "".concat(terminal, " / ").concat(total);
+}
+
+// The bottom-bar logo is a "jump to the real dashboard" shortcut, meant to
+// work the same way wherever this bar ends up rendering -- a deliberate
+// no-op when the page showing it is already the plain dashboard (currently
+// the only place it renders, but the guard is what the button is supposed
+// to mean regardless of where it's embedded).
+function openDashboardFromBottomBar() {
+  return _openDashboardFromBottomBar.apply(this, arguments);
+}
+function _openDashboardFromBottomBar() {
+  _openDashboardFromBottomBar = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee21() {
+    return _regeneratorRuntime().wrap(function _callee21$(_context21) {
+      while (1) switch (_context21.prev = _context21.next) {
+        case 0:
+          if (!(!isQueuedWorkerActionSurfacePage() && !isCoordinatorHistoryPage())) {
+            _context21.next = 2;
+            break;
+          }
+          return _context21.abrupt("return");
+        case 2:
+          _context21.next = 4;
+          return openCoordinatorViewFromHere('open-coordinator');
+        case 4:
+        case "end":
+          return _context21.stop();
+      }
+    }, _callee21);
+  }));
+  return _openDashboardFromBottomBar.apply(this, arguments);
 }
 function getBlockOutcomeCounts() {
   var metricsDocument = state.metrics || {};
@@ -3948,10 +4187,13 @@ function render() {
   renderEvents();
   renderWakeupMetrics(queueItems);
   renderScanCostHistogram();
+  renderAuthorityLoadHistogram();
   renderEventHistogram();
+  renderPhaseTimingHistogram();
   renderQueue(queueItems);
   checkCoordinatorOutliers(queueItems);
   renderOutliers();
+  renderDashboardBottomBar(queueItems);
   syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount);
   syncRequeueFailedControls(failedCount + canceledCount);
   syncCurrentWorkPauseControls(queueItems);
@@ -4026,20 +4268,20 @@ function clearEvents() {
   return _clearEvents.apply(this, arguments);
 }
 function _clearEvents() {
-  _clearEvents = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee19() {
-    return _regeneratorRuntime().wrap(function _callee19$(_context19) {
-      while (1) switch (_context19.prev = _context19.next) {
+  _clearEvents = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee22() {
+    return _regeneratorRuntime().wrap(function _callee22$(_context22) {
+      while (1) switch (_context22.prev = _context22.next) {
         case 0:
-          _context19.next = 2;
+          _context22.next = 2;
           return browser.storage.local.set(_defineProperty({}, COORDINATOR_EVENTS_KEY, []));
         case 2:
           state.events = [];
           render();
         case 4:
         case "end":
-          return _context19.stop();
+          return _context22.stop();
       }
-    }, _callee19);
+    }, _callee22);
   }));
   return _clearEvents.apply(this, arguments);
 }
@@ -4047,10 +4289,10 @@ function clearCompletedRuns() {
   return _clearCompletedRuns.apply(this, arguments);
 }
 function _clearCompletedRuns() {
-  _clearCompletedRuns = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee20() {
+  _clearCompletedRuns = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee23() {
     var runItems, nextHiddenRunIds, _iterator8, _step8, run, runId;
-    return _regeneratorRuntime().wrap(function _callee20$(_context20) {
-      while (1) switch (_context20.prev = _context20.next) {
+    return _regeneratorRuntime().wrap(function _callee23$(_context23) {
+      while (1) switch (_context23.prev = _context23.next) {
         case 0:
           runItems = getDisplayRuns(getDisplayQueueItems(), {
             includeHidden: true
@@ -4071,15 +4313,15 @@ function _clearCompletedRuns() {
             _iterator8.f();
           }
           state.hiddenRunIds = Array.from(nextHiddenRunIds);
-          _context20.next = 7;
+          _context23.next = 7;
           return browser.storage.local.set(_defineProperty({}, HIDDEN_RUNS_KEY, state.hiddenRunIds));
         case 7:
           render();
         case 8:
         case "end":
-          return _context20.stop();
+          return _context23.stop();
       }
-    }, _callee20);
+    }, _callee23);
   }));
   return _clearCompletedRuns.apply(this, arguments);
 }
@@ -4174,11 +4416,11 @@ function syncStartCoordinatorControls() {
   button.title = state.requiresQuoraVisit ? 'Start Current Work without waiting for a Quora page' : 'Quora runtime is available';
 }
 function getRetryFailedWorkWaitText() {
-  var _ref5 = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
-    _ref5$hasPendingWork = _ref5.hasPendingWork,
-    hasPendingWork = _ref5$hasPendingWork === void 0 ? false : _ref5$hasPendingWork,
-    _ref5$hasActiveWork = _ref5.hasActiveWork,
-    hasActiveWork = _ref5$hasActiveWork === void 0 ? false : _ref5$hasActiveWork;
+  var _ref9 = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
+    _ref9$hasPendingWork = _ref9.hasPendingWork,
+    hasPendingWork = _ref9$hasPendingWork === void 0 ? false : _ref9$hasPendingWork,
+    _ref9$hasActiveWork = _ref9.hasActiveWork,
+    hasActiveWork = _ref9$hasActiveWork === void 0 ? false : _ref9$hasActiveWork;
   if (!hasPendingWork) return '';
   if (state.requiresQuoraVisit) return 'waiting for first Quora page';
   if (hasActiveWork) return 'waiting for current work to idle';
@@ -4195,22 +4437,22 @@ function requeueFailed() {
   return _requeueFailed.apply(this, arguments);
 }
 function _requeueFailed() {
-  _requeueFailed = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee21() {
+  _requeueFailed = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee24() {
     var items, requeueableCount, button, result;
-    return _regeneratorRuntime().wrap(function _callee21$(_context21) {
-      while (1) switch (_context21.prev = _context21.next) {
+    return _regeneratorRuntime().wrap(function _callee24$(_context24) {
+      while (1) switch (_context24.prev = _context24.next) {
         case 0:
           items = getDisplayQueueItems();
           requeueableCount = getQueueStatusCount('failed', items) + getQueueStatusCount('canceled', items);
           if (!(requeueableCount <= 0)) {
-            _context21.next = 6;
+            _context24.next = 6;
             break;
           }
           retryFailedLastResult = {
             reason: 'no-failed-current-work'
           };
           render();
-          return _context21.abrupt("return");
+          return _context24.abrupt("return");
         case 6:
           button = document.getElementById('requeueFailedButton');
           if (button) button.disabled = true;
@@ -4218,7 +4460,7 @@ function _requeueFailed() {
             reason: 'requeueing-failed'
           };
           render();
-          _context21.next = 12;
+          _context24.next = 12;
           return sendRuntimeMessageWithTimeout({
             action: 'requeue-coordinator-failed'
           }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)["catch"](function (error) {
@@ -4227,19 +4469,19 @@ function _requeueFailed() {
             };
           });
         case 12:
-          result = _context21.sent;
+          result = _context24.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? 'requeue-failed' : "requeued-".concat(Number.parseInt(result === null || result === void 0 ? void 0 : result.selected, 10) || 0)
           };
-          _context21.next = 16;
+          _context24.next = 16;
           return loadState();
         case 16:
           render();
         case 17:
         case "end":
-          return _context21.stop();
+          return _context24.stop();
       }
-    }, _callee21);
+    }, _callee24);
   }));
   return _requeueFailed.apply(this, arguments);
 }
@@ -4247,22 +4489,22 @@ function cancelCurrentWorkItem() {
   return _cancelCurrentWorkItem.apply(this, arguments);
 }
 function _cancelCurrentWorkItem() {
-  _cancelCurrentWorkItem = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee22() {
+  _cancelCurrentWorkItem = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee25() {
     var _result$canceledUrls, _result$canceledWorkK;
     var item,
       storageKey,
       profileHref,
       result,
-      _args22 = arguments;
-    return _regeneratorRuntime().wrap(function _callee22$(_context22) {
-      while (1) switch (_context22.prev = _context22.next) {
+      _args25 = arguments;
+    return _regeneratorRuntime().wrap(function _callee25$(_context25) {
+      while (1) switch (_context25.prev = _context25.next) {
         case 0:
-          item = _args22.length > 0 && _args22[0] !== undefined ? _args22[0] : {};
+          item = _args25.length > 0 && _args25[0] !== undefined ? _args25[0] : {};
           if (isPendingQueueStatus("".concat((item === null || item === void 0 ? void 0 : item.status) || '').trim())) {
-            _context22.next = 3;
+            _context25.next = 3;
             break;
           }
-          return _context22.abrupt("return");
+          return _context25.abrupt("return");
         case 3:
           storageKey = "".concat(item.storageKey || '').trim();
           profileHref = getQueueItemHref('', item);
@@ -4270,7 +4512,7 @@ function _cancelCurrentWorkItem() {
             reason: 'canceling-one-current-work'
           };
           render();
-          _context22.next = 9;
+          _context25.next = 9;
           return sendRuntimeMessageWithTimeout({
             action: 'cancel-coordinator-current-work-item',
             storageKey: storageKey,
@@ -4284,19 +4526,19 @@ function _cancelCurrentWorkItem() {
             };
           });
         case 9:
-          result = _context22.sent;
+          result = _context25.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? 'cancel-one-current-work-failed' : "canceled-".concat((Number.parseInt(result === null || result === void 0 || (_result$canceledUrls = result.canceledUrls) === null || _result$canceledUrls === void 0 ? void 0 : _result$canceledUrls.length, 10) || 0) + (Number.parseInt(result === null || result === void 0 || (_result$canceledWorkK = result.canceledWorkKeys) === null || _result$canceledWorkK === void 0 ? void 0 : _result$canceledWorkK.length, 10) || 0))
           };
-          _context22.next = 13;
+          _context25.next = 13;
           return loadState();
         case 13:
           render();
         case 14:
         case "end":
-          return _context22.stop();
+          return _context25.stop();
       }
-    }, _callee22);
+    }, _callee25);
   }));
   return _cancelCurrentWorkItem.apply(this, arguments);
 }
@@ -4304,23 +4546,23 @@ function requeueFailedItem() {
   return _requeueFailedItem.apply(this, arguments);
 }
 function _requeueFailedItem() {
-  _requeueFailedItem = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee23() {
+  _requeueFailedItem = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee26() {
     var item,
       itemStatus,
       storageKey,
       profileHref,
       result,
-      _args23 = arguments;
-    return _regeneratorRuntime().wrap(function _callee23$(_context23) {
-      while (1) switch (_context23.prev = _context23.next) {
+      _args26 = arguments;
+    return _regeneratorRuntime().wrap(function _callee26$(_context26) {
+      while (1) switch (_context26.prev = _context26.next) {
         case 0:
-          item = _args23.length > 0 && _args23[0] !== undefined ? _args23[0] : {};
+          item = _args26.length > 0 && _args26[0] !== undefined ? _args26[0] : {};
           itemStatus = "".concat((item === null || item === void 0 ? void 0 : item.status) || '');
           if (!(itemStatus !== 'failed' && itemStatus !== 'canceled')) {
-            _context23.next = 4;
+            _context26.next = 4;
             break;
           }
-          return _context23.abrupt("return");
+          return _context26.abrupt("return");
         case 4:
           storageKey = "".concat(item.storageKey || '').trim();
           profileHref = getQueueItemHref('', item);
@@ -4328,7 +4570,7 @@ function _requeueFailedItem() {
             reason: 'requeueing-one-failed'
           };
           render();
-          _context23.next = 10;
+          _context26.next = 10;
           return sendRuntimeMessageWithTimeout({
             action: 'requeue-coordinator-failed',
             storageKey: storageKey,
@@ -4340,19 +4582,19 @@ function _requeueFailedItem() {
             };
           });
         case 10:
-          result = _context23.sent;
+          result = _context26.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? 'requeue-failed' : "requeued-".concat(Number.parseInt(result === null || result === void 0 ? void 0 : result.selected, 10) || 0)
           };
-          _context23.next = 14;
+          _context26.next = 14;
           return loadState();
         case 14:
           render();
         case 15:
         case "end":
-          return _context23.stop();
+          return _context26.stop();
       }
-    }, _callee23);
+    }, _callee26);
   }));
   return _requeueFailedItem.apply(this, arguments);
 }
@@ -4408,10 +4650,10 @@ function toggleCurrentWorkPause() {
   return _toggleCurrentWorkPause.apply(this, arguments);
 }
 function _toggleCurrentWorkPause() {
-  _toggleCurrentWorkPause = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee24() {
+  _toggleCurrentWorkPause = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee27() {
     var button, wasPaused, action, result;
-    return _regeneratorRuntime().wrap(function _callee24$(_context24) {
-      while (1) switch (_context24.prev = _context24.next) {
+    return _regeneratorRuntime().wrap(function _callee27$(_context27) {
+      while (1) switch (_context27.prev = _context27.next) {
         case 0:
           button = document.getElementById('pauseCurrentWorkButton');
           flashButton(button);
@@ -4419,7 +4661,7 @@ function _toggleCurrentWorkPause() {
           currentWorkPausePending = wasPaused ? 'resume' : 'pause';
           render();
           action = state.paused ? 'resume-paused-coordinator-nukes' : 'pause-coordinator-nukes';
-          _context24.next = 8;
+          _context27.next = 8;
           return sendRuntimeMessageWithTimeout({
             action: action
           }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)["catch"](function (error) {
@@ -4428,20 +4670,20 @@ function _toggleCurrentWorkPause() {
             };
           });
         case 8:
-          result = _context24.sent;
+          result = _context27.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? wasPaused ? 'resume-failed' : 'pause-failed' : wasPaused ? 'resumed-current-work' : 'paused-current-work'
           };
           currentWorkPausePending = '';
-          _context24.next = 13;
+          _context27.next = 13;
           return loadState();
         case 13:
           render();
         case 14:
         case "end":
-          return _context24.stop();
+          return _context27.stop();
       }
-    }, _callee24);
+    }, _callee27);
   }));
   return _toggleCurrentWorkPause.apply(this, arguments);
 }
@@ -4452,22 +4694,22 @@ function cancelCurrentWork() {
 // the service worker to remove every Current Work row entirely, live or
 // completed, so the list actually empties.
 function _cancelCurrentWork() {
-  _cancelCurrentWork = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee25() {
+  _cancelCurrentWork = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee28() {
     var _result$canceledUrls2, _result$canceledWorkK2;
     var pendingCount, button, result;
-    return _regeneratorRuntime().wrap(function _callee25$(_context25) {
-      while (1) switch (_context25.prev = _context25.next) {
+    return _regeneratorRuntime().wrap(function _callee28$(_context28) {
+      while (1) switch (_context28.prev = _context28.next) {
         case 0:
           pendingCount = getPendingCurrentWorkItems().length;
           if (!(pendingCount <= 0)) {
-            _context25.next = 5;
+            _context28.next = 5;
             break;
           }
           retryFailedLastResult = {
             reason: 'no-pending-current-work'
           };
           render();
-          return _context25.abrupt("return");
+          return _context28.abrupt("return");
         case 5:
           button = document.getElementById('cancelCurrentWorkButton');
           if (button) button.disabled = true;
@@ -4475,7 +4717,7 @@ function _cancelCurrentWork() {
             reason: 'canceling-current-work'
           };
           render();
-          _context25.next = 11;
+          _context28.next = 11;
           return sendRuntimeMessageWithTimeout({
             action: 'cancel-coordinator-current-work'
           }, {
@@ -4486,19 +4728,19 @@ function _cancelCurrentWork() {
             };
           });
         case 11:
-          result = _context25.sent;
+          result = _context28.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? 'cancel-current-work-failed' : "canceled-".concat((Number.parseInt(result === null || result === void 0 || (_result$canceledUrls2 = result.canceledUrls) === null || _result$canceledUrls2 === void 0 ? void 0 : _result$canceledUrls2.length, 10) || 0) + (Number.parseInt(result === null || result === void 0 || (_result$canceledWorkK2 = result.canceledWorkKeys) === null || _result$canceledWorkK2 === void 0 ? void 0 : _result$canceledWorkK2.length, 10) || 0))
           };
-          _context25.next = 15;
+          _context28.next = 15;
           return loadState();
         case 15:
           render();
         case 16:
         case "end":
-          return _context25.stop();
+          return _context28.stop();
       }
-    }, _callee25);
+    }, _callee28);
   }));
   return _cancelCurrentWork.apply(this, arguments);
 }
@@ -4506,22 +4748,22 @@ function clearCurrentWork() {
   return _clearCurrentWork.apply(this, arguments);
 }
 function _clearCurrentWork() {
-  _clearCurrentWork = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee26() {
+  _clearCurrentWork = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee29() {
     var _result$clearedUrls, _result$clearedWorkKe;
     var totalRowCount, button, result;
-    return _regeneratorRuntime().wrap(function _callee26$(_context26) {
-      while (1) switch (_context26.prev = _context26.next) {
+    return _regeneratorRuntime().wrap(function _callee29$(_context29) {
+      while (1) switch (_context29.prev = _context29.next) {
         case 0:
           totalRowCount = getDisplayQueueItems().length;
           if (!(totalRowCount <= 0)) {
-            _context26.next = 5;
+            _context29.next = 5;
             break;
           }
           retryFailedLastResult = {
             reason: 'no-current-work-to-clear'
           };
           render();
-          return _context26.abrupt("return");
+          return _context29.abrupt("return");
         case 5:
           button = document.getElementById('clearCurrentWorkButton');
           if (button) button.disabled = true;
@@ -4529,7 +4771,7 @@ function _clearCurrentWork() {
             reason: 'clearing-current-work'
           };
           render();
-          _context26.next = 11;
+          _context29.next = 11;
           return sendRuntimeMessageWithTimeout({
             action: 'clear-coordinator-current-work'
           }, {
@@ -4540,19 +4782,19 @@ function _clearCurrentWork() {
             };
           });
         case 11:
-          result = _context26.sent;
+          result = _context29.sent;
           retryFailedLastResult = {
             reason: result !== null && result !== void 0 && result.error ? 'clear-current-work-failed' : "cleared-".concat((Number.parseInt(result === null || result === void 0 || (_result$clearedUrls = result.clearedUrls) === null || _result$clearedUrls === void 0 ? void 0 : _result$clearedUrls.length, 10) || 0) + (Number.parseInt(result === null || result === void 0 || (_result$clearedWorkKe = result.clearedWorkKeys) === null || _result$clearedWorkKe === void 0 ? void 0 : _result$clearedWorkKe.length, 10) || 0))
           };
-          _context26.next = 15;
+          _context29.next = 15;
           return loadState();
         case 15:
           render();
         case 16:
         case "end":
-          return _context26.stop();
+          return _context29.stop();
       }
-    }, _callee26);
+    }, _callee29);
   }));
   return _clearCurrentWork.apply(this, arguments);
 }
@@ -4560,23 +4802,23 @@ function toggleRetryFailed() {
   return _toggleRetryFailed.apply(this, arguments);
 }
 function _toggleRetryFailed() {
-  _toggleRetryFailed = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee27() {
-    return _regeneratorRuntime().wrap(function _callee27$(_context27) {
-      while (1) switch (_context27.prev = _context27.next) {
+  _toggleRetryFailed = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee30() {
+    return _regeneratorRuntime().wrap(function _callee30$(_context30) {
+      while (1) switch (_context30.prev = _context30.next) {
         case 0:
           if (!retryFailedActive) {
-            _context27.next = 3;
+            _context30.next = 3;
             break;
           }
           stopRetryFailed('stopped');
-          return _context27.abrupt("return");
+          return _context30.abrupt("return");
         case 3:
           retryFailedActive = true;
           retryFailedLastResult = {
             reason: 'starting'
           };
           render();
-          _context27.next = 8;
+          _context30.next = 8;
           return browser.storage.local.set(_defineProperty({}, COORDINATOR_RETRY_FAILED_ENABLED_KEY, true));
         case 8:
           retryFailedLastResult = {
@@ -4585,17 +4827,17 @@ function _toggleRetryFailed() {
           render();
         case 10:
         case "end":
-          return _context27.stop();
+          return _context30.stop();
       }
-    }, _callee27);
+    }, _callee30);
   }));
   return _toggleRetryFailed.apply(this, arguments);
 }
 function stopRetryFailed() {
   var reason = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 'idle';
-  var _ref6 = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {},
-    _ref6$persist = _ref6.persist,
-    persist = _ref6$persist === void 0 ? true : _ref6$persist;
+  var _ref10 = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {},
+    _ref10$persist = _ref10.persist,
+    persist = _ref10$persist === void 0 ? true : _ref10$persist;
   retryFailedActive = false;
   retryFailedLastResult = {
     reason: reason
@@ -4606,10 +4848,10 @@ function stopRetryFailed() {
   }
 }
 function getDisplayQueueItems() {
-  return Object.entries(state.queue || {}).map(function (_ref7) {
-    var _ref8 = _slicedToArray(_ref7, 2),
-      key = _ref8[0],
-      item = _ref8[1];
+  return Object.entries(state.queue || {}).map(function (_ref11) {
+    var _ref12 = _slicedToArray(_ref11, 2),
+      key = _ref12[0],
+      item = _ref12[1];
     var source = item && _typeof(item) === 'object' ? item : {};
     return _objectSpread(_objectSpread({}, source), {}, {
       storageKey: key
@@ -5033,6 +5275,22 @@ function getCurrentQueueLoadThrottle() {
     until: until
   });
 }
+
+// The server's run status is a deliberately small 3-state rollup --
+// 'running'/'paused'/'empty' -- where 'empty' means "nothing left to do in
+// this run" regardless of whether that's because every item succeeded or
+// the run never had any items (see getCoordinatorRunStatus's own comment;
+// "Clear Completed" above relies on exactly that single value to find
+// everything it should hide). Showing that raw label on a 494-item run that
+// fully succeeded reads as if the run lost its items, not that it finished
+// -- this only affects the displayed badge text, not the underlying status
+// value anything else here keys off of.
+function getRunStatusLabel() {
+  var run = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+  var status = "".concat((run === null || run === void 0 ? void 0 : run.status) || '').trim() || 'unknown';
+  if (status !== 'empty') return status;
+  return (Number.parseInt(run === null || run === void 0 ? void 0 : run.itemCount, 10) || 0) > 0 ? 'done' : 'empty';
+}
 function renderRuns(runs) {
   var container = document.getElementById('runList');
   if (!container) return;
@@ -5048,7 +5306,7 @@ function renderRuns(runs) {
     row.append(buildTitleCell(runDisplay.title, runDisplay.subtitle, {
       titleHref: runDisplay.titleHref,
       title: runId
-    }), buildBadge(run.status || 'unknown'), buildTextCell("".concat(Number.parseInt(run.itemCount, 10) || 0, " items")), buildTextCell(submittedAt ? formatDateTime(submittedAt) : ''));
+    }), buildBadge(getRunStatusLabel(run)), buildTextCell("".concat(Number.parseInt(run.itemCount, 10) || 0, " items")), buildTextCell(submittedAt ? formatDateTime(submittedAt) : ''));
     return row;
   }), state.loading ? 'Loading history...' : 'No dashboard runs yet.');
 }
@@ -5121,7 +5379,11 @@ function renderWakeupMetrics() {
   var payloadQueueBytes = getMetricCounter(counters, 'storagePayload.write.queue.bytes');
   var payloadRunsBytes = getMetricCounter(counters, 'storagePayload.write.runs.bytes');
   var payloadProgressBytes = getMetricCounter(counters, 'storagePayload.write.progress.bytes');
+  var payloadQueueViewBytes = getMetricCounter(counters, 'storagePayload.write.queueView.bytes');
   var payloadMaxBytes = getMetricCounter(counters, 'storagePayload.write.total.maxBytes');
+  var queueViewWriteCalls = getMetricCounter(counters, 'storagePayload.write.queueView.latencyCalls');
+  var queueViewWriteLatencyMsSum = getMetricCounter(counters, 'storagePayload.write.queueView.latencyMsSum');
+  var queueViewWriteMaxLatencyMs = getMetricCounter(counters, 'storagePayload.write.queueView.maxLatencyMs');
   var readBytes = getMetricCounter(counters, 'storagePayload.read.total.bytes');
   var readCalls = getMetricCounter(counters, 'storagePayload.read.total.calls');
   var readQueueBytes = getMetricCounter(counters, 'storagePayload.read.queue.bytes');
@@ -5287,18 +5549,23 @@ function renderWakeupMetrics() {
       title: 'Physical chrome.storage.local writes to WAL segment keys (mbCoordinatorQueueWal.segment.*) -- the incremental append-side storage cost, separate from the logical "WAL writes" append count above. Concerning if the per-write size trends upward over a session; segments should stay small individually until a checkpoint switch folds them back down.'
     }), buildMetricCard('Checkpoint writes', "".concat(walCheckpointWrites), "".concat(formatBytes(walCheckpointBytes), " written; max ").concat(formatBytes(walCheckpointMaxBytes)), {
       title: 'Physical chrome.storage.local writes for a checkpoint switch (folding accumulated segments back into one snapshot) -- the actual byte cost of that fold, separate from the "WAL writes" card\'s checkpoint switch count. Concerning if this grows large enough to make Storage set latency spike during a switch, since a checkpoint write blocks the same serialized write queue as everything else.'
-    }), buildMetricCard('Queue view writes', "".concat(viewProjectionSaved), "".concat(viewProjectionFailed, " failure").concat(viewProjectionFailed === 1 ? '' : 's', " this epoch"), {
+    }), buildMetricCard('Queue view writes', "".concat(viewProjectionSaved), "".concat(formatBytes(payloadQueueViewBytes), " written; avg ").concat(queueViewWriteCalls ? formatDuration(queueViewWriteLatencyMsSum / queueViewWriteCalls) : '--', ", max ").concat(formatDuration(queueViewWriteMaxLatencyMs), "; ").concat(viewProjectionFailed, " failure").concat(viewProjectionFailed === 1 ? '' : 's', " this epoch"), {
       alert: viewProjectionFailed > 0,
-      title: 'The durable mbCoordinatorQueueView snapshot -- what the dashboard, popup, and CDP tools actually read -- is written by a separate storage.set from the WAL append it is supposed to mirror, and can fail independently under load. Any failure here means the view can show stale status (e.g. "queued") for a row the WAL already has as terminal, with only a best-effort reconcile as catch-up and no guaranteed deadline. Concerning if this is ever nonzero.'
+      // 2026-09-30: this write no longer blocks the WAL append or
+      // executor-apply call that asked for it -- it's fired
+      // off-critical-path and only its own completion is timed
+      // here, so "avg"/"max" reflect the write's own cost, not
+      // added latency on whatever triggered it.
+      title: 'The durable mbCoordinatorQueueView snapshot -- what the dashboard, worker bar, popup, and CDP tools actually read -- is written by a separate, non-blocking storage.set from the WAL append it mirrors, and can fail independently under load. Any failure here means the view can show stale status (e.g. "queued") for a row the WAL already has as terminal, with only a best-effort reconcile as catch-up and no guaranteed deadline. Concerning if failures are ever nonzero, or if avg/max latency climbs -- this write is not on any other operation\'s critical path, but it still competes for the same serialized storage queue.'
     }), buildMetricCard('Read payload avg', readCalls ? formatBytes(readBytes / readCalls) : '--', "".concat(formatBytes(readBytes), " total; max ").concat(formatBytes(readMaxBytes)), {
       title: 'Average and largest single-read payload size across all storage reads this epoch. Concerning if this grows steadily over a long-running session -- it usually tracks queue/progress size, and a large max next to a much smaller average flags one unusually expensive read worth finding via Read hot path.'
     }), buildMetricCard('Read payload keys', formatBytes(readQueueBytes), "queue ".concat(formatBytes(readQueueBytes), ", view ").concat(formatBytes(readQueueViewBytes), ", progress ").concat(formatBytes(readProgressBytes)), {
       title: 'Read bytes broken down by which storage key they came from. Concerning if "queue" (the raw authoritative queue, as opposed to the cheaper "view" projection) dominates read volume long after startup -- that\'s a sign something is bypassing the queue-view/resident-cache path and reading the full queue directly.'
     }), buildMetricCard('Read hot path', topReadPath.path || '--', formatStoragePayloadPathDetail(topReadPath), {
       title: 'Which named code path (metricPath, e.g. "reconcile.load") is responsible for the most read bytes this epoch. Concerning if a path you would not expect to read often (anything outside startup/reconcile) shows up here with a high call count -- that usually means a cache that should be short-circuiting it is not.'
-    }), buildMetricCard('Payload avg', payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--', "".concat(formatBytes(payloadBytes), " total; max ").concat(formatBytes(payloadMaxBytes)), {
-      title: 'Average and largest single-write payload size across all storage writes this epoch. Concerning if this trends upward over a long session -- larger writes mean longer Storage set latency and a bigger blast radius if one gets interrupted mid-write.'
-    }), buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), "queue ".concat(formatBytes(payloadQueueBytes), ", runs ").concat(formatBytes(payloadRunsBytes), ", progress ").concat(formatBytes(payloadProgressBytes)), {
+    }), buildMetricCard('Write payload avg', payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--', "".concat(formatBytes(payloadBytes), " total; max ").concat(formatBytes(payloadMaxBytes)), {
+      title: 'Average and largest single-write payload size across all storage writes this epoch (the write-side counterpart to Read payload avg above). Concerning if this trends upward over a long session -- larger writes mean longer Storage set latency and a bigger blast radius if one gets interrupted mid-write.'
+    }), buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), "queue ".concat(formatBytes(payloadQueueBytes), ", view ").concat(formatBytes(payloadQueueViewBytes), ", runs ").concat(formatBytes(payloadRunsBytes), ", progress ").concat(formatBytes(payloadProgressBytes)), {
       title: 'Write bytes broken down by which storage key they went to. Not concerning by itself -- "queue" naturally dominates on a large batch -- but useful alongside Write hot path to see which code path is driving that volume.'
     }), buildMetricCard('Write hot path', topWritePath.path || '--', formatStoragePayloadPathDetail(topWritePath), {
       title: 'Which named code path is responsible for the most write bytes this epoch -- the write-side equivalent of Read hot path. Concerning if a path outside normal enqueue/reconcile/terminal-settlement activity dominates, or if its average latency (shown in the detail line) is high relative to its byte size.'
@@ -5313,6 +5580,7 @@ function renderWakeupMetrics() {
     var recentEntries = _toConsumableArray(entries).sort(function (left, right) {
       return getTime(right) - getTime(left);
     }).slice(0, 30);
+    setText('metricsJournalCount', "".concat(recentEntries.length, " ").concat(recentEntries.length === 1 ? 'entry' : 'entries'));
     replaceChildren(journal, recentEntries.map(function (entry) {
       var row = document.createElement('div');
       row.className = 'row row--event';
@@ -5365,13 +5633,13 @@ function getMetricCounter() {
 function sumMetricCounters() {
   var counters = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
   var prefix = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : '';
-  return Object.entries(counters || {}).filter(function (_ref9) {
-    var _ref10 = _slicedToArray(_ref9, 1),
-      key = _ref10[0];
+  return Object.entries(counters || {}).filter(function (_ref13) {
+    var _ref14 = _slicedToArray(_ref13, 1),
+      key = _ref14[0];
     return key.startsWith(prefix);
-  }).reduce(function (total, _ref11) {
-    var _ref12 = _slicedToArray(_ref11, 2),
-      value = _ref12[1];
+  }).reduce(function (total, _ref15) {
+    var _ref16 = _slicedToArray(_ref15, 2),
+      value = _ref16[1];
     return total + (Number(value) || 0);
   }, 0);
 }
@@ -5381,14 +5649,14 @@ function getTopStoragePayloadPath() {
   var normalizedDirection = direction === 'write' ? 'write' : 'read';
   var prefix = "storagePayload.".concat(normalizedDirection, ".path.");
   var suffix = '.bytes';
-  var top = Object.entries(counters || {}).filter(function (_ref13) {
-    var _ref14 = _slicedToArray(_ref13, 1),
-      key = _ref14[0];
+  var top = Object.entries(counters || {}).filter(function (_ref17) {
+    var _ref18 = _slicedToArray(_ref17, 1),
+      key = _ref18[0];
     return key.startsWith(prefix) && key.endsWith(suffix);
-  }).map(function (_ref15) {
-    var _ref16 = _slicedToArray(_ref15, 2),
-      key = _ref16[0],
-      value = _ref16[1];
+  }).map(function (_ref19) {
+    var _ref20 = _slicedToArray(_ref19, 2),
+      key = _ref20[0],
+      value = _ref20[1];
     var path = key.slice(prefix.length, -suffix.length);
     var bytes = Number(value) || 0;
     return {
@@ -5481,14 +5749,14 @@ function getMetricJournalSubtitle() {
 }
 function formatMetricCounterDelta() {
   var counters = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
-  var entries = Object.entries(counters || {}).filter(function (_ref17) {
-    var _ref18 = _slicedToArray(_ref17, 2),
-      value = _ref18[1];
+  var entries = Object.entries(counters || {}).filter(function (_ref21) {
+    var _ref22 = _slicedToArray(_ref21, 2),
+      value = _ref22[1];
     return Number(value) !== 0;
-  }).slice(0, 3).map(function (_ref19) {
-    var _ref20 = _slicedToArray(_ref19, 2),
-      key = _ref20[0],
-      value = _ref20[1];
+  }).slice(0, 3).map(function (_ref23) {
+    var _ref24 = _slicedToArray(_ref23, 2),
+      key = _ref24[0],
+      value = _ref24[1];
     return "".concat(key.replace(/^[^.]+\./, ''), " +").concat(value);
   });
   return entries.join(', ');
@@ -5509,10 +5777,10 @@ function formatMetricDetails() {
     var entry = _Object$entries[_i2];
     if (!used.has(entry[0])) orderedEntries.push(entry);
   }
-  return orderedEntries.slice(0, 14).map(function (_ref21) {
-    var _ref22 = _slicedToArray(_ref21, 2),
-      key = _ref22[0],
-      value = _ref22[1];
+  return orderedEntries.slice(0, 14).map(function (_ref25) {
+    var _ref26 = _slicedToArray(_ref25, 2),
+      key = _ref26[0],
+      value = _ref26[1];
     return "".concat(key, ": ").concat(formatMetricDetailValue(key, value));
   }).join('\n');
 }
@@ -5681,36 +5949,36 @@ function fetchFlightRecorderForOutlier() {
   return _fetchFlightRecorderForOutlier.apply(this, arguments);
 }
 function _fetchFlightRecorderForOutlier() {
-  _fetchFlightRecorderForOutlier = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee28() {
+  _fetchFlightRecorderForOutlier = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee31() {
     var rowKey,
       attemptId,
       result,
       entry,
       _entry,
-      _args28 = arguments;
-    return _regeneratorRuntime().wrap(function _callee28$(_context28) {
-      while (1) switch (_context28.prev = _context28.next) {
+      _args31 = arguments;
+    return _regeneratorRuntime().wrap(function _callee31$(_context31) {
+      while (1) switch (_context31.prev = _context31.next) {
         case 0:
-          rowKey = _args28.length > 0 && _args28[0] !== undefined ? _args28[0] : '';
-          attemptId = _args28.length > 1 && _args28[1] !== undefined ? _args28[1] : '';
-          _context28.prev = 2;
-          _context28.next = 5;
+          rowKey = _args31.length > 0 && _args31[0] !== undefined ? _args31[0] : '';
+          attemptId = _args31.length > 1 && _args31[1] !== undefined ? _args31[1] : '';
+          _context31.prev = 2;
+          _context31.next = 5;
           return sendRuntimeMessageWithTimeout({
             action: 'get-flight-recorder',
             rowKey: rowKey,
             limit: 50
           }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS);
         case 5:
-          result = _context28.sent;
+          result = _context31.sent;
           entry = state.outliers.find(function (item) {
             return item.rowKey === rowKey && item.attemptId === attemptId;
           });
           if (entry) entry.flightRecorderEntries = Array.isArray(result === null || result === void 0 ? void 0 : result.entries) ? result.entries : [];
-          _context28.next = 14;
+          _context31.next = 14;
           break;
         case 10:
-          _context28.prev = 10;
-          _context28.t0 = _context28["catch"](2);
+          _context31.prev = 10;
+          _context31.t0 = _context31["catch"](2);
           _entry = state.outliers.find(function (item) {
             return item.rowKey === rowKey && item.attemptId === attemptId;
           });
@@ -5719,9 +5987,9 @@ function _fetchFlightRecorderForOutlier() {
           renderOutliers();
         case 15:
         case "end":
-          return _context28.stop();
+          return _context31.stop();
       }
-    }, _callee28, null, [[2, 10]]);
+    }, _callee31, null, [[2, 10]]);
   }));
   return _fetchFlightRecorderForOutlier.apply(this, arguments);
 }
@@ -6203,6 +6471,34 @@ function renderScanCostHistogram() {
   });
   renderHorizontalHistogram(container, scanData);
 }
+function renderAuthorityLoadHistogram() {
+  var container = document.getElementById('authorityLoadHistogram');
+  if (!container) return;
+  var metricsDocument = state.metrics || {};
+  var counters = (metricsDocument.currentEpoch || metricsDocument).counters || {};
+
+  // authorityLoad.<verb>.<from>.calls -- calls of interest to the
+  // coordinator-authority-state accessors, not flight-recorder events.
+  var authorityLoadData = [];
+  Object.keys(counters).forEach(function (key) {
+    var match = key.match(/^authorityLoad\.([^.]+)\.(.+)\.calls$/);
+    if (!match) return;
+    var _match = _slicedToArray(match, 3),
+      verb = _match[1],
+      from = _match[2];
+    var callsCount = getMetricCounter(counters, key);
+    if (callsCount <= 0) return;
+    authorityLoadData.push({
+      label: "".concat(verb, ": ").concat(from),
+      value: callsCount,
+      detail: "".concat(callsCount, " call").concat(callsCount === 1 ? '' : 's')
+    });
+  });
+  authorityLoadData.sort(function (a, b) {
+    return b.value - a.value;
+  });
+  renderHorizontalHistogram(container, authorityLoadData);
+}
 function renderEventHistogram() {
   var container = document.getElementById('eventHistogram');
   if (!container) return;
@@ -6226,10 +6522,10 @@ function renderEventHistogram() {
     });
 
     // Convert to array and sort by count descending
-    var eventData = Object.entries(eventCounts).map(function (_ref23) {
-      var _ref24 = _slicedToArray(_ref23, 2),
-        label = _ref24[0],
-        count = _ref24[1];
+    var eventData = Object.entries(eventCounts).map(function (_ref27) {
+      var _ref28 = _slicedToArray(_ref27, 2),
+        label = _ref28[0],
+        count = _ref28[1];
       return {
         label: label,
         value: count,
@@ -6243,6 +6539,43 @@ function renderEventHistogram() {
     // If message fails, render empty state
     renderHorizontalHistogram(container, []);
   });
+}
+
+// 2026-10-06: average time spent in each phase of a mute-block action's
+// notice-select-open-load-inspect-action-detect-close cycle, sourced from
+// profileAction.phase.<key>.totalMs/sampleCount (swCoordinatorProgressReducer.js's
+// recordCoordinatorProfileActionPhaseDurations, computed from each terminal
+// row's own milestone timestamps). 'Notice/select' is covered separately by
+// secs/handoff -- this starts at 'open' (row goes active -> tab created).
+var COORDINATOR_PROFILE_ACTION_PHASE_LABELS = [['open', 'Open (active → tab created)'], ['navigate', 'Navigate (tab created → navigation started)'], ['load', 'Load (navigation → content script opened)'], ['claim', 'Claim (content opened → action claimed)'], ['inspect', 'Inspect (claimed → profile ready)'], ['action', 'Action (ready → mute/block attempted)'], ['detect', 'Detect (attempted → terminal)'], ['close', 'Close (terminal → tab closed)']];
+function formatPhaseTimingDurationMs(value) {
+  if (!Number.isFinite(value)) return 'n/a';
+  if (value < 1000) return "".concat(Math.round(value), "ms");
+  return "".concat((value / 1000).toFixed(value < 10000 ? 1 : 0), "s");
+}
+function renderPhaseTimingHistogram() {
+  var container = document.getElementById('phaseTimingHistogram');
+  if (!container) return;
+  var metricsDocument = state.metrics || {};
+  var metrics = metricsDocument.currentEpoch || metricsDocument;
+  var counters = metrics.counters || {};
+  var data = COORDINATOR_PROFILE_ACTION_PHASE_LABELS.map(function (_ref29) {
+    var _ref30 = _slicedToArray(_ref29, 2),
+      key = _ref30[0],
+      label = _ref30[1];
+    var sampleCount = getMetricCounter(counters, "profileAction.phase.".concat(key, ".sampleCount"));
+    var totalMs = getMetricCounter(counters, "profileAction.phase.".concat(key, ".totalMs"));
+    var maxMs = getMetricCounter(counters, "profileAction.phase.".concat(key, ".maxMs"));
+    var avgMs = sampleCount ? totalMs / sampleCount : 0;
+    return {
+      label: label,
+      value: avgMs,
+      detail: sampleCount ? "avg ".concat(formatPhaseTimingDurationMs(avgMs), " (n=").concat(sampleCount, ", max ").concat(formatPhaseTimingDurationMs(maxMs), ")") : 'no samples yet'
+    };
+  }).filter(function (row) {
+    return row.value > 0;
+  });
+  renderHorizontalHistogram(container, data);
 }
 function renderHorizontalHistogram(container) {
   var data = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];

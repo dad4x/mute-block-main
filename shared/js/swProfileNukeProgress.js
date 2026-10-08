@@ -74,6 +74,7 @@ function createProfileNukeProgress(deps = {}) {
         makeCoordinatorQueueWalCheckpoint,
         buildCoordinatorQueueView,
         buildCoordinatorContentQueueIndex,
+        buildCoordinatorContentQueueIndexShardPayload,
         buildCoordinatorContentSourceIndexShardPayload
     } = deps.handlers || {}
     const {
@@ -85,6 +86,7 @@ function createProfileNukeProgress(deps = {}) {
         COORDINATOR_QUEUE_WAL_KEY,
         COORDINATOR_QUEUE_VIEW_KEY,
         COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
+        COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
         COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX
     } = deps.constants || {}
 
@@ -404,11 +406,26 @@ function createProfileNukeProgress(deps = {}) {
             if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_WAL_KEY)) {
                 next[COORDINATOR_QUEUE_WAL_KEY] = makeCoordinatorQueueWalCheckpoint(queue, {createdAt: nowMs})
             }
-            if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_VIEW_KEY)) {
-                next[COORDINATOR_QUEUE_VIEW_KEY] = buildCoordinatorQueueView(queue, nowMs)
-            }
+            // 2026-10-02: used to also inject a freshly-built
+            // COORDINATOR_QUEUE_VIEW_KEY here unconditionally on every full-
+            // queue write -- missed during the 2026-10-01 "remove all on-disk
+            // mbCoordinatorQueueView persistence" work (this call site isn't
+            // near any of the other projection-payload builders that work
+            // touched). That kept the disk key perpetually re-populated with
+            // whatever queue shape happened to be writing at that moment --
+            // not the ratcheted/statsClearedAt-filtered view the rest of the
+            // app expects -- which the WAL's auto-recovery-from-view path
+            // (attemptCoordinatorQueueWalAutoRecoveryFromView) then read back
+            // in as "the truth" on the next hydrate failure, reintroducing
+            // old/mismatched row states on top of a live WAL that had since
+            // moved on. Confirmed live: reappearing rows and up to 3
+            // concurrently active tabs right after a
+            // coordinator-authority-queue-wal-auto-recovered-from-view event.
             if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_CONTENT_QUEUE_INDEX_KEY)) {
                 next[COORDINATOR_CONTENT_QUEUE_INDEX_KEY] = buildCoordinatorContentQueueIndex(queue, nowMs)
+            }
+            if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX))) {
+                Object.assign(next, buildCoordinatorContentQueueIndexShardPayload(queue, nowMs))
             }
             if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX))) {
                 Object.assign(next, buildCoordinatorContentSourceIndexShardPayload(queue, nowMs))

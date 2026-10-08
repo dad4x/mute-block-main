@@ -64,6 +64,8 @@ function createCoordinatorContentQueueIndex(deps = {}) {
     const {
         COORDINATOR_QUEUE_VIEW_KEY,
         COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
+        COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
+        COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
         COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
         COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
         MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS
@@ -114,6 +116,64 @@ function createCoordinatorContentQueueIndex(deps = {}) {
 
     function hashCoordinatorContentIndexKey(value = '', bucketCount = COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT) {
         return hashProjectionShardKey(value, bucketCount)
+    }
+
+    // 2026-10-07: additive sibling of buildCoordinatorContentQueueIndex above,
+    // not a replacement -- live traffic confirmed getContentPageCoordinatorState
+    // (every Quora content page's "what's my queue status" poll) was reading
+    // that function's full-queue blob in full every time (1.09MB avg this
+    // session, scaling directly with backlog depth: COORDINATOR_CONTENT_QUEUE_INDEX_KEY
+    // covers up to MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS items from the
+    // WHOLE live queue), then filtering it down to the handful of profileHrefs
+    // that one page actually asked about. Mirrors the already-proven pattern
+    // from profile-nuke-progress sharding and the sibling content-source-index
+    // sharding (both already shard by a hashed key and let a scoped request
+    // fetch only the relevant bucket) -- reuses the exact same shared
+    // hashProjectionShardKey/getProjectionShardKey/makeProjectionShardDefaults
+    // helpers those two already use, not a new scheme. Keyed by normalized
+    // profileHref (direct dict lookup within a shard, same as how progress
+    // shards key by href), not by the queue's own storage key, since callers
+    // always ask "is profile X in the queue", never "is storage key Y".
+    //
+    // The existing COORDINATOR_CONTENT_QUEUE_INDEX_KEY write is left fully
+    // intact (same shape, same call sites) specifically because many existing
+    // tests assert its exact fields (items/truncated/total/indexed) -- this
+    // only ADDS a second, additional representation alongside it for the hot
+    // read path to prefer instead.
+    function getCoordinatorContentQueueIndexShardKey(profileHref = '') {
+        return getProjectionShardKey(
+            COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
+            COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
+            normalizeQuoraProfileUrl(profileHref) || profileHref
+        )
+    }
+
+    function getCoordinatorContentQueueIndexShardDefaults(profileHrefs = []) {
+        const defaults = {}
+        for(const href of profileHrefs || []) {
+            const key = getCoordinatorContentQueueIndexShardKey(href)
+            if(key) defaults[key] = {}
+        }
+        return defaults
+    }
+
+    function buildCoordinatorContentQueueIndexShardPayload(queue = {}, nowMs = now()) {
+        const shards = makeProjectionShardDefaults(
+            COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
+            COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
+            () => ({version: 1, updatedAt: nowMs, records: {}})
+        )
+
+        for(const [itemKey, item] of Object.entries(queue || {})) {
+            if(!shouldIncludeCoordinatorItemInContentQueueIndex(item)) continue
+            const summary = summarizeCoordinatorContentQueueItem(itemKey, item)
+            const href = summary.profileHref || normalizeQuoraProfileUrl(itemKey) || itemKey
+            const shardKey = getCoordinatorContentQueueIndexShardKey(href)
+            if(!shardKey) continue
+            shards[shardKey].records[href] = summary
+        }
+
+        return shards
     }
 
     function getCoordinatorContentSourceIndexShardKeyByIndex(index = 0) {
@@ -204,10 +264,17 @@ function createCoordinatorContentQueueIndex(deps = {}) {
         return shards
     }
 
+    // 2026-10-01: no longer includes COORDINATOR_QUEUE_VIEW_KEY -- see
+    // refreshCoordinatorQueueViewForDashboard's own comment in sw.js for why
+    // mbCoordinatorQueueView is never persisted. Every call site that used to
+    // get the queue view "for free" as part of this bundle now broadcasts it
+    // separately via notifyCoordinatorDashboardStateChanged instead.
+    // content-queue-index/source-index are untouched -- content.js's own UI
+    // reads those back from storage, so they still need to land on disk.
     function buildCoordinatorQueueDerivedProjectionPayload(queue = {}, nowMs = now()) {
         return {
-            [COORDINATOR_QUEUE_VIEW_KEY]: buildCoordinatorQueueView(queue, nowMs),
             [COORDINATOR_CONTENT_QUEUE_INDEX_KEY]: buildCoordinatorContentQueueIndex(queue, nowMs),
+            ...buildCoordinatorContentQueueIndexShardPayload(queue, nowMs),
             ...buildCoordinatorContentSourceIndexShardPayload(queue, nowMs)
         }
     }
@@ -224,6 +291,9 @@ function createCoordinatorContentQueueIndex(deps = {}) {
         summarizeCoordinatorContentQueueItem,
         shouldIncludeCoordinatorItemInContentQueueIndex,
         buildCoordinatorContentQueueIndex,
+        getCoordinatorContentQueueIndexShardKey,
+        getCoordinatorContentQueueIndexShardDefaults,
+        buildCoordinatorContentQueueIndexShardPayload,
         hashCoordinatorContentIndexKey,
         getCoordinatorContentSourceIndexShardKeyByIndex,
         getCoordinatorContentSourceIndexShardKey,

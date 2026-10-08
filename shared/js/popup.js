@@ -47,10 +47,8 @@ async function init() {
     const status = document.getElementById('status')
     const spaceSortBy = document.getElementById('spaceSortBy')
     const spaceList = document.getElementById('spaceList')
-    const clearNukedPosts = document.getElementById('clearNukedPosts')
     const openCoordinator = document.getElementById('openCoordinator')
     const openHistory = document.getElementById('openHistory')
-    const nukedPostCount = document.getElementById('nukedPostCount')
 
     const fopDelay = document.getElementById('fopDelay')
     const flipToAnswers = document.getElementById('flipToAnswers')
@@ -78,7 +76,6 @@ async function init() {
     })
     popupState.sortBy = settings[SPACE_SORT_KEY] === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME
     spaceSortBy.value = popupState.sortBy
-    renderNukedPostCount(nukedPostCount)
 
     if(!haveSameNukedPostKeys(settings[SPACE_NUKED_POSTS_KEY] || {}, popupState.nukedPosts)) {
         await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: popupState.nukedPosts})
@@ -106,7 +103,6 @@ async function init() {
         })
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
         maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
-        renderNukedPostCount(nukedPostCount)
 
         await browser.storage.local.set({
             ...nextSettings,
@@ -132,7 +128,6 @@ async function init() {
             retentionDays: popupState.nukedPostRetentionDays,
             maxEntries: popupState.maxRememberedNukedPosts
         })
-        renderNukedPostCount(nukedPostCount)
         await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: popupState.nukedPosts})
 
         showStatus(status, 'Settings reset.')
@@ -150,23 +145,6 @@ async function init() {
 
         event.preventDefault()
         void updateSpaceCategory(button.dataset.spaceKey, button.dataset.category, spaceList)
-    })
-
-    clearNukedPosts.addEventListener('click', async () => {
-        const count = Object.keys(popupState.nukedPosts || {}).length
-        if(!count) {
-            showStatus(status, 'Nothing to clear.')
-            return
-        }
-
-        if(!window.confirm(`Clear Recent History for ${count} ${count === 1 ? 'entry' : 'entries'}?`)) {
-            return
-        }
-
-        popupState.nukedPosts = {}
-        renderNukedPostCount(nukedPostCount)
-        await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: {}})
-        showStatus(status, 'Recent History cleared.')
     })
 
     openCoordinator?.addEventListener('click', async () => {
@@ -210,7 +188,6 @@ async function init() {
 
         if(changes[SPACE_NUKED_POSTS_KEY]) {
             popupState.nukedPosts = changes[SPACE_NUKED_POSTS_KEY].newValue || {}
-            renderNukedPostCount(nukedPostCount)
         }
 
         if(changes[NUKED_POST_RETENTION_DAYS_KEY]) {
@@ -236,11 +213,6 @@ function showStatus(element, message) {
         element.hidden = true
         element.textContent = ''
     }, 1200)
-}
-
-function renderNukedPostCount(element) {
-    const count = Object.keys(popupState.nukedPosts || {}).length
-    element.textContent = `${count} history entr${count === 1 ? 'y' : 'ies'}`
 }
 
 async function updateSpaceCategory(spaceKey, category, container) {

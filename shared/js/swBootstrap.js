@@ -22,7 +22,6 @@ function registerServiceWorkerListeners(deps = {}) {
     } = deps
     const {
         defaults,
-        COORDINATOR_QUEUE_VIEW_KEY,
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
@@ -51,6 +50,7 @@ function registerServiceWorkerListeners(deps = {}) {
         claimPendingTabAction,
         clearCoordinatorCurrentWork,
         clearCoordinatorReconcileAlarms,
+        clearCoordinatorTerminalStats,
         clearPersistentFailedRetry,
         clearSchedulerAlarms,
         closeIdleQueuedWorkerActionSurfaceWindows,
@@ -78,7 +78,6 @@ function registerServiceWorkerListeners(deps = {}) {
         getOwnedNukeStatus,
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
-        hasStoredCoordinatorWorkInQueueView,
         recordInitialBlockedStateFromRequest,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
@@ -116,7 +115,6 @@ function registerServiceWorkerListeners(deps = {}) {
         refreshCoordinatorQueueViewForDashboard,
         refreshCoordinatorRunsViewForDashboard,
         refreshQueueWakeupMetricsViewForDashboard,
-        refreshStaleCompactQueueViewIfNeeded,
         releaseCoordinatorActionLease,
         releaseQueuedTab,
         rememberBrowserSessionMarker,
@@ -368,6 +366,24 @@ function registerServiceWorkerListeners(deps = {}) {
     
         const metadata = getQueuedTabMetadata(tabId)
         if(metadata && changeInfo.status === 'complete') {
+            // Marks the browser-level page-load boundary of a handoff, split
+            // from 'tab-open-request' (swexecutor.js, fired when the tab is
+            // first created) and 'profile-action-finalized'
+            // (swCoordinatorProgressReducer.js, fired once the row goes
+            // terminal): tab-open-request -> this event is page-load time
+            // (not ours), this event -> profile-action-finalized is our own
+            // block-and-finalize processing time. Correlated by targetUrl
+            // (profileHref) rather than a shared rowKey/runId, since this
+            // listener only has the tab's own metadata to go on.
+            recordFlightRecorderEvent({
+                kind: 'tab-page-load-complete',
+                source: 'tabs.onUpdated',
+                tabId,
+                targetUrl: metadata.profileHref || metadata.coordinatorKey || observedUrl,
+                runId: metadata.runId || '',
+                attemptId: metadata.attemptId || '',
+                attemptNumber: metadata.attemptNumber || 0
+            })
             scheduleQueuedTabContentScriptEnsure(tabId, 'tab-load-complete')
         }
     
@@ -447,12 +463,6 @@ function registerServiceWorkerListeners(deps = {}) {
         if(changes?.[TARGET_QUEUED_TAB_CONCURRENCY_KEY]) {
             setTargetQueuedTabConcurrency(changes[TARGET_QUEUED_TAB_CONCURRENCY_KEY].newValue)
         }
-        if(hasStoredCoordinatorWorkInQueueView(changes?.[COORDINATOR_QUEUE_VIEW_KEY]?.newValue || null)) {
-            scheduleCoordinatorQueueResume(1000, 'storage-queue-view-changed', {
-                allowBeforeQuora: true
-            })
-        }
-    
         if(!changes?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]) return
         if(getProfileNukeProgressProjectionWriteDepth() > 0) return
     
@@ -525,13 +535,13 @@ function registerServiceWorkerListeners(deps = {}) {
             })
         }
         else if(request.action === 'coordinator-page-ready') {
-            return refreshStaleCompactQueueViewIfNeeded('dashboard-ready')
+            return Promise.resolve()
                 .then(() => {
                     if(!getQuoraRuntimeActivated()) return {
                         displayOnly: true,
                         requiresQuoraVisit: true
                     }
-    
+
                     return dedupeCoordinatorTabs(sender.tab?.id || null).then(coordinator => ({
                         ...(coordinator || {}),
                         displayOnly: true
@@ -644,6 +654,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'reset-queue-wakeup-metrics') {
             return resetQueueWakeupMetricsEpochAfterLoad('manual')
+        }
+        else if(request.action === 'clear-coordinator-terminal-stats') {
+            return clearCoordinatorTerminalStats()
         }
         else if(request.action === 'get-content-page-coordinator-state') {
             return getContentPageCoordinatorState(request, sender)

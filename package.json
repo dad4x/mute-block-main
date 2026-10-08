@@ -1,6 +1,6 @@
 {
   "name": "mute-block",
-  "version": "1.6.1335",
+  "version": "1.6.1383",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
@@ -15,7 +15,7 @@
     "build:firefox": "web-ext build --config=firefox-config.cjs",
     "chrome": "web-ext run --config=chrome-config.cjs",
     "firefox": "web-ext run --config=firefox-config.cjs",
-    "test": "node test/subject.test.js && node test/jobState.test.js && node test/swQueueRuntime.test.js && node test/walSnapshotStore.test.js && node test/walSnapshotStoreFuzz.test.js && node test/storageInvariants.test.js && node test/rawReportPages.test.js && node test/sharedModeration.test.js && node test/sharedModerationFuzz.test.js && node test/contentActionSelectors.test.js && node test/contentSpaceScopedState.test.js && node test/contentSourcePostResolution.test.js && node test/swStorageMetrics.test.js && node test/p1-contract.test.js && node test/swSynthetic.test.js && node test/swScenarioFuzz.test.js",
+    "test": "node test/subject.test.js && node test/jobState.test.js && node test/swQueueRuntime.test.js && node test/walSnapshotStore.test.js && node test/walSnapshotStoreFuzz.test.js && node test/storageInvariants.test.js && node test/rawReportPages.test.js && node test/sharedModeration.test.js && node test/sharedModerationFuzz.test.js && node test/contentActionSelectors.test.js && node test/contentSpaceScopedState.test.js && node test/contentSourcePostResolution.test.js && node test/contentEnqueueChunkRetry.test.js && node test/contentInlineResolution.test.js && node test/cdpClickProfileExtensionAction.test.js && node test/requeueFailures.test.js && node test/swStorageMetrics.test.js && node test/p1-contract.test.js && node test/swSynthetic.test.js && node test/swScenarioFuzz.test.js",
     "test:parallel": "node tools/run-tests-parallel.js",
     "test:wal-fuzz": "node test/walSnapshotStoreFuzz.test.js",
     "test:wal-fuzz:long": "WAL_FUZZ_PROFILE=long WAL_FUZZ_SEEDS=200 WAL_FUZZ_ROUNDS=300 WAL_FUZZ_ACTORS_MAX=8 node test/walSnapshotStoreFuzz.test.js",
@@ -36,5 +36,8 @@
     "laravel-mix": "^6.0.49",
     "web-ext-plugin": "^2.9.0",
     "webextension-polyfill": "^0.12.0"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
   }
 }

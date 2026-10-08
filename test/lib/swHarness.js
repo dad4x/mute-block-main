@@ -169,6 +169,7 @@ function createFakeBrowser(initialStorage = {}) {
         runtime: {
             onInstalled: makeEvent(),
             onStartup: makeEvent(),
+            onSuspend: makeEvent(),
             onMessage: runtimeOnMessage,
             getURL(relativePath = '') {
                 return `moz-extension://mute-block/${relativePath}`
@@ -538,6 +539,8 @@ module.exports.__test = {
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
     mergeCoordinatorQueueViewTimingCache,
+    setCoordinatorQueueWalResidentStoreCache,
+    getResidentCoordinatorQueueWalPhysicalStoredSupplement,
     buildCoordinatorContentQueueIndex,
     coordinatorRawQueueNormalizationChangedRows,
     normalizeRawCoordinatorQueueForReconcileFallback,

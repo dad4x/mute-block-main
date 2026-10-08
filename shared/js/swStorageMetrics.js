@@ -178,6 +178,23 @@ function createStorageMetrics(deps = {}) {
         recordQueueWakeupMetricMax(`storagePayload.${normalizedDirection}.path.${normalizedPath}.maxLatencyMs`, elapsed)
     }
 
+    // recordStoragePathLatencyMetrics buckets by metricPath, which varies
+    // per call site even for the same storage key (e.g. the compact queue
+    // view gets written from ~4 different call sites, each with its own
+    // path name) -- there was no single place to see "how long do queue-view
+    // writes take" without summing across paths by hand. This buckets by
+    // key instead (same 'queueView'/'queue'/etc. names recordStoragePayloadMetrics
+    // already uses for byte/row counts), so a write's size and latency can
+    // be read off the same key regardless of which call site produced it.
+    function recordStorageKeyLatencyMetrics(direction = '', key = '', durationMs = 0) {
+        const normalizedDirection = direction === 'read' ? 'read' : 'write'
+        const metricKey = getStorageMetricKeyName(key)
+        const elapsed = Math.max(0, Number(durationMs) || 0)
+        incrementQueueWakeupMetric(`storagePayload.${normalizedDirection}.${metricKey}.latencyCalls`)
+        incrementQueueWakeupMetric(`storagePayload.${normalizedDirection}.${metricKey}.latencyMsSum`, elapsed)
+        recordQueueWakeupMetricMax(`storagePayload.${normalizedDirection}.${metricKey}.maxLatencyMs`, elapsed)
+    }
+
     function normalizeSnapshotWriteReason(reason = '') {
         const normalized = `${reason || ''}`.trim()
         return SNAPSHOT_WRITE_REASONS.has(normalized) ? normalized : 'unclassified'
@@ -344,6 +361,7 @@ function createStorageMetrics(deps = {}) {
         getStorageMetricPathName,
         recordStoragePathPayloadMetrics,
         recordStoragePathLatencyMetrics,
+        recordStorageKeyLatencyMetrics,
         normalizeSnapshotWriteReason,
         recordSnapshotWriteReasonMetrics,
         normalizeQueueWriteOperationName,

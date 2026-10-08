@@ -26,7 +26,8 @@ function createQueuedExecutorTabStatus(deps = {}) {
         browser,
         promiseWithTimeout,
         normalizeTabId,
-        incrementQueueWakeupMetric
+        incrementQueueWakeupMetric,
+        normalizeStorageMetricPathName
     } = deps.handlers || {}
     const {
         QUEUED_TAB_GET_TIMEOUT_MS
@@ -102,9 +103,18 @@ function createQueuedExecutorTabStatus(deps = {}) {
         catch(error) {
             const message = error?.message || `${error || ''}`
             const timedOut = /timed out/i.test(message)
+            // 2026-10-08: broken out by caller-supplied `reason` (already
+            // threaded through every call site for exactly this kind of
+            // attribution) so the next handoff-latency check can tell which
+            // caller's tab lookups are actually driving the aggregate
+            // tabGetFailed/tabGetTimedOut ratio, instead of guessing from a
+            // single flat counter shared by all 13+ call sites.
+            const reasonTag = normalizeStorageMetricPathName(reason || 'queued-executor-tab-get')
             incrementQueueWakeupMetric('job.tabGetFailed')
+            incrementQueueWakeupMetric(`job.tabGetFailed.byReason.${reasonTag}`)
             if(timedOut) {
                 incrementQueueWakeupMetric('job.tabGetTimedOut')
+                incrementQueueWakeupMetric(`job.tabGetTimedOut.byReason.${reasonTag}`)
                 const queryResult = await getQueuedExecutorTabStatusFromTabList(normalizedTabId, reason)
                 if(queryResult.found || queryResult.missing) {
                     return {

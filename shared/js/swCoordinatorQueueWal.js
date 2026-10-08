@@ -342,8 +342,8 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         return {ok: true, append, physicalWal}
     }
 
-    function verifyAppendedCoordinatorQueueWalReplay(append) {
-        const recoveredAfterAppend = recoverProjectedState(append.store)
+    function verifyAppendedCoordinatorQueueWalReplay(append, options = {}) {
+        const recoveredAfterAppend = recoverProjectedState(append.store, [], options)
         const appendedRecordIds = new Set((append.records || []).map(record => record.id).filter(Boolean))
         const ignoredAppendedRecords = (recoveredAfterAppend?.projected?.ignored || [])
             .filter(entry => appendedRecordIds.has(entry?.record?.id))

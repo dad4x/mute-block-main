@@ -140,15 +140,32 @@ function createCoordinatorReconcileSupportSingles(deps = {}) {
     // test:parallel suite before landing -- passed clean, matching the
     // pattern this codebase has already seen play out safely for
     // swQueuedWorkFastResume.js's fire-and-forget chains.
-    function notifyCoordinatorDashboardStateChanged(keys = [], reason = '') {
+    // 2026-09-30: `state` now carries the actual freshly-written value for
+    // each changed key alongside the bare "this changed" signal -- these
+    // values are already sitting in memory as the payload this same
+    // metricStorageSet call is about to persist, so attaching them here
+    // costs nothing extra and lets a listening page apply them directly
+    // instead of turning around and re-reading the same thing back off
+    // disk (an extra storageGet, or worse, a whole loadState() round trip)
+    // just to learn what this message already knows. See
+    // installDashboardRuntimeRefreshListener in coordinator.js for the
+    // consumer side -- it still falls back to its old pull-based refresh
+    // when a message arrives without a usable value for a key.
+    function notifyCoordinatorDashboardStateChanged(keys = [], reason = '', payload = {}) {
         const changedKeys = Array.from(new Set(keys || []))
             .filter(key => COORDINATOR_DASHBOARD_STATE_KEYS.has(key))
         if(!changedKeys.length) return
 
+        const state = {}
+        for(const key of changedKeys) {
+            if(Object.prototype.hasOwnProperty.call(payload || {}, key)) state[key] = payload[key]
+        }
+
         void browser.runtime.sendMessage({
             action: 'coordinator-dashboard-state-changed',
             reason: normalizeStorageMetricPathName(reason),
-            keys: changedKeys
+            keys: changedKeys,
+            state
         }).catch(() => {})
     }
 

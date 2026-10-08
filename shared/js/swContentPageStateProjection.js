@@ -130,6 +130,52 @@ function createContentPageStateProjection(deps = {}) {
         }
     }
 
+    // 2026-10-07: additive sibling of normalizeCoordinatorContentSourceIndexRecords
+    // below, for the new per-profileHref queue-index shards (see
+    // buildCoordinatorContentQueueIndexShardPayload's own comment in
+    // swCoordinatorContentQueueIndex.js for why these exist alongside, not
+    // instead of, the original monolithic COORDINATOR_CONTENT_QUEUE_INDEX_KEY).
+    // Unlike the source-index shards (records keyed by sourceKey, each value
+    // an {items: [...]} bucket with possible hash collisions to filter), queue-
+    // index shards key records directly by normalized profileHref -- mirrors
+    // profile-nuke-progress shards exactly, direct dict lookup per requested
+    // href, no collision-array needed.
+    function normalizeCoordinatorContentQueueIndexShardRecords(shards = {}, profileHrefs = []) {
+        const scopedQueue = {}
+        const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
+        if(!hrefs.length) return scopedQueue
+
+        for(const shard of Object.values(shards || {})) {
+            const records = shard && typeof shard === 'object' && shard.records && typeof shard.records === 'object'
+                ? shard.records
+                : {}
+            for(const href of hrefs) {
+                const item = records[href]
+                if(!item || typeof item !== 'object') continue
+                const itemKey = item.storageKey || item.profileHref || href
+                scopedQueue[itemKey] = item
+            }
+        }
+
+        return scopedQueue
+    }
+
+    // Unlike hasMissingRequestedProfileProgressShard/hasMissingRequestedCoordinatorSourceShard
+    // above, this has no "only matters if truncated" gate -- there's no
+    // non-sharded inline fallback for queue-index data the way progressView
+    // carries some records inline, so a requested shard's freshness always
+    // needs checking directly.
+    function hasMissingRequestedCoordinatorQueueIndexShard(queueShardDefaults = {}, stored = {}) {
+        return Object.keys(queueShardDefaults || {}).some(key => {
+            const shard = stored?.[key]
+            return !shard ||
+                typeof shard !== 'object' ||
+                (Number.parseInt(shard.version, 10) || 0) < 1 ||
+                !shard.records ||
+                typeof shard.records !== 'object'
+        })
+    }
+
     function normalizeCoordinatorContentSourceIndexRecords(shards = {}, request = {}) {
         const sourceKeys = new Set(getCoordinatorContentSourceKeysForRequest(request))
         const scopedQueue = {}
@@ -227,6 +273,8 @@ function createContentPageStateProjection(deps = {}) {
         shouldIncludeCoordinatorItemForContentPage,
         shouldIncludeProfileProgressForContentPage,
         normalizeCoordinatorContentQueueIndex,
+        normalizeCoordinatorContentQueueIndexShardRecords,
+        hasMissingRequestedCoordinatorQueueIndexShard,
         normalizeCoordinatorContentSourceIndexRecords,
         normalizeProfileNukeProgressView,
         hasMissingRequestedProfileProgressShard,

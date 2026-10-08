@@ -91,3 +91,47 @@ test('space-feed poster extraction excludes timestamps from embedded/quoted sub-
         /const embedAncestor = candidate\.closest\(SPACE_FEED_EMBED_SCOPE_SELECTOR\)[\s\S]*continue/
     )
 })
+
+test('space-feed profile-link-card scanner excludes embedded/quoted sub-post authors', () => {
+    // 2026-10-08 third recurrence of the same Franklin Veaux class of
+    // incident -- the 2026-09-25 fix patched getSpaceFeedPostCandidateProfileUrls's
+    // asset-space branch, and the 2026-09-27 fix patched
+    // getSpaceFeedPosterProfileUrls's timestamp walk (shared by both the
+    // asset- and target-space branches). Neither touched this third, wholly
+    // separate path: getSpaceFeedProfileLinkCardEntries (asset-space only),
+    // which scans the entire space feed's content root for any visible
+    // q-box/puppeteer_test_link-classed profile anchor -- the exact markup
+    // Quora also uses for an embedded/quoted answer's author byline -- with
+    // no awareness of SPACE_FEED_EMBED_SCOPE_SELECTOR at all. A genuine
+    // contributor's answer to an unrelated question got embedded/quoted in
+    // a troll-patrol (asset) space's post, his byline rendered as this same
+    // card shape, and he was queued for mute-block a third time as a result.
+    const source = readRepoFile('shared/js/content.js')
+    const cardRootBody = extractFunction(source, 'function getSpaceFeedProfileLinkCardRoot(link)')
+
+    assert.match(
+        cardRootBody,
+        /if\(root\.closest\(SPACE_FEED_EMBED_SCOPE_SELECTOR\)\) return null/
+    )
+})
+
+test('space-feed post content scopes exclude embedded/quoted sub-post regions', () => {
+    // 2026-10-08: auditing the Franklin Veaux pattern turned up two more
+    // consumers of the same gap before either could actually be triggered
+    // live -- getSpaceFeedPostCandidateProfileUrls's main dom-profile-link
+    // loop and its text-profile-url fallback both iterate whatever scopes
+    // this function returns, and neither has any embed-awareness of its
+    // own. getSpaceFeedPostContentScopes used to deliberately include
+    // embed/quote marker elements (.standalone_featurable,
+    // [data-is-quora-embed="true"], [data-type="hyperlink_embed"]) as
+    // scopes to search *inside*, so an embedded/quoted sub-post's own
+    // author byline link (or its plain-text URL) was indistinguishable
+    // from something the actual poster deliberately wrote.
+    const source = readRepoFile('shared/js/content.js')
+    const scopesBody = extractFunction(source, 'function getSpaceFeedPostContentScopes(postRoot)')
+
+    assert.match(
+        scopesBody,
+        /if\(scope !== postRoot && scope\.closest\(SPACE_FEED_EMBED_SCOPE_SELECTOR\)\) return/
+    )
+})

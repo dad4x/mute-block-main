@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const {gzipSync, gunzipSync} = require('fflate')
 const {
     hydrateSegmentedWalStore,
     isSegmentedWalStorageMeta,
@@ -13,6 +14,18 @@ const {
     getTargets,
     runMain
 } = require('./lib/cdp')
+
+// Matches sw.js's COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC exactly -- production
+// checkpoints written since v1.6.1380 are gzip-compressed, so any tool
+// reading one back via the raw walSnapshotStore API directly (bypassing
+// sw.js's own codec-aware wrapper functions) needs this to decode it.
+const QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {
+    codec: {
+        name: 'gzip',
+        compress: bytes => gzipSync(bytes),
+        decompress: bytes => gunzipSync(bytes)
+    }
+}
 
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
@@ -50,7 +63,7 @@ function recoverQueue(stored = {}) {
     }
 
     if(!store) return {queue: rawQueue, recovered: false, reason: 'missing-wal'}
-    const recovered = recoverProjectedState(store)
+    const recovered = recoverProjectedState(store, [], QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
     if(recovered?.recovered !== true) {
         return {queue: rawQueue, recovered: false, reason: recovered?.reason || 'wal-recovery-failed', hydrate, wal: recovered}
     }
