@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const {gzipSync, gunzipSync} = require('fflate')
 const {
     createFakeBrowser,
     loadServiceWorkerHarness: loadServiceWorkerHarnessBase
@@ -12,6 +13,20 @@ const {
     makePairedCheckpointStore,
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
+
+// Matches sw.js's COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC exactly (same name,
+// same gzipSync/gunzipSync backing) -- production checkpoints written via a
+// real switchCoordinatorAuthorityQueueWalCheckpoint() call are gzip-encoded
+// now, so any test reading one back through the raw walSnapshotStore API
+// directly (bypassing sw.js's own codec-aware wrapper functions) needs this
+// to decode it.
+const TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {
+    codec: {
+        name: 'gzip',
+        compress: bytes => gzipSync(bytes),
+        decompress: bytes => gunzipSync(bytes)
+    }
+}
 
 const tests = []
 const LEGACY_PROFILE_PROGRESS_KEY = ['mb', 'Profile', 'Nuke', 'Progress'].join('')
@@ -67,14 +82,14 @@ test('dashboard queue view includes all rows while content queue index remains c
     assert.equal(contentIndex.itemLimit, 1200)
     assert.equal(contentIndex.truncated, true)
 
+    // 2026-10-02: mbCoordinatorQueueView is never persisted to disk (see the
+    // "get rid of it all" removal) -- a direct raw-queue write only derives
+    // and stores the content-queue-index projection now, not the queue view.
     await sw.metricStorageSet({
         mbCoordinatorQueue: queue
     }, {metricPath: 'syntheticLargeQueueView'})
 
-    assert.equal(storage.mbCoordinatorQueueView.total, 1205)
-    assert.equal(storage.mbCoordinatorQueueView.items.length, 1205)
-    assert.equal(storage.mbCoordinatorQueueView.itemLimit, 1205)
-    assert.equal(storage.mbCoordinatorQueueView.truncated, false)
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(storage.mbCoordinatorContentQueueIndex.items.length, 1200)
     assert.equal(storage.mbCoordinatorContentQueueIndex.truncated, true)
 })
@@ -266,81 +281,6 @@ test('dashboard queue view excludes an implausible multi-hour handoff gap from t
     assert.equal(queueView.activationHandoffTiming.excludedOutliers, 1)
     assert.equal(queueView.activationHandoffTiming.elapsedMs, 500)
     assert.equal(queueView.activationHandoffTiming.seconds, 0.5)
-})
-
-test('mergeCoordinatorQueueViewTimingCache preserves the richer same-epoch timing summary', () => {
-    // 2026-09-29: mbCoordinatorQueueView gets rebuilt on every ordinary
-    // coordinator mutation (persistCoordinatorAuthorityQueueWalMutation and
-    // its siblings) using only the live resident queue, with no
-    // completed-rows merge -- far more often than the dashboard's own ~2s
-    // poll (refreshCoordinatorQueueViewForDashboard), which does merge in
-    // recently-archived rows. A row's own archival is itself one of these
-    // frequent mutations, so the moment a block completes and archives, an
-    // unmerged rebuild fires and overwrites the view using a queue snapshot
-    // that no longer has the row that just left it -- confirmed live:
-    // actualBlockTiming.blocks stayed 0 despite a dozen-plus fresh
-    // outcome:"blocked" rows in the WAL well within the current epoch.
-    // mergeCoordinatorQueueViewTimingCache keeps whichever of {cache, fresh}
-    // has more samples for the same epoch, so an incomplete rebuild can't
-    // regress a richer one already seen.
-    const {sw} = loadServiceWorkerHarness()
-    const epochStartedAt = 5000
-
-    const richView = {
-        actualBlockTiming: {epochStartedAt, blocks: 10, elapsedMs: 33210, seconds: 3.321},
-        alreadyBlockedTiming: {epochStartedAt, blocks: 1, elapsedMs: 1037, seconds: 1.037},
-        activationHandoffTiming: {epochStartedAt, handoffs: 4, elapsedMs: 8000, seconds: 2},
-        counts: {queued: 20, active: 1, succeeded: 5, failed: 0}
-    }
-    const mergedRich = sw.mergeCoordinatorQueueViewTimingCache(richView)
-    assert.equal(mergedRich.actualBlockTiming.blocks, 10)
-    assert.equal(mergedRich.counts.succeeded, 5)
-
-    // A subsequent unmerged rebuild in the same epoch, missing the
-    // just-archived rows -- exactly the live failure mode. The dashboard's
-    // "terminal count" tile (getQueueTerminalCount, coordinator.js) sums
-    // exactly these terminal-status entries, so this reproduces the live
-    // "went from one to zero" report too. Non-terminal statuses
-    // (queued/active) are deliberately NOT ratcheted -- those legitimately
-    // shrink as rows progress, so the fresh (lower) queued count here must
-    // win, not the stale cached one.
-    const poorView = {
-        actualBlockTiming: {epochStartedAt, blocks: 0, elapsedMs: 0, seconds: 0},
-        alreadyBlockedTiming: {epochStartedAt, blocks: 0, elapsedMs: 0, seconds: 0},
-        activationHandoffTiming: {epochStartedAt, handoffs: 0, elapsedMs: 0, seconds: 0},
-        counts: {queued: 15, active: 1, succeeded: 0, failed: 0}
-    }
-    const mergedPoor = sw.mergeCoordinatorQueueViewTimingCache(poorView)
-    assert.equal(mergedPoor.actualBlockTiming.blocks, 10)
-    assert.equal(mergedPoor.alreadyBlockedTiming.blocks, 1)
-    assert.equal(mergedPoor.activationHandoffTiming.handoffs, 4)
-    assert.equal(mergedPoor.counts.succeeded, 5)
-    assert.equal(mergedPoor.counts.failed, 0)
-    assert.equal(mergedPoor.counts.queued, 15)
-
-    // A later computation that's genuinely caught up further should become
-    // the new high-water mark, not get stuck on the old cached value.
-    const caughtUpView = {
-        actualBlockTiming: {epochStartedAt, blocks: 12, elapsedMs: 40000, seconds: 3.3},
-        alreadyBlockedTiming: {epochStartedAt, blocks: 1, elapsedMs: 1037, seconds: 1.037},
-        activationHandoffTiming: {epochStartedAt, handoffs: 4, elapsedMs: 8000, seconds: 2},
-        counts: {queued: 10, active: 1, succeeded: 7, failed: 0}
-    }
-    const mergedCaughtUp = sw.mergeCoordinatorQueueViewTimingCache(caughtUpView)
-    assert.equal(mergedCaughtUp.actualBlockTiming.blocks, 12)
-    assert.equal(mergedCaughtUp.counts.succeeded, 7)
-
-    // A new epoch starting over should not carry the old epoch's cache
-    // forward.
-    const newEpochView = {
-        actualBlockTiming: {epochStartedAt: epochStartedAt + 100000, blocks: 0, elapsedMs: 0, seconds: 0},
-        alreadyBlockedTiming: {epochStartedAt: epochStartedAt + 100000, blocks: 0, elapsedMs: 0, seconds: 0},
-        activationHandoffTiming: {epochStartedAt: epochStartedAt + 100000, handoffs: 0, elapsedMs: 0, seconds: 0},
-        counts: {queued: 3, active: 0, succeeded: 0, failed: 0}
-    }
-    const mergedNewEpoch = sw.mergeCoordinatorQueueViewTimingCache(newEpochView)
-    assert.equal(mergedNewEpoch.actualBlockTiming.blocks, 0)
-    assert.equal(mergedNewEpoch.counts.succeeded, 0)
 })
 
 test('dashboard queue view excludes an implausible multi-hour block duration from the average', async () => {
@@ -661,11 +601,19 @@ function makeProgressProjectionSeed(href, record = {}) {
 function getRecoveredCoordinatorQueue(storage = {}) {
     const walStore = getStoredCoordinatorQueueWal(storage)
     if(walStore) {
-        const recovered = recoverProjectedState(walStore)
+        const recovered = recoverProjectedState(walStore, [], TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
         const queue = recovered?.projected?.state?.queue || recovered?.state?.queue
         if(queue && typeof queue === 'object') return queue
     }
     return storage?.mbCoordinatorQueue || {}
+}
+
+// mbCoordinatorQueueView is no longer persisted to disk (see
+// refreshCoordinatorQueueViewForDashboard's own comment in sw.js) -- tests
+// that used to read storage.mbCoordinatorQueueView directly for counts/items
+// recompute it fresh the same way the dashboard would instead.
+function getFreshQueueView(sw, storage = {}) {
+    return sw.buildCoordinatorQueueView(getRecoveredCoordinatorQueue(storage), Date.now(), {runs: storage.mbCoordinatorRuns || {}})
 }
 
 function hasStorageDefault(defaults = {}, key = '') {
@@ -913,6 +861,36 @@ test('queued tab nudge treats missing tab as handled queue state', async () => {
     assert.equal(result.nudged, false)
     assert.equal(result.reason, 'missing-tab')
     assert.equal(sw.state().queueWakeupCounters['nudge.failed.missingTab'], 1)
+})
+
+test('queued tab nudge reclassifies missing-action as already-removed when the tab closes during recovery', async () => {
+    // 2026-10-03: live diagnostic data (missing-action-before-send events,
+    // added 2026-09-28) showed most real nudge.rejected.missingAction cases
+    // have removedRuntimeTabReason populated -- the tab was gone by the end
+    // of the recovery attempt even though the early already-removed check
+    // (right at function entry) passed, because the tab closed DURING this
+    // function's own recovery await (getQueuedExecutorTabWithTimeout /
+    // RECOVER_PENDING_TAB_ACTION). This simulates exactly that: no pending
+    // action exists up front (forcing the recovery path), and the tab
+    // closes for real partway through that recovery.
+    const href = 'https://www.quora.com/profile/Synthetic-Nudge-Removed-During-Recovery'
+    const {browser, sw} = loadServiceWorkerHarness({now: 10070})
+    const tab = await browser.tabs.create({url: href, active: true})
+
+    const originalGet = browser.tabs.get.bind(browser.tabs)
+    browser.tabs.get = async candidateTabId => {
+        if(Number.parseInt(candidateTabId, 10) === tab.id) {
+            await browser.tabs.remove(tab.id)
+        }
+        return originalGet(candidateTabId)
+    }
+
+    const result = await sw.nudgeQueuedTabActionClaim(tab.id, 'synthetic-removed-during-recovery')
+
+    assert.equal(result.nudged, false)
+    assert.equal(result.reason, 'already-removed')
+    assert.equal(sw.state().queueWakeupCounters['nudge.rejected.alreadyRemoved'], 1)
+    assert.equal(sw.state().queueWakeupCounters['nudge.rejected.missingAction'] || 0, 0)
 })
 
 test('queued tab nudge rebuilds claimable action from durable tab id when tab lookup times out', async () => {
@@ -1669,7 +1647,7 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     assert.deepEqual(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], progressB)
     // hrefA archived out of the live dashboard queueView the same way it left
     // .queue -- its canceled count no longer shows up here.
-    assert.equal(storage.mbCoordinatorQueueView.counts.canceled, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.canceled, undefined)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
         getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
@@ -1690,12 +1668,13 @@ test('single current work cancel WAL-terminalizes only the selected pending row'
     // hrefA left the WAL-recovered queue entirely (archived), so it's no
     // longer projected there at all.
     assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[hrefA], undefined)
+    const pendingView = getFreshQueueView(sw, storage)
     assert.equal(
-        (storage.mbCoordinatorQueueView.counts.queued || 0) +
-            (storage.mbCoordinatorQueueView.counts.opening || 0) +
-            (storage.mbCoordinatorQueueView.counts.active || 0) +
-            (storage.mbCoordinatorQueueView.counts.acting || 0) +
-            (storage.mbCoordinatorQueueView.counts.settling || 0),
+        (pendingView.counts.queued || 0) +
+            (pendingView.counts.opening || 0) +
+            (pendingView.counts.active || 0) +
+            (pendingView.counts.acting || 0) +
+            (pendingView.counts.settling || 0),
         1
     )
 })
@@ -1796,7 +1775,7 @@ test('bulk current work cancel WAL-terminalizes all pending rows as a batch', as
     // The persisted queue-view snapshot is built from the live queue at
     // write time, which no longer holds canceled rows -- they archived out
     // in the same write. 0 here is correct, not a regression.
-    assert.equal(storage.mbCoordinatorQueueView.counts.canceled || 0, 0)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.canceled || 0, 0)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
         getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
@@ -1900,7 +1879,7 @@ test('bulk current work clear removes every row from the live queue and the comp
     assert.equal(Object.keys(sw.coordinatorAuthority.current().queue).length, 0, 'live queue is fully empty after clear, including the row that was already terminal')
     assert.equal(await sw.findCompletedWorkRowByKey(hrefDone), null, 'completed-work log no longer holds the previously-archived row')
     assert.equal(await sw.findCompletedWorkRowByKey(hrefPending), null, 'the pending row was removed outright, not archived into the completed log')
-    assert.equal(storage.mbCoordinatorQueueView.total, 0)
+    assert.equal(getFreshQueueView(sw, storage).total, 0)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -2020,7 +1999,13 @@ test('queue accounting audit explains raw WAL drift without writing storage', as
     assert.equal(JSON.stringify(accounting.mismatches), JSON.stringify([]))
 })
 
-test('queue accounting audit flags stale compact dashboard counts', async () => {
+test('queue accounting audit no longer reads or reports on a persisted queue view', async () => {
+    // 2026-10-01: mbCoordinatorQueueView is never persisted to disk (see
+    // refreshCoordinatorQueueViewForDashboard's own comment), so
+    // getCoordinatorQueueAccounting has nothing stale to compare against --
+    // rebuiltView (computed fresh from the just-recovered queue) is the only
+    // view this reports now, and consistent only reflects WAL recovery
+    // success.
     const hrefA = 'https://www.quora.com/profile/Synthetic-Accounting-Stale-A'
     const hrefB = 'https://www.quora.com/profile/Synthetic-Accounting-Stale-B'
     const runId = 'run-accounting-audit-stale'
@@ -2082,43 +2067,23 @@ test('queue accounting audit flags stale compact dashboard counts', async () => 
         coordinatorKey: hrefA,
         profileHref: hrefA
     }), timers)
-    storage.mbCoordinatorQueueView = {
-        ...storage.mbCoordinatorQueueView,
-        counts: {queued: 2},
-        authoritativeCounts: {queued: 2},
-        items: []
-    }
 
-    const before = JSON.stringify({
-        queue: storage.mbCoordinatorQueue,
-        queueWal: getStoredCoordinatorQueueWal(storage),
-        queueView: storage.mbCoordinatorQueueView
-    })
     const accounting = await browser.runtime.sendMessage({
         action: 'get-coordinator-queue-accounting',
         reason: 'synthetic-stale-view'
     })
 
-    assert.equal(JSON.stringify({
-        queue: storage.mbCoordinatorQueue,
-        queueWal: getStoredCoordinatorQueueWal(storage),
-        queueView: storage.mbCoordinatorQueueView
-    }), before)
-    assert.equal(accounting.consistent, false)
-    // See the sibling "explains raw WAL drift" test above: the canceled row
-    // now leaves the recovered/WAL-authoritative queue entirely instead of
-    // just flipping status in place, so raw (still 2 rows) vs. recovered
-    // (now 1 row) diverges on total count too, not just per-status counts.
-    assert.equal(JSON.stringify(accounting.rawDivergences), JSON.stringify(['raw-vs-recovered-total', 'raw-vs-recovered-counts']))
-    assert.equal(JSON.stringify(accounting.mismatches), JSON.stringify([
-        'stored-view-vs-recovered-counts',
-        'stored-view-vs-recovered-authoritative-counts'
-    ]))
-    assert.equal(JSON.stringify(accounting.storedView.counts), JSON.stringify({queued: 2}))
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
+    assert.equal(accounting.consistent, true)
+    assert.equal(accounting.storedView, undefined)
     assert.equal(accounting.rebuiltView.counts.queued, 1)
-    // The canceled row archived out of the recovered queue, so the rebuilt
-    // (WAL-authoritative) view no longer carries a canceled count at all.
     assert.equal(accounting.rebuiltView.counts.canceled, undefined)
+    // See the sibling "explains raw WAL drift" test above: the canceled row
+    // leaves the recovered/WAL-authoritative queue entirely instead of just
+    // flipping status in place, so raw (still 2 rows) vs. recovered (now 1
+    // row) diverges on total count too, not just per-status counts.
+    assert.equal(JSON.stringify(accounting.rawDivergences), JSON.stringify(['raw-vs-recovered-total', 'raw-vs-recovered-counts']))
+    assert.equal(JSON.stringify(accounting.mismatches), JSON.stringify([]))
 })
 
 test('single current work cancel WAL append failure leaves selected row pending', async () => {
@@ -2476,6 +2441,52 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
     assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
 })
 
+test('bulk current work pause defers its content-queue-index rebuild instead of writing it synchronously', async () => {
+    // 2026-10-03: persistCoordinatorAuthorityQueueWalBatchMutation's default
+    // path (used by stored-work-pause, bulk cancel/clear, etc.) used to
+    // rebuild and write the content-queue-index/source-index synchronously
+    // on every batch mutation -- same fix as the single-row mutation path,
+    // proven here for the batch one specifically.
+    const href = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Default-Defer'
+    const runId = 'run-bulk-pause-default-defer'
+    const attemptId = 'attempt-bulk-pause-default-defer'
+    const tabId = 704
+    const now = 504100
+    const sentinelContentQueueIndex = {version: 2, updatedAt: now - 1000, total: 0, indexed: 0, itemLimit: 500, truncated: false, items: []}
+    const {storage, timers, sw} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbCoordinatorContentQueueIndex: sentinelContentQueueIndex,
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    // Not checked for "still sentinel immediately" like the single-row
+    // version of this test -- pauseCoordinatorNukes's own settlement here
+    // already spans several fake-timer steps (settleWithFakeTimers' own
+    // tick loop), which can carry past the projection's defer delay before
+    // the main promise even resolves. What matters is that this path goes
+    // through the deferred branch at all (projectionDeferred) instead of
+    // the old synchronous one, and that the rebuild does eventually land.
+    const result = await settleWithFakeTimers(sw.pauseCoordinatorNukes(), timers)
+
+    assert.equal(result.paused, true)
+    assert.ok((sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionDeferred'] || 0) >= 1)
+
+    await timers.tick(5000)
+    await flushAsync(20)
+
+    assert.notDeepEqual(storage.mbCoordinatorContentQueueIndex, sentinelContentQueueIndex)
+})
+
 test('bulk current work pause WAL-requeues active rows as a batch', async () => {
     const hrefActive = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Active'
     const hrefQueued = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Queued'
@@ -2532,7 +2543,7 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     assert.equal(storage.mbCoordinatorQueue[hrefQueued].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefActive].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefQueued].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 2)
+    assert.equal(getFreshQueueView(sw, storage).counts.queued, 2)
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
     assert.equal(storage.mbCoordinatorEvents[0].type, 'paused')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].status, 'tab-opened')
@@ -2548,6 +2559,183 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     const recovered = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
     assert.equal(recovered[hrefActive].status, 'queued')
     assert.equal(recovered[hrefQueued].status, 'queued')
+})
+
+test('pause closes the live runtime tab even when the durable row tabId is stale', async () => {
+    // 2026-10-03: mutateCoordinatorStoredWorkPause already detected this
+    // mismatch (durable-vs-live-tabid-mismatch diagnostic, added 2026-09-28
+    // after the "Henry"/stuck-tab incident) but only logged it -- the close
+    // sweep still only targeted the durable (stale) tabId, so the real,
+    // still-running tab was never asked to close. This proves the fix:
+    // when the live runtime surface disagrees with the durable row, pause
+    // now closes the LIVE tab too, not just the stale durable one.
+    const href = 'https://www.quora.com/profile/Synthetic-Pause-Stale-Tabid'
+    const runId = 'run-pause-stale-tabid'
+    const attemptId = 'attempt-pause-stale-tabid'
+    const staleTabId = 901
+    const liveTabId = 902
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 504100,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId: staleTabId, now: 504100})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    // The durable row's own tabId (staleTabId) no longer matches the tab
+    // actually running the action -- queueRuntime's own tracking (a
+    // deliberately separate, volatile concept from the durable row) says
+    // liveTabId is the real one.
+    browser.__tabs.set(liveTabId, {
+        id: liveTabId,
+        windowId: 1,
+        url: href,
+        active: false
+    })
+    sw.__testAddProvisionalQueuedTab(liveTabId, {
+        profileHref: href,
+        coordinatorKey: href,
+        attemptId,
+        runId
+    })
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'pause-coordinator-nukes'
+    }), timers)
+
+    assert.equal(result.paused, true)
+    // The actual fix: both the stale durable tabId AND the real live tab
+    // are targeted for closure -- previously only staleTabId would have
+    // been here, leaving liveTabId (the one actually still running) alive.
+    assert.deepEqual([...result.ownedTabIds].sort(), [staleTabId, liveTabId].sort())
+    assert.equal(browser.__removedTabs.includes(staleTabId), true)
+    assert.equal(browser.__removedTabs.includes(liveTabId), true)
+})
+
+test('clear-coordinator-terminal-stats hides terminal rows from the dashboard view without touching queued work', async () => {
+    const terminalHref = 'https://www.quora.com/profile/Synthetic-Stats-Clear-Terminal'
+    const queuedHref = 'https://www.quora.com/profile/Synthetic-Stats-Clear-Queued'
+    const runId = 'run-stats-clear-cutoff'
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 600000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [terminalHref]: {
+                    runId,
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    actionKind: 'mute-block',
+                    targetProfileHref: terminalHref,
+                    requestedUrl: terminalHref,
+                    coordinatorKey: terminalHref,
+                    queuedAt: 598000,
+                    terminalAt: 599500,
+                    updatedAt: 599500
+                },
+                [queuedHref]: {
+                    runId,
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    targetProfileHref: queuedHref,
+                    requestedUrl: queuedHref,
+                    coordinatorKey: queuedHref,
+                    queuedAt: 599000
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    targetProfileHrefs: [terminalHref, queuedHref],
+                    targetWorkKeys: [terminalHref, queuedHref],
+                    status: 'running'
+                }
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const before = await browser.runtime.sendMessage({action: 'refresh-coordinator-queue-view', reason: 'test-before-clear'})
+    assert.equal(before.view.counts.succeeded, 1)
+    assert.equal(before.view.counts.queued, 1)
+    assert.equal(before.view.total, 2)
+
+    const clearResult = await browser.runtime.sendMessage({action: 'clear-coordinator-terminal-stats'})
+    assert.equal(clearResult.cleared, true)
+    assert.ok(clearResult.clearedAt >= 600000)
+    assert.ok(storage.mbCoordinatorStatsClearedAt >= 600000)
+
+    const after = await browser.runtime.sendMessage({action: 'refresh-coordinator-queue-view', reason: 'test-after-clear'})
+    assert.equal(after.view.counts.succeeded || 0, 0)
+    assert.equal(after.view.counts.queued, 1)
+    assert.equal(after.view.total, 1)
+
+    // The terminal row isn't deleted anywhere -- just excluded from this
+    // merge -- so the authoritative queue and completed-work log are
+    // untouched.
+    assert.equal(getRecoveredCoordinatorQueue(storage)[terminalHref]?.status, 'succeeded')
+})
+
+test('fresh run-status summary reflects current pause state, not a stale per-run flag', async () => {
+    // Live bug (2026-10-01): materializeCoordinatorRunsPausedStateFromControl
+    // only stamps run.paused onto runs that already have a pending item at
+    // the moment the queue is paused/resumed (see its own skip condition) --
+    // a run enqueued or resumed-into afterward never gets that stamp, so the
+    // stored mbCoordinatorRuns record keeps showing stale data forever. The
+    // dashboard's "fresh" run summary (refresh-coordinator-runs-view) is
+    // built specifically to not trust stale stored fields for exactly this
+    // reason, but getCoordinatorRunStatus was still reading run.paused
+    // instead of the current global control -- this run showed 'running' on
+    // the dashboard while the queue was genuinely paused.
+    const href = 'https://www.quora.com/profile/Synthetic-Stale-Run-Pause-Flag'
+    const runId = 'run-stale-pause-flag'
+    const {browser, storage} = loadServiceWorkerHarness({
+        now: 600000,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {
+                [href]: {
+                    runId,
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    coordinatorKey: href,
+                    queuedAt: 599000
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    sourcePages: ['https://www.quora.com/space/example'],
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href],
+                    status: 'running'
+                    // Deliberately no `paused` field -- this is the stale
+                    // state a run created/resumed-into after the last pause
+                    // materialization pass would actually have.
+                }
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    assert.equal(storage.mbCoordinatorRuns[runId].paused, undefined)
+
+    const result = await browser.runtime.sendMessage({action: 'refresh-coordinator-runs-view'})
+
+    assert.equal(result.refreshed, true)
+    assert.equal(result.runs[runId].status, 'paused')
 })
 
 test('bulk current work pause WAL append failure does not close active owned tab', async () => {
@@ -2779,8 +2967,8 @@ test('manual failed retry WAL moves resolver rows without leaving stale source k
     assert.equal(result.queued, 1)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[retryKey], undefined)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView.counts.failed || 0, 0)
+    assert.equal(getFreshQueueView(sw, storage).counts.queued, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.failed || 0, 0)
     assert.equal(storage.mbCoordinatorEvents.at(-1).type, 'retry')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'failed')
     // Tombstoned rather than deleted (see makeTombstonedProfileProgressRecord
@@ -3596,7 +3784,7 @@ test('row event persists queue only for nonterminal durable status changes', asy
     assert.equal(result.recorded, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[href].tabId, null)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
     assert.equal(
@@ -3728,7 +3916,18 @@ test('segmented queue WAL appends do not rewrite checkpoint snapshots after migr
     assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(restarted.storage)).projected.state.queue[hrefB].status, 'active')
 })
 
-test('segmented queue WAL append rewrites active segments when previous physical keys are incomplete', async () => {
+test('segmented queue WAL append backfills incomplete previous physical keys from the resident WAL cache', async () => {
+    // 2026-10-06: confirmed live on a 54-hour epoch that this exact scenario
+    // (the mutation's own authority projection has a stale/incomplete view
+    // of committed physical segment keys -- the common case for the
+    // resident-projection fast path, since absorbPersistedSnapshot only
+    // absorbs whatever subset of keys each write's own payload happens to
+    // include) was forcing a full checkpoint rewrite on 35% of all WAL
+    // appends, costing 23.3GB in that one epoch. coordinatorQueueWalResidentStoreCache
+    // (kept fully current on every successful write, independent of
+    // whatever the caller's own projection carries) now backfills the gap
+    // so the append stays incremental whenever that cache actually has the
+    // missing data -- which it does here, since hydrate() just populated it.
     const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Incomplete-Physical'
     const runId = 'run-segmented-wal-incomplete-physical'
     const attemptId = 'attempt-segmented-wal-incomplete-physical'
@@ -3761,8 +3960,95 @@ test('segmented queue WAL append rewrites active segments when previous physical
     assert.ok(storage[segment0])
     assert.ok(storage[segment1])
 
+    // Simulate the caller's own authority projection going stale -- segment0
+    // is missing from its copy -- while leaving the resident WAL cache
+    // (a separate, always-current module-level cache hydrate() just
+    // populated) untouched. This is deliberately NOT the same as deleting
+    // segment0 from durable storage.
+    delete authorityState.stored[segment0]
+
+    const walPayloadKeys = []
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        if(isCoordinatorQueueWalPayload(payload)) {
+            walPayloadKeys.push(Object.keys(payload).sort())
+        }
+        return originalSet(payload)
+    }
+
+    const result = await sw.enqueueSpaceFeedStorageUpdate(() => sw.coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'row-event-progress-milestone',
+        rowKey: href,
+        reason: 'ordinaryMutation',
+        currentAuthorityState: authorityState,
+        mutate(current) {
+            return {
+                ...current,
+                status: 'active',
+                tabId: 506,
+                activeAt: 150260,
+                updatedAt: 150260,
+                milestones: {
+                    ...(current.milestones || {}),
+                    actionReadyAt: 150260
+                }
+            }
+        }
+    }))
+
+    assert.equal(result.durable, true)
+    // The resident cache backfilled the gap -- append stays incremental,
+    // writing only the new segment, not a full checkpoint rewrite.
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentIncrementalInvalidated'] || 0, 0)
+    assert.ok(walPayloadKeys.length >= 1)
+    assert.ok(walPayloadKeys[0].includes(segment2))
+    assert.ok(!walPayloadKeys[0].includes(segment0))
+    assert.ok(!walPayloadKeys[0].includes(segment1))
+})
+
+test('segmented queue WAL append still rewrites active segments when the resident cache is also incomplete', async () => {
+    // The true fallback case this test used to cover alone: when NEITHER
+    // the caller's own projection NOR the resident WAL cache has the full
+    // committed-segment picture (e.g. the resident cache was reset, or
+    // genuinely never had this generation), the append correctly falls
+    // back to a full rewrite rather than silently dropping data.
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Incomplete-Physical-No-Cache'
+    const runId = 'run-segmented-wal-incomplete-physical-no-cache'
+    const attemptId = 'attempt-segmented-wal-incomplete-physical-no-cache'
+    const queue = {
+        [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 150250})
+    }
+    const segmentedWal = makeSegmentedQueueWalStorage(queue, 2, {
+        rowKey: href,
+        createdAt: 150250
+    })
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 150260,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            ...segmentedWal,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const authorityState = await sw.coordinatorAuthority.hydrate()
+    const activeGeneration = authorityState.stored.mbCoordinatorQueueWal.meta.activeCheckpoint
+    const segment0 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 0)
+    const segment1 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 1)
+    const segment2 = getSegmentedWalSegmentKey('mbCoordinatorQueueWal', activeGeneration, 2)
+    assert.ok(storage[segment0])
+    assert.ok(storage[segment1])
+
     delete storage[segment0]
     delete authorityState.stored[segment0]
+    // Knock out the resident WAL cache too, so there is genuinely nowhere
+    // left to backfill segment0's missing key from.
+    sw.setCoordinatorQueueWalResidentStoreCache(null)
 
     const walPayloadKeys = []
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -3852,18 +4138,101 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
         storage
     })
 
-    // 2026-09-15: a segmented-WAL hydrate failure no longer throws -- it
-    // auto-recovers from mbCoordinatorQueueView (a derived read-model that
-    // survives the corruption because it isn't stored as WAL segments). The
-    // test's original point stands either way: the recovered row must come
-    // from the view's correct 'active' status, never from the stale
-    // mbCoordinatorQueue raw mirror (still 'queued' below), which is what
-    // "does not fall back to stale raw queue" means now.
-    const recoveredState = await restarted.sw.coordinatorAuthority.hydrate()
-    assert.equal(recoveredState.queue[href].status, 'active')
+    // 2026-10-01: mbCoordinatorQueueView is no longer persisted at all (see
+    // refreshCoordinatorQueueViewForDashboard's own comment in sw.js), so
+    // the 2026-09-15 auto-recovery-from-view path (attemptCoordinatorQueueWalAutoRecoveryFromView)
+    // never has a view to recover from any more -- it's left in place but is
+    // now always a no-op (view-empty), falling through to the same "refuse
+    // silently guessing and surface the failure" behavior this test
+    // originally covered before that auto-recovery existed. "does not fall
+    // back to stale raw queue" now means exactly that: no silent recovery of
+    // any kind, stale or otherwise.
+    await assert.rejects(
+        () => restarted.sw.coordinatorAuthority.hydrate(),
+        /segmented queue WAL hydrate failed: missing-segment/
+    )
     assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'queued')
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
-    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 1)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 0)
+})
+
+test('segmented queue WAL hydrate absorbs a transient torn cross-key write via same-call retry', async () => {
+    // 2026-10-03: chrome.storage.local has no cross-key transaction
+    // guarantee -- a concurrent read can observe fresh meta before a
+    // checkpoint-switch's own checkpoint/segment keys from the SAME write
+    // become visible. This simulates that exact transient window: the
+    // segment key is "missing" on the first read (as if the write hasn't
+    // fully landed yet) and present again by the second, same as a real
+    // torn write would resolve itself within a read or two.
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Wal-Torn-Write-Retry'
+    const runId = 'run-segmented-wal-torn-write-retry'
+    const attemptId = 'attempt-segmented-wal-torn-write-retry'
+    const {browser, storage, sw} = loadServiceWorkerHarness({
+        now: 150300,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 150300}),
+                    status: 'queued',
+                    activeAt: 0,
+                    tabId: null
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const recorded = await sw.applyCoordinatorRowEvent({
+        eventKind: 'queued-progress-milestone',
+        profileHref: href,
+        patch: {
+            status: 'page-ready',
+            actionReadyAt: 150310,
+            runId,
+            tabId: 505,
+            actionKind: 'mute-block',
+            attemptId,
+            attemptNumber: 1
+        }
+    })
+    assert.equal(recorded.recorded, true)
+
+    const segmentKey = 'mbCoordinatorQueueWal.segment.A.0000'
+    const segmentValue = storage[segmentKey]
+    assert.ok(segmentValue)
+    delete storage[segmentKey]
+
+    const restarted = loadServiceWorkerHarness({
+        now: 150320,
+        storage
+    })
+
+    let restoredOnce = false
+    const originalGet = restarted.browser.storage.local.get.bind(restarted.browser.storage.local)
+    restarted.browser.storage.local.get = async defaults => {
+        const result = await originalGet(defaults)
+        const requestedMissingSegment = defaults && typeof defaults === 'object' &&
+            Object.prototype.hasOwnProperty.call(defaults, segmentKey) &&
+            result[segmentKey] == null
+        if(requestedMissingSegment && !restoredOnce) {
+            restoredOnce = true
+            // The torn write "finishes landing" by the time of the retry.
+            restarted.storage[segmentKey] = segmentValue
+        }
+        return result
+    }
+
+    const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href]?.status, 'active')
+    assert.equal(restoredOnce, true)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateTornWriteRetried'] || 0, 1)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 0)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrated'] || 0, 1)
 })
 
 test('segmented queue WAL hydrate failure still throws when no queue view is available to recover from', async () => {
@@ -4975,7 +5344,7 @@ test('batched row event queue WAL mutations compose against updated projection',
     assert.equal(result.results[hrefB].recorded, true)
     assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
     assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 2)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].tabId, tabA)
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].status, 'active')
@@ -5101,9 +5470,15 @@ test('row event queue WAL projection failure does not poison durable acknowledge
             }
         }
     })
+    // 2026-10-01: mbCoordinatorQueueView is no longer part of this write at
+    // all (see buildCoordinatorQueueDerivedProjectionPayload's own comment)
+    // -- mbCoordinatorContentQueueIndex is still bundled into the same
+    // derived-projection save, so failing it exercises the same
+    // "projection save failed, durable acknowledgement must still stand"
+    // path this test covers.
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
+        if(payload?.mbCoordinatorContentQueueIndex) {
             return false
         }
         return originalSet(payload)
@@ -5432,7 +5807,7 @@ test('terminal job progress applies queue mutation through authority without dup
     assert.equal(result.terminal, true, JSON.stringify(result))
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.succeeded, undefined)
     const archivedRow = await sw.findCompletedWorkRowByKey(href)
     assert.equal(archivedRow?.status, 'succeeded')
     assert.equal(archivedRow?.outcome, 'blocked')
@@ -5559,6 +5934,111 @@ test('genuine block terminal progress records a reallyBlocked profileAction stat
     )
     assert.ok((after['profileAction.reallyBlocked.maxDurationMs'] || 0) > 0)
     assert.equal(after['profileAction.alreadyBlocked.count'] || 0, before['profileAction.alreadyBlocked.count'] || 0)
+})
+
+test('genuine block terminal progress records per-phase open/load/inspect/action/detect/close timing', async () => {
+    // 2026-10-06: the notice-select-open-load-inspect-action-detect-close
+    // cycle used to only ever get measured as one lump (activeAt ->
+    // terminalAt, profileAction.reallyBlocked.totalDurationMs above) even
+    // though every row already carries the granular milestone timestamps
+    // needed to split it up. Proves recordCoordinatorProfileActionPhaseDurations
+    // computes a plausible sample for each phase from a row with a full,
+    // realistic milestone sequence.
+    // nowMs inside recordCoordinatorProfileActionOutcomeStat is the
+    // harness's pinned clock (the `now` option below), NOT derived from the
+    // incoming patch's own terminalAt/blockedAt fields -- same convention
+    // the existing totalDurationMs assertions above rely on (activeAt vs.
+    // the pinned clock, not vs. blockedAt). All milestones here are
+    // therefore built comfortably before that pinned clock, so the final
+    // "detect" phase (blockAttemptedAt -> terminal, which falls back to
+    // nowMs since the OLD item passed into the stat function never has its
+    // own terminalAt stamped yet) lands on a real, positive duration.
+    const href = 'https://www.quora.com/profile/Synthetic-Phase-Timing-Stat'
+    const runId = 'run-phase-timing-stat'
+    const attemptId = 'attempt-phase-timing-stat'
+    const tabId = 507
+    const pinnedNow = 250000
+    const activeAt = 248000
+    const {sw} = loadServiceWorkerHarness({
+        now: pinnedNow,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250000}),
+                    activeAt,
+                    milestones: {
+                        tabCreatedAt: activeAt + 50,
+                        navigationStartedAt: activeAt + 100,
+                        contentOpenedAt: activeAt + 900,
+                        actionClaimedAt: activeAt + 950,
+                        profileReadyAt: activeAt + 1200,
+                        blockAttemptedAt: activeAt + 1400,
+                        muteAttemptedAt: 0,
+                        closeRequestedAt: 0,
+                        tabClosedAt: 0
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: activeAt + 1400
+                }
+            }
+        }
+    })
+
+    const terminalAt = activeAt + 1800
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: terminalAt,
+        terminalAt,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    const counters = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, true, JSON.stringify(result))
+    assert.equal(result.terminal, true, JSON.stringify(result))
+    // open: activeAt -> tabCreatedAt (50ms)
+    assert.equal(counters['profileAction.phase.open.sampleCount'] || 0, 1)
+    assert.equal(counters['profileAction.phase.open.totalMs'] || 0, 50)
+    // navigate: tabCreatedAt -> navigationStartedAt (50ms)
+    assert.equal(counters['profileAction.phase.navigate.totalMs'] || 0, 50)
+    // load: navigationStartedAt -> contentOpenedAt (800ms)
+    assert.equal(counters['profileAction.phase.load.totalMs'] || 0, 800)
+    // claim: contentOpenedAt -> actionClaimedAt (50ms)
+    assert.equal(counters['profileAction.phase.claim.totalMs'] || 0, 50)
+    // inspect: actionClaimedAt -> profileReadyAt (250ms)
+    assert.equal(counters['profileAction.phase.inspect.totalMs'] || 0, 250)
+    // action: profileReadyAt -> blockAttemptedAt (200ms)
+    assert.equal(counters['profileAction.phase.action.totalMs'] || 0, 200)
+    // detect: blockAttemptedAt -> terminal. The OLD item passed into the
+    // stat function never has its own terminalAt stamped yet (that only
+    // lands on the NEW projected item this same transition produces), so
+    // this phase falls back to nowMs (the pinned clock) rather than the
+    // patch's own terminalAt -- 250000 - 249400 = 600ms.
+    assert.equal(counters['profileAction.phase.detect.totalMs'] || 0, 600)
+    // close: no closeRequestedAt/tabClosedAt recorded -- no sample.
+    assert.equal(counters['profileAction.phase.close.sampleCount'] || 0, 0)
 })
 
 test('already-blocked terminal progress records an alreadyBlocked profileAction stat, not reallyBlocked', async () => {
@@ -5761,6 +6241,84 @@ test('genuine block confirmed via a live tab the runtime lost track of records a
             (before['profileAction.reallyBlocked.totalDurationMs'] || 0) > 0
     )
     assert.equal(after['profileAction.alreadyBlocked.count'] || 0, before['profileAction.alreadyBlocked.count'] || 0)
+})
+
+// 2026-09-30: live incident -- content.js's closeQueuedBlockedTab calls
+// sweepServiceWorkerBlockedProfileTabs() (routing here) *and* separately
+// reports terminal progress through the normal recordQueuedProfileProgress
+// path; both can land at nearly the same instant. Whichever wins durably
+// archives the row first, so this function's own recordActiveBlockedLiveTabTerminal
+// call sees an already-terminal row and correctly reports "nothing new to
+// record" -- but used to bail out entirely on that signal without ever
+// closing the tab, while content.js (having gotten `signaled: true` back
+// from this same call) trusted this function to close it and skipped its
+// own requestCloseTab(). Neither side closed it: confirmed live, a fully-
+// succeeded queued tab sat open indefinitely, permanently blocking the
+// worker-window action-surface busy check for every subsequent queued item.
+test('terminalizing an already-archived live tab still closes it instead of leaving it orphaned', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Live-Tab-Concurrent-Terminal'
+    const runId = 'run-live-tab-concurrent-terminal'
+    const attemptId = 'attempt-live-tab-concurrent-terminal'
+    const trackedTabId = 605
+    const liveTabId = 606
+    const expectedActiveRow = makeActiveCoordinatorRow({href, runId, attemptId, tabId: trackedTabId, now: 260000})
+    const {sw, browser} = loadServiceWorkerHarness({
+        now: 260000,
+        storage: {
+            mbCoordinatorPaused: false,
+            // The row already reflects the OTHER, winning code path's
+            // outcome (recordQueuedProfileProgress's normal terminal-progress
+            // write) by the time this function's own record attempt runs.
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...expectedActiveRow,
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    terminalAt: 260100,
+                    updatedAt: 260100
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: []
+        }
+    })
+    browser.__tabs.set(liveTabId, {id: liveTabId, windowId: 1, url: href})
+    browser.tabs.sendMessage = async (tabId, message) => {
+        if(message?.action === 'close-if-blocked') {
+            return {willClose: true, resolvedProfileHref: href, lastUrl: href}
+        }
+        return {}
+    }
+
+    await sw.coordinatorAuthority.hydrate()
+    const archiveResult = await sw.archiveTerminalCoordinatorRow(href, sw.coordinatorAuthority.current().queue[href])
+    assert.equal(archiveResult.archived, true)
+    assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'succeeded', 'sanity check: row is already archived before this call runs')
+
+    const before = sw.state().queueWakeupCounters
+    const liveProfileTabsByHref = new Map([[href, [{id: liveTabId, windowId: 1, url: href}]]])
+    // expectedActiveRow is what a caller reading the row moments before the
+    // race resolved would still have in hand -- still 'active', the same
+    // attemptId as the row that just won and archived.
+    const result = await sw.terminalizeActiveCoordinatorItemFromBlockedLiveTab(
+        href,
+        expectedActiveRow,
+        null,
+        liveProfileTabsByHref,
+        'test-concurrent-terminal-race'
+    )
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.changed, true, JSON.stringify(result))
+    assert.equal(result.terminalized, true, JSON.stringify(result))
+    assert.equal(browser.__tabs.has(liveTabId), false, 'the orphaned tab must actually be closed')
+    assert.equal(
+        (after['blockedLiveTabTerminal.closedAfterConcurrentTerminalize'] || 0) -
+            (before['blockedLiveTabTerminal.closedAfterConcurrentTerminalize'] || 0),
+        1
+    )
 })
 
 test('already-blocked confirmation via a live tab the runtime lost track of records an alreadyBlocked stat, not reallyBlocked', async () => {
@@ -6386,10 +6944,11 @@ test('terminal authority queue WAL switches checkpoint generation and continues 
     assert.equal(storage.mbCoordinatorQueue[hrefC].status, 'active')
     // hrefA/hrefB archived out of the live queue/queueView entirely; only
     // hrefC (still active) remains in the dashboard view.
-    assert.equal(storage.mbCoordinatorQueueView.items.find(row => row.storageKey === hrefA), undefined)
-    assert.equal(storage.mbCoordinatorQueueView.items.find(row => row.storageKey === hrefB), undefined)
-    assert.equal(storage.mbCoordinatorQueueView.items.find(row => row.storageKey === hrefC)?.status, 'active')
-    const recoveredAfterCheckpoint = recoverProjectedState(getStoredCoordinatorQueueWal(storage))
+    const checkpointView = getFreshQueueView(sw, storage)
+    assert.equal(checkpointView.items.find(row => row.storageKey === hrefA), undefined)
+    assert.equal(checkpointView.items.find(row => row.storageKey === hrefB), undefined)
+    assert.equal(checkpointView.items.find(row => row.storageKey === hrefC)?.status, 'active')
+    const recoveredAfterCheckpoint = recoverProjectedState(getStoredCoordinatorQueueWal(storage), [], TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
     assert.equal(recoveredAfterCheckpoint.checkpoint.snapshotSeq, checkpointedRecordCount)
     assert.equal(recoveredAfterCheckpoint.projected.state.queue[hrefA], undefined)
     assert.equal(recoveredAfterCheckpoint.projected.state.queue[hrefC].status, 'active')
@@ -6509,7 +7068,7 @@ test('terminal authority queue WAL physical cleanup failure does not poison chec
     assert.equal(checkpointSwitch.physicalCleanup?.reason, 'storage-remove-failed')
     assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueWal'), true)
     assert.equal(Object.prototype.hasOwnProperty.call(storage, oldSegmentKey), true)
-    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href], undefined)
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage), [], TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS).projected.state.queue[href], undefined)
     const restarted = loadServiceWorkerHarness({
         now: 252870,
         storage
@@ -6613,8 +7172,8 @@ test('terminal authority queue WAL checkpoint updates compact projection without
     assert.equal(checkpointSwitch.durable, true)
     assert.equal(rawQueueWriteAttempted, false)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href], undefined)
-    assert.equal(storage.mbCoordinatorQueueView.items.find(row => row.storageKey === href), undefined)
+    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage), [], TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS).projected.state.queue[href], undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.items.find(row => row.storageKey === href), undefined)
     const restarted = loadServiceWorkerHarness({
         now: 253100,
         storage
@@ -7274,12 +7833,71 @@ test('legacy progress runtime aliases are absent runtime actions', async () => {
     browser.storage.local.set = originalSet
 })
 
+test('a plain terminal mutation defers its content-queue-index rebuild instead of writing it synchronously', async () => {
+    // 2026-10-03: this used to be the unconditional, synchronous, O(queue)
+    // content-queue-index/source-index rebuild+write for every mutation that
+    // didn't explicitly opt into deferral -- confirmed live as a dominant
+    // contributor to per-mutation latency and write-payload size on a large
+    // queue. Proves the fix directly: a plain mutation with no special
+    // projection options leaves the content-queue-index untouched until
+    // after the default defer delay elapses.
+    const href = 'https://www.quora.com/profile/Synthetic-Default-Defer-Projection'
+    const runId = 'run-default-defer-projection'
+    const attemptId = 'attempt-default-defer-projection'
+    const tabId = 611
+    const now = 255000
+    const sentinelContentQueueIndex = {version: 2, updatedAt: now - 1000, total: 0, indexed: 0, itemLimit: 500, truncated: false, items: []}
+    const {storage, sw, timers} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            mbCoordinatorContentQueueIndex: sentinelContentQueueIndex,
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: now + 100,
+        terminalAt: now + 100,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+
+    assert.equal(result.recorded, true)
+    assert.equal(result.terminal, true)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionDeferred'] || 0, 1)
+    // Still the pre-mutation sentinel -- the rebuild hasn't run yet.
+    assert.deepEqual(storage.mbCoordinatorContentQueueIndex, sentinelContentQueueIndex)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionSaved'] || 0, 0)
+
+    await timers.tick(5000)
+    await flushAsync(20)
+
+    assert.notDeepEqual(storage.mbCoordinatorContentQueueIndex, sentinelContentQueueIndex)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionSaved'] || 0, 1)
+})
+
 test('terminal authority queue WAL projection failure does not poison durable acknowledgement', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Wal-Projection-Failure'
     const runId = 'run-terminal-wal-projection-failure'
     const attemptId = 'attempt-terminal-wal-projection-failure'
     const tabId = 517
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw, timers} = loadServiceWorkerHarness({
         now: 254000,
         storage: {
             mbCoordinatorPaused: false,
@@ -7306,7 +7924,7 @@ test('terminal authority queue WAL projection failure does not poison durable ac
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
+        if(payload?.mbCoordinatorContentQueueIndex) {
             return false
         }
         return originalSet(payload)
@@ -7326,6 +7944,13 @@ test('terminal authority queue WAL projection failure does not poison durable ac
         expectTerminal: true,
         senderTabId: tabId
     })
+    // 2026-10-03: the content-queue-index projection save is now deferred by
+    // default (COORDINATOR_PROJECTION_DEFAULT_DEFER_DELAY_MS) -- advance
+    // fake time so the deferred write (and its injected failure) actually
+    // runs, then flush enough real microtask turns for its own internal
+    // await chain (metricStorageSet etc.) to fully settle.
+    await timers.tick(5000)
+    await flushAsync(20)
 
     assert.equal(result.recorded, true)
     assert.equal(result.terminal, true)
@@ -7394,7 +8019,7 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal(storage.mbCoordinatorQueue[hrefB].sourceSettlementOutcome, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].sourceSettlementOutcome, 'confirmed')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].sourceSettlementOutcome, 'confirmed')
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, 2)
+    assert.equal(getFreshQueueView(sw, storage).counts.succeeded, 2)
     assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement'], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefA], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], undefined)
@@ -7621,7 +8246,7 @@ test('terminal settlement projection failure does not poison WAL settlement', as
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Projection-Failure'
     const runId = 'run-terminal-settlement-projection-failure'
     const attemptId = 'attempt-terminal-settlement-projection-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
+    const {browser, storage, sw, timers} = loadServiceWorkerHarness({
         now: 254680,
         storage: {
             mbCoordinatorPaused: false,
@@ -7654,13 +8279,20 @@ test('terminal settlement projection failure does not poison WAL settlement', as
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
+        if(payload?.mbCoordinatorContentQueueIndex) {
             return false
         }
         return originalSet(payload)
     }
 
     const result = await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
+    // 2026-10-03: batch projection save is now deferred by default (see
+    // COORDINATOR_PROJECTION_DEFAULT_DEFER_DELAY_MS) -- advance fake time so
+    // the deferred write (and its injected failure) actually runs, then
+    // flush enough real microtask turns for its own internal await chain
+    // (metricStorageSet etc.) to fully settle.
+    await timers.tick(5000)
+    await flushAsync(20)
 
     assert.equal(result.settled, 1)
     assert.equal(result.confirmed, 1)
@@ -7820,7 +8452,7 @@ test('action lease request is WAL-backed and recovers after restart', async () =
     assert.ok(getStoredCoordinatorQueueWal(storage))
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.reason, 'test-request')
 
     const walRecords = getWalRecordsForGeneration(
@@ -8125,7 +8757,7 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     // action-lease-request test's pattern above.
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 2)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease.heartbeatAt, now)
     assert.equal(sw.coordinatorAuthority.current().queue[otherHref].actionLease.reason, 'expired-other')
 
@@ -8143,6 +8775,69 @@ test('action lease heartbeat is WAL-backed and does not clear unrelated expired 
     const hydrated = await restarted.sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].actionLease.heartbeatAt, now)
     assert.equal(hydrated.queue[otherHref].actionLease.reason, 'expired-other')
+})
+
+test('a resident-fast-path mutation records accurate durable work counts for the no-work-writes metric', async () => {
+    // 2026-10-06: recordActiveStorageWorkSnapshot used to only ever get
+    // called from inside the ~10 "load" functions (loadCoordinatorCurrentAuthorityState
+    // and siblings) -- a mutation that instead took applyLocked's resident-
+    // projection fast path (no currentAuthorityState supplied, the common
+    // case for call sites that don't bother pre-resolving one -- e.g.
+    // recoverExhaustedRolledBackQueuedCoordinatorItem) never recorded a
+    // snapshot at all, so the active storage context's durableActiveRows/
+    // durableQueuedRows stayed at their 0 default and
+    // recordStorageIdleChurnCounters misclassified the write as "no durable
+    // work" / "no runtime work" regardless of how busy the queue actually
+    // was. This proves the fix: a mutation reached via the resident fast
+    // path, with other real queued/active rows present, no longer trips
+    // storageUpdate.noDurableWork.
+    const mutatedHref = 'https://www.quora.com/profile/Synthetic-No-Work-Writes-Mutated'
+    const otherActiveHref = 'https://www.quora.com/profile/Synthetic-No-Work-Writes-Other-Active'
+    const otherQueuedHref = 'https://www.quora.com/profile/Synthetic-No-Work-Writes-Other-Queued'
+    const runId = 'run-no-work-writes-accounting'
+    const attemptId = 'attempt-no-work-writes-mutated'
+    const now = 266000
+    const {sw, storage} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [mutatedHref]: makeActiveCoordinatorRow({href: mutatedHref, runId, attemptId, tabId: 640, now}),
+                [otherActiveHref]: makeActiveCoordinatorRow({href: otherActiveHref, runId, attemptId: 'attempt-no-work-writes-other-active', tabId: 641, now}),
+                [otherQueuedHref]: makeQueuedCoordinatorRow({href: otherQueuedHref, runId, attemptId: 'attempt-no-work-writes-other-queued', now})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: mutatedHref, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    await sw.coordinatorAuthority.hydrate()
+
+    const mutationResult = await sw.enqueueSpaceFeedStorageUpdate(() => sw.coordinatorAuthority.applyWithinStorageUpdate({
+        operationKind: 'row-event-progress-milestone',
+        rowKey: mutatedHref,
+        reason: 'ordinaryMutation',
+        // Deliberately no currentAuthorityState/authorityState/lockedProjection
+        // -- forces applyLocked's resident-projection fast path, the one
+        // that used to skip recordActiveStorageWorkSnapshot entirely.
+        mutate(current) {
+            return {
+                ...current,
+                updatedAt: now + 100,
+                milestones: {
+                    ...(current.milestones || {}),
+                    actionReadyAt: now + 100
+                }
+            }
+        }
+    }))
+
+    assert.equal(mutationResult.durable, true, JSON.stringify(mutationResult))
+    assert.equal(sw.coordinatorAuthority.current().queue[mutatedHref].updatedAt, now + 100)
+    assert.equal(sw.state().queueWakeupCounters['storageUpdate.noDurableWork'] || 0, 0)
 })
 
 test('action lease heartbeat never rebuilds the content-queue-index/source-index projections', async () => {
@@ -8214,7 +8909,7 @@ test('action lease heartbeat never rebuilds the content-queue-index/source-index
     await timers.tick(0)
     await flushAsync(50)
 
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal(storage.mbCoordinatorContentQueueIndex.updatedAt, now - 1000)
 })
 
@@ -8591,14 +9286,15 @@ test('action lease release projection failure does not poison durable acknowledg
             mbCoordinatorEvents: []
         }
     })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
-            return false
-        }
-        return originalSet(payload)
-    }
-
+    // 2026-10-01: action-lease-release's deferred projection save is
+    // projectionPayload: 'queueViewOnly' -- that path is now a pure
+    // notifyCoordinatorDashboardStateChanged broadcast with no storage write
+    // of its own (see buildCoordinatorQueueDerivedProjectionPayload's own
+    // comment), so there's no write left for this test to fail and
+    // projectionFailed can never increment for this specific mutation
+    // anymore. What's left to verify is exactly what the test's name says:
+    // the durable WAL acknowledgement itself doesn't depend on that
+    // broadcast succeeding.
     const result = await sw.releaseCoordinatorActionLease({
         profileHref: href,
         attemptId,
@@ -8612,18 +9308,11 @@ test('action lease release projection failure does not poison durable acknowledg
     assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].actionLease, null)
-    // action-lease-release now defers its projection save (see the
-    // deferProjectionSave comment on mutateCoordinatorActionLeaseRelease in
-    // sw.js), so the failure this test injects is only observed once the
-    // deferred setTimeout(0) fires.
     await timers.tick(0)
     await flushAsync(50)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 0)
+    assert.equal(getFreshQueueView(sw, storage).items.find(row => row.storageKey === href)?.status, 'active')
 })
 
 test('action lease release rejects stale queue attempt before WAL append', async () => {
@@ -8883,7 +9572,7 @@ test('concurrent terminal projection saves do not regress newer terminal progres
     assert.equal(archivedA.status, 'succeeded')
     assert.equal(archivedB.status, 'succeeded')
     // Both rows archived out of .queue/queueView entirely.
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.succeeded, undefined)
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
         getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
@@ -9027,7 +9716,7 @@ test('terminal job progress reports durable terminal queue despite projection sa
     const archivedRow = await sw.findCompletedWorkRowByKey(href)
     assert.equal(archivedRow?.status, 'succeeded')
     assert.equal(archivedRow?.outcome, 'blocked')
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.succeeded, undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocked')
     assert.equal(sw.state().queueWakeupCounters['terminalProgress.projectionSaveFailed'] || 0, 0)
@@ -9093,7 +9782,7 @@ test('terminal job progress acknowledges durable terminal queue before projectio
     assert.equal(result.terminal, true)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'succeeded')
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.succeeded, undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
 
     await timers.tick(sw.state().constants.QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS + 1000)
@@ -9440,7 +10129,7 @@ test('clear profile state removes queue row through WAL authority and saves deri
     assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
     assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.queued || 0, 0)
     const clearLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
@@ -10468,7 +11157,7 @@ test('runtime authority sweep promotes matching queued authority row for owned l
     assert.ok(sw.state().activeQueuedTabs.includes(tabId))
     assert.equal(sw.state().queuedTabMetadata.find(([id]) => id === tabId)?.[1]?.durableActiveReason, 'runtime-authority-queued-row-transition')
     assert.ok((sw.state().queueWakeupCounters['queuedTabActions.runtimeAuthority.queuedRowPromoted'] || 0) >= 1)
-    assert.equal(storage.mbCoordinatorQueueView.items[0].status, 'active')
+    assert.equal(getFreshQueueView(sw, storage).items[0].status, 'active')
 })
 
 test('authority reconcile rejects persisted tab id reuse with unrelated live tab', async () => {
@@ -10955,7 +11644,7 @@ test('queued profile tab completing on a non-profile Quora URL is skipped and cl
     )
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
     assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'non-profile-target')
-    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
+    assert.equal(sw.buildCoordinatorQueueView(sw.coordinatorAuthority.current().queue, Date.now(), {runs: storage.mbCoordinatorRuns || {}}).counts.skipped, 1)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     await waitFor(
         () => storage.mbProfileNukeProgressView?.records?.[href]?.status === 'profile-unavailable',
@@ -11059,15 +11748,33 @@ test('queued profile tab redirecting to a different profile is skipped and close
     await timers.tick(1000)
     await flushAsync(20)
 
-    await waitFor(
-        () => sw.coordinatorAuthority.current().queue[href]?.status === 'skipped' ||
-            getRecoveredCoordinatorQueue(storage)[href]?.status === 'skipped',
+    // The terminal row (and the queue view's count for it) can be archived
+    // out of the live queue within the same tick budget this waitFor polls
+    // across (see TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS), so the predicate
+    // captures both the row and a queue-view snapshot built fresh from the
+    // resident authority queue together at the moment it's seen, rather than
+    // recomputing from storage afterward when archival may have already
+    // swept the row out of it. mbCoordinatorQueueView itself is never
+    // persisted (see refreshCoordinatorQueueViewForDashboard's own comment).
+    const terminalSnapshot = await waitFor(
+        () => {
+            const authorityQueue = sw.coordinatorAuthority.current().queue
+            const authorityRow = authorityQueue[href]
+            if(authorityRow?.status === 'skipped') {
+                return {row: authorityRow, queueView: sw.buildCoordinatorQueueView(authorityQueue, Date.now(), {runs: storage.mbCoordinatorRuns || {}})}
+            }
+            const recoveredRow = getRecoveredCoordinatorQueue(storage)[href]
+            if(recoveredRow?.status === 'skipped') {
+                return {row: recoveredRow, queueView: getFreshQueueView(sw, storage)}
+            }
+            return null
+        },
         'profile redirect mismatch authority row was not terminalized',
         {timers, attempts: 20, tickMs: 100}
     )
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
-    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'profile-redirect-mismatch')
-    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, 1)
+    assert.equal(terminalSnapshot.row.status, 'skipped')
+    assert.equal(terminalSnapshot.row.outcome, 'profile-redirect-mismatch')
+    assert.equal(terminalSnapshot.queueView?.counts?.skipped, 1)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     await waitFor(
         () => storage.mbProfileNukeProgressView?.records?.[href]?.status === 'profile-unavailable',
@@ -11153,14 +11860,22 @@ test('late successful terminal progress does not overwrite profile redirect mism
     await timers.tick(1000)
     await flushAsync(20)
 
-    await waitFor(
-        () => sw.coordinatorAuthority.current().queue[href]?.status === 'skipped' ||
-            getRecoveredCoordinatorQueue(storage)[href]?.status === 'skipped',
+    // Same race as the sibling "skipped and closed" test above: the row can
+    // archive out of .queue within this same poll budget, so capture the
+    // terminal row at the moment it's seen instead of re-reading it after.
+    const terminalRow = await waitFor(
+        () => {
+            const authorityRow = sw.coordinatorAuthority.current().queue[href]
+            if(authorityRow?.status === 'skipped') return authorityRow
+            const recoveredRow = getRecoveredCoordinatorQueue(storage)[href]
+            if(recoveredRow?.status === 'skipped') return recoveredRow
+            return null
+        },
         'profile redirect mismatch authority row was not terminalized before late progress',
         {timers, attempts: 20, tickMs: 100}
     )
-    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'skipped')
-    assert.equal(sw.coordinatorAuthority.current().queue[href].outcome, 'profile-redirect-mismatch')
+    assert.equal(terminalRow?.status, 'skipped')
+    assert.equal(terminalRow?.outcome, 'profile-redirect-mismatch')
 
     const lateResult = await browser.runtime.sendMessage({
         action: 'record-job-terminal',
@@ -11285,7 +12000,7 @@ test('authority reconcile skips durable active profile row that landed on a non-
     const archivedRow = await sw.findCompletedWorkRowByKey(href)
     assert.equal(archivedRow?.status, 'skipped')
     assert.equal(archivedRow?.outcome, 'non-profile-target')
-    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.skipped, undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
@@ -11344,7 +12059,7 @@ test('non-profile landing terminalization is WAL-backed and recovers after resta
     assert.equal(result.status, 'skipped')
     assert.equal(result.outcome, 'non-profile-target')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.skipped, undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
     assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
@@ -11660,7 +12375,7 @@ test('non-profile landing projection failure does not poison WAL terminalization
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
+        if(payload?.mbCoordinatorContentQueueIndex) {
             throw new Error('synthetic non-profile projection save failure')
         }
         return originalSet(payload)
@@ -11813,7 +12528,7 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), true)
     assert.equal(result.status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueView.counts.failed, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.failed, undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'failed')
     assert.equal(storage.mbCoordinatorEvents.length, 1)
     assert.equal(storage.mbCoordinatorEvents[0].details.coordinatorKey, key)
@@ -12191,7 +12906,7 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     assert.equal(result.resolved, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
     assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, false)
@@ -12737,7 +13452,7 @@ test('unresolved resolver terminalization is WAL-backed and recovers after resta
     assert.equal(result.recorded, true)
     assert.equal(result.status, 'skipped')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueView.counts.skipped, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.skipped, undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'skipped')
     assert.equal(storage.mbCoordinatorEvents.length, 1)
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
@@ -13127,7 +13842,7 @@ test('key-only terminalization projection failure does not poison WAL terminaliz
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
+        if(payload?.mbCoordinatorContentQueueIndex) {
             throw new Error('synthetic key-only projection save failure')
         }
         return originalSet(payload)
@@ -13448,6 +14163,11 @@ test('pauseCoordinatorNukes snapshots the flight recorder and diagnosticEvents t
     // pausing. Per user request, pausing snapshots both into
     // mbPauseDiagnosticSnapshot so a restart right after pausing doesn't
     // erase the evidence.
+    // 2026-09-29: snapshotDiagnosticsOnPause (sw.js) only writes when dev
+    // mode is on (mbDashboardDevModeEnabled) -- see fa3f663's "Gate the
+    // pause diagnostic snapshot on dev mode instead of writing it for every
+    // user" -- so this fixture needs it explicitly enabled to exercise the
+    // snapshot path at all.
     const {storage, sw} = loadServiceWorkerHarness({
         now: 500000,
         storage: {
@@ -13455,6 +14175,7 @@ test('pauseCoordinatorNukes snapshots the flight recorder and diagnosticEvents t
             mbCoordinatorQueue: {},
             mbCoordinatorRuns: {},
             mbCoordinatorEvents: [],
+            mbDashboardDevModeEnabled: true,
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
@@ -13816,7 +14537,7 @@ test('queue save rejects raw queue snapshot writes by default', async () => {
     assert.equal(counters['storagePayload.write.path.reason.ordinaryMutation.calls'], undefined)
 })
 
-test('direct raw queue storage writes maintain compact queue view', async () => {
+test('direct raw queue storage writes maintain content queue index but not a persisted queue view', async () => {
     const {sw, storage} = loadServiceWorkerHarness({now: 2000})
     const queuedHref = 'https://www.quora.com/profile/Direct-Queue-Write'
     const nonAuthorityHref = 'https://www.quora.com/profile/Direct-Non-Authority-Write'
@@ -13842,11 +14563,15 @@ test('direct raw queue storage writes maintain compact queue view', async () => 
         }
     }, {metricPath: 'directQueueWrite'})
 
-    assert.equal(storage.mbCoordinatorQueueView.version, 1)
-    assert.equal(storage.mbCoordinatorQueueView.total, 2)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 2)
-    assert.equal(storage.mbCoordinatorQueueView.authoritativeCounts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView.hasAuthoritativeStoredWork, true)
+    // 2026-10-02: a direct raw-queue write no longer persists a queue view
+    // to disk at all (see "get rid of it all") -- a dedicated write path
+    // (shared/js/swProfileNukeProgress.js's addContentPageStateProjectionPayload)
+    // used to inject one here unconditionally, missed during that removal,
+    // which kept the disk key perpetually re-populated with a stale/
+    // unratcheted snapshot the WAL's auto-recovery-from-view path later read
+    // back in as "the truth" after a hydrate failure -- confirmed live as
+    // reappearing queue rows and up to 3 concurrently active tabs.
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.equal(storage.mbCoordinatorContentQueueIndex.version, 2)
     assert.equal(storage.mbCoordinatorContentQueueIndex.indexed, 2)
 })
@@ -14162,8 +14887,8 @@ test('coordinator authority apply persists accepted row change', async () => {
     // recovered shadow queue as well (archived, not merely status-flipped).
     assert.equal(recoveredShadow.projected.state.queue[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(storage.mbCoordinatorQueueView.counts.failed, undefined)
-    assert.equal(storage.mbCoordinatorQueueView.items.find(item => item.storageKey === href), undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.failed, undefined)
+    assert.equal(storage.mbCoordinatorQueueView?.items.find(item => item.storageKey === href), undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'failed')
 
     const counters = sw.state().queueWakeupCounters
@@ -15040,7 +15765,7 @@ test('storage get records compact-view read payload by call path', async () => {
     assert.ok(counters['storagePayload.read.path.dashboard.initial.bytes'] > 0)
     assert.equal(counters['storagePayload.read.path.dashboard.initial.calls'], 1)
     assert.equal(counters['storagePayload.read.path.dashboard.initial.maxLatencyMs'] >= 0, true)
-    assert.equal(storage.mbCoordinatorQueueView.total, 120)
+    assert.equal(storage.mbCoordinatorQueueView?.total, 120)
 })
 
 test("flight recorder retains capacity and dropped count", async () => {
@@ -15067,6 +15792,32 @@ test("flight recorder retains capacity and dropped count", async () => {
     assert.equal(snapshot.entries.length, expectedCapacity)
     assert.equal(snapshot.entries[0].seq, 9)
     assert.equal(snapshot.entries.at(-1).seq, snapshot.newestSeq)
+})
+
+test('flight recorder survives a service-worker restart via onSuspend session flush', async () => {
+    const first = loadServiceWorkerHarness({now: 1000})
+    first.sw.__testResetFlightRecorder()
+    first.sw.recordFlightRecorderEvent({
+        kind: 'tab-open-request',
+        source: 'synthetic',
+        targetUrl: 'https://www.quora.com/profile/Session-Persisted'
+    })
+    const beforeSuspend = first.sw.getFlightRecorderSnapshot()
+    assert.equal(beforeSuspend.entries.length, 1)
+
+    await first.browser.runtime.onSuspend.emit()
+    await flushAsync(10)
+    assert.ok(first.browser.__sessionStorage?.mbFlightRecorderSnapshot)
+
+    // Same fake browser (and so the same chrome.storage.session) as a fresh
+    // sw.js module instance -- this is what a real MV3 idle eviction looks
+    // like: every module-level `let` resets, but session storage doesn't.
+    const restarted = loadServiceWorkerHarness({now: 2000, browser: first.browser})
+    await flushAsync(10)
+    const restartedSnapshot = restarted.sw.getFlightRecorderSnapshot()
+    const restored = restartedSnapshot.entries.find(entry => entry.targetUrl === 'https://www.quora.com/profile/Session-Persisted')
+    assert.ok(restored)
+    assert.equal(restored.kind, 'tab-open-request')
 })
 
 test("flight recorder filters by kind rowKey and targetUrl", async () => {
@@ -15303,31 +16054,31 @@ test('WAL storage can seed compact dashboard queue view without dashboard full r
     assert.equal(result.refreshed, true)
     assert.equal(result.total, 90)
     assert.equal(result.view.total, 90)
-    assert.equal(storage.mbCoordinatorQueueView.total, 90)
-    assert.equal(storage.mbCoordinatorQueueView.items.length, 90)
-    assert.equal(storage.mbCoordinatorQueueView.itemLimit, 90)
-    assert.equal(storage.mbCoordinatorQueueView.truncated, false)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 4)
+    assert.equal(result.view.items.length, 90)
+    assert.equal(result.view.itemLimit, 90)
+    assert.equal(result.view.truncated, false)
+    assert.equal(result.view.counts.queued, 4)
+    // mbCoordinatorQueueView is no longer persisted to disk -- see
+    // refreshCoordinatorQueueViewForDashboard's own comment -- so the
+    // "without dashboard full read" claim in this test's name is now true of
+    // every call, not just this seeded-from-WAL one; nothing writes the raw
+    // queue blob either.
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.deepEqual(storage.mbCoordinatorQueue, queue)
 
     const counters = sw.state().queueWakeupCounters
     assert.ok((counters['storagePayload.read.queueWal.bytes'] || 0) > 0)
     assert.equal(counters['storagePayload.read.queue.bytes'], undefined)
-    assert.ok(counters['storagePayload.write.queueView.bytes'] > 0)
+    assert.equal(counters['storagePayload.write.queueView.bytes'], undefined)
     assert.equal(counters['storagePayload.read.path.queueView.test.calls'], 1)
-    assert.equal(counters['storagePayload.write.path.queueView.test.calls'], 1)
 })
 
-test('dashboard queue view refresh skips the storage write when nothing changed since the last one', async () => {
-    // 2026-09-27: with a dashboard tab left open polling every 2s
-    // (DASHBOARD_COMPACT_REFRESH_INTERVAL_MS in coordinator.js) against an
-    // idle/paused queue, this used to write the freshly-built view
-    // unconditionally every single poll -- confirmed live via the flight
-    // recorder to produce thousands of no-op writes over a few hours, each
-    // also inflating storageUpdate.noDurableWork (the "No-work writes"
-    // card) for no real reason. It should now skip the write when the
-    // rebuilt view is identical (aside from updatedAt) to what's already
-    // stored, and only write again once something genuinely changes.
+test('dashboard queue view refresh never writes mbCoordinatorQueueView to storage', async () => {
+    // 2026-10-01: mbCoordinatorQueueView's disk copy was removed entirely
+    // (see refreshCoordinatorQueueViewForDashboard's own comment) -- open
+    // pages get it exclusively through this function's return value and the
+    // dashboard-notify broadcast, so every poll is a no-write, no-throttle
+    // computation and the returned total is always immediately accurate.
     const href = 'https://www.quora.com/profile/Synthetic-Unchanged-View'
     const {sw, storage} = loadServiceWorkerHarness({
         now: 1000,
@@ -15340,21 +16091,14 @@ test('dashboard queue view refresh skips the storage write when nothing changed 
 
     const first = await sw.refreshCoordinatorQueueViewForDashboard('poll')
     assert.equal(first.total, 1)
-    assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.queueView.poll.calls'], 1)
-    const firstUpdatedAt = storage.mbCoordinatorQueueView.updatedAt
+    assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.queueView.poll.calls'], undefined)
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
 
-    const second = await sw.refreshCoordinatorQueueViewForDashboard('poll')
-    assert.equal(second.total, 1)
-    // Still exactly 1 write: the second poll found nothing changed, so it
-    // never called metricStorageSet at all.
-    assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.queueView.poll.calls'], 1)
-    assert.equal(storage.mbCoordinatorQueueView.updatedAt, firstUpdatedAt)
-
-    // A genuine change (a new row) makes the next poll write again.
     storage.mbCoordinatorQueue[`${href}-2`] = makeQueuedCoordinatorRow({href: `${href}-2`, now: 1000})
-    const third = await sw.refreshCoordinatorQueueViewForDashboard('poll')
-    assert.equal(third.total, 2)
-    assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.queueView.poll.calls'], 2)
+    const second = await sw.refreshCoordinatorQueueViewForDashboard('poll')
+    assert.equal(second.total, 2)
+    assert.equal(sw.state().queueWakeupCounters['storagePayload.write.path.queueView.poll.calls'], undefined)
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
 })
 
 test('dashboard queue view refresh omits terminal rows whose runs were already pruned', async () => {
@@ -15411,13 +16155,13 @@ test('dashboard queue view refresh omits terminal rows whose runs were already p
     assert.equal(result.refreshed, true)
     assert.equal(result.total, 2)
     assert.equal(result.view.total, 2)
-    assert.equal(storage.mbCoordinatorQueueView.total, 2)
-    assert.equal(storage.mbCoordinatorQueueView.counts.failed, 1)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView.counts.succeeded || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.items.some(item => item.storageKey === staleHref), false)
-    assert.equal(storage.mbCoordinatorQueueView.items.some(item => item.storageKey === liveHref), true)
-    assert.equal(storage.mbCoordinatorQueueView.items.some(item => item.storageKey === pendingHref), true)
+    assert.equal(result.view.counts.failed, 1)
+    assert.equal(result.view.counts.queued, 1)
+    assert.equal(result.view.counts.succeeded || 0, 0)
+    assert.equal(result.view.items.some(item => item.storageKey === staleHref), false)
+    assert.equal(result.view.items.some(item => item.storageKey === liveHref), true)
+    assert.equal(result.view.items.some(item => item.storageKey === pendingHref), true)
+    assert.equal(storage.mbCoordinatorQueueView, undefined)
 })
 
 test('dashboard queue view refresh uses WAL terminal authority over stale raw queue', async () => {
@@ -15475,7 +16219,7 @@ test('dashboard queue view refresh uses WAL terminal authority over stale raw qu
     assert.equal(result.view.counts.succeeded, 1)
     assert.equal(result.view.counts.active || 0, 0)
     assert.equal(restarted.storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal(restarted.storage.mbCoordinatorQueueView.counts.succeeded, 1)
+    assert.equal(restarted.storage.mbCoordinatorQueueView, undefined)
     assert.equal(restarted.sw.state().queueWakeupCounters['storagePayload.read.path.queueView.wal-terminal-audit.calls'], 1)
 })
 
@@ -16566,7 +17310,17 @@ test('extension update rearms queued stored work without a manual resume poke', 
     assert.ok(['queued', 'opening', 'active'].includes(storage.mbCoordinatorQueue[href].status))
 })
 
-test('extension update refreshes stale compact queue view when durable queue is empty', async () => {
+test('extension update does not resume from a stale leftover queue view when the durable queue is empty', async () => {
+    // 2026-10-01: refreshStaleCompactQueueViewIfNeeded (the mechanism this
+    // test originally covered) was removed along with mbCoordinatorQueueView's
+    // disk persistence entirely -- there's no "stale persisted view" case to
+    // detect or repair any more, since nothing ever persists one. A leftover
+    // mbCoordinatorQueueView from a previous version (seeded here to prove
+    // the point) is simply never read: rearmStoredWorkAfterExtensionReload
+    // now asks the real WAL-backed queue directly
+    // (hasUnpausedStoredCoordinatorWorkInDurableQueue), which correctly
+    // reports nothing to resume regardless of what this stale leftover
+    // claims.
     const href = 'https://www.quora.com/profile/Synthetic-Stale-Queue-View'
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 3340,
@@ -16600,16 +17354,17 @@ test('extension update refreshes stale compact queue view when durable queue is 
     await flushAsync(250)
 
     assert.equal(storage.mbCoordinatorQueue, undefined)
-    assert.equal(storage.mbCoordinatorQueueView.total, 0)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.hasAuthoritativeStoredWork, false)
+    assert.equal(getFreshQueueView(sw, storage).total, 0)
     assert.equal(listTabs(browser).some(tab => tab.url === href), false)
-    assert.equal(sw.state().queueWakeupCounters['pump.changed.staleQueueViewRefreshed'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['pump.changed.staleQueueViewRefreshed'] || 0, 0)
 })
 
-test('dashboard ready refreshes stale compact queue view when durable queue is empty', async () => {
+test('dashboard ready ignores a stale leftover queue view and reports no stored work', async () => {
+    // See the sibling "extension update" test's own comment -- same removal,
+    // same reasoning. coordinator-page-ready no longer calls
+    // refreshStaleCompactQueueViewIfNeeded at all.
     const href = 'https://www.quora.com/profile/Synthetic-Dashboard-Stale-Queue-View'
-    const {browser, storage} = loadServiceWorkerHarness({
+    const {browser, sw, storage} = loadServiceWorkerHarness({
         now: 3340,
         storage: {
             mbCoordinatorPaused: false,
@@ -16642,12 +17397,15 @@ test('dashboard ready refreshes stale compact queue view when durable queue is e
     assert.equal(ready.displayOnly, true)
     assert.equal(ready.requiresQuoraVisit, true)
     assert.equal(storage.mbCoordinatorQueue, undefined)
-    assert.equal(storage.mbCoordinatorQueueView.total, 0)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.hasAuthoritativeStoredWork, false)
+    assert.equal(getFreshQueueView(sw, storage).total, 0)
 })
 
-test('dashboard resume and cancel clear compact-only queued rows without spawning executor tabs', async () => {
+test('dashboard resume and cancel ignore a stale leftover queue view and spawn no executor tabs', async () => {
+    // 2026-10-01: same removal as the two tests above -- resume/cancel no
+    // longer special-case "the view claims stored work but the durable
+    // queue doesn't have it" (refreshStaleCompactQueueViewIfNeeded is gone),
+    // they just ask the real WAL-backed queue directly and get the
+    // ordinary "nothing to do" outcome.
     const firstHref = 'https://www.quora.com/profile/Synthetic-Compact-Only-Resume'
     const secondHref = 'https://www.quora.com/profile/Synthetic-Compact-Only-Cancel'
     const {browser, sw, storage, timers} = loadServiceWorkerHarness({
@@ -16677,18 +17435,15 @@ test('dashboard resume and cancel clear compact-only queued rows without spawnin
     })
 
     await activateQuoraRuntime(browser, firstHref)
-    const resume = await browser.runtime.sendMessage({
+    const resume = await settleWithFakeTimers(browser.runtime.sendMessage({
         action: 'resume-paused-coordinator-nukes'
-    })
+    }), timers)
     await flushAsync(100)
     await timers.tick(1000)
     await flushAsync(250)
 
-    assert.equal(resume.reason, 'stale-queue-view-refreshed')
     assert.equal(storage.mbCoordinatorQueue, undefined)
-    assert.equal(storage.mbCoordinatorQueueView.total, 0)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.hasAuthoritativeStoredWork, false)
+    assert.equal(getFreshQueueView(sw, storage).total, 0)
     assert.equal(listTabs(browser).some(tab => tab.url === firstHref || tab.url === secondHref), false)
 
     storage.mbCoordinatorQueueView = {
@@ -16712,13 +17467,11 @@ test('dashboard resume and cancel clear compact-only queued rows without spawnin
         action: 'cancel-coordinator-current-work'
     })
 
-    assert.equal(cancel.reason, 'stale-queue-view-refreshed')
     assert.equal(cancel.canceledUrls.length, 0)
     assert.equal(cancel.ownedTabIds.length, 0)
-    assert.equal(storage.mbCoordinatorQueueView.total, 0)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued || 0, 0)
+    assert.equal(getFreshQueueView(sw, storage).total, 0)
     assert.equal(listTabs(browser).some(tab => tab.url === secondHref), false)
-    assert.equal(sw.state().queueWakeupCounters['pump.changed.staleQueueViewRefreshed'] || 0, 2)
+    assert.equal(sw.state().queueWakeupCounters['pump.changed.staleQueueViewRefreshed'] || 0, 0)
 })
 
 test('dashboard resume starts service-worker queued work before alarm delivery', async () => {
@@ -17034,7 +17787,7 @@ test('active transition retargets a replacement actor tab for the same attempt',
     assert.equal(transitioned, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, newTabId)
-    assert.equal(storage.mbCoordinatorQueueView.items.find(item => item.storageKey === href).tabId, newTabId)
+    assert.equal(getFreshQueueView(sw, storage).items.find(item => item.storageKey === href).tabId, newTabId)
 })
 
 test('coordinator reconcile alarm clears the pending timeout and runs reconcile', async () => {
@@ -18052,12 +18805,12 @@ test('service-worker reuses existing worker window after in-memory surface state
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const existingSurface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
     const duplicateSurface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -18159,12 +18912,12 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const existingSurface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
     const duplicateSurface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -18177,7 +18930,7 @@ test('service-worker reuses persisted worker window when tab URLs are hidden', a
         mbQueuedActionSurfaceState: {
             windowId: existingSurface.id,
             anchorTabId,
-            url: browser.runtime.getURL('coordinator.html#worker-window'),
+            url: browser.runtime.getURL('coordinator.html#progress'),
             reason: 'previous-service-worker',
             updatedAt: 2001
         }
@@ -18215,7 +18968,7 @@ test('service-worker closes idle orphan worker windows after Quora activation', 
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
     })
     const orphanSurface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -18409,7 +19162,14 @@ test('service-worker worker window stays open while durable queued work remains'
     await flushAsync(20)
 
     const recoveredQueue = getRecoveredCoordinatorQueue(storage)
-    assert.equal(recoveredQueue[secondHref].status, 'queued')
+    // The shortened terminal-progress settlement defer (see
+    // TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS) means queue continuation can
+    // pick the second row up for execution within this same tick budget, so
+    // it may already have advanced from 'queued' to 'active' by the time
+    // this reads storage. Either way it's still durable, non-terminal work
+    // -- which is what this test is actually checking keeps the worker
+    // window open below.
+    assert.ok(['queued', 'active'].includes(recoveredQueue[secondHref].status))
     assert.equal(browser.__tabs.has(profileTab.id), false)
     assert.equal(browser.__windows.has(workerWindowId), true)
     assert.equal(sw.state().queueWakeupCounters['actionSurface.workerWindow.cleanupBusy.durableQueued'] > 0, true)
@@ -19355,7 +20115,7 @@ test('coordinator enqueue persists QuoraReporting asset provenance', async () =>
     const href = 'https://www.quora.com/profile/Synthetic-Provenance-Asset'
     const runId = 'run-provenance-asset'
     const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, storage} = loadServiceWorkerHarness({now: 3020})
+    const {browser, storage, sw} = loadServiceWorkerHarness({now: 3020})
 
     const provenance = {
         kind: 'quora-reporting-asset',
@@ -19390,8 +20150,11 @@ test('coordinator enqueue persists QuoraReporting asset provenance', async () =>
     assert.equal(enqueue.queued, 1, JSON.stringify(enqueue))
     const row = getRecoveredCoordinatorQueue(storage)[href]
     assert.deepEqual(row.provenance, provenance)
-    const viewRow = storage.mbCoordinatorQueueView.items.find(item => item.targetProfileHref === href)
-    assert.deepEqual(viewRow.provenance, provenance)
+    const viewRow = getFreshQueueView(sw, storage).items.find(item => item.targetProfileHref === href)
+    // normalizeCoordinatorItemProvenance returns a null-prototype object --
+    // deepEqual's prototype check fails even though every key/value matches,
+    // same reasoning as normalizeCoordinatorMap elsewhere in this file.
+    assert.equal(JSON.stringify(viewRow.provenance), JSON.stringify(provenance))
 })
 
 test('enqueue WAL append failure does not reset active owned tab', async () => {
@@ -22062,7 +22825,7 @@ test('executor apply adopts service-worker-owned queued row from duplicate worke
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -22130,7 +22893,7 @@ test('executor apply adopts live worker-surface tab after fill timeout before op
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -22222,7 +22985,7 @@ test('queued live-tab recovery adopts resolve-profile worker-surface tab by requ
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -22587,7 +23350,15 @@ test('executor apply requeues actorless active row and re-primes queued no-open 
         // real timeout).
         assert.ok([0, 1].includes(sw.state().queuedTabActions.length))
         if(sw.state().queuedTabActions.length) {
-            assert.equal(sw.state().queuedTabActions[0].profileHref, queuedHref)
+            // 2026-10-06: which of the two now-queued rows (the originally-
+            // active one, requeued for its missing tab, or the originally-
+            // queued one) wins the single reprime slot is itself a race --
+            // confirmed both legitimately end up 'queued' here regardless.
+            // Faster incremental WAL appends (coordinatorQueueWalResidentStoreCache
+            // backfill, 2026-10-06) shifted which one typically wins without
+            // either being wrong; same race class the comment above already
+            // documents for queued-tab-fill-timeout-before-open-attempt.
+            assert.ok([activeHref, queuedHref].includes(sw.state().queuedTabActions[0].profileHref))
         }
     }
     else {
@@ -22783,7 +23554,22 @@ test('executor apply queue critical storage avoids soft-fails in compound active
     })
     void resultPromise.catch(() => null)
 
-    const result = await settleWithFakeTimers(resultPromise, timers, [0, 250, 750, 1500, 4000, 10000, 30000, 60000])
+    // 2026-09-29: the original coarse schedule (...4000, 10000, 30000, 60000)
+    // advanced the fake clock straight from 706500 to 716500 in one 10000ms
+    // leap -- landing exactly on QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS's
+    // own boundary for the queued-live-tab adoption's durably-active confirm
+    // check. That confirm check has no real latency of its own (the harness's
+    // storage mock resolves on a plain microtask, no fake-timer dependency),
+    // so it should trivially beat a 10-second timeout -- but the single big
+    // tick gave the fake-timer engine's pending-timeout queue no smaller
+    // checkpoint to let that microtask chain resolve before the timeout's
+    // own deadline landed at the same virtual instant, so the confirm lost
+    // the race purely on fake-clock coarseness and the reconcile sweep
+    // treated the freshly-adopted tab as an unconfirmed orphan and closed
+    // it. Splitting that single 10000ms jump into ten 1000ms ticks gives the
+    // confirm's microtask chain room to settle on an earlier, smaller step.
+    const result = await settleWithFakeTimers(resultPromise, timers,
+        [0, 250, 750, 1500, 4000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 30000, 60000])
     browser.tabs.sendMessage = originalSendMessage
 
     assertStorageSoftFailCounterDeltaZero(sw, softFailCountersBefore)
@@ -23215,7 +24001,7 @@ test('executor apply adopts worker-surface live tab on final open decision timeo
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -23397,7 +24183,7 @@ test('executor apply repairs final-open timeout live batch shape with duplicate 
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -23690,6 +24476,186 @@ test('executor apply defers queued-authority fill timeout before open attempt', 
     assert.equal(recorder.entries.length, 0)
 })
 
+test('fast-executor resume coalesces a recent identical no-op instead of repeating the full pass', async () => {
+    const activationHref = 'https://www.quora.com/profile/Synthetic-Fast-Executor-Coalesce-Activation'
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 90000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {},
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    await activateQuoraRuntime(browser, activationHref)
+
+    const first = await sw.runCoordinatorQueueExecutorFastPath('synthetic-fast-executor-coalesce-first', {
+        awaitFill: true,
+        skipAuthorityReconcile: true
+    })
+    assert.notEqual(first.reason, 'fast-executor-recent-noop-coalesced')
+    const noopAfterFirst = sw.state().queueWakeupCounters['pump.fastExecutor.noop'] || 0
+    assert.ok(noopAfterFirst >= 1)
+
+    const second = await sw.runCoordinatorQueueExecutorFastPath('synthetic-fast-executor-coalesce-second', {
+        awaitFill: true,
+        skipAuthorityReconcile: true
+    })
+    assert.equal(second.reason, 'fast-executor-recent-noop-coalesced')
+    assert.equal(second.coalescedFrom, first.reason)
+    assert.equal(sw.state().queueWakeupCounters['pump.fastExecutor.noop'] || 0, noopAfterFirst)
+    assert.ok((sw.state().queueWakeupCounters['pump.fastExecutor.recentNoopCoalesced'] || 0) >= 1)
+})
+
+test('queue WAL checkpoint switch writes a gzip-compressed checkpoint', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Checkpoint-Gzip-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Checkpoint-Gzip-B'
+    const runId = 'run-checkpoint-gzip'
+    const {sw, storage} = loadServiceWorkerHarness({
+        now: 400000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-checkpoint-gzip-a', now: 400000}),
+                [hrefB]: makeQueuedCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-checkpoint-gzip-b', now: 400000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: hrefA, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpointSwitch.checkpointSwitched, true)
+    assert.equal(checkpointSwitch.durable, true)
+
+    const walMeta = storage['mbCoordinatorQueueWal.meta']
+    const checkpoint = storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}`]
+    assert.equal(checkpoint.codec, 'gzip')
+    assert.equal(checkpoint.encoding, 'base64')
+    assert.equal(typeof checkpoint.state, 'undefined')
+    assert.ok(typeof checkpoint.payload === 'string' && checkpoint.payload.length > 0)
+    assert.ok(checkpoint.compressedBytes < checkpoint.uncompressedBytes)
+
+    // Round-trip correctness: a fresh hydrate must still recover both rows
+    // from the now-compressed checkpoint.
+    const rehydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(rehydrated.queue[hrefA].status, 'queued')
+    assert.equal(rehydrated.queue[hrefB].status, 'queued')
+})
+
+test('coordinator queue WAL recovery still reads a pre-compression (raw) checkpoint correctly', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Checkpoint-Legacy-Raw'
+    const runId = 'run-checkpoint-legacy-raw'
+    const {sw} = loadServiceWorkerHarness({
+        now: 400100,
+        storage: {
+            mbCoordinatorPaused: false,
+            // Seeded directly as a raw (pre-compression) checkpoint, mirroring
+            // the exact shape every checkpoint written before this fix has on
+            // disk right now: codec: 'raw-json', encoding: 'object', an
+            // inline `state` object -- no gzip payload at all.
+            'mbCoordinatorQueueWal.meta': {
+                version: 1,
+                activeCheckpoint: 'A',
+                snapshotSeq: 1,
+                nextSeq: 2,
+                generations: {
+                    A: {snapshotSeq: 1, segments: 0},
+                    B: {snapshotSeq: 0, segments: 0}
+                },
+                checkpointSwitch: {inProgress: false, targetSeq: 0, startedAt: 0},
+                segmentedStorage: {version: 1, committedSegments: {A: 0, B: 0}, softSwitchAt: 0, hardSegmentLimit: 0, updatedAt: 400100}
+            },
+            'mbCoordinatorQueueWal.checkpoint.A': {
+                version: 1,
+                id: 'A',
+                snapshotSeq: 1,
+                snapshotEpoch: 0,
+                createdAt: 400100,
+                stateHash: '',
+                codec: 'raw-json',
+                encoding: 'object',
+                uncompressedBytes: 0,
+                compressedBytes: 0,
+                base64Bytes: 0,
+                state: {
+                    queue: {
+                        [href]: makeQueuedCoordinatorRow({href, runId, attemptId: 'attempt-checkpoint-legacy-raw', now: 400100})
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const hydrated = await sw.coordinatorAuthority.hydrate()
+    assert.equal(hydrated.queue[href].status, 'queued')
+})
+
+test('executor apply post-fill-timeout authority refresh scopes its progress fetch to known activation hrefs', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Classifier-Fill-Timeout-Scoped-Refresh'
+    const runId = 'run-classifier-fill-timeout-scoped-refresh'
+    const attemptId = 'attempt-classifier-fill-timeout-scoped-refresh'
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now: 376110,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeQueuedCoordinatorRow({href, runId, attemptId, now: 376110}),
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testSetQueuedTabFillPromise(new Promise(resolve => {
+        timers.setTimeout(() => {
+            resolve({
+                openedTabs: 0,
+                active: 0,
+                schedulerBlockingActive: 0,
+                remainingActions: 0,
+                reason: 'queued-tab-fill-timeout',
+                timedOut: true,
+                error: 'queued tab fill timed out after 20000ms'
+            })
+        }, 0)
+    }), 376110)
+
+    await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-classifier-fill-timeout-scoped-refresh', {
+            ownerTabId: 'service-worker-queue-owner',
+            serviceWorkerOwned: true,
+            queueOnlyAuthority: true,
+            forceDurableQueueReload: true,
+            awaitFill: true,
+            returnAfterDurableActive: true
+        }),
+        timers,
+        [0, 250, 750, 1500, 4000]
+    )
+
+    const counters = sw.state().queueWakeupCounters
+    assert.ok((counters['storagePayload.read.path.currentAuthority.load.scoped.calls'] || 0) >= 1)
+    assert.ok((counters['storagePayload.read.path.currentAuthority.load.scoped.maxBytes'] || 0) < 2000)
+})
 
 test('executor apply defers queued-authority enqueue when fill timeout has active work in flight', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Classifier-Fill-Timeout-Active-Work'
@@ -23833,7 +24799,7 @@ test('executor apply adopts live tab when runtime-materializing fill timeout alr
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -23963,7 +24929,7 @@ test('executor apply treats vanished post-materialization live tab as transient 
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -25524,7 +26490,7 @@ test('executor apply adopts live worker tab before opening duplicate queued runt
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -27087,7 +28053,7 @@ test('executor apply consumes expired worker-window active-missing-tab and close
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -27097,7 +28063,7 @@ test('executor apply consumes expired worker-window active-missing-tab and close
         mbQueuedActionSurfaceState: {
             windowId: surface.id,
             anchorTabId: surfaceTabId,
-            url: browser.runtime.getURL('coordinator.html#worker-window'),
+            url: browser.runtime.getURL('coordinator.html#progress'),
             reason: 'synthetic-worker-active-missing',
             updatedAt: 100000
         }
@@ -27456,7 +28422,7 @@ test('queued fill does not open second worker profile tab while surface profile 
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -28738,7 +29704,7 @@ test('service-worker executor adopts orphaned worker-window resolve-profile tab 
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -30370,7 +31336,7 @@ test('no-foreground worker window releases profile tab after settled active tran
         }
     })
     const surface = await browser.windows.create({
-        url: browser.runtime.getURL('coordinator.html#worker-window'),
+        url: browser.runtime.getURL('coordinator.html#progress'),
         focused: false,
         type: 'normal'
     })
@@ -30679,7 +31645,7 @@ test('active transition is WAL-backed and recovers after restart', async () => {
     assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
 
@@ -30831,7 +31797,7 @@ test('active transition durable acknowledgement ignores queued tab close metadat
 
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
 })
 
 test('active transition does not require runtime queued tab maps', async () => {
@@ -30888,7 +31854,7 @@ test('active transition does not require runtime queued tab maps', async () => {
 
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active, 1)
+    assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
 })
 
 test('active transition is rejected while paused instead of racing the pause rollback', async () => {
@@ -30977,16 +31943,13 @@ test('active transition projection failure does not poison durable acknowledgeme
         attemptId,
         attemptNumber: 1
     })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    let projectionWrites = 0
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorQueueView) {
-            projectionWrites += 1
-            return false
-        }
-        return originalSet(payload)
-    }
-
+    // 2026-10-01: this mutation's projectionPayload is 'queueViewOnly' with
+    // includeProjectionInWalSave left false (details doesn't set
+    // allowActiveTransitionAfterRollback), so it always takes the pure
+    // notifyCoordinatorDashboardStateChanged broadcast branch -- no storage
+    // write of its own left to fail (see buildCoordinatorQueueDerivedProjectionPayload's
+    // own comment). What's left to verify is exactly the test's name: the
+    // durable WAL acknowledgement doesn't depend on that broadcast.
     const result = await sw.transitionCoordinatorItemForQueuedTab({
         profileHref: href,
         url: href,
@@ -31017,13 +31980,9 @@ test('active transition projection failure does not poison durable acknowledgeme
     await timers.tick(0)
     await flushAsync(50)
 
-    assert.equal(projectionWrites, 1)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 0)
+    assert.equal(getFreshQueueView(sw, storage).items.find(item => item.storageKey === href)?.status, 'active')
 })
 
 test('stale active transition append cannot repaint compact queue view over WAL authority', async () => {
@@ -31113,8 +32072,9 @@ test('stale active transition append cannot repaint compact queue view over WAL 
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].attemptId, freshAttemptId)
     await timers.tick(0)
     await flushAsync(50)
-    assert.equal(storage.mbCoordinatorQueueView.counts.active || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.items.some(item =>
+    const freshView = getFreshQueueView(sw, storage)
+    assert.equal(freshView.counts.active || 0, 0)
+    assert.equal(freshView.items.some(item =>
         (item.storageKey || item.targetProfileHref || item.requestedUrl) === href &&
             item.status === 'active'
     ), false)
@@ -32615,6 +33575,92 @@ test('stale queued tab sweep defers hung tab lookup without releasing executor s
     )
 })
 
+test('stale queued tab sweep looks up multiple active tabs concurrently, not sequentially', async () => {
+    // 2026-10-08: live telemetry (v1.6.1382's per-reason tabGetFailed/
+    // tabGetTimedOut breakdown) found sweepStaleQueuedTabs's own tab-status
+    // lookups were the single largest source of genuine chrome.tabs.get()
+    // timeouts -- a sequential for...await loop meant a slow/hung lookup
+    // for one active tab delayed even *starting* the lookup for the next.
+    // Fixed by prefetching all active tabs' statuses via Promise.all
+    // (only when there's more than one, to avoid changing timing for the
+    // common 0-or-1-tab case the rest of this file's fake-timer tests
+    // depend on). This test proves the concurrency directly: both tabs'
+    // browser.tabs.get is invoked before either's hung promise is given a
+    // chance to resolve, rather than the second only starting after the
+    // first's full timeout elapses.
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Concurrent-Sweep-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Concurrent-Sweep-B'
+    const runId = 'run-concurrent-sweep'
+    const attemptIdA = 'attempt-concurrent-sweep-a'
+    const attemptIdB = 'attempt-concurrent-sweep-b'
+    const tabIdA = 781
+    const tabIdB = 782
+    const {browser, sw, timers} = loadServiceWorkerHarness({
+        now: 3695,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefA]: makeActiveCoordinatorRow({href: hrefA, runId, attemptId: attemptIdA, tabId: tabIdA, now: 3695}),
+                [hrefB]: makeActiveCoordinatorRow({href: hrefB, runId, attemptId: attemptIdB, tabId: tabIdB, now: 3695})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: hrefA, runId, targetProfileHrefs: [hrefA, hrefB]})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    sw.__testAddProvisionalQueuedTab(tabIdA, {
+        profileHref: hrefA,
+        coordinatorKey: hrefA,
+        requestedUrl: hrefA,
+        ownerTabId: 'service-worker-queue-owner',
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        runId,
+        attemptId: attemptIdA,
+        attemptNumber: 1,
+        openedAt: 3600,
+        durableActiveAt: 3610
+    })
+    sw.__testAddProvisionalQueuedTab(tabIdB, {
+        profileHref: hrefB,
+        coordinatorKey: hrefB,
+        requestedUrl: hrefB,
+        ownerTabId: 'service-worker-queue-owner',
+        tabAction: 'nuke',
+        actionKind: 'mute-block',
+        runId,
+        attemptId: attemptIdB,
+        attemptNumber: 1,
+        openedAt: 3600,
+        durableActiveAt: 3610
+    })
+
+    const originalGet = browser.tabs.get.bind(browser.tabs)
+    const callOrder = []
+    browser.tabs.get = async candidateTabId => {
+        const normalized = Number.parseInt(candidateTabId, 10)
+        if(normalized === tabIdA || normalized === tabIdB) {
+            callOrder.push(normalized)
+            return new Promise((resolve, reject) => {
+                timers.setTimeout(() => reject(new Error('synthetic hung tab get timeout')), 2500)
+            })
+        }
+        return originalGet(candidateTabId)
+    }
+
+    const sweepPromise = sw.sweepStaleQueuedTabs()
+    await settleWithFakeTimers(Promise.resolve(), timers, [0])
+
+    assert.equal(callOrder.length, 2)
+    assert.ok(callOrder.includes(tabIdA))
+    assert.ok(callOrder.includes(tabIdB))
+
+    await settleWithFakeTimers(sweepPromise, timers, [1000, 1500, 0, 0, 0, 1000, 1000, 1500, 0, 0, 0, 1000, 0, 0])
+    browser.tabs.get = originalGet
+})
+
 test('authority reconcile requeues durable active row without runtime actor through WAL', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-No-Actor'
     const runId = 'run-active-no-actor'
@@ -32678,8 +33724,9 @@ test('authority reconcile requeues durable active row without runtime actor thro
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueueView.counts.active || 0, 0)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
+    const freshView = getFreshQueueView(sw, storage)
+    assert.equal(freshView.counts.active || 0, 0)
+    assert.equal(freshView.counts.queued, 1)
     assert.notEqual(sw.coordinatorAuthority.current().queue[href].attemptId, 'attempt-active-no-actor')
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
@@ -34996,8 +36043,8 @@ test('authority reconcile ignores stale mismatched progress for active-without-a
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.queued, 1)
+    assert.equal(storage.mbCoordinatorQueueView?.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -35075,8 +36122,8 @@ test('authority reconcile requeues projection-only action-phase active row when 
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
-    assert.equal(storage.mbCoordinatorQueueView.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    assert.equal(storage.mbCoordinatorQueueView?.counts.queued, 1)
+    assert.equal(storage.mbCoordinatorQueueView?.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -38391,6 +39438,194 @@ test('re-enqueuing an archived failed row for retry correctly revives it into th
 
     const stillCompleted = await sw.findCompletedWorkRowByKey(href)
     assert.equal(stillCompleted, null, 'removed from the completed log once revived into the live queue')
+})
+
+test('reconcile tick recovers a stale active row with no live tab, independent of queued-action pruning', async () => {
+    // Regression for a live 2026-10-06 incident: a durable row sat at status
+    // 'active' for over an hour with zero matching live tabs while reconcile
+    // ticks kept firing normally every ~60s. Root cause: the deep classifier
+    // that handles this exact case (runCoordinatorExecutorApplyPhase's
+    // 'active-missing-tab' handling) was only reached from the reconcile
+    // tick when prunedQueuedActions > 0 that tick -- a condition about
+    // unrelated pending tab-claim intents, unrelated to whether THIS row's
+    // tab is gone. With no queued actions to prune (the common case once a
+    // row has been stuck a while), the classifier never ran at all. This
+    // proves the new unconditional stale-active-row watchdog
+    // (recoverStaleActiveCoordinatorRows, wired into every reconcile tick)
+    // catches it instead.
+    const href = 'https://www.quora.com/profile/Synthetic-Stale-Active-Watchdog'
+    const runId = 'run-stale-active-watchdog'
+    const attemptId = 'attempt-stale-active-watchdog'
+    const now = 1000000
+    const {sw, storage, timers} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: 9501, now}),
+                    // Well past STALE_ACTIVE_COORDINATOR_ROW_WATCHDOG_MS
+                    // (180000ms) and with no provisional/live tab ever
+                    // registered for tabId 9501 -- the exact "zombie active
+                    // row" shape from the live incident.
+                    activeAt: now - 300000,
+                    updatedAt: now - 300000
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
+    // No queued actions exist to prune this tick -- the exact condition
+    // that left prunedQueuedActions at 0 and skipped the classifier in the
+    // live incident, pre-fix.
+    assert.equal(sw.state().queueWakeupCounters['reconcile.changed.queuedActionsPruned'] || 0, 0)
+
+    await settleWithFakeTimers(
+        sw.runCoordinatorReconcileTick('synthetic-stale-active-watchdog', {allowBeforeQuora: true}),
+        timers,
+        [0, 250, 750, 1500, 4000, 10000, 20000, 0]
+    )
+
+    assert.equal(sw.state().queueWakeupCounters['reconcile.staleActiveRowWatchdogRecovered'] || 0, 1)
+    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].status, 'active')
+})
+
+test('executor apply phase bounds its queued-row scan instead of examining the whole backlog', async () => {
+    // Regression for a live 2026-10-07 incident: a 1167-item backlog
+    // resume measured scan.runCoordinatorExecutorApplyPhase.items averaging
+    // ~1147 (the full queue) across 513 calls in 14 minutes, correlating
+    // with job.tabGetFailed/job.tabGetTimedOut swamping job.tabOpened
+    // ~25:1 and a 26.2s/99.7s real-block/handoff reading -- the
+    // classifyCoordinatorExecutorState step already bounds ITS classification
+    // to the front of the FIFO queue, but runCoordinatorExecutorApplyPhase's
+    // own loop still paid the cheap-but-nonzero per-item cost (href
+    // derivation, progress lookup, attempt-mismatch checks) for every
+    // untouched backlog row regardless. This seeds a queue well past
+    // COORDINATOR_RECONCILE_ACTION_BUDGET (25) and proves the new budget
+    // actually skips rows beyond it, rather than just hoping the classifier
+    // bound alone was enough.
+    const runId = 'run-executor-apply-scan-bound'
+    const totalRows = 200
+    const queue = {}
+    const targetProfileHrefs = []
+    for(let index = 0; index < totalRows; index += 1) {
+        const href = `https://www.quora.com/profile/Synthetic-Scan-Bound-${index}`
+        targetProfileHrefs.push(href)
+        queue[href] = {
+            ...makeQueuedCoordinatorRow({href, runId, attemptId: `attempt-scan-bound-${index}`, now: 5000}),
+            executorMaxConcurrent: 1
+        }
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href: targetProfileHrefs[0], runId, targetProfileHrefs})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    await sw.runCoordinatorExecutorApplyPhase('synthetic-scan-bound', {
+        ownerTabId: 'service-worker-queue-owner',
+        serviceWorkerOwned: true,
+        queueOnlyAuthority: true,
+        forceDurableQueueReload: true,
+        awaitFill: false,
+        returnAfterDurableActive: true
+    })
+
+    const skipped = sw.state().queueWakeupCounters['reconcile.executor.queuedScanBudgetSkipped'] || 0
+    assert.equal(skipped, totalRows - 25,
+        `expected exactly the rows beyond the 25-row budget to be skipped, got ${skipped}`)
+})
+
+test('content-page state reads only its own profileHref shard, not the full content-queue-index blob', async () => {
+    // Regression for a live 2026-10-07 finding: getContentPageCoordinatorState
+    // (every Quora profile/space page's "what's my queue status" poll) read
+    // the entire COORDINATOR_CONTENT_QUEUE_INDEX_KEY blob on every call --
+    // confirmed live at 1.09MB avg on a ~1100-row backlog, since that key
+    // covers up to MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS items from the
+    // WHOLE live queue regardless of how many hrefs the page actually asked
+    // about. Fixed by sharding the same data by profileHref (mirroring the
+    // already-proven profile-nuke-progress/content-source-index shard
+    // pattern) and reading only the shard(s) for the requested hrefs. The
+    // old monolithic key is still written (other tests/consumers still rely
+    // on its exact shape) -- this proves the hot read path no longer
+    // fetches it.
+    const targetHref = 'https://www.quora.com/profile/Scoped-Shard-Target'
+    const queue = {}
+    for(let index = 0; index < 1200; index += 1) {
+        const href = `https://www.quora.com/profile/Scoped-Shard-Filler-${index}`
+        queue[href] = {
+            id: `filler-${index}`,
+            status: 'queued',
+            serviceWorkerOwned: true,
+            executorOwner: 'service-worker',
+            targetProfileHref: href,
+            queuedAt: 10000 + index,
+            updatedAt: 10000 + index
+        }
+    }
+    queue[targetHref] = {
+        id: 'scoped-shard-target',
+        status: 'queued',
+        serviceWorkerOwned: true,
+        executorOwner: 'service-worker',
+        targetProfileHref: targetHref,
+        queuedAt: 1,
+        updatedAt: 1
+    }
+
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        storage: {
+            mbProfileNukeProgressView: {
+                version: 2,
+                updatedAt: 20,
+                total: 0,
+                recordLimit: 1200,
+                truncated: false,
+                records: {}
+            }
+        }
+    })
+    await sw.metricStorageSet({
+        mbCoordinatorQueue: queue
+    }, {metricPath: 'seed.scopedShardTarget'})
+
+    // Confirm the old monolithic key really was built with the full queue
+    // (sanity check that this scenario is the same shape the live incident
+    // was -- a big, truncated, content-queue-index) before proving the new
+    // read path ignores it.
+    assert.equal(storage.mbCoordinatorContentQueueIndex.truncated, true)
+    assert.ok(Object.keys(storage).some(key => key.startsWith('mbCoordinatorContentQueueIndexShard.')))
+
+    await activateQuoraRuntime(browser, `https://www.quora.com/profile/${targetHref.split('/').pop()}`)
+    await flushAsync(20)
+    const beforeContentQueueIndexBytes = sw.state().queueWakeupCounters['storagePayload.read.contentQueueIndex.bytes'] || 0
+
+    const result = await browser.runtime.sendMessage({
+        action: 'get-content-page-coordinator-state',
+        pageType: 'profile',
+        profileHrefs: [targetHref]
+    })
+
+    assert.equal(result.queueRows, 1)
+    assert.equal(result.coordinatorQueue[targetHref]?.status, 'queued')
+
+    const afterContentQueueIndexBytes = sw.state().queueWakeupCounters['storagePayload.read.contentQueueIndex.bytes'] || 0
+    assert.equal(afterContentQueueIndexBytes, beforeContentQueueIndexBytes,
+        'the scoped content-page request should not have read the full content-queue-index blob')
 })
 
 ;(async () => {

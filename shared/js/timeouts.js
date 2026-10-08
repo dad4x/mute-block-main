@@ -65,6 +65,18 @@ module.exports = {
     SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS: 90000,
     SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS: 1000,
 
+    // content.js chunk-level retry (sendCoordinatorEnqueueChunked): a chunk
+    // that comes back with no response, a storage timeout, or durable:false
+    // has not landed at all -- this write path has no partial-success state,
+    // so re-sending the same chunk can never double-count. 2026-10-06: a
+    // 491-candidate batch silently lost its last (32-item) chunk this way,
+    // with the old break-on-first-failure loop reporting a numerically
+    // "complete" summary that was actually short by 32 -- user explicitly
+    // ruled out "ask the user to retry" as a fix, so failed chunks now retry
+    // in place with backoff instead of abandoning the rest of the batch.
+    SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS: 5,
+    SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS: 2000,
+
     // coordinator.js dashboard-to-service-worker message round trips
     // (sendRuntimeMessageWithTimeout's own default, and the heavier
     // mutation-style calls that explicitly opt into a longer budget)
@@ -72,5 +84,36 @@ module.exports = {
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS: 10000,
 
     // sw.js
-    WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS: 15000
+    WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS: 15000,
+
+    // sw.js stale-active-row watchdog (runCoordinatorReconcileTickOnce): a
+    // durable row can sit at status 'active' indefinitely if the specific
+    // combination of conditions that would normally classify and recover it
+    // (classifyCoordinatorExecutorState's 'active-missing-tab' case, handled
+    // in runCoordinatorExecutorApplyPhase) never gets reached -- that deep
+    // classifier only runs when prunedQueuedActions > 0 this tick, which has
+    // nothing to do with whether an unrelated active row's tab is actually
+    // gone. Confirmed live 2026-10-06: one row sat 'active' for over an hour
+    // with zero matching live tabs (getLiveProfileTabsByHref came back
+    // empty for its href) while reconcile ticks kept running normally every
+    // ~60s. This watchdog runs unconditionally on every reconcile tick
+    // (cheap: the full queue is already loaded for the unrelated
+    // queued-action prune step) and force-recovers any active row past this
+    // age with no matching live tab, independent of that gate.
+    STALE_ACTIVE_COORDINATOR_ROW_WATCHDOG_MS: 180000,
+
+    // sw.js runCoordinatorQueueExecutorFastPath coalescing (2026-10-07): a
+    // burst of distinct reactive triggers (slot-release, active-transition,
+    // queued-authority-enqueue, etc.) can each independently call this
+    // function within milliseconds of each other. Confirmed live: 13 such
+    // calls back to back, each 45-72 real seconds (queued behind the same
+    // serialized storage-update lane), with every call after the first
+    // finding nothing left to do. This window bounds how recently the last
+    // completed call must have finished -- and how little must have changed
+    // since (compared via a cheap in-memory runtime/queue-counts fingerprint,
+    // no storage I/O) -- for a new call to reuse that result instead of
+    // repeating the full pass. Short enough that a call outside this window
+    // is treated as a genuinely new situation, long enough to collapse a
+    // same-moment burst of triggers into one real pass.
+    COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS: 2000
 }

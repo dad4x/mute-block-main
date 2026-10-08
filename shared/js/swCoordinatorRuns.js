@@ -73,7 +73,7 @@ function createCoordinatorRuns(deps = {}) {
         return recordUpdatedAt > 0 && itemTerminalAt > 0 && recordUpdatedAt >= itemTerminalAt
     }
 
-    function getCoordinatorRunStatus(runItems = [], existingRun = {}) {
+    function getCoordinatorRunStatus(runItems = [], paused = false) {
         // Run-level status is a deliberately small 3-state rollup --
         // 'running' / 'paused' / 'empty' -- distinct from the much larger
         // per-item status vocabulary (queued/opening/active/acting/settling/
@@ -82,11 +82,14 @@ function createCoordinatorRuns(deps = {}) {
         // succeeded, some were canceled, or the run never had any items --
         // it intentionally doesn't distinguish cause at the run level (that
         // detail lives on each item's own status).
-        if(!runItems.length) return existingRun?.paused ? 'paused' : 'empty'
+        //
+        // `paused` is the caller's own current-paused decision, not a stored
+        // per-run flag -- see each call site for where that comes from.
+        if(!runItems.length) return paused ? 'paused' : 'empty'
 
         const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
         if(terminalCount === runItems.length) return 'empty'
-        if(existingRun?.paused) return 'paused'
+        if(paused) return 'paused'
         return 'running'
     }
 
@@ -217,7 +220,7 @@ function createCoordinatorRuns(deps = {}) {
                     itemCount: targetProfileHrefs.length || runItems.length || targetWorkKeyList.length || 0,
                     activeCount,
                     terminalCount,
-                    status: getCoordinatorRunStatus(runItems, existing),
+                    status: getCoordinatorRunStatus(runItems, existing?.paused === true),
                     updatedAt: Math.max(Number.parseInt(existing.updatedAt, 10) || 0, latestItemUpdatedAt)
                 }
             }
@@ -239,7 +242,7 @@ function createCoordinatorRuns(deps = {}) {
     // is nothing to race because there is nothing mutated: two concurrent
     // callers computing this from the same inputs get the same answer, and
     // neither one's answer depends on what the other wrote.
-    function summarizeCoordinatorRunFromItems(runId = '', run = {}, items = []) {
+    function summarizeCoordinatorRunFromItems(runId = '', run = {}, items = [], globalPaused = false) {
         const targetHrefs = new Set()
         const targetWorkKeys = new Set()
         const sourcePages = new Set(Array.isArray(run?.sourcePages) ? run.sourcePages : [])
@@ -272,7 +275,16 @@ function createCoordinatorRuns(deps = {}) {
             itemCount: targetWorkKeyList.length || targetProfileHrefs.length || items.length || 0,
             activeCount,
             terminalCount,
-            status: getCoordinatorRunStatus(items, run),
+            // Unlike the mutated-running-total path (recomputeCoordinatorRuns
+            // above), this is the *current* global paused control, not the
+            // stored run.paused flag: that flag is only ever stamped by
+            // materializeCoordinatorRunsPausedStateFromControl, which skips
+            // any run with no pending item at the moment it runs (see its
+            // own comment) -- a run enqueued or resumed-into after that last
+            // ran would keep a stale flag forever otherwise. Confirmed live:
+            // runs created after the last pause toggle showed 'running'
+            // while the queue was actually paused.
+            status: getCoordinatorRunStatus(items, globalPaused === true),
             updatedAt: Math.max(Number.parseInt(run?.updatedAt, 10) || 0, latestItemUpdatedAt)
         }
     }
@@ -284,7 +296,7 @@ function createCoordinatorRuns(deps = {}) {
     // of the two at a time (archiveTerminalCoordinatorRow removes it from the
     // live queue the same durable write that adds it to the completed log),
     // so there's no double-count risk to reconcile between them.
-    function buildFreshCoordinatorRunsSummary(runs = {}, queue = {}, completedRows = []) {
+    function buildFreshCoordinatorRunsSummary(runs = {}, queue = {}, completedRows = [], globalPaused = false) {
         const itemsByRunId = {}
         const addItem = item => {
             const itemRunId = `${item?.runId || ''}`.trim()
@@ -304,7 +316,7 @@ function createCoordinatorRuns(deps = {}) {
             const items = itemsByRunId[runId] || []
             const run = runs?.[runId] || null
             if(!items.length && !run) continue
-            summary[runId] = summarizeCoordinatorRunFromItems(runId, run || {id: runId}, items)
+            summary[runId] = summarizeCoordinatorRunFromItems(runId, run || {id: runId}, items, globalPaused === true)
         }
         return summary
     }

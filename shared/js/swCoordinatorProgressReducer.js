@@ -93,6 +93,61 @@
 // excludedOutliers so the dashboard can surface that something was dropped.
 const PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
 
+// 2026-10-06: finer-grained breakdown of the same activeAt->terminalAt
+// window profileAction.*.totalDurationMs already measures as one lump --
+// the notice/select phase is already covered by activationHandoffTiming
+// (terminal row -> next row activation), so this picks up right where
+// that leaves off. Field order mirrors milestone recording order on the
+// item itself (tabCreatedAt, navigationStartedAt, contentOpenedAt,
+// actionClaimedAt, profileReadyAt, mute/blockAttemptedAt, then terminal,
+// then close) -- each phase is independently sane-checked (both
+// endpoints present, in order, within the same outlier bound), so a row
+// that skips a milestone (a shortcut path, or a failed row with mostly-
+// zero milestones) just contributes no sample for the phases it skipped
+// rather than corrupting a neighboring phase's average.
+const COORDINATOR_PROFILE_ACTION_PHASES = [
+    {key: 'open', from: 'activeAt', to: 'tabCreatedAt'},
+    {key: 'navigate', from: 'tabCreatedAt', to: 'navigationStartedAt'},
+    {key: 'load', from: 'navigationStartedAt', to: 'contentOpenedAt'},
+    {key: 'claim', from: 'contentOpenedAt', to: 'actionClaimedAt'},
+    {key: 'inspect', from: 'actionClaimedAt', to: 'profileReadyAt'},
+    {key: 'action', from: 'profileReadyAt', to: 'actionAttemptedAt'},
+    {key: 'detect', from: 'actionAttemptedAt', to: 'terminalAt'},
+    {key: 'close', from: 'terminalAt', to: 'tabClosedAt'}
+]
+
+function getCoordinatorProfileActionPhaseTime(item, milestones, field, nowMs) {
+    if(field === 'activeAt') return Number.parseInt(item?.activeAt, 10) || 0
+    if(field === 'terminalAt') return Number.parseInt(item?.terminalAt, 10) || nowMs || 0
+    if(field === 'actionAttemptedAt') {
+        return Number.parseInt(milestones?.blockAttemptedAt, 10) ||
+            Number.parseInt(milestones?.muteAttemptedAt, 10) || 0
+    }
+    if(field === 'tabClosedAt') {
+        return Number.parseInt(milestones?.tabClosedAt, 10) ||
+            Number.parseInt(milestones?.closeRequestedAt, 10) || 0
+    }
+    return Number.parseInt(milestones?.[field], 10) || 0
+}
+
+function recordCoordinatorProfileActionPhaseDurations(item, nowMs, capabilities = {}) {
+    const {incrementQueueWakeupMetric, recordQueueWakeupMetricMax} = capabilities
+    if(typeof incrementQueueWakeupMetric !== 'function') return
+    const milestones = item?.milestones || {}
+    for(const phase of COORDINATOR_PROFILE_ACTION_PHASES) {
+        const fromAt = getCoordinatorProfileActionPhaseTime(item, milestones, phase.from, nowMs)
+        const toAt = getCoordinatorProfileActionPhaseTime(item, milestones, phase.to, nowMs)
+        if(fromAt <= 0 || toAt <= 0 || toAt < fromAt) continue
+        const phaseMs = toAt - fromAt
+        if(phaseMs > PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS) continue
+        incrementQueueWakeupMetric(`profileAction.phase.${phase.key}.sampleCount`)
+        incrementQueueWakeupMetric(`profileAction.phase.${phase.key}.totalMs`, phaseMs)
+        if(typeof recordQueueWakeupMetricMax === 'function') {
+            recordQueueWakeupMetricMax(`profileAction.phase.${phase.key}.maxMs`, phaseMs)
+        }
+    }
+}
+
 function createCoordinatorProgressReducer(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const {
@@ -123,7 +178,8 @@ function createCoordinatorProgressReducer(deps = {}) {
         buildCoordinatorFailureClassification,
         incrementQueueWakeupMetric,
         recordQueueWakeupMetricMax,
-        pushQueueWakeupDiagnosticEvent
+        pushQueueWakeupDiagnosticEvent,
+        recordFlightRecorderEvent
     } = deps.handlers || {}
 
     // Distinguishes "was already blocked before we did anything" from "we
@@ -222,6 +278,26 @@ function createCoordinatorProgressReducer(deps = {}) {
                 }
             })
         }
+        // 2026-09-30: marks the end of a handoff's "block and finalize"
+        // phase (active -> terminal), for splitting a handoff gap into its
+        // three stages -- previous-op-end -> tab-open (ours), tab-open ->
+        // page-load-complete (not ours), page-load-complete -> this event
+        // (ours) -- against the 'tab-open-request' (swexecutor.js) and
+        // 'tab-page-load-complete' (swBootstrap.js) flight-recorder events
+        // via rowKey/runId, rather than folding it into the single
+        // activationHandoffTiming gap this project already tracks.
+        if(typeof recordFlightRecorderEvent === 'function') {
+            recordFlightRecorderEvent({
+                kind: 'profile-action-finalized',
+                source: 'recordCoordinatorProfileActionOutcomeStat',
+                rowKey: rowIdentityKey,
+                runId: item?.runId || '',
+                targetUrl: item?.targetProfileHref || item?.requestedUrl || '',
+                activeAt,
+                durationMs,
+                reason: outcome
+            })
+        }
         if(durationMs > PROFILE_ACTION_TIMING_SAMPLE_MAX_PLAUSIBLE_MS) {
             incrementQueueWakeupMetric(`profileAction.${bucket}.excludedOutliers`)
             return
@@ -231,6 +307,7 @@ function createCoordinatorProgressReducer(deps = {}) {
         if(typeof recordQueueWakeupMetricMax === 'function') {
             recordQueueWakeupMetricMax(`profileAction.${bucket}.maxDurationMs`, durationMs)
         }
+        recordCoordinatorProfileActionPhaseDurations(item, nowMs, {incrementQueueWakeupMetric, recordQueueWakeupMetricMax})
     }
 
 

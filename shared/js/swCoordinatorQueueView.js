@@ -268,13 +268,46 @@ function createCoordinatorQueueView(deps = {}) {
             })
             .sort((left, right) => left.terminalAt - right.terminalAt)
 
+        // 2026-09-30: this used to be `activations.find(...)` -- an O(activations)
+        // linear scan of the *entire* activations array, re-run from scratch for
+        // every terminal row, i.e. O(terminals * activations) for this function
+        // alone. Confirmed as the dominant cause of per-block time scaling with
+        // queue depth (every active-transition/terminal-settlement WAL write
+        // rebuilds the whole queue view, and this was the one piece of that
+        // rebuild that was itself quadratic in queue size, not just linear).
+        // `activations` is already sorted ascending by activeAt, so grouping by
+        // runId once preserves that order per bucket, and each terminal's "first
+        // activation after terminalAt, same run, not itself" lookup becomes a
+        // binary search instead of a full rescan -- same matching semantics,
+        // O(log k) instead of O(activations) per terminal.
+        const activationsByRunId = new Map()
+        for(const activation of activations) {
+            let bucket = activationsByRunId.get(activation.runId)
+            if(!bucket) {
+                bucket = []
+                activationsByRunId.set(activation.runId, bucket)
+            }
+            bucket.push(activation)
+        }
+        function findNextActivationForTerminal(terminal) {
+            const bucket = activationsByRunId.get(terminal.runId)
+            if(!bucket || !bucket.length) return null
+            let low = 0
+            let high = bucket.length
+            while(low < high) {
+                const mid = (low + high) >>> 1
+                if(bucket[mid].activeAt > terminal.terminalAt) high = mid
+                else low = mid + 1
+            }
+            for(let index = low; index < bucket.length; index++) {
+                if(bucket[index].key !== terminal.key) return bucket[index]
+            }
+            return null
+        }
+
         const samples = []
         for(const terminal of terminals) {
-            const nextActivation = activations.find(candidate =>
-                candidate.key !== terminal.key &&
-                candidate.runId === terminal.runId &&
-                candidate.activeAt > terminal.terminalAt
-            )
+            const nextActivation = findNextActivationForTerminal(terminal)
             if(!nextActivation) continue
             // 2026-09-27: a paused span sitting between this terminal row
             // and the next row (same run) becoming active used to count in
@@ -393,25 +426,39 @@ function createCoordinatorQueueView(deps = {}) {
         return queue
     }
 
-    function filterCoordinatorQueueForCompactView(queue = {}, runs = {}) {
+    function filterCoordinatorQueueForCompactView(queue = {}, runs = {}, statsClearedAt = 0) {
         const knownRunIds = new Set(
             Object.keys(runs && typeof runs === 'object' ? runs : {})
                 .map(runId => `${runId || ''}`.trim())
                 .filter(Boolean)
         )
-        if(!knownRunIds.size) return queue
+        const clearedAt = Number.parseInt(statsClearedAt, 10) || 0
+        if(!knownRunIds.size && !clearedAt) return queue
 
         const filteredQueue = {}
         for(const [key, item] of Object.entries(queue || {})) {
+            const terminal = isTerminalCoordinatorStatus(item?.status)
             const runId = `${item?.runId || ''}`.trim()
-            if(runId && !knownRunIds.has(runId) && isTerminalCoordinatorStatus(item?.status)) continue
+            if(knownRunIds.size && runId && !knownRunIds.has(runId) && terminal) continue
+            // See COORDINATOR_STATS_CLEARED_AT_KEY (sw.js): a terminal item
+            // that finished at or before the last "Clear All Stats" cutoff
+            // is excluded here too, so every caller of buildCoordinatorQueueView
+            // -- not just the dashboard's own on-demand refresh -- agrees on
+            // what counts as "still showing", instead of the hot-path WAL-
+            // append-triggered rebuilds (which call this with no cutoff
+            // context of their own) disagreeing and overwriting the filtered
+            // result with pre-cutoff rows. Never matches a non-terminal item.
+            if(clearedAt && terminal) {
+                const terminalAt = Number.parseInt(item?.terminalAt, 10) || 0
+                if(terminalAt > 0 && terminalAt <= clearedAt) continue
+            }
             filteredQueue[key] = item
         }
         return filteredQueue
     }
 
     function buildCoordinatorQueueView(queue = {}, nowMs = now(), options = {}) {
-        const compactQueue = filterCoordinatorQueueForCompactView(queue, options.runs || {})
+        const compactQueue = filterCoordinatorQueueForCompactView(queue, options.runs || {}, options.statsClearedAt || 0)
         const entries = Object.entries(compactQueue || {})
         const epochStartedAt = getCoordinatorQueueViewEpochStartedAt()
         const counts = {}

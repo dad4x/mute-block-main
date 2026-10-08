@@ -1,9 +1,24 @@
 /*
  * ARCHITECTURE: Flight recorder boundary.
  *
- * The flight recorder is volatile diagnostic state. It observes machine and
- * runtime transitions, but it is not authority and must not write storage or
- * schedule work.
+ * The flight recorder is diagnostic state, not authority: it observes
+ * machine and runtime transitions but never drives decisions, and it must
+ * never write chrome.storage.local (disk-backed, the durable authority
+ * store) or schedule work.
+ *
+ * 2026-09-30: this module still has no dependencies and writes nothing
+ * itself -- seedFlightRecorderFromPersisted/getFlightRecorderPersistableSnapshot
+ * below are plain functions over plain data, with no browser/storage access
+ * of their own. The actual chrome.storage.session persistence (flush on
+ * browser.runtime.onSuspend, reseed at startup) is wired up in sw.js via
+ * swSessionMemory.js, keeping this file itself free of realm-crossing risk.
+ * This persistence used to be flatly forbidden here, on the mistaken belief
+ * that in-memory module state survives a service-worker restart -- it
+ * doesn't (confirmed live: up to 17 restarts in one ~79-minute session), so
+ * without it the recorder was losing its entire buffer on exactly the
+ * cadence that matters most for diagnosing across a real run (e.g. the
+ * tab-open-request/tab-page-load-complete/profile-action-finalized
+ * handoff-phase split this was built for).
  */
 
 const {
@@ -67,7 +82,18 @@ const FLIGHT_RECORDER_KINDS = new Set([
     // record at all). browser.tabs.remove() was wrapped in .catch(() => {})
     // with no trace of the outcome, so a failed/no-op removal was
     // indistinguishable from a successful one after the fact.
-    "terminal-tab-close-result"
+    "terminal-tab-close-result",
+    // 2026-09-30: splits a handoff gap (activationHandoffTiming's single
+    // terminal->nextActive number) into its three stages -- previous row's
+    // profile-action-finalized -> this row's tab-open-request is our own
+    // scheduling overhead; tab-open-request -> tab-page-load-complete is
+    // the browser's page load, not ours; tab-page-load-complete -> this
+    // row's own profile-action-finalized is our block-and-finalize
+    // processing. Correlated across the three by targetUrl (and rowKey/
+    // runId where available), not a dedicated id, since they're emitted
+    // from three independent call sites that don't share one.
+    "tab-page-load-complete",
+    "profile-action-finalized"
 ])
 
 let flightRecorderSeq = 0
@@ -155,7 +181,9 @@ function sanitizeFlightRecorderEntry(entry = {}) {
         "committedSegmentsB",
         "retiredKeys",
         "viewItemCount",
-        "rebuiltRowCount"
+        "rebuiltRowCount",
+        "durationMs",
+        "activeAt"
     ]) {
         const value = sanitizeFlightRecorderInteger(entry?.[field])
         if(value !== undefined) sanitized[field] = value
@@ -251,11 +279,50 @@ function __testResetFlightRecorder() {
     flightRecorderEntries.fill(undefined)
 }
 
+// Everything this instance would need to reconstruct its buffer elsewhere
+// (or in a fresh instance after this one is evicted) -- the full resident
+// window, not just whatever a caller's own `limit` asked for.
+function getFlightRecorderPersistableSnapshot() {
+    return getFlightRecorderSnapshot({limit: FLIGHT_RECORDER_CAPACITY})
+}
+
+// Repopulates the buffer from a previously-persisted snapshot (see
+// getFlightRecorderPersistableSnapshot). Only seeds an instance that hasn't
+// recorded anything of its own yet (flightRecorderSeq === 0) -- this is
+// meant to run once, at startup, before any real event has had a chance to
+// land; if one already has by the time an async session-storage load
+// resolves, that genuine live data wins and the persisted snapshot is
+// dropped rather than risking it clobbering something newer.
+function seedFlightRecorderFromPersisted(persisted = null) {
+    if(flightRecorderSeq !== 0) return false
+    const entries = Array.isArray(persisted?.entries) ? persisted.entries : []
+    if(!entries.length) return false
+
+    let maxSeq = 0
+    for(const entry of entries) {
+        const sanitized = sanitizeFlightRecorderEntry(entry)
+        if(!sanitized) continue
+        const seq = Number.parseInt(entry?.seq, 10)
+        if(!Number.isFinite(seq) || seq <= 0) continue
+        sanitized.seq = seq
+        flightRecorderEntries[seq % FLIGHT_RECORDER_CAPACITY] = sanitized
+        if(seq > maxSeq) maxSeq = seq
+    }
+    if(!maxSeq) return false
+
+    flightRecorderSeq = maxSeq
+    const persistedDropped = Number.parseInt(persisted?.droppedCount, 10) || 0
+    flightRecorderDroppedCount = Math.max(persistedDropped, Math.max(0, flightRecorderSeq - FLIGHT_RECORDER_CAPACITY))
+    return true
+}
+
 module.exports = {
     FLIGHT_RECORDER_CAPACITY,
     FLIGHT_RECORDER_KINDS,
     __testResetFlightRecorder,
     getFlightRecorder,
     getFlightRecorderSnapshot,
-    recordFlightRecorderEvent
+    getFlightRecorderPersistableSnapshot,
+    recordFlightRecorderEvent,
+    seedFlightRecorderFromPersisted
 }

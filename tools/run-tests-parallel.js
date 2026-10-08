@@ -22,6 +22,11 @@ const lanes = [
       ['node', 'test/sharedModeration.test.js'],
       ['node', 'test/contentActionSelectors.test.js'],
       ['node', 'test/contentSpaceScopedState.test.js'],
+      ['node', 'test/contentSourcePostResolution.test.js'],
+      ['node', 'test/contentEnqueueChunkRetry.test.js'],
+      ['node', 'test/contentInlineResolution.test.js'],
+      ['node', 'test/cdpClickProfileExtensionAction.test.js'],
+      ['node', 'test/requeueFailures.test.js'],
       ['node', 'test/swStorageMetrics.test.js']
     ]
   },

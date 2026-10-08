@@ -70,7 +70,9 @@ const {
     SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS,
     SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS,
     SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS,
-    SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS
+    SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS,
+    SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS,
+    SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS
 } = require('./timeouts')
 const {
     COORDINATOR_ENQUEUE_CHUNK_SIZE
@@ -132,6 +134,8 @@ let profileButtonsRefreshBurstCount = 0
 let profileButtonsRefreshBurstStartedAt = 0
 let profileButtonRail = null
 let profileButtonRailResizeHooked = false
+let contentProgressBarEl = null
+let contentProgressBarStorageListenerInstalled = false
 let autoProfileAction = undefined
 let autoProfileActionPending = false
 let autoProfileActionClaimPending = false
@@ -233,7 +237,9 @@ const SPACE_FEED_CANDIDATE_CONFIDENCE_LOW = 'low'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
 const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
 const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
+const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
 const COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
+const CONTENT_PROGRESS_BAR_ID = 'mb-ext_progress-bar'
 const PENDING_COORDINATOR_STATUSES = new Set(['queued', 'opening', 'active', 'acting', 'settling'])
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
@@ -302,6 +308,7 @@ async function init() {
     browser.runtime.onMessage.addListener(onMessage)
     const initialPage = getPageType()
     announceQuoraRuntimeReady(initialPage)
+    initContentProgressBar()
     if(initialPage === 'profile-search') {
         installNavigationHooks()
         scheduleProfileSearchControls(0)
@@ -3622,6 +3629,166 @@ function getOrCreateProfileButtonRail() {
 function resetProfileButtonRail() {
     profileButtonRail?.remove()
     profileButtonRail = null
+}
+
+// An ambient, display-only "work is happening in the background" signal on
+// whatever Quora page the user is actually looking at -- mirrors the worker
+// window's progress fill/count (coordinator.js's renderWorkerBar) using the
+// same mbCoordinatorQueueView the worker window reads, but with no buttons:
+// this is a second, independent surface, and giving it its own pause/cancel
+// controls would mean two surfaces racing to mutate queue state.
+// Reads the page's own light/dark rendering rather than guessing at a
+// Quora-specific dark-mode class (which could change) -- the actual
+// rendered background luminance is a page-agnostic signal, with
+// prefers-color-scheme as a fallback for an unstyled/transparent body.
+function isPageInDarkMode() {
+    try {
+        const bodyBackground = getComputedStyle(document.body).backgroundColor
+        const channels = (bodyBackground.match(/[\d.]+/g) || []).map(Number)
+        if(channels.length >= 3 && !(channels[3] === 0)) {
+            const [red, green, blue] = channels
+            const luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255
+            return luminance < 0.5
+        }
+    }
+    catch {}
+    return !!globalThis.matchMedia?.('(prefers-color-scheme: dark)')?.matches
+}
+
+function getOrCreateContentProgressBar() {
+    for(const stale of document.querySelectorAll(`#${CONTENT_PROGRESS_BAR_ID}`)) {
+        if(stale !== contentProgressBarEl) stale.remove()
+    }
+    if(contentProgressBarEl?.isConnected) return contentProgressBarEl
+
+    const darkMode = isPageInDarkMode()
+    const barBackground = darkMode ? 'rgba(32, 32, 35, 0.92)' : 'rgba(255, 255, 255, 0.92)'
+    const textColor = darkMode ? '#e8e8ea' : '#1c1c1e'
+    const trackBackground = darkMode ? 'rgba(255, 255, 255, 0.18)' : 'rgba(0, 0, 0, 0.12)'
+    const borderColor = darkMode ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)'
+
+    const bar = document.createElement('div')
+    bar.id = CONTENT_PROGRESS_BAR_ID
+    bar.style.position = 'fixed'
+    bar.style.left = '0'
+    bar.style.right = '0'
+    bar.style.bottom = '0'
+    bar.style.zIndex = '999999'
+    bar.style.display = 'flex'
+    bar.style.alignItems = 'center'
+    bar.style.gap = '10px'
+    bar.style.padding = '5px 12px'
+    bar.style.background = barBackground
+    bar.style.borderTop = `1px solid ${borderColor}`
+    bar.style.color = textColor
+    bar.style.fontSize = '12px'
+    bar.style.fontFamily = 'system-ui, -apple-system, sans-serif'
+    // Display-only -- never intercept clicks/scroll on the page beneath it.
+    bar.style.pointerEvents = 'none'
+
+    const brand = document.createElement('div')
+    brand.style.display = 'flex'
+    brand.style.alignItems = 'center'
+    brand.style.gap = '6px'
+    brand.style.flexShrink = '0'
+
+    const logo = document.createElement('img')
+    logo.src = browser.runtime.getURL('icons/32.png')
+    logo.alt = ''
+    logo.width = 16
+    logo.height = 16
+    logo.style.display = 'block'
+
+    const label = document.createElement('div')
+    label.textContent = 'Progress'
+    label.style.fontWeight = '600'
+    label.style.whiteSpace = 'nowrap'
+
+    brand.append(logo, label)
+
+    const track = document.createElement('div')
+    track.style.flex = '1'
+    track.style.height = '6px'
+    track.style.borderRadius = '3px'
+    track.style.background = trackBackground
+    track.style.overflow = 'hidden'
+
+    const fill = document.createElement('div')
+    fill.className = `${CONTENT_PROGRESS_BAR_ID}-fill`
+    fill.style.height = '100%'
+    fill.style.width = '0%'
+    fill.style.background = '#b92b27'
+    fill.style.transition = 'width 200ms ease'
+    track.appendChild(fill)
+
+    const count = document.createElement('div')
+    count.className = `${CONTENT_PROGRESS_BAR_ID}-count`
+    count.style.whiteSpace = 'nowrap'
+
+    bar.append(brand, track, count)
+    document.body.appendChild(bar)
+    contentProgressBarEl = bar
+    return bar
+}
+
+function removeContentProgressBar() {
+    contentProgressBarEl?.remove()
+    contentProgressBarEl = null
+}
+
+async function refreshContentProgressBar() {
+    if(!document.body) return
+
+    const stored = await safeStorageGet({
+        [COORDINATOR_QUEUE_VIEW_KEY]: null,
+        [COORDINATOR_PAUSED_KEY]: false
+    }).catch(() => null)
+    const view = stored?.[COORDINATOR_QUEUE_VIEW_KEY]
+    const paused = !!stored?.[COORDINATOR_PAUSED_KEY]
+    const hasView = !!view && typeof view === 'object' && Array.isArray(view.items)
+    const total = hasView ? (Number.parseInt(view.total, 10) || 0) : 0
+    const counts = hasView && view.counts && typeof view.counts === 'object' ? view.counts : {}
+    const pending = [...PENDING_COORDINATOR_STATUSES].reduce(
+        (sum, status) => sum + (Number.parseInt(counts[status], 10) || 0),
+        0
+    )
+    const terminal = Math.max(0, total - pending)
+
+    // Vanish when there's nothing queued, the batch is fully done, or the
+    // queue is paused -- this is meant to be an ambient signal that work is
+    // actively happening, not a persistent fixture.
+    if(!hasView || total <= 0 || paused || terminal >= total) {
+        removeContentProgressBar()
+        return
+    }
+
+    const bar = getOrCreateContentProgressBar()
+    const fill = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-fill`)
+    const count = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-count`)
+    if(fill) fill.style.width = `${Math.min(100, Math.round((terminal / total) * 100))}%`
+    if(count) count.textContent = `${terminal} / ${total}`
+}
+
+function installContentProgressBarStorageListener() {
+    if(contentProgressBarStorageListenerInstalled) return
+    const source = getStorageChangeSource()
+    if(!source) return
+    contentProgressBarStorageListenerInstalled = true
+    // A dedicated listener, independent of setStorageChangeListenerEnabled's
+    // on/off toggle (which some page types, e.g. profile-search, never turn
+    // on) -- this overlay needs to stay live on every Quora page regardless
+    // of that page-type-specific gating.
+    source.addListener((changes, areaName) => {
+        if(areaName !== 'local') return
+        if(changes[COORDINATOR_QUEUE_VIEW_KEY] || changes[COORDINATOR_PAUSED_KEY]) {
+            void refreshContentProgressBar()
+        }
+    })
+}
+
+function initContentProgressBar() {
+    installContentProgressBarStorageListener()
+    void refreshContentProgressBar()
 }
 
 function reorderProfileButtonRail(rail) {
@@ -6973,6 +7140,19 @@ function getSpaceFeedProfileLinkCardRoot(link) {
     const root = link.closest('a[href*="/profile/"]')
     if(!(root instanceof HTMLAnchorElement) || !isVisible(root)) return null
     if(isExtensionOwnedNode(root)) return null
+    // 2026-10-08 (Franklin Veaux incident): this scanner looks for Quora's
+    // own standalone "profile card" widget, but that widget shares its
+    // q-box/puppeteer_test_link markup with the author byline Quora renders
+    // for an embedded/quoted sub-post (a feature card, a Quora-native embed,
+    // or a hyperlink embed) -- the exact class of false positive the
+    // SPACE_FEED_EMBED_SCOPE_SELECTOR exclusion was already added for in
+    // getSpaceFeedPosterProfileUrls (2026-09-27) and the asset/target split
+    // in getSpaceFeedPostCandidateProfileUrls (2026-09-25), neither of which
+    // this separate scanner goes through. A genuine contributor's answer to
+    // an unrelated question got embedded/quoted in a troll-patrol post, his
+    // byline rendered as this same card shape, and he was queued for
+    // mute-block with no further scrutiny as a result.
+    if(root.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return null
     if(root.querySelector('a.post_timestamp, .post_timestamp')) return null
     if(root.closest('.mb-ext_space-feed-post-nuke-host')) return null
     if(!root.classList.contains('q-box') && !root.classList.contains('puppeteer_test_link')) return null
@@ -7129,9 +7309,21 @@ function getSpaceFeedPostContentScopes(postRoot) {
 
     const scopes = []
     const addScope = scope => {
-        if(scope && !scopes.includes(scope)) {
-            scopes.push(scope)
-        }
+        if(!scope || scopes.includes(scope)) return
+        // 2026-10-08 (Franklin Veaux pattern, third+fourth occurrence): a
+        // scope nested inside -- or itself matching -- an embedded/quoted
+        // sub-post marker is the embed's own content, not the actual
+        // poster's. Both consumers of this scope list (the dom-profile-link
+        // loop and the text-profile-url fallback, both in
+        // getSpaceFeedPostCandidateProfileUrls) have no embed-awareness of
+        // their own, so a link or plain-text URL inside an embed -- most
+        // commonly the embedded answer's own author byline -- was
+        // previously indistinguishable from something the actual poster
+        // deliberately wrote. Excluding these scopes entirely matches how
+        // getSpaceFeedPosterProfileUrls (2026-09-27) and
+        // getSpaceFeedProfileLinkCardRoot (2026-10-08) already handle this.
+        if(scope !== postRoot && scope.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return
+        scopes.push(scope)
     }
 
     for(const scope of Array.from(postRoot.querySelectorAll(
@@ -9374,21 +9566,39 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
     const resetCleanupTargets = []
 
     for(let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-        const chunkResult = await safeSendRuntimeMessageWithTimeout({
-            action: 'enqueue-coordinator-items',
-            run: payload.run,
-            source: payload.source,
-            execute: payload.execute,
-            items: chunks[chunkIndex],
-            runSummary: {
-                requested: totalItems,
-                priorQueued: queued,
-                priorMerged: merged,
-                ...(chunkIndex === 0 && payload.source?.preFilter ? {preFilter: payload.source.preFilter} : {})
-            }
-        }, null, SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS)
+        // A failed/timed-out attempt below has no partial-success state to
+        // worry about (see SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS's comment in
+        // timeouts.js): either the durable write already landed, in which
+        // case waitForCoordinatorEnqueueSummary already found it and this
+        // isn't a failure at all, or it never landed, in which case
+        // resending the identical chunk is safe and can't double-count. So
+        // retry the SAME chunk in place with backoff rather than abandoning
+        // every chunk after it -- a user-visible "add again" step is not an
+        // acceptable substitute for this actually completing on its own.
+        let settled = null
+        for(let attempt = 1; attempt <= SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS; attempt += 1) {
+            const chunkResult = await safeSendRuntimeMessageWithTimeout({
+                action: 'enqueue-coordinator-items',
+                run: payload.run,
+                source: payload.source,
+                execute: payload.execute,
+                items: chunks[chunkIndex],
+                runSummary: {
+                    requested: totalItems,
+                    priorQueued: queued,
+                    priorMerged: merged,
+                    ...(chunkIndex === 0 && payload.source?.preFilter ? {preFilter: payload.source.preFilter} : {})
+                }
+            }, null, SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS)
 
-        const settled = chunkResult || await waitForCoordinatorEnqueueSummary(runId, SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS)
+            settled = chunkResult || await waitForCoordinatorEnqueueSummary(runId, SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS)
+            const chunkFailed = !settled || settled.storageTimedOut === true || settled.durable === false
+            if(!chunkFailed) break
+            if(attempt < SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS) {
+                await sleep(SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)))
+            }
+        }
+
         if(!settled) {
             storageTimedOut = true
             stopReason = 'chunk-enqueue-no-response'

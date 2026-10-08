@@ -1566,16 +1566,16 @@ function init() {
   return _init.apply(this, arguments);
 }
 function _init() {
-  _init = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee7() {
-    var manifest, settings, form, status, spaceSortBy, spaceList, clearNukedPosts, openCoordinator, openHistory, nukedPostCount, fopDelay, flipToAnswers, fopFlipDelay, coordinatorAutoStartOnBrowserStart, profilesPerBatch, targetQueuedTabConcurrency, nukedPostRetentionDays, maxRememberedNukedPosts;
-    return _regeneratorRuntime().wrap(function _callee7$(_context7) {
-      while (1) switch (_context7.prev = _context7.next) {
+  _init = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee6() {
+    var manifest, settings, form, status, spaceSortBy, spaceList, openCoordinator, openHistory, fopDelay, flipToAnswers, fopFlipDelay, coordinatorAutoStartOnBrowserStart, profilesPerBatch, targetQueuedTabConcurrency, nukedPostRetentionDays, maxRememberedNukedPosts;
+    return _regeneratorRuntime().wrap(function _callee6$(_context6) {
+      while (1) switch (_context6.prev = _context6.next) {
         case 0:
           manifest = browser.runtime.getManifest();
-          _context7.next = 3;
+          _context6.next = 3;
           return browser.storage.local.get(_objectSpread(_objectSpread({}, defaults), {}, _defineProperty(_defineProperty(_defineProperty({}, SPACE_REGISTRY_KEY, {}), SPACE_SORT_KEY, SPACE_SORT_NAME), SPACE_NUKED_POSTS_KEY, {})));
         case 3:
-          settings = _context7.sent;
+          settings = _context6.sent;
           document.getElementById('appName').textContent = manifest.name;
           document.getElementById('appVersion').textContent = "v".concat(manifest.version);
           document.getElementById('closePopup').addEventListener('click', function () {
@@ -1585,10 +1585,8 @@ function _init() {
           status = document.getElementById('status');
           spaceSortBy = document.getElementById('spaceSortBy');
           spaceList = document.getElementById('spaceList');
-          clearNukedPosts = document.getElementById('clearNukedPosts');
           openCoordinator = document.getElementById('openCoordinator');
           openHistory = document.getElementById('openHistory');
-          nukedPostCount = document.getElementById('nukedPostCount');
           fopDelay = document.getElementById('fopDelay');
           flipToAnswers = document.getElementById('flipToAnswers');
           fopFlipDelay = document.getElementById('fopFlipDelay');
@@ -1614,14 +1612,13 @@ function _init() {
           });
           popupState.sortBy = settings[SPACE_SORT_KEY] === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME;
           spaceSortBy.value = popupState.sortBy;
-          renderNukedPostCount(nukedPostCount);
           if (haveSameNukedPostKeys(settings[SPACE_NUKED_POSTS_KEY] || {}, popupState.nukedPosts)) {
-            _context7.next = 41;
+            _context6.next = 38;
             break;
           }
-          _context7.next = 41;
+          _context6.next = 38;
           return browser.storage.local.set(_defineProperty({}, SPACE_NUKED_POSTS_KEY, popupState.nukedPosts));
-        case 41:
+        case 38:
           form.addEventListener('submit', /*#__PURE__*/function () {
             var _ref = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee(event) {
               var nextSettings;
@@ -1645,12 +1642,11 @@ function _init() {
                     });
                     nukedPostRetentionDays.value = popupState.nukedPostRetentionDays;
                     maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts;
-                    renderNukedPostCount(nukedPostCount);
-                    _context.next = 10;
+                    _context.next = 9;
                     return browser.storage.local.set(_objectSpread(_objectSpread({}, nextSettings), {}, _defineProperty({}, SPACE_NUKED_POSTS_KEY, popupState.nukedPosts)));
-                  case 10:
+                  case 9:
                     showStatus(status, 'Settings saved.');
-                  case 11:
+                  case 10:
                   case "end":
                     return _context.stop();
                 }
@@ -1681,12 +1677,11 @@ function _init() {
                     retentionDays: popupState.nukedPostRetentionDays,
                     maxEntries: popupState.maxRememberedNukedPosts
                   });
-                  renderNukedPostCount(nukedPostCount);
-                  _context2.next = 16;
+                  _context2.next = 15;
                   return browser.storage.local.set(_defineProperty({}, SPACE_NUKED_POSTS_KEY, popupState.nukedPosts));
-                case 16:
+                case 15:
                   showStatus(status, 'Settings reset.');
-                case 17:
+                case 16:
                 case "end":
                   return _context2.stop();
               }
@@ -1712,38 +1707,37 @@ function _init() {
             event.preventDefault();
             void updateSpaceCategory(button.dataset.spaceKey, button.dataset.category, spaceList);
           });
-          clearNukedPosts.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee4() {
-            var count;
+          openCoordinator === null || openCoordinator === void 0 || openCoordinator.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee4() {
+            var currentWindow, result;
             return _regeneratorRuntime().wrap(function _callee4$(_context4) {
               while (1) switch (_context4.prev = _context4.next) {
                 case 0:
-                  count = Object.keys(popupState.nukedPosts || {}).length;
-                  if (count) {
-                    _context4.next = 4;
-                    break;
-                  }
-                  showStatus(status, 'Nothing to clear.');
-                  return _context4.abrupt("return");
-                case 4:
-                  if (window.confirm("Clear Recent History for ".concat(count, " ").concat(count === 1 ? 'entry' : 'entries', "?"))) {
-                    _context4.next = 6;
-                    break;
-                  }
-                  return _context4.abrupt("return");
-                case 6:
-                  popupState.nukedPosts = {};
-                  renderNukedPostCount(nukedPostCount);
-                  _context4.next = 10;
-                  return browser.storage.local.set(_defineProperty({}, SPACE_NUKED_POSTS_KEY, {}));
-                case 10:
-                  showStatus(status, 'Recent History cleared.');
-                case 11:
+                  _context4.next = 2;
+                  return browser.windows.getCurrent()["catch"](function () {
+                    return null;
+                  });
+                case 2:
+                  currentWindow = _context4.sent;
+                  _context4.next = 5;
+                  return browser.runtime.sendMessage({
+                    action: 'open-coordinator',
+                    active: true,
+                    windowId: (currentWindow === null || currentWindow === void 0 ? void 0 : currentWindow.id) || null
+                  })["catch"](function (error) {
+                    return {
+                      error: (error === null || error === void 0 ? void 0 : error.message) || "".concat(error || '')
+                    };
+                  });
+                case 5:
+                  result = _context4.sent;
+                  showStatus(status, result !== null && result !== void 0 && result.error ? 'Dashboard open failed.' : 'Dashboard opened.');
+                case 7:
                 case "end":
                   return _context4.stop();
               }
             }, _callee4);
           })));
-          openCoordinator === null || openCoordinator === void 0 || openCoordinator.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee5() {
+          openHistory === null || openHistory === void 0 || openHistory.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee5() {
             var currentWindow, result;
             return _regeneratorRuntime().wrap(function _callee5$(_context5) {
               while (1) switch (_context5.prev = _context5.next) {
@@ -1756,36 +1750,6 @@ function _init() {
                   currentWindow = _context5.sent;
                   _context5.next = 5;
                   return browser.runtime.sendMessage({
-                    action: 'open-coordinator',
-                    active: true,
-                    windowId: (currentWindow === null || currentWindow === void 0 ? void 0 : currentWindow.id) || null
-                  })["catch"](function (error) {
-                    return {
-                      error: (error === null || error === void 0 ? void 0 : error.message) || "".concat(error || '')
-                    };
-                  });
-                case 5:
-                  result = _context5.sent;
-                  showStatus(status, result !== null && result !== void 0 && result.error ? 'Dashboard open failed.' : 'Dashboard opened.');
-                case 7:
-                case "end":
-                  return _context5.stop();
-              }
-            }, _callee5);
-          })));
-          openHistory === null || openHistory === void 0 || openHistory.addEventListener('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee6() {
-            var currentWindow, result;
-            return _regeneratorRuntime().wrap(function _callee6$(_context6) {
-              while (1) switch (_context6.prev = _context6.next) {
-                case 0:
-                  _context6.next = 2;
-                  return browser.windows.getCurrent()["catch"](function () {
-                    return null;
-                  });
-                case 2:
-                  currentWindow = _context6.sent;
-                  _context6.next = 5;
-                  return browser.runtime.sendMessage({
                     action: 'open-coordinator-history',
                     active: true,
                     windowId: (currentWindow === null || currentWindow === void 0 ? void 0 : currentWindow.id) || null
@@ -1795,13 +1759,13 @@ function _init() {
                     };
                   });
                 case 5:
-                  result = _context6.sent;
+                  result = _context5.sent;
                   showStatus(status, result !== null && result !== void 0 && result.error ? 'History open failed.' : 'History opened.');
                 case 7:
                 case "end":
-                  return _context6.stop();
+                  return _context5.stop();
               }
-            }, _callee6);
+            }, _callee5);
           })));
           browser.storage.onChanged.addListener(function (changes) {
             if (changes[SPACE_REGISTRY_KEY]) {
@@ -1815,7 +1779,6 @@ function _init() {
             }
             if (changes[SPACE_NUKED_POSTS_KEY]) {
               popupState.nukedPosts = changes[SPACE_NUKED_POSTS_KEY].newValue || {};
-              renderNukedPostCount(nukedPostCount);
             }
             if (changes[NUKED_POST_RETENTION_DAYS_KEY]) {
               popupState.nukedPostRetentionDays = normalizeRetentionDays(changes[NUKED_POST_RETENTION_DAYS_KEY].newValue, defaults[NUKED_POST_RETENTION_DAYS_KEY]);
@@ -1827,11 +1790,11 @@ function _init() {
             }
           });
           renderSpaceList(spaceList);
-        case 50:
+        case 46:
         case "end":
-          return _context7.stop();
+          return _context6.stop();
       }
-    }, _callee7);
+    }, _callee6);
   }));
   return _init.apply(this, arguments);
 }
@@ -1844,43 +1807,39 @@ function showStatus(element, message) {
     element.textContent = '';
   }, 1200);
 }
-function renderNukedPostCount(element) {
-  var count = Object.keys(popupState.nukedPosts || {}).length;
-  element.textContent = "".concat(count, " history entr").concat(count === 1 ? 'y' : 'ies');
-}
 function updateSpaceCategory(_x, _x2, _x3) {
   return _updateSpaceCategory.apply(this, arguments);
 }
 function _updateSpaceCategory() {
-  _updateSpaceCategory = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee8(spaceKey, category, container) {
+  _updateSpaceCategory = _asyncToGenerator( /*#__PURE__*/_regeneratorRuntime().mark(function _callee7(spaceKey, category, container) {
     var _popupState$spaceRegi;
     var existingRecord, nextRecord;
-    return _regeneratorRuntime().wrap(function _callee8$(_context8) {
-      while (1) switch (_context8.prev = _context8.next) {
+    return _regeneratorRuntime().wrap(function _callee7$(_context7) {
+      while (1) switch (_context7.prev = _context7.next) {
         case 0:
           existingRecord = (_popupState$spaceRegi = popupState.spaceRegistry) === null || _popupState$spaceRegi === void 0 ? void 0 : _popupState$spaceRegi[spaceKey];
           if (existingRecord) {
-            _context8.next = 3;
+            _context7.next = 3;
             break;
           }
-          return _context8.abrupt("return");
+          return _context7.abrupt("return");
         case 3:
           nextRecord = buildSpaceRecord(existingRecord, category, existingRecord);
           if (nextRecord) {
-            _context8.next = 6;
+            _context7.next = 6;
             break;
           }
-          return _context8.abrupt("return");
+          return _context7.abrupt("return");
         case 6:
           popupState.spaceRegistry = _objectSpread(_objectSpread({}, popupState.spaceRegistry), {}, _defineProperty({}, spaceKey, nextRecord));
           renderSpaceList(container);
-          _context8.next = 10;
+          _context7.next = 10;
           return browser.storage.local.set(_defineProperty({}, SPACE_REGISTRY_KEY, popupState.spaceRegistry));
         case 10:
         case "end":
-          return _context8.stop();
+          return _context7.stop();
       }
-    }, _callee8);
+    }, _callee7);
   }));
   return _updateSpaceCategory.apply(this, arguments);
 }
