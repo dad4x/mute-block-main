@@ -102,6 +102,7 @@ function registerServiceWorkerListeners(deps = {}) {
         normalizeQuoraProfileUrl,
         normalizeRuntimeMessageAction,
         normalizeTabId,
+        notifyQueuedWorkerActionSurfaceSlotMaybeFreed,
         openCoordinatorPage,
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
@@ -215,10 +216,12 @@ function registerServiceWorkerListeners(deps = {}) {
         })
     }
     browser.tabs.onRemoved.addListener(tabId => {
+        notifyQueuedWorkerActionSurfaceSlotMaybeFreed()
+
         if(normalizeTabId(tabId) === normalizeTabId(getQueuedActionSurfaceAnchorTabId())) {
             resetQueuedWorkerActionSurface('anchor-removed')
         }
-    
+
         if(tabId === getCoordinatorTabId()) {
             void forgetCoordinatorTabId(tabId)
         }

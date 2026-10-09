@@ -115,5 +115,48 @@ module.exports = {
     // repeating the full pass. Short enough that a call outside this window
     // is treated as a genuinely new situation, long enough to collapse a
     // same-moment burst of triggers into one real pass.
-    COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS: 2000
+    COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS: 2000,
+
+    // sw.js createOwnedTabInQueuedWorkerActionSurface (2026-10-08): the
+    // worker window can only ever hold one profile tab at a time (Quora
+    // requires a tab be foregrounded to make progress, so every mute-block
+    // action shares one dedicated window and foregrounds its tab there).
+    // When a new action finds the window already occupied, it used to
+    // throw immediately and rely on the next generic reconcile/resume tick
+    // (a 60s worst-case fallback) to retry blind -- confirmed live as the
+    // dominant remaining handoff-latency cost once tabGetTimedOut was fixed
+    // (openSkippedBusy running close to or above tabOpened, retries costing
+    // 7-8s each). Waiting here instead, on a signal that fires the instant
+    // any tab is removed, lets a busy caller proceed the moment the
+    // occupant actually leaves rather than bailing out and polling later.
+    //
+    // This does NOT try to estimate "how long a normal occupant action
+    // takes" -- that's unknowable in general (it varies with whatever the
+    // action actually does) and guessing it directly went badly both
+    // times tried live the same session: 8000ms rescued 22/40 busy
+    // encounters but let the 18 losers each burn the full 8s before
+    // falling through (wasted, since a deep backlog almost always has
+    // other work available instead); 1000ms cut the waste per loser but
+    // then only rescued 2/47 (most real releases take longer than 1s), so
+    // the open success rate got *worse* than having no wait at all. Both
+    // attempts were also confounded by a real bug since fixed: the
+    // underlying wait is a signal that fires on *any* tab removal
+    // anywhere (see notifyQueuedWorkerActionSurfaceSlotMaybeFreed's own
+    // comment), and the code used to give up after checking just once per
+    // wakeup instead of looping on fresh signals -- an unrelated tab
+    // closing elsewhere in the browser could fail the wait faster than
+    // the timeout itself, which is pure noise in any A/B of the timeout
+    // value alone.
+    //
+    // What this value actually bounds, now that the loop is fixed: how
+    // long this call is willing to keep holding
+    // queuedWorkerActionSurfaceTabOpenLock -- which every *other*
+    // worker-window open attempt queues behind -- before giving up on one
+    // stuck slot and letting the fill loop try something else. Kept
+    // safely under QUEUED_TAB_CREATE_TIMEOUT_MS (10000ms, the outer
+    // promiseWithTimeout wrapping the whole open call in
+    // fillQueuedTabsOnce) so a genuinely stuck occupant still fails here,
+    // with the accurate "worker-action-surface-busy" reason, rather than
+    // in the outer wrapper with a less specific "tab create timed out".
+    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS: 8000
 }

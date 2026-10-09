@@ -842,12 +842,31 @@ async function refreshCompactRunsView() {
     return false
 }
 
-function hasCoordinatorQueueView(value = state.queueView) {
-    return !!value &&
-        typeof value === 'object' &&
-        !Array.isArray(value) &&
-        Number.parseInt(value.version, 10) >= 1 &&
-        Array.isArray(value.items)
+// Deliberately not a default parameter (`value = state.queueView`): a
+// caller checking some other object's shape -- e.g.
+// hasCoordinatorQueueView(result?.view) -- passes an explicit `undefined`
+// when that object has no .view at all (including when the object itself,
+// `result`, is null), and a default parameter activates on ANY explicit
+// undefined argument, not just a missing one. That silently substituted
+// the dashboard's own cached state.queueView in its place, which can
+// easily still look valid -- so the check passed, the caller proceeded as
+// if the response had a real view, and crashed moments later reading
+// .view off the actual (null) result. Confirmed live 2026-10-08:
+// "Uncaught (in promise) TypeError: Cannot read properties of null
+// (reading 'view')" in coordinator.js, both organically (refreshCompactQueueView,
+// 14 occurrences from one idle dashboard) and via Clear All Stats
+// (refreshCompactMetricsView's identical pattern, see
+// hasQueueWakeupMetricsView below). arguments.length distinguishes a
+// genuinely no-arg call (the many call sites below that mean "check the
+// dashboard's current state") from an explicit-but-undefined one (must be
+// checked literally, never substituted).
+function hasCoordinatorQueueView(value) {
+    const resolved = arguments.length > 0 ? value : state.queueView
+    return !!resolved &&
+        typeof resolved === 'object' &&
+        !Array.isArray(resolved) &&
+        Number.parseInt(resolved.version, 10) >= 1 &&
+        Array.isArray(resolved.items)
 }
 
 async function refreshCompactMetricsView() {
@@ -870,13 +889,18 @@ async function refreshCompactMetricsView() {
     return false
 }
 
-function hasQueueWakeupMetricsView(value = state.metrics) {
-    return !!value &&
-        typeof value === 'object' &&
-        !Array.isArray(value) &&
-        Number.parseInt(value.version, 10) >= 1 &&
-        Number.parseInt(value.viewVersion, 10) >= 1 &&
-        !!value.currentEpoch
+// See hasCoordinatorQueueView's own comment -- same explicit-undefined-vs-
+// no-argument distinction, for the same reason (refreshCompactMetricsView's
+// `hasQueueWakeupMetricsView(result?.view)` call above is the Clear All
+// Stats crash's actual trigger).
+function hasQueueWakeupMetricsView(value) {
+    const resolved = arguments.length > 0 ? value : state.metrics
+    return !!resolved &&
+        typeof resolved === 'object' &&
+        !Array.isArray(resolved) &&
+        Number.parseInt(resolved.version, 10) >= 1 &&
+        Number.parseInt(resolved.viewVersion, 10) >= 1 &&
+        !!resolved.currentEpoch
 }
 
 function applyCoordinatorQueueView(value = {}) {

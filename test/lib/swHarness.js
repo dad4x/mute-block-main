@@ -570,6 +570,8 @@ module.exports.__test = {
     getFlightRecorder,
     getFlightRecorderSnapshot,
     createOwnedTabInQueuedWorkerActionSurface,
+    getOrCreateQueuedWorkerActionSurface,
+    restoreFocusIfQueuedWorkerActionSurfaceIdle,
     getCoordinatorWhyNotRunning,
     getStorageUpdateQueueSnapshot,
     getRuntimeSurfaceForCoordinatorItem,
