@@ -52,7 +52,8 @@ const {
 const {
     WAIT_FOR_USER_START_DURABLE_ACTIVATION_DEFAULT_TIMEOUT_MS,
     STALE_ACTIVE_COORDINATOR_ROW_WATCHDOG_MS,
-    COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS
+    COORDINATOR_FAST_EXECUTOR_RECENT_NOOP_COOLDOWN_MS,
+    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS
 } = require('./timeouts')
 const {
     COORDINATOR_ENQUEUE_CHUNK_SIZE
@@ -941,16 +942,22 @@ let coordinatorTabId = null
 let coordinatorOpenPromise = null
 let queuedActionSurfaceWindowId = null
 let queuedActionSurfaceAnchorTabId = null
+// A busy createOwnedTabInQueuedWorkerActionSurface caller awaits this
+// instead of immediately bailing out -- see notifyQueuedWorkerActionSurfaceSlotMaybeFreed's
+// own comment for why it fires broadly (any tab removal) rather than only
+// for a tracked worker-window occupant.
+let queuedWorkerActionSurfaceSlotFreedResolve = null
+let queuedWorkerActionSurfaceSlotFreedPromise = null
 // 2026-09-29: the tab/window that was actually focused right before the
 // worker window was created -- captured once per worker-window lifetime,
-// not read fresh on every promotion, because focusQueuedWorkerActionSurfaceWindow
-// now keeps the worker window itself focused for as long as it's open. A
-// fresh getLastFocusedActiveTab() call during a later foreground-required
-// confirmation (promoteQueuedTab) would just see the worker window's own
-// tab by then, not the real external caller, defeating the point of
-// restoring focus back to it afterward (restoreOwnerTabFocus). Cleared
-// alongside the other worker-window state in closeQueuedWorkerActionSurfaceWindow
-// so the next window's first caller gets captured fresh.
+// not read fresh on every promotion, because a later foreground-required
+// confirmation (promoteQueuedTab) can itself be mid-flight through its own
+// brief focus steal by the time it would re-read "last focused" -- it
+// would just see the worker window's own tab by then, not the real
+// external caller, defeating the point of restoring focus back to it
+// afterward (restoreOwnerTabFocus). Cleared alongside the other
+// worker-window state in closeQueuedWorkerActionSurfaceWindow so the next
+// window's first caller gets captured fresh.
 let queuedActionSurfaceCallerTab = null
 let queuedActionSurfaceOpenPromise = null
 let queuedActionSurfaceCleanupTimeout = null
@@ -27083,33 +27090,47 @@ async function getLiveQueuedWorkerActionSurface() {
     return null
 }
 
-// 2026-09-29: every worker-window tab activation used to hand OS focus
-// straight back to whatever the caller was looking at before, via a
-// restoreQueuedActionSurfaceCallerFocus helper that lived here (removed --
-// no callers left) -- so the worker window itself was never the OS-focused
-// window. Confirmed live this is enough on its own to throttle the tab's
-// own JS timers (the content script's close-if-blocked poll included),
-// independent of the earlier queuedTabConcurrency fix for having more than
-// one tab open in the window at once. Per explicit user request, the
-// worker window's one active tab should be foregrounded instead of handing
-// focus back; closing the (now idle) worker window when work runs out
-// naturally hands OS focus to whatever window was used before it, the same
-// way closing any focused window does, so no explicit restore-on-idle path
-// is needed either.
-async function focusQueuedWorkerActionSurfaceWindow(windowId = null, tabId = null) {
+// History, for whoever next touches worker-window focus handling: this
+// window used to get explicitly focused twice -- once right after
+// creation (briefly, then restored -- removed 2026-10-08, see
+// getOrCreateQueuedWorkerActionSurface's own comment) and once on every
+// single action tab open (to dodge Chrome's background-tab timer
+// throttling -- also removed 2026-10-08, per explicit user request, see
+// createOwnedTabInQueuedWorkerActionSurface's own comment: stealing
+// mouse/keyboard focus from whatever the user was actively doing on every
+// open was worse than the throttling it avoided). Neither call site
+// remains. The one focus-stealing path still standing on purpose is
+// promoteQueuedTab's brief, genuinely-needed foreground for a real
+// confirmation click, which pairs with restoreOwnerTabFocus for its own
+// restore. restoreFocusIfQueuedWorkerActionSurfaceIdle below is a
+// separate, general safety net: whenever a worker-window tab is released
+// and nothing else is tracked against that window, hand focus back to
+// whoever was using the computer before the window existed, rather than
+// relying on the window eventually closing (scheduleQueuedWorkerActionSurfaceCleanup
+// runs on a delay and often decides to keep the window open anyway, since
+// more work is expected) to hand focus back as a side effect of that
+// close -- confirmed live via window-focus-summary.js that the window can
+// sit focused, in front, holding nothing but its own idle status page,
+// for the entire gap between one action's tab closing and the next
+// opening.
+async function restoreFocusIfQueuedWorkerActionSurfaceIdle(windowId = null, reason = 'idle-after-release') {
     const normalizedWindowId = Number.parseInt(windowId, 10) || 0
     if(!normalizedWindowId || !browser.windows?.update) return false
+    if(hasQueuedWorkerActionSurfaceRuntimeWork(normalizedWindowId)) return false
+
+    const restoreWindowId = Number.parseInt(queuedActionSurfaceCallerTab?.windowId, 10) || 0
+    if(!restoreWindowId || restoreWindowId === normalizedWindowId) return false
 
     recordFlightRecorderEvent({
         kind: 'window-focus-request',
-        source: 'focusQueuedWorkerActionSurfaceWindow',
-        tabId: normalizeTabId(tabId) || null,
-        windowId: normalizedWindowId,
+        source: 'restoreFocusIfQueuedWorkerActionSurfaceIdle',
+        windowId: restoreWindowId,
         accepted: true,
-        reason: 'foreground-worker-window'
+        reason
     })
-    const focused = await browser.windows.update(normalizedWindowId, {focused: true}).catch(() => null)
-    return !!focused
+    const restored = await browser.windows.update(restoreWindowId, {focused: true}).catch(() => null)
+    if(restored) incrementQueueWakeupMetric('actionSurface.workerWindow.focusYieldedIdle')
+    return !!restored
 }
 
 async function getOrCreateQueuedWorkerActionSurface(previousActiveTab = null) {
@@ -27138,20 +27159,27 @@ async function getOrCreateQueuedWorkerActionSurface(previousActiveTab = null) {
         queuedActionSurfaceCallerTab = previousActiveTab?.id ? previousActiveTab : null
         if(anchorTab?.id) await reconcileQueuedWorkerActionSurfaceSingleton(anchorTab, 'created')
         void persistQueuedWorkerActionSurfaceState(windowId, queuedActionSurfaceAnchorTabId, 'created')
-        // Focusing here is deliberate (a background-tab window gets its
-        // timers throttled by Chrome otherwise) but was previously
-        // one-directional -- nothing ever gave focus back, so the freshly
-        // created worker window stayed in front of whatever the user was
-        // looking at instead of staying buried the way it's designed to.
-        // The promotion flow already does exactly this brief-focus-then-
-        // restore dance (restoreOwnerTabFocus) for its own narrower case;
-        // mirror it here for plain creation.
-        void focusQueuedWorkerActionSurfaceWindow(windowId, anchorTab?.id).then(() => {
-            const restoreWindowId = Number.parseInt(previousActiveTab?.windowId, 10) || 0
-            if(restoreWindowId && restoreWindowId !== windowId) {
-                void browser.windows.update(restoreWindowId, {focused: true}).catch(() => {})
-            }
-        })
+        // 2026-10-08: used to proactively focus here too (a background-tab
+        // window gets its timers throttled by Chrome otherwise), then
+        // fire-and-forget restore focus back afterward. But nothing in a
+        // freshly created window needs unthrottled timers yet -- it holds
+        // only its own idle status page, no profile tab, until the caller
+        // (createOwnedTabInQueuedWorkerActionSurface) opens one and
+        // deliberately focuses the window itself for that real reason. The
+        // restore-after-create dance here was never awaited before this
+        // function returned, so it raced that same caller's own focus
+        // call with no guaranteed order -- and if the caller's own open
+        // was slow (or didn't happen at all, e.g. paused right after
+        // resume recreated the window) the restore could be the only
+        // thing that ever ran, land on a now-stale previousActiveTab, or
+        // just lose the race, leaving the window focused with nothing in
+        // it. Recurring live complaint ("worker window doesn't go back
+        // behind the user window", reproduced via pause -> manually close
+        // the window -> resume) plus "grabs mouse focus while typing" --
+        // both explained by stealing focus here for no immediate purpose.
+        // Simplest fix: don't. Created unfocused and left alone; the one
+        // real focus call that matters is the caller's own, right when
+        // there's an actual tab to unthrottle.
         incrementQueueWakeupMetric('actionSurface.workerWindow.created')
 
         return {
@@ -27188,6 +27216,32 @@ async function getOrCreateQueuedWorkerActionSurface(previousActiveTab = null) {
 // backs off instead of creating a second one.
 let queuedWorkerActionSurfaceTabOpenLock = Promise.resolve()
 
+function getQueuedWorkerActionSurfaceSlotFreedPromise() {
+    if(!queuedWorkerActionSurfaceSlotFreedPromise) {
+        queuedWorkerActionSurfaceSlotFreedPromise = new Promise(resolve => {
+            queuedWorkerActionSurfaceSlotFreedResolve = resolve
+        })
+    }
+    return queuedWorkerActionSurfaceSlotFreedPromise
+}
+
+// Called from the global browser.tabs.onRemoved listener (swBootstrap.js)
+// on *every* tab removal, not just a confirmed worker-window occupant --
+// there's no cheap way to know from onRemoved's bare tabId alone whether
+// the removed tab was the one sitting in the worker window (the tab is
+// already gone by the time this fires, and tracking "the current occupant
+// tabId" separately would be one more piece of state to keep in sync with
+// reality). A spurious wakeup just costs a busy waiter one extra
+// browser.tabs.query re-check (cheap); a missed real one would silently
+// reintroduce the old poll-and-give-up behavior this exists to replace.
+function notifyQueuedWorkerActionSurfaceSlotMaybeFreed() {
+    if(!queuedWorkerActionSurfaceSlotFreedResolve) return
+    const resolve = queuedWorkerActionSurfaceSlotFreedResolve
+    queuedWorkerActionSurfaceSlotFreedResolve = null
+    queuedWorkerActionSurfaceSlotFreedPromise = null
+    resolve()
+}
+
 async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = {}) {
     if(!shouldUseQueuedWorkerActionSurface(action)) return null
 
@@ -27216,11 +27270,59 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         // that merely shows the same profile, in a different window,
         // never counts.
         const surfaceWindowId = Number.parseInt(surface.windowId, 10) || 0
-        const surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
         const anchorTabId = normalizeTabId(surface.anchorTabId)
-        if(surfaceWindowTabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)) {
-            incrementQueueWakeupMetric('actionSurface.workerWindow.openSkippedBusy')
-            throw new Error('worker-action-surface-busy')
+        const isSurfaceBusy = tabs => tabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)
+
+        let surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
+        if(isSurfaceBusy(surfaceWindowTabs)) {
+            // Rather than bail out immediately and leave the next attempt to
+            // whatever generic reconcile/resume tick happens to fire next
+            // (previously a 60s worst-case fallback, confirmed live as the
+            // dominant handoff-latency cost -- see
+            // WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS's own comment),
+            // wait here for the occupant to actually leave. The wait is a
+            // signal (any tab removal), not a poll, so it fires the instant
+            // a tab closes instead of on some fixed interval -- but
+            // notifyQueuedWorkerActionSurfaceSlotMaybeFreed fires on *any*
+            // tab removal, not just this window's occupant (see its own
+            // comment), so one wakeup finding the window still busy does
+            // NOT mean the real release already happened and was missed --
+            // it means that particular wakeup was unrelated. Loop on fresh
+            // signals until the window is actually free or the deadline
+            // passes, rather than treating the first unrelated wakeup as a
+            // failure (confirmed live as a real bug, not just a tuning
+            // problem: with heavy background tab churn across a deep
+            // queue, spurious wakeups are common, and bailing on the first
+            // one could fail faster than even a short timeout).
+            //
+            // The deadline bounds something different than "how long a
+            // normal occupant action takes" (that's unknowable in general,
+            // and guessing it directly -- 8000ms, then 1000ms -- produced
+            // worse live numbers both times). It bounds how long this call
+            // is willing to keep holding queuedWorkerActionSurfaceTabOpenLock,
+            // which every *other* worker-window open attempt queues behind,
+            // before giving up on one stuck slot and letting the fill loop
+            // try something else. Kept safely under QUEUED_TAB_CREATE_TIMEOUT_MS
+            // (10000ms, the outer promiseWithTimeout wrapping the whole
+            // open call in fillQueuedTabsOnce) for the same reason as
+            // before: a genuinely stuck occupant should fail here, not in
+            // the outer wrapper, so the error reported is the accurate one.
+            incrementQueueWakeupMetric('actionSurface.workerWindow.openWaitedBusy')
+            const waitDeadline = Date.now() + WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS
+            while(isSurfaceBusy(surfaceWindowTabs)) {
+                const remainingMs = waitDeadline - Date.now()
+                if(remainingMs <= 0) break
+                await Promise.race([
+                    getQueuedWorkerActionSurfaceSlotFreedPromise(),
+                    new Promise(resolve => setTimeout(resolve, remainingMs))
+                ])
+                surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
+            }
+            if(isSurfaceBusy(surfaceWindowTabs)) {
+                incrementQueueWakeupMetric('actionSurface.workerWindow.openSkippedBusy')
+                throw new Error('worker-action-surface-busy')
+            }
+            incrementQueueWakeupMetric('actionSurface.workerWindow.openUnblockedAfterWait')
         }
 
         const surfaceCreateOptions = {
@@ -27246,7 +27348,16 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
             incrementQueueWakeupMetric('actionSurface.workerWindow.activateFailed')
             throw new Error('worker-action-surface-activate-failed')
         }
-        void focusQueuedWorkerActionSurfaceWindow(activatedWindowId || surfaceWindowId, activatedTabId)
+        // 2026-10-08: used to also call focusQueuedWorkerActionSurfaceWindow
+        // here (steal OS focus so the tab's own JS timers, close-if-blocked
+        // polling included, don't get throttled as a background window) --
+        // per explicit user request, that's no longer worth it: it could
+        // grab mouse/keyboard focus away from whatever the user was
+        // actively doing (typing included) every time a new action tab
+        // opened, not just once. browser.tabs.update above already makes
+        // this the active tab *within* the worker window (needed for it to
+        // render/run at all); accepting whatever extra timer throttling an
+        // unfocused-but-visible window gets is the explicit trade here.
         tagActionWithQueuedWorkerSurface(action, surface, activatedTab || tab, activatedAt)
         incrementQueueWakeupMetric('actionSurface.workerWindow.openedTab')
 
@@ -30653,6 +30764,10 @@ async function releaseQueuedTab(tabId, options = {}) {
         }
         scheduleReleaseContinuation()
         if(metadata?.actionSurfaceMode === 'worker-window' || metadata?.actionSurfaceWindowId) {
+            void restoreFocusIfQueuedWorkerActionSurfaceIdle(
+                metadata?.actionSurfaceWindowId || queuedActionSurfaceWindowId,
+                'idle-after-release'
+            )
             scheduleQueuedWorkerActionSurfaceCleanup('idle-after-release')
         }
     }
@@ -30662,6 +30777,10 @@ async function releaseQueuedTab(tabId, options = {}) {
             allowBeforeQuora: true
         })
         if(metadata?.actionSurfaceMode === 'worker-window' || metadata?.actionSurfaceWindowId) {
+            void restoreFocusIfQueuedWorkerActionSurfaceIdle(
+                metadata?.actionSurfaceWindowId || queuedActionSurfaceWindowId,
+                'idle-after-release'
+            )
             scheduleQueuedWorkerActionSurfaceCleanup('idle-after-release')
         }
     }
@@ -34395,6 +34514,7 @@ registerServiceWorkerListeners({
         normalizeQuoraProfileUrl,
         normalizeRuntimeMessageAction,
         normalizeTabId,
+        notifyQueuedWorkerActionSurfaceSlotMaybeFreed,
         openCoordinatorPage,
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,

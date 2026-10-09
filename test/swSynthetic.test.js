@@ -14,6 +14,8 @@ const {
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
 
+const SYNTHETIC_TEST_WATCHDOG_MS = 20000
+
 // Matches sw.js's COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC exactly (same name,
 // same gzipSync/gunzipSync backing) -- production checkpoints written via a
 // real switchCoordinatorAuthorityQueueWalCheckpoint() call are gzip-encoded
@@ -410,6 +412,41 @@ async function settleWithFakeTimers(promise, timers, steps = [0, 1000, 4000, 500
     }
 
     await flushAsync(50)
+    if(settledError) throw settledError
+    if(!settled) {
+        const pendingTimers = timers && typeof timers.pending === 'function'
+            ? timers.pending().slice(0, 10)
+            : []
+        throw new Error(`fake-timer operation did not settle; pendingTimers=${JSON.stringify(pendingTimers)}`)
+    }
+    return settledValue
+}
+
+// Like settleWithFakeTimers, but advances the clock in small fixed
+// increments instead of jumping by large steps, stopping the instant the
+// promise settles. Use this when a short internal throttle/backoff wait
+// needs to clear without overshooting a longer-delay timer scheduled
+// immediately afterward (settleWithFakeTimers' bigger steps would fire both
+// in one jump).
+async function settleWithFakeTimersInSmallSteps(promise, timers, {stepMs = 50, maxSteps = 60} = {}) {
+    let settled = false
+    let settledValue
+    let settledError
+    promise.then(value => {
+        settled = true
+        settledValue = value
+    }, error => {
+        settled = true
+        settledError = error
+    })
+
+    for(let index = 0; index < maxSteps && !settled; index += 1) {
+        await flushAsync(5)
+        if(settled) break
+        await timers.tick(stepMs)
+    }
+
+    await flushAsync(20)
     if(settledError) throw settledError
     if(!settled) {
         const pendingTimers = timers && typeof timers.pending === 'function'
@@ -18636,7 +18673,7 @@ test('service-worker queued action preserves foreground fallback policy when cla
     assert.equal(claim.noForegroundFallback, false)
 })
 
-test('service-worker no-foreground destructive work uses worker window and focuses it', async () => {
+test('service-worker no-foreground destructive work uses worker window without stealing OS focus', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Worker-Surface'
     const runId = 'run-worker-surface'
     const attemptId = 'attempt-worker-surface'
@@ -18694,8 +18731,16 @@ test('service-worker no-foreground destructive work uses worker window and focus
     const workerWindow = Array.from(browser.__windows.values()).find(win => win.id !== userTab.windowId)
 
     assert.ok(workerWindow?.id)
-    assert.equal(workerWindow.focused, true)
+    // 2026-10-08: used to deliberately steal OS focus here (so the worker
+    // window's active tab doesn't get its JS timers throttled as a
+    // background window) -- per explicit user request, reversed: grabbing
+    // mouse/keyboard focus away from whatever the user is actually doing
+    // (typing included) on every single action tab open is worse than
+    // accepting an unfocused-but-visible window's extra timer throttling.
+    // See createOwnedTabInQueuedWorkerActionSurface's own comment, sw.js.
+    assert.equal(workerWindow.focused, false)
     assert.equal((await browser.tabs.get(userTab.id)).active, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
     assert.equal(profileTab?.windowId, workerWindow.id)
     assert.equal(profileTab?.active, true)
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].tabId, profileTab.id)
@@ -18707,14 +18752,69 @@ test('service-worker no-foreground destructive work uses worker window and focus
     const metadata = sw.state().queuedTabMetadata.find(([tabId]) => tabId === profileTab.id)?.[1] || {}
     assert.equal(metadata.actionSurfaceMode, 'worker-window')
     assert.equal(metadata.actionSurfaceWindowId, workerWindow.id)
-    // 2026-09-29: per explicit user request, the worker window's one active
-    // tab is now foregrounded instead of handing OS focus back to whatever
-    // the caller was looking at before (confirmed live that an unfocused
-    // worker window throttles its own tab's JS timers, close-if-blocked
-    // polling included) -- see focusQueuedWorkerActionSurfaceWindow, sw.js.
     assert.equal(browser.__windowUpdates.some(update =>
         update.windowId === workerWindow.id && update.options?.focused === true
-    ), true)
+    ), false)
+})
+
+test('getOrCreateQueuedWorkerActionSurface creates the window without touching window focus', async () => {
+    // 2026-10-08: used to briefly focus the freshly created window then
+    // fire-and-forget restore focus back, racing whatever the caller did
+    // next with no guaranteed order -- removed per explicit user request
+    // (see createOwnedTabInQueuedWorkerActionSurface's own comment, sw.js)
+    // since nothing in a window holding only its own idle status page
+    // needs unthrottled timers yet, and the race could leave the window
+    // focused with nothing in it if the restore lost or never ran.
+    const {sw, browser} = loadServiceWorkerHarness({now: 4000})
+    const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=test', active: true})
+
+    const surface = await sw.getOrCreateQueuedWorkerActionSurface(userTab)
+    assert.ok(surface?.windowId)
+    assert.notEqual(surface.windowId, userTab.windowId)
+
+    assert.equal(browser.__windows.get(surface.windowId)?.focused, false)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
+    assert.equal(browser.__windowUpdates.some(update => update.windowId === surface.windowId), false)
+})
+
+test('restoreFocusIfQueuedWorkerActionSurfaceIdle hands focus back to the caller once nothing is tracked against the window', async () => {
+    const {sw, browser} = loadServiceWorkerHarness({now: 4000})
+    const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=test', active: true})
+    const makeAction = href => ({
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    })
+
+    const tab = await sw.createOwnedTabInQueuedWorkerActionSurface(
+        makeAction('https://www.quora.com/profile/Synthetic-Worker-Idle-Restore'),
+        {url: 'https://www.quora.com/profile/Synthetic-Worker-Idle-Restore'}
+    )
+    assert.ok(tab?.id)
+    const workerWindowId = tab.windowId
+
+    // Simulate the window holding focus for some other, legitimate reason
+    // (e.g. the confirmation-promotion flow's own brief steal) to prove
+    // this function actively restores it, not merely that nothing stole
+    // it in the first place -- createOwnedTabInQueuedWorkerActionSurface
+    // itself no longer touches focus at all (see the no-steal test above).
+    await browser.windows.update(workerWindowId, {focused: true})
+    assert.equal(browser.__windows.get(workerWindowId)?.focused, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, false)
+
+    // Nothing tracks this tab as runtime work from this isolated call
+    // alone (that bookkeeping is fillQueuedTabsOnce's own, applied after
+    // createOwnedTabInQueuedWorkerActionSurface returns), so the window
+    // reads as idle immediately.
+    const restored = await sw.restoreFocusIfQueuedWorkerActionSurfaceIdle(workerWindowId, 'test-idle-release')
+    assert.equal(restored, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
+    assert.equal(browser.__windows.get(workerWindowId)?.focused, false)
 })
 
 test('createOwnedTabInQueuedWorkerActionSurface serializes two overlapping opens into one tab', async () => {
@@ -18730,7 +18830,7 @@ test('createOwnedTabInQueuedWorkerActionSurface serializes two overlapping opens
     // tracked tabs, not another counter -- this test calls the function
     // twice without awaiting the first, the way two overlapping callers
     // would, and checks only one tab actually gets created.
-    const {sw} = loadServiceWorkerHarness({now: 4000})
+    const {sw, timers} = loadServiceWorkerHarness({now: 4000})
     const makeAction = href => ({
         ownerTabId: 'service-worker-queue-owner',
         actionKind: 'mute-block',
@@ -18754,15 +18854,115 @@ test('createOwnedTabInQueuedWorkerActionSurface serializes two overlapping opens
     const first = await firstPromise
     assert.ok(first?.id)
 
+    // The second call now waits (see WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS)
+    // instead of rejecting immediately -- since nothing closes the first
+    // tab in this test, the wait runs out and it still rejects the same
+    // way, just after the fake clock is ticked past that timeout.
     let secondError = null
-    const second = await secondPromise.catch(error => {
+    const second = await settleWithFakeTimersInSmallSteps(secondPromise.catch(error => {
         secondError = error
         return null
-    })
+    }), timers, {stepMs: 200, maxSteps: 60})
 
     assert.equal(second, null)
     assert.ok(secondError)
     assert.match(secondError.message, /worker-action-surface-busy/)
+})
+
+test('createOwnedTabInQueuedWorkerActionSurface proceeds as soon as the occupying tab closes, instead of rejecting immediately', async () => {
+    // Companion to the "serializes two overlapping opens" test above: once
+    // the first call actually finishes, the slot is occupied but not by a
+    // *racing* caller anymore -- a busy second attempt should wait for the
+    // real occupant to leave and then proceed, not reject on the spot the
+    // way it used to. See WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS's own
+    // comment in shared/js/timeouts.js for the live cost this replaces.
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000})
+    const makeAction = href => ({
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    })
+
+    const first = await sw.createOwnedTabInQueuedWorkerActionSurface(
+        makeAction('https://www.quora.com/profile/Synthetic-Worker-Wait-First'),
+        {url: 'https://www.quora.com/profile/Synthetic-Worker-Wait-First'}
+    )
+    assert.ok(first?.id)
+
+    const secondPromise = sw.createOwnedTabInQueuedWorkerActionSurface(
+        makeAction('https://www.quora.com/profile/Synthetic-Worker-Wait-Second'),
+        {url: 'https://www.quora.com/profile/Synthetic-Worker-Wait-Second'}
+    )
+    await flushAsync(10)
+
+    // Close the occupant the way a finished action does -- this should
+    // wake the waiting second call via the onRemoved-driven signal rather
+    // than it needing to wait out the full timeout.
+    await browser.tabs.remove(first.id)
+
+    const second = await settleWithFakeTimersInSmallSteps(secondPromise, timers)
+    assert.ok(second?.id)
+    assert.notEqual(second.id, first.id)
+})
+
+test('createOwnedTabInQueuedWorkerActionSurface keeps waiting past an unrelated tab removal instead of failing on the first spurious wakeup', async () => {
+    // notifyQueuedWorkerActionSurfaceSlotMaybeFreed (sw.js) fires on *any*
+    // tab removal, not just the worker-window occupant's -- there's no
+    // cheap way to tell from a bare removed tabId alone. The busy-wait
+    // used to recheck once per wakeup and give up immediately if still
+    // busy, so an unrelated tab closing elsewhere could fail a waiting
+    // open faster than even a short timeout. Confirmed as a real
+    // confound in this session's live A/B of the timeout value, not just
+    // a tuning problem. This proves the fix: an unrelated removal wakes
+    // the wait, finds the real occupant still there, and keeps waiting
+    // for the next signal instead of giving up.
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000})
+    const makeAction = href => ({
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    })
+
+    const first = await sw.createOwnedTabInQueuedWorkerActionSurface(
+        makeAction('https://www.quora.com/profile/Synthetic-Worker-Spurious-First'),
+        {url: 'https://www.quora.com/profile/Synthetic-Worker-Spurious-First'}
+    )
+    assert.ok(first?.id)
+
+    const secondPromise = sw.createOwnedTabInQueuedWorkerActionSurface(
+        makeAction('https://www.quora.com/profile/Synthetic-Worker-Spurious-Second'),
+        {url: 'https://www.quora.com/profile/Synthetic-Worker-Spurious-Second'}
+    )
+    await flushAsync(10)
+
+    // An unrelated tab, elsewhere in the browser, closes first -- this
+    // should wake the wait but NOT resolve it, since the real occupant
+    // (first.id) is still there.
+    const unrelatedTab = await browser.tabs.create({url: 'https://www.quora.com/notifications', active: false})
+    await browser.tabs.remove(unrelatedTab.id)
+    await flushAsync(10)
+
+    let settledEarly = false
+    secondPromise.then(() => { settledEarly = true }, () => { settledEarly = true })
+    await flushAsync(10)
+    assert.equal(settledEarly, false, 'the wait resolved on an unrelated tab removal instead of continuing to wait')
+
+    // Now close the real occupant -- this should be the signal that
+    // actually unblocks the second call.
+    await browser.tabs.remove(first.id)
+    const second = await settleWithFakeTimersInSmallSteps(secondPromise, timers)
+    assert.ok(second?.id)
+    assert.notEqual(second.id, first.id)
 })
 
 test('service-worker reuses existing worker window after in-memory surface state is lost', async () => {
@@ -19849,12 +20049,15 @@ test('queued profile actions are throttled and opened background', async () => {
     )
 
     assert.equal(opened.length, 1)
-    // 2026-09-29: this used to also require the window stay unfocused
-    // whenever the tab ended up active -- per explicit user request, the
-    // worker window's one active tab is now always foregrounded
-    // (focusQueuedWorkerActionSurfaceWindow, sw.js), so an active tab here
-    // legitimately means a focused window too. The throttling this test is
-    // actually about (only one of the two hrefs opens a tab) is unaffected.
+    // 2026-09-29/2026-10-08: this used to also require the window stay
+    // unfocused whenever the tab ended up active, then briefly required
+    // the opposite (the worker window's one active tab was always
+    // foregrounded, per a since-reversed explicit user request -- see
+    // createOwnedTabInQueuedWorkerActionSurface's own comment, sw.js).
+    // window focus is no longer coupled to a tab's own active-within-its-
+    // window state either way, so this just confirms a tab opened; the
+    // throttling this test is actually about (only one of the two hrefs
+    // opens a tab) is unaffected.
     if(opened[0].active !== true) {
         assert.equal(opened[0].active, false)
     }
@@ -33986,7 +34189,7 @@ test('executor queue-only reconcile preserves fresh startup actor before no-acto
     const href = 'https://www.quora.com/profile/Synthetic-Executor-Fresh-Startup-Actor'
     const runId = 'run-executor-fresh-startup-actor'
     const attemptId = 'attempt-executor-fresh-startup-actor'
-    const {browser, sw, storage} = loadServiceWorkerHarness({
+    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
         now: 3900,
         storage: {
             mbCoordinatorPaused: false,
@@ -34014,12 +34217,26 @@ test('executor queue-only reconcile preserves fresh startup actor before no-acto
         openedAt: 3890
     })
 
-    const result = await sw.runCoordinatorExecutorApplyPhase('dashboard-resume-fast-executor', {
+    // This item's single tabId gets probed for "close-if-blocked" twice in
+    // one apply-phase pass -- once via sweepProfileTabsWithoutActiveQueueAuthority's
+    // prepass, once via the main per-item loop's
+    // terminalizeActiveCoordinatorItemFromBlockedLiveTab call -- and the
+    // second probe hits CLOSE_IF_BLOCKED_MIN_PROBE_INTERVAL_MS's (750ms)
+    // real (fake-timer-backed) throttle wait since Date.now() hasn't
+    // advanced. Ticking the fake clock forward in small (50ms) increments,
+    // stopping the instant the call settles, clears that wait without also
+    // firing the 1000ms scheduleCoordinatorReconcile call the unresolved-case
+    // branch makes afterward -- a single large tick (e.g. settleWithFakeTimers'
+    // default steps) overshoots both at once, and the assertions below need
+    // that reconcile timeout to still be pending. Without ticking the clock
+    // at all, the wait never resolves and the test hangs forever with
+    // nothing left to time it out (see
+    // project_swsynthetic_silent_hang_2026_10_07 in project memory).
+    const result = await settleWithFakeTimersInSmallSteps(sw.runCoordinatorExecutorApplyPhase('dashboard-resume-fast-executor', {
         serviceWorkerOwned: true,
         queueOnlyAuthority: true,
         requeueMissingActiveTabs: true
-    })
-
+    }), timers)
     assert.equal(result.changed, false)
     assert.equal(result.reason, 'executor-cases-unresolved')
     assert.equal(result.primaryUnresolvedCase?.case, 'active-with-tab-and-pending-action')
@@ -36043,8 +36260,9 @@ test('authority reconcile ignores stale mismatched progress for active-without-a
     assert.equal(sw.coordinatorAuthority.current().queue[href].attemptNumber, 2)
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
-    assert.equal(storage.mbCoordinatorQueueView?.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView?.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    const queueView = getFreshQueueView(sw, storage)
+    assert.equal(queueView.counts.queued, 1)
+    assert.equal(queueView.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -36122,8 +36340,9 @@ test('authority reconcile requeues projection-only action-phase active row when 
     assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, null)
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.equal(getProgressShardRecord(storage, href).attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
-    assert.equal(storage.mbCoordinatorQueueView?.counts.queued, 1)
-    assert.equal(storage.mbCoordinatorQueueView?.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
+    const queueView = getFreshQueueView(sw, storage)
+    assert.equal(queueView.counts.queued, 1)
+    assert.equal(queueView.items[0].attemptId, sw.coordinatorAuthority.current().queue[href].attemptId)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -39664,7 +39883,21 @@ test('content-page state reads only its own profileHref shard, not the full cont
         const {name, fn} = selectedTests[index]
         try {
             currentTestHarnesses = []
+            // A test whose awaited call never settles (e.g. it exercises a
+            // fake-timer-gated delay without ticking the clock) has no
+            // pending real timer/handle to keep the event loop open, so
+            // Node exits cleanly (code 0) right at that await -- silently
+            // truncating the run instead of hanging or failing. This
+            // watchdog forces a real handle to stay alive so a stuck test
+            // fails loudly instead of vanishing (see
+            // project_swsynthetic_silent_hang_2026_10_07 in project memory).
+            const watchdogTimeout = setTimeout(() => {
+                console.log(`not ok - ${name}`)
+                console.log(`Error: test did not settle within ${SYNTHETIC_TEST_WATCHDOG_MS}ms (likely an un-ticked fake timer) -- see project_swsynthetic_silent_hang_2026_10_07`)
+                process.exit(1)
+            }, SYNTHETIC_TEST_WATCHDOG_MS)
             await fn()
+            clearTimeout(watchdogTimeout)
             console.log(`ok - ${name}`)
         }
         catch(error) {
