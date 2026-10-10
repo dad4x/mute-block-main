@@ -31,6 +31,10 @@ const FLIGHT_RECORDER_STRING_MAX = 240
 const FLIGHT_RECORDER_URL_MAX = 500
 const FLIGHT_RECORDER_KINDS = new Set([
     "start-resume",
+    "activation-guard-claim",
+    "activation-guard-release",
+    "activation-guard-hit",
+    "activation-guard-prune",
     "fill-decision",
     "fill-recovery",
     "executor-classification",

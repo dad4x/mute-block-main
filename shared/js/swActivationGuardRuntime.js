@@ -182,6 +182,7 @@ function createActivationGuardRuntime(deps = {}) {
             const guardedAt = Number.parseInt(guard?.guardedAt, 10) || 0
             if(!guardedAt || now - guardedAt > QUEUED_ACTIVATION_GUARD_TTL_MS) {
                 queuedActivationGuards.delete(key)
+                recordActivationGuardEvent('activation-guard-prune', key, guard)
                 pruned += 1
             }
         }
@@ -191,11 +192,29 @@ function createActivationGuardRuntime(deps = {}) {
         return pruned
     }
 
+    // Tell-tales for the slow-handoff investigation (2026-10-10): every claim, release, blocked hit,
+    // and TTL prune of an activation guard is recorded with its key and holder.
+    function recordActivationGuardEvent(kind, key = '', guard = {}) {
+        recordFlightRecorderEvent({
+            kind,
+            source: 'activationGuardRuntime',
+            rowKey: key,
+            reason: guard?.reason || '',
+            runId: guard?.runId || '',
+            attemptId: guard?.attemptId || '',
+            attemptNumber: guard?.attemptNumber || 0,
+            tabId: guard?.tabId || null,
+            elapsedMs: Math.max(0, getNow() - (Number.parseInt(guard?.guardedAt, 10) || 0))
+        })
+    }
+
     function hasQueuedActivationGuard(value = null) {
         const key = getQueuedActivationGuardKey(value)
         if(!key) return false
         pruneQueuedActivationGuards()
-        return queuedActivationGuards.has(key)
+        const guard = queuedActivationGuards.get(key)
+        if(guard) recordActivationGuardEvent('activation-guard-hit', key, guard)
+        return !!guard
     }
 
     function claimQueuedActivationGuard(value = null, tab = null, reason = 'queued-activation') {
@@ -203,20 +222,26 @@ function createActivationGuardRuntime(deps = {}) {
         if(!key) return ''
         pruneQueuedActivationGuards()
         if(queuedActivationGuards.has(key)) return ''
-        queuedActivationGuards.set(key, {
+        const guard = {
             guardedAt: getNow(),
             reason,
             tabId: normalizeTabId(tab?.id || value?.tabId || value?.activeTabId || null),
             runId: value?.runId || '',
             attemptId: getAttemptIdFromValue(value),
             attemptNumber: getAttemptNumberFromValue(value)
-        })
+        }
+        queuedActivationGuards.set(key, guard)
+        recordActivationGuardEvent('activation-guard-claim', key, guard)
         return key
     }
 
     function releaseQueuedActivationGuard(value = null) {
         const key = getQueuedActivationGuardKey(value)
-        return key ? queuedActivationGuards.delete(key) : false
+        if(!key) return false
+        const guard = queuedActivationGuards.get(key)
+        const released = queuedActivationGuards.delete(key)
+        if(guard) recordActivationGuardEvent('activation-guard-release', key, guard)
+        return released
     }
 
     function releaseQueuedActivationGuardForTab(tabId = null, metadata = null) {
@@ -227,6 +252,7 @@ function createActivationGuardRuntime(deps = {}) {
         for(const [key, guard] of queuedActivationGuards.entries()) {
             if(normalizeTabId(guard?.tabId) !== normalizedTabId) continue
             queuedActivationGuards.delete(key)
+            recordActivationGuardEvent('activation-guard-release', key, guard)
             released = true
         }
         return released

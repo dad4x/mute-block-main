@@ -65,13 +65,25 @@ const {
     buildSegmentedWalStoragePayload,
     CHECKPOINT_A,
     CHECKPOINT_B,
+    CHECKPOINT_SHARD_DEFAULT_COUNT,
     createChromeLocalStorageAdapter,
+    normalizeCheckpointId,
+    normalizeCheckpointShardCount,
     createSerializedStorageUpdateQueue,
     createSerializedStorageUpdateState,
     createStorageUpdateAccessors,
     getWalRecordsForGeneration,
     getSegmentedWalCheckpointKey,
+    getKeyedRowReadKeys,
+    getQueueMirrorKeys,
+    isQueueMirrorFresh,
+    planQueueMirrorAppend,
+    planQueueMirrorRebuild,
+    selectQueueMirrorRecords,
+    getSegmentedWalCheckpointShardKeys,
     getSegmentedWalSegmentKey,
+    projectKeyedRowFromStored,
+    projectKeyedRowFromResidentStore,
     getSegmentedWalCommittedSegmentCount,
     getSegmentedWalMetaKey,
     hydrateSegmentedWalStore,
@@ -403,6 +415,10 @@ const COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC = {
 // call below as the `options` fragment (or merged into a caller-supplied
 // one) so read and write sides agree on the same codec.
 const COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC}
+// Checkpoints are written in the sharded-v1 format (see walSnapshotStore.js).
+// Monolithic checkpoints written before this change still read unchanged, and
+// each slot converts to sharded the next time it is rewritten.
+const COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT = CHECKPOINT_SHARD_DEFAULT_COUNT
 const COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT = 128
 const COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT = 1024
 // 2026-09-14: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT used to defer the
@@ -690,6 +706,10 @@ const STALE_QUEUED_TAB_MAX_RETRIES = 1
 const COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = 3
 const FOREGROUND_LEASE_WAIT_EVENT_MS = 5000
 const COORDINATOR_RECONCILE_INTERVAL_MS = 5000
+// Unscoped terminal-owned-tab sweep (orphan cleanup). Job completions clean
+// only their own hrefs; this full pass runs from the reconcile tick, at most
+// once per this interval.
+const TERMINAL_OWNED_TAB_ORPHAN_SWEEP_MIN_INTERVAL_MS = 60000
 const COORDINATOR_RECONCILE_BACKOFF_BASE_MS = 5000
 const COORDINATOR_RECONCILE_BACKOFF_MAX_MS = 60000
 const STALE_SCHEDULER_ALARM_SUPPRESSION_MS = 5000
@@ -850,7 +870,6 @@ let coordinatorQueueWalCheckpointSwitchPromise = null
 // function's comment for why the switch no longer gets its own position in
 // the shared write queue at all.
 let coordinatorQueueWalCheckpointSwitchDueReason = ''
-let coordinatorQueueWalAutoRecoveryPersistPromise = null
 // 2026-09-15 resident WAL store cache: canUseResidentCoordinatorQueueWalStoreForMeta
 // (swCoordinatorQueueWal.js) has always been correct -- given a candidate
 // store and the current meta, it tells you whether the candidate is still
@@ -1983,7 +2002,7 @@ async function resetQueueWakeupMetricsEpochAfterLoad(reason = 'manual', options 
 }
 
 async function resumeStoredWorkAfterQuoraActivation(reason = 'quora-observed') {
-    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState({
+    const currentAuthorityState = await coordinatorQueueReader.currentAuthority({
         [COORDINATOR_PAUSED_KEY]: false,
         [COORDINATOR_PAUSE_GENERATION_KEY]: 0
     }).catch(() => null)
@@ -3476,6 +3495,7 @@ const queuedTabRuntimeStatus = createQueuedTabRuntimeStatus({
 const {
     isDurablyActiveQueuedTab,
     getDurablyActiveQueuedTabCount,
+    getCapacityConsumingQueuedTabCount,
     getDurablyActiveCoordinatorAuthorityRowCount,
     getFreshQueuedTabRuntimeStartupAnchor,
     isFreshQueuedTabRuntimeStartup,
@@ -3822,7 +3842,7 @@ async function mutateCoordinatorActiveNonProfileLandingTerminalize(operation = {
     const itemKey = `${operation.itemKey || ''}`.trim()
     if(!itemKey) return {changed: false, reason: 'missing-item-key'}
 
-    const state = await loadCoordinatorQueueRunsProgressProjection({
+    const state = await coordinatorQueueReader.runsProgress({
         metricPath: 'reconcile.nonProfileLanding.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -4000,7 +4020,7 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
         return {changed: false, reason: 'not-profile-redirect-mismatch'}
     }
 
-    const state = await loadCoordinatorQueueRunsProgressProjection({
+    const state = await coordinatorQueueReader.runsProgress({
         metricPath: 'reconcile.profileRedirectMismatch.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -4195,7 +4215,7 @@ async function mutateCoordinatorActiveWithoutRuntimeActorReconcile(operation = {
         incrementQueueWakeupMetric('reconcile.activeWithoutActor.usedResidentAuthority')
     }
     if(!currentAuthorityState) {
-        currentAuthorityState = await loadCoordinatorQueueRunsProjection({
+        currentAuthorityState = await coordinatorQueueReader.runs({
             metricPath: 'reconcile.activeWithoutActor.load'
         })
     }
@@ -4493,7 +4513,7 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
         incrementQueueWakeupMetric('reconcile.terminalProgressActive.usedResidentAuthority')
     }
     if(!currentAuthorityState) {
-        currentAuthorityState = await loadCoordinatorQueueRunsProgressProjection({
+        currentAuthorityState = await coordinatorQueueReader.runsProgress({
             metricPath: 'reconcile.terminalProgressActive.load'
         })
     }
@@ -4630,7 +4650,7 @@ async function settleDurableCoordinatorItemFromTerminalProgress(itemKey = '', ex
         }
         : null
     if(!currentAuthorityState) {
-        currentAuthorityState = await loadCoordinatorQueueRunsProgressProjection({
+        currentAuthorityState = await coordinatorQueueReader.runsProgress({
             metricPath: 'terminalSettlement.terminalProgress.load'
         })
     }
@@ -4785,12 +4805,12 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
         ? (options.forceDurableQueueReload === true
             ? null
             : getHydratedCoordinatorAuthorityState('reconcile.authority.queueOnly.usedResidentAuthority')) ||
-            await loadCoordinatorQueueRunsProjection({
+            await coordinatorQueueReader.runs({
                 metricPath: options.forceDurableQueueReload === true
                     ? 'reconcile.authority.queueOnly.forceDurableReload'
                     : 'reconcile.authority.queueOnly.load'
             })
-        : await loadCoordinatorCurrentAuthorityState({
+        : await coordinatorQueueReader.currentAuthority({
             [COORDINATOR_PAUSED_KEY]: false
         })
     const queue = currentAuthorityState.queue
@@ -5271,7 +5291,7 @@ async function runCoordinatorAuthorityReconcileActions(reason = 'coordinator-aut
 }
 
 async function observeCoordinatorReconcileSnapshot(reason = 'reconcile-observe', options = {}) {
-    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState({
+    const currentAuthorityState = await coordinatorQueueReader.currentAuthority({
         [COORDINATOR_PAUSED_KEY]: false
     })
     const queue = currentAuthorityState.queue || {}
@@ -5615,8 +5635,7 @@ const {
     areCoordinatorAccountingCountsEqual,
     makeCoordinatorQueueAccountingComparison,
     summarizeCoordinatorQueueWalAccounting,
-    makeCoordinatorCurrentWorkAccounting,
-    buildCoordinatorQueueFromView
+    makeCoordinatorCurrentWorkAccounting
 } = coordinatorQueueView
 
 async function getCoordinatorQueueAccounting(request = {}) {
@@ -6131,16 +6150,11 @@ async function loadCoordinatorStatsClearedAtFromStorage() {
 // throttle and the hot-path's unmerged rebuilds created -- see git history
 // for that whole chapter). It served three purposes, none of which need a
 // disk-backed snapshot of this specific shape: disaster recovery if the WAL
-// itself became unreadable (attemptCoordinatorQueueWalAutoRecoveryFromView/
-// buildCoordinatorQueueFromView, left in place but now always a no-op --
-// metricStorageGet's COORDINATOR_QUEUE_VIEW_KEY default returns null, so
-// viewItemCount is always 0 and this returns {ok: false, reason: 'view-empty'}
-// immediately, falling through to ordinary WAL-corruption handling -- losing
-// the live queue to a real WAL corruption means re-enqueuing, which is an
-// accepted tradeoff), a cheap startup "is there stored work" check (now just
+// itself became unreadable (retired -- see retireLegacyQueueViewStorageKey),
+// a cheap startup "is there stored work" check (now just
 // asks the real WAL-backed queue -- see
 // hasUnpausedStoredCoordinatorWorkInDurableQueue), and a message-timeout
-// fallback (coordinator.js's refreshCompactQueueView no longer has one,
+// fallback (coordinator.js's refreshCompactDashboardViews no longer has one,
 // same reasoning). None of them needed millisecond freshness, and none of
 // them are worth the throttle/ratchet machinery it took to keep a
 // multiply-written disk copy self-consistent. The completed-work log itself
@@ -6148,19 +6162,55 @@ async function loadCoordinatorStatsClearedAtFromStorage() {
 // untouched by any of this -- that's real authoritative data with the same
 // durability as the live queue, never mixed into this view's disk
 // persistence in the first place.
-async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refresh') {
-    recordFlightRecorderEvent({
-        kind: 'dashboard-refresh',
-        source: 'refreshCoordinatorQueueViewForDashboard',
-        reason
+// Shared read behind every dashboard view request. The queue view, the runs
+// view, and the combined refresh-coordinator-dashboard-views message all need
+// the same three inputs: recovered queue authority, the runs map, and the full
+// completed-work log. Loading them once per request instead of once per view
+// halves the WAL reconstruction a dashboard poll pays for. Read-only: nothing
+// here writes storage, and the builders below must not mutate the snapshot,
+// because the combined message feeds one snapshot to both builders.
+// Newest first, so the caller can take the most recent N. Shared by getRecentCompletedWorkRows and the
+// dashboard snapshot, which must order completed history identically.
+function sortCompletedWorkRowsNewestFirst(completedMap = {}, limit = 50) {
+    return Object.values(normalizeCoordinatorMap(completedMap))
+        .sort((left, right) => (Number.parseInt(right?.terminalAt || right?.updatedAt, 10) || 0) -
+            (Number.parseInt(left?.terminalAt || left?.updatedAt, 10) || 0))
+        .slice(0, limit)
+}
+
+async function loadCoordinatorDashboardAuthoritySnapshot(metricLabel = 'dashboard') {
+    // One WAL read and one projection feed both the live queue and the completed history. Before this,
+    // the queue reader and the completed-history reader each read and replayed the WAL.
+    const walStored = await metricStorageGet({...getCoordinatorQueueWalStorageDefaults()}, {
+        metricPath: metricLabel
     })
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
-        metricPath: `queueView.${reason}`
+    const queueSnapshot = {}
+    const walStore = await loadCoordinatorQueueWalProjection(walStored, queueSnapshot, {
+        metricPath: `${metricLabel}.segments`
     })
+    const queue = recoverQueueFromWalStore(queueSnapshot, walStore)
+    recordActiveStorageWorkSnapshot(queue)
+    closeRuntimeTabsReclaimedByAuthority(queue, 'queue-projection-reclaimed-runtime')
+    const recovered = recoverProjectedState(walStore, [], COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
+    // Unbounded (not just the most recent 50): a run's stats need every one of
+    // its rows ever archived, see refreshCoordinatorRunsViewForDashboard.
+    const completedRows = sortCompletedWorkRowsNewestFirst(
+        recovered?.projected?.state?.completed || {},
+        Number.MAX_SAFE_INTEGER
+    )
     const stored = await metricStorageGet({
-        [COORDINATOR_RUNS_KEY]: {}
-    }, {metricPath: `queueView.${reason}.runs`})
-    const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
+        [COORDINATOR_RUNS_KEY]: {},
+        [COORDINATOR_PAUSED_KEY]: false
+    }, {metricPath: `${metricLabel}.runs`})
+    return {
+        queue,
+        runs: normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {}),
+        globalPaused: stored[COORDINATOR_PAUSED_KEY] === true,
+        completedRows
+    }
+}
+
+function buildCoordinatorQueueViewFromDashboardSnapshot(snapshot) {
     // A terminal row leaves the live authority queue as soon as it durably
     // settles (archiveTerminalCoordinatorRow moves it to the completed-work
     // log) -- currentAuthorityState.queue alone would make this dashboard
@@ -6174,9 +6224,8 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
     // view if its runId is still a currently-known run (or it's post-cutoff;
     // see COORDINATOR_STATS_CLEARED_AT_KEY), so this can't resurrect stale
     // rows from long-cleared batches.
-    const queue = {...currentAuthorityState.queue}
-    const recentCompletedRows = await getRecentCompletedWorkRows(Number.MAX_SAFE_INTEGER)
-    for(const completedRow of recentCompletedRows) {
+    const queue = {...snapshot.queue}
+    for(const completedRow of snapshot.completedRows) {
         if(!completedRow || typeof completedRow !== 'object') continue
         // completed-work rows never carry coordinatorKey/profileHref fields
         // (those don't exist on this shape -- see archiveTerminalCoordinatorRow's
@@ -6189,7 +6238,21 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
             queue[completedKey] = completedRow
         }
     }
-    const view = mergeCoordinatorQueueViewTimingCache(buildCoordinatorQueueView(queue, Date.now(), {runs, statsClearedAt: coordinatorStatsClearedAtResident}))
+    return mergeCoordinatorQueueViewTimingCache(buildCoordinatorQueueView(queue, Date.now(), {runs: snapshot.runs, statsClearedAt: coordinatorStatsClearedAtResident}))
+}
+
+function buildCoordinatorRunsSummaryFromDashboardSnapshot(snapshot) {
+    return buildFreshCoordinatorRunsSummary(snapshot.runs, snapshot.queue, snapshot.completedRows, snapshot.globalPaused)
+}
+
+async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refresh') {
+    recordFlightRecorderEvent({
+        kind: 'dashboard-refresh',
+        source: 'refreshCoordinatorQueueViewForDashboard',
+        reason
+    })
+    const snapshot = await loadCoordinatorDashboardAuthoritySnapshot(`queueView.${reason}`)
+    const view = buildCoordinatorQueueViewFromDashboardSnapshot(snapshot)
     recordFlightRecorderEvent({
         kind: 'compact-view-materialized',
         source: 'refreshCoordinatorQueueViewForDashboard',
@@ -6234,26 +6297,38 @@ async function clearCoordinatorTerminalStats() {
 // summary for this one request -- nothing persisted here to go stale or to
 // race against.
 async function refreshCoordinatorRunsViewForDashboard(reason = 'dashboard-refresh') {
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
-        metricPath: `runsView.${reason}`
-    })
-    const stored = await metricStorageGet({
-        [COORDINATOR_RUNS_KEY]: {},
-        [COORDINATOR_PAUSED_KEY]: false
-    }, {metricPath: `runsView.${reason}.runs`})
-    const runs = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
-    const globalPaused = stored[COORDINATOR_PAUSED_KEY] === true
-    // Unlike refreshCoordinatorQueueViewForDashboard's bounded recent-completed
-    // scan (fine there -- it's just trimming what a truncated queue view
-    // shows), a run's stats need every one of its rows ever archived, not
-    // just the most recent 50 across ALL runs, or an older run's counts would
-    // silently shrink as newer runs' completions push it out of that window.
-    const completedRows = await getRecentCompletedWorkRows(Number.MAX_SAFE_INTEGER)
-    const runsSummary = buildFreshCoordinatorRunsSummary(runs, currentAuthorityState.queue || {}, completedRows, globalPaused)
+    const snapshot = await loadCoordinatorDashboardAuthoritySnapshot(`runsView.${reason}`)
     return {
         refreshed: true,
         reason,
-        runs: runsSummary
+        runs: buildCoordinatorRunsSummaryFromDashboardSnapshot(snapshot)
+    }
+}
+
+// What the dashboard's loadState asks for on every poll: both views from one
+// authority read, instead of two round trips that each replay the same WAL and
+// completed-work log.
+async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-refresh') {
+    recordFlightRecorderEvent({
+        kind: 'dashboard-refresh',
+        source: 'refreshCoordinatorDashboardViewsForDashboard',
+        reason
+    })
+    const snapshot = await loadCoordinatorDashboardAuthoritySnapshot(`dashboardViews.${reason}`)
+    const view = buildCoordinatorQueueViewFromDashboardSnapshot(snapshot)
+    const runs = buildCoordinatorRunsSummaryFromDashboardSnapshot(snapshot)
+    recordFlightRecorderEvent({
+        kind: 'compact-view-materialized',
+        source: 'refreshCoordinatorDashboardViewsForDashboard',
+        reason
+    })
+    return {
+        refreshed: true,
+        reason,
+        total: view.total,
+        truncated: view.truncated,
+        view,
+        runs
     }
 }
 
@@ -6539,6 +6614,150 @@ function cacheCoordinatorQueueWalResidentStoreFromWrite(store = null, payload = 
     setCoordinatorQueueWalResidentStoreCache({...store, meta: writtenMeta})
 }
 
+// Phase 2 of the mirror plan: the session mirror. It is written only after a WAL write has
+// been acknowledged by storage, and it is read only when its meta matches the disk meta.
+// Storage stays the authority. A stale or missing mirror costs one disk read and nothing else.
+let coordinatorQueueMirrorWriteChain = Promise.resolve()
+
+function getCoordinatorQueueMirrorSessionArea() {
+    return browser.storage?.session || null
+}
+
+function enqueueCoordinatorQueueMirrorWrite(task) {
+    const run = coordinatorQueueMirrorWriteChain.then(task)
+    coordinatorQueueMirrorWriteChain = run.catch(() => null)
+    return run
+}
+
+// Rebuilds the whole mirror from disk. Reads the disk meta first, then the keys that meta
+// names, and checks the meta again so a slot that moved in between is never mirrored.
+async function rebuildCoordinatorQueueMirrorFromDisk() {
+    const session = getCoordinatorQueueMirrorSessionArea()
+    if(!session) return false
+    const metaRead = await metricStorageGet({[COORDINATOR_QUEUE_WAL_META_KEY]: null}, {
+        metricPath: 'queueMirror.rebuild.meta'
+    })
+    const diskMeta = metaRead?.[COORDINATOR_QUEUE_WAL_META_KEY]
+    if(!isSegmentedWalStorageMeta(diskMeta)) return false
+    const readKeys = Object.fromEntries(
+        getQueueMirrorKeys(diskMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY}).map(key => [key, null])
+    )
+    const stored = await metricStorageGet(readKeys, {metricPath: 'queueMirror.rebuild'})
+    if(!isQueueMirrorFresh(stored?.[COORDINATOR_QUEUE_WAL_META_KEY], diskMeta)) {
+        incrementQueueWakeupMetric('queueMirror.rebuildSkippedMoved')
+        return false
+    }
+    const plan = planQueueMirrorRebuild(stored, stored[COORDINATOR_QUEUE_WAL_META_KEY], {baseKey: COORDINATOR_QUEUE_WAL_KEY})
+    if(!plan.ok) {
+        incrementQueueWakeupMetric('queueMirror.rebuildIncomplete')
+        return false
+    }
+
+    // The previous mirror's keys are known from its own meta. Keys it held that the new
+    // mirror does not are removed, so no retired segment lingers in the session area.
+    const previous = await session.get({[COORDINATOR_QUEUE_WAL_META_KEY]: null})
+    const previousMeta = previous?.[COORDINATOR_QUEUE_WAL_META_KEY]
+    const previousKeys = isSegmentedWalStorageMeta(previousMeta)
+        ? getQueueMirrorKeys(previousMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
+        : []
+    const retired = previousKeys.filter(key => !Object.prototype.hasOwnProperty.call(plan.records, key))
+    if(retired.length) await session.remove(retired)
+    await session.set(plan.records)
+    incrementQueueWakeupMetric('queueMirror.rebuilt')
+    return true
+}
+
+// After an acknowledged WAL write, and before the caller's result is returned. The session
+// update is awaited, so a read that starts after an ack always finds the mirror fresh. It
+// advances the mirror when the write is a plain append, and rebuilds it from disk otherwise.
+// It never throws: a failed mirror write is counted, and the disk write still stands.
+async function mirrorCoordinatorQueueWalAfterAck(payload = {}) {
+    const meta = payload?.[COORDINATOR_QUEUE_WAL_META_KEY]
+    if(!getCoordinatorQueueMirrorSessionArea() || !isSegmentedWalStorageMeta(meta)) return false
+    // Only a sharded active slot has a mirror to keep. Legacy slots keep the disk path alone.
+    const activeSlot = normalizeCheckpointId(meta.activeCheckpoint)
+    if(!normalizeCheckpointShardCount(meta.checkpoints?.[activeSlot]?.shardCount)) return false
+    try {
+        return await enqueueCoordinatorQueueMirrorWrite(async () => {
+            const session = getCoordinatorQueueMirrorSessionArea()
+            const sessionRead = await session.get({[COORDINATOR_QUEUE_WAL_META_KEY]: null})
+            const plan = planQueueMirrorAppend(
+                sessionRead?.[COORDINATOR_QUEUE_WAL_META_KEY],
+                payload,
+                {baseKey: COORDINATOR_QUEUE_WAL_KEY}
+            )
+            if(plan) {
+                await session.set(plan.records)
+                incrementQueueWakeupMetric('queueMirror.appendAdvanced')
+                return true
+            }
+            incrementQueueWakeupMetric('queueMirror.appendNotPlannable')
+            return rebuildCoordinatorQueueMirrorFromDisk()
+        })
+    }
+    catch(error) {
+        incrementQueueWakeupMetric('queueMirror.writeFailed')
+        return false
+    }
+}
+
+// Reads queue rows from the mirror when its meta matches disk. Returns ok: false in every
+// other case, and the caller reads disk. Extra defaults (progress shards) are always read
+// from disk, because the mirror does not hold them.
+function canReadCoordinatorQueueRowsFromMirror() {
+    return !!getCoordinatorQueueMirrorSessionArea() && !!getResidentKeyedRowPlan()
+}
+
+async function readCoordinatorQueueRowsFromMirror(wanted = [], options = {}) {
+    const session = getCoordinatorQueueMirrorSessionArea()
+    if(!session || !getResidentKeyedRowPlan()) return {ok: false, reason: 'mirror-not-attempted', rows: {}}
+    const extraDefaults = options.extraDefaults || {}
+    try {
+        const [diskRead, sessionMetaRead, extraRead] = await Promise.all([
+            metricStorageGet({[COORDINATOR_QUEUE_WAL_META_KEY]: null}, {metricPath: 'queueMirror.read.diskMeta'}),
+            session.get({[COORDINATOR_QUEUE_WAL_META_KEY]: null}),
+            Object.keys(extraDefaults).length
+                ? metricStorageGet(extraDefaults, {metricPath: options.metricPath || 'queueMirror.read.extra'})
+                : Promise.resolve({})
+        ])
+        const diskMeta = diskRead?.[COORDINATOR_QUEUE_WAL_META_KEY]
+        const mirrorMeta = sessionMetaRead?.[COORDINATOR_QUEUE_WAL_META_KEY]
+        if(!isQueueMirrorFresh(mirrorMeta, diskMeta)) {
+            incrementQueueWakeupMetric('queueMirror.readStale')
+            return {ok: false, reason: 'mirror-stale', rows: {}}
+        }
+
+        const mirrorKeys = {[COORDINATOR_QUEUE_WAL_META_KEY]: null}
+        for(const key of wanted) {
+            for(const readKey of getKeyedRowReadKeys(mirrorMeta, key, {baseKey: COORDINATOR_QUEUE_WAL_KEY})) {
+                mirrorKeys[readKey] = null
+            }
+        }
+        const mirror = await session.get(mirrorKeys)
+        const stored = {...mirror, ...(extraRead || {})}
+        const rows = {}
+        for(const key of wanted) {
+            const projected = projectKeyedRowFromStored(stored, {
+                baseKey: COORDINATOR_QUEUE_WAL_KEY,
+                area: 'queue',
+                key,
+                ...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS
+            })
+            if(!projected.ok) {
+                incrementQueueWakeupMetric('queueMirror.readGap')
+                return {ok: false, reason: projected.reason, rows: {}}
+            }
+            if(projected.found) rows[key] = projected.value
+        }
+        incrementQueueWakeupMetric('queueMirror.readHit')
+        return {ok: true, reason: '', rows, stored, source: 'mirror'}
+    }
+    catch(error) {
+        incrementQueueWakeupMetric('queueMirror.readFailed')
+        return {ok: false, reason: 'mirror-read-error', rows: {}}
+    }
+}
+
 // 2026-10-06: confirmed live on a 54-hour-old epoch that
 // coordinatorAuthority.queueWal.segmentIncrementalInvalidated exactly
 // matched checkpointWrites at 4017 -- 35% of all 11543 WAL appends that
@@ -6629,8 +6848,7 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
         // segment data itself ("missing-segment"). Confirmed live
         // (2026-10-01/03): 6-9 of these per ~20-minute run, previously
         // invisible because they silently self-healed via
-        // attemptCoordinatorQueueWalAutoRecoveryFromView's queue-view
-        // snapshot -- now that nothing persists that view to disk any more
+        // legacy queue-view snapshot (since retired) -- now that nothing persists that view to disk any more
         // (see the 2026-10-01/02 removal above), every one of them used to
         // surface as a thrown error the caller had to retry from scratch,
         // 500ms+ later, behind whatever storage backlog existed at the time.
@@ -6661,6 +6879,11 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
                 [COORDINATOR_QUEUE_WAL_META_KEY]: null,
                 [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_A)]: null,
                 [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_B)]: null
+            }
+            for(const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+                for(const key of getSegmentedWalCheckpointShardKeys(COORDINATOR_QUEUE_WAL_KEY, checkpointId, COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT)) {
+                    atomicReadKeys[key] = null
+                }
             }
             for(let segmentNo = 0; segmentNo < guessedSegmentCount; segmentNo += 1) {
                 atomicReadKeys[getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, guessedActiveCheckpoint, segmentNo)] = null
@@ -6737,9 +6960,9 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
             hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
         )
         // 2026-09-15: auto-recover instead of leaving the coordinator dead in
-        // the water -- this used to require someone running
-        // tools/cdp/recover-queue-wal-from-view.js by hand after every
-        // "missing-segment" incident (a hard crash mid checkpoint-switch is
+        // the water -- this used to require someone running a CDP helper by
+        // hand after every "missing-segment" incident (both the helper and the
+        // view recovery have since been retired, see LEGACY_QUEUE_VIEW_RETIREMENT.md) (a hard crash mid checkpoint-switch is
         // enough to cause one; chrome.storage.local has no cross-key
         // transaction guarantee). mbCoordinatorQueueView is a materialized
         // read-model independent of the WAL's own physical segments, so it
@@ -6771,59 +6994,9 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
         // a thrown recovery attempt the same as an unsuccessful one keeps the
         // contract intact -- and correctly counted -- no matter how backed up
         // storage is.
-        let viewRecovery = null
-        try {
-            viewRecovery = await attemptCoordinatorQueueWalAutoRecoveryFromView(stored, meta, options)
-        }
-        catch(error) {
-            viewRecovery = {ok: false, reason: `auto-recovery-threw: ${error?.message || error || 'unknown error'}`.slice(0, 240)}
-        }
-        if(viewRecovery?.ok === true && viewRecovery.store) {
-            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView')
-            recordCoordinatorDiagnosticEvent(
-                'coordinator-authority-queue-wal-auto-recovered-from-view',
-                `Rebuilt ${viewRecovery.rebuiltRowCount} row(s) from queue view after hydrate failure (${hydrated?.reason || 'hydrate-failed'})`
-            )
-            recordFlightRecorderEvent({
-                kind: 'queue-wal-auto-recovery',
-                source: 'loadCoordinatorQueueWalStoreFromStorage',
-                reason: hydrated?.reason || 'hydrate-failed',
-                viewItemCount: viewRecovery.viewItemCount,
-                rebuiltRowCount: viewRecovery.rebuiltRowCount
-            })
-            stored[COORDINATOR_QUEUE_WAL_KEY] = viewRecovery.store
-            // Cached optimistically, ahead of the durable persist below.
-            setCoordinatorQueueWalResidentStoreCache(viewRecovery.store)
-            // 2026-09-26: this used to be fire-and-forget ("the in-memory
-            // store already unblocks the caller"), on the theory that a
-            // caller should never wait on a full checkpoint write in this
-            // already-rare failure branch. In practice that meant a
-            // service-worker restart landing before this write completed
-            // silently dropped the repair -- storage kept its old (corrupt)
-            // meta, which won't match this recovered store's meta, so
-            // canUseResidentCoordinatorQueueWalStoreForMeta correctly refused
-            // to serve it as stale on the next hydrate... but that also means
-            // the NEXT restart hits the exact same 'missing-checkpoint'
-            // failure and repeats this same recovery, forever, if restarts
-            // keep coming faster than this write can land (confirmed live:
-            // 7 restarts in a row, same "missing-checkpoint" diagnostic every
-            // time, zero of the 7 auto-recovery persists ever completing).
-            // Awaiting it here means the repair actually lands before this
-            // function returns, at the cost of this rare branch taking
-            // slightly longer -- worth it since the alternative is a
-            // standing storage inconsistency that only self-heals by luck.
-            await scheduleCoordinatorQueueWalAutoRecoveryPersist(
-                viewRecovery.store,
-                stored,
-                hydrated?.reason || 'hydrate-failed'
-            )
-            return viewRecovery.store
-        }
-        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedAutoRecoveryFromViewFailed')
-        recordCoordinatorDiagnosticEvent(
-            'coordinator-authority-queue-wal-auto-recovery-from-view-failed',
-            viewRecovery?.reason || 'no-usable-queue-view'
-        )
+        // Retired: a hydrate failure is never rebuilt from the legacy queue view. That copy predates the
+        // WAL and can resurrect rows the WAL has already moved past. The failure below is the contract.
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedRecoveryRetired')
         if(hydrated?.reason === 'missing-checkpoint' &&
             !Object.keys(normalizeCoordinatorMap(snapshotQueue || {})).length) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedMissingCheckpointReset')
@@ -6879,112 +7052,6 @@ async function loadCoordinatorQueueWalStoreFromStorage(stored = {}, snapshotQueu
 // ticks, verified against test/swSynthetic.test.js and test/swScenarioFuzz.test.js.
 function loadCoordinatorQueueWalProjection(stored, snapshotQueue, options = {}) {
     return loadCoordinatorQueueWalStoreFromStorage(stored, snapshotQueue, options)
-}
-
-// In-memory half of the 2026-09-15 WAL auto-recovery (see the call site in
-// loadCoordinatorQueueWalStoreFromStorage): rebuilds a fresh paired-checkpoint
-// store from mbCoordinatorQueueView, mirroring
-// tools/cdp/recover-queue-wal-from-view.js's logic exactly, including its
-// row-count-mismatch safety refusal. Read-only -- callers decide whether/how
-// to persist the result via scheduleCoordinatorQueueWalAutoRecoveryPersist.
-async function attemptCoordinatorQueueWalAutoRecoveryFromView(stored = {}, previousMeta = null, options = {}) {
-    let view = Object.prototype.hasOwnProperty.call(stored || {}, COORDINATOR_QUEUE_VIEW_KEY)
-        ? stored[COORDINATOR_QUEUE_VIEW_KEY]
-        : undefined
-    if(view === undefined) {
-        const viewStored = await metricStorageGet({[COORDINATOR_QUEUE_VIEW_KEY]: null}, {
-            metricPath: options.metricPath
-                ? `${options.metricPath}.autoRecoveryViewRead`
-                : 'coordinatorQueueWal.autoRecovery.viewRead'
-        })
-        view = viewStored?.[COORDINATOR_QUEUE_VIEW_KEY] || null
-        stored[COORDINATOR_QUEUE_VIEW_KEY] = view
-    }
-    const viewItemCount = Array.isArray(view?.items) ? view.items.length : Object.keys(view?.items || {}).length
-    if(!viewItemCount) return {ok: false, reason: 'view-empty', viewItemCount: 0, rebuiltRowCount: 0}
-
-    const rebuiltQueue = buildCoordinatorQueueFromView(view)
-    const rebuiltRowCount = Object.keys(rebuiltQueue).length
-    if(rebuiltRowCount !== viewItemCount) {
-        return {ok: false, reason: 'row-count-mismatch', viewItemCount, rebuiltRowCount}
-    }
-
-    const previousNextSeq = Number.parseInt(previousMeta?.nextSeq, 10) || 1
-    const snapshotSeq = Math.max(0, previousNextSeq - 1)
-    const nextSeq = Math.max(previousNextSeq, snapshotSeq + 1)
-    const store = makePairedCheckpointStore({queue: rebuiltQueue}, {
-        createdAt: Date.now(),
-        snapshotSeq,
-        nextSeq
-    })
-    return {ok: true, store, viewItemCount, rebuiltRowCount}
-}
-
-// Durable half of the 2026-09-15 WAL auto-recovery. Its one caller now
-// awaits this (see the 2026-09-26 comment there for why the original
-// fire-and-forget design let this repair get silently dropped across a
-// fast restart). Still single-flight guarded the same way
-// scheduleCoordinatorQueueWalCheckpointSwitch coalesces concurrent switch
-// attempts -- multiple hydrate call sites can hit the same corruption in
-// the same tick, and should all await the one in-flight write rather than
-// each starting their own.
-function scheduleCoordinatorQueueWalAutoRecoveryPersist(store, previousStored = {}, reason = 'hydrate-failed') {
-    if(coordinatorQueueWalAutoRecoveryPersistPromise) return coordinatorQueueWalAutoRecoveryPersistPromise
-    const payload = buildSegmentedWalStoragePayload(store, {
-        baseKey: COORDINATOR_QUEUE_WAL_KEY,
-        softSwitchAt: COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
-        hardSegmentLimit: COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
-        updatedAt: Date.now()
-    })
-    const payloadKeys = Object.keys(payload)
-    const retiredKeys = Object.keys(previousStored || {})
-        .filter(isCoordinatorQueueWalPhysicalStorageKey)
-        .filter(key => !payloadKeys.includes(key))
-    coordinatorQueueWalAutoRecoveryPersistPromise = (async () => {
-        try {
-            await metricStorageSet(payload, {
-                metricPath: 'queueWal.autoRecoveryFromView.save',
-                queueOperation: 'queue-wal-auto-recovery-from-view',
-                queueChangedRows: payloadKeys.length,
-                coordinatorAuthorityWrite: true
-            })
-            if(retiredKeys.length) {
-                await metricStorageRemove(retiredKeys, {metricPath: 'queueWal.autoRecoveryFromView.cleanup'})
-            }
-            // Re-affirm the resident cache (already set optimistically at
-            // read time, before this durable write even started) against the
-            // exact meta this write just put in storage, same as every other
-            // write-completion site -- see cacheCoordinatorQueueWalResidentStoreFromWrite.
-            cacheCoordinatorQueueWalResidentStoreFromWrite(store, payload)
-            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.autoRecoveredFromViewPersisted')
-            recordFlightRecorderEvent({
-                kind: 'queue-wal-auto-recovery',
-                source: 'scheduleCoordinatorQueueWalAutoRecoveryPersist',
-                reason,
-                durable: true,
-                retiredKeys: retiredKeys.length
-            })
-        }
-        catch(error) {
-            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.autoRecoveredFromViewPersistFailed')
-            recordCoordinatorDiagnosticEvent(
-                'coordinator-authority-queue-wal-auto-recovery-persist-failed',
-                error?.message || 'Coordinator authority queue WAL auto-recovery persist failed'
-            )
-            recordFlightRecorderEvent({
-                kind: 'queue-wal-auto-recovery',
-                source: 'scheduleCoordinatorQueueWalAutoRecoveryPersist',
-                reason,
-                durable: false,
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
-            })
-        }
-        finally {
-            coordinatorQueueWalAutoRecoveryPersistPromise = null
-        }
-    })()
-    void coordinatorQueueWalAutoRecoveryPersistPromise
-    return coordinatorQueueWalAutoRecoveryPersistPromise
 }
 
 // Self-throttled: getBytesInUse is a real async storage call, so this is
@@ -7156,12 +7223,12 @@ async function maybeRunDueCoordinatorQueueWalCheckpointSwitchInline() {
     if(!coordinatorQueueWalCheckpointSwitchDueReason) return
     const reason = coordinatorQueueWalCheckpointSwitchDueReason
     coordinatorQueueWalCheckpointSwitchDueReason = ''
-    coordinatorQueueWalCheckpointSwitchPromise = performCoordinatorQueueWalCheckpointSwitch({
+    coordinatorQueueWalCheckpointSwitchPromise = coordinatorAuthority.runExclusiveOnApplyTail(() => performCoordinatorQueueWalCheckpointSwitch({
         metricPath: `queueWal.${reason}.load`,
         saveMetricPath: `queueWal.${reason}.save`,
         suppressCheckpointSwitchSchedule: true,
         switchReason: reason
-    }).catch(() => null)
+    })).catch(() => null)
     await coordinatorQueueWalCheckpointSwitchPromise
     coordinatorQueueWalCheckpointSwitchPromise = null
 }
@@ -7433,6 +7500,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         }
     }
     cacheCoordinatorQueueWalResidentStoreFromWrite(append.store, physicalWal.payload)
+    void mirrorCoordinatorQueueWalAfterAck(physicalWal.payload)
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended')
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
@@ -7449,7 +7517,7 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
     const projectionQueueOperation = `${result.operationKind || 'authority-row-mutation'}-projection`
     // Replay-verify delegated to verifyAppendedCoordinatorQueueWalReplay
     // (swCoordinatorQueueWal.js) -- see the comment there.
-    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS))
+    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, {...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS, baseQueue: result.previousProjectionQueue || null, baseNextSeq: storedWal?.meta?.nextSeq}))
     const {recoveredAfterAppend, ignoredAppendedRecords} = replayVerified
     if(!replayVerified.ok) {
         incrementQueueWakeupMetric(ignoredAppendedRecords.length
@@ -7797,6 +7865,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         }
     }
     cacheCoordinatorQueueWalResidentStoreFromWrite(append.store, physicalWal.payload)
+    void mirrorCoordinatorQueueWalAfterAck(physicalWal.payload)
 
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appended', records.length)
     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.appendBytes', getJsonByteSize(append.records || []))
@@ -7816,7 +7885,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
 
     // See the matching comment in persistCoordinatorAuthorityQueueWalMutation
     // above for why this is delegated to verifyAppendedCoordinatorQueueWalReplay.
-    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS))
+    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, {...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS, baseQueue: options.previousProjectionQueue || null, baseNextSeq: storedWal?.meta?.nextSeq}))
     const {ignoredAppendedRecords} = replayVerified
     if(!replayVerified.ok) {
         incrementQueueWakeupMetric(ignoredAppendedRecords.length
@@ -8044,7 +8113,8 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             snapshotSeq: maxAppliedSeq,
             createdAt: Date.now(),
             codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC,
-            codecName: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC.name
+            codecName: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC.name,
+            shardCount: COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT
         })
         const activated = activateCheckpoint(prepared.store, prepared.checkpointId, COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
         if(activated?.activated !== true) {
@@ -8194,6 +8264,10 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             committedSegmentsB: getSegmentedWalCommittedSegmentCount(postSwitchMeta, 'B')
         })
 
+        // Awaited last, after the physical cleanup, so the switch keeps its own storage sequence.
+        // The mirror is fresh before the caller gets the result.
+        await mirrorCoordinatorQueueWalAfterAck(checkpointWal?.payload || {})
+
         return {
             checkpointSwitched: true,
             saved: true,
@@ -8224,7 +8298,7 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         reason: 'storage-update-fallback'
     }
 
-    return enqueueSpaceFeedStorageUpdate(() => performCoordinatorQueueWalCheckpointSwitch(options), {
+    return enqueueSpaceFeedStorageUpdate(() => coordinatorAuthority.runExclusiveOnApplyTail(() => performCoordinatorQueueWalCheckpointSwitch(options)), {
         reason: 'coordinator-authority.queueWal.checkpointSwitch',
         timeoutMs: options.timeoutMs,
         failureValue: failureResult
@@ -9029,7 +9103,7 @@ function createCoordinatorAuthority() {
     let applyTail = Promise.resolve()
 
     async function hydrate(defaults = {}) {
-        projection = makeCoordinatorAuthorityProjection(await loadCoordinatorCurrentAuthorityState(defaults))
+        projection = makeCoordinatorAuthorityProjection(await coordinatorQueueReader.currentAuthority(defaults))
         closeRuntimeTabsReclaimedByAuthority(projection.queue, 'authority-hydrate-reclaimed-runtime')
         hydrated = true
         return current()
@@ -9259,18 +9333,27 @@ function createCoordinatorAuthority() {
         const reason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
 
         const storageContext = getActiveStorageContext()
-        const providedAuthorityState = operation.allowCurrentAuthorityState === true ||
+        const callerAuthorityState = operation.allowCurrentAuthorityState === true ||
             (storageContext && operation.allowLockedProjection === true)
             ? normalizeCoordinatorAuthorityStateInput(
                 operation.currentAuthorityState || operation.authorityState || operation.lockedProjection
             )
             : null
+        // A caller snapshot whose WAL meta is not the acknowledged one predates a later write, such as a
+        // checkpoint switch. Appending to it would write the old generation over the new one, so the
+        // authority falls back to its own projection, which absorbs every acknowledged write.
+        const providedAuthorityState = callerAuthorityState && hydrated &&
+            projection.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] &&
+            JSON.stringify(callerAuthorityState.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null) !==
+                JSON.stringify(projection.stored[COORDINATOR_QUEUE_WAL_META_KEY])
+            ? null
+            : callerAuthorityState
         const residentAuthorityRows = !providedAuthorityState && hydrated
             ? makeCoordinatorAuthorityProjection(projection)
             : null
         const freshAuthorityRows = providedAuthorityState ||
             residentAuthorityRows ||
-            await loadCoordinatorQueueRunsProjection()
+            await coordinatorQueueReader.runs()
         if(residentAuthorityRows) {
             incrementQueueWakeupMetric('coordinatorAuthority.residentProjectionUsedForMutation')
         }
@@ -9520,6 +9603,17 @@ function createCoordinatorAuthority() {
         return run
     }
 
+    // Runs one task as the next link on the applyTail chain, so every authority write queued
+    // before or after it orders against it. A checkpoint switch runs here: a write can never
+    // capture the pre-switch state and then persist it over the new checkpoint.
+    function runExclusiveOnApplyTail(task) {
+        const run = applyTail
+            .catch(() => null)
+            .then(task)
+        applyTail = run.catch(() => null)
+        return run
+    }
+
     // Removes one row from the resident projection's queue, ordered on the
     // same applyTail chain as enqueueApplyLocked so it can never race a
     // concurrently in-flight applyLocked call for a different row (2026-09-26
@@ -9620,6 +9714,7 @@ function createCoordinatorAuthority() {
         enqueueResidentRowRemoval,
         persist,
         apply,
+        runExclusiveOnApplyTail,
         applyWithinStorageUpdate,
         absorbPersistedSnapshot,
         isHydrated() {
@@ -9823,11 +9918,7 @@ async function getRecentCompletedWorkRows(limit = 50) {
         metricPath: 'completedWork.getRecent.load.segments'
     })
     const recovered = recoverProjectedState(walStore, [], COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
-    const completed = normalizeCoordinatorMap(recovered?.projected?.state?.completed || {})
-    return Object.values(completed)
-        .sort((left, right) => (Number.parseInt(right?.terminalAt || right?.updatedAt, 10) || 0) -
-            (Number.parseInt(left?.terminalAt || left?.updatedAt, 10) || 0))
-        .slice(0, limitNum)
+    return sortCompletedWorkRowsNewestFirst(recovered?.projected?.state?.completed || {}, limitNum)
 }
 
 async function loadCoordinatorQueueRunsProgressProjection(options = {}) {
@@ -9983,7 +10074,7 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}, options = {})
 
 // Named-verb accessors over loadCoordinatorCurrentAuthorityState. These exist
 // so a call site's own code reveals its cost intent instead of every caller
-// looking identical ("just another loadCoordinatorCurrentAuthorityState()
+// looking identical ("just another coordinatorQueueReader.currentAuthority()
 // call") regardless of whether it reads the whole 32-shard progress
 // projection, one row's worth, or nothing at all because a valid resident
 // copy was already sitting in memory. `from` identifies the call site for
@@ -9993,14 +10084,14 @@ async function loadCoordinatorCurrentAuthorityState(defaults = {}, options = {})
 // caller genuinely needs the full coordinator state (e.g. a full queue scan).
 async function getFullCoordinatorAuthorityStateExpensive(from, defaults = {}) {
     recordAuthorityLoadCall('full', from)
-    return loadCoordinatorCurrentAuthorityState(defaults, {})
+    return coordinatorQueueReader.currentAuthority(defaults, {})
 }
 
 // Scoped to specific profile hrefs: still a real storage read, but the
 // progress-shard fetch (and nothing else) is bounded to just those rows.
 async function getCoordinatorAuthorityStateForRowsCheap(from, profileHrefs = [], defaults = {}) {
     recordAuthorityLoadCall('cheap', from)
-    return loadCoordinatorCurrentAuthorityState(defaults, {profileHrefs})
+    return coordinatorQueueReader.currentAuthority(defaults, {profileHrefs})
 }
 
 // Cheapest: if this process already holds a hydrated, verifiably-current
@@ -10039,7 +10130,7 @@ async function verifyCoordinatorAuthorityStateForRowsCheap(from, profileHrefs = 
         }
         incrementQueueWakeupMetric('authorityLoad.verify.residentMiss')
     }
-    return loadCoordinatorCurrentAuthorityState({}, {profileHrefs: normalizedHrefs})
+    return coordinatorQueueReader.currentAuthority({}, {profileHrefs: normalizedHrefs})
 }
 
 // Forces a genuinely fresh read: drops this process's resident WAL-store
@@ -10048,7 +10139,7 @@ async function verifyCoordinatorAuthorityStateForRowsCheap(from, profileHrefs = 
 async function forceReloadCoordinatorAuthorityStateExpensive(from, defaults = {}) {
     recordAuthorityLoadCall('forceReload', from)
     setCoordinatorQueueWalResidentStoreCache(null)
-    return loadCoordinatorCurrentAuthorityState(defaults, {})
+    return coordinatorQueueReader.currentAuthority(defaults, {})
 }
 
 async function loadCoordinatorQueueRunsEventsProjection(options = {}) {
@@ -12349,7 +12440,7 @@ async function reprimeFreshQueuedTabActionsForPrunedStaleAttempts(plannedActions
     const knownHrefs = getNormalizedProfileHrefList(
         plannedActions.map(staleAction => staleAction?.profileHref || staleAction?.url || '')
     )
-    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState({}, {profileHrefs: knownHrefs})
+    const currentAuthorityState = await coordinatorQueueReader.currentAuthority({}, {profileHrefs: knownHrefs})
         .catch(() => null)
     const queue = currentAuthorityState?.queue || null
     if(!queue) return {reprimed: 0, reason: 'authority-load-failed'}
@@ -12448,7 +12539,7 @@ async function reprimeFreshQueuedTabActionsForCurrentPendingItems(pendingItems =
     const knownHrefs = getNormalizedProfileHrefList(
         pendingItems.map(pendingItem => getCoordinatorItemHref(pendingItem))
     )
-    const currentAuthorityState = await loadCoordinatorCurrentAuthorityState({}, {profileHrefs: knownHrefs})
+    const currentAuthorityState = await coordinatorQueueReader.currentAuthority({}, {profileHrefs: knownHrefs})
         .catch(() => null)
     const queue = currentAuthorityState?.queue || null
     if(!queue) return {reprimed: 0, reason: 'authority-load-failed'}
@@ -13012,7 +13103,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
     }
 
     terminalizeExhaustedRolledBackQueuedBatchPromise = enqueueSpaceFeedStorageUpdate(async () => {
-        const state = await loadCoordinatorQueueRunsProjection({
+        const state = await coordinatorQueueReader.runs({
             metricPath: 'reconcile.exhaustedRolledBackQueued.batch.load'
         })
         const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -13163,6 +13254,7 @@ const executorEnqueueFailureClassification = createExecutorEnqueueFailureClassif
     handlers: {
         queueRuntime,
         getDurablyActiveQueuedTabCount,
+        getCapacityConsumingQueuedTabCount,
         getSchedulerBlockingQueuedExecutorCount,
         getQueuedProfileOpenReservationCount,
         getEffectiveQueuedTabOpenConcurrency,
@@ -13366,7 +13458,7 @@ async function recoverQueuedActionLiveTabAfterFinalOpenDecline(action = {}, deci
         // When href is empty (coordinatorKey-only resolution-queue case),
         // fall back to the full fetch unchanged rather than guess.
         currentAuthorityState = await promiseWithTimeout(
-            loadCoordinatorCurrentAuthorityState({}, href ? {profileHrefs: [href]} : {}),
+            coordinatorQueueReader.currentAuthority({}, href ? {profileHrefs: [href]} : {}),
             QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
             'queued tab final open recovery authority reload'
         ).catch(() => null)
@@ -13623,7 +13715,7 @@ async function validateQueuedTabOpenAgainstCurrentAuthority(action = {}) {
     const actionHref = normalizeQuoraProfileUrl(action?.profileHref || action?.url || '')
     if(!currentAuthorityState) {
         currentAuthorityState = await promiseWithTimeout(
-            getCoordinatorAuthorityStateForRowsCheap('validateQueuedTabOpenAgainstCurrentAuthority.initial', [actionHref]),
+            coordinatorQueueReader.actionRows('validateQueuedTabOpenAgainstCurrentAuthority.initial', action),
             QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
             'queued tab final open authority reload'
         ).catch(() => null)
@@ -13642,7 +13734,7 @@ async function validateQueuedTabOpenAgainstCurrentAuthority(action = {}) {
     }))
     if(openDecision.open === true && options.verifyFreshAuthority !== false) {
         const freshAuthorityState = await promiseWithTimeout(
-            getCoordinatorAuthorityStateForRowsCheap('validateQueuedTabOpenAgainstCurrentAuthority.verifyFresh', [actionHref]),
+            coordinatorQueueReader.actionRows('validateQueuedTabOpenAgainstCurrentAuthority.verifyFresh', action),
             QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS,
             'queued tab final open fresh authority reload'
         ).catch(() => null)
@@ -14405,7 +14497,7 @@ async function reprimeQueuedTabActionsForNoOpenEvent(event = {}) {
     )
     const currentAuthorityState = event.currentAuthorityState?.queue
         ? event.currentAuthorityState
-        : await loadCoordinatorCurrentAuthorityState({}, {profileHrefs: knownHrefs}).catch(() => coordinatorAuthority.current() || null)
+        : await coordinatorQueueReader.currentAuthority({}, {profileHrefs: knownHrefs}).catch(() => coordinatorAuthority.current() || null)
     const queue = currentAuthorityState?.queue || null
     const ownerTabId = event.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID
     const ownerWindowId = event.ownerWindowId || null
@@ -14807,7 +14899,7 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
         : null
     const state = providedAuthorityState ||
         getHydratedCoordinatorAuthorityState('activeTransition.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'activeTransition.load'
         })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -14943,6 +15035,186 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
     return true
 }
 
+// Phase 1 of the mirror plan: queue rows read from storage by key, without loading
+// the whole queue. The meta is planned from the resident copy when there is one,
+// and the stored meta comes back in the same read. The projection checks every key
+// it needs, so a stale plan fails closed as a missing key, and attempt 2 reads the
+// meta fresh. Any gap returns ok: false, and the caller falls back to the full load.
+// This never throws. It also never runs the reclaim in closeRuntimeTabsReclaimedByAuthority,
+// because a partial queue must not drive that.
+const STALE_PLAN_REASONS = new Set(['missing-segment', 'missing-checkpoint', 'legacy-checkpoint', 'missing-checkpoint-shard', 'checkpoint-shard-identity-mismatch', 'checkpoint-manifest-meta-mismatch', 'segment-identity-mismatch'])
+
+// The resident meta, when it describes a sharded active slot. Anything else (no
+// resident copy, or a legacy monolithic slot) means no keyed read is attempted.
+function getResidentKeyedRowPlan() {
+    const meta = coordinatorQueueWalResidentStoreCache?.meta || null
+    if(!isSegmentedWalStorageMeta(meta)) return null
+    const active = normalizeCheckpointId(meta.activeCheckpoint)
+    return normalizeCheckpointShardCount(meta.checkpoints?.[active]?.shardCount) ? meta : null
+}
+
+// The resident copy answers when the disk meta names the same generation. It costs one small
+// storage read (the meta, plus any extra defaults the caller asked for), and the rows come from
+// memory: the tail is indexed per row, so no segment is read or parsed here. Anything else
+// returns ok: false, and the caller goes on to the mirror and then the storage path.
+// `resident` is captured before the await, so a write that lands during the read cannot
+// swap in a different copy partway through.
+async function readCoordinatorQueueRowsFromResident(wanted = [], options = {}) {
+    const resident = coordinatorQueueWalResidentStoreCache
+    if(!resident || !getResidentKeyedRowPlan()) return {ok: false, reason: 'resident-not-attempted', rows: {}}
+    const extraDefaults = options.extraDefaults || {}
+    try {
+        const read = await metricStorageGet({[COORDINATOR_QUEUE_WAL_META_KEY]: null, ...extraDefaults}, {
+            metricPath: `${options.metricPath || 'queueResident'}.residentMeta`
+        })
+        const diskMeta = read?.[COORDINATOR_QUEUE_WAL_META_KEY]
+        const rows = {}
+        for(const key of wanted) {
+            const projected = projectKeyedRowFromResidentStore(resident, diskMeta, {
+                baseKey: COORDINATOR_QUEUE_WAL_KEY,
+                area: 'queue',
+                key,
+                ...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS
+            })
+            if(!projected.ok) {
+                incrementQueueWakeupMetric('queueResident.readMiss')
+                return {ok: false, reason: projected.reason, rows: {}}
+            }
+            if(projected.found) rows[key] = projected.value
+        }
+        incrementQueueWakeupMetric('queueResident.readHit')
+        return {ok: true, reason: '', rows, stored: read, source: 'resident'}
+    }
+    catch(error) {
+        incrementQueueWakeupMetric('queueResident.readFailed')
+        return {ok: false, reason: 'resident-read-error', rows: {}}
+    }
+}
+
+async function loadCoordinatorQueueRowsFromStorage(keys = [], options = {}) {
+    const metricPath = options.metricPath || 'keyedRows'
+    const wanted = [...new Set((keys || []).map(key => `${key || ''}`.trim()).filter(Boolean))]
+    if(!wanted.length) return {ok: true, reason: '', rows: {}}
+    // The resident copy goes first when the plan is sharded. Without a sharded plan it is not touched.
+    const residentRead = getResidentKeyedRowPlan() ? await readCoordinatorQueueRowsFromResident(wanted, options) : null
+    if(residentRead?.ok) return residentRead
+    // Await only when a mirror read can start, so the common path adds no microtask hops.
+    const mirrorRead = canReadCoordinatorQueueRowsFromMirror() ? readCoordinatorQueueRowsFromMirror(wanted, options) : null
+    const fromMirror = mirrorRead ? await mirrorRead : null
+    if(fromMirror?.ok) return fromMirror
+    try {
+        let lastReason = 'keyed-read-not-attempted'
+        for(let attempt = 1; attempt <= 2; attempt += 1) {
+            let meta = attempt === 1 ? getResidentKeyedRowPlan() : null
+            if(attempt === 1 && options.requireResidentPlan === true && !meta) {
+                return {ok: false, reason: 'no-resident-plan', rows: {}}
+            }
+            if(!isSegmentedWalStorageMeta(meta)) {
+                const metaRead = await metricStorageGet({[COORDINATOR_QUEUE_WAL_META_KEY]: null}, {
+                    metricPath: `${metricPath}.meta`
+                })
+                meta = metaRead?.[COORDINATOR_QUEUE_WAL_META_KEY]
+            }
+            if(!isSegmentedWalStorageMeta(meta)) return {ok: false, reason: 'missing-segmented-meta', rows: {}}
+
+            const readKeys = {[COORDINATOR_QUEUE_WAL_META_KEY]: null, ...(options.extraDefaults || {})}
+            for(const key of wanted) {
+                for(const readKey of getKeyedRowReadKeys(meta, key, {baseKey: COORDINATOR_QUEUE_WAL_KEY})) {
+                    readKeys[readKey] = null
+                }
+            }
+            const stored = await metricStorageGet(readKeys, {metricPath})
+            const rows = {}
+            let failed = null
+            for(const key of wanted) {
+                const projected = projectKeyedRowFromStored(stored, {
+                    baseKey: COORDINATOR_QUEUE_WAL_KEY,
+                    area: 'queue',
+                    key,
+                    ...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS
+                })
+                if(!projected.ok) {
+                    failed = projected
+                    break
+                }
+                if(projected.found) rows[key] = projected.value
+            }
+            if(!failed) return {ok: true, reason: '', rows, stored}
+            lastReason = failed.reason
+            // Only a stale plan (a key that moved between the two reads) is worth a retry.
+            // A legacy slot or a corrupt shard will not change, so stop here.
+            if(!STALE_PLAN_REASONS.has(failed.reason)) break
+        }
+        return {ok: false, reason: lastReason, rows: {}}
+    }
+    catch(error) {
+        return {ok: false, reason: 'keyed-read-error', error: error?.message || `${error || ''}`, rows: {}}
+    }
+}
+
+// One row, in the shape the single-key callers expect.
+async function loadCoordinatorQueueRowFromStorage(key = '', options = {}) {
+    const read = await loadCoordinatorQueueRowsFromStorage([key], options)
+    if(!read.ok) return {ok: false, reason: read.reason, error: read.error || ''}
+    const found = Object.prototype.hasOwnProperty.call(read.rows, key)
+    return {ok: true, reason: '', found, value: found ? read.rows[key] : null}
+}
+
+// The state the final-open decision reads: one queue row for the action and the
+// progress record for its href. Falls back to the scoped full read on a gap.
+function loadCoordinatorQueueStateForActionRows(from = '', action = {}) {
+    const normalizedHref = normalizeQuoraProfileUrl(action?.profileHref || action?.url || '')
+    if(!getResidentKeyedRowPlan()) return getCoordinatorAuthorityStateForRowsCheap(from, [normalizedHref])
+    return loadCoordinatorQueueStateForActionRowsKeyed(from, action, normalizedHref)
+}
+
+async function loadCoordinatorQueueStateForActionRowsKeyed(from = '', action = {}, normalizedHref = '') {
+    const coordinatorKey = action?.coordinatorKey || (normalizedHref ? normalizedHref : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
+    const keys = [normalizedHref, coordinatorKey].filter(Boolean)
+    const read = await loadCoordinatorQueueRowsFromStorage(keys, {
+        metricPath: `${from}.rows`,
+        requireResidentPlan: true,
+        extraDefaults: normalizedHref ? getProfileNukeProgressProjectionDefaults([normalizedHref]) : {}
+    })
+    if(!read.ok) return getCoordinatorAuthorityStateForRowsCheap(from, [normalizedHref || coordinatorKey])
+    const progress = normalizedHref ? getProfileNukeProgressRecordsFromProjection(read.stored, [normalizedHref]) : {}
+    return {queue: read.rows, progress}
+}
+
+// One queue item by key (or null). The keyed read answers when it can, and the
+// full load answers only when it can't.
+async function readCoordinatorQueueItemByKey(key = '', options = {}) {
+    const normalizedKey = `${key || ''}`.trim()
+    if(!normalizedKey) return null
+    if(!getResidentKeyedRowPlan()) {
+        const direct = await coordinatorQueueReader.full({
+            metricPath: `${options.metricPath || 'queueItem'}.fallback`
+        }).catch(() => null)
+        return direct?.queue?.[normalizedKey] || null
+    }
+    const keyed = await loadCoordinatorQueueRowFromStorage(normalizedKey, {...options, requireResidentPlan: true})
+    if(keyed.ok) return keyed.found ? keyed.value : null
+    const full = await coordinatorQueueReader.full({
+        metricPath: `${options.metricPath || 'queueItem'}.fallback`
+    }).catch(() => null)
+    return full?.queue?.[normalizedKey] || null
+}
+
+// The one seam for authority reads. Every caller goes through this object, so
+// the storage mirror (mirror plan phases 2 to 4) can change how reads are served
+// without touching callers. Today each method is the existing loader unchanged,
+// except row, which is the keyed storage read (phase 1).
+const coordinatorQueueReader = {
+    full: options => loadCoordinatorQueueProjection(options),
+    runs: options => loadCoordinatorQueueRunsProjection(options),
+    runsProgress: options => loadCoordinatorQueueRunsProgressProjection(options),
+    currentAuthority: (defaults, options) => loadCoordinatorCurrentAuthorityState(defaults, options),
+    row: (key, options) => loadCoordinatorQueueRowFromStorage(key, options),
+    rows: (keys, options) => loadCoordinatorQueueRowsFromStorage(keys, options),
+    item: (key, options) => readCoordinatorQueueItemByKey(key, options),
+    actionRows: (from, action) => loadCoordinatorQueueStateForActionRows(from, action)
+}
+
 async function confirmQueuedTabDurablyActive(action = {}, tab = {}, details = {}) {
     const tabId = normalizeTabId(tab?.id)
     if(!tabId) return false
@@ -14962,10 +15234,20 @@ async function confirmQueuedTabDurablyActive(action = {}, tab = {}, details = {}
     )
     if(!expectedAttemptId || !expectedAttemptNumber) return false
 
-    const state = await loadCoordinatorQueueProjection({
+    // Only this one row is needed. A miss falls through to the full load, because
+    // the href match below can find a row stored under a different key.
+    const keyedRow = coordinatorKey
+        ? await loadCoordinatorQueueRowFromStorage(coordinatorKey, {metricPath: 'pendingTabAction.confirm.row'})
+        : {ok: false, reason: 'no-coordinator-key'}
+    incrementQueueWakeupMetric(keyedRow.ok && keyedRow.found
+        ? 'pendingTabAction.confirm.keyedRow.hit'
+        : 'pendingTabAction.confirm.keyedRow.fallback')
+    const state = keyedRow.ok && keyedRow.found
+        ? {queue: {[coordinatorKey]: keyedRow.value}}
+        : await coordinatorQueueReader.full({
             metricPath: 'pendingTabAction.confirm.load'
         }).catch(() => null) ||
-        getHydratedCoordinatorAuthorityState('pendingTabAction.confirm.residentAuthorityFallback')
+            getHydratedCoordinatorAuthorityState('pendingTabAction.confirm.residentAuthorityFallback')
     const queue = state?.queue || {}
     const entry = coordinatorKey && queue[coordinatorKey]
         ? {key: coordinatorKey, item: queue[coordinatorKey]}
@@ -14991,7 +15273,7 @@ async function rollbackFailedQueuedTabOpen(action = {}, tab = {}, details = {}) 
 
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(details.currentAuthorityState || null) ||
         coordinatorAuthority.current() ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'rollbackActiveTransition.preRollbackBlockedLiveTab.load'
         }).catch(() => null)
     const currentQueue = currentAuthorityState?.queue || {}
@@ -17236,12 +17518,12 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             ? (options.forceDurableQueueReload === true
                 ? null
                 : getHydratedCoordinatorAuthorityState('reconcile.executor.queueOnly.usedResidentAuthority')) ||
-                await loadCoordinatorQueueRunsProjection({
+                await coordinatorQueueReader.runs({
                     metricPath: options.forceDurableQueueReload === true
                         ? 'reconcile.executor.queueOnly.forceDurableReload'
                         : 'reconcile.executor.queueOnly.load'
                 })
-            : await loadCoordinatorCurrentAuthorityState()
+            : await coordinatorQueueReader.currentAuthority()
     }
     if(!Object.keys(currentAuthorityState?.queue || {}).length) {
         const rawQueueState = await metricStorageGet({
@@ -17288,6 +17570,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         liveProfileTabsByHref = await getLiveProfileTabsByHref()
     }
     let terminalizedExhausted = 0
+    const preSettleStartedAt = Date.now()
     const preTerminalizedExhausted = await applyCoordinatorQueueMachineEvent({
         type: 'EXHAUSTED_ROLLBACK_SETTLE',
         items: Object.values(currentAuthorityState.queue || {}),
@@ -17313,6 +17596,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         reason: 'batch-terminalize-error',
         error: error?.message || `${error || ''}`
     }))
+    noteActiveStorageMetricPhase('exhaustedRollbackSettlePrePass', Date.now() - preSettleStartedAt, preSettleStartedAt, Date.now())
     terminalizedExhausted += preTerminalizedExhausted?.terminalized || 0
     const preRecoveredExhaustedKeys = new Set(preTerminalizedExhausted?.recoveredKeys || [])
     const preRecoveredExhausted = preTerminalizedExhausted?.recovered || 0
@@ -17438,7 +17722,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
                         reason: terminalProgressResult.reason || 'active-missing-terminal-progress-settled'
                     })
                     incrementMetric('changed.activeMissingTerminalProgressSettled')
-                    scheduleTerminalProgressContinuation('active-missing-terminal-progress-settled')
+                    scheduleTerminalProgressContinuation('active-missing-terminal-progress-settled', [getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)])
                     continue
                 }
                 incrementMetric(`noop.activeMissingTerminalProgress.${normalizeStorageMetricPathName(terminalProgressResult?.reason || 'notSettled')}`)
@@ -17686,7 +17970,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             if(terminalResult?.accepted === true && terminalResult?.durable === true) {
                 incrementMetric('changed.terminalizedQueuedFromTerminalProgress')
                 currentAuthorityState = coordinatorAuthority.current()
-                scheduleTerminalProgressContinuation('queued-terminal-progress-authority-continuation')
+                scheduleTerminalProgressContinuation('queued-terminal-progress-authority-continuation', [href])
                 continue
             }
             incrementMetric(`noop.queuedTerminalProgress.${terminalResult?.reason || 'notTerminalized'}`)
@@ -18968,7 +19252,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         const knownHrefs = getNormalizedProfileHrefList(
             queueRuntime.listActivationIntents().map(action => action?.profileHref || action?.url || '')
         )
-        const refreshedAuthorityState = await loadCoordinatorCurrentAuthorityState({}, {profileHrefs: knownHrefs})
+        const refreshedAuthorityState = await coordinatorQueueReader.currentAuthority({}, {profileHrefs: knownHrefs})
             .catch(() => null)
         if(refreshedAuthorityState?.queue) {
             currentAuthorityState = refreshedAuthorityState
@@ -20192,7 +20476,7 @@ async function waitForUserStartDurableActivation(startedActiveRows = 0, timeoutM
 
 async function getCoordinatorWhyNotRunning(request = {}) {
     const currentAuthorityState = getHydratedCoordinatorAuthorityState('whyNotRunning.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'whyNotRunning.load'
         })
     const queue = currentAuthorityState?.queue || {}
@@ -20427,7 +20711,7 @@ async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {
             }
         }
         else {
-            const walAuthorityState = await loadCoordinatorQueueProjection({
+            const walAuthorityState = await coordinatorQueueReader.full({
                     metricPath: 'pump.resume.storageProjectionFallback.load'
                 })
                 .catch(() => null)
@@ -21531,7 +21815,7 @@ async function runCoordinatorQueueExecutorFastPath(reason = 'resume-fast-executo
             }
         }
         if(!effectiveResidentAuthorityHasDurableWork) {
-            const projectionAuthorityState = await loadCoordinatorQueueProjection({
+            const projectionAuthorityState = await coordinatorQueueReader.full({
                     metricPath: 'pump.fastExecutor.storageProjectionFallback.load'
                 })
                 .catch(() => null)
@@ -21748,7 +22032,7 @@ async function runScheduledCoordinatorQueueResume(reason = '', options = {}) {
 
     if(scheduledRawQueueCounts.durableActiveRows <= 0 &&
         scheduledRawQueueCounts.durableQueuedRows <= 0) {
-        const scheduledWalAuthorityState = await loadCoordinatorQueueProjection({
+        const scheduledWalAuthorityState = await coordinatorQueueReader.full({
             metricPath: 'pump.scheduledResume.walPreload.load'
         }).catch(() => null)
         const scheduledWalQueueCounts = getCoordinatorQueueWorkCounts(scheduledWalAuthorityState?.queue || {})
@@ -22060,9 +22344,10 @@ async function runCoordinatorReconcileTickOnce(reason = 'coordinator-reconcile',
         })
         prunedRuntime = await pruneMissingQueuedTabRuntimeState('reconcile-runtime-prune')
         if(prunedRuntime > 0) incrementQueueWakeupMetric('reconcile.changed.runtimePruned', prunedRuntime)
+        scheduleTerminalOwnedTabOrphanSweep()
         const queuedActionsBeforePrune = queueRuntime.getActivationIntentCount()
         let usedRawQueueFallbackForPrune = false
-        let pruneAuthorityState = await loadCoordinatorCurrentAuthorityState({
+        let pruneAuthorityState = await coordinatorQueueReader.currentAuthority({
                 [COORDINATOR_PAUSED_KEY]: false
             })
             .catch(() => coordinatorAuthority.current())
@@ -22394,7 +22679,7 @@ async function recoverStoredCoordinatorWork(reason = 'stored-work-recovery', opt
 async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery', options = {}) {
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(options.currentAuthorityState || null) ||
         getHydratedCoordinatorAuthorityState('storedWorkRecovery.usedResidentAuthority') ||
-        await loadCoordinatorCurrentAuthorityState({
+        await coordinatorQueueReader.currentAuthority({
             [COORDINATOR_PAUSED_KEY]: false
         })
     let queue = currentAuthorityState.queue
@@ -22409,7 +22694,7 @@ async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery',
         if(options.forceDurableQueueReload !== true) {
             return {recovered: false, reason: 'no-stored-work'}
         }
-        currentAuthorityState = await loadCoordinatorCurrentAuthorityState({
+        currentAuthorityState = await coordinatorQueueReader.currentAuthority({
             [COORDINATOR_PAUSED_KEY]: false
         })
         queue = currentAuthorityState.queue
@@ -22422,7 +22707,7 @@ async function recoverStoredCoordinatorWorkOnce(reason = 'stored-work-recovery',
     }
 
     if(options.forceDurableQueueReload === true) {
-        currentAuthorityState = await loadCoordinatorCurrentAuthorityState({
+        currentAuthorityState = await coordinatorQueueReader.currentAuthority({
             [COORDINATOR_PAUSED_KEY]: false
         })
         queue = currentAuthorityState.queue
@@ -23274,6 +23559,7 @@ async function persistLastCoordinatorEnqueueSummary(storageRequest = {}, result 
     const preFilter = preFilterSource && typeof preFilterSource === 'object'
         ? {
             totalCandidates: Number.parseInt(preFilterSource.totalCandidates, 10) || 0,
+            rawWorkItems: Number.parseInt(preFilterSource.rawWorkItems, 10) || 0,
             alreadyNuked: Number.parseInt(preFilterSource.alreadyNuked, 10) || 0,
             unqueueable: Number.parseInt(preFilterSource.unqueueable, 10) || 0,
             duplicateProfile: Number.parseInt(preFilterSource.duplicateProfile, 10) || 0
@@ -23657,6 +23943,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     const enqueuePreFilter = enqueuePreFilterSource && typeof enqueuePreFilterSource === 'object'
         ? {
             totalCandidates: Number.parseInt(enqueuePreFilterSource.totalCandidates, 10) || 0,
+            rawWorkItems: Number.parseInt(enqueuePreFilterSource.rawWorkItems, 10) || 0,
             alreadyNuked: Number.parseInt(enqueuePreFilterSource.alreadyNuked, 10) || 0,
             unqueueable: Number.parseInt(enqueuePreFilterSource.unqueueable, 10) || 0,
             duplicateProfile: Number.parseInt(enqueuePreFilterSource.duplicateProfile, 10) || 0
@@ -24450,7 +24737,7 @@ async function mutateCoordinatorRunsPausedSet(operation = {}) {
     if(snapshotReason !== 'ordinaryMutation') return {changed: false, reason: 'invalid-runs-paused-reason'}
 
     const paused = operation.paused === true
-    const state = await loadCoordinatorQueueRunsProjection({
+    const state = await coordinatorQueueReader.runs({
         metricPath: 'runsPaused.load'
     })
     const queue = state.queue
@@ -25239,7 +25526,7 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
 
     const state = normalizeCoordinatorAuthorityStateInput(details.currentAuthorityState || operation.currentAuthorityState || null) ||
         getHydratedCoordinatorAuthorityState('rollbackActiveTransition.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'rollbackActiveTransition.load'
         })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -25459,7 +25746,7 @@ async function mutateCoordinatorStaleRetryQueuedTabAdvance(operation = {}) {
     const coordinatorKey = operation.coordinatorKey || action?.coordinatorKey || (href ? href : makeProfileResolutionQueueKey(action?.requestedUrl || action?.url || ''))
     if(!action || (!href && !coordinatorKey)) return false
 
-    const state = await loadCoordinatorQueueRunsProjection({
+    const state = await coordinatorQueueReader.runs({
         metricPath: 'staleRetry.load'
     })
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
@@ -25735,7 +26022,7 @@ async function mutateCoordinatorActionLeaseRequest(operation = {}) {
     let currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
         operation.currentAuthorityState || operation.authorityState || null
     ) || getHydratedCoordinatorAuthorityState('actionLease.request.usedResidentAuthority') ||
-        await loadCoordinatorQueueProjection({
+        await coordinatorQueueReader.full({
             metricPath: 'actionLease.request.load'
         })
     const queue = currentAuthorityState.queue
@@ -25923,7 +26210,7 @@ async function mutateCoordinatorInitialBlockedState(operation = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
         operation.currentAuthorityState || operation.authorityState || null
     ) || getHydratedCoordinatorAuthorityState('initialBlockedState.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'initialBlockedState.load'
         })
     const entry = findCoordinatorQueueEntryForHref(currentAuthorityState.queue, profileHref)
@@ -26008,7 +26295,7 @@ async function mutateCoordinatorActionLeaseHeartbeat(operation = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
         operation.currentAuthorityState || operation.authorityState || null
     ) || getHydratedCoordinatorAuthorityState('actionLease.heartbeat.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'actionLease.heartbeat.load'
         })
     const entry = findCoordinatorQueueEntryForHref(currentAuthorityState.queue, profileHref)
@@ -26087,7 +26374,7 @@ async function mutateCoordinatorActionLeaseRelease(operation = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
         operation.currentAuthorityState || operation.authorityState || null
     ) || getHydratedCoordinatorAuthorityState('actionLease.release.usedResidentAuthority') ||
-        await loadCoordinatorQueueRunsProjection({
+        await coordinatorQueueReader.runs({
             metricPath: 'actionLease.release.load'
         })
     const entry = findCoordinatorQueueEntryForHref(currentAuthorityState.queue, profileHref)
@@ -26161,7 +26448,7 @@ async function mutateCoordinatorActionLeasesForTabRelease(operation = {}) {
 
     const now = Number.parseInt(operation.now, 10) || Date.now()
     const releaseReason = `${operation.releaseReason || 'tab-released'}`.trim()
-    let currentAuthorityState = await loadCoordinatorQueueProjection({
+    let currentAuthorityState = await coordinatorQueueReader.full({
         metricPath: 'actionLease.tabRelease.load'
     })
     const queue = currentAuthorityState.queue
@@ -26924,7 +27211,7 @@ async function hasDurableQueuedCoordinatorWorkForActionSurface(reason = 'worker-
     const residentQueue = coordinatorAuthority.isHydrated() ? coordinatorAuthority.current()?.queue : null
     const authorityState = residentQueue
         ? null
-        : await loadCoordinatorCurrentAuthorityState({
+        : await coordinatorQueueReader.currentAuthority({
             [COORDINATOR_PAUSED_KEY]: false
         }).catch(() => null)
     if(hasDurableQueuedBacklogForActionSurface(residentQueue || authorityState?.queue || {}, windowId)) {
@@ -28149,7 +28436,7 @@ async function nudgeQueuedTabActionClaim(tabId, reason = '') {
                     tabId: normalizedTabId,
                     metadata,
                     options: {
-                        loadAuthorityState: () => loadCoordinatorQueueProjection({
+                        loadAuthorityState: () => coordinatorQueueReader.full({
                             metricPath: 'nudgeFailure.runtimeAuthority.load'
                         })
                     }
@@ -28171,7 +28458,7 @@ async function nudgeQueuedTabActionClaim(tabId, reason = '') {
                 tabId: normalizedTabId,
                 metadata,
                 options: {
-                    loadAuthorityState: () => loadCoordinatorQueueProjection({
+                    loadAuthorityState: () => coordinatorQueueReader.full({
                         metricPath: 'nudgeFailure.runtimeAuthority.load'
                     })
                 }
@@ -28725,7 +29012,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
     const resultPromise = enqueueSpaceFeedStorageUpdate(async () => {
         const currentAuthorityState = getHydratedCoordinatorAuthorityState(
             'backgroundBlockedSweepTerminal.usedResidentAuthority'
-        ) || await loadCoordinatorQueueRunsProjection({
+        ) || await coordinatorQueueReader.runs({
             metricPath: 'backgroundBlockedSweepTerminal.load'
         })
         const queue = currentAuthorityState.queue || {}
@@ -28788,6 +29075,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
             }
         }
         scheduleQueuedWorkContinuation('background-blocked-sweep-terminal')
+        scheduleCompletedJobOwnedTabCleanup([normalizedProfileHref])
         kickQueuedWorkAfterSlotFreed('background-blocked-sweep-terminal-slot-freed')
 
         const nextQueue = coordinatorAuthority.current().queue
@@ -28837,7 +29125,10 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
 
     const result = await resultPromise
 
-    if(result?.terminal) scheduleQueuedWorkContinuation('background-blocked-sweep-terminal')
+    if(result?.terminal) {
+        scheduleQueuedWorkContinuation('background-blocked-sweep-terminal')
+        scheduleCompletedJobOwnedTabCleanup([normalizedProfileHref])
+    }
     return result
 }
 
@@ -28919,7 +29210,7 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
     const resultPromise = enqueueSpaceFeedStorageUpdate(async () => {
         const currentAuthorityState = getHydratedCoordinatorAuthorityState(
             'activeBlockedLiveTabTerminal.usedResidentAuthority'
-        ) || await loadCoordinatorQueueRunsProjection({
+        ) || await coordinatorQueueReader.runs({
             metricPath: 'activeBlockedLiveTabTerminal.load'
         })
         const queue = currentAuthorityState.queue || {}
@@ -28974,6 +29265,7 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
             }
         }
         scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
+        scheduleCompletedJobOwnedTabCleanup([normalizedProfileHref])
         kickQueuedWorkAfterSlotFreed('active-blocked-live-tab-terminal-slot-freed')
 
         const nextQueue = coordinatorAuthority.current().queue
@@ -29023,7 +29315,10 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
 
     const result = await resultPromise
 
-    if(result?.terminal) scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
+    if(result?.terminal) {
+        scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
+        scheduleCompletedJobOwnedTabCleanup([normalizedProfileHref])
+    }
     return result
 }
 
@@ -29098,7 +29393,7 @@ async function sweepProfileTabsWithoutActiveQueueAuthority(options = {}) {
         ? providedAuthorityState
         : normalizeCoordinatorAuthorityStateInput(providedAuthorityState) ||
         getHydratedCoordinatorAuthorityState('profileTabsWithoutActiveAuthority.usedResidentAuthority') ||
-        await loadCoordinatorQueueProjection({
+        await coordinatorQueueReader.full({
             metricPath: options.metricPath || 'profileTabsWithoutActiveAuthority.load'
         }).catch(() => null)
     const queue = currentAuthorityState?.queue || {}
@@ -29205,18 +29500,17 @@ async function sweepProfileTabsWithoutActiveQueueAuthority(options = {}) {
     }
 }
 
-async function closeSuccessfulSourceProfileTabs(queue = {}, profileHrefs = []) {
-    const hrefFilter = new Set(getNormalizedProfileHrefList(profileHrefs || []))
+// terminalRowEntries are the terminal rows the calling pass already scanned
+// ({itemKey, href, item}), so this does not walk the whole queue again.
+async function closeSuccessfulSourceProfileTabs(terminalRowEntries = []) {
     let candidates = 0
     let closed = 0
 
-    for(const [itemKey, item] of Object.entries(queue || {})) {
+    for(const {href, item} of terminalRowEntries) {
         if(item?.status !== 'succeeded' || item?.closeSourceTabOnSuccess !== true) continue
 
-        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const tabId = normalizeTabId(item?.sourceTabId)
         if(!href || !tabId) continue
-        if(hrefFilter.size && !hrefFilter.has(href)) continue
 
         candidates += 1
         try {
@@ -29238,19 +29532,78 @@ async function closeSuccessfulSourceProfileTabs(queue = {}, profileHrefs = []) {
     return {candidates, closed}
 }
 
-async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
+// Terminal cleanup runs one unfiltered pass at a time. Per-row callers used to
+// start a full pass each (about twelve per terminal job), all overlapping and
+// each redoing the queue scan, the owned-tab walk, and both sweeps. A call that
+// arrives during a pass now shares one trailing pass, which starts only after
+// the current one settles, so every caller still gets a pass that began after
+// its own state change. Filtered calls (profileHrefs) keep a pass of their own.
+let terminalOwnedTabClosePassesInFlight = 0
+let terminalOwnedTabClosePass = null
+let terminalOwnedTabCloseTrailingPass = null
+
+function closeTerminalOwnedProfileTabs(profileHrefs = [], options = {}) {
+    incrementQueueWakeupMetric('terminalOwnedTabClose.calls')
+    if(profileHrefs?.length) return startTerminalOwnedTabClosePass(profileHrefs, options)
+    if(!terminalOwnedTabClosePass) return startTerminalOwnedTabClosePass([])
+
+    incrementQueueWakeupMetric('terminalOwnedTabClose.coalesced')
+    if(!terminalOwnedTabCloseTrailingPass) {
+        const current = terminalOwnedTabClosePass
+        terminalOwnedTabCloseTrailingPass = current.then(() => null, () => null).then(() => {
+            terminalOwnedTabCloseTrailingPass = null
+            return startTerminalOwnedTabClosePass([])
+        })
+    }
+    return terminalOwnedTabCloseTrailingPass
+}
+
+// Times and counts one pass without adding a promise hop: the pass promise is
+// returned as-is and the bookkeeping runs on the side.
+function startTerminalOwnedTabClosePass(profileHrefs = [], options = {}) {
+    const shared = !profileHrefs?.length
+    const startedAt = Date.now()
+    terminalOwnedTabClosePassesInFlight += 1
+    recordQueueWakeupMetricMax('terminalOwnedTabClose.maxInFlight', terminalOwnedTabClosePassesInFlight)
+    const pass = closeTerminalOwnedProfileTabsBody(profileHrefs, options)
+    const settle = () => {
+        terminalOwnedTabClosePassesInFlight -= 1
+        noteActiveStorageMetricPhase('terminalOwnedTabClose', Date.now() - startedAt, startedAt, Date.now())
+        if(shared && terminalOwnedTabClosePass === pass) terminalOwnedTabClosePass = null
+    }
+    if(shared) terminalOwnedTabClosePass = pass
+    pass.then(settle, settle)
+    return pass
+}
+
+async function closeTerminalOwnedProfileTabsBody(profileHrefs = [], options = {}) {
     await ownedTabIdsReady
+    let segmentStartedAt = Date.now()
+    const noteSegment = name => {
+        const endedAt = Date.now()
+        noteActiveStorageMetricPhase(`terminalOwnedTabClose.${name}`, endedAt - segmentStartedAt, segmentStartedAt, endedAt)
+        segmentStartedAt = endedAt
+    }
 
     const hrefFilter = new Set(getNormalizedProfileHrefList(profileHrefs || []))
     const currentAuthorityState = getHydratedCoordinatorAuthorityState('terminalOwnedTabs.usedResidentAuthority') ||
-        await loadCoordinatorQueueProjection({
+        await coordinatorQueueReader.full({
             metricPath: 'terminalOwnedTabs.load'
         })
     const queue = currentAuthorityState.queue || {}
     const terminalHrefs = new Set()
     const terminalTabIdsByHref = new Map()
+    const terminalRowEntries = []
+    // A scoped pass reads only its own hrefs' rows. Queue rows are keyed by
+    // their profile href (getCoordinatorItemQueueKey), so a keyed lookup finds
+    // them without walking the queue. Rows keyed some other way are left to
+    // the unscoped orphan sweep. An unscoped pass still walks every row.
+    const rowCandidates = hrefFilter.size
+        ? Array.from(hrefFilter, href => [href, queue[href]]).filter(([, item]) => item)
+        : Object.entries(queue || {})
+    incrementQueueWakeupMetric('terminalOwnedTabClose.rowsScanned', rowCandidates.length)
 
-    for(const [itemKey, item] of Object.entries(queue || {})) {
+    for(const [itemKey, item] of rowCandidates) {
         if(!isTerminalCoordinatorStatus(item?.status)) continue
 
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
@@ -29258,9 +29611,11 @@ async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
         if(hrefFilter.size && !hrefFilter.has(href)) continue
 
         terminalHrefs.add(href)
+        terminalRowEntries.push({itemKey, href, item})
         addExpectedTerminalTabId(terminalTabIdsByHref, href, item?.tabId)
     }
 
+    noteSegment('scanQueue')
     if(!terminalHrefs.size) return {closed: 0}
 
     let closed = 0
@@ -29289,14 +29644,28 @@ async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
         }
     }
 
+    noteSegment('terminalTabs')
     const ownerEntries = queueRuntime.listOwnedTabParentEntries()
+    let ownedTabsWalked = 0
+    let ownedTabsSkipped = 0
 
     for(const [, ownedTabIds] of ownerEntries) {
         for(const tabId of Array.from(ownedTabIds || [])) {
             const normalizedTabId = normalizeTabId(tabId)
             if(closedTabIds.has(normalizedTabId)) continue
+            // A scoped pass does not fetch an owned tab unless its recorded href
+            // is one of its hrefs. The fetch below is the expensive part. Tabs
+            // with no recorded href are left to the unscoped orphan sweep.
+            if(hrefFilter.size) {
+                const recordedHref = normalizeQuoraProfileUrl(getQueuedTabMetadata(normalizedTabId)?.profileHref || '')
+                if(!recordedHref || !hrefFilter.has(recordedHref)) {
+                    ownedTabsSkipped += 1
+                    continue
+                }
+            }
 
             let tab = null
+            ownedTabsWalked += 1
             tab = await getQueuedExecutorTabWithTimeout(tabId, 'terminal-owned-child-tab')
             if(!tab) {
                 unregisterOwnedTab(tabId)
@@ -29317,14 +29686,24 @@ async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
         }
     }
 
+    incrementQueueWakeupMetric('terminalOwnedTabClose.ownedTabsWalked', ownedTabsWalked)
+    incrementQueueWakeupMetric('terminalOwnedTabClose.ownedTabsSkipped', ownedTabsSkipped)
+    noteSegment('ownedTabs')
     if(closed) {
         await fillQueuedTabs()
+        noteSegment('fill')
     }
 
-    const swept = hrefFilter.size
+    // A job-completion pass sweeps live tabs for its hrefs with the same rule
+    // as the unscoped pass. The narrower expected-tab sweep is for settlement
+    // passes, which keep it. A completed job's tab can have lost its tab id
+    // and owner by now, and the narrower sweep would skip it.
+    const swept = hrefFilter.size && options.completedJob !== true
         ? await sweepTerminalBlockedProfileTabs(Array.from(terminalHrefs), terminalTabIdsByHref)
         : await sweepTerminalProfileTabsByAuthority(Array.from(terminalHrefs))
-    const sourceClosed = await closeSuccessfulSourceProfileTabs(queue, Array.from(terminalHrefs))
+    noteSegment('sweepLive')
+    const sourceClosed = await closeSuccessfulSourceProfileTabs(terminalRowEntries)
+    noteSegment('sourceTabs')
 
     return {
         closed: closed + swept.signaled + sourceClosed.closed,
@@ -29334,6 +29713,33 @@ async function closeTerminalOwnedProfileTabs(profileHrefs = []) {
         sourceTabCandidates: sourceClosed.candidates,
         sourceTabsSignaled: sourceClosed.closed
     }
+}
+
+// Job-completion cleanup: closes owned tabs and rows for the completed job's
+// hrefs only. An empty list is skipped. It is not promoted to an unscoped pass,
+// which would be the whole-queue walk completions are meant to avoid.
+function scheduleCompletedJobOwnedTabCleanup(profileHrefs = []) {
+    if(!getNormalizedProfileHrefList(profileHrefs || []).length) return
+    void closeTerminalOwnedProfileTabs(profileHrefs, {completedJob: true}).catch(() => null)
+}
+
+// Unscoped orphan sweep, started from the reconcile tick. Throttled to one
+// pass per TERMINAL_OWNED_TAB_ORPHAN_SWEEP_MIN_INTERVAL_MS (the first tick
+// always runs one). Fire-and-forget, so the tick does not wait on it.
+let terminalOwnedTabOrphanSweepLastAt = 0
+
+function scheduleTerminalOwnedTabOrphanSweep(now = Date.now()) {
+    if(terminalOwnedTabOrphanSweepLastAt &&
+        now - terminalOwnedTabOrphanSweepLastAt < TERMINAL_OWNED_TAB_ORPHAN_SWEEP_MIN_INTERVAL_MS) {
+        incrementQueueWakeupMetric('terminalOwnedTabClose.orphanSweepThrottled')
+        return false
+    }
+    terminalOwnedTabOrphanSweepLastAt = now
+    incrementQueueWakeupMetric('terminalOwnedTabClose.orphanSweep')
+    void closeTerminalOwnedProfileTabs().catch(() => {
+        incrementQueueWakeupMetric('terminalOwnedTabClose.orphanSweepFailed')
+    })
+    return true
 }
 
 async function recoverConfirmedLiveRuntimeActorForCoordinatorItem(item = null, record = null, reason = 'reconcile-confirmed-live-runtime') {
@@ -29751,7 +30157,7 @@ async function pruneQueuedTabActions(ownerTabId = null, options = {}) {
         }
 
         try {
-            const currentAuthorityState = await loadCoordinatorQueueProjection({
+            const currentAuthorityState = await coordinatorQueueReader.full({
                 metricPath: 'queuedTabActions.prune.load'
             })
             coordinatorQueue = currentAuthorityState.queue
@@ -29843,7 +30249,7 @@ async function releaseUnconfirmedQueuedTabIfAuthorityNotActive(tabId = null, met
         null
     )
     if(!state) {
-        state = await loadCoordinatorQueueProjection({
+        state = await coordinatorQueueReader.full({
             metricPath: 'queuedTabActions.unconfirmedActive.load'
         }).catch(() => null)
     }
@@ -29927,7 +30333,7 @@ async function releaseQueuedTabRuntimeIfAuthorityNotActive(tabId = null, metadat
         state = normalizeCoordinatorAuthorityStateInput(await options.loadAuthorityState())
     }
     if(!state) {
-        state = await loadCoordinatorQueueProjection({
+        state = await coordinatorQueueReader.full({
             metricPath: 'queuedTabActions.runtimeAuthority.load'
         }).catch(() => null)
     }
@@ -30098,7 +30504,7 @@ async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
     const loadRuntimeAuthorityState = async () => {
         if(runtimeAuthorityLoadAttempted) return runtimeAuthorityState
         runtimeAuthorityLoadAttempted = true
-        runtimeAuthorityState = await loadCoordinatorQueueProjection({
+        runtimeAuthorityState = await coordinatorQueueReader.full({
             metricPath: 'staleQueuedTabSweep.runtimeAuthority.load'
         }).catch(() => null)
         return runtimeAuthorityState
@@ -30328,7 +30734,10 @@ async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
                     expectTerminal: true,
                     senderTabId: tabId
                 })
-                if(terminalResult?.terminal) scheduleQueuedWorkContinuation('stale-active-terminal-progress')
+                if(terminalResult?.terminal) {
+                    scheduleQueuedWorkContinuation('stale-active-terminal-progress')
+                    scheduleCompletedJobOwnedTabCleanup([metadata.profileHref])
+                }
             }
         }
         try {
@@ -30390,7 +30799,7 @@ async function getOwnedNukeStatus(parentTabId, options = {}) {
         // waste. Same fallback pattern already used by
         // recoverPendingTabActionFromCoordinatorQueue and others.
         const currentAuthorityState = getHydratedCoordinatorAuthorityState('ownedNukeStatus.queue.usedResidentAuthority') ||
-            await loadCoordinatorQueueProjection({
+            await coordinatorQueueReader.full({
                 metricPath: 'ownedNukeStatus.queue.load'
             }).catch(() => null)
         const queue = currentAuthorityState?.queue || {}
@@ -30546,7 +30955,7 @@ async function reconcileReleasedActiveCoordinatorTab(metadata = null, tabId = nu
     const coordinatorKey = `${metadata?.coordinatorKey || href || ''}`.trim()
     if(!href && !coordinatorKey) return {changed: false, reason: 'missing-profile-href'}
 
-    const state = await loadCoordinatorQueueRunsProgressProjection({
+    const state = await coordinatorQueueReader.runsProgress({
         metricPath: 'queuedTabRelease.missingActive.load',
         profileHrefs: href ? [href] : []
     }).catch(() => null)
@@ -30873,12 +31282,10 @@ function scheduleQueuedWorkContinuation(reason = 'queued-work-continuation') {
             })
             .catch(() => null)
     }
-    void closeTerminalOwnedProfileTabs().catch(() => {
-        scheduleCoordinatorReconcile(1000, {
-            reason: `${normalizedReason}-close-terminal-failed`,
-            edgeTriggered: true
-        })
-    })
+    // No terminal-tab cleanup here. A continuation runs for every queue
+    // transition, so a full pass per call was the cost. Job completions clean
+    // their own hrefs (scheduleCompletedJobOwnedTabCleanup), and the orphan
+    // sweep runs from the reconcile tick.
 }
 
 async function isPersistedCoordinatorTabClaimableBySameProfileTab(item = null, record = null, itemKey = '', tab = {}) {
@@ -30954,7 +31361,7 @@ async function recoverPendingTabActionFromCoordinatorQueue(sender = {}) {
     let currentAuthorityState = null
     try {
         currentAuthorityState = getHydratedCoordinatorAuthorityState('pendingTabAction.recover.residentAuthority') ||
-            await loadCoordinatorQueueProjection({
+            await coordinatorQueueReader.full({
             metricPath: 'pendingTabAction.recover.load'
         })
         queue = currentAuthorityState.queue
@@ -31284,10 +31691,9 @@ async function validateProgressAttempt(profileHref = '', patch = {}, sender = {}
     if(metadataAttemptId && metadataAttemptId === incomingAttemptId) return true
 
     try {
-        const currentAuthorityState = await loadCoordinatorQueueProjection({
+        const item = await coordinatorQueueReader.item(normalizedHref, {
             metricPath: 'progressAttempt.validate.load'
         })
-        const item = currentAuthorityState.queue[normalizedHref] || null
         const itemAttemptId = getAttemptIdFromValue(item)
         if(item && shouldApplyProgressToCoordinatorItem(item, patch)) {
             if(itemAttemptId && itemAttemptId !== incomingAttemptId) {
@@ -31654,7 +32060,7 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
     const outcome = `${request.outcome || 'unresolved-target'}`.trim()
 
     return enqueueSpaceFeedStorageUpdate(async () => {
-        const currentAuthorityState = await loadCoordinatorQueueRunsProjection({
+        const currentAuthorityState = await coordinatorQueueReader.runs({
             metricPath: 'resolver.unresolved.load'
         })
         const stored = await metricStorageGet({
@@ -32678,7 +33084,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                             queue = currentAuthorityState.queue
                             if(mappedTerminal) {
                                 terminalSettlementHrefs.add(normalizedHref)
-                                scheduleTerminalProgressContinuation('terminal-progress-authority-continuation')
+                                scheduleTerminalProgressContinuation('terminal-progress-authority-continuation', [normalizedHref])
                             }
                         }
                         else {
@@ -32867,7 +33273,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
     }
 
     if(updateResult?.terminal === true) {
-        scheduleTerminalProgressContinuation('terminal-progress-continuation')
+        const terminalCompletedHrefs = Object.keys(updateResult.results || {})
+            .filter(href => updateResult.results[href]?.terminal === true)
+        scheduleTerminalProgressContinuation('terminal-progress-continuation', terminalCompletedHrefs)
     }
 
     return updateResult
@@ -33078,6 +33486,7 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
         return {recorded: !!result.recorded, terminal: false, reason: 'non-terminal-progress'}
     }
     scheduleQueuedWorkContinuation('terminal-job-progress')
+    scheduleCompletedJobOwnedTabCleanup([targetProfileHref])
 
     return {
         recorded: !!result.recorded,
@@ -33166,7 +33575,7 @@ async function fillQueuedTabs(options = {}) {
         }
     }
     const activeCapacityUsed = Math.max(
-        queueRuntime.getActiveQueuedTabCount(),
+        getCapacityConsumingQueuedTabCount(),
         getSchedulerBlockingQueuedExecutorCount()
     ) + getQueuedProfileOpenReservationCount()
     if(options.returnAfterDurableActive === true &&
@@ -33201,7 +33610,7 @@ async function fillQueuedTabs(options = {}) {
         ? options.currentAuthorityState
         : getHydratedCoordinatorAuthorityState('pump.fill.usedResidentAuthority')
     if(!queuedTabFillAuthorityState?.queue && queueRuntime.getActivationIntentCount() > 0) {
-        queuedTabFillAuthorityState = await loadCoordinatorQueueRunsProjection({
+        queuedTabFillAuthorityState = await coordinatorQueueReader.runs({
             metricPath: 'pump.fill.authorityPreload'
         }).catch(() => null)
         if(queuedTabFillAuthorityState?.queue) {
@@ -33427,7 +33836,7 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
 
             const currentAuthorityState = options.currentAuthorityState?.queue
                 ? options.currentAuthorityState
-                : await loadCoordinatorQueueProjection().catch(() => null)
+                : await coordinatorQueueReader.full().catch(() => null)
             const currentQueue = currentAuthorityState?.queue || {}
             const profileHref = plan.profileHref || normalizeQuoraProfileUrl(action.profileHref || action.url || '')
             const coordinatorKey = plan.coordinatorKey || action.coordinatorKey || profileHref || ''
@@ -33470,7 +33879,7 @@ async function confirmQueuedTabOpenDurableActiveEffect(action = {}, tab = {}, pl
             }
 
             if(activeTransitionSettled) {
-                const state = currentAuthorityState || await loadCoordinatorQueueProjection().catch(() => null)
+                const state = currentAuthorityState || await coordinatorQueueReader.full().catch(() => null)
                 const queue = state?.queue || {}
                 const entry = coordinatorKey && queue[coordinatorKey]
                     ? {key: coordinatorKey, item: queue[coordinatorKey]}
@@ -33704,7 +34113,7 @@ async function fillQueuedTabsOnce(options = {}) {
         )
         const currentAuthorityState = options.currentAuthorityState?.queue
             ? options.currentAuthorityState
-            : await loadCoordinatorCurrentAuthorityState({}, {profileHrefs: knownHrefs}).catch(() => coordinatorAuthority.current() || null)
+            : await coordinatorQueueReader.currentAuthority({}, {profileHrefs: knownHrefs}).catch(() => coordinatorAuthority.current() || null)
         const currentQueue = currentAuthorityState?.queue || null
         const restoredActions = currentQueue
             ? queuedActionsBeforeCleanup.filter(action =>
@@ -34281,7 +34690,7 @@ async function terminalizeQueuedTabProfileRedirectMismatchFromMetadata(tabId, ex
 }
 
 async function loadScopedCoordinatorQueueFallbackForContentPage(request = {}, profileHrefSet = new Set()) {
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
+    const currentAuthorityState = await coordinatorQueueReader.full({
         metricPath: 'contentPageState.queueFallback.truncated'
     })
     const queue = currentAuthorityState.queue
@@ -34297,7 +34706,7 @@ async function loadScopedCoordinatorQueueFallbackForContentPage(request = {}, pr
 }
 
 async function rebuildContentPageStateProjectionFromCurrentState(reason = 'missing') {
-    const currentAuthorityState = await loadCoordinatorQueueProjection({
+    const currentAuthorityState = await coordinatorQueueReader.full({
         metricPath: `contentPageState.rebuild.${reason}`
     })
     const stored = await metricStorageGet({
@@ -34527,6 +34936,7 @@ registerServiceWorkerListeners({
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
         refreshCoordinatorRunsViewForDashboard,
+        refreshCoordinatorDashboardViewsForDashboard,
         refreshQueueWakeupMetricsViewForDashboard,
         releaseCoordinatorActionLease,
         releaseQueuedTab,
@@ -34565,6 +34975,24 @@ registerServiceWorkerListeners({
     }
 })
 
+// LEGACY QUEUE VIEW RETIREMENT (for archaeologists; the full notes are in LEGACY_QUEUE_VIEW_RETIREMENT.md).
+//
+// mbCoordinatorQueueView was a disk copy of the queue, rebuilt from the live authority on every write.
+// It stopped being written on 2026-10-01. Its last reader, a WAL-hydrate-failure recovery
+// (attemptCoordinatorQueueWalAutoRecoveryFromView), was retired after that: a pre-WAL copy can
+// resurrect rows the WAL has already moved past. Installs that predate the removal still hold a
+// stale copy, so this removes it once at startup. Removing an absent key is a no-op, and nothing
+// reads the key any more.
+function retireLegacyQueueViewStorageKey() {
+    try {
+        return Promise.resolve(coordinatorStorageAdapter.remove([COORDINATOR_QUEUE_VIEW_KEY])).catch(() => null)
+    }
+    catch(error) {
+        return Promise.resolve(null)
+    }
+}
+
+void retireLegacyQueueViewStorageKey()
 void startQueueWakeupMetricsBackedStartupWork()
 scheduleStoredWorkRearmAfterServiceWorkerReload()
 // 2026-09-27: this used to be called right after its own definition, far

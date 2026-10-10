@@ -110,7 +110,7 @@ function createProfileNukeRecordClassification(deps = {}) {
         return record.unblockOk === true &&
             record.unmuteOk === true &&
             /^(?:unblocked|already-unblocked|not-blocked|not-blocked-anymore)$/.test(unblockReason) &&
-            !/error|failed|not-found/i.test(unmuteReason) &&
+            !/error|failed|not-found|unverified/i.test(unmuteReason) &&
             !`${record.finalError || ''}`.trim()
     }
 

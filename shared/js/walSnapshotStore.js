@@ -20,6 +20,8 @@ const RAW_SNAPSHOT_CODEC = 'raw-json'
 const GZIP_SNAPSHOT_CODEC = 'gzip'
 const BASE64_ENCODING = 'base64'
 const SEGMENTED_WAL_STORAGE_VERSION = 1
+const CHECKPOINT_SHARD_FORMAT = 'sharded-v1'
+const CHECKPOINT_SHARD_DEFAULT_COUNT = 10
 
 function cloneJson(value) {
     if(value === undefined) return undefined
@@ -133,6 +135,7 @@ function makeWalMeta(options = {}) {
 }
 
 function makeCheckpoint(state = {}, options = {}) {
+    if(normalizeCheckpointShardCount(options.shardCount)) return makeShardedCheckpoint(state, options)
     const snapshotSeq = normalizeSeq(options.snapshotSeq)
     const snapshotEpoch = normalizeSeq(options.snapshotEpoch)
     const createdAt = normalizeSeq(options.createdAt)
@@ -165,6 +168,493 @@ function makeCheckpoint(state = {}, options = {}) {
         base64Bytes: 0,
         state: snapshotState
     }
+}
+
+// Sharded checkpoint format (sharded-v1). The state's top-level map areas are
+// partitioned by key hash into a fixed number of shards. Each shard is encoded
+// with the same codec a monolithic checkpoint uses. Top-level values that are
+// not maps (lists, scalars) live whole in shard 0. Each shard carries a hash of
+// its own subset, so a torn or mixed write is caught per shard as well as by
+// the whole-state hash. The shard count is fixed for a format version. Changing
+// it means re-sharding, so it is recorded in the manifest.
+function normalizeCheckpointShardCount(value) {
+    const count = Number.parseInt(value, 10)
+    return Number.isFinite(count) && count > 1 ? count : 0
+}
+
+function getCheckpointShardIndex(key = '', shardCount = CHECKPOINT_SHARD_DEFAULT_COUNT) {
+    return Number.parseInt(hashString(`${key}`), 16) % shardCount
+}
+
+function isCheckpointMapArea(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function partitionCheckpointState(state = {}, shardCount = CHECKPOINT_SHARD_DEFAULT_COUNT) {
+    const shardStates = Array.from({length: shardCount}, () => ({}))
+    const mapAreas = []
+    const valueAreas = []
+    for(const [area, value] of Object.entries(state || {})) {
+        if(isCheckpointMapArea(value)) {
+            mapAreas.push(area)
+            for(const shardState of shardStates) shardState[area] = {}
+            for(const [key, entry] of Object.entries(value)) {
+                shardStates[getCheckpointShardIndex(key, shardCount)][area][key] = entry
+            }
+        }
+        else {
+            valueAreas.push(area)
+            shardStates[0][area] = value
+        }
+    }
+    return {shardStates, areas: {map: mapAreas, value: valueAreas}}
+}
+
+// Rebuilds the whole state from decoded shard states. Returns null when a key
+// shows up in two shards, which only corrupted or mixed shards can produce.
+function mergeCheckpointShardStates(shardStates = [], areas = {map: [], value: []}) {
+    const state = {}
+    for(const area of areas.map || []) {
+        state[area] = {}
+        for(const shardState of shardStates) {
+            for(const [key, entry] of Object.entries(normalizeObject(shardState?.[area]))) {
+                if(Object.prototype.hasOwnProperty.call(state[area], key)) return null
+                state[area][key] = entry
+            }
+        }
+    }
+    for(const area of areas.value || []) {
+        if(shardStates[0] && Object.prototype.hasOwnProperty.call(shardStates[0], area)) {
+            state[area] = shardStates[0][area]
+        }
+    }
+    return state
+}
+
+function makeShardedCheckpoint(state = {}, options = {}) {
+    const shardCount = normalizeCheckpointShardCount(options.shardCount) || CHECKPOINT_SHARD_DEFAULT_COUNT
+    const snapshotState = cloneJson(state || {})
+    const {shardStates, areas} = partitionCheckpointState(snapshotState, shardCount)
+    const shards = shardStates.map((shardState, index) => ({
+        index,
+        shardStateHash: hashState(shardState),
+        ...encodeCheckpointSnapshot(shardState, {
+            codec: options.codec,
+            codecName: options.codecName
+        })
+    }))
+
+    return {
+        version: WAL_SCHEMA_VERSION,
+        id: normalizeCheckpointId(options.id),
+        snapshotSeq: normalizeSeq(options.snapshotSeq),
+        snapshotEpoch: normalizeSeq(options.snapshotEpoch),
+        createdAt: normalizeSeq(options.createdAt),
+        stateHash: hashState(snapshotState),
+        format: CHECKPOINT_SHARD_FORMAT,
+        shardCount,
+        areas,
+        shards
+    }
+}
+
+function decodeShardedCheckpointState(checkpoint = null, options = {}) {
+    const shardCount = normalizeCheckpointShardCount(checkpoint.shardCount)
+    const shards = Array.isArray(checkpoint.shards) ? checkpoint.shards : []
+    if(!shardCount || shards.length !== shardCount) {
+        return {ok: false, reason: 'checkpoint-shard-count-mismatch', state: null}
+    }
+
+    const shardStates = []
+    for(let index = 0; index < shardCount; index += 1) {
+        const shard = shards[index]
+        if(!shard || shard.index !== index) {
+            return {ok: false, reason: 'checkpoint-shard-missing', shardIndex: index, state: null}
+        }
+        const decoded = decodeCheckpointSnapshot(shard, options)
+        if(!decoded.ok) {
+            return {ok: false, reason: 'checkpoint-shard-decode-failed', shardIndex: index, shardReason: decoded.reason, state: null}
+        }
+        const actualHash = hashState(decoded.state || {})
+        if(shard.shardStateHash && shard.shardStateHash !== actualHash) {
+            return {ok: false, reason: 'checkpoint-shard-hash-mismatch', shardIndex: index, state: null}
+        }
+        shardStates.push(decoded.state || {})
+    }
+
+    const state = mergeCheckpointShardStates(shardStates, checkpoint.areas)
+    if(!state) return {ok: false, reason: 'checkpoint-shard-key-collision', state: null}
+    return {ok: true, reason: '', state}
+}
+
+// The checkpoint record kept in storage: everything except the shard payloads.
+function getCheckpointManifest(checkpoint = {}) {
+    if(checkpoint?.format !== CHECKPOINT_SHARD_FORMAT) return cloneJson(checkpoint)
+    const {shards = [], ...rest} = checkpoint
+    return cloneJson({
+        ...rest,
+        shards: shards.map(shard => ({
+            index: shard.index,
+            shardStateHash: shard.shardStateHash,
+            codec: shard.codec,
+            encoding: shard.encoding,
+            uncompressedBytes: shard.uncompressedBytes,
+            compressedBytes: shard.compressedBytes,
+            base64Bytes: shard.base64Bytes
+        }))
+    })
+}
+
+// One storage record per shard. The identity fields let a reader reject a shard
+// left over from another checkpoint or snapshot sequence.
+function getCheckpointShardRecord(checkpoint = {}, shard = {}) {
+    return cloneJson({
+        version: WAL_SCHEMA_VERSION,
+        checkpointId: checkpoint.id,
+        snapshotSeq: checkpoint.snapshotSeq,
+        snapshotEpoch: checkpoint.snapshotEpoch,
+        ...shard
+    })
+}
+
+// Reads one checkpoint slot from a stored snapshot. Monolithic (legacy) slots are
+// returned as they are. Sharded slots are reassembled from their shard records,
+// and each record must match the manifest's identity.
+function readStoredCheckpoint(stored = {}, baseKey = 'wal', checkpointId = CHECKPOINT_A) {
+    const manifest = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, checkpointId)] || null)
+    if(!manifest) return {ok: false, reason: 'missing-checkpoint', checkpoint: null}
+    if(manifest.format !== CHECKPOINT_SHARD_FORMAT) return {ok: true, reason: '', checkpoint: manifest}
+
+    const shardCount = normalizeCheckpointShardCount(manifest.shardCount)
+    const descriptors = Array.isArray(manifest.shards) ? manifest.shards : []
+    if(!shardCount || descriptors.length !== shardCount) {
+        return {ok: false, reason: 'checkpoint-shard-count-mismatch', checkpoint: null}
+    }
+    const shards = []
+    for(let index = 0; index < shardCount; index += 1) {
+        const descriptor = descriptors[index]
+        const key = getSegmentedWalCheckpointShardKey(baseKey, checkpointId, index)
+        const record = cloneJson(stored?.[key] || null)
+        if(!record) return {ok: false, reason: 'missing-checkpoint-shard', missingKey: key, checkpoint: null}
+        if(!descriptor || descriptor.index !== index ||
+            record.checkpointId !== manifest.id ||
+            record.snapshotSeq !== manifest.snapshotSeq ||
+            record.index !== index ||
+            record.shardStateHash !== descriptor.shardStateHash) {
+            return {ok: false, reason: 'checkpoint-shard-identity-mismatch', missingKey: key, checkpoint: null}
+        }
+        shards.push({...descriptor, payload: record.payload, state: record.state})
+    }
+    return {ok: true, reason: '', checkpoint: {...manifest, shards}}
+}
+
+function getSegmentedWalCheckpointShardKey(baseKey = 'wal', checkpointId = CHECKPOINT_A, index = 0) {
+    return `${getSegmentedWalCheckpointKey(baseKey, checkpointId)}.s${`${index}`.padStart(2, '0')}`
+}
+
+function getSegmentedWalCheckpointShardKeys(baseKey = 'wal', checkpointId = CHECKPOINT_A, shardCount = CHECKPOINT_SHARD_DEFAULT_COUNT) {
+    const count = normalizeCheckpointShardCount(shardCount)
+    return Array.from({length: count}, (_, index) => getSegmentedWalCheckpointShardKey(baseKey, checkpointId, index))
+}
+
+// Keyed row reads over the sharded layout. A map record names one (area, key)
+// and changes nothing else, so one row is exactly: the row in its shard, then
+// the active generation's tail records for that (area, key), applied in order.
+// The storage keys for that read: the meta, the active manifest, one shard, and every committed
+// tail segment. The segments are still listed in full, because a row's records can sit in any
+// of them. Only the resident copy (projectKeyedRowFromResidentStore) avoids reading the tail.
+function getKeyedRowReadKeys(meta = null, key = '', options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    if(!isSegmentedWalStorageMeta(meta)) return [getSegmentedWalMetaKey(baseKey)]
+    const active = normalizeCheckpointId(meta.activeCheckpoint)
+    const keys = [getSegmentedWalMetaKey(baseKey), getSegmentedWalCheckpointKey(baseKey, active)]
+    const shardCount = normalizeCheckpointShardCount(meta.checkpoints?.[active]?.shardCount)
+    if(shardCount) {
+        keys.push(getSegmentedWalCheckpointShardKey(baseKey, active, getCheckpointShardIndex(key, shardCount)))
+    }
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, active)
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        keys.push(getSegmentedWalSegmentKey(baseKey, active, segmentNo))
+    }
+    return keys
+}
+
+// A keyed read may only use a manifest whose identity is the active metadata's. A stale or mixed
+// manifest with a matching shard would otherwise project a row from an older base.
+function checkpointManifestMatchesMeta(manifest = {}, metaCheckpoint = {}, activeId = '') {
+    return normalizeCheckpointId(manifest.id) === activeId &&
+        normalizeSeq(manifest.snapshotSeq) === normalizeSeq(metaCheckpoint.snapshotSeq) &&
+        normalizeSeq(manifest.snapshotEpoch) === normalizeSeq(metaCheckpoint.snapshotEpoch) &&
+        normalizeSeq(manifest.createdAt) === normalizeSeq(metaCheckpoint.createdAt) &&
+        manifest.stateHash === metaCheckpoint.stateHash &&
+        normalizeCheckpointShardCount(manifest.shardCount) === normalizeCheckpointShardCount(metaCheckpoint.shardCount)
+}
+
+function projectKeyedRowFromStored(stored = {}, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const area = `${options.area || ''}`
+    const key = `${options.key || ''}`
+    if(!area || !key) return {ok: false, reason: 'missing-area-or-key'}
+
+    const meta = cloneJson(stored?.[getSegmentedWalMetaKey(baseKey)] || null)
+    if(!isSegmentedWalStorageMeta(meta)) return {ok: false, reason: 'missing-segmented-meta'}
+    const active = normalizeCheckpointId(meta.activeCheckpoint)
+
+    const manifest = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, active)] || null)
+    if(!manifest) return {ok: false, reason: 'missing-checkpoint'}
+    if(manifest.format !== CHECKPOINT_SHARD_FORMAT) return {ok: false, reason: 'legacy-checkpoint'}
+    const metaCheckpoint = meta.checkpoints?.[active] || null
+    if(!metaCheckpoint) return {ok: false, reason: 'checkpoint-meta-missing'}
+    if(!checkpointManifestMatchesMeta(manifest, metaCheckpoint, active)) {
+        return {ok: false, reason: 'checkpoint-manifest-meta-mismatch'}
+    }
+
+    const shardCount = normalizeCheckpointShardCount(manifest.shardCount)
+    if(!shardCount) return {ok: false, reason: 'checkpoint-shard-count-mismatch'}
+    const shardIndex = getCheckpointShardIndex(key, shardCount)
+    const descriptor = Array.isArray(manifest.shards) ? manifest.shards[shardIndex] : null
+    const shardKey = getSegmentedWalCheckpointShardKey(baseKey, active, shardIndex)
+    const record = cloneJson(stored?.[shardKey] || null)
+    if(!descriptor || !record) return {ok: false, reason: 'missing-checkpoint-shard', missingKey: shardKey}
+    if(descriptor.index !== shardIndex ||
+        record.checkpointId !== manifest.id ||
+        record.snapshotSeq !== manifest.snapshotSeq ||
+        record.index !== shardIndex ||
+        record.shardStateHash !== descriptor.shardStateHash) {
+        return {ok: false, reason: 'checkpoint-shard-identity-mismatch', missingKey: shardKey}
+    }
+
+    const decoded = decodeCheckpointSnapshot({...descriptor, payload: record.payload, state: record.state}, options)
+    if(!decoded.ok) return {ok: false, reason: 'checkpoint-shard-decode-failed', shardReason: decoded.reason}
+    if(hashState(decoded.state || {}) !== descriptor.shardStateHash) {
+        return {ok: false, reason: 'checkpoint-shard-hash-mismatch'}
+    }
+
+    const areas = manifest.areas || {map: [], value: []}
+    if((areas.value || []).includes(area)) return {ok: false, reason: 'not-a-map-area'}
+    const tail = []
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, active)
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        const segmentKey = getSegmentedWalSegmentKey(baseKey, active, segmentNo)
+        const wrapped = normalizeSegmentedWalSegment(stored?.[segmentKey], active, segmentNo)
+        if(!wrapped) return {ok: false, reason: 'missing-segment', missingKey: segmentKey}
+        if(wrapped.generation !== active || wrapped.segmentNo !== segmentNo) {
+            return {ok: false, reason: 'segment-identity-mismatch', missingKey: segmentKey}
+        }
+        for(const raw of wrapped.segment.records || []) {
+            const walRecord = makeWalRecord(raw)
+            if(walRecord.area === area && walRecord.key === key) tail.push(walRecord)
+        }
+    }
+    tail.sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
+
+    const row = projectKeyedRowFromShardState(decoded.state, tail, {area, key, snapshotSeq: manifest.snapshotSeq})
+    return {
+        ok: true,
+        reason: '',
+        found: row.found,
+        value: row.value,
+        snapshotSeq: normalizeSeq(manifest.snapshotSeq),
+        shardIndex,
+        tailRecords: tail.length
+    }
+}
+
+// One row from a verified shard state plus the (area, key) tail records, already sorted.
+// Replay runs against a one-row copy of the shard, so the shard state itself is never touched.
+function projectKeyedRowFromShardState(shardState = {}, tail = [], options = {}) {
+    const {area, key, snapshotSeq} = options
+    const shardMap = isCheckpointMapArea(shardState?.[area]) ? shardState[area] : {}
+    const mini = {[area]: {}}
+    if(Object.prototype.hasOwnProperty.call(shardMap, key)) mini[area][key] = shardMap[key]
+
+    const appliedIds = new Set()
+    let state = mini
+    for(const walRecord of tail) {
+        const result = applyWalRecord(state, walRecord, {snapshotSeq, appliedIds})
+        if(result.applied) state = result.state
+    }
+
+    const found = Object.prototype.hasOwnProperty.call(state[area], key)
+    return {found, value: found ? cloneJson(state[area][key]) : null}
+}
+
+// Resident keyed reads. The resident copy is the WAL store this process last wrote or read
+// (coordinatorQueueWalResidentStoreCache in sw.js). It holds the active sharded manifest and
+// every committed tail segment in memory. It is only a cache: it answers when the disk meta
+// names the same generation, and the manifest binding still has to hold. Storage stays the
+// authority, and the storage path (projectKeyedRowFromStored) is the fallback.
+//
+// Per call the work is one shard (decoded and hash-checked once per shard object) plus the
+// records for this (area, key). Tail records are indexed by row once per segments array.
+// Committed segments are sealed and only ever appended to, so the index extends by new
+// segments and never rereads old ones. A new segments array (from a later write) gets a
+// fresh index, built once.
+const residentTailRowIndexes = new WeakMap()
+const residentVerifiedShardStates = new WeakMap()
+
+function residentRowId(area = '', key = '') {
+    return `${area}\u0000${key}`
+}
+
+function extendResidentTailRowIndex(segments = []) {
+    let index = residentTailRowIndexes.get(segments)
+    if(!index || index.indexedSegments > segments.length) {
+        index = {indexedSegments: 0, rows: new Map()}
+        residentTailRowIndexes.set(segments, index)
+    }
+    let scanned = 0
+    for(; index.indexedSegments < segments.length; index.indexedSegments += 1) {
+        for(const record of segments[index.indexedSegments]?.records || []) {
+            scanned += 1
+            // Same trimming as normalizeWalRecord, so the index agrees with the storage path.
+            const id = residentRowId(`${record?.area || ''}`.trim(), `${record?.key || ''}`.trim())
+            const list = index.rows.get(id)
+            if(list) list.push(record)
+            else index.rows.set(id, [record])
+        }
+    }
+    return {index, scanned}
+}
+
+function getResidentVerifiedShardState(shard = {}, options = {}) {
+    const cached = residentVerifiedShardStates.get(shard)
+    if(cached) return cached
+    const decoded = decodeCheckpointSnapshot(shard, options)
+    let verified
+    if(!decoded.ok) verified = {ok: false, reason: 'checkpoint-shard-decode-failed', shardReason: decoded.reason}
+    else if(hashState(decoded.state || {}) !== shard.shardStateHash) verified = {ok: false, reason: 'checkpoint-shard-hash-mismatch'}
+    else verified = {ok: true, reason: '', state: decoded.state}
+    residentVerifiedShardStates.set(shard, verified)
+    return verified
+}
+
+function projectKeyedRowFromResidentStore(resident = null, diskMeta = null, options = {}) {
+    const area = `${options.area || ''}`
+    const key = `${options.key || ''}`
+    if(!area || !key) return {ok: false, reason: 'missing-area-or-key'}
+    if(!resident || typeof resident !== 'object') return {ok: false, reason: 'resident-missing'}
+    if(!isSegmentedWalStorageMeta(diskMeta)) return {ok: false, reason: 'missing-segmented-meta'}
+
+    const active = normalizeCheckpointId(diskMeta.activeCheckpoint)
+    // Freshness: the same generation test the session mirror uses (active slot, committed
+    // tail, next sequence), plus the in-memory segment count, which must match the meta.
+    if(!isQueueMirrorFresh(resident.meta, diskMeta)) return {ok: false, reason: 'resident-meta-mismatch'}
+    const segments = resident.wal?.[active]?.segments
+    if(!Array.isArray(segments) || segments.length !== getSegmentedWalCommittedSegmentCount(diskMeta, active)) {
+        return {ok: false, reason: 'resident-meta-mismatch'}
+    }
+
+    const manifest = resident.checkpoints?.[active] || null
+    if(!manifest) return {ok: false, reason: 'missing-checkpoint'}
+    if(manifest.format !== CHECKPOINT_SHARD_FORMAT) return {ok: false, reason: 'legacy-checkpoint'}
+    const metaCheckpoint = diskMeta.checkpoints?.[active] || null
+    if(!metaCheckpoint) return {ok: false, reason: 'checkpoint-meta-missing'}
+    if(!checkpointManifestMatchesMeta(manifest, metaCheckpoint, active)) {
+        return {ok: false, reason: 'checkpoint-manifest-meta-mismatch'}
+    }
+
+    const shardCount = normalizeCheckpointShardCount(manifest.shardCount)
+    if(!shardCount) return {ok: false, reason: 'checkpoint-shard-count-mismatch'}
+    const shardIndex = getCheckpointShardIndex(key, shardCount)
+    const shard = Array.isArray(manifest.shards) ? manifest.shards[shardIndex] : null
+    if(!shard || shard.index !== shardIndex) return {ok: false, reason: 'missing-checkpoint-shard'}
+    const verified = getResidentVerifiedShardState(shard, options)
+    if(!verified.ok) return {ok: false, reason: verified.reason, shardReason: verified.shardReason}
+
+    const areas = manifest.areas || {map: [], value: []}
+    if((areas.value || []).includes(area)) return {ok: false, reason: 'not-a-map-area'}
+
+    const {index, scanned} = extendResidentTailRowIndex(segments)
+    const tail = (index.rows.get(residentRowId(area, key)) || [])
+        .map(makeWalRecord)
+        .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
+    const row = projectKeyedRowFromShardState(verified.state, tail, {area, key, snapshotSeq: manifest.snapshotSeq})
+    return {
+        ok: true,
+        reason: '',
+        found: row.found,
+        value: row.value,
+        snapshotSeq: normalizeSeq(manifest.snapshotSeq),
+        shardIndex,
+        tailRecords: tail.length,
+        // Records this call examined. Steady state is 0: the index is already built.
+        scannedRecords: scanned
+    }
+}
+
+// Phase 2 of the mirror plan: the keys a session mirror holds. It is the active
+// slot's manifest, its shard records, the active generation's segments, and the meta,
+// under the same keys storage uses, so the mirror needs no translation. A keyed read
+// against the mirror is the same projection as a keyed read against storage. The
+// mirror is only a cache: the disk meta decides whether it may be used.
+function getQueueMirrorKeys(meta = null, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    if(!isSegmentedWalStorageMeta(meta)) return [getSegmentedWalMetaKey(baseKey)]
+    const active = normalizeCheckpointId(meta.activeCheckpoint)
+    const keys = [getSegmentedWalMetaKey(baseKey), getSegmentedWalCheckpointKey(baseKey, active)]
+    const shardCount = normalizeCheckpointShardCount(meta.checkpoints?.[active]?.shardCount)
+    for(let index = 0; index < shardCount; index += 1) {
+        keys.push(getSegmentedWalCheckpointShardKey(baseKey, active, index))
+    }
+    const committedSegments = getSegmentedWalCommittedSegmentCount(meta, active)
+    for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
+        keys.push(getSegmentedWalSegmentKey(baseKey, active, segmentNo))
+    }
+    return keys
+}
+
+// The part of a storage payload (or stored snapshot) that the mirror holds, as an object.
+function selectQueueMirrorRecords(stored = {}, meta = null, options = {}) {
+    const mirror = {}
+    for(const key of getQueueMirrorKeys(meta, options)) {
+        if(stored && Object.prototype.hasOwnProperty.call(stored, key)) mirror[key] = stored[key]
+    }
+    return mirror
+}
+
+// Phase 2 freshness. A session mirror may answer a read only when its meta describes the
+// same state as the disk meta: the same active slot, the same committed tail, and the same
+// next sequence. Anything else means the mirror is behind or ahead, so the read goes to disk.
+function isQueueMirrorFresh(mirrorMeta = null, diskMeta = null, options = {}) {
+    if(!isSegmentedWalStorageMeta(mirrorMeta) || !isSegmentedWalStorageMeta(diskMeta)) return false
+    const active = normalizeCheckpointId(diskMeta.activeCheckpoint)
+    return normalizeCheckpointId(mirrorMeta.activeCheckpoint) === active &&
+        getSegmentedWalCommittedSegmentCount(mirrorMeta, active) === getSegmentedWalCommittedSegmentCount(diskMeta, active) &&
+        normalizeSeq(mirrorMeta.nextSeq) === normalizeSeq(diskMeta.nextSeq)
+}
+
+// The records one acknowledged append adds to a mirror that already holds the previous
+// state. Returns null when the mirror cannot be advanced this way: the active slot changed,
+// a checkpoint was written, or the committed count does not line up. Callers then rebuild.
+function planQueueMirrorAppend(mirrorMeta = null, payload = {}, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const meta = payload?.[getSegmentedWalMetaKey(baseKey)]
+    if(!isSegmentedWalStorageMeta(meta) || !isSegmentedWalStorageMeta(mirrorMeta)) return null
+    const active = normalizeCheckpointId(meta.activeCheckpoint)
+    if(normalizeCheckpointId(mirrorMeta.activeCheckpoint) !== active) return null
+    const checkpointPrefix = `${baseKey}.checkpoint.`
+    if(Object.keys(payload).some(key => key.startsWith(checkpointPrefix))) return null
+
+    const committedBefore = getSegmentedWalCommittedSegmentCount(mirrorMeta, active)
+    const committedNow = getSegmentedWalCommittedSegmentCount(meta, active)
+    if(committedNow < committedBefore) return null
+    const records = {[getSegmentedWalMetaKey(baseKey)]: meta}
+    for(let segmentNo = committedBefore; segmentNo < committedNow; segmentNo += 1) {
+        const key = getSegmentedWalSegmentKey(baseKey, active, segmentNo)
+        if(!Object.prototype.hasOwnProperty.call(payload, key)) return null
+        records[key] = payload[key]
+    }
+    return {records, meta}
+}
+
+// A full mirror, built from a stored snapshot. Returns ok: false if any key the mirror needs
+// is absent, because a partial mirror would answer wrongly.
+function planQueueMirrorRebuild(stored = {}, meta = null, options = {}) {
+    const keys = getQueueMirrorKeys(meta, options)
+    const missingKeys = keys.filter(key => !(stored && Object.prototype.hasOwnProperty.call(stored, key)))
+    if(missingKeys.length) return {ok: false, reason: 'mirror-keys-missing', missingKeys, records: {}}
+    return {ok: true, reason: '', records: selectQueueMirrorRecords(stored, meta, options), meta}
 }
 
 function makePairedCheckpointStore(initialState = {}, options = {}) {
@@ -250,6 +740,7 @@ function decodeCheckpointSnapshot(checkpoint = null, options = {}) {
     if(!checkpoint || typeof checkpoint !== 'object') {
         return {ok: false, reason: 'missing-checkpoint', state: null}
     }
+    if(checkpoint.format === CHECKPOINT_SHARD_FORMAT) return decodeShardedCheckpointState(checkpoint, options)
     if(checkpoint.state && typeof checkpoint.state === 'object') {
         return {ok: true, reason: '', state: cloneJson(checkpoint.state)}
     }
@@ -304,7 +795,8 @@ function setCheckpointMeta(store, checkpoint) {
             snapshotSeq: checkpoint.snapshotSeq,
             snapshotEpoch: checkpoint.snapshotEpoch,
             createdAt: checkpoint.createdAt,
-            stateHash: checkpoint.stateHash
+            stateHash: checkpoint.stateHash,
+            shardCount: normalizeCheckpointShardCount(checkpoint.shardCount)
         }
     }
 }
@@ -435,6 +927,8 @@ function buildSegmentedWalStorageDefaults(meta = null, options = {}) {
 
     const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
     defaults[getSegmentedWalCheckpointKey(baseKey, activeCheckpoint)] = null
+    const activeShardCount = normalizeCheckpointShardCount(meta.checkpoints?.[activeCheckpoint]?.shardCount)
+    for(const key of getSegmentedWalCheckpointShardKeys(baseKey, activeCheckpoint, activeShardCount)) defaults[key] = null
     const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
     for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
         defaults[getSegmentedWalSegmentKey(baseKey, activeCheckpoint, segmentNo)] = null
@@ -470,7 +964,16 @@ function buildSegmentedWalStoragePayload(store = {}, options = {}) {
     for(const generationId of generationsToWrite) {
         const id = normalizeCheckpointId(generationId)
         if(writeCheckpoints && store?.checkpoints && Object.prototype.hasOwnProperty.call(store.checkpoints, id)) {
-            payload[getSegmentedWalCheckpointKey(baseKey, id)] = cloneJson(store.checkpoints[id] || null)
+            const checkpoint = store.checkpoints[id] || null
+            if(checkpoint?.format === CHECKPOINT_SHARD_FORMAT) {
+                payload[getSegmentedWalCheckpointKey(baseKey, id)] = getCheckpointManifest(checkpoint)
+                for(const shard of checkpoint.shards || []) {
+                    payload[getSegmentedWalCheckpointShardKey(baseKey, id, shard.index)] = getCheckpointShardRecord(checkpoint, shard)
+                }
+            }
+            else {
+                payload[getSegmentedWalCheckpointKey(baseKey, id)] = cloneJson(checkpoint)
+            }
         }
         const generation = getWalGeneration(store, id)
         const segments = Array.isArray(generation?.segments) ? generation.segments : []
@@ -500,9 +1003,10 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
     }
 
     const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
-    const checkpoint = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, activeCheckpoint)] || null)
-    if(!checkpoint) {
-        return {ok: false, reason: 'missing-checkpoint', store: null, meta}
+    const activeRead = readStoredCheckpoint(stored, baseKey, activeCheckpoint)
+    const checkpoint = activeRead.checkpoint
+    if(!activeRead.ok || !checkpoint) {
+        return {ok: false, reason: activeRead.reason || 'missing-checkpoint', missingKey: activeRead.missingKey, store: null, meta}
     }
 
     const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
@@ -520,7 +1024,8 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
     }
 
     const inactiveCheckpoint = getInactiveCheckpointId(activeCheckpoint)
-    const inactiveStored = cloneJson(stored?.[getSegmentedWalCheckpointKey(baseKey, inactiveCheckpoint)] || null)
+    const inactiveRead = readStoredCheckpoint(stored, baseKey, inactiveCheckpoint)
+    const inactiveStored = inactiveRead.ok ? inactiveRead.checkpoint : null
     const activeSnapshotSeq = Math.max(
         normalizeSeq(meta?.generations?.[activeCheckpoint]?.snapshotSeq),
         normalizeSeq(checkpoint.snapshotSeq)
@@ -607,7 +1112,8 @@ function writeInactiveCheckpoint(store = {}, state = {}, options = {}) {
         snapshotEpoch: options.snapshotEpoch,
         createdAt: options.createdAt,
         codec: options.codec,
-        codecName: options.codecName
+        codecName: options.codecName,
+        shardCount: options.shardCount
     })
 
     nextStore.checkpoints[inactive] = checkpoint
@@ -768,6 +1274,19 @@ function shouldApplyPatch(existing = null, patch = {}, record = {}) {
     return {ok: true, reason: ''}
 }
 
+// A map branch needs a writable copy of its area. A caller that owns its state (projectSnapshot)
+// passes context.ownedAreas: the first copy of an area is made once, and later records in the same
+// replay write into it. Without ownedAreas every record copies, as before, so the reducer stays pure.
+function takeAreaForWrite(nextState = {}, area = '', context = {}) {
+    const current = nextState[area]
+    if(context.ownedAreas?.has(area) && current && typeof current === 'object' && !Array.isArray(current)) {
+        return current
+    }
+    const copy = {...normalizeObject(current)}
+    context.ownedAreas?.add(area)
+    return copy
+}
+
 function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
     const record = makeWalRecord(rawRecord)
     const validation = validateWalRecord(record)
@@ -793,12 +1312,12 @@ function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
     const area = record.area
 
     if(record.kind === 'map.remove') {
-        const map = {...normalizeObject(nextState[area])}
+        const map = takeAreaForWrite(nextState, area, context)
         delete map[record.key]
         nextState[area] = map
     }
     else if(record.kind === 'map.set') {
-        const map = {...normalizeObject(nextState[area])}
+        const map = takeAreaForWrite(nextState, area, context)
         const value = cloneJson(record.value || {})
         const check = shouldApplyPatch(map[record.key] || null, value, record)
         if(!check.ok) return {state, applied: false, reason: check.reason, record}
@@ -806,7 +1325,7 @@ function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
         nextState[area] = map
     }
     else if(record.kind === 'map.patch') {
-        const map = {...normalizeObject(nextState[area])}
+        const map = takeAreaForWrite(nextState, area, context)
         const previous = map[record.key] || {}
         const patch = cloneJson(record.patch || {})
         const check = shouldApplyPatch(previous, patch, record)
@@ -840,9 +1359,11 @@ function projectSnapshot(checkpoint = {}, records = [], options = {}) {
     const applied = []
     let state = cloneJson(baseState || {})
     let maxSeq = snapshotSeq
+    // state is our own clone, so each area is copied once and then written in place.
+    const ownedAreas = new Set()
 
     for(const record of sortedRecords) {
-        const result = applyWalRecord(state, record, {snapshotSeq, appliedIds})
+        const result = applyWalRecord(state, record, {snapshotSeq, appliedIds, ownedAreas})
         if(result.applied) {
             state = result.state
             applied.push(record)
@@ -918,7 +1439,26 @@ function estimateStateBytes(state = {}, options = {}) {
 module.exports = {
     CHECKPOINT_A,
     CHECKPOINT_B,
+    CHECKPOINT_SHARD_DEFAULT_COUNT,
+    CHECKPOINT_SHARD_FORMAT,
+    normalizeCheckpointId,
+    normalizeCheckpointShardCount,
     DEFAULT_RECOVERY_CRITICAL_AREAS,
+    getCheckpointManifest,
+    getSegmentedWalCheckpointShardKey,
+    getSegmentedWalCheckpointShardKeys,
+    makeShardedCheckpoint,
+    mergeCheckpointShardStates,
+    partitionCheckpointState,
+    readStoredCheckpoint,
+    getKeyedRowReadKeys,
+    getQueueMirrorKeys,
+    selectQueueMirrorRecords,
+    isQueueMirrorFresh,
+    planQueueMirrorAppend,
+    planQueueMirrorRebuild,
+    projectKeyedRowFromStored,
+    projectKeyedRowFromResidentStore,
     GZIP_SNAPSHOT_CODEC,
     RAW_SNAPSHOT_CODEC,
     SEGMENTED_WAL_STORAGE_VERSION,

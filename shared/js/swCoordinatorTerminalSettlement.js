@@ -183,6 +183,9 @@ function createCoordinatorTerminalSettlement(deps = {}) {
 
     function scheduleTerminalOwnedProfileTabCleanup(profileHrefs = [], delayMs = 0) {
         const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
+        // An empty list is skipped. closeTerminalOwnedProfileTabs() with no list
+        // is the unscoped pass, which only the reconcile-tick orphan sweep runs.
+        if(!hrefs.length) return
         setTimeoutFn(() => {
             void closeTerminalOwnedProfileTabs(hrefs).catch(() => {
                 scheduleCoordinatorReconcile(1000, {reason: 'terminal-tab-cleanup-failed'})

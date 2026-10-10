@@ -123,12 +123,26 @@ test('maps reverse ok flags to terminal success when late status stays unblockin
         unblockOk: true,
         unblockReason: 'unblocked',
         unmuteOk: true,
-        unmuteReason: 'unmute-clicked-unverified'
+        unmuteReason: 'unmuted'
     })
 
     assert.equal(mapped.status, 'succeeded')
     assert.equal(mapped.outcome, 'unblocked')
     assert.equal(mapped.terminal, true)
+})
+
+test('does not map an unblock with unverified unmute to terminal success', () => {
+    const mapped = mapProgressToCoordinatorState({
+        actionKind: 'unblock-unmute',
+        status: 'unblocking',
+        unblockOk: true,
+        unblockReason: 'unblocked',
+        unmuteOk: true,
+        unmuteReason: 'unmute-clicked-unverified'
+    })
+
+    assert.notEqual(mapped.status, 'succeeded')
+    assert.equal(mapped.terminal, false)
 })
 
 test('extracts durable milestones from legacy profile progress', () => {

@@ -523,8 +523,15 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
         runId: page === 'profile-search' ? profileSearchLastRunId || '' : ''
     }
 
+    const stateRequestStartedAt = Date.now()
     contentPageStateRefreshPromise = safeSendRuntimeMessageWithTimeout(request, null, 3000)
         .then(result => {
+            recordSpaceMarkPerf('stateRoundTrip', {
+                ms: Date.now() - stateRequestStartedAt,
+                ok: !!result,
+                hrefs: profileHrefs.length,
+                page
+            })
             if(!result || typeof result !== 'object') return false
             if(result.coordinatorQueue && typeof result.coordinatorQueue === 'object') {
                 coordinatorQueue = normalizeCoordinatorQueue(result.coordinatorQueue)
@@ -1568,11 +1575,46 @@ async function sweepServiceWorkerBlockedProfileTabs() {
     }
 }
 
+// Timeline for space-feed marking latency (diagnostic only; nothing reads it in
+// the extension). Events go to an attribute on <html>, which the body observer
+// does not watch, so a CDP reader can pull them from the page.
+const SPACE_MARK_PERF_ATTRIBUTE = 'data-mb-perf-space-marking'
+const SPACE_MARK_PERF_MAX_RECENT_EVENTS = 100
+const spaceMarkPerfEvents = []
+// Running totals per event name, so a long run (100+ page-downs) stays complete
+// even after the recent-event window has rolled past it.
+const spaceMarkPerfTotals = {}
+
+function recordSpaceMarkPerf(name = '', fields = {}) {
+    try {
+        const t = Date.now()
+        spaceMarkPerfEvents.push({t, name, ...fields})
+        if(spaceMarkPerfEvents.length > SPACE_MARK_PERF_MAX_RECENT_EVENTS) {
+            spaceMarkPerfEvents.splice(0, spaceMarkPerfEvents.length - SPACE_MARK_PERF_MAX_RECENT_EVENTS)
+        }
+        const total = spaceMarkPerfTotals[name] || {count: 0, sumMs: 0, maxMs: 0, okCount: 0}
+        total.count += 1
+        if(typeof fields.ms === 'number') {
+            total.sumMs += fields.ms
+            total.maxMs = Math.max(total.maxMs, fields.ms)
+        }
+        if(fields.ok === true) total.okCount += 1
+        spaceMarkPerfTotals[name] = total
+        document.documentElement?.setAttribute(SPACE_MARK_PERF_ATTRIBUTE, JSON.stringify({
+            totals: spaceMarkPerfTotals,
+            recent: spaceMarkPerfEvents
+        }))
+    }
+    catch {}
+}
+
 async function getOwnedNukeStatus(options = {}) {
+    const startedAt = Date.now()
     const result = await safeSendRuntimeMessageWithTimeout({
         action: 'get-owned-nuke-status',
         runId: options.runId || ''
     }, null, 2500)
+    recordSpaceMarkPerf('ownedStatus', {ms: Date.now() - startedAt, ok: !!result})
     return normalizeOwnedNukeStatus(result)
 }
 
@@ -1777,6 +1819,7 @@ function startObserver() {
             if(!areExtensionOnlyMutations(mutations)) {
                 const hasStructuralFeedChange = hasSpaceFeedStructuralMutations(mutations)
                 if(hasStructuralFeedChange) {
+                    recordSpaceMarkPerf('mutation')
                     invalidateSpaceFeedEntryCacheForMutations(mutations)
                 }
                 injectSpaceSidebarOpenProfilesBtn()
@@ -1846,6 +1889,7 @@ function installSpaceFeedViewportRefresh() {
         }
         if(page !== 'space') return
 
+        if(Date.now() > spaceFeedScrollActiveUntil) recordSpaceMarkPerf('scrollStart')
         spaceFeedScrollActiveUntil = Date.now() + SPACE_FEED_SCROLL_IDLE_MS
         clearTimeout(spaceAssetNukeViewportTimeout)
         spaceAssetNukeViewportTimeout = setTimeout(() => {
@@ -9785,11 +9829,18 @@ async function nukeSpaceFeedEntries(button, entries) {
     // through to the enqueue summary is what lets both the page that queued
     // this batch and the dashboard show why a big selection shrank instead
     // of leaving it looking like most of it silently vanished.
+    // rawWorkItems counts one per (post, profile) pair this click submits, the
+    // same unit the nuke button's count is built from. workAssociations has one
+    // per unique profile, so the difference is the duplicates collapsed across
+    // posts (or repeated within one post).
+    const rawWorkItems = unfinishedEntries.reduce((total, entry) =>
+        total + (entry.candidateUrls.length || (entry.resolveProfileFromPage ? 1 : 0)), 0)
     const preFilter = {
         totalCandidates: entries.length,
+        rawWorkItems,
         alreadyNuked: alreadyNukedCount,
         unqueueable: unqueueableCount,
-        duplicateProfile: Math.max(0, unfinishedEntries.length - workAssociations.length)
+        duplicateProfile: Math.max(0, rawWorkItems - workAssociations.length)
     }
     if(!workAssociations.length) {
         syncSpaceFeedNukeControls()
@@ -10251,6 +10302,7 @@ function syncSpaceFeedNukeControls() {
     const entries = getLatestSpaceFeedEntries()
     scheduleSpaceFeedScopedStateRefresh(entries)
     const renderModel = buildSpaceFeedRenderModel(scannedEntries, entries)
+    recordSpaceMarkPerf('render', {entries: entries.length, coordinatorReady: coordinatorQueueLoaded})
     scheduleSpaceFeedProgressReconciliation(entries)
     clearStaleLocalSpaceFeedBusyState()
     clearInactiveSpaceFeedNukeMode()
@@ -13057,7 +13109,10 @@ async function unmuteProfileBestEffort(options = {}) {
 
     await dismissProfileActionSurface()
     if(!silent) reportActionIssue('Unmute could not be verified', true)
-    return {ok: true, changed: true, reason: 'unmute-clicked-unverified'}
+    // The click was dispatched but the menu never reported the inverse state,
+    // so the profile may still be muted. This must not read as success: callers
+    // gate terminal unblock-unmute success on ok.
+    return {ok: false, changed: true, reason: 'unmute-clicked-unverified'}
 }
 
 async function waitForCanonicalProfileActionRoute(profileHref, timeoutMs = WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS) {
@@ -13157,6 +13212,11 @@ async function unblockUnmuteProfile(options = {}) {
         }
 
         rememberProfileUnblocked(profileHref)
+        // The unblock verified, but a profile that is still muted is not a
+        // completed reverse action. Keep the nuke state so the retry runs again.
+        if(unmute?.reason === 'unmute-clicked-unverified') {
+            return {ok: false, reason: unmute.reason, unblock, unmute}
+        }
         if(clearNukeState) {
             await clearProfileNukeState(profileHref, 'Unblock Unmute action unblocked the profile')
         }

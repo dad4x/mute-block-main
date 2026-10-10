@@ -143,7 +143,7 @@ function isSuccessfulUnblockUnmuteRecord(record = null, status = normalizeString
     return record.unblockOk === true &&
         record.unmuteOk === true &&
         /^(?:unblocked|already-unblocked|not-blocked|not-blocked-anymore)$/.test(unblockReason) &&
-        !/error|failed|not-found/i.test(unmuteReason) &&
+        !/error|failed|not-found|unverified/i.test(unmuteReason) &&
         !normalizeString(record.finalError)
 }
 

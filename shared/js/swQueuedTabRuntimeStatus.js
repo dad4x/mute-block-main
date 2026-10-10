@@ -93,6 +93,29 @@ function createQueuedTabRuntimeStatus(deps = {}) {
         return Number.isFinite(metadata?.durableActiveAt) && metadata.durableActiveAt > 0
     }
 
+    // A non-durable provisional tab whose attempt has no authority row holds no capacity. Nothing
+    // is waiting on it, and reconcile clears it later. Durable tabs, and tabs whose attempt still has
+    // an authority row, always count.
+    function isOrphanProvisionalQueuedTab(tabId) {
+        if(isDurablyActiveQueuedTab(tabId)) return false
+        const metadata = getQueuedTabMetadata(tabId)
+        const attemptId = getAttemptIdFromValue(metadata)
+        if(!attemptId) return false
+        const authorityState = getHydratedCoordinatorAuthorityState()
+        if(!authorityState?.queue) return false
+        const key = metadata?.coordinatorKey || metadata?.profileHref || ''
+        const row = key ? authorityState.queue[key] : null
+        return getAttemptIdFromValue(row) !== attemptId
+    }
+
+    function getCapacityConsumingQueuedTabCount() {
+        let count = 0
+        for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
+            if(!isOrphanProvisionalQueuedTab(tabId)) count += 1
+        }
+        return count
+    }
+
     function getDurablyActiveQueuedTabCount() {
         let count = 0
         for(const tabId of queueRuntime.listActiveQueuedTabIds()) {
@@ -489,6 +512,7 @@ function createQueuedTabRuntimeStatus(deps = {}) {
     return {
         isDurablyActiveQueuedTab,
         getDurablyActiveQueuedTabCount,
+        getCapacityConsumingQueuedTabCount,
         getDurablyActiveCoordinatorAuthorityRowCount,
         getFreshQueuedTabRuntimeStartupAnchor,
         isFreshQueuedTabRuntimeStartup,

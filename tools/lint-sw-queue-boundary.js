@@ -98,6 +98,8 @@ function findRestrictedSwCalls() {
     let currentFunction = ''
     for(let index = 0; index < lines.length; index += 1) {
         const line = lines[index]
+        // Comment-only lines describe calls; they are not calls.
+        if(/^\s*\/\//.test(line)) continue
         const functionMatch = line.match(/\b(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*\(/)
         if(functionMatch) currentFunction = functionMatch[1]
         for(const name of restrictedSwCalls.concat(Array.from(projectionDispatchCalls))) {

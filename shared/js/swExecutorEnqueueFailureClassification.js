@@ -68,6 +68,7 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
     const {
         queueRuntime,
         getDurablyActiveQueuedTabCount,
+        getCapacityConsumingQueuedTabCount,
         getSchedulerBlockingQueuedExecutorCount,
         getQueuedProfileOpenReservationCount,
         getEffectiveQueuedTabOpenConcurrency,
@@ -78,9 +79,8 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
     } = deps.handlers || {}
 
     function isQueuedExecutorCapacityConsumed(fillResult = {}) {
-        const activeCount = (Number.parseInt(fillResult.active, 10) || 0) ||
+        const activeCount = getCapacityConsumingQueuedTabCount() ||
             (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) ||
-            queueRuntime.getActiveQueuedTabCount() ||
             queueRuntime.getPendingTabActionCount() ||
             getSchedulerBlockingQueuedExecutorCount() ||
             getQueuedProfileOpenReservationCount() ||
@@ -90,9 +90,8 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
 
     function isExecutorMaterializationDeferredByCapacity(enqueueResult = {}) {
         const fillResult = enqueueResult?.fillResult || {}
-        const activeCount = (Number.parseInt(fillResult.active, 10) || 0) ||
+        const activeCount = getCapacityConsumingQueuedTabCount() ||
             (Number.parseInt(fillResult.schedulerBlockingActive, 10) || 0) ||
-            queueRuntime.getActiveQueuedTabCount() ||
             queueRuntime.getPendingTabActionCount() ||
             getDurablyActiveQueuedTabCount()
         const remainingActions = Number.parseInt(fillResult.remainingActions, 10) || 0

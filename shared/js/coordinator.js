@@ -777,7 +777,7 @@ async function loadState() {
     // refreshDashboardStateFromCompactStorage) would otherwise just keep
     // re-reading that same stale snapshot forever instead of ever
     // correcting it.
-    await refreshCompactQueueView()
+    const refreshed = await refreshCompactDashboardViews()
     // Same reasoning as the queue view above, for the same underlying reason:
     // mbCoordinatorRuns[runId]'s itemCount/targetProfileHrefs/targetWorkKeys/
     // activeCount/terminalCount/status are maintained as a mutated running
@@ -788,7 +788,7 @@ async function loadState() {
     // Ask the service worker to compute run stats fresh from current
     // authority plus the full completed-work log instead of trusting that
     // storage copy; fall back to it only if the message truly fails.
-    if(!await refreshCompactRunsView()) {
+    if(!refreshed.runsRefreshed) {
         state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
     }
     state.events = normalizeEvents(stored[COORDINATOR_EVENTS_KEY])
@@ -805,42 +805,39 @@ async function loadState() {
     state.lastEnqueueSummary = stored[LAST_ENQUEUE_SUMMARY_KEY] || null
 }
 
-async function refreshCompactQueueView() {
+// One round trip for both dashboard views. The service worker reads authority
+// once and derives the queue view and the runs summary from that read, so a
+// poll no longer pays for the same WAL replay twice.
+async function refreshCompactDashboardViews() {
     const result = await sendRuntimeMessageWithTimeout({
-        action: 'refresh-coordinator-queue-view',
-        reason: 'dashboard-load-missing-view'
-    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
-    if(hasCoordinatorQueueView(result?.view)) {
-        applyCoordinatorQueueView(result.view)
-        return true
-    }
-
-    // mbCoordinatorQueueView is no longer persisted to disk (see sw.js's
-    // refreshCoordinatorQueueViewForDashboard) -- there's no storage fallback
-    // to read if the message above timed out or came back empty.
-    applyCoordinatorQueueView({
-        version: 1,
-        updatedAt: Date.now(),
-        total: 0,
-        counts: {},
-        itemLimit: 0,
-        truncated: false,
-        items: []
-    })
-    return false
-}
-
-async function refreshCompactRunsView() {
-    const result = await sendRuntimeMessageWithTimeout({
-        action: 'refresh-coordinator-runs-view',
+        action: 'refresh-coordinator-dashboard-views',
         reason: 'dashboard-load'
     }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
-    if(result?.runs && typeof result.runs === 'object' && !Array.isArray(result.runs)) {
-        state.runs = result.runs
-        return true
+
+    const queueRefreshed = hasCoordinatorQueueView(result?.view)
+    if(queueRefreshed) {
+        applyCoordinatorQueueView(result.view)
     }
-    return false
+    else {
+        // mbCoordinatorQueueView is no longer persisted to disk (see sw.js's
+        // refreshCoordinatorQueueViewForDashboard) -- there's no storage fallback
+        // to read if the message above timed out or came back empty.
+        applyCoordinatorQueueView({
+            version: 1,
+            updatedAt: Date.now(),
+            total: 0,
+            counts: {},
+            itemLimit: 0,
+            truncated: false,
+            items: []
+        })
+    }
+
+    const runsRefreshed = !!result?.runs && typeof result.runs === 'object' && !Array.isArray(result.runs)
+    if(runsRefreshed) state.runs = result.runs
+    return {queueRefreshed, runsRefreshed}
 }
+
 
 // Deliberately not a default parameter (`value = state.queueView`): a
 // caller checking some other object's shape -- e.g.
@@ -853,7 +850,7 @@ async function refreshCompactRunsView() {
 // if the response had a real view, and crashed moments later reading
 // .view off the actual (null) result. Confirmed live 2026-10-08:
 // "Uncaught (in promise) TypeError: Cannot read properties of null
-// (reading 'view')" in coordinator.js, both organically (refreshCompactQueueView,
+// (reading 'view')" in coordinator.js, both organically (refreshCompactDashboardViews,
 // 14 occurrences from one idle dashboard) and via Clear All Stats
 // (refreshCompactMetricsView's identical pattern, see
 // hasQueueWakeupMetricsView below). arguments.length distinguishes a
@@ -1194,18 +1191,23 @@ function formatCoordinatorEnqueueBreakdown(summary = null) {
     // several posts by the same author collapsing to one profile) -- without
     // this, "requested" alone understates how big the original selection
     // was and the drop looks unexplained.
+    // Reads as: raw candidates (one per post-profile pair), duplicates collapsed
+    // to unique profiles, then what was queued. Summaries written before
+    // rawWorkItems existed fall back to the plain requested count.
     const preFilter = summary.preFilter
-    const totalCandidates = Number.parseInt(preFilter?.totalCandidates, 10) || 0
-    if(preFilter && totalCandidates > requested) {
+    const rawWorkItems = Number.parseInt(preFilter?.rawWorkItems, 10) || 0
+    const duplicates = Number.parseInt(preFilter?.duplicateProfile, 10) || 0
+    if(preFilter) {
         if(preFilter.alreadyNuked) noticeParts.push(`${preFilter.alreadyNuked} already nuked`)
-        if(preFilter.duplicateProfile) noticeParts.push(`${preFilter.duplicateProfile} duplicate profile`)
         if(preFilter.unqueueable) noticeParts.push(`${preFilter.unqueueable} unresolvable`)
     }
 
-    const fromLabel = preFilter && totalCandidates > requested ? totalCandidates : requested
+    const fromPart = rawWorkItems > requested
+        ? `${rawWorkItems} candidates, ${duplicates} duplicates, ${requested} unique`
+        : `${requested} candidates`
     return noticeParts.length
-        ? `${fromLabel} candidates -> ${queued} new (${noticeParts.join(', ')})`
-        : `${fromLabel} candidates -> ${queued} new`
+        ? `${fromPart} -> ${queued} new (${noticeParts.join(', ')})`
+        : `${fromPart} -> ${queued} new`
 }
 
 function syncLastEnqueueSummary() {

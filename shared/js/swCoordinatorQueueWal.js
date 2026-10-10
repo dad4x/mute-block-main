@@ -6,7 +6,9 @@ const {
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     isSegmentedWalStorageMeta,
-    recoverProjectedState
+    recoverProjectedState,
+    applyWalRecord,
+    makeWalRecord
 } = require('./swstorage')
 
 function requireCoordinatorQueueWalCapability(groupName = '', capabilities = {}, name = '') {
@@ -342,7 +344,58 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         return {ok: true, append, physicalWal}
     }
 
+    // Incremental verification (2026-10-09, option (b) of the codex take-2 review). Applies the appended
+    // records to the authority's own pre-append queue with the same reducer recovery uses, instead of
+    // recovering the whole WAL after every append. It fails closed the same way: any record the reducer
+    // ignores fails the append. It returns null, and the caller falls back to full recovery, whenever it
+    // cannot establish the base: no base queue, a record outside the queue area (completed-history
+    // archives), or appended seqs that are not the contiguous tail ending at nextSeq - 1.
+    // Full recovery still runs at hydrate and at every checkpoint switch. Those bound how long any drift
+    // between the in-memory base and storage can last.
+    function verifyAppendedIncrementally(append = {}, options = {}) {
+        const baseQueue = options.baseQueue || null
+        if(!baseQueue || typeof baseQueue !== 'object' || Array.isArray(baseQueue)) return null
+        const records = (append.records || []).map(makeWalRecord)
+        if(!records.length) return null
+        if(records.some(record => record.area !== 'queue')) return null
+        const nextSeq = Number.parseInt(append.store?.meta?.nextSeq, 10) || 0
+        const firstSeq = nextSeq - records.length
+        const seqs = records.map(record => record.seq).sort((left, right) => left - right)
+        if(seqs.some((seq, index) => seq !== firstSeq + index)) return null
+        // The base must be the state the append was prepared against. A base that predates a later write
+        // would start one seq early or late, so only an exact match with the pre-append nextSeq is trusted.
+        const baseNextSeq = Number.parseInt(options.baseNextSeq, 10)
+        if(!Number.isFinite(baseNextSeq) || baseNextSeq !== firstSeq) return null
+
+        const ordered = records.slice().sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
+        // The base is copied once. The reducer then writes into that copy, and never into the caller's map.
+        let state = {queue: {...baseQueue}}
+        const appliedIds = new Set()
+        const ownedAreas = new Set(['queue'])
+        const ignored = []
+        for(const record of ordered) {
+            const result = applyWalRecord(state, record, {snapshotSeq: 0, appliedIds, ownedAreas})
+            if(result.applied) state = result.state
+            else ignored.push({record, reason: result.reason})
+        }
+        return {
+            ok: ignored.length === 0,
+            recoveredAfterAppend: null,
+            ignoredAppendedRecords: ignored,
+            authoritativeProjectionQueue: state.queue,
+            authoritativeProjectionCompleted: null,
+            reason: ignored[0]?.reason || '',
+            incremental: true
+        }
+    }
+
     function verifyAppendedCoordinatorQueueWalReplay(append, options = {}) {
+        const incremental = verifyAppendedIncrementally(append, options)
+        if(incremental) {
+            incrementQueueWakeupMetric('queueWal.replayVerify.incremental')
+            return incremental
+        }
+        incrementQueueWakeupMetric('queueWal.replayVerify.full')
         const recoveredAfterAppend = recoverProjectedState(append.store, [], options)
         const appendedRecordIds = new Set((append.records || []).map(record => record.id).filter(Boolean))
         const ignoredAppendedRecords = (recoveredAfterAppend?.projected?.ignored || [])

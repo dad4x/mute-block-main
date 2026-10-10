@@ -56,6 +56,256 @@ function deferred() {
     return {promise, resolve, reject}
 }
 
+test('combined dashboard refresh matches the separate views and reads storage roughly half as much', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Combined-Dashboard-Views'
+    const runId = 'run-combined-dashboard-views'
+    const {sw} = loadServiceWorkerHarness({
+        now: 3000,
+        storage: {
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, now: 3000})
+            }
+        }
+    })
+    const readCalls = () => sw.state().queueWakeupCounters['storagePayload.read.total.calls'] || 0
+
+    const separateBefore = readCalls()
+    const separateQueue = await sw.refreshCoordinatorQueueViewForDashboard('compare')
+    const separateRuns = await sw.refreshCoordinatorRunsViewForDashboard('compare')
+    const separateReads = readCalls() - separateBefore
+
+    const combinedBefore = readCalls()
+    const combined = await sw.refreshCoordinatorDashboardViewsForDashboard('compare')
+    const combinedReads = readCalls() - combinedBefore
+
+    assert.equal(combined.refreshed, true)
+    assert.equal(combined.view.total, separateQueue.view.total)
+    assert.deepEqual(combined.view.counts, separateQueue.view.counts)
+    assert.deepEqual(combined.runs, separateRuns.runs)
+    assert.ok(combinedReads * 2 <= separateReads, `combined refresh should read storage at most half as often as the two separate refreshes (combined=${combinedReads}, separate=${separateReads})`)
+})
+
+test('terminal cleanup coalesces overlapping per-row calls into one trailing pass', async () => {
+    const {sw} = loadServiceWorkerHarness({now: 4000, storage: {}})
+    const first = sw.closeTerminalOwnedProfileTabs()
+    const coalesced = [1, 2, 3, 4].map(() => sw.closeTerminalOwnedProfileTabs())
+    await Promise.all([first, ...coalesced])
+
+    const counters = sw.state().queueWakeupCounters
+    assert.equal(counters['terminalOwnedTabClose.calls'], 5)
+    assert.equal(counters['terminalOwnedTabClose.coalesced'], 4)
+    assert.ok(coalesced.every(promise => promise === coalesced[0]), 'coalesced callers share one trailing pass')
+    assert.notEqual(coalesced[0], first, 'the trailing pass is a new pass, not the running one')
+})
+
+test('keyed queue row reads answer from a sharded checkpoint and match the stored rows', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Keyed-Row-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Keyed-Row-B'
+    const runId = 'run-keyed-row'
+    const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-keyed-a', now: 500000})
+    const rowB = makeQueuedCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-keyed-b', now: 500000})
+
+    // Build the sharded layout with the same store functions the service worker uses,
+    // then start the harness from that storage. This avoids the harness's split copies
+    // after an in-harness checkpoint switch.
+    const zlibCodec = {
+        name: 'gzip',
+        compress: bytes => require('node:zlib').gzipSync(bytes),
+        decompress: bytes => require('node:zlib').gunzipSync(bytes)
+    }
+    const wal = require('../shared/js/walSnapshotStore')
+    const state = {queue: {[hrefA]: rowA, [hrefB]: rowB}, completed: {}, runs: {}, progress: {}, events: []}
+    const written = wal.writeInactiveCheckpoint(wal.makePairedCheckpointStore({}, {snapshotSeq: 0, codec: zlibCodec}), state, {
+        snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec: zlibCodec, codecName: zlibCodec.name, shardCount: 10
+    })
+    const activated = wal.activateCheckpoint(written.store, written.checkpointId, {codec: zlibCodec})
+    assert.equal(activated.activated, true, activated.reason)
+    const walPayload = wal.buildSegmentedWalStoragePayload(activated.store, {
+        baseKey: 'mbCoordinatorQueueWal',
+        writeCheckpoints: true
+    })
+    assert.equal(walPayload['mbCoordinatorQueueWal.checkpoint.' + written.checkpointId].format, 'sharded-v1')
+
+    const {sw} = loadServiceWorkerHarness({
+        now: 500000,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...walPayload,
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+
+    const keyed = await sw.loadCoordinatorQueueRowFromStorage(hrefA, {metricPath: 'test.keyedRow'})
+    assert.equal(keyed.ok, true, keyed.reason)
+    assert.equal(keyed.found, true)
+    assert.equal(keyed.value.attemptId, 'attempt-keyed-a')
+    assert.equal(keyed.value.status, rowA.status)
+
+    const absent = await sw.loadCoordinatorQueueRowFromStorage('https://www.quora.com/profile/Synthetic-Keyed-Row-Nobody', {metricPath: 'test.keyedRow'})
+    assert.equal(absent.ok, true, absent.reason)
+    assert.equal(absent.found, false)
+
+    const batch = await sw.loadCoordinatorQueueRowsFromStorage([hrefA, hrefB], {metricPath: 'test.keyedRows'})
+    assert.equal(batch.ok, true, batch.reason)
+    assert.deepEqual(Object.keys(batch.rows).sort(), [hrefA, hrefB].sort())
+})
+
+test('keyed queue row reads answer from the resident WAL copy while disk meta names the same generation', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Resident-Row-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Resident-Row-B'
+    const runId = 'run-resident-row'
+    const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-resident-a', now: 700000})
+    const rowB = makeQueuedCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-resident-b', now: 700000})
+    const zlibCodec = {
+        name: 'gzip',
+        compress: bytes => require('node:zlib').gzipSync(bytes),
+        decompress: bytes => require('node:zlib').gunzipSync(bytes)
+    }
+    const wal = require('../shared/js/walSnapshotStore')
+    const baseKey = 'mbCoordinatorQueueWal'
+    const state = {queue: {[hrefA]: rowA, [hrefB]: rowB}, completed: {}, runs: {}, progress: {}, events: []}
+    const written = wal.writeInactiveCheckpoint(wal.makePairedCheckpointStore({}, {snapshotSeq: 0, codec: zlibCodec}), state, {
+        snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec: zlibCodec, codecName: zlibCodec.name, shardCount: 10
+    })
+    let activated = wal.activateCheckpoint(written.store, written.checkpointId, {codec: zlibCodec})
+    assert.equal(activated.activated, true, activated.reason)
+    // One tail record, so the active generation has a committed segment and the resident plan is set.
+    activated = {store: wal.appendWalRecordsToGeneration(activated.store, [{
+        seq: 6, kind: 'map.patch', area: 'queue', key: hrefB, patch: {status: 'active', tabId: 882}
+    }], {}).store}
+    const walPayload = wal.buildSegmentedWalStoragePayload(activated.store, {baseKey, writeCheckpoints: true})
+
+    const {sw, storage} = loadServiceWorkerHarness({
+        now: 700000,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...walPayload,
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    // Fresh: the resident copy answers, and it answers what storage holds.
+    const resident = await sw.loadCoordinatorQueueRowsFromStorage([hrefA, hrefB], {metricPath: 'test.resident'})
+    assert.equal(resident.ok, true, resident.reason)
+    assert.equal(resident.source, 'resident')
+    assert.equal(resident.rows[hrefA].attemptId, 'attempt-resident-a')
+    assert.equal(resident.rows[hrefB].tabId, 882)
+    const fromStorage = wal.projectKeyedRowFromStored(walPayload, {baseKey, area: 'queue', key: hrefB, codec: zlibCodec})
+    assert.deepEqual(resident.rows[hrefB], fromStorage.value)
+    assert.equal(sw.state().queueWakeupCounters['queueResident.readHit'], 1)
+
+    // Disk moves on without the resident copy: it must not answer, and the storage path does.
+    storage[`${baseKey}.meta`] = {...storage[`${baseKey}.meta`], nextSeq: storage[`${baseKey}.meta`].nextSeq + 1}
+    const stale = await sw.loadCoordinatorQueueRowsFromStorage([hrefB], {metricPath: 'test.resident'})
+    assert.equal(stale.ok, true, stale.reason)
+    assert.equal(stale.source, undefined)
+    assert.equal(stale.rows[hrefB].tabId, 882)
+    assert.equal(sw.state().queueWakeupCounters['queueResident.readMiss'], 1)
+})
+
+test('with no resident copy (no committed tail), keyed queue row reads fall back to storage and answer correctly', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Null-Resident-A'
+    const runId = 'run-null-resident'
+    const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-null-resident', now: 800000})
+    const zlibCodec = {
+        name: 'gzip',
+        compress: bytes => require('node:zlib').gzipSync(bytes),
+        decompress: bytes => require('node:zlib').gunzipSync(bytes)
+    }
+    const wal = require('../shared/js/walSnapshotStore')
+    const baseKey = 'mbCoordinatorQueueWal'
+    const written = wal.writeInactiveCheckpoint(wal.makePairedCheckpointStore({}, {snapshotSeq: 0, codec: zlibCodec}), {
+        queue: {[hrefA]: rowA}, completed: {}, runs: {}, progress: {}, events: []
+    }, {snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec: zlibCodec, codecName: zlibCodec.name, shardCount: 10})
+    const activated = wal.activateCheckpoint(written.store, written.checkpointId, {codec: zlibCodec})
+    assert.equal(activated.activated, true, activated.reason)
+    // No tail record: the active generation has no committed segment, so the resident cache stays null.
+    const walPayload = wal.buildSegmentedWalStoragePayload(activated.store, {baseKey, writeCheckpoints: true})
+
+    const {sw} = loadServiceWorkerHarness({
+        now: 800000,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...walPayload,
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const read = await sw.loadCoordinatorQueueRowsFromStorage([hrefA], {metricPath: 'test.nullResident'})
+    assert.equal(read.ok, true, read.reason)
+    assert.equal(read.source, undefined)
+    assert.equal(read.rows[hrefA].attemptId, 'attempt-null-resident')
+    const counters = sw.state().queueWakeupCounters
+    assert.equal(counters['queueResident.readHit'] || 0, 0)
+    assert.equal(counters['queueResident.readMiss'] || 0, 0)
+})
+
+test('the queue mirror rebuilds from disk, serves keyed rows while its meta matches, and steps aside when disk moves', async () => {
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Mirror-Row-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Mirror-Row-B'
+    const runId = 'run-mirror-row'
+    const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-mirror-a', now: 600000})
+    const rowB = makeQueuedCoordinatorRow({href: hrefB, runId, attemptId: 'attempt-mirror-b', now: 600000})
+    const zlibCodec = {
+        name: 'gzip',
+        compress: bytes => require('node:zlib').gzipSync(bytes),
+        decompress: bytes => require('node:zlib').gunzipSync(bytes)
+    }
+    const wal = require('../shared/js/walSnapshotStore')
+    const state = {queue: {[hrefA]: rowA, [hrefB]: rowB}, completed: {}, runs: {}, progress: {}, events: []}
+    const written = wal.writeInactiveCheckpoint(wal.makePairedCheckpointStore({}, {snapshotSeq: 0, codec: zlibCodec}), state, {
+        snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec: zlibCodec, codecName: zlibCodec.name, shardCount: 10
+    })
+    let activated = wal.activateCheckpoint(written.store, written.checkpointId, {codec: zlibCodec})
+    assert.equal(activated.activated, true, activated.reason)
+    // One tail record, so the active generation has a committed segment and the resident plan is set.
+    activated = {store: wal.appendWalRecordsToGeneration(activated.store, [{
+        seq: 6, kind: 'map.patch', area: 'queue', key: hrefB, patch: {status: 'active', tabId: 881}
+    }], {}).store}
+    const walPayload = wal.buildSegmentedWalStoragePayload(activated.store, {
+        baseKey: 'mbCoordinatorQueueWal',
+        writeCheckpoints: true
+    })
+
+    const {sw, storage, browser} = loadServiceWorkerHarness({
+        now: 600000,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...walPayload,
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    assert.equal(await sw.rebuildCoordinatorQueueMirrorFromDisk(), true)
+    const session = browser.__sessionStorage
+    assert.ok(session['mbCoordinatorQueueWal.meta'], 'the mirror holds the meta')
+
+    const hit = await sw.readCoordinatorQueueRowsFromMirror([hrefA, hrefB], {metricPath: 'test.mirror'})
+    assert.equal(hit.ok, true, hit.reason)
+    assert.equal(hit.rows[hrefA].attemptId, 'attempt-mirror-a')
+    assert.equal(hit.rows[hrefB].tabId, 881)
+
+    // The disk meta moves on without the mirror: the mirror must step aside.
+    storage['mbCoordinatorQueueWal.meta'] = {
+        ...storage['mbCoordinatorQueueWal.meta'],
+        nextSeq: storage['mbCoordinatorQueueWal.meta'].nextSeq + 1
+    }
+    const stale = await sw.readCoordinatorQueueRowsFromMirror([hrefA], {metricPath: 'test.mirror'})
+    assert.equal(stale.ok, false)
+    assert.equal(stale.reason, 'mirror-stale')
+})
+
 test('dashboard queue view includes all rows while content queue index remains capped', async () => {
     const {sw, storage} = loadServiceWorkerHarness()
     const queue = {}
@@ -562,6 +812,10 @@ function refreshSyntheticRawQueueWalSeed(storage = {}, now = 1000) {
         ? store.wal[activeGenerationId].segments.length
         : 0
     if((Number.parseInt(store?.meta?.nextSeq, 10) || 0) > 1 || activeSegments > 0) return
+    // Once the worker has written its own sharded checkpoint, the storage is the worker's state,
+    // not the raw fixture. Re-seeding it would roll the checkpoint pointer back on the next read.
+    const diskMeta = storage?.['mbCoordinatorQueueWal.meta']
+    if(Number.parseInt(diskMeta?.checkpoints?.[diskMeta?.activeCheckpoint]?.shardCount, 10) > 0) return
 
     Object.assign(storage, makeSegmentedQueueWalStorage(storage.mbCoordinatorQueue || {}, 0, {
         createdAt: now
@@ -4177,7 +4431,7 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
 
     // 2026-10-01: mbCoordinatorQueueView is no longer persisted at all (see
     // refreshCoordinatorQueueViewForDashboard's own comment in sw.js), so
-    // the 2026-09-15 auto-recovery-from-view path (attemptCoordinatorQueueWalAutoRecoveryFromView)
+    // the 2026-09-15 auto-recovery-from-view path (since retired -- see LEGACY_QUEUE_VIEW_RETIREMENT.md)
     // never has a view to recover from any more -- it's left in place but is
     // now always a no-op (view-empty), falling through to the same "refuse
     // silently guessing and surface the failure" behavior this test
@@ -4328,7 +4582,7 @@ test('segmented queue WAL hydrate failure still throws when no queue view is ava
     )
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 1)
     assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 0)
-    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveryFromViewFailed'] || 0, 1)
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedRecoveryRetired'] || 0, 1)
 })
 
 test('segmented queue WAL missing checkpoint residue hydrates as empty authority', async () => {
@@ -4444,9 +4698,9 @@ test('segmented queue WAL missing checkpoint with segment residue hydrates as em
 // silently wiped 900 real rows seconds after they were recovered. The fix
 // reorders view-based auto-recovery to run before this reset branch for
 // every failure reason, not just the ones that reach the final throw.
-test('segmented queue WAL missing checkpoint recovers from queue view instead of resetting to empty', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Missing-Checkpoint-View-Recovery'
-    const runId = 'run-segmented-missing-checkpoint-view-recovery'
+test('segmented queue WAL missing checkpoint ignores a legacy queue view and resets to empty', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Segmented-Missing-Checkpoint-No-View-Recovery'
+    const runId = 'run-segmented-missing-checkpoint-no-view-recovery'
     const queue = {
         [href]: {
             runId,
@@ -4463,7 +4717,7 @@ test('segmented queue WAL missing checkpoint recovers from queue view instead of
             queuedAt: 150340,
             terminalAt: 150341,
             updatedAt: 150341,
-            attemptId: 'attempt-segmented-missing-checkpoint-view-recovery',
+            attemptId: 'attempt-segmented-missing-checkpoint-no-view-recovery',
             attemptNumber: 1,
             milestones: {}
         }
@@ -4482,6 +4736,7 @@ test('segmented queue WAL missing checkpoint recovers from queue view instead of
                 [runId]: makeCoordinatorRun({href, runId})
             },
             mbCoordinatorEvents: [],
+            // A pre-WAL copy of the queue. Retired recovery must never read it back into authority.
             mbCoordinatorQueueView: {
                 version: 1,
                 updatedAt: 150341,
@@ -4495,7 +4750,7 @@ test('segmented queue WAL missing checkpoint recovers from queue view instead of
                     targetProfileHref: href,
                     requestedUrl: href,
                     dedupeKey: href,
-                    attemptId: 'attempt-segmented-missing-checkpoint-view-recovery',
+                    attemptId: 'attempt-segmented-missing-checkpoint-no-view-recovery',
                     attemptNumber: 1,
                     terminalAt: 150341,
                     updatedAt: 150341
@@ -4508,22 +4763,10 @@ test('segmented queue WAL missing checkpoint recovers from queue view instead of
     delete storage[`mbCoordinatorQueueWal.checkpoint.${activeCheckpoint}`]
 
     const hydrated = await sw.coordinatorAuthority.hydrate()
-    assert.equal(hydrated.queue[href]?.status, 'succeeded')
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 1)
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 0)
-    // 2026-09-26: the durable half of this recovery used to be fire-and-
-    // forget, so a restart landing before it completed could silently drop
-    // the repair -- storage would still be missing the checkpoint on the
-    // very next hydrate, forever, if restarts kept outrunning the write.
-    // Now that hydrate() awaits it, the repaired checkpoint must already be
-    // durably written by the time this call resolves, not merely
-    // in-memory.
-    const repairedActiveCheckpoint = storage['mbCoordinatorQueueWal.meta']?.activeCheckpoint
-    assert.ok(repairedActiveCheckpoint, 'a repaired checkpoint id was durably written')
-    assert.ok(
-        storage[`mbCoordinatorQueueWal.checkpoint.${repairedActiveCheckpoint}`],
-        'the checkpoint this repair activated is durably present in storage, not just cached in memory'
-    )
+    assert.equal(hydrated.queue[href], undefined)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedAutoRecoveredFromView'] || 0, 0)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedRecoveryRetired'] || 0, 1)
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.segmentedMissingCheckpointReset'] || 0, 1)
 })
 
 test('segmented queue WAL soft threshold records lifecycle metrics and switches the checkpoint immediately', async () => {
@@ -15769,40 +16012,25 @@ test('coordinator authority reentrant apply rejects outside storage update', asy
     assert.equal(sw.state().queueWakeupCounters.storageSetCalls, undefined)
 })
 
-test('storage get records compact-view read payload by call path', async () => {
-    const {sw, storage} = loadServiceWorkerHarness({
+test('startup removes the retired queue-view key from storage', async () => {
+    // mbCoordinatorQueueView is retired (see LEGACY_QUEUE_VIEW_RETIREMENT.md). Installs that still hold the
+    // stale copy lose it at startup, and the cleanup must not disturb other keys.
+    const {storage} = loadServiceWorkerHarness({
         now: 1000,
         storage: {
+            mbCoordinatorPaused: true,
             mbCoordinatorQueueView: {
                 version: 1,
                 updatedAt: 1000,
-                total: 120,
-                counts: {queued: 2, succeeded: 118},
-                itemLimit: 1,
-                truncated: false,
+                total: 1,
                 items: [{storageKey: 'profile', status: 'queued', targetProfileHref: 'https://www.quora.com/profile/Profile'}]
             },
-            mbCoordinatorQueue: Object.fromEntries(Array.from({length: 120}, (_, index) => [
-                `profile-${index}`,
-                {status: index < 2 ? 'queued' : 'succeeded'}
-            ]))
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
-
-    const stored = await sw.metricStorageGet({
-        mbCoordinatorQueueView: {},
-        mbQueueWakeupMetrics: {}
-    }, {metricPath: 'dashboard.initial'})
-
-    assert.equal(stored.mbCoordinatorQueue, undefined)
-    assert.equal(stored.mbCoordinatorQueueView.total, 120)
-    const counters = sw.state().queueWakeupCounters
-    assert.ok(counters['storagePayload.read.queueView.bytes'] > 0)
-    assert.equal(counters['storagePayload.read.queue.bytes'], undefined)
-    assert.ok(counters['storagePayload.read.path.dashboard.initial.bytes'] > 0)
-    assert.equal(counters['storagePayload.read.path.dashboard.initial.calls'], 1)
-    assert.equal(counters['storagePayload.read.path.dashboard.initial.maxLatencyMs'] >= 0, true)
-    assert.equal(storage.mbCoordinatorQueueView?.total, 120)
+    await flushAsync(25)
+    assert.equal(Object.prototype.hasOwnProperty.call(storage, 'mbCoordinatorQueueView'), false)
+    assert.equal(storage.mbCoordinatorPaused, true)
 })
 
 test("flight recorder retains capacity and dropped count", async () => {
@@ -24738,12 +24966,23 @@ test('queue WAL checkpoint switch writes a gzip-compressed checkpoint', async ()
     assert.equal(checkpointSwitch.durable, true)
 
     const walMeta = storage['mbCoordinatorQueueWal.meta']
+    // The slot is a sharded-v1 manifest. Each shard is its own gzip-plus-base64
+    // record, so the payload checks run per shard, and the size check on totals.
     const checkpoint = storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}`]
-    assert.equal(checkpoint.codec, 'gzip')
-    assert.equal(checkpoint.encoding, 'base64')
-    assert.equal(typeof checkpoint.state, 'undefined')
-    assert.ok(typeof checkpoint.payload === 'string' && checkpoint.payload.length > 0)
-    assert.ok(checkpoint.compressedBytes < checkpoint.uncompressedBytes)
+    assert.equal(checkpoint.format, 'sharded-v1')
+    assert.equal(checkpoint.shardCount, 10)
+    assert.equal(checkpoint.shards.length, 10)
+    const shardRecords = checkpoint.shards.map((shard, index) =>
+        storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}.s${String(index).padStart(2, '0')}`])
+    for (const record of shardRecords) {
+        assert.equal(record.codec, 'gzip')
+        assert.equal(record.encoding, 'base64')
+        assert.equal(typeof record.state, 'undefined')
+        assert.ok(typeof record.payload === 'string' && record.payload.length > 0)
+    }
+    const compressedTotal = shardRecords.reduce((total, record) => total + record.compressedBytes, 0)
+    const uncompressedTotal = shardRecords.reduce((total, record) => total + record.uncompressedBytes, 0)
+    assert.ok(compressedTotal < uncompressedTotal)
 
     // Round-trip correctness: a fresh hydrate must still recover both rows
     // from the now-compressed checkpoint.

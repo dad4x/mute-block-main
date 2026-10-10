@@ -115,6 +115,7 @@ function registerServiceWorkerListeners(deps = {}) {
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
         refreshCoordinatorRunsViewForDashboard,
+        refreshCoordinatorDashboardViewsForDashboard,
         refreshQueueWakeupMetricsViewForDashboard,
         releaseCoordinatorActionLease,
         releaseQueuedTab,
@@ -642,6 +643,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'refresh-coordinator-runs-view') {
             return refreshCoordinatorRunsViewForDashboard(request.reason || 'dashboard-refresh')
+        }
+        else if(request.action === 'refresh-coordinator-dashboard-views') {
+            return refreshCoordinatorDashboardViewsForDashboard(request.reason || 'dashboard-refresh')
         }
         else if(request.action === 'get-coordinator-queue-accounting') {
             return getCoordinatorQueueAccounting(request)
