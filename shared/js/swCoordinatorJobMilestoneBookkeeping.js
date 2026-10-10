@@ -33,7 +33,7 @@
 //   here on the same "try it, verify with the full suite" basis, and
 //   confirmed green.
 // - scheduleTerminalProgressContinuation is not `async` but its body
-//   contains `void closeTerminalOwnedProfileTabs().catch(() => null)` and
+//   contains `void closeTerminalOwnedProfileTabs(hrefs).catch(() => null)` and
 //   `void runCoordinatorQueueExecutorFastPath(reason, {...}).catch(error => {...})`
 //   -- both `.catch()`-chained, both reaching into resident sw.js `async`
 //   functions, both `void`-discarded by this function itself so nothing
@@ -162,6 +162,9 @@ function createCoordinatorJobMilestoneBookkeeping(deps = {}) {
     const terminalProgressSettlementPromises = new Map()
     let terminalProgressContinuationFastExecutorPromise = null
     let terminalProgressContinuationPendingReason = null
+    // Hrefs from completions that arrived while a fast-executor pass was in
+    // flight, so the trailing pass still cleans each of them.
+    const terminalProgressContinuationPendingHrefs = new Set()
 
     function scheduleTerminalProgressSettlement(profileHrefs = []) {
         const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
@@ -223,17 +226,21 @@ function createCoordinatorJobMilestoneBookkeeping(deps = {}) {
         return true
     }
 
-    function scheduleTerminalProgressContinuation(reason = 'terminal-progress-continuation') {
+    function scheduleTerminalProgressContinuation(reason = 'terminal-progress-continuation', profileHrefs = []) {
+        const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
         scheduleQueuedWorkContinuation(reason, {
             forceDurableQueueReload: false
         })
         scheduleCoordinatorQueueResume(1000, reason, {
             allowBeforeQuora: true
         })
-        void closeTerminalOwnedProfileTabs().catch(() => null)
+        // Cleans only this completion's hrefs. An empty list is skipped, not
+        // promoted to the unscoped pass (the reconcile tick's orphan sweep covers it).
+        if(hrefs.length) void closeTerminalOwnedProfileTabs(hrefs, {completedJob: true}).catch(() => null)
 
         if(terminalProgressContinuationFastExecutorPromise) {
             terminalProgressContinuationPendingReason = reason
+            for(const href of hrefs) terminalProgressContinuationPendingHrefs.add(href)
             incrementQueueWakeupMetric('terminalProgress.continuationFastExecutorCoalescedInFlight')
             return
         }
@@ -255,8 +262,10 @@ function createCoordinatorJobMilestoneBookkeeping(deps = {}) {
                 terminalProgressContinuationFastExecutorPromise = null
                 if(terminalProgressContinuationPendingReason) {
                     const nextReason = terminalProgressContinuationPendingReason
+                    const nextHrefs = Array.from(terminalProgressContinuationPendingHrefs)
                     terminalProgressContinuationPendingReason = null
-                    scheduleTerminalProgressContinuation(nextReason)
+                    terminalProgressContinuationPendingHrefs.clear()
+                    scheduleTerminalProgressContinuation(nextReason, nextHrefs)
                 }
             })
     }

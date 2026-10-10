@@ -403,29 +403,6 @@ function createCoordinatorQueueView(deps = {}) {
         }
     }
 
-    // Inverse of summarizeCoordinatorQueueViewItem: rebuilds a queue map from
-    // a persisted mbCoordinatorQueueView, keyed the same way the live queue
-    // is (storageKey, falling back to dedupeKey/targetProfileHref for older
-    // view shapes). Used only for WAL "missing-segment" recovery -- the view
-    // item isn't a byte-identical copy of the original row (it's the curated
-    // subset summarizeCoordinatorQueueViewItem projects), but it carries
-    // every field the coordinator's own row-processing reads (status,
-    // attempt/retry info, tabId, source, runId, etc.), which is what made
-    // the 2026-09-14 manual recovery (tools/cdp/recover-queue-wal-from-view.js)
-    // work cleanly against a live corrupted store.
-    function buildCoordinatorQueueFromView(view = null) {
-        const items = Array.isArray(view?.items)
-            ? view.items
-            : Object.values(view?.items || {})
-        const queue = {}
-        for(const item of items) {
-            const key = `${item?.storageKey || item?.dedupeKey || item?.targetProfileHref || ''}`.trim()
-            if(!key || !item) continue
-            queue[key] = item
-        }
-        return queue
-    }
-
     function filterCoordinatorQueueForCompactView(queue = {}, runs = {}, statsClearedAt = 0) {
         const knownRunIds = new Set(
             Object.keys(runs && typeof runs === 'object' ? runs : {})
@@ -670,7 +647,6 @@ function createCoordinatorQueueView(deps = {}) {
         getCoordinatorActivationHandoffActiveTime,
         summarizeCoordinatorActivationHandoffTiming,
         summarizeCoordinatorQueueViewItem,
-        buildCoordinatorQueueFromView,
         filterCoordinatorQueueForCompactView,
         buildCoordinatorQueueView,
         makeCoordinatorQueueAccountingCounts,

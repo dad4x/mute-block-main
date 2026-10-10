@@ -21,6 +21,7 @@ const lanes = [
       ['node', 'test/rawReportPages.test.js'],
       ['node', 'test/sharedModeration.test.js'],
       ['node', 'test/contentActionSelectors.test.js'],
+      ['node', 'test/contentUnmuteVerification.test.js'],
       ['node', 'test/contentSpaceScopedState.test.js'],
       ['node', 'test/contentSourcePostResolution.test.js'],
       ['node', 'test/contentEnqueueChunkRetry.test.js'],
@@ -35,6 +36,9 @@ const lanes = [
     commandTimeoutMs: 60000,
     commands: [
       ['node', 'test/walSnapshotStore.test.js'],
+      ['node', 'test/walCheckpointShards.test.js'],
+      ['node', 'test/walKeyedRead.test.js'],
+      ['node', 'test/walIncrementalVerify.test.js'],
       ['node', 'test/walSnapshotStoreFuzz.test.js']
     ]
   },
@@ -42,7 +46,8 @@ const lanes = [
     name: 'contract',
     commandTimeoutMs: 30000,
     commands: [
-      ['node', 'test/p1-contract.test.js']
+      ['node', 'test/p1-contract.test.js'],
+      ['node', 'test/terminalOwnedTabScope.test.js']
     ]
   },
   {

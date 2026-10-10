@@ -415,7 +415,7 @@ function createProfileNukeProgress(deps = {}) {
             // whatever queue shape happened to be writing at that moment --
             // not the ratcheted/statsClearedAt-filtered view the rest of the
             // app expects -- which the WAL's auto-recovery-from-view path
-            // (attemptCoordinatorQueueWalAutoRecoveryFromView) then read back
+            // (since retired -- see LEGACY_QUEUE_VIEW_RETIREMENT.md) then read back
             // in as "the truth" on the next hydrate failure, reintroducing
             // old/mismatched row states on top of a live WAL that had since
             // moved on. Confirmed live: reappearing rows and up to 3
