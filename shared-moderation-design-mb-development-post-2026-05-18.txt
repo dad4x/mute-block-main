@@ -1,0 +1,178 @@
+Status: discussion draft.
+
+Canonical planning now starts at planning.md. Canonical architecture starts at
+architecture.md. This is a human-readable design-post draft, not an active
+implementation plan.
+
+Draft Design: Shared Mute-Block Publication and Import
+
+I am working through the shared moderation design for Mute-Block and would like comments before we harden the implementation.
+
+The goal is to let Mute-Block users benefit from each other's moderation work without turning any one user's Space into an automatic command authority. A shared post should be evidence and recommendation. The local extension should still decide what to do, based on the user's own settings.
+
+Core idea
+
+Mute-Block would be able to publish human-readable shared moderation posts to a user-chosen Space. Other Mute-Block users could subscribe to those Spaces and import the posts as moderation signals.
+
+For the first version, Quora Spaces are the transport because that is what exists now. The schema should still be transport-neutral enough that it can later project to ATproto labels, modlists, or another backend.
+
+The shared stream is append-only. Each post is atomic. We should not need updates, edits, or a global index of every event. Duplicate facts are tolerable and should be handled by import logic.
+
+What gets exported
+
+The export journal should record changes the local browser profile actually made to Quora state:
+
+- profile block added
+- profile block removed
+- profile mute added
+- profile mute removed
+- Space classification changed
+
+It should not publish, by default:
+
+- profiles merely found already blocked or muted
+- failed attempts
+- candidates merely discovered
+- local queue state
+- transient retry or lease state
+
+Already-blocked observations are useful local execution information, but they are not changes this browser profile made. Unblock and unmute events are different: those represent a conscious pardon by the user, so they belong in the history.
+
+Post shape
+
+Shared moderation posts should remain intelligible to humans. They should not look like opaque storage blobs.
+
+A journal post might read roughly like:
+
+Mute-Block shared moderation journal for 2026-05-18.
+
+This post lists Mute-Block profile and Space-classification changes I made today so other Mute-Block users may review or import them.
+
+Then the post can include a machine-readable appendix between markers, using the extension's event-journal format. The parser should tolerate Quora formatting changes such as extra blank lines. For Quora profile subjects, the payload should use canonical identifiers such as quora-profile:Some-User rather than raw profile URLs, because Quora may linkify or rewrite visible URLs.
+
+Scheduling
+
+Daily export seems sufficient for the first version.
+
+Automatic export should:
+
+- collect local unexported mutation events
+- publish at most one daily post
+- suppress automatic posts below a user preference threshold, initially something like 10 events
+- allow a manual Publish Now action to override the threshold
+- mark events as exported only after the extension can see the posted entry and verify the expected document and event ids
+
+On failure, the events should stay pending until the next daily attempt or a manual Publish Now. We should avoid retry loops.
+
+Automatic import should also be low-cadence at first: scan subscribed/shared Spaces daily, parse Mute-Block journal blocks, validate the schema, classify the source relationship, and hand the results to local policy.
+
+Space classification UI
+
+The current Asset / Neutral / Target buttons need to become more expressive, but I do not want a busy control surface.
+
+The current proposal is one visible dropdown at a time.
+
+When a Space is neutral or unset:
+
+Mute-Block Category:
+
+- Asset
+- Neutral
+- Target
+
+When a Space is an asset:
+
+Mute-Block Asset:
+
+- Manual
+- Reviewed
+- Dead Hand
+- Neutral
+
+When a Space is a target:
+
+Mute-Block Target:
+
+- Manual
+- Reviewed
+- Dead Hand
+- Neutral
+
+Neutral remains available from the Asset or Target dropdown so there is a way back, but it is not sitting as one peer button in a three-button row. That should reduce accidental category churn.
+
+The mode names are intended to represent an aggression gradient:
+
+Manual: detect useful content or targets, but require the user to start action.
+
+Reviewed: collect recommendations or candidates into a review flow before action.
+
+Dead Hand: allow trusted local or imported signals to create queue work automatically under caps.
+
+"Dead Hand" is intentionally stark. It is a reference to doomsday nuclear alert planning, and for now it communicates the right level of proactive behavior.
+
+Same account versus other users
+
+There are two different import cases.
+
+First, another browser profile using the same Quora account. These browsers already share the actual Quora mute/block state through Quora. They should not replay the user's own action journal into new profile actions. For the same account, the useful shared data is global configuration: Space categories, export settings, subscribed source Spaces, and similar browser-agnostic preferences.
+
+Second, other users subscribing to a shared Space. For them, the publisher's journal is a moderation signal. It may suggest profiles to block or mute, or Spaces to classify, but it should not automatically override their local policy.
+
+Roaming profile
+
+Each local browser profile should have a Use Roaming Profile option.
+
+When enabled, a browser profile reads same-account global configuration from a public Mute-Block roaming profile document rather than relying only on its own extension local storage.
+
+The roaming profile should be treated as public. It should not contain browser-specific or machine-specific information:
+
+- no local storage profile id
+- no browser name
+- no machine name
+- no device label
+- no queue state
+- no execution history
+
+It can contain browser-agnostic settings that make sense as shared same-account configuration:
+
+- Space categories and modes
+- shared export Space URL
+- daily export enabled or disabled
+- minimum automatic export batch threshold
+- subscribed/shared source Space list
+- non-browser-specific policy defaults
+
+To avoid scrolling through old posts to find the current profile, the shared Space can have a pinned pointer post saying:
+
+Current Mute-Block roaming profile: <url>
+
+Action journal posts stay append-only. The pinned pointer is the small mutable pointer to the current profile document.
+
+Recommendations and review
+
+Imported Space classification changes from other users should not directly change the local Space registry. They should become recommendations.
+
+The Dashboard or Preferences page should have a Space Recommendations view. Each recommendation should show the Space, current local classification, recommended classification and mode, source publisher, source post, source count, first seen, last seen, and actions such as Apply, Dismiss, and Open Space.
+
+When visiting a Space that has pending recommendations, the content-page dropdown should show a compact indicator. Activating it should open a new extension tab focused on the recommendations for that Space. The full review UI should not be squeezed into the Quora page.
+
+Privacy and ATproto
+
+For the Quora Space publication MVP, I am inclined to treat this as transparent. If we publish moderation journals in a public or semi-public Quora Space, we should not pretend it is private.
+
+That means Quora shared posts may reveal exactly what the publisher blocked, muted, pardoned, or classified, and when. That is revealing, but it is also consistent with the existing shared reporting Space model.
+
+ATproto may need a different privacy model later. Reports to labelers might be identified, pseudonymous, anonymous, or redacted depending on the service and policy. Importing ATproto-originated labels or lists may also need different filtering. So the Quora transparency decision should not be hardwired into the future ATproto path.
+
+Open questions
+
+I would especially like comments on these:
+
+- Does the single-dropdown Space classification model make sense?
+- Are Manual / Reviewed / Dead Hand the right behavior levels?
+- Is daily export with a minimum batch threshold a reasonable default?
+- Should Space classification recommendations from subscribed users always require manual approval?
+- Is transparent Quora publication acceptable for this MVP?
+- Does any part of this look socially bad, operationally risky, or likely to create Quora ToS trouble?
+
+The implementation bias should be conservative: publish less, import into review first, make automatic behavior explicit, and keep local policy in charge.

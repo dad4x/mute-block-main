@@ -1,0 +1,28 @@
+{
+  "schema": "com.muteblock.roamingProfile",
+  "schema_version": 1,
+  "document_id": "mbrp:fixture:2026-05-20:001",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "settings": {
+    "shared_export_space_url": "https://muteblockdevelopment.quora.com/",
+    "daily_export_enabled": true,
+    "minimum_auto_export_events": 10,
+    "subscribed_spaces": [
+      "https://muteblockdevelopment.quora.com/"
+    ],
+    "space_classifications": {
+      "https://target-space.quora.com/": {
+        "category": "target",
+        "mode": "reviewed"
+      },
+      "https://asset-space.quora.com/": {
+        "category": "asset",
+        "mode": "manual"
+      }
+    }
+  }
+}

@@ -1,0 +1,111 @@
+
+Status: active architecture sketch.
+
+Canonical planning now starts at planning.md. Canonical architecture starts at
+architecture.md. This note captures the current "repair is normal processing"
+direction and should be folded back into architecture.md when the implementation
+settles.
+
+
+› suppose we pursue the 'repair is really processing' approach.  what does that mean, and what do we do?
+
+
+• Pursuing “repair is really processing” means we stop treating repair as an exceptional cleanup path and
+  make it the normal scheduler/reconciler.
+
+  The core model becomes:
+
+  durable queue state + live browser observations -> reconcile tick -> durable state changes + minimal side
+  effects
+
+  So “operate” stops being the authority. It becomes a fast event source: user clicked, tab loaded, content
+  script reported progress, timer fired, storage write completed. Those events request reconciliation. The
+  reconciler decides what should happen next.
+
+  What we do:
+
+  1. Make one scheduler/reconciler entry point.
+     pump, resume, repair, tab events, alarms, and dashboard actions should all converge on one tick
+     function. They can carry different reasons, but they should not each have their own partial state
+     machine.
+  2. Define the fixed-point cases explicitly.
+     Each tick walks durable queue rows and live tabs:
+      - queued + no runtime: claim durably, then open/nudge as provisional side effect.
+      - active + matching confirmed runtime: continue/observe/nudge.
+      - active + no matching runtime: adopt a matching tab by token, or release/requeue/fail the row.
+      - runtime + no matching durable active row: detach/close as orphan/provisional fallout.
+      - terminal + runtime: close/detach.
+      - challenge/no progress timeout: mark retry/fail according to policy.
+  3. Make tokens mandatory.
+     Adoption and confirmation should require row id plus attempt/claim token plus tab id where applicable.
+     Row id alone is too weak under delayed writes.
+  4. Treat side effects as provisional until confirmed.
+     Opening a tab, sending a message, or scheduling an alarm should not by itself create scheduler
+     authority. Authority comes from durable state matching the attempt.
+  5. Stop direct work paths from bypassing reconciliation.
+     Most foreground/user actions should enqueue or emit an event, then request a tick. The only exceptions
+     are truly local foreground buttons where the user is looking at the page and the action is
+     intentionally immediate.
+  6. Make repair idempotent and cheap.
+     A tick should be safe to run often. If nothing changed, it exits. If storage is slow, it should leave
+     enough durable breadcrumbs that the next tick can continue instead of needing special recovery logic.
+  7. Rename the concepts once the model is true.
+     “repair” should probably become reconcileQueue or schedulerTick. Keep “repair” only for a subcase:
+     cleaning inconsistent observations.
+
+  The practical next patch direction is not “add more repair calls.” It is to pull the active/queued/
+  runtime-tab decisions into one reconciler and make every wakeup path call that. Then tests can assert
+  invariants after every tick:
+
+  - no durable active row without confirmed runtime unless it is immediately reclaimed/requeued
+  - no runtime-owned tab without durable active claim
+  - timed-out storage confirmation cannot leave scheduler-blocking runtime state
+  - repeated ticks converge or make bounded progress
+  - stale late writes cannot adopt a newer attempt
+
+  That makes the service worker model explicit: wakeups are unreliable, storage is slow, tabs are
+  observations, and convergence is the product. The fast path can still be fast, but only as an
+  optimization of the reconciler, not a separate authority.
+
+Additional guardrails:
+
+1. Make each reconcile tick two-phase.
+   First collect a bounded observation snapshot: durable rows, owned tabs, visible matching tabs, content
+   script claims, challenge state, and recent progress. Then decide the target transitions. Only after that
+   should it perform durable writes and side effects. Do not open/adopt/own a tab in the same conceptual
+   step that is still trying to prove the durable claim.
+
+2. Keep runtime and durable authority symmetric.
+   The earlier failure was runtime ownership without a durable active row. The paired failure is now just
+   as important: a durable active row without a confirmed runtime actor. The reconciler should treat both
+   as ordinary cases:
+    - provisional/runtime-only actor: confirm by token or detach/close.
+    - durable-active-only row: adopt by token or release/requeue/fail.
+
+3. Separate confirmed actors from candidates.
+   A live tab is only a candidate until it matches row id, attempt/claim token, and expected role. A candidate
+   tab can be closed, detached, or probed, but it must not block the scheduler as active work.
+
+4. Make the normal tick bounded.
+   If repair becomes processing, it cannot do unbounded full-queue recompute work every wake. A tick should
+   have a row/action budget, avoid full derived-state rebuilds unless dirty state requires it, and reschedule
+   itself when more work remains.
+
+5. Treat slow storage as expected input.
+   A timed-out storage operation should not create a special limbo state. It should leave enough durable or
+   runtime breadcrumbs for the next tick to classify the case using the same matrix above. Late completions
+   must be token-checked before they can confirm anything.
+
+6. Make convergence observable.
+   Metrics should show, per epoch:
+    - durableActiveWithoutActor count and age.
+    - provisionalActorWithoutDurable count and age.
+    - reconcile ticks requested, changed, no-op, and rescheduled.
+    - rows reclaimed/requeued/failed by reconcile.
+    - max tick wall time and max durable write time.
+    - bounded-progress evidence: queued/active/terminal movement per N ticks.
+
+7. Test the matrix directly.
+   Synthetic tests should seed durable rows and fake tab observations, then run repeated ticks until fixed
+   point. They should assert convergence for delayed storage confirmation, stale late writes, service-worker
+   restart between claim/open/confirm, challenge tabs, orphan tabs, and durable active rows whose tab vanished.

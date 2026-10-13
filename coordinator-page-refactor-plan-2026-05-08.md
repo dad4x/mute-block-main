@@ -1,5 +1,12 @@
 # Coordinator Page Refactor Plan 2026-05-08
 
+Status: mostly absorbed historical plan.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). This note is still
+useful for why coordination moved out of source pages, but active scheduler and
+dashboard authority decisions live in the canonical notes.
+
 This plan captures the current redesign direction for `mute-block-main` space-feed `Nuke 'Em` work. It is meant to survive disruption and give the next session a concrete restart point.
 
 ## Goal
@@ -368,7 +375,7 @@ Keep existing keys during migration:
 
 ### Events
 
-Events should be append-style and optionally compacted later:
+Events should be append-style and optionally folded into a checkpoint later:
 
 ```json
 {

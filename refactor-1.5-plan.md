@@ -1,5 +1,12 @@
 # Refactor 1.5 Plan
 
+Status: closed historical plan.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). The `1.5` lane is
+closed for new feature work; use this note only for history and rationale that
+may still inform the `1.6`/`2.0` reset.
+
 This branch starts the `1.5` series. The goal is an internal architecture reset for the accreted `1.4` nuke, progress, and space-classification code while preserving the user-facing workflows that currently work.
 
 ## Branch Policy

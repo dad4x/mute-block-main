@@ -1,0 +1,953 @@
+html,
+body {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    font: 14px/1.4 system-ui, sans-serif;
+    background: #f4f5f7;
+    color: #1f2937;
+    min-height: 100vh;
+}
+
+/* .coordinator/.worker-bar both set their own `display`, at the same
+   specificity as the browser's built-in [hidden] rule -- author styles win
+   that tie regardless of source order, so setting element.hidden = true on
+   dashboardView/workerBarView/historyView (applyCoordinatorViewMode) was
+   silently doing nothing and all three views rendered stacked together on
+   every page load. Confirmed live 2026-09-29. */
+[hidden] {
+    display: none !important;
+}
+
+.coordinator {
+    align-content: start;
+    box-sizing: border-box;
+    display: grid;
+    gap: 16px;
+    grid-template-rows: auto auto;
+    margin: 0 auto;
+    max-width: 1120px;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+/* The history page is a short list, not a full control panel -- it
+   shouldn't force itself to fill the viewport height like the real
+   dashboard does. */
+#historyView {
+    min-height: 0;
+}
+
+/* Room for the fixed dashboard-bottom-bar below so the last panel doesn't
+   sit underneath it. */
+#dashboardView {
+    padding-bottom: 76px;
+}
+
+.coordinator-header {
+    align-items: center;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    display: flex;
+    justify-content: space-between;
+    padding: 16px 18px;
+}
+
+.brand {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    min-width: 0;
+}
+
+.brand-mark {
+    display: block;
+    height: 40px;
+    object-fit: contain;
+    width: 40px;
+}
+
+.header-status {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+h1,
+h2 {
+    line-height: 1.2;
+    margin: 0;
+}
+
+h1 {
+    font-size: 24px;
+}
+
+h2 {
+    font-size: 16px;
+}
+
+.version {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+.status-pill {
+    background: #eef2ff;
+    border-radius: 3px;
+    color: #3730a3;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 6px 10px;
+}
+
+.dev-mode-toggle {
+    align-items: center;
+    cursor: pointer;
+    display: flex;
+    gap: 8px;
+    color: #374151;
+    font-size: 12px;
+    user-select: none;
+}
+
+.dev-mode-toggle input {
+    height: 0;
+    opacity: 0;
+    position: absolute;
+    width: 0;
+}
+
+.dev-mode-toggle-track {
+    background: #d1d5db;
+    border-radius: 999px;
+    display: inline-block;
+    flex-shrink: 0;
+    height: 18px;
+    position: relative;
+    transition: background 0.15s ease;
+    width: 32px;
+}
+
+.dev-mode-toggle-thumb {
+    background: #fff;
+    border-radius: 50%;
+    height: 14px;
+    left: 2px;
+    position: absolute;
+    top: 2px;
+    transition: transform 0.15s ease;
+    width: 14px;
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track {
+    background: #4f46e5;
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track .dev-mode-toggle-thumb {
+    transform: translateX(14px);
+}
+
+.dev-mode-toggle input:focus-visible ~ .dev-mode-toggle-track {
+    outline: 2px solid #4f46e5;
+    outline-offset: 2px;
+}
+
+.summary-grid {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.summary-tile,
+.panel {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+}
+
+.summary-tile {
+    padding: 10px 12px;
+}
+
+.summary-label {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.summary-value {
+    font-size: 22px;
+    font-weight: 800;
+    line-height: 1.1;
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.summary-detail {
+    color: #6b7280;
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* .panel's own `display: flex` (an author rule) otherwise beats the
+   user-agent stylesheet's `[hidden] { display: none }` regardless of
+   specificity, since author styles always win over UA styles in the
+   cascade -- this reasserts it as an author rule so hiding a dev-mode
+   panel (or a collapsed one) actually hides it. */
+.panel[hidden] {
+    display: none;
+}
+
+.panel-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.panel-stack .panel {
+    flex: 0 0 auto;
+}
+
+.panel-stack > .summary-grid {
+    flex: 0 0 auto;
+}
+
+.panel-stack .panel[data-panel-scroll-target="queueList"] {
+    max-height: 42vh;
+}
+
+.panel-stack .panel[data-panel-scroll-target="metricsJournal"] {
+    max-height: none;
+}
+
+.panel-stack .panel[data-panel-scroll-target="runList"],
+.panel-stack .panel[data-panel-scroll-target="eventList"],
+.panel-stack .panel[data-panel-scroll-target="eventHistogram"] {
+    max-height: 28vh;
+}
+
+.panel-stack .panel[data-panel-scroll-target="eventHistogram"] .histogram-container {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.panel-stack .panel.panel--collapsed {
+    flex: 0 0 auto;
+}
+
+.panel-head {
+    align-items: center;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+    padding: 12px 14px;
+}
+
+.panel-title {
+    align-items: center;
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+}
+
+.panel-toggle {
+    align-items: center;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    color: #374151;
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 800;
+    height: 26px;
+    justify-content: center;
+    line-height: 1;
+    padding: 0;
+    width: 26px;
+}
+
+.panel-toggle:hover {
+    background: #f9fafb;
+}
+
+.panel-head span,
+.panel-actions span {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.panel-actions {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+    min-width: 0;
+}
+
+.panel-actions--queue {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.panel-actions-row {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.panel-action-buttons {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.panel-action-state {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+    text-align: right;
+}
+
+.clear-button {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    color: #374151;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.clear-button:hover:not(:disabled) {
+    background: #f9fafb;
+}
+
+.clear-button--danger {
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.clear-button--danger:hover:not(:disabled) {
+    background: #fef2f2;
+}
+
+.clear-button[aria-pressed="true"] {
+    background: #eef2ff;
+    border-color: #818cf8;
+    color: #3730a3;
+}
+
+.clear-button--pause-active {
+    background: #ecfdf5;
+    border-color: #34d399;
+    color: #047857;
+}
+
+.clear-button--flash {
+    animation: button-flash 650ms ease-out;
+}
+
+.pause-state {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 3px;
+    color: #4b5563;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.pause-state--paused {
+    background: #ecfdf5;
+    border-color: #34d399;
+    color: #047857;
+}
+
+.pause-state--pending {
+    background: #fffbeb;
+    border-color: #f59e0b;
+    color: #92400e;
+}
+
+@keyframes button-flash {
+    0% {
+        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.45);
+        transform: translateY(0);
+    }
+
+    35% {
+        box-shadow: 0 0 0 5px rgba(37, 99, 235, 0.16);
+        transform: translateY(-1px);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+        transform: translateY(0);
+    }
+}
+
+.clear-button:disabled {
+    cursor: default;
+    opacity: 0.55;
+}
+
+.panel-note {
+    border-bottom: 1px solid #f0f1f3;
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 8px 14px;
+}
+
+.list {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.list[hidden] {
+    display: none;
+}
+
+.metrics-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+}
+
+.metrics-panel[hidden] {
+    display: none;
+}
+
+.metrics-grid {
+    border-bottom: 1px solid #f0f1f3;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    padding: 10px 12px;
+}
+
+.metric-card {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 8px;
+    min-width: 0;
+}
+
+.metric-card--alert {
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.metric-card--alert .metric-value {
+    color: #991b1b;
+}
+
+.metric-card--trend-up {
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.metric-card--trend-up .metric-value {
+    color: #991b1b;
+}
+
+.metric-card--trend-down {
+    background: #dcfce7;
+    border-color: #86efac;
+}
+
+.metric-card--trend-down .metric-value {
+    color: #166534;
+}
+
+.metric-label {
+    color: #6b7280;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1.15;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.metric-value {
+    color: #111827;
+    font-size: 16px;
+    font-weight: 800;
+    line-height: 1.15;
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.metric-detail {
+    color: #6b7280;
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.panel-subhead {
+    align-items: center;
+    border-top: 1px solid #f0f1f3;
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+}
+
+.panel-subhead h3 {
+    color: #374151;
+    flex: 1 1 auto;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0;
+    min-width: 0;
+    text-transform: uppercase;
+}
+
+.panel-subhead span {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.panel-subhead .panel-toggle {
+    height: 22px;
+    width: 22px;
+}
+
+.metrics-journal {
+    flex: 0 0 auto;
+    max-height: 28vh;
+    overflow-y: auto;
+}
+
+.empty {
+    color: #6b7280;
+    padding: 18px 14px;
+}
+
+.histogram-container {
+    flex: 0 0 auto;
+    padding: 12px 14px;
+}
+
+.histogram-row {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.histogram-row:last-child {
+    margin-bottom: 0;
+}
+
+.histogram-label {
+    color: #374151;
+    flex: 0 0 150px;
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 150px;
+}
+
+.histogram-bar-container {
+    align-items: center;
+    display: flex;
+    flex: 1 1 auto;
+    gap: 8px;
+    min-width: 0;
+}
+
+.histogram-bar {
+    background: #3b82f6;
+    border-radius: 4px;
+    flex: 0 0 auto;
+    height: 24px;
+    position: relative;
+}
+
+.histogram-bar-label {
+    color: #374151;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 80px;
+    text-align: right;
+}
+
+.row {
+    border-bottom: 1px solid #f0f1f3;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: minmax(180px, 1fr) 120px 140px 160px;
+    padding: 12px 14px;
+}
+
+.row:last-child {
+    border-bottom: 0;
+}
+
+.row--event {
+    grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
+}
+
+.row--queue {
+    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
+}
+
+.row-time-cell {
+    line-height: 1.25;
+    white-space: normal;
+}
+
+.row-time-line {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.row-time-line--detail {
+    color: #374151;
+    margin-top: 2px;
+}
+
+.row-action-cell {
+    align-self: start;
+    display: flex;
+    justify-content: flex-end;
+    min-width: 0;
+}
+
+.row-cancel-cell {
+    align-self: start;
+    display: flex;
+    justify-content: flex-start;
+    min-width: 0;
+}
+
+.row-action-button {
+    padding: 6px 10px;
+    white-space: nowrap;
+}
+
+.row-cancel-button {
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.row-cancel-button:hover:not(:disabled) {
+    background: #fef2f2;
+}
+
+.row-title {
+    color: inherit;
+    font-weight: 700;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.row-subtitle {
+    color: #6b7280;
+    font-size: 12px;
+    margin-top: 2px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+a.row-title,
+a.row-subtitle {
+    display: block;
+    text-decoration: none;
+}
+
+a.row-title:hover,
+a.row-subtitle:hover {
+    color: #1d4ed8;
+    text-decoration: underline;
+}
+
+.badge {
+    align-self: start;
+    background: #e5e7eb;
+    border-radius: 3px;
+    color: #374151;
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 8px;
+    text-align: center;
+}
+
+.badge--queued {
+    background: #eef2ff;
+    color: #3730a3;
+}
+
+.badge--opening,
+.badge--active,
+.badge--acting,
+.badge--settling,
+.badge--running {
+    background: #cffafe;
+    border: 1px solid #67e8f9;
+    color: #155e75;
+}
+
+.badge--succeeded {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.badge--failed,
+.badge--canceled,
+.badge--enqueued {
+    background: #f3f4f6;
+    color: #374151;
+}
+
+@media (max-width: 760px) {
+    .coordinator {
+        display: block;
+        min-height: 0;
+        padding: 12px;
+    }
+
+    .summary-grid {
+        grid-template-columns: 1fr;
+        margin-bottom: 12px;
+    }
+
+    .metrics-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .coordinator-header,
+    .panel {
+        margin-bottom: 12px;
+    }
+
+    .panel-stack {
+        display: block;
+    }
+
+    .row {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Worker window "idiot light" status bar -- deliberately not the full
+   control-panel dashboard: a window-width strip with a progress fill and a
+   handled/total count, plus the handful of actions relevant to a background
+   worker window (pause/resume, cancel, jump to the real dashboard or
+   history). */
+.worker-bar {
+    align-items: center;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    box-sizing: border-box;
+    color: #1f2937;
+    display: flex;
+    gap: 16px;
+    padding: 12px 16px;
+    width: 100%;
+}
+
+.worker-bar-brand {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-logo {
+    display: block;
+    height: 40px;
+    object-fit: contain;
+    width: 40px;
+}
+
+.worker-bar-title {
+    font-size: 13px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-progress {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 999px;
+    flex: 1 1 auto;
+    height: 14px;
+    overflow: hidden;
+    position: relative;
+}
+
+.worker-bar-fill {
+    background: #b92b27;
+    height: 100%;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.worker-bar-count {
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-button {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 999px;
+    color: #374151;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 12px;
+    white-space: nowrap;
+}
+
+.worker-bar-button:hover {
+    background: #f9fafb;
+}
+
+.worker-bar-button--danger {
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.worker-bar-button--danger:hover {
+    background: #fef2f2;
+}
+
+.worker-bar-button--danger:hover {
+    background: #450a0a;
+}
+
+/* Dashboard-page footer bar -- a persistent, window-width progress strip
+   pinned to the bottom of the real control-panel dashboard (not the
+   worker-window's own .worker-bar above, though it borrows that look).
+   The logo is a "jump to the real dashboard" shortcut, meant to work the
+   same way wherever this bar ends up rendering -- a no-op when the page
+   showing it is already the plain dashboard (see the click handler in
+   coordinator.js). Brand red (#b92b27), matching the extension's icon and
+   popup/content accent color, rather than the worker-bar's neutral fill. */
+.dashboard-bottom-bar {
+    align-items: center;
+    background: #fff;
+    border-top: 1px solid #e5e7eb;
+    bottom: 0;
+    box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
+    box-sizing: border-box;
+    display: flex;
+    gap: 12px;
+    left: 0;
+    padding: 10px 16px;
+    position: fixed;
+    right: 0;
+    width: 100%;
+    z-index: 10;
+}
+
+.dashboard-bottom-bar-logo {
+    background: none;
+    border: none;
+    cursor: pointer;
+    display: block;
+    flex: 0 0 auto;
+    line-height: 0;
+    padding: 0;
+}
+
+.dashboard-bottom-bar-logo img {
+    display: block;
+    height: 28px;
+    object-fit: contain;
+    width: 28px;
+}
+
+.dashboard-bottom-bar-progress {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 999px;
+    flex: 1 1 auto;
+    height: 12px;
+    overflow: hidden;
+    position: relative;
+}
+
+.dashboard-bottom-bar-fill {
+    background: #b92b27;
+    height: 100%;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.dashboard-bottom-bar-count {
+    color: #1f2937;
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    white-space: nowrap;
+}

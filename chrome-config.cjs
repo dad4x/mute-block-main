@@ -8,7 +8,7 @@ module.exports = {
 		overwriteDest: true,
 	},
 	run: {
-		chromiumBinary: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+		chromiumBinary: '/usr/bin/google-chrome',
 		target: ['chromium'],
 		startUrl: ['https://www.google.com.pk'],
 	}

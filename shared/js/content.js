@@ -1,5 +1,20 @@
+const MUTE_BLOCK_CONTENT_SCRIPT_VERSION = (() => {
+    try {
+        return `${globalThis.chrome?.runtime?.getManifest?.()?.version || ''}`.trim()
+    }
+    catch {
+        return ''
+    }
+})()
+
+try {
+    document.documentElement?.setAttribute('data-mb-content-script-ready', MUTE_BLOCK_CONTENT_SCRIPT_VERSION || 'unknown')
+}
+catch {}
+
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const { BRAND_RED } = require('./colorTokens')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -20,12 +35,95 @@ const {
 } = require('./spaceRegistry')
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
+    isLikelyExplicitProfileTargetHref,
+    isLikelyExplicitProfileTargetSlug,
     normalizeQuoraProfileHref,
     sanitizeProfileHrefSlug
 } = require('./subject')
+const {
+    mapProgressToCoordinatorState,
+    TRANSIENT_PROGRESS_STATUSES,
+    UNBLOCK_UNMUTE_ACTION_KIND
+} = require('./jobState')
+const {
+    WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_CONDITION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CONDITION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS,
+    READ_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    READ_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS,
+    ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS,
+    CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS,
+    SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS,
+    SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS,
+    SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS,
+    SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS
+} = require('./timeouts')
+const {
+    COORDINATOR_ENQUEUE_CHUNK_SIZE
+} = require('./coordinatorEnqueueChunking')
 
-const SPACE_FEED_PROFILES_PER_BATCH = 5
+const SPACE_FEED_PROFILES_PER_BATCH = 3
+const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
+const PROFILE_SEARCH_PROFILES_PER_BATCH = 3
+const PROFILE_SEARCH_COLLECT_LIMIT = 100
+const PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES = 120
+const PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000
+const PROFILE_SEARCH_MATCH_IGNORED_TOKENS = new Set([
+    'a',
+    'an',
+    'and',
+    'for',
+    'of',
+    'the'
+])
 const CONTENT_SCRIPT_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS = 2500
+const QUEUED_TERMINAL_PROGRESS_MESSAGE_TIMEOUT_MS = 5000
+const QUEUED_TERMINAL_PROGRESS_MESSAGE_ATTEMPTS = 3
+const QUEUED_TERMINAL_PROGRESS_RETRY_DELAY_MS = 250
+const QUEUED_ACTION_CLAIM_MESSAGE_TIMEOUT_MS = 6000
+const QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS = 500
+const QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS = 5000
+const QUEUED_ACTION_CLAIM_FAST_ATTEMPTS = 6
+const QUEUED_ACTION_CLAIM_RESCUE_INTERVAL_MS = 2000
+const QUORA_RUNTIME_READY_ANNOUNCE_DELAYS_MS = [0, 1000, 5000, 15000]
+const QUEUED_PROFILE_RESOLUTION_MESSAGE_TIMEOUT_MS = 5000
+const QUEUED_PROFILE_RESOLUTION_MESSAGE_ATTEMPTS = 3
+const QUEUED_PROFILE_RESOLUTION_RETRY_DELAY_MS = 350
+const QUEUED_ACTION_HEARTBEAT_MS = 5000
+const CONTENT_PAGE_STATE_REFRESH_MIN_INTERVAL_MS = 1000
+const PROFILE_SEARCH_PENDING_REFRESH_MS = 2000
+const HIDDEN_PROFILE_READY_FAST_PROBE_MS = 3500
+const HIDDEN_PROFILE_READY_NO_FOREGROUND_MS = 12000
+const VISIBLE_PROFILE_READY_MS = 25000
+const SERVICE_WORKER_QUEUE_OWNER_ID = 'service-worker-queue-owner'
+// A host page re-render (or, previously, our own remove-then-recreate of a
+// managed button whose insertion target's parent got replaced) can satisfy
+// shouldRefreshProfileButtons' mutation check again immediately after a
+// refresh runs, scheduling another refresh forever -- this observably
+// flashed the injected buttons/native menu indefinitely on a live profile
+// page with no coordinator work in flight. This caps how many refreshes a
+// single profile visit gets in a short window before giving up until the
+// next genuinely new mutation window or a profile-key change.
+const PROFILE_BUTTONS_REFRESH_BURST_LIMIT = 6
+const PROFILE_BUTTONS_REFRESH_BURST_WINDOW_MS = 3000
 
 let profilesModalTimeout
 let profileButtonsTimeout
@@ -33,12 +131,27 @@ let profileButtonsRefreshTimeout
 let profileButtonsPending = false
 let profileActionInProgress = false
 let profileButtonsFollowUpTimeouts = []
+let profileButtonsRefreshBurstCount = 0
+let profileButtonsRefreshBurstStartedAt = 0
+let profileButtonRail = null
+let profileButtonRailResizeHooked = false
+let contentProgressBarEl = null
+let contentProgressBarStorageListenerInstalled = false
 let autoProfileAction = undefined
 let autoProfileActionPending = false
+let autoProfileActionClaimPending = false
+let autoProfileActionRescueTimeout = null
 let autoProfileActionAttempts = 0
+let activeQueuedAttemptId = ''
+let activeQueuedAttemptNumber = 0
+let activeQueuedAttemptProfileHref = ''
+let activeQueuedNoForegroundFallback = false
+let activeQueuedActionSurfaceMode = ''
 let profileBlockMutationCount = 0
 let profileBlockHintKey = null
 let profileBlockHintAt = 0
+let profileUnblockedHintKey = null
+let profileUnblockedHintAt = 0
 let originalPosterRedirectPending = false
 let originalPosterRedirectAttempts = 0
 let originalPosterRedirectTimeout = null
@@ -48,6 +161,20 @@ let questionPageFollowUpTimeouts = []
 let spacePostBtnTimeout
 let spacePostBtnPending = false
 let spacePostFollowUpTimeouts = []
+let profileSearchControlsTimeout
+let profileSearchControlsPending = false
+let profileSearchCollecting = false
+let profileSearchCollectStopRequested = false
+let profileSearchCollectionKey = ''
+let profileSearchStagedHrefs = []
+let profileSearchStagedHrefSet = new Set()
+let profileSearchCollectCursorScrollY = 0
+let profileSearchCollectCursorHref = ''
+let profileSearchFollowUpTimeouts = []
+let profileSearchPendingRefreshTimeout = null
+let profileSearchLastRunId = ''
+let profileSearchLastQueuedAt = 0
+let profileSearchLastQueuedCount = 0
 let spacePageFollowUpTimeouts = []
 let spaceClassificationTimeout
 let spaceClassificationPending = false
@@ -72,9 +199,21 @@ let spaceRegistry = {}
 let spaceNukedPosts = {}
 let spacePendingNukedPosts = {}
 let profileNukeProgress = {}
+let coordinatorQueue = {}
+let coordinatorQueueLoaded = false
+let cloudflareChallengeReported = false
+let contentPageStateRefreshPromise = null
+let contentPageStateRefreshAt = 0
+let spaceFeedScopedStateRefreshPromise = null
+let spaceFeedScopedStateRefreshActiveSignature = ''
+let spaceFeedScopedStateRefreshQueuedEntries = null
+let spaceFeedScopedStateRefreshQueuedSignature = ''
+let spaceFeedScopedStateSignature = ''
+let storageChangeListenerInstalled = false
 let spaceFeedNukingPostKeys = new Set()
 let activeSpaceFeedNukeMode = ''
 let activeSpaceFeedNukeRunId = ''
+let activeSpaceFeedNukeSpaceKey = ''
 let profileDisplayNamesByHref = {}
 let ownedNukeStatusCache = {
     active: 0,
@@ -87,43 +226,59 @@ let activeProfileModal = null
 let handledModalProfileUrls = new Set()
 let queuedModalNukeProfileUrls = new Set()
 let initialized = false
-let alreadyBlockedCoordinatorRepairKey = ''
-const PROFILE_ACTION_BUTTON_ORDER = ['mute-block-close', 'mute-block', 'close-tab']
+let alreadyBlockedCoordinatorReconcileKey = ''
+let manualUnblockedReconcileKey = ''
+const PROFILE_ACTION_BUTTON_ORDER = ['unblock-unmute', 'mute-block-close', 'mute-block', 'close-tab']
 const SPACE_POST_NUKE_MIN_PROFILES = 2
 const SPACE_FEED_POST_NUKE_MIN_PROFILES = 1
+const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
+const SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH = 'high'
+const SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM = 'medium'
+const SPACE_FEED_CANDIDATE_CONFIDENCE_LOW = 'low'
 const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
-const PROFILE_NUKE_PROGRESS_KEY = 'mbProfileNukeProgress'
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
+const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
+const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
+const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
+const COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
+const CONTENT_PROGRESS_BAR_ID = 'mb-ext_progress-bar'
+const PENDING_COORDINATOR_STATUSES = new Set(['queued', 'opening', 'active', 'acting', 'settling'])
 const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
 const SPACE_FEED_SCROLL_IDLE_MS = 450
 const SPACE_FEED_SCROLL_REFRESH_GRACE_MS = 120
 const SPACE_FEED_PROGRESS_REFRESH_IDLE_MS = 320
 const SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX = 1800
+const SPACE_FEED_SCAN_ABOVE_VIEWPORT_MARGIN_PX = 320
 const SPACE_FEED_SCAN_MAX_TIMESTAMPS = 60
 const SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES = 160
 const SPACE_FEED_SCAN_SAMPLE_STEP_PX = 140
 const SPACE_FEED_SCAN_SAMPLE_X_RATIOS = [0.28, 0.5, 0.72]
 const MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES = 80
 const MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES = 4
+const FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS = 8000
+const FOREGROUND_PROMOTION_LEASE_WAIT_MS = 90000
+const ACTION_LEASE_WAIT_MS = 45000
+const ACTION_LEASE_POLL_MS = 2500
+const PAGE_WORLD_CONFIRM_ACTIVATION_ATTR = 'data-mb-confirm-activation-token'
 const SPACE_FEED_ROOT_SELECTOR =
     '.q-box.qu-borderAll.qu-borderColor--raised.qu-boxShadow--small.qu-mb--small.qu-bg--raised,' +
     '.puppeteer_test_tribe_post_item_feed_story,' +
     '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
     'article,' +
     '[role="article"]'
+// Markers for an embedded/quoted sub-post nested inside a post's own DOM
+// (a feature card, a Quora-native embed, or a hyperlink embed) -- distinct
+// from SPACE_FEED_ROOT_SELECTOR's generic "post item container" markers,
+// which also match nested posts and so can't be used to tell embedded
+// content apart from the primary post.
+const SPACE_FEED_EMBED_SCOPE_SELECTOR =
+    '.standalone_featurable,' +
+    '[data-is-quora-embed="true"],' +
+    '[data-type="hyperlink_embed"]'
 const UNMUTE_ACTION_REGEX = /\bun[\s-]*mute\b/i
 const UNBLOCK_ACTION_REGEX = /\bun[\s-]*block\b/i
-const TRANSIENT_PROFILE_NUKE_STATUSES = new Set([
-    'queued',
-    'tab-opening',
-    'tab-opened',
-    'awaiting-visibility',
-    'page-ready',
-    'retrying',
-    'muting',
-    'blocking'
-])
+const UNMUTE_CONTEXT_REGEX = /\bun[\s-]*mut(?:e|ed|ing)\b/i
+const UNBLOCK_CONTEXT_REGEX = /\bun[\s-]*block(?:ed|ing)?\b/i
 addEventListener('unhandledrejection', event => {
     if(isExtensionContextInvalidatedError(event.reason) || isRuntimeConnectionError(event.reason)) {
         event.preventDefault()
@@ -134,6 +289,8 @@ addEventListener('pagehide', clearCloseTabFollowUps)
 addEventListener('beforeunload', clearCloseTabFollowUps)
 addEventListener('pagehide', clearBlockedCloseChecks)
 addEventListener('beforeunload', clearBlockedCloseChecks)
+addEventListener('pagehide', clearProfileSearchPendingRefresh)
+addEventListener('beforeunload', clearProfileSearchPendingRefresh)
 
 if(document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => void init(), {once: true})
@@ -149,35 +306,73 @@ async function init() {
     const bodyReady = document.body || await waitForCondition(() => !!document.body, 5000, 25)
     if(!bodyReady || !document.body) return
 
-    settings = await safeStorageGet(defaults)
-    spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
-    const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
-    spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
-    spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-    const storedProfileNukeProgress = (await safeStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}}))[PROFILE_NUKE_PROGRESS_KEY] || {}
-    profileNukeProgress = normalizeStoredProfileNukeProgress(storedProfileNukeProgress)
-    if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
-        await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
-    }
-    if(JSON.stringify(profileNukeProgress) !== JSON.stringify(storedProfileNukeProgress || {})) {
-        await safeStorageSet({[PROFILE_NUKE_PROGRESS_KEY]: profileNukeProgress})
-    }
     browser.runtime.onMessage.addListener(onMessage)
-    getStorageChangeSource()?.addListener(onStorageChanged)
-    installNavigationHooks()
-    await reconcileReloadCanceledNukes()
+    const initialPage = getPageType()
+    announceQuoraRuntimeReady(initialPage)
+    initContentProgressBar()
+    if(initialPage === 'profile-search') {
+        installNavigationHooks()
+        scheduleProfileSearchControls(0)
+        scheduleProfileSearchFollowUps()
+        void safeStorageGet(defaults).then(stored => {
+            settings = stored
+            scheduleProfileSearchControls(0)
+        }).catch(() => null)
+        void refreshContentPageCoordinatorStateFromRuntime({force: true})
+            .then(() => scheduleProfileSearchControls(0))
+            .catch(() => null)
+        installSpaceFeedViewportRefresh()
+        startObserver()
+        return
+    }
 
     if(maybeRedirectToCanonicalProfileUrl()) {
         return
     }
 
-    const page = getPageType()
-
-    if(page === 'profile') {
+    // Mute/block button insertion depends only on this page's own DOM
+    // (getProfileButtonInsertionTarget/isProfileBlocked) -- it has no
+    // dependency on settings, spaceRegistry, or the coordinator queue
+    // fetched below. Firing it here, before that slower sequential chain,
+    // means the button can appear as soon as Quora's own profile menu
+    // renders instead of being needlessly gated behind a coordinator-queue
+    // round trip and reconcileReloadCanceledNukes -- a live trace found
+    // these two steps alone routinely add several seconds before the first
+    // insertion attempt even happens, on a page where Quora's own DOM was
+    // already ready (see entropy-reduction-action-plan-2026-09-09.md,
+    // "profile button insertion delay", 2026-09-11). syncProfileButtons's
+    // coordinator-state-dependent pieces (maybeRecordAlreadyBlockedCoordinatorProfile,
+    // nudgeCurrentProfilePendingClaim) already do their own scoped refresh
+    // or are safely re-invoked by ensureProfileButtons's own retry/follow-up
+    // cycle once the queue arrives, so running this before that data is
+    // loaded is not a functional dependency issue.
+    if(initialPage === 'profile') {
         ensureProfileButtons()
         scheduleProfileButtonsFollowUps()
+        installProfilePageEventListeners()
+        // The observer re-inserts the buttons when Quora renders its menu. It used to start only after the
+        // two worker round trips below (up to 7 s under load), so buttons were late exactly when the worker
+        // was busy. It depends only on this page's DOM, so it can start here.
+        startObserver()
     }
-    else if(page === 'question-log') {
+
+    settings = await safeStorageGet(defaults)
+    spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
+    const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
+    spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
+    spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    await refreshCoordinatorQueueFromRuntime({force: true})
+    if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
+        // The worker owns the space nuked-post keys (set-space-nuked-posts). Bounded, so the wait cannot stall init.
+        await safeSendRuntimeMessageWithTimeout({action: 'set-space-nuked-posts', nukedPosts: spaceNukedPosts}, null)
+    }
+    setStorageChangeListenerEnabled(true)
+    installNavigationHooks()
+    await reconcileReloadCanceledNukes()
+
+    const page = initialPage
+
+    if(page === 'question-log') {
         scheduleOriginalPosterRedirect()
     }
     else if(page === 'question') {
@@ -194,11 +389,176 @@ async function init() {
             void reconcileStaleSpaceFeedProgress()
         }, 350)
     }
+    else if(page === 'profile-search') {
+        scheduleProfileSearchControls(200)
+        scheduleProfileSearchFollowUps()
+    }
 
     scheduleSpacePageFollowUps()
-    void maybeRunAutoProfileAction()
+    nudgeCurrentProfilePendingClaim()
     installSpaceFeedViewportRefresh()
     startObserver()
+}
+
+function announceQuoraRuntimeReady(pageType = '') {
+    const announce = () => {
+        void safeSendRuntimeMessage({
+            action: 'quora-runtime-ready',
+            url: location.href,
+            pageType,
+            contentScriptVersion: MUTE_BLOCK_CONTENT_SCRIPT_VERSION || ''
+        }, null).catch(() => null)
+    }
+
+    for(const delayMs of QUORA_RUNTIME_READY_ANNOUNCE_DELAYS_MS) {
+        if(delayMs <= 0) announce()
+        else setTimeout(announce, delayMs)
+    }
+}
+
+async function refreshCoordinatorQueueFromRuntime(options = {}) {
+    await refreshContentPageCoordinatorStateFromRuntime({
+        ...options,
+        force: true
+    })
+    return coordinatorQueue
+}
+
+function getCurrentPageStateProfileHrefs(options = {}) {
+    const hrefs = []
+    if(Array.isArray(options.profileHrefs)) hrefs.push(...options.profileHrefs)
+
+    const page = getPageType()
+    if(page === 'profile') {
+        hrefs.push(location.href)
+    }
+    else if(page === 'profile-search') {
+        const rows = Array.isArray(options.rows) ? options.rows : getProfileSearchRows()
+        hrefs.push(...rows.map(row => row?.href || ''))
+        hrefs.push(...getProfileSearchStagedHrefs())
+    }
+    else if(page === 'space') {
+        const entries = Array.isArray(options.entries) ? options.entries : getLatestSpaceFeedEntries()
+        for(const entry of entries) {
+            hrefs.push(...(Array.isArray(entry?.candidateUrls) ? entry.candidateUrls : []))
+        }
+        for(const record of Object.values(spacePendingNukedPosts || {})) {
+            hrefs.push(...getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
+        }
+    }
+
+    return getNormalizedProfileHrefList(hrefs).slice(0, 250)
+}
+
+function getProfileHrefScopeSignature(profileHrefs = []) {
+    return getNormalizedProfileHrefList(profileHrefs).sort().join('\n')
+}
+
+function getSpaceFeedScopedStateSignature(entries = []) {
+    return getProfileHrefScopeSignature(getCurrentPageStateProfileHrefs({entries}))
+}
+
+function scheduleSpaceFeedScopedStateRefresh(entries = []) {
+    if(getPageType() !== 'space') return false
+
+    const scopedEntries = Array.isArray(entries) ? entries : []
+    const signature = getSpaceFeedScopedStateSignature(scopedEntries)
+    if(!signature) {
+        spaceFeedScopedStateSignature = ''
+        return false
+    }
+    if(coordinatorQueueLoaded && signature === spaceFeedScopedStateSignature) return false
+
+    if(spaceFeedScopedStateRefreshPromise) {
+        if(signature !== spaceFeedScopedStateRefreshActiveSignature) {
+            spaceFeedScopedStateRefreshQueuedEntries = scopedEntries
+            spaceFeedScopedStateRefreshQueuedSignature = signature
+        }
+        return true
+    }
+
+    spaceFeedScopedStateRefreshActiveSignature = signature
+    spaceFeedScopedStateRefreshPromise = (async () => {
+        if(contentPageStateRefreshPromise) await contentPageStateRefreshPromise.catch(() => false)
+
+        const refreshed = await refreshContentPageCoordinatorStateFromRuntime({
+            force: true,
+            entries: scopedEntries
+        })
+        if(refreshed) {
+            spaceFeedScopedStateSignature = signature
+            if(getPageType() === 'space') {
+                syncSpaceFeedNukeControls()
+            }
+        }
+        return refreshed
+    })()
+        .catch(() => false)
+        .finally(() => {
+            spaceFeedScopedStateRefreshPromise = null
+            spaceFeedScopedStateRefreshActiveSignature = ''
+
+            const queuedEntries = spaceFeedScopedStateRefreshQueuedEntries
+            const queuedSignature = spaceFeedScopedStateRefreshQueuedSignature
+            spaceFeedScopedStateRefreshQueuedEntries = null
+            spaceFeedScopedStateRefreshQueuedSignature = ''
+
+            if(queuedSignature && queuedSignature !== spaceFeedScopedStateSignature) {
+                scheduleSpaceFeedScopedStateRefresh(queuedEntries)
+            }
+        })
+
+    return true
+}
+
+async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
+    const page = getPageType()
+    if(!['profile-search', 'profile', 'space'].includes(page)) return false
+
+    const now = Date.now()
+    if(!options.force && now - contentPageStateRefreshAt < CONTENT_PAGE_STATE_REFRESH_MIN_INTERVAL_MS) return false
+    if(contentPageStateRefreshPromise) return contentPageStateRefreshPromise
+
+    const profileHrefs = getCurrentPageStateProfileHrefs(options)
+    const request = {
+        action: 'get-content-page-coordinator-state',
+        pageType: page,
+        url: location.href,
+        profileHrefs,
+        sourcePageUrl: page === 'profile-search' ? normalizeCurrentProfileSearchPageUrl() : '',
+        searchQuery: page === 'profile-search' ? new URLSearchParams(location.search).get('q') || '' : '',
+        runId: page === 'profile-search' ? profileSearchLastRunId || '' : ''
+    }
+
+    const stateRequestStartedAt = Date.now()
+    contentPageStateRefreshPromise = safeSendRuntimeMessageWithTimeout(request, null, 3000)
+        .then(result => {
+            recordSpaceMarkPerf('stateRoundTrip', {
+                ms: Date.now() - stateRequestStartedAt,
+                ok: !!result,
+                hrefs: profileHrefs.length,
+                page
+            })
+            if(!result || typeof result !== 'object') return false
+            if(result.coordinatorQueue && typeof result.coordinatorQueue === 'object') {
+                coordinatorQueue = normalizeCoordinatorQueue(result.coordinatorQueue)
+                coordinatorQueueLoaded = true
+            }
+            if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
+                profileNukeProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
+            }
+            contentPageStateRefreshAt = Date.now()
+            if(page === 'space') {
+                spaceFeedScopedStateSignature = getProfileHrefScopeSignature(profileHrefs)
+            }
+            return true
+        })
+        .catch(() => false)
+        .finally(() => {
+            contentPageStateRefreshPromise = null
+        })
+
+    return contentPageStateRefreshPromise
 }
 
 function onStorageChanged(changes, areaName) {
@@ -227,14 +587,28 @@ function onStorageChanged(changes, areaName) {
                 scheduleSpaceFeedProgressDrivenRefresh()
             }
         }
-        else if(key === PROFILE_NUKE_PROGRESS_KEY) {
-            profileNukeProgress = normalizeStoredProfileNukeProgress(change.newValue || {})
-            if(getPageType() === 'space') {
+        else if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key === COORDINATOR_QUEUE_VIEW_KEY) {
+            scheduleContentPageStateProjectionRefresh()
+        }
+    }
+}
+
+function scheduleContentPageStateProjectionRefresh() {
+    void refreshContentPageCoordinatorStateFromRuntime({force: true})
+        .then(() => {
+            const page = getPageType()
+            if(page === 'space') {
                 void reconcileStaleSpaceFeedProgress()
                 scheduleSpaceFeedProgressDrivenRefresh()
             }
-        }
-    }
+            else if(page === 'profile-search') {
+                scheduleProfileSearchControls(0)
+            }
+            else if(page === 'profile' && hasCurrentProfilePendingCoordinatorQueueItem()) {
+                nudgeCurrentProfilePendingClaim()
+            }
+        })
+        .catch(() => null)
 }
 
 function isExtensionContextInvalidatedError(error) {
@@ -253,6 +627,23 @@ function getStorageArea() {
 
 function getStorageChangeSource() {
     return browser?.storage?.onChanged || globalThis.chrome?.storage?.onChanged || null
+}
+
+function setStorageChangeListenerEnabled(enabled) {
+    const source = getStorageChangeSource()
+    if(!source) return false
+
+    if(enabled) {
+        if(storageChangeListenerInstalled) return true
+        source.addListener(onStorageChanged)
+        storageChangeListenerInstalled = true
+        return true
+    }
+
+    if(!storageChangeListenerInstalled) return true
+    source.removeListener?.(onStorageChanged)
+    storageChangeListenerInstalled = false
+    return true
 }
 
 async function safeStorageGet(fallback) {
@@ -278,7 +669,7 @@ async function safeSendRuntimeMessage(message, fallback = null) {
     }
 }
 
-async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = 12000) {
+async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs = SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS) {
     const timeoutMarker = {timedOut: true}
     const timeout = new Promise(resolve => setTimeout(() => resolve(timeoutMarker), timeoutMs))
     const result = await Promise.race([
@@ -289,21 +680,55 @@ async function safeSendRuntimeMessageWithTimeout(message, fallback = null, timeo
     return result === timeoutMarker ? fallback : result
 }
 
-async function safeStorageSet(value) {
-    const storageArea = getStorageArea()
-    if(!storageArea?.set) return
+async function sendRecordedRuntimeMessageWithRetry(message, mappedProgress = {}) {
+    const terminal = mappedProgress?.terminal === true
+    const timeoutMs = terminal
+        ? QUEUED_TERMINAL_PROGRESS_MESSAGE_TIMEOUT_MS
+        : QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS
+    const attempts = terminal
+        ? QUEUED_TERMINAL_PROGRESS_MESSAGE_ATTEMPTS
+        : 1
+    let result = null
 
-    try {
-        await storageArea.set(value)
+    for(let attempt = 1; attempt <= attempts; attempt += 1) {
+        result = await safeSendRuntimeMessageWithTimeout(message, null, timeoutMs)
+        if(result?.recorded || result?.staleAttempt) return result
+        if(attempt < attempts) await sleep(QUEUED_TERMINAL_PROGRESS_RETRY_DELAY_MS)
     }
-    catch(error) {
-        if(isExtensionContextInvalidatedError(error)) return
-        throw error
+
+    return result
+}
+
+async function sendQueuedProfileResolutionMessageWithRetry(message) {
+    let result = null
+
+    for(let attempt = 1; attempt <= QUEUED_PROFILE_RESOLUTION_MESSAGE_ATTEMPTS; attempt += 1) {
+        result = await safeSendRuntimeMessageWithTimeout(
+            message,
+            null,
+            QUEUED_PROFILE_RESOLUTION_MESSAGE_TIMEOUT_MS
+        )
+        if(result?.resolved === true) return result
+        if(result?.resolved === false && result.reason !== 'missing-coordinator-item') return result
+        if(attempt < QUEUED_PROFILE_RESOLUTION_MESSAGE_ATTEMPTS) {
+            await sleep(QUEUED_PROFILE_RESOLUTION_RETRY_DELAY_MS)
+        }
     }
+
+    return result
 }
 
 async function reconcileReloadCanceledNukes() {
-    const result = await safeSendRuntimeMessage({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []})
+    // This runs unconditionally during init(), for every page type, before
+    // either the profile page's mute-block button or the space page's
+    // asset/neutral/target buttons get created -- so an unbounded message
+    // wait here stalls button injection on every page, not just this one
+    // cleanup step. safeSendRuntimeMessage has no timeout at all; use the
+    // same bounded pattern as the sibling coordinator-state refresh call in
+    // refreshContentPageCoordinatorStateFromRuntime instead, so a
+    // slow/asleep service worker degrades to "skip this cleanup cycle"
+    // rather than blocking page setup indefinitely.
+    const result = await safeSendRuntimeMessageWithTimeout({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []}, 4000)
     const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
     if(!canceledUrls.length) return
 
@@ -311,7 +736,7 @@ async function reconcileReloadCanceledNukes() {
 }
 
 function isTransientProfileNukeStatus(status) {
-    return TRANSIENT_PROFILE_NUKE_STATUSES.has(`${status || ''}`.trim())
+    return TRANSIENT_PROGRESS_STATUSES.has(`${status || ''}`.trim())
 }
 
 function getPendingSpaceFeedRecord(postKey) {
@@ -377,7 +802,23 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
     if(getPageType() !== 'space') return false
 
     updateOwnedNukeStatusCache(await getOwnedNukeStatus())
-    const urlsToClear = new Set()
+    const pendingProfileHrefs = getNormalizedProfileHrefList(
+        Object.values(spacePendingNukedPosts || {})
+            .flatMap(record => getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
+    )
+    if(pendingProfileHrefs.length) {
+        const result = await safeSendRuntimeMessageWithTimeout({
+            action: 'settle-terminal-coordinator-items',
+            profileHrefs: pendingProfileHrefs
+        }, null, 2500)
+        if(result?.pendingPosts && typeof result.pendingPosts === 'object') {
+            spacePendingNukedPosts = result.pendingPosts
+        }
+        if(result?.nukedPosts && typeof result.nukedPosts === 'object') {
+            spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
+        }
+    }
+
     const updatesByHref = new Map()
 
     for(const [profileHref, record] of Object.entries(profileNukeProgress || {})) {
@@ -399,8 +840,6 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
             const record = getProfileNukeProgressRecord(normalizedUrl)
             if(!shouldReconcilePendingProfileRecord(record, pendingRecord)) continue
 
-            urlsToClear.add(normalizedUrl)
-
             if(record && isTransientProfileNukeStatus(record.status) && record.status !== 'interrupted') {
                 updatesByHref.set(normalizedUrl, {
                     profileHref: normalizedUrl,
@@ -412,22 +851,16 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
 
     const updates = Array.from(updatesByHref.values())
     if(updates.length) {
-        await recordProfileNukeProgressBatch(updates)
+        applyLocalProfileNukeProgressUpdates(updates)
     }
 
-    if(urlsToClear.size) {
-        await removePendingSpaceFeedUrls(Array.from(urlsToClear))
-        return true
-    }
-
-    return false
+    return updates.length > 0
 }
 
 async function failCurrentQueuedProfile(additionalUrls = []) {
     const failedUrls = getNormalizedProfileHrefList(additionalUrls || [])
     if(!failedUrls.length) return []
 
-    await removePendingSpaceFeedUrls(failedUrls)
     return failedUrls
 }
 
@@ -497,6 +930,10 @@ function mergeStoredProfileProgressRecord(existing = null, incoming = null, norm
         profileHref: normalizedHref || newer.profileHref || older.profileHref || ''
     }
 
+    if(shouldPreserveSettledProfileProgress(older, newer)) {
+        preserveSettledProfileProgress(older, merged)
+    }
+
     merged.updatedAt = Math.max(leftUpdatedAt, rightUpdatedAt, Date.now())
 
     if(left.postKeys || right.postKeys) {
@@ -516,6 +953,43 @@ function mergeStoredProfileProgressRecord(existing = null, incoming = null, norm
     }
 
     return merged
+}
+
+function preserveSettledProfileProgress(previous = {}, next = {}) {
+    for(const key of [
+        'status',
+        'blockSucceeded',
+        'unblockSucceeded',
+        'foundBlockedBeforeQueue',
+        'finalError',
+        'terminalAt',
+        'blockedAt',
+        'unblockedAt',
+        'unavailableReason'
+    ]) {
+        if(previous[key] !== undefined) next[key] = previous[key]
+    }
+
+    return next
+}
+
+function shouldPreserveSettledProfileProgress(previous = {}, incoming = {}) {
+    if(!isSettledProfileNukeRecord(previous)) return false
+    if(!isTransientProfileNukeStatus(incoming?.status)) return false
+
+    const previousActionKind = `${previous.actionKind || 'mute-block'}`.trim()
+    const incomingActionKind = `${incoming.actionKind || previousActionKind}`.trim()
+    if(previousActionKind !== incomingActionKind) return false
+
+    const previousAttemptId = getAttemptIdFromValue(previous)
+    const incomingAttemptId = getAttemptIdFromValue(incoming)
+    if(previousAttemptId && incomingAttemptId && previousAttemptId !== incomingAttemptId) return false
+
+    const previousAttemptNumber = getAttemptNumberFromValue(previous)
+    const incomingAttemptNumber = getAttemptNumberFromValue(incoming)
+    if(previousAttemptNumber && incomingAttemptNumber && previousAttemptNumber !== incomingAttemptNumber) return false
+
+    return true
 }
 
 function normalizeStoredProfileNukeProgress(records) {
@@ -547,11 +1021,50 @@ function normalizeProfileProgressPatch(href, patch = {}, existing = null) {
     if(!normalizedHref) return null
 
     const previous = existing || profileNukeProgress?.[normalizedHref] || {}
+    const patchAttemptId = `${patch.attemptId || patch.attempt?.id || ''}`.trim()
+    const patchAttemptNumber = Number.parseInt(patch.attemptNumber ?? patch.attempt?.number, 10) || 0
+    const activeAttemptId = patchAttemptId ||
+        (activeQueuedAttemptId && activeQueuedAttemptProfileHref === normalizedHref ? activeQueuedAttemptId : '')
+    const activeAttemptNumber = patchAttemptNumber ||
+        (activeAttemptId && activeQueuedAttemptProfileHref === normalizedHref ? activeQueuedAttemptNumber : 0)
     const next = {
         ...previous,
         ...patch,
         profileHref: normalizedHref,
         updatedAt: Date.now()
+    }
+
+    const preserveSettled = shouldPreserveSettledProfileProgress(previous, patch)
+    if(preserveSettled) {
+        preserveSettledProfileProgress(previous, next)
+    }
+
+    if(patch.status === 'queued' && !preserveSettled) {
+        Object.assign(next, {
+            attemptId: patchAttemptId,
+            attemptNumber: patchAttemptNumber,
+            muteError: '',
+            blockError: '',
+            finalError: '',
+            unblockReason: '',
+            unmuteReason: '',
+            selectedActionLabel: '',
+            selectedActionRect: null,
+            menuActionLabels: [],
+            visibleProfileMenuLabels: [],
+            directBlockFailureDetail: null,
+            profileMenuOpen: false,
+            profileBlocked: false
+        })
+    }
+    else {
+        if(activeAttemptId) next.attemptId = activeAttemptId
+        if(activeAttemptNumber) next.attemptNumber = activeAttemptNumber
+    }
+
+    if(next.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
+        next.blockSucceeded = false
+        next.foundBlockedBeforeQueue = false
     }
 
     if(next.blockSucceeded && next.status === 'interrupted') {
@@ -612,6 +1125,7 @@ function buildQueuedProfileProgressPatch(event, extraPatch = {}) {
         blockSucceeded: false,
         blockAttemptedAt: 0,
         blockError: '',
+        directBlockFailureDetail: null,
         actionReadyAt: 0,
         blockedAt: 0,
         mutedAt: 0,
@@ -634,25 +1148,96 @@ async function recordProfileNukeProgress(href, patch = {}) {
     const nextRecord = normalizeProfileProgressPatch(normalizedHref, patch)
     if(!nextRecord) return null
 
+    const useJobProtocol = isActiveQueuedProgressRecord(normalizedHref)
+    const mapped = mapProfileProgressToCoordinatorState(nextRecord)
+
+    if(useJobProtocol) {
+        profileNukeProgress = pruneProfileNukeProgress({
+            ...profileNukeProgress,
+            [normalizedHref]: nextRecord
+        })
+
+        const result = await sendRecordedRuntimeMessageWithRetry({
+            action: mapped.terminal ? 'record-job-terminal' : 'record-job-milestone',
+            profileHref: normalizedHref,
+            patch: nextRecord,
+            attemptId: nextRecord.attemptId || activeQueuedAttemptId || '',
+            attemptNumber: nextRecord.attemptNumber || activeQueuedAttemptNumber || 0
+        }, mapped)
+
+        if(result?.recorded) {
+            const acceptedRecord = result.record && typeof result.record === 'object'
+                ? result.record
+                : nextRecord
+            profileNukeProgress = pruneProfileNukeProgress({
+                ...profileNukeProgress,
+                [normalizedHref]: acceptedRecord
+            })
+        }
+        return {
+            ...nextRecord,
+            runtimeRecorded: !!result?.recorded,
+            staleAttempt: result?.staleAttempt === true,
+            serviceWorkerOnly: true
+        }
+    }
+
     profileNukeProgress = pruneProfileNukeProgress({
         ...profileNukeProgress,
         [normalizedHref]: nextRecord
     })
 
-    const result = await safeSendRuntimeMessageWithTimeout({
-        action: 'record-nuke-progress',
+    // Not under the coordinator queue protocol -- this is a legacy direct
+    // action (the "Mute Block"/"Unblock Unmute" buttons on a manually-opened
+    // profile page). There's no attemptId/runId and never will be, so this
+    // doesn't go through the queue-machine event path above; it persists
+    // straight to the profile-progress projection instead, independent of
+    // the coordinator queue. Without this, legacy-action progress only ever
+    // lived in this tab's own memory and was lost the moment the tab closed.
+    //
+    // Deliberately NOT awaited: this function is called repeatedly inline
+    // throughout muteProfile/blockProfile/unblockUnmuteProfile's own
+    // multi-step Quora UI sequence (open menu -> confirm -> verify), and
+    // those callers never inspect this function's return value -- they just
+    // `await` it as a checkpoint. Under the service-worker responsiveness
+    // problems observed live-testing this session, awaiting a 4s-bounded
+    // message here at every checkpoint measurably delayed that UI sequence
+    // and was observed to leave a legacy action only partially completed
+    // (an "unmuted" confirmation fired but the block was never actually
+    // removed). Persisting the audit record durably is worth doing, but not
+    // at the cost of slowing down or destabilizing the actual user-facing
+    // action -- fire it in the background and let the in-memory cache pick
+    // up the durable record if/when it lands.
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'record-direct-profile-progress',
         profileHref: normalizedHref,
-        patch
-    }, null, 2500)
-    if(!result?.recorded) {
-        await persistProfileNukeProgressLocally()
-    }
-    await repairCoordinatorQueueRowFromProfileProgress(normalizedHref, nextRecord)
+        patch: nextRecord
+    }, null, 4000).then(directResult => {
+        if(!directResult?.recorded) return
+        const acceptedRecord = directResult.record && typeof directResult.record === 'object'
+            ? directResult.record
+            : nextRecord
+        profileNukeProgress = pruneProfileNukeProgress({
+            ...profileNukeProgress,
+            [normalizedHref]: acceptedRecord
+        })
+    }).catch(() => null)
 
-    return nextRecord
+    return {
+        ...nextRecord,
+        runtimeRecorded: false,
+        localOnly: true,
+        persistPending: true
+    }
 }
 
-async function recordProfileNukeProgressBatch(updates) {
+function isActiveQueuedProgressRecord(normalizedHref = '') {
+    return !!activeQueuedAttemptId &&
+        !!normalizedHref &&
+        activeQueuedAttemptProfileHref === normalizedHref
+}
+
+function applyLocalProfileNukeProgressUpdates(updates) {
     const normalizedUpdates = []
     const nextProgress = {
         ...profileNukeProgress
@@ -666,82 +1251,39 @@ async function recordProfileNukeProgressBatch(updates) {
         const nextRecord = normalizeProfileProgressPatch(normalizedHref, patch, nextProgress[normalizedHref] || null)
         if(!nextRecord) continue
 
-        normalizedUpdates.push({profileHref: normalizedHref, patch})
+        normalizedUpdates.push({profileHref: normalizedHref, patch: nextRecord})
         nextProgress[normalizedHref] = nextRecord
     }
 
     if(!normalizedUpdates.length) return false
 
     profileNukeProgress = pruneProfileNukeProgress(nextProgress)
-    const result = await safeSendRuntimeMessageWithTimeout({
-        action: 'record-nuke-progress-batch',
-        updates: normalizedUpdates
-    }, null, 2500)
-    if(!result?.recorded) {
-        await persistProfileNukeProgressLocally()
-    }
-    return true
+    return false
 }
 
-async function repairCoordinatorQueueRowFromProfileProgress(href, record = null) {
-    if(!isSuccessfulProfileNukeRecord(record)) return false
-
-    const normalizedHref = normalizeQuoraProfileHref(href || record?.profileHref || '')
-    if(!normalizedHref) return false
-
-    for(let attempt = 0; attempt < 4; attempt += 1) {
-        const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
-        const queue = stored[COORDINATOR_QUEUE_KEY] || {}
-        const item = queue[normalizedHref]
-        if(!item) return false
-        if(`${item.status || ''}` === 'succeeded') return true
-
-        const now = Date.now()
-        const terminalAt = Number.parseInt(record.terminalAt || record.blockedAt || record.updatedAt, 10) || now
-        const nextItem = {
-            ...item,
-            status: 'succeeded',
-            outcome: record.status === 'already-blocked' ? 'already-blocked' : 'blocked',
-            error: '',
-            updatedAt: Math.max(Number.parseInt(item.updatedAt, 10) || 0, Number.parseInt(record.updatedAt, 10) || 0, now),
-            terminalAt,
-            tabId: null,
-            milestones: {
-                ...(item.milestones || {}),
-                muteAttemptedAt: record.muteAttemptedAt || item.milestones?.muteAttemptedAt || 0,
-                blockAttemptedAt: record.blockAttemptedAt || item.milestones?.blockAttemptedAt || 0,
-                tabClosedAt: record.tabClosedAt || item.milestones?.tabClosedAt || 0
-            }
-        }
-
-        await safeStorageSet({
-            [COORDINATOR_QUEUE_KEY]: {
-                ...queue,
-                [normalizedHref]: nextItem
-            }
-        })
-
-        await sleep(50 + attempt * 100)
-        const verified = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
-        const verifiedItem = verified[COORDINATOR_QUEUE_KEY]?.[normalizedHref]
-        if(`${verifiedItem?.status || ''}` === 'succeeded') return true
+function mapProfileProgressToCoordinatorState(record = {}) {
+    const mapped = mapProgressToCoordinatorState(record)
+    return {
+        status: mapped.status || '',
+        outcome: mapped.outcome || '',
+        error: mapped.error || '',
+        terminal: mapped.terminal === true
     }
+}
 
-    return false
+function getAttemptIdFromValue(value = null) {
+    if(!value || typeof value !== 'object') return ''
+    return `${value.attemptId || value.attempt?.id || ''}`.trim()
+}
+
+function getAttemptNumberFromValue(value = null) {
+    if(!value || typeof value !== 'object') return 0
+    return Number.parseInt(value.attemptNumber ?? value.attempt?.number, 10) || 0
 }
 
 function getProfileNukeProgressRecord(href) {
     const normalizedHref = normalizeQuoraProfileHref(href)
     return normalizedHref ? profileNukeProgress?.[normalizedHref] || null : null
-}
-
-async function persistProfileNukeProgressLocally() {
-    const stored = (await safeStorageGet({[PROFILE_NUKE_PROGRESS_KEY]: {}}))[PROFILE_NUKE_PROGRESS_KEY] || {}
-    profileNukeProgress = normalizeStoredProfileNukeProgress({
-        ...stored,
-        ...profileNukeProgress
-    })
-    await safeStorageSet({[PROFILE_NUKE_PROGRESS_KEY]: profileNukeProgress})
 }
 
 async function recordCurrentProfileNukeProgress(patch = {}) {
@@ -756,27 +1298,204 @@ async function recordCurrentProfileNukeProgress(patch = {}) {
     })
 }
 
+function noteCurrentProfileNukeProgress(patch = {}) {
+    void recordCurrentProfileNukeProgress(patch)
+}
+
+// Reports whether this profile was already blocked the moment this tab
+// first got a chance to check -- fire-and-forget, safe to call repeatedly
+// (every attempt/retry calls this, but the service worker only ever keeps
+// the first report: see mutateCoordinatorInitialBlockedState, sw.js). Only
+// meaningful for a coordinator-managed action (activeQueuedAttemptId set);
+// a manual/legacy button click has no coordinator row for this to attach
+// to, and the service worker's own guard would just no-op it anyway, so
+// skip the round trip entirely for that case. See
+// classifyBlockConfirmationFromItem's comment (sw.js) for why this exists:
+// a later retry's own tab has no memory of whether an *earlier* attempt was
+// the one that actually clicked block, so relying only on the current
+// attempt's local state loses that history.
+function reportInitialBlockedStateIfQueued(blocked) {
+    if(!activeQueuedAttemptId) return
+    reportInitialBlockedStateUnconditionally(blocked)
+}
+
+// 2026-09-29: the close-if-blocked message handler (onMessage below) calls
+// this instead of reportInitialBlockedStateIfQueued above -- that gate
+// exists to skip the round trip for a manual/legacy button click with no
+// coordinator row, but close-if-blocked is a message the coordinator only
+// ever sends to a tab it's already tracking as an active queued row, so the
+// gate is simply wrong there: it's guaranteed coordinator context already.
+// Confirmed live 2026-09-29 (FPT-Camera-3): this poll starts firing the
+// moment the tab opens, well before the claim round trip that sets
+// activeQueuedAttemptId completes (which took ~10s under load in that
+// session, across repeated re-claims) -- every not-blocked observation from
+// that window was silently dropped by the old gate, even though the
+// service worker resolves the row from the tab's already-attached queued-
+// tab metadata (set at tab-open time, independent of the claim) and could
+// have accepted them. The row's true not-blocked starting state lost the
+// "recorded once, first report wins" race to whichever observation reached
+// the service worker first *after* activeQueuedAttemptId was finally set --
+// misclassifying a genuine live block as already-blocked.
+// Diagnostic events for the flight recorder: what the user did on the page and when the page's blocked
+// state changed. Stamped with this page's clock so they line up with the worker's own events.
+function reportPageEvent(event, detail = '') {
+    void safeSendRuntimeMessage({
+        action: 'record-page-event',
+        event,
+        detail: `${detail || ''}`.slice(0, 80),
+        clientAt: Date.now()
+    }).catch(() => null)
+}
+
+let lastReportedProfileBlocked = null
+
+function reportProfileBlockedTransition() {
+    if(getPageType() !== 'profile') return
+    const blocked = !!isProfileBlocked()
+    if(blocked === lastReportedProfileBlocked) return
+    lastReportedProfileBlocked = blocked
+    reportPageEvent('profile-blocked-state', blocked ? 'blocked' : 'not-blocked')
+}
+
+function installProfilePageEventListeners() {
+    for(const type of ['pointerdown', 'click']) {
+        document.addEventListener(type, event => {
+            if(getPageType() !== 'profile') return
+            const target = event.target?.closest?.('button, a, [role="menuitem"], [role="menu"] *') || event.target
+            const label = `${target?.textContent || target?.getAttribute?.('aria-label') || ''}`.replace(/\s+/g, ' ').trim()
+            if(!/mute|block|unmute|unblock|confirm|yes/i.test(label)) return
+            reportPageEvent(`user-${type}`, label)
+        }, true)
+    }
+}
+
+function reportInitialBlockedStateUnconditionally(blocked) {
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'record-initial-blocked-state',
+        blocked: blocked === true
+    }, null, SAFE_SEND_RUNTIME_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
+function getDirectBlockActionDiagnostic(branch = '', extra = {}) {
+    const blockButton = getMenuAction(isBlockActionLabel)
+    const unblockButton = getMenuAction(isUnblockActionLabel)
+    const confirmButton = getBlockConfirmAction()
+    return {
+        branch,
+        url: location.href,
+        pageType: getPageType() || 'unknown',
+        profileBlocked: isProfileBlocked(),
+        profileMenuOpen: isProfileMenuOpen(),
+        profileMenuButtonRect: getProfileMenuButtonDebugRect(),
+        menuActionLabels: getVisibleProfileMenuActionLabels(),
+        blockOptionPresent: !!blockButton,
+        blockOptionLabel: getActionDebugLabel(blockButton),
+        blockOptionRect: getActionDebugRect(blockButton),
+        unblockOptionPresent: !!unblockButton,
+        unblockOptionLabel: getActionDebugLabel(unblockButton),
+        unblockOptionRect: getActionDebugRect(unblockButton),
+        blockConfirmPresent: !!confirmButton,
+        blockConfirmLabel: getActionDebugLabel(confirmButton),
+        blockConfirmRect: getActionDebugRect(confirmButton),
+        securityVerification: !!getSecurityVerificationReason(),
+        securityVerificationReason: getSecurityVerificationReason(),
+        unavailableReason: getProfileUnavailableReason() || '',
+        ...extra
+    }
+}
+
+async function clearProfileNukeState(href, reason = '') {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    if(!normalizedHref) return false
+
+    delete profileNukeProgress[normalizedHref]
+    clearProfileBlockHint()
+    rememberProfileUnblocked(normalizedHref)
+
+    const result = await safeSendRuntimeMessageWithTimeout({
+        action: 'clear-profile-nuke-state',
+        profileHref: normalizedHref,
+        reason
+    }, null, 2500)
+
+    if(result) {
+        if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
+            profileNukeProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
+        }
+        if(result.pendingPosts && typeof result.pendingPosts === 'object') {
+            spacePendingNukedPosts = result.pendingPosts
+        }
+        if(result.nukedPosts && typeof result.nukedPosts === 'object') {
+            spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
+        }
+        return !!result.cleared
+    }
+
+    return false
+}
+
+async function maybeClearCurrentProfileNukeStateFromLiveUnblocked() {
+    if(getPageType() !== 'profile') return false
+    if(activeQueuedAttemptId) return false
+
+    const href = getProfileKey(location.href)
+    if(!href) return false
+
+    const record = getProfileNukeProgressRecord(href)
+    if(!isSuccessfulProfileNukeRecord(record)) return false
+    if(record.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) return false
+
+    const reconcileKey = [
+        href,
+        record.status || '',
+        record.updatedAt || 0,
+        record.terminalAt || 0
+    ].join('|')
+    if(reconcileKey === manualUnblockedReconcileKey) return false
+    manualUnblockedReconcileKey = reconcileKey
+
+    if(!isProfileBlocked()) {
+        rememberProfileUnblocked(href)
+        await clearProfileNukeState(href, 'Visible profile is no longer blocked')
+        ensureProfileButtons()
+        return true
+    }
+
+    if(!getProfileMenuButton()) return false
+
+    const blockState = await readProfileMenuState(isBlockActionLabel, isUnblockActionLabel, 1200, 150)
+    if(blockState !== 'primary') return false
+
+    rememberProfileUnblocked(href)
+    await clearProfileNukeState(href, 'Profile menu offers Block after stored nuke success')
+    ensureProfileButtons()
+    return true
+}
+
 async function maybeRecordAlreadyBlockedCoordinatorProfile() {
     if(getPageType() !== 'profile' || !isProfileBlocked()) return
 
     const href = normalizeQuoraProfileHref(location.href)
     if(!href) return
 
-    const stored = await safeStorageGet({[COORDINATOR_QUEUE_KEY]: {}})
-    const item = stored[COORDINATOR_QUEUE_KEY]?.[href]
+    await refreshCoordinatorQueueFromRuntime({
+        profileHrefs: [href]
+    })
+    const item = coordinatorQueue[href]
     if(!item || `${item.status || ''}` === 'succeeded') return
+    if(`${item.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) return
 
-    const repairKey = [
+    const reconcileKey = [
         href,
         item.status || '',
         item.outcome || '',
         item.updatedAt || 0,
         item.terminalAt || 0
     ].join('|')
-    if(repairKey === alreadyBlockedCoordinatorRepairKey) return
-    alreadyBlockedCoordinatorRepairKey = repairKey
+    if(reconcileKey === alreadyBlockedCoordinatorReconcileKey) return
+    alreadyBlockedCoordinatorReconcileKey = reconcileKey
 
-    await recordProfileNukeProgress(href, {
+    const progressPatch = {
         status: 'already-blocked',
         openedViablePage: true,
         foundBlockedBeforeQueue: true,
@@ -786,13 +1505,84 @@ async function maybeRecordAlreadyBlockedCoordinatorProfile() {
         resolvedProfileHref: href,
         remappedFromRequested: false,
         finalError: '',
-        event: 'Visible profile was already blocked; repairing coordinator row'
+        event: 'Visible profile was already blocked; reconciling coordinator row'
+    }
+    const progress = await recordAlreadyBlockedCoordinatorProgress(href, item, progressPatch)
+    if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+        alreadyBlockedCoordinatorReconcileKey = ''
+        console.info('Already-blocked reconcile was not recorded; leaving queued tab open for retry')
+        setTimeout(() => void sweepServiceWorkerBlockedProfileTabs(), 1000)
+        setTimeout(() => void maybeRecordAlreadyBlockedCoordinatorProfile(), 2000)
+        return
+    }
+
+    if(isActiveQueuedProgressRecord(href)) {
+        await notifyQueuedTabComplete()
+        await requestCloseTab()
+    }
+    else if(item?.serviceWorkerOwned === true || `${item?.executorOwner || ''}` === 'service-worker') {
+        setTimeout(() => void sweepServiceWorkerBlockedProfileTabs(), 1000)
+    }
+}
+
+async function recordAlreadyBlockedCoordinatorProgress(href, item = {}, patch = {}) {
+    const attemptId = `${item?.attemptId || item?.attempt?.id || ''}`.trim()
+    const attemptNumber = Number.parseInt(item?.attemptNumber ?? item?.attempt?.number, 10) || 0
+
+    if(!attemptId || item?.serviceWorkerOwned !== true && `${item?.executorOwner || ''}` !== 'service-worker') {
+        return recordProfileNukeProgress(href, patch)
+    }
+
+    const nextRecord = normalizeProfileProgressPatch(href, {
+        ...patch,
+        actionKind: item?.actionKind || 'mute-block',
+        runId: item?.runId || '',
+        attemptId,
+        attemptNumber,
+        ownerTabId: item?.ownerTabId || SERVICE_WORKER_QUEUE_OWNER_ID,
+        ownerWindowId: item?.ownerWindowId || null
     })
-    await confirmCurrentProfileBlockedSpaceFeedEntries(href)
+    if(!nextRecord) return null
+
+    const mapped = mapProfileProgressToCoordinatorState(nextRecord)
+    if(!mapped.terminal) return recordProfileNukeProgress(href, patch)
+
+    profileNukeProgress = pruneProfileNukeProgress({
+        ...profileNukeProgress,
+        [href]: nextRecord
+    })
+
+    const result = await sendRecordedRuntimeMessageWithRetry({
+        action: 'record-job-terminal',
+        profileHref: href,
+        patch: nextRecord,
+        attemptId,
+        attemptNumber
+    }, mapped)
+
+    if(result?.recorded) {
+        const acceptedRecord = result.record && typeof result.record === 'object'
+            ? result.record
+            : nextRecord
+        profileNukeProgress = pruneProfileNukeProgress({
+            ...profileNukeProgress,
+            [href]: acceptedRecord
+        })
+    }
+
+    return {
+        ...nextRecord,
+        runtimeRecorded: !!result?.recorded,
+        staleAttempt: result?.staleAttempt === true,
+        serviceWorkerOnly: true
+    }
 }
 
 async function notifyQueuedTabComplete() {
-    const result = await safeSendRuntimeMessage({action: 'release-tab-slot'}, null)
+    const result = await safeSendRuntimeMessageWithTimeout({
+        action: 'release-job-tab',
+        attemptId: activeQueuedAttemptId || ''
+    }, null, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
     return !!result?.released
 }
 
@@ -804,8 +1594,54 @@ async function sweepBlockedProfileTabs() {
     }
 }
 
-async function getOwnedNukeStatus() {
-    const result = await safeSendRuntimeMessageWithTimeout({action: 'get-owned-nuke-status'}, null, 2500)
+async function sweepServiceWorkerBlockedProfileTabs() {
+    const result = await safeSendRuntimeMessage({action: 'sweep-service-worker-blocked-profile-tabs'}, null)
+    return {
+        owned: Number.parseInt(result?.owned, 10) || 0,
+        signaled: Number.parseInt(result?.signaled, 10) || 0
+    }
+}
+
+// Timeline for space-feed marking latency (diagnostic only; nothing reads it in
+// the extension). Events go to an attribute on <html>, which the body observer
+// does not watch, so a CDP reader can pull them from the page.
+const SPACE_MARK_PERF_ATTRIBUTE = 'data-mb-perf-space-marking'
+const SPACE_MARK_PERF_MAX_RECENT_EVENTS = 100
+const spaceMarkPerfEvents = []
+// Running totals per event name, so a long run (100+ page-downs) stays complete
+// even after the recent-event window has rolled past it.
+const spaceMarkPerfTotals = {}
+
+function recordSpaceMarkPerf(name = '', fields = {}) {
+    try {
+        const t = Date.now()
+        spaceMarkPerfEvents.push({t, name, ...fields})
+        if(spaceMarkPerfEvents.length > SPACE_MARK_PERF_MAX_RECENT_EVENTS) {
+            spaceMarkPerfEvents.splice(0, spaceMarkPerfEvents.length - SPACE_MARK_PERF_MAX_RECENT_EVENTS)
+        }
+        const total = spaceMarkPerfTotals[name] || {count: 0, sumMs: 0, maxMs: 0, okCount: 0}
+        total.count += 1
+        if(typeof fields.ms === 'number') {
+            total.sumMs += fields.ms
+            total.maxMs = Math.max(total.maxMs, fields.ms)
+        }
+        if(fields.ok === true) total.okCount += 1
+        spaceMarkPerfTotals[name] = total
+        document.documentElement?.setAttribute(SPACE_MARK_PERF_ATTRIBUTE, JSON.stringify({
+            totals: spaceMarkPerfTotals,
+            recent: spaceMarkPerfEvents
+        }))
+    }
+    catch {}
+}
+
+async function getOwnedNukeStatus(options = {}) {
+    const startedAt = Date.now()
+    const result = await safeSendRuntimeMessageWithTimeout({
+        action: 'get-owned-nuke-status',
+        runId: options.runId || ''
+    }, null, 2500)
+    recordSpaceMarkPerf('ownedStatus', {ms: Date.now() - startedAt, ok: !!result})
     return normalizeOwnedNukeStatus(result)
 }
 
@@ -826,16 +1662,21 @@ function updateOwnedNukeStatusCache(status = null) {
     return ownedNukeStatusCache
 }
 
-async function promoteCurrentQueuedTab(reason = 'hidden-tab-stall', allowForegroundFallback = true) {
-    if(!allowForegroundFallback) return false
-    if(document.visibilityState === 'visible') return false
+async function promoteCurrentQueuedTab(reason = 'hidden-tab-stall', allowForegroundFallback = false) {
+    if(!allowForegroundFallback) return {promoted: false, reason: 'foreground-fallback-disabled'}
 
-    const response = await safeSendRuntimeMessage({
+    const response = await safeSendRuntimeMessageWithTimeout({
         action: 'promote-queued-tab',
-        reason
-    }, {promoted: false})
+        reason,
+        attemptId: activeQueuedAttemptId || '',
+        attemptNumber: activeQueuedAttemptNumber || 0
+    }, {promoted: false, reason: 'promote-message-timeout'}, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
 
-    return !!response?.promoted
+    return {
+        ...(response || {}),
+        promoted: response?.promoted === true,
+        reason: response?.reason || (response?.promoted ? 'promoted' : 'promote-denied')
+    }
 }
 
 async function refreshOwnedNukeStatusCache() {
@@ -855,9 +1696,17 @@ function formatNukeProgressLabel(label, status = null) {
     return `${label} [t:${status.owned} a:${status.active} q:${status.queued}]`
 }
 
-function formatSpaceFeedNukingLabel(entries = [], label = 'Nuking...') {
-    const remaining = getDedupedSpaceFeedUrls(entries).length
-    return remaining > 0 ? `${label} ${remaining} left` : label
+function formatSpaceFeedGlobalWorkLabel(count = 0) {
+    const remaining = Number.parseInt(count, 10) || 0
+    return remaining > 0 ? `Nuking... ${remaining} left` : 'Nuking...'
+}
+
+function formatSpaceFeedPostWorkLabel() {
+    return 'Nuking this'
+}
+
+function formatSpaceFeedNukingLabel(entries = []) {
+    return formatSpaceFeedGlobalWorkLabel(getSpaceFeedQueuedWorkCount(entries))
 }
 
 function getSpaceFeedNukeButtonMode(button) {
@@ -865,26 +1714,34 @@ function getSpaceFeedNukeButtonMode(button) {
 }
 
 function rememberActiveSpaceFeedNukeMode(button, runId) {
+    const space = resolveCurrentSpaceDescriptor()
     activeSpaceFeedNukeMode = getSpaceFeedNukeButtonMode(button)
     activeSpaceFeedNukeRunId = runId || ''
+    activeSpaceFeedNukeSpaceKey = space?.key || ''
 }
 
 function clearInactiveSpaceFeedNukeMode() {
-    if(spaceFeedNukingPostKeys.size || hasOwnedNukeWorkInFlight() || hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
+    if(spaceFeedNukingPostKeys.size ||
+        getStoredPendingSpaceFeedWorkCountForSpace() > 0 ||
+        hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) {
+        return false
+    }
 
     activeSpaceFeedNukeMode = ''
     activeSpaceFeedNukeRunId = ''
+    activeSpaceFeedNukeSpaceKey = ''
     return true
 }
 
-function isActiveSpaceFeedNukeMode(mode, localBusy = false) {
-    return activeSpaceFeedNukeMode === mode &&
-        (localBusy || hasOwnedNukeWorkInFlight())
+function isActiveSpaceFeedNukeMode(mode, localBusy = false, space = resolveCurrentSpaceDescriptor()) {
+    if(activeSpaceFeedNukeMode !== mode) return false
+    if(activeSpaceFeedNukeSpaceKey && space?.key && activeSpaceFeedNukeSpaceKey !== space.key) return false
+
+    return localBusy || hasOwnedNukeWorkInFlight()
 }
 
 function isUnknownSpaceFeedNukeActive(localBusy = false) {
-    return !activeSpaceFeedNukeMode &&
-        (localBusy || hasOwnedNukeWorkInFlight())
+    return !activeSpaceFeedNukeMode && localBusy
 }
 
 function hasOwnedNukeWorkInFlight(status = ownedNukeStatusCache) {
@@ -914,13 +1771,13 @@ function syncOwnedNukeDrainButton(button, status = null) {
     setNukeButtonDone(button)
 }
 
-async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalMs = 1000, options = {}) {
+async function waitForOwnedNukeTabsToDrain(button, timeoutMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_INTERVAL_MS, options = {}) {
     const startedAt = Date.now()
     let nextSweepAt = 0
     const allowPause = !!options.allowPause
 
     while(Date.now() - startedAt < timeoutMs) {
-        const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+        const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus({runId: options.runId || ''}))
         if(status.owned <= 0 && status.queued <= 0) {
             setNukeButtonDone(button)
             return true
@@ -938,7 +1795,7 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalM
         await sleep(intervalMs)
     }
 
-    const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+    const status = updateOwnedNukeStatusCache(await getOwnedNukeStatus({runId: options.runId || ''}))
     if(allowPause && status.paused) {
         setNukeButtonIdle(button)
         return false
@@ -947,25 +1804,46 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = 180000, intervalM
     return false
 }
 
+let observerStarted = false
+
 function startObserver() {
+    if(observerStarted) return
+    observerStarted = true
+
     new MutationObserver(async mutations => {
         if(location.href !== currentUrl) {
             const previousProfileKey = getProfileKey(currentUrl)
             currentUrl = location.href
             resetQuestionPageBtn()
             resetSpacePostNukeBtn()
+            resetProfileSearchControls()
             resetSpaceAssetNukeControls()
             resetSpaceFeedScanCache()
+            if(getPageType() !== 'profile') resetProfileButtonRail()
 
             const nextProfileKey = getProfileKey(currentUrl)
             if(previousProfileKey !== nextProfileKey) {
                 clearProfileBlockHint()
+                resetProfileButtonsRefreshBurstGuard()
+                // Switching from one profile to another without ever leaving
+                // page type 'profile' (e.g. a same-tab navigation) used to
+                // leave the previous profile's rail and buttons in place --
+                // isProfileTargetPlacement only checks parentage, not which
+                // profile the buttons were bound for, so they'd silently
+                // keep working the WRONG profile instead of being rebuilt.
+                resetProfileButtonRail()
             }
         }
 
         const page = getPageType()
 
+        if(page === 'profile') reportProfileBlockedTransition()
         if(page === 'profile' && shouldRefreshProfileButtons(mutations)) {
+            scheduleProfileButtonsRefresh()
+        }
+        // The buttons wait for Quora's menu button, which may appear without the menu nodes checked above.
+        if(page === 'profile' && !isProfileBlocked() &&
+            !document.querySelector('.mb-ext_mute-block-btn') && getProfileMenuButton()) {
             scheduleProfileButtonsRefresh()
         }
 
@@ -979,6 +1857,7 @@ function startObserver() {
             if(!areExtensionOnlyMutations(mutations)) {
                 const hasStructuralFeedChange = hasSpaceFeedStructuralMutations(mutations)
                 if(hasStructuralFeedChange) {
+                    recordSpaceMarkPerf('mutation')
                     invalidateSpaceFeedEntryCacheForMutations(mutations)
                 }
                 injectSpaceSidebarOpenProfilesBtn()
@@ -993,6 +1872,19 @@ function startObserver() {
                     scheduleSpaceAssetNukeControls(180)
                 }
             }
+        }
+        else if(page === 'profile-search' && !areExtensionOnlyMutations(mutations)) {
+            scheduleProfileSearchControls(180)
+        }
+
+        const activeModal = getProfilePeopleModal()
+        const activeModalButtons = getModalProfileActionButtons(activeModal)
+        const needsLateModalActions = activeModal &&
+            getProfileModalItems(activeModal).length &&
+            ((!activeModalButtons.open && getOpenableProfileModalItems(activeModal).length) ||
+                (!activeModalButtons.nuke && getNukeableProfileModalItems(activeModal).length))
+        if(needsLateModalActions) {
+            injectModalOpenProfilesBtn()
         }
 
         let modal = document.querySelector('[role="dialog"][aria-modal="true"]:not([data-mb-checked])')
@@ -1013,7 +1905,12 @@ function installSpaceFeedViewportRefresh() {
     if(spaceAssetNukeViewportListenerInstalled) return
 
     const scheduleFromResize = () => {
-        if(getPageType() !== 'space') return
+        const page = getPageType()
+        if(page === 'profile-search') {
+            scheduleProfileSearchControls(160)
+            return
+        }
+        if(page !== 'space') return
 
         clearTimeout(spaceAssetNukeViewportTimeout)
         spaceAssetNukeViewportTimeout = setTimeout(() => {
@@ -1023,8 +1920,14 @@ function installSpaceFeedViewportRefresh() {
     }
 
     const scheduleFromScroll = () => {
-        if(getPageType() !== 'space') return
+        const page = getPageType()
+        if(page === 'profile-search') {
+            scheduleProfileSearchControls(220)
+            return
+        }
+        if(page !== 'space') return
 
+        if(Date.now() > spaceFeedScrollActiveUntil) recordSpaceMarkPerf('scrollStart')
         spaceFeedScrollActiveUntil = Date.now() + SPACE_FEED_SCROLL_IDLE_MS
         clearTimeout(spaceAssetNukeViewportTimeout)
         spaceAssetNukeViewportTimeout = setTimeout(() => {
@@ -1044,6 +1947,9 @@ function resetSpaceFeedScanCache() {
     discoveredSpaceFeedEntries = new Map()
     spaceFeedEntryCache = new Map()
     spaceFeedRootCache = new WeakMap()
+    spaceFeedScopedStateSignature = ''
+    spaceFeedScopedStateRefreshQueuedEntries = null
+    spaceFeedScopedStateRefreshQueuedSignature = ''
 }
 
 function getSpaceFeedPostRootFromMutationNode(node) {
@@ -1107,7 +2013,8 @@ function syncSpaceFeedCachedViewportControls() {
     if(getPageType() !== 'space' || !latestSpaceFeedEntries.length || !isNukableSpacePage()) return false
 
     const entries = getLatestSpaceFeedEntries()
-    syncSpaceFeedTopNukeButton(entries)
+    const renderModel = buildSpaceFeedRenderModel(entries)
+    syncSpaceFeedTopNukeButton(renderModel)
     syncSpaceFeedTopBarLayout()
     return true
 }
@@ -1117,7 +2024,8 @@ function getCachedSpaceFeedEntries() {
         ...entry,
         postKey: entry.postKey,
         postUrl: entry.postUrl,
-        candidateUrls: [...entry.candidateUrls]
+        candidateUrls: [...entry.candidateUrls],
+        resolutionReason: entry.resolutionReason || ''
     }))
 }
 
@@ -1125,13 +2033,18 @@ function scheduleSpaceFeedProgressDrivenRefresh() {
     if(getPageType() !== 'space') return false
 
     const entries = getCachedSpaceFeedEntries()
+    const hasActiveSpaceWork = getStoredPendingSpaceFeedWorkCountForSpace() > 0 ||
+        (entries.length ? hasActivePendingSpaceFeedWork(entries) : false)
     if(entries.length && isNukableSpacePage()) {
-        syncSpaceFeedTopNukeButton(entries)
+        const renderModel = buildSpaceFeedRenderModel(entries)
+        syncSpaceFeedTopNukeButton(renderModel)
         syncSpaceFeedTopBarLayout()
         scheduleSpaceFeedProgressReconciliation(entries, 250)
     }
 
-    scheduleSpaceAssetNukeControls(hasOwnedNukeWorkInFlight() ? 800 : SPACE_FEED_PROGRESS_REFRESH_IDLE_MS)
+    scheduleSpaceAssetNukeControls(hasOwnedNukeWorkInFlight() || hasActiveSpaceWork
+        ? 800
+        : SPACE_FEED_PROGRESS_REFRESH_IDLE_MS)
     return true
 }
 
@@ -1169,29 +2082,36 @@ function areExtensionOnlyMutations(mutations) {
 
 function syncProfileButtons() {
     injectCloseTabBtn()
+    toggleUnblockUnmuteBtn()
     toggleMuteBlockBtn()
     toggleMuteBlockCloseBtn()
+    positionProfileButtonRail(getProfileButtonInsertionTarget())
+    void maybeClearCurrentProfileNukeStateFromLiveUnblocked()
     void maybeRecordAlreadyBlockedCoordinatorProfile()
+    nudgeCurrentProfilePendingClaim()
 }
 
 function hasProfileButtons() {
     const hasCloseBtn = !!document.querySelector('.mb-ext_close-tab-btn')
+    const hasUnblockBtn = !isProfileBlocked() || !!document.querySelector('.mb-ext_unblock-unmute-btn')
     const hasMuteBtn = !!document.querySelector('.mb-ext_mute-block-btn') || isProfileBlocked()
     const hasMuteCloseBtn = !!document.querySelector('.mb-ext_mute-block-close-btn') || isProfileBlocked()
-    return hasCloseBtn && hasMuteBtn && hasMuteCloseBtn
+    return hasCloseBtn && hasUnblockBtn && hasMuteBtn && hasMuteCloseBtn
 }
 
 function areProfileButtonsCorrectlyPlaced(target = getProfileButtonInsertionTarget()) {
     const closeBtn = document.querySelector('.mb-ext_close-tab-btn')
+    const unblockBtn = document.querySelector('.mb-ext_unblock-unmute-btn')
     const muteBtn = document.querySelector('.mb-ext_mute-block-btn')
     const muteCloseBtn = document.querySelector('.mb-ext_mute-block-close-btn')
 
-    if(!target) return !closeBtn && (!muteBtn || isProfileBlocked()) && (!muteCloseBtn || isProfileBlocked())
+    if(!target) return !closeBtn && (!unblockBtn || !isProfileBlocked()) && (!muteBtn || isProfileBlocked()) && (!muteCloseBtn || isProfileBlocked())
     if(closeBtn && !isProfileTargetPlacement(closeBtn, target)) return false
+    if(unblockBtn && !isProfileTargetPlacement(unblockBtn, target)) return false
     if(muteBtn && !isProfileTargetPlacement(muteBtn, target)) return false
     if(muteCloseBtn && !isProfileTargetPlacement(muteCloseBtn, target)) return false
 
-    return true
+    return isProfileButtonRailPositionCurrent(target)
 }
 
 function shouldRefreshProfileButtons(mutations) {
@@ -1200,17 +2120,42 @@ function shouldRefreshProfileButtons(mutations) {
     const target = getProfileButtonInsertionTarget()
     if(hasProfileButtons() && areProfileButtonsCorrectlyPlaced(target)) return false
 
-    return mutations.some(mutation => {
+    const wantsRefresh = mutations.some(mutation => {
         return Array.from(mutation.removedNodes).some(node => {
             return node.nodeType === Node.ELEMENT_NODE &&
-                (node.matches?.('.mb-ext_close-tab-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn') ||
-                    node.querySelector?.('.mb-ext_close-tab-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn'))
+                (node.matches?.('.mb-ext_close-tab-btn, .mb-ext_unblock-unmute-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn') ||
+                    node.querySelector?.('.mb-ext_close-tab-btn, .mb-ext_unblock-unmute-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn'))
         }) || Array.from(mutation.addedNodes).some(node => {
             return node.nodeType === Node.ELEMENT_NODE &&
                 (node.matches?.('[role="menu"], [data-popper-placement], [aria-haspopup="menu"]') ||
                     node.querySelector?.('[role="menu"], [data-popper-placement], [aria-haspopup="menu"]'))
         })
     })
+    if(!wantsRefresh) return false
+
+    return admitProfileButtonsRefreshBurst()
+}
+
+// See PROFILE_BUTTONS_REFRESH_BURST_LIMIT above for why this exists: caps
+// how many refreshes a single burst of qualifying mutations can trigger so
+// a host re-render (or our own remove-then-recreate, if the insertion
+// target's identity churns) can't keep re-satisfying
+// shouldRefreshProfileButtons and flash the injected buttons/native menu
+// indefinitely. Resets after a quiet gap, or explicitly on profile-key
+// change (see startObserver).
+function admitProfileButtonsRefreshBurst() {
+    const now = Date.now()
+    if(now - profileButtonsRefreshBurstStartedAt > PROFILE_BUTTONS_REFRESH_BURST_WINDOW_MS) {
+        profileButtonsRefreshBurstStartedAt = now
+        profileButtonsRefreshBurstCount = 0
+    }
+    profileButtonsRefreshBurstCount += 1
+    return profileButtonsRefreshBurstCount <= PROFILE_BUTTONS_REFRESH_BURST_LIMIT
+}
+
+function resetProfileButtonsRefreshBurstGuard() {
+    profileButtonsRefreshBurstCount = 0
+    profileButtonsRefreshBurstStartedAt = 0
 }
 
 function scheduleProfileButtonsRefresh(delay = 400) {
@@ -1234,7 +2179,10 @@ function scheduleProfileButtonsFollowUps() {
 
     for(const delay of delays) {
         const timeoutId = setTimeout(() => {
-            if(getPageType() === 'profile' && !profileActionInProgress) {
+            if(getPageType() !== 'profile') return
+
+            nudgeCurrentProfilePendingClaim()
+            if(!profileActionInProgress) {
                 ensureProfileButtons()
             }
         }, delay)
@@ -1269,35 +2217,109 @@ function ensureProfileButtons() {
 }
 
 function onMessage(request, sender, sendResponse) {
-    if(request.action === 'close-if-blocked') {
-        if(getPageType() === 'profile' && isProfileBlocked()) {
-            return (async () => {
-                const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
-                const resolvedProfileHref = getProfileKey(location.href) || ''
-                const progressHref = requestedProfileHref || resolvedProfileHref || location.href
+    if(request.action === 'unblock-unmute-profile') {
+        return unblockUnmuteProfile({
+            silent: !!request.silent,
+            allowForegroundFallback: request.allowForegroundFallback !== false
+        })
+    }
 
-                await recordProfileNukeProgress(progressHref, {
-                    status: 'already-blocked',
-                    openedViablePage: true,
-                    foundBlockedBeforeQueue: true,
-                    blockSucceeded: true,
-                    blockedAt: Date.now(),
-                    lastUrl: location.href,
-                    resolvedProfileHref,
-                    remappedFromRequested: !!(requestedProfileHref && resolvedProfileHref && requestedProfileHref !== resolvedProfileHref),
-                    finalError: '',
-                    event: 'Profile confirmed blocked by background sweep'
-                })
-                await confirmCurrentProfileBlockedSpaceFeedEntries(progressHref)
-                await notifyQueuedTabComplete()
-                setTimeout(() => {
-                    void requestCloseTab(2, 100, true)
-                }, 0)
-                return {willClose: true, resolvedProfileHref}
-            })()
+    if(request.action === 'close-if-blocked') {
+        if(`${request.actionKind || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) {
+            return Promise.resolve({willClose: false, reason: 'reverse-action'})
         }
 
-        return {willClose: false, armed: false}
+        if(getPageType() === 'profile') {
+            // getPageType() is URL-only; gate on real readiness (live 2026-09-29).
+            const pageReady = document.readyState !== 'loading' &&
+                (!!getProfileMenuButton() || !!getProfileUnavailableReason())
+            if(!pageReady) return Promise.resolve({willClose: false, reason: 'not-ready', armed: false})
+            const blocked = isProfileBlocked()
+            // Often the first observer of blocked state on an attempt --
+            // unconditional (not gated on activeQueuedAttemptId) since this
+            // call site is always coordinator context already.
+            reportInitialBlockedStateUnconditionally(blocked)
+
+            if(blocked) {
+                const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
+                const resolvedProfileHref = getProfileKey(location.href) || ''
+                if(!requestedProfileHref || !resolvedProfileHref || requestedProfileHref !== resolvedProfileHref) {
+                    return Promise.resolve({
+                        willClose: false,
+                        reason: 'profile-mismatch',
+                        resolvedProfileHref,
+                        lastUrl: location.href
+                    })
+                }
+
+                // blockAttempted is a plain read of this tab's own in-memory
+                // progress cache, set synchronously the moment blockProfile()
+                // dispatches its click -- no storage round trip, so it's
+                // available immediately here even when the durable
+                // item.milestones.blockAttemptedAt write is still stuck behind
+                // the shared coordinator storage-update queue. Lets the service
+                // worker tell "we just blocked this" apart from "this was
+                // already blocked" without waiting on that slower,
+                // sometimes-backed-up channel (classifyBlockConfirmationFromItem,
+                // sw.js).
+                return Promise.resolve({
+                    willClose: true,
+                    resolvedProfileHref,
+                    lastUrl: location.href,
+                    blockAttempted: profileNukeProgress[resolvedProfileHref]?.blockAttempted === true
+                })
+            }
+        }
+
+        // A redirected profile (for example /profile/<slug> redirected to /<slug>) lands on Quora's
+        // not-found page. That page is not a profile page, so it reaches this fall-through instead.
+        if(isQuoraNotFoundPage()) {
+            return Promise.resolve({willClose: false, reason: 'page-not-found', pageUnavailable: true, unavailableReason: 'Page Not Found', lastUrl: location.href})
+        }
+        return Promise.resolve({willClose: false, armed: false})
+    }
+
+    if(request.action === 'claim-current-profile-tab-action') {
+        return (async () => {
+            if(!request.queuedAction) {
+                await refreshCoordinatorQueueFromRuntime().catch(() => null)
+            }
+            const nextProfileAction = request.queuedAction && typeof request.queuedAction === 'object'
+                ? request.queuedAction
+                : undefined
+            if(getPageType() !== 'profile' && !canResolveQueuedProfileFromCurrentPage(nextProfileAction || {})) {
+                return {accepted: false, reason: 'not-profile'}
+            }
+            autoProfileAction = nextProfileAction
+            autoProfileActionAttempts = 0
+            void maybeRecordAlreadyBlockedCoordinatorProfile()
+            void maybeRunAutoProfileAction()
+            scheduleCurrentProfilePendingClaimRescue(500)
+            return {accepted: true, reason: request.reason || ''}
+        })()
+    }
+
+    if(request.action === 'get-profile-action-surface-state') {
+        const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
+        const resolvedProfileHref = getProfileKey(location.href) || ''
+        const confirmationKind = getBlockConfirmAction()
+            ? 'block'
+            : getMuteConfirmAction()
+            ? 'mute'
+            : getUnblockConfirmAction()
+            ? 'unblock'
+            : getUnmuteConfirmAction()
+            ? 'unmute'
+            : ''
+        return Promise.resolve({
+            pageType: getPageType() || '',
+            resolvedProfileHref,
+            requestedProfileHref,
+            profileMatches: !!requestedProfileHref && !!resolvedProfileHref && requestedProfileHref === resolvedProfileHref,
+            pendingProfileConfirmation: !!confirmationKind,
+            confirmationKind,
+            profileActionInProgress
+        })
     }
 
     switch(request.status) {
@@ -1550,6 +2572,22 @@ function setNukeButtonDone(button, label = 'Nuked') {
     button.innerText = label
 }
 
+function setNukeButtonNotice(button, label, restoreLabel = `Nuke 'Em`) {
+    if(!button) return
+
+    setNukeButtonIdle(button, label)
+    const noticeToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    button.dataset.mbNukeNoticeToken = noticeToken
+    setTimeout(() => {
+        if(!button.isConnected) return
+        if(button.dataset.mbNukeNoticeToken !== noticeToken) return
+        if(button.dataset.mbNukeState !== 'idle' || button.innerText !== label) return
+
+        delete button.dataset.mbNukeNoticeToken
+        setNukeButtonIdle(button, restoreLabel)
+    }, 1800)
+}
+
 function setMuteBlockHelp(element, helpText) {
     if(!element) return
 
@@ -1563,11 +2601,32 @@ async function animateNukeButtonPress(button) {
 
     button.classList.remove('mb-ext_nuke-profiles-btn--flash')
     button.classList.remove('mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    await waitForAnimationFramePair({timeoutMs: 120})
     button.classList.add('mb-ext_nuke-profiles-btn--pressed')
     button.classList.add('mb-ext_nuke-profiles-btn--flash')
     await sleep(360)
     button.classList.remove('mb-ext_nuke-profiles-btn--flash')
+}
+
+function waitForAnimationFramePair(options = {}) {
+    const timeoutMs = Math.max(16, Number.parseInt(options.timeoutMs, 10) || 120)
+    return new Promise(resolve => {
+        let settled = false
+        const finish = () => {
+            if(settled) return
+            settled = true
+            clearTimeout(timeoutId)
+            resolve()
+        }
+        const timeoutId = setTimeout(finish, timeoutMs)
+
+        try {
+            requestAnimationFrame(() => requestAnimationFrame(finish))
+        }
+        catch {
+            finish()
+        }
+    })
 }
 
 function installNavigationHooks() {
@@ -1584,26 +2643,35 @@ function installNavigationHooks() {
             clearProfileButtonsFollowUps()
             resetQuestionPageBtn()
             resetSpacePostNukeBtn()
+            resetProfileSearchControls()
             resetSpaceAssetNukeControls()
 
             if(maybeRedirectToCanonicalProfileUrl()) {
                 return
             }
 
-            if(getPageType() === 'profile') {
+            const page = getPageType()
+            setStorageChangeListenerEnabled(page !== 'profile-search')
+            if(page !== 'profile') resetProfileButtonRail()
+
+            if(page === 'profile') {
                 ensureProfileButtons()
                 scheduleProfileButtonsFollowUps()
             }
-            else if(getPageType() === 'space-post') {
+            else if(page === 'space-post') {
                 scheduleSpacePostNukeBtn()
                 scheduleSpacePostFollowUps()
             }
-            else if(getPageType() === 'space') {
+            else if(page === 'space') {
                 activateSpacePageControls(200)
             }
-            else if(getPageType() === 'question') {
+            else if(page === 'question') {
                 ensureQuestionPageFOPBtn()
                 scheduleQuestionPageFollowUps()
+            }
+            else if(page === 'profile-search') {
+                scheduleProfileSearchControls(0)
+                scheduleProfileSearchFollowUps()
             }
 
             scheduleSpacePageFollowUps()
@@ -1664,7 +2732,7 @@ function scheduleSpaceClassificationControls(delay = 150) {
 function shouldRefreshSpaceAssetNukeControls(mutations = null) {
     if(getPageType() !== 'space') return false
 
-    const main = document.querySelector('#mainContent')
+    const main = getSpaceFeedContentRoot()
     const storedEntryCount = Number.parseInt(main?.dataset.mbSpaceFeedEntryCount || '-1', 10)
     const storedPostButtonCount = Number.parseInt(main?.dataset.mbSpaceFeedPostButtonCount || '-1', 10)
     const hasStatusButton = !!document.querySelector('.mb-ext_space-feed-status-btn')
@@ -1739,17 +2807,31 @@ function isQuoraSpaceSubdomainRootPage() {
     )
 }
 
+function pathnameHasSegment(pathname = '', segment = '') {
+    const normalizedSegment = `${segment || ''}`.toLowerCase()
+    if(!normalizedSegment) return false
+
+    const normalizedPathname = `${pathname || ''}`.toLowerCase()
+    const parts = normalizedPathname.split('/').filter(Boolean)
+    return parts.includes(normalizedSegment)
+}
+
 function getPageType() {
     const params = new URLSearchParams(location.search)
+    const pathname = location.pathname || ''
+    const title = document.title || ''
 
     if(getProfileKey(location.href) && params.get('__nsrc__') !== 'notif_page') {
         return 'profile'
     }
-    else if(/\/log(?:$|[/?#])/i.test(location.pathname) || /question\slog/i.test(document.title)) {
+    else if(pathnameHasSegment(pathname, 'log') || title.toLowerCase().includes('question log')) {
         return 'question-log'
     }
-    else if(/^\/topic(?:$|[/?#])/i.test(location.pathname)) {
+    else if(pathname.toLowerCase() === '/topic' || pathname.toLowerCase().startsWith('/topic/')) {
         return 'topic'
+    }
+    else if(isProfileSearchPage()) {
+        return 'profile-search'
     }
     else if(document.querySelector('.puppeteer_test_tribe_info_header')) {
         return 'space'
@@ -1765,6 +2847,14 @@ function getPageType() {
     }
 
     return false
+}
+
+function isProfileSearchPage() {
+    if(location.hostname.toLowerCase() !== 'www.quora.com') return false
+    if((location.pathname || '').toLowerCase() !== '/search') return false
+
+    const params = new URLSearchParams(location.search)
+    return `${params.get('type') || ''}`.toLowerCase() === 'profile'
 }
 
 function maybeRedirectToCanonicalProfileUrl() {
@@ -1904,6 +2994,51 @@ function isSecurityVerificationPage() {
     return !!getSecurityVerificationReason()
 }
 
+// Cloudflare's own challenge-token query parameters, present on the
+// interstitial URL itself -- unlike getSecurityVerificationReason's
+// title/body-text heuristics, this fires immediately (even before the
+// challenge page's DOM has rendered) and is specific to Cloudflare rather
+// than Quora's other security-verification interstitials. Confirmed as the
+// definitive signal during the 2026-09-12 incident: profiles that looked
+// "stuck" for ~30-90s (Ray-Savage-52 and others) were sitting on this
+// interstitial the whole time, not failing inside the extension.
+//
+// 2026-09-25: matching only the exact key `__cf_chl_tk` missed a live
+// incident where Cloudflare was issuing `__cf_chl_rt_tk` instead (a profile,
+// Emily-22838, sat behind an unreported challenge for 2+ minutes with the
+// coordinator endlessly retrying a claim against a page that could never
+// resolve on its own). Cloudflare has used several `__cf_chl_*_tk` variants
+// over time (`__cf_chl_jschl_tk`, `__cf_chl_captcha_tk`, `__cf_chl_rt_tk`,
+// ...) for different challenge types, so matching the shared `__cf_chl`
+// prefix instead of one exact key is the resilient check -- it doesn't
+// depend on knowing every variant Cloudflare currently issues or issues next.
+function isCloudflareChallengePage() {
+    try {
+        const params = new URLSearchParams(location.search)
+        for(const key of params.keys()) {
+            if(key.startsWith('__cf_chl')) return true
+        }
+        return false
+    }
+    catch {
+        return false
+    }
+}
+
+// Fire-and-forget, once per content-script lifetime (a solved challenge
+// navigates/reloads the real page, which reinjects a fresh content script
+// with its own fresh flag) -- callers can check this cheaply on every retry
+// tick of a stuck page without spamming the SW with a message per tick.
+function maybeReportCloudflareChallenge() {
+    if(cloudflareChallengeReported) return
+    if(!isCloudflareChallengePage()) return
+    cloudflareChallengeReported = true
+    void safeSendRuntimeMessageWithTimeout({
+        action: 'cloudflare-challenge-detected',
+        href: location.href
+    }, null, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
+}
+
 function isSecurityVerificationProgressRecord(record) {
     if(!record?.securityVerification) return false
 
@@ -1923,21 +3058,35 @@ function getProfileUnavailableReason() {
 
     const title = (document.title || '').toLowerCase()
     const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()
-    const patterns = [
+
+    // Quora-enforced terminal states (the account itself was banned/disabled
+    // by Quora, not merely missing) are distinguished from generic
+    // not-found cases so callers can treat them as equivalent to an
+    // already-completed block rather than a transient skip.
+    const enforcedPatterns = [
+        // Quora can expose this phrase with dropped "s" glyphs in innerText.
+        /\bthis? (?:profile|user|account) has? been (?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/,
+        /\bthis (?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/,
+        /\b(?:profile|user|account) (?:(?:is|has been) )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted|banned)\b/
+    ]
+    const notFoundPatterns = [
         /\buser not found\b/,
         /\bprofile not found\b/,
         /\bpage not found\b/,
-        /\bthis (?:profile|user|account) (?:is )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted)\b/,
-        /\b(?:profile|user|account) (?:is )?(?:unavailable|disabled|deactivated|deleted|suspended|restricted)\b/,
         /\b(?:profile|user|account) (?:does not|doesn't) exist\b/,
         /\bno longer exists\b/
     ]
+    const matches = pattern => pattern.test(title) || pattern.test(bodyText)
 
-    if(patterns.some(pattern => pattern.test(title) || pattern.test(bodyText))) {
-        return 'Profile unavailable'
-    }
+    if(enforcedPatterns.some(matches)) return 'Profile banned'
+    if(notFoundPatterns.some(matches)) return 'Profile unavailable'
 
     return ''
+}
+
+function isQuoraNotFoundPage() {
+    const bodyText = (document.body?.innerText || '').replace(/s+/g, ' ').trim().toLowerCase()
+    return /page not found/.test(bodyText) && /couldn'?t find the page you were looking for/.test(bodyText)
 }
 
 function getQuestionLogHref() {
@@ -1970,8 +3119,35 @@ function getQuestionDebugState() {
     }
 }
 
+const MAX_ELEMENT_TEXT_CHARS = 4096
+
+function compactElementText(text = '', maxChars = MAX_ELEMENT_TEXT_CHARS) {
+    const input = `${text || ''}`
+    const limit = Math.min(input.length, maxChars)
+    let output = ''
+    let pendingSpace = false
+
+    for(let index = 0; index < limit; index += 1) {
+        const char = input[index]
+        const code = char.charCodeAt(0)
+        const isWhitespace = code <= 32 || code === 160
+        if(isWhitespace) {
+            pendingSpace = output.length > 0
+            continue
+        }
+
+        if(pendingSpace) {
+            output += ' '
+            pendingSpace = false
+        }
+        output += char
+    }
+
+    return output
+}
+
 function getElementText(element) {
-    return (element?.innerText || element?.textContent || '').replace(/\s+/g, ' ').trim()
+    return compactElementText(element?.innerText || element?.textContent || '')
 }
 
 function isVisible(element) {
@@ -2036,6 +3212,22 @@ function getProfilePrimaryAction() {
     return actionButtons[0] || null
 }
 
+// Cheap, page-DOM-only safety check: a maintained followers list isn't
+// practical to get out of Quora, but the profile's own primary action
+// button already tells us the current relationship at the moment we're
+// about to act -- "Following" means the user deliberately follows this
+// person, which is a strong signal a mute/block here would be a mistake
+// (a miscategorized candidate, e.g. a real contributor whose profile link
+// got swept up from a post as if it were a scam-target link). "Follow" /
+// "Follow back" / "Requested" are not an established follow relationship
+// and don't gate anything. Exact match on "Following" only -- deliberately
+// narrow rather than reusing isProfilePrimaryActionText's broader set.
+function isProfileFollowedByCurrentUser() {
+    const action = getProfilePrimaryAction()
+    if(!action) return false
+    return /^following$/i.test(getElementText(action).trim())
+}
+
 function getVisibleButtons(root) {
     if(!root) return []
 
@@ -2077,7 +3269,7 @@ function getQuestionActionRow() {
 }
 
 function getProfileActionRow() {
-    const main = document.querySelector('#mainContent')
+    const main = getSpaceFeedContentRoot()
     if(!main) return null
     const mainRect = main.getBoundingClientRect()
 
@@ -2156,7 +3348,6 @@ function getProfileActionRow() {
             if(secondaryButtons.length >= 1) score += 420
             if(secondaryButtons.length >= 2) score += 320
             if(primaryButtons.length) score += 180
-            if(isProfileBlocked()) score += 180
             if(rowTexts.includes('notify me')) score += 320
             if(rowTexts.includes('ask')) score += 260
             if(rowTexts.includes('message')) score += 180
@@ -2204,18 +3395,18 @@ function getProfileActionAnchor(actionRow = getProfileActionRow()) {
     return secondaryButtons[0] || null
 }
 
+// Buttons live in profileButtonRail (see getOrCreateProfileButtonRail), not
+// as DOM siblings of target.element -- so "correctly placed" just means the
+// button is one of ours and lives in the rail. Whether the rail itself is
+// currently positioned at target's live location is a separate, position-
+// based check (isProfileButtonRailPositionCurrent), because Quora can (and
+// does, on this profile page, roughly every 1-2s) destroy and recreate
+// target.element on its own without the button needing to move at all.
 function isProfileTargetPlacement(button, target) {
     if(!button || !target?.element) return false
-    if(button.parentElement !== target.element.parentElement) return false
     if(!getProfileManagedButtonKind(button)) return false
 
-    if(target.type === 'before-menu') {
-        const sequence = getManagedButtonSequenceBeforeTarget(target)
-        return sequence.join('|') === PROFILE_ACTION_BUTTON_ORDER.filter(kind => sequence.includes(kind)).join('|')
-    }
-
-    const sequence = getManagedButtonSequenceAfterTarget(target)
-    return sequence.join('|') === PROFILE_ACTION_BUTTON_ORDER.filter(kind => sequence.includes(kind)).join('|')
+    return button.parentElement === profileButtonRail
 }
 
 function getQuestionActionMenuButton() {
@@ -2270,6 +3461,9 @@ function getQuestionButtonInsertionTarget() {
 }
 
 function getProfileMenuButton() {
+    const extensionRowMenu = getProfileExtensionActionRowMenuButton()
+    if(extensionRowMenu) return extensionRowMenu
+
     const actionRow = getProfileActionRow()
     const actionAnchor = getProfileActionAnchor(actionRow)
     if(!actionRow || !actionAnchor) {
@@ -2278,7 +3472,7 @@ function getProfileMenuButton() {
 
     const scope = actionRow
     const rowMenuButtons = getVisibleButtons(scope).filter(button => {
-        return button.getAttribute('aria-haspopup') === 'menu' && isSameRow(actionAnchor, button)
+        return isProfileMenuButtonCandidate(button, actionAnchor) && isSameRow(actionAnchor, button)
     })
 
     rowMenuButtons.sort((left, right) => {
@@ -2291,20 +3485,74 @@ function getProfileMenuButton() {
     return rowMenuButtons[0] || getProfileMenuButtonFallback(actionAnchor)
 }
 
+function getProfileExtensionActionRowMenuButton() {
+    const main = document.querySelector('#mainContent, main, [role="main"]')
+    if(!main) return null
+
+    // Managed buttons live in profileButtonRail (appended to document.body,
+    // not main -- see getOrCreateProfileButtonRail), not as descendants of
+    // main any more, so this has to search the rail; their getBoundingClientRect()
+    // still reflects the real on-screen position next to the live menu
+    // button, which is all the distance-scoring below actually needs.
+    const managedButtons = Array.from((profileButtonRail || main).querySelectorAll(
+        '.mb-ext_unblock-unmute-btn, .mb-ext_mute-block-btn, .mb-ext_mute-block-close-btn, .mb-ext_close-tab-btn'
+    )).filter(isVisible)
+    if(!managedButtons.length) return null
+
+    const menuButtons = getVisibleButtons(main)
+        .filter(button => isProfileMenuButtonCandidate(button))
+        .map(button => {
+            const rect = button.getBoundingClientRect()
+            const bestDistance = managedButtons.reduce((best, managedButton) => {
+                const managedRect = managedButton.getBoundingClientRect()
+                const verticalDistance = Math.abs(
+                    (managedRect.top + managedRect.height / 2) - (rect.top + rect.height / 2)
+                )
+                const horizontalDistance = rect.left - managedRect.right
+                if(verticalDistance > 28) return best
+                if(horizontalDistance < -12) return best
+                return Math.min(best, Math.abs(horizontalDistance) + verticalDistance * 4)
+            }, Number.POSITIVE_INFINITY)
+
+            return {button, score: Number.isFinite(bestDistance) ? 1000 - bestDistance : -1, top: rect.top, left: rect.left}
+        })
+        .filter(candidate => candidate.score > 0)
+
+    menuButtons.sort((left, right) => right.score - left.score || left.top - right.top || right.left - left.left)
+    return menuButtons[0]?.button || null
+}
+
+function isProfileMenuButtonCandidate(button, anchor = null) {
+    if(!button) return false
+
+    const text = getElementText(button)
+    const ariaLabel = `${button.getAttribute('aria-label') || ''}`
+    const label = `${ariaLabel} ${text}`.replace(/\s+/g, ' ').trim()
+    const isMenuLike = button.getAttribute('aria-haspopup') === 'menu' ||
+        button.classList?.contains('puppeteer_test_overflow_menu') ||
+        /\bmore\b|\boptions\b/i.test(label)
+
+    if(!isMenuLike) return false
+    if(/\b(?:share|add question|most recent|sort|filter|newest|oldest|all related|all content)\b/i.test(label)) return false
+
+    const rect = button.getBoundingClientRect()
+    const anchorRect = anchor?.getBoundingClientRect?.() || null
+    const isExplicitOverflow = button.classList?.contains('puppeteer_test_overflow_menu') ||
+        /\bmore\b|\boptions\b/i.test(label)
+
+    if(!isExplicitOverflow && text && rect.width > 80) return false
+    if(!anchorRect && rect.top > 360) return false
+
+    return true
+}
+
 function getProfileMenuButtonFallback(anchor = null) {
     const main = document.querySelector('#mainContent, main, [role="main"]')
     if(!main) return null
 
     const anchorRect = anchor?.getBoundingClientRect() || null
     const candidates = getVisibleButtons(main)
-        .filter(button => {
-            const text = getElementText(button)
-            const ariaLabel = `${button.getAttribute('aria-label') || ''}`
-            return button.getAttribute('aria-haspopup') === 'menu' ||
-                button.classList?.contains('puppeteer_test_overflow_menu') ||
-                /\bmore\b|\boptions\b/i.test(text) ||
-                /\bmore\b|\boptions\b/i.test(ariaLabel)
-        })
+        .filter(button => isProfileMenuButtonCandidate(button, anchor))
         .map(button => {
             const rect = button.getBoundingClientRect()
             let score = 0
@@ -2335,7 +3583,34 @@ function getProfileMenuButtonFallback(anchor = null) {
     return candidates[0]?.button || null
 }
 
+// Quora's own action-row buttons (Follow, notification bell, message, the
+// "..." menu) leave very little horizontal room next to them, which is
+// exactly why anchoring there put our buttons on top of Quora's own controls
+// (live-repro'd 2026-09-26, screenshot showed "Mute Block Close" covering
+// the notification bell). The "X followers * Y following" line sits just
+// below that row with open space to its right, so prefer anchoring there;
+// the button-row anchors in getProfileButtonInsertionTarget below remain a
+// fallback for whatever profile layout doesn't have this line.
+function getProfileFollowStatsAnchor() {
+    const main = getSpaceFeedContentRoot()
+    if(!main) return null
+    const mainRect = main.getBoundingClientRect()
+
+    const candidates = Array.from(main.querySelectorAll('a, span, div, button')).filter(element => {
+        if(!isVisible(element)) return false
+        if(element.children.length) return false
+        if(!/^[\d.,]+[km]?\s+following$/i.test(getElementText(element))) return false
+        return Math.abs(element.getBoundingClientRect().top - mainRect.top) <= 420
+    })
+
+    candidates.sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+    return candidates[0] || null
+}
+
 function getProfileButtonInsertionTarget() {
+    const statsAnchor = getProfileFollowStatsAnchor()
+    if(statsAnchor) return {type: 'after-stats', element: statsAnchor}
+
     const menuButton = getProfileMenuButton()
     if(menuButton) return {type: 'before-menu', element: menuButton}
 
@@ -2387,61 +3662,279 @@ function getProfileManagedButtonKind(button) {
     if(!button) return null
     if(button.dataset?.mbProfileBtnKind) return button.dataset.mbProfileBtnKind
     if(button.classList?.contains('mb-ext_close-tab-btn')) return 'close-tab'
+    if(button.classList?.contains('mb-ext_unblock-unmute-btn')) return 'unblock-unmute'
     if(button.classList?.contains('mb-ext_mute-block-btn')) return 'mute-block'
     if(button.classList?.contains('mb-ext_mute-block-close-btn')) return 'mute-block-close'
     return null
 }
 
-function getManagedButtonSequenceBeforeTarget(target) {
-    const sequence = []
-    let node = target?.element?.previousElementSibling || null
+const PROFILE_BUTTON_RAIL_GAP_PX = 6
 
-    while(node && getProfileManagedButtonKind(node)) {
-        sequence.unshift(getProfileManagedButtonKind(node))
-        node = node.previousElementSibling
+// Quora periodically destroys and recreates the DOM subtree containing
+// target.element on its own -- confirmed live: it kept happening with our
+// own insertion code fully blocked and zero runtime messages received, so
+// it isn't something our extension triggers. Inserting the buttons as
+// literal siblings inside that subtree meant they got destroyed right along
+// with it, which was not just a visible flash but a real click-hijack risk
+// (bindSinglePressAction fires its action on pointerdown, so a stray press
+// near the target during one of these remounts could land on a
+// just-recreated button and fire an action nobody intended). Keeping the
+// buttons in one persistent element appended to document.body, and only
+// ever repositioning that element, means Quora's remounts never touch them.
+function getOrCreateProfileButtonRail() {
+    // Defense in depth against ever showing two overlapping rails (seen
+    // live 2026-09-19: two of our buttons rendered stacked on top of each
+    // other) -- whatever the exact cause (a stale rail this script instance
+    // lost track of, a bfcache restore, anything else), only one
+    // .mb-ext_profile-button-rail should ever exist on the page at once.
+    // Has to run even when profileButtonRail is already valid: a stray
+    // extra element sitting elsewhere in the DOM is invisible to the
+    // isConnected check below, which only looks at the one rail this
+    // script instance already knows about.
+    for(const stale of document.querySelectorAll('.mb-ext_profile-button-rail')) {
+        if(stale !== profileButtonRail) stale.remove()
     }
 
-    return sequence
-}
+    if(profileButtonRail?.isConnected) return profileButtonRail
 
-function getManagedButtonSequenceAfterTarget(target) {
-    const sequence = []
-    let node = target?.element?.nextElementSibling || null
-
-    while(node && getProfileManagedButtonKind(node)) {
-        sequence.push(getProfileManagedButtonKind(node))
-        node = node.nextElementSibling
+    if(!profileButtonRailResizeHooked) {
+        profileButtonRailResizeHooked = true
+        let resizeTimeout
+        addEventListener('resize', () => {
+            clearTimeout(resizeTimeout)
+            resizeTimeout = setTimeout(() => {
+                if(getPageType() === 'profile') scheduleProfileButtonsRefresh(0)
+            }, 150)
+        })
     }
 
-    return sequence
+    profileButtonRail = document.createElement('span')
+    profileButtonRail.className = 'mb-ext_profile-button-rail'
+    profileButtonRail.style.position = 'absolute'
+    profileButtonRail.style.zIndex = '999999'
+    profileButtonRail.style.display = 'inline-flex'
+    profileButtonRail.style.alignItems = 'center'
+    document.body.appendChild(profileButtonRail)
+    return profileButtonRail
 }
 
-function normalizeProfileActionButtonOrder(target) {
-    const parent = target?.element?.parentElement
-    if(!parent) return
+function resetProfileButtonRail() {
+    profileButtonRail?.remove()
+    profileButtonRail = null
+}
 
+// An ambient, display-only "work is happening in the background" signal on
+// whatever Quora page the user is actually looking at -- mirrors the worker
+// window's progress fill/count (coordinator.js's renderWorkerBar) using the
+// same mbCoordinatorQueueView the worker window reads, but with no buttons:
+// this is a second, independent surface, and giving it its own pause/cancel
+// controls would mean two surfaces racing to mutate queue state.
+// Reads the page's own light/dark rendering rather than guessing at a
+// Quora-specific dark-mode class (which could change) -- the actual
+// rendered background luminance is a page-agnostic signal, with
+// prefers-color-scheme as a fallback for an unstyled/transparent body.
+function isPageInDarkMode() {
+    try {
+        const bodyBackground = getComputedStyle(document.body).backgroundColor
+        const channels = (bodyBackground.match(/[\d.]+/g) || []).map(Number)
+        if(channels.length >= 3 && !(channels[3] === 0)) {
+            const [red, green, blue] = channels
+            const luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255
+            return luminance < 0.5
+        }
+    }
+    catch {}
+    return !!globalThis.matchMedia?.('(prefers-color-scheme: dark)')?.matches
+}
+
+function getOrCreateContentProgressBar() {
+    for(const stale of document.querySelectorAll(`#${CONTENT_PROGRESS_BAR_ID}`)) {
+        if(stale !== contentProgressBarEl) stale.remove()
+    }
+    if(contentProgressBarEl?.isConnected) return contentProgressBarEl
+
+    const darkMode = isPageInDarkMode()
+    const barBackground = darkMode ? 'rgba(32, 32, 35, 0.92)' : 'rgba(255, 255, 255, 0.92)'
+    const textColor = darkMode ? '#e8e8ea' : '#1c1c1e'
+    const trackBackground = darkMode ? 'rgba(255, 255, 255, 0.18)' : 'rgba(0, 0, 0, 0.12)'
+    const borderColor = darkMode ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)'
+
+    const bar = document.createElement('div')
+    bar.id = CONTENT_PROGRESS_BAR_ID
+    bar.style.position = 'fixed'
+    bar.style.left = '0'
+    bar.style.right = '0'
+    bar.style.bottom = '0'
+    bar.style.zIndex = '999999'
+    bar.style.display = 'flex'
+    bar.style.alignItems = 'center'
+    bar.style.gap = '10px'
+    bar.style.padding = '5px 12px'
+    bar.style.background = barBackground
+    bar.style.borderTop = `1px solid ${borderColor}`
+    bar.style.color = textColor
+    bar.style.fontSize = '12px'
+    bar.style.fontFamily = 'system-ui, -apple-system, sans-serif'
+    // Display-only -- never intercept clicks/scroll on the page beneath it.
+    bar.style.pointerEvents = 'none'
+
+    const brand = document.createElement('div')
+    brand.style.display = 'flex'
+    brand.style.alignItems = 'center'
+    brand.style.gap = '6px'
+    brand.style.flexShrink = '0'
+
+    const logo = document.createElement('img')
+    logo.src = browser.runtime.getURL('icons/32.png')
+    logo.alt = ''
+    logo.width = 16
+    logo.height = 16
+    logo.style.display = 'block'
+
+    const label = document.createElement('div')
+    label.textContent = 'Progress'
+    label.style.fontWeight = '600'
+    label.style.whiteSpace = 'nowrap'
+
+    brand.append(logo, label)
+
+    const track = document.createElement('div')
+    track.style.flex = '1'
+    track.style.height = '6px'
+    track.style.borderRadius = '3px'
+    track.style.background = trackBackground
+    track.style.overflow = 'hidden'
+
+    const fill = document.createElement('div')
+    fill.className = `${CONTENT_PROGRESS_BAR_ID}-fill`
+    fill.style.height = '100%'
+    fill.style.width = '0%'
+    fill.style.background = BRAND_RED
+    fill.style.transition = 'width 200ms ease'
+    track.appendChild(fill)
+
+    const count = document.createElement('div')
+    count.className = `${CONTENT_PROGRESS_BAR_ID}-count`
+    count.style.whiteSpace = 'nowrap'
+
+    bar.append(brand, track, count)
+    document.body.appendChild(bar)
+    contentProgressBarEl = bar
+    return bar
+}
+
+function removeContentProgressBar() {
+    contentProgressBarEl?.remove()
+    contentProgressBarEl = null
+}
+
+async function refreshContentProgressBar() {
+    if(!document.body) return
+
+    const stored = await safeStorageGet({
+        [COORDINATOR_QUEUE_VIEW_KEY]: null,
+        [COORDINATOR_PAUSED_KEY]: false
+    }).catch(() => null)
+    const view = stored?.[COORDINATOR_QUEUE_VIEW_KEY]
+    const paused = !!stored?.[COORDINATOR_PAUSED_KEY]
+    const hasView = !!view && typeof view === 'object' && Array.isArray(view.items)
+    const total = hasView ? (Number.parseInt(view.total, 10) || 0) : 0
+    const counts = hasView && view.counts && typeof view.counts === 'object' ? view.counts : {}
+    const pending = [...PENDING_COORDINATOR_STATUSES].reduce(
+        (sum, status) => sum + (Number.parseInt(counts[status], 10) || 0),
+        0
+    )
+    const terminal = Math.max(0, total - pending)
+
+    // Vanish when there's nothing queued, the batch is fully done, or the
+    // queue is paused -- this is meant to be an ambient signal that work is
+    // actively happening, not a persistent fixture.
+    if(!hasView || total <= 0 || paused || terminal >= total) {
+        removeContentProgressBar()
+        return
+    }
+
+    const bar = getOrCreateContentProgressBar()
+    const fill = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-fill`)
+    const count = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-count`)
+    if(fill) fill.style.width = `${Math.min(100, Math.round((terminal / total) * 100))}%`
+    if(count) count.textContent = `${terminal} / ${total}`
+}
+
+function installContentProgressBarStorageListener() {
+    if(contentProgressBarStorageListenerInstalled) return
+    const source = getStorageChangeSource()
+    if(!source) return
+    contentProgressBarStorageListenerInstalled = true
+    // A dedicated listener, independent of setStorageChangeListenerEnabled's
+    // on/off toggle (which some page types, e.g. profile-search, never turn
+    // on) -- this overlay needs to stay live on every Quora page regardless
+    // of that page-type-specific gating.
+    source.addListener((changes, areaName) => {
+        if(areaName !== 'local') return
+        if(changes[COORDINATOR_QUEUE_VIEW_KEY] || changes[COORDINATOR_PAUSED_KEY]) {
+            void refreshContentProgressBar()
+        }
+    })
+}
+
+function initContentProgressBar() {
+    installContentProgressBarStorageListener()
+    void refreshContentProgressBar()
+}
+
+function reorderProfileButtonRail(rail) {
     const buttonsByKind = new Map(
-        Array.from(parent.children)
+        Array.from(rail.children)
             .map(button => [getProfileManagedButtonKind(button), button])
             .filter(([kind]) => !!kind)
     )
 
-    if(target.type === 'before-menu') {
-        for(const kind of PROFILE_ACTION_BUTTON_ORDER) {
-            const button = buttonsByKind.get(kind)
-            if(button) target.element.insertAdjacentElement('beforebegin', button)
-        }
-
-        return
-    }
-
-    let anchor = target.element
     for(const kind of PROFILE_ACTION_BUTTON_ORDER) {
         const button = buttonsByKind.get(kind)
-        if(!button) continue
-        anchor.insertAdjacentElement('afterend', button)
-        anchor = button
+        if(button) rail.appendChild(button)
     }
+}
+
+function positionProfileButtonRail(target) {
+    const rail = getOrCreateProfileButtonRail()
+    const element = target?.element
+    if(!element?.isConnected) return rail
+
+    const rect = element.getBoundingClientRect()
+    rail.style.height = `${rect.height}px`
+    rail.style.top = `${rect.top + window.scrollY}px`
+
+    if(target.type === 'before-menu') {
+        const railWidth = rail.getBoundingClientRect().width
+        rail.style.left = `${rect.left + window.scrollX - PROFILE_BUTTON_RAIL_GAP_PX - railWidth}px`
+    }
+    else {
+        rail.style.left = `${rect.right + window.scrollX + PROFILE_BUTTON_RAIL_GAP_PX}px`
+    }
+
+    return rail
+}
+
+function isProfileButtonRailPositionCurrent(target) {
+    if(!profileButtonRail?.isConnected) return false
+
+    const element = target?.element
+    if(!element?.isConnected) return true
+
+    const rect = element.getBoundingClientRect()
+    const expectedTop = rect.top + window.scrollY
+    if(Math.abs(expectedTop - Number.parseFloat(profileButtonRail.style.top || '0')) > 1) return false
+
+    const railLeft = Number.parseFloat(profileButtonRail.style.left || '0')
+    if(target.type === 'before-menu') {
+        const railWidth = profileButtonRail.getBoundingClientRect().width
+        const expectedLeft = rect.left + window.scrollX - PROFILE_BUTTON_RAIL_GAP_PX - railWidth
+        return Math.abs(expectedLeft - railLeft) <= 1
+    }
+
+    const expectedLeft = rect.right + window.scrollX + PROFILE_BUTTON_RAIL_GAP_PX
+    return Math.abs(expectedLeft - railLeft) <= 1
 }
 
 function getProfilePeopleModal() {
@@ -2487,6 +3980,14 @@ function isProfilePeopleModal(modal) {
         getProfileModalItems(modal).length > 0
 }
 
+function isContributorProfileModal(modal) {
+    return !!modal && /\bcontributor(?:s)?\b/i.test(getElementText(modal))
+}
+
+function getProfileModalForItem(item) {
+    return item?.closest?.('[role="dialog"][aria-modal="true"], [role="dialog"].modal_content_inner, .modal_content_inner[aria-modal="true"]') || getProfilePeopleModal()
+}
+
 function syncActiveProfileModal(modal = getProfilePeopleModal()) {
     if(modal && modal !== activeProfileModal) {
         activeProfileModal = modal
@@ -2528,7 +4029,9 @@ function hasVisibleFollowProxy(root) {
 
 function isModalItemQueueable(item) {
     const href = getModalItemProfileHref(item)
-    return !!href && !isProfileNukeSucceeded(href) && hasVisibleFollowProxy(item)
+    if(!href || isProfileNukeSucceeded(href)) return false
+    if(isContributorProfileModal(getProfileModalForItem(item))) return true
+    return hasVisibleFollowProxy(item)
 }
 
 function isModalItemHandled(item) {
@@ -2612,6 +4115,7 @@ function findOverlayAction(regex, roots) {
     for(const root of roots) {
         const candidates = Array.from(root.querySelectorAll('.puppeteer_test_popover_item, [role="menuitem"], button, [role="button"], a'))
         const match = candidates.find(candidate => {
+            if(shouldIgnoreActionCandidate(candidate)) return false
             if(!isVisible(candidate)) return false
 
             return matchesActionLabel(regex, getActionCandidateLabel(candidate))
@@ -2672,6 +4176,42 @@ function isBlockActionLabel(label) {
     return /\bblock\b/i.test(`${label || ''}`) && !isUnblockActionLabel(label)
 }
 
+function hasUnmuteActionText(text) {
+    const value = `${text || ''}`
+    return UNMUTE_ACTION_REGEX.test(value) || UNMUTE_CONTEXT_REGEX.test(value)
+}
+
+function hasUnblockActionText(text) {
+    const value = `${text || ''}`
+    return UNBLOCK_ACTION_REGEX.test(value) || UNBLOCK_CONTEXT_REGEX.test(value)
+}
+
+function isMuteConfirmButtonLabel(label) {
+    const value = `${label || ''}`
+    return /\bmute\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(value) &&
+        !hasUnmuteActionText(value) &&
+        !hasUnblockActionText(value)
+}
+
+function isBlockConfirmButtonLabel(label) {
+    const value = `${label || ''}`
+    return /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(value) &&
+        !hasUnblockActionText(value) &&
+        !hasUnmuteActionText(value)
+}
+
+function isUnmuteConfirmButtonLabel(label) {
+    const value = `${label || ''}`
+    return /\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(value) &&
+        !hasUnblockActionText(value)
+}
+
+function isUnblockConfirmButtonLabel(label) {
+    const value = `${label || ''}`
+    return /\bun[\s-]*block\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(value) &&
+        !hasUnmuteActionText(value)
+}
+
 function getVisibleProfileMenuActionLabels() {
     const labels = []
     const seen = new Set()
@@ -2690,6 +4230,58 @@ function getVisibleProfileMenuActionLabels() {
     }
 
     return labels.slice(0, 20)
+}
+
+function getProfileMenuButtonDebugRect() {
+    return getActionDebugRect(getProfileMenuButton())
+}
+
+function getActionDebugLabel(element) {
+    if(!element) return ''
+    return getActionCandidateLabel(element) || getElementText(element)
+}
+
+function getActionDebugRect(element) {
+    if(!element?.getBoundingClientRect) return null
+
+    const rect = element.getBoundingClientRect()
+    return {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+    }
+}
+
+function getReverseActionDebugSnapshot(extra = {}) {
+    return {
+        documentVisibility: document.visibilityState,
+        overlayCount: getOverlayRoots(false).length,
+        profileBlocked: isProfileBlocked({ignoreHints: true}),
+        profileMenuOpen: isProfileMenuOpen(),
+        profileMenuButtonFound: !!getProfileMenuButton(),
+        profileMenuButtonRect: getProfileMenuButtonDebugRect(),
+        visibleProfileMenuLabels: getVisibleProfileMenuActionLabels(),
+        ...extra
+    }
+}
+
+async function recordReverseActionProgress(patch = {}) {
+    await recordCurrentProfileNukeProgress({
+        actionKind: UNBLOCK_UNMUTE_ACTION_KIND,
+        ...patch
+    })
+}
+
+function isProfileActionMenuOpen() {
+    const labels = getVisibleProfileMenuActionLabels()
+    return labels.some(label => {
+        return isMuteActionLabel(label) ||
+            isUnmuteActionLabel(label) ||
+            isBlockActionLabel(label) ||
+            isUnblockActionLabel(label) ||
+            /^report$/i.test(label)
+    })
 }
 
 function getDialogAction(regex) {
@@ -2717,10 +4309,10 @@ function getMuteConfirmContainer() {
         .filter(isVisible)
         .filter(element => {
             const text = getElementText(element)
-            if(!/\bmuted\b|\bmuting this person\b/i.test(text)) return false
+            if(!isMuteConfirmContextText(text)) return false
 
             const buttons = getVisibleActionButtons(element)
-            return buttons.some(button => /\bconfirm\b/i.test(getElementText(button))) &&
+            return buttons.some(button => isMuteConfirmButtonLabel(getActionCandidateLabel(button))) &&
                 buttons.some(button => /\bcancel\b/i.test(getElementText(button)))
         })
         .map(element => {
@@ -2737,19 +4329,20 @@ function getMuteConfirmContainer() {
 function getMuteConfirmCandidates() {
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
-        .filter(button => /\bconfirm\b/i.test(getElementText(button)))
+        .filter(button => isMuteConfirmButtonLabel(getActionCandidateLabel(button)))
         .map(button => {
             const context = getBestActionContext(button)
             const contextText = context?.text || ''
             let score = scoreActionCandidate(button, /\bconfirm\b/i, contextText)
 
             if(/\bmuted\b|\bmuting this person\b/i.test(contextText)) score += 1200
-            if(/\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
+            if(hasUnmuteActionText(contextText) || hasUnblockActionText(contextText) ||
+                /\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
             if(/\bcancel\b/i.test(contextText) && !/\bmuted\b|\bmuting this person\b/i.test(contextText)) score -= 500
 
             return {button, score, contextText}
         })
-        .filter(candidate => /\bmuted\b|\bmuting this person\b/i.test(candidate.contextText))
+        .filter(candidate => isMuteConfirmContextText(candidate.contextText))
 
     candidates.sort((left, right) => right.score - left.score)
     return candidates
@@ -2762,18 +4355,39 @@ function getMuteConfirmAction() {
     const container = getMuteConfirmContainer()
     if(container) {
         const containerButtons = getVisibleActionButtons(container)
-            .filter(button => /\bconfirm\b/i.test(getElementText(button)))
+            .filter(button => isMuteConfirmButtonLabel(getActionCandidateLabel(button)))
             .map(button => ({button, score: scoreActionCandidate(button, /\bconfirm\b/i, getElementText(container)) + 500}))
 
         containerButtons.sort((left, right) => right.score - left.score)
         if(containerButtons.length) return containerButtons[0].button
     }
 
-    return getDialogPrimaryAction(getDialogRoots(), /\bconfirm\b|\bmute\b/i)
+    return getContextualDialogPrimaryAction(
+        getDialogRoots(),
+        /\bconfirm\b|\bmute\b/i,
+        isMuteConfirmContextText,
+        button => isMuteConfirmButtonLabel(getActionCandidateLabel(button))
+    )
 }
 
 function isMuteConfirmPending() {
-    return !!getMuteConfirmContainer() || getMuteConfirmCandidates().length > 0
+    return !!getMuteConfirmAction()
+}
+
+function isMuteConfirmContextText(text) {
+    const value = text || ''
+    return /\bmuted\b|\bmuting this person\b/i.test(value) &&
+        !hasUnmuteActionText(value) &&
+        !hasUnblockActionText(value)
+}
+
+function isBlockConfirmContextText(text) {
+    const value = text || ''
+    return /\bblock this profile\b|\bblock this person\b|\bblocking this person\b|\bblock\b|\bblocked\b/i.test(value) &&
+        !isMuteConfirmContextText(value) &&
+        !hasUnblockActionText(value) &&
+        !hasUnmuteActionText(value) &&
+        !/\bask question\b|\badd question\b|\bcreate post\b/i.test(value)
 }
 
 function getBlockConfirmContainer() {
@@ -2781,10 +4395,10 @@ function getBlockConfirmContainer() {
         .filter(isVisible)
         .filter(element => {
             const text = getElementText(element)
-            if(!/\bblock\b|\bblocked\b|\bunblock\b/i.test(text)) return false
+            if(!isBlockConfirmContextText(text)) return false
 
             const buttons = getVisibleActionButtons(element)
-            return buttons.some(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button))) &&
+            return buttons.some(button => isBlockConfirmButtonLabel(getActionCandidateLabel(button))) &&
                 buttons.some(button => /\bcancel\b/i.test(getElementText(button)))
         })
         .map(element => {
@@ -2808,20 +4422,20 @@ function getBlockConfirmCandidates() {
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
         .filter(isInBlockConfirmSurface)
-        .filter(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button)))
+        .filter(button => isBlockConfirmButtonLabel(getActionCandidateLabel(button)))
         .map(button => {
             const context = getBestActionContext(button)
             const contextText = context?.text || ''
             let score = scoreActionCandidate(button, /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i, contextText)
 
-            if(/\bblock this profile\b|\bblock this person\b|\bblock\b|\bblocked\b/i.test(contextText)) score += 1200
-            if(/\bmuted\b|\bmuting this person\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
-            if(/\bcancel\b/i.test(contextText) && !/\bblock this profile\b|\bblock this person\b|\bblock\b|\bblocked\b/i.test(contextText)) score -= 500
+            if(isBlockConfirmContextText(contextText)) score += 1200
+            if(isMuteConfirmContextText(contextText) || hasUnblockActionText(contextText) ||
+                hasUnmuteActionText(contextText) || /\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
+            if(/\bcancel\b/i.test(contextText) && !isBlockConfirmContextText(contextText)) score -= 500
 
             return {button, score, contextText}
         })
-        .filter(candidate => /\bblock this profile\b|\bblock this person\b|\bblock\b|\bblocked\b/i.test(candidate.contextText) &&
-            !/\bmuted\b|\bmuting this person\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(candidate.contextText))
+        .filter(candidate => isBlockConfirmContextText(candidate.contextText))
 
     candidates.sort((left, right) => right.score - left.score)
     return candidates
@@ -2831,14 +4445,19 @@ function getBlockConfirmAction() {
     const container = getBlockConfirmContainer()
     if(container) {
         const containerButtons = getVisibleActionButtons(container)
-            .filter(button => /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i.test(getElementText(button)))
+            .filter(button => isBlockConfirmButtonLabel(getActionCandidateLabel(button)))
             .map(button => ({button, score: scoreActionCandidate(button, /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i, getElementText(container)) + 500}))
 
         containerButtons.sort((left, right) => right.score - left.score)
         if(containerButtons.length) return containerButtons[0].button
     }
 
-    const dialogPrimary = getDialogPrimaryAction(getDialogRoots(), /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i)
+    const dialogPrimary = getContextualDialogPrimaryAction(
+        getDialogRoots(),
+        /\bblock\b|\bconfirm\b|\bcontinue\b|\byes\b|\bok\b/i,
+        isBlockConfirmContextText,
+        button => isBlockConfirmButtonLabel(getActionCandidateLabel(button))
+    )
     if(dialogPrimary) return dialogPrimary
 
     const buttons = getBlockConfirmCandidates()
@@ -2846,7 +4465,7 @@ function getBlockConfirmAction() {
 }
 
 function isBlockConfirmPending() {
-    return !!getBlockConfirmContainer() || getBlockConfirmCandidates().length > 0
+    return !!getBlockConfirmAction()
 }
 
 function getDialogRoots() {
@@ -2858,7 +4477,7 @@ function getDialogRoots() {
     return Array.from(new Set(roots))
 }
 
-function getDialogPrimaryAction(dialogRoots, preferredRegex = null) {
+function getDialogPrimaryAction(dialogRoots, preferredRegex = null, acceptsButton = null) {
     const candidates = []
 
     for(const root of dialogRoots) {
@@ -2867,6 +4486,7 @@ function getDialogPrimaryAction(dialogRoots, preferredRegex = null) {
         for(const button of Array.from(root.querySelectorAll('button, [role="button"], a'))) {
             if(shouldIgnoreActionCandidate(button)) continue
             if(!isVisible(button)) continue
+            if(typeof acceptsButton === 'function' && !acceptsButton(button)) continue
 
             const score = scoreActionCandidate(button, preferredRegex, rootText)
             if(score > -600) candidates.push({button, score})
@@ -2877,8 +4497,14 @@ function getDialogPrimaryAction(dialogRoots, preferredRegex = null) {
     return candidates[0]?.button || null
 }
 
+function getContextualDialogPrimaryAction(dialogRoots, preferredRegex, acceptsContext, acceptsButton = null) {
+    const roots = dialogRoots.filter(root => acceptsContext(getElementText(root)))
+    return getDialogPrimaryAction(roots, preferredRegex, acceptsButton)
+}
+
 function shouldIgnoreActionCandidate(candidate) {
     if(!candidate) return true
+    if(candidate.classList?.contains('mb-ext_unblock-unmute-btn')) return true
     if(candidate.classList?.contains('mb-ext_mute-block-btn')) return true
     if(candidate.classList?.contains('mb-ext_close-tab-btn')) return true
     if(candidate.classList?.contains('mb-ext_mute-block-close-btn')) return true
@@ -2948,8 +4574,22 @@ function scoreActionCandidate(candidate, preferredRegex = null, rootText = '') {
 }
 
 function getGlobalPrimaryAction(preferredRegex = null) {
+    // This scans the WHOLE document, not just a dialog -- unlike
+    // getDialogPrimaryAction, there's no overlay root to scope the search to.
+    // scoreActionCandidate's styling/position heuristics (e.g. +80 for a
+    // qu-bg--red/qu-bg--blue primary-styled button) exist to break ties among
+    // otherwise-plausible candidates, not to invent one: without requiring an
+    // actual label match first, this used to happily return Quora's own
+    // unrelated "Add question" composer button (styled as the page's one
+    // prominent red CTA) whenever dismissProfileActionSurface() called this
+    // with no real dialog left to dismiss, hijacking the page mid-action.
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(candidate => !shouldIgnoreActionCandidate(candidate) && isVisible(candidate))
+        .filter(candidate => {
+            if(!preferredRegex) return true
+            const label = `${candidate.getAttribute('aria-label') || ''} ${getElementText(candidate)}`.trim()
+            return preferredRegex.test(label)
+        })
         .map(button => ({button, score: scoreActionCandidate(button, preferredRegex)}))
         .filter(candidate => candidate.score > -600)
 
@@ -2957,7 +4597,7 @@ function getGlobalPrimaryAction(preferredRegex = null) {
     return candidates[0]?.button || null
 }
 
-async function waitForAction(getAction, timeoutMs = 4000, intervalMs = 200) {
+async function waitForAction(getAction, timeoutMs = WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
@@ -2970,7 +4610,7 @@ async function waitForAction(getAction, timeoutMs = 4000, intervalMs = 200) {
     return null
 }
 
-async function waitForCondition(check, timeoutMs = 4000, intervalMs = 200) {
+async function waitForCondition(check, timeoutMs = WAIT_FOR_CONDITION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_CONDITION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
@@ -2981,7 +4621,41 @@ async function waitForCondition(check, timeoutMs = 4000, intervalMs = 200) {
     return false
 }
 
-async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = 5000, intervalMs = 250) {
+function waitForConditionOrDomMutation(check, timeoutMs = WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_CONDITION_OR_DOM_MUTATION_DEFAULT_INTERVAL_MS) {
+    if(check()) return Promise.resolve(true)
+
+    return new Promise(resolve => {
+        let settled = false
+        let observer = null
+        let interval = null
+        let timeout = null
+
+        const finish = value => {
+            if(settled) return
+            settled = true
+            if(observer) observer.disconnect()
+            if(interval) clearInterval(interval)
+            if(timeout) clearTimeout(timeout)
+            resolve(value)
+        }
+
+        const probe = () => {
+            if(check()) finish(true)
+        }
+
+        observer = new MutationObserver(probe)
+        observer.observe(document.documentElement || document.body, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            characterData: true
+        })
+        interval = setInterval(probe, intervalMs)
+        timeout = setTimeout(() => finish(false), timeoutMs)
+    })
+}
+
+async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS) {
     const action = await waitForAction(() => {
         const inverse = getMenuAction(inverseRegex)
         if(inverse) return {state: 'inverse', button: inverse}
@@ -2997,11 +4671,11 @@ async function waitForMenuState(primaryRegex, inverseRegex, timeoutMs = 5000, in
 
 async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex, options = {}) {
     const {
-        timeoutMs = 5000,
-        intervalMs = 250,
+        timeoutMs = WAIT_FOR_MENU_STATE_DEFAULT_TIMEOUT_MS,
+        intervalMs = WAIT_FOR_MENU_STATE_DEFAULT_INTERVAL_MS,
         promotionReason = 'profile-menu-action-not-found',
         silent = false,
-        allowForegroundFallback = true
+        allowForegroundFallback = false
     } = options
 
     let state = await waitForMenuState(primaryRegex, inverseRegex, timeoutMs, intervalMs)
@@ -3012,8 +4686,8 @@ async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex
         event: 'Profile menu action was not visible in the background; requesting foreground fallback'
     })
 
-    const promoted = await promoteCurrentQueuedTab(promotionReason, allowForegroundFallback)
-    if(!promoted) return null
+    const promotion = await promoteCurrentQueuedTab(promotionReason, allowForegroundFallback)
+    if(!promotion.promoted) return null
 
     await sleep(300)
     state = await waitForMenuState(primaryRegex, inverseRegex, 2000, 200)
@@ -3031,8 +4705,8 @@ async function waitForMenuStateWithForegroundFallback(primaryRegex, inverseRegex
     return waitForMenuState(primaryRegex, inverseRegex, timeoutMs, intervalMs)
 }
 
-async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = 2500, intervalMs = 200) {
-    const opened = await ensureProfileMenuOpen()
+async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = READ_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = READ_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
+    const opened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!opened) return null
 
     await sleep(400)
@@ -3047,11 +4721,11 @@ async function readProfileMenuState(primaryRegex, inverseRegex, timeoutMs = 2500
     return state?.state || null
 }
 
-async function waitForProfileMenuState(expectedState, primaryRegex, inverseRegex, timeoutMs = 8000, intervalMs = 500) {
+async function waitForProfileMenuState(expectedState, primaryRegex, inverseRegex, timeoutMs = WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_PROFILE_MENU_STATE_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
     const startedAt = Date.now()
 
     while(Date.now() - startedAt < timeoutMs) {
-        const state = await readProfileMenuState(primaryRegex, inverseRegex, 1800, 200)
+        const state = await readProfileMenuState(primaryRegex, inverseRegex, 1800, 200, silent, allowForegroundFallback)
         if(state === expectedState) return true
         await sleep(intervalMs)
     }
@@ -3059,7 +4733,11 @@ async function waitForProfileMenuState(expectedState, primaryRegex, inverseRegex
     return false
 }
 
-function isProfileBlocked() {
+function isProfileBlocked(options = {}) {
+    const {ignoreHints = false} = options
+    if(!ignoreHints && hasRecentProfileUnblockedHint()) return false
+    if(isProfileVisiblyUnblocked()) return false
+
     const main = document.querySelector('#mainContent')
     if(main) {
         const labels = Array.from(main.querySelectorAll('div, span, button, a'))
@@ -3077,20 +4755,60 @@ function isProfileBlocked() {
         }
     }
 
+    if(hasProfileBlockedBodyText()) {
+        rememberProfileBlocked()
+        return true
+    }
+
     if(isProfileBlockedFromInlineState()) {
         rememberProfileBlocked()
         return true
     }
 
-    return hasRecentProfileBlockHint()
+    return !ignoreHints && hasRecentProfileBlockHint()
+}
+
+function hasProfileBlockedBodyText() {
+    if(getPageType() !== 'profile' || document.readyState === 'loading') return false
+
+    const bodyText = document.body?.innerText || ''
+    return /(^|\n)\s*BLOCKED\s*(\n|$)/i.test(bodyText) ||
+        /\byou(?:'ve| have)\s+blocked\b/i.test(bodyText)
+}
+
+function isProfileLoadedAndLiveUnblocked() {
+    return getPageType() === 'profile' &&
+        document.readyState !== 'loading' &&
+        (!isProfileBlocked({ignoreHints: true}) || isProfileVisiblyUnblocked()) &&
+        !!getProfileMenuButton()
+}
+
+async function waitForVerifiedProfileUnblocked(timeoutMs = WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS, silent = false, allowForegroundFallback = false) {
+    const verified = await waitForConditionOrDomMutation(() => {
+        return isProfileVisiblyUnblocked() || !!getMenuAction(isBlockActionLabel)
+    }, timeoutMs, intervalMs)
+    if(verified) return true
+
+    return waitForProfileMenuState('inverse', isUnblockActionLabel, isBlockActionLabel, 5000, 500, silent, allowForegroundFallback)
+}
+
+function isProfileVisiblyUnblocked() {
+    if(getPageType() !== 'profile' || document.readyState === 'loading') return false
+
+    if(hasProfileBlockedBodyText()) return false
+
+    return !!getProfileMenuButton() && !!getProfilePrimaryAction()
 }
 
 function getProfileKey(href = location.href) {
     return normalizeQuoraProfileHref(href)
 }
 
-function escapeRegex(text) {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+function hasInlineBlockedStateMarker(text = '') {
+    return text.includes('"isBlockedByViewer?":true') ||
+        text.includes('\\"isBlockedByViewer?\\":true') ||
+        text.includes('"isBlocking?":true') ||
+        text.includes('\\"isBlocking?\\":true')
 }
 
 function isProfileBlockedFromInlineState() {
@@ -3105,18 +4823,27 @@ function isProfileBlockedFromInlineState() {
         return false
     }
 
-    const pathPattern = escapeRegex(profilePath)
-    const blockedPattern = /\\?"isBlockedByViewer\\?":true|\\?"isBlocking\\?":true/
+    const lowerProfilePath = profilePath.toLowerCase()
 
     for(const script of Array.from(document.scripts || [])) {
         const text = script.textContent || ''
-        if(!text || !text.includes(profilePath)) continue
+        const lowerText = text.toLowerCase()
+        if(!text || !lowerText.includes(lowerProfilePath)) continue
 
-        const match = text.match(new RegExp(`${pathPattern}[\\s\\S]{0,4000}`, 'i'))
-        if(match && blockedPattern.test(match[0])) return true
+        let searchFrom = 0
+        let matchesScanned = 0
 
-        const reverseMatch = text.match(new RegExp(`[\\s\\S]{0,4000}${pathPattern}`, 'i'))
-        if(reverseMatch && blockedPattern.test(reverseMatch[0])) return true
+        while(matchesScanned < 10) {
+            const index = lowerText.indexOf(lowerProfilePath, searchFrom)
+            if(index < 0) break
+
+            const contextStart = Math.max(0, index - 4000)
+            const contextEnd = Math.min(text.length, index + profilePath.length + 4000)
+            if(hasInlineBlockedStateMarker(text.slice(contextStart, contextEnd))) return true
+
+            searchFrom = index + lowerProfilePath.length
+            matchesScanned += 1
+        }
     }
 
     return false
@@ -3133,6 +4860,22 @@ function rememberProfileBlocked() {
 
     profileBlockHintKey = profileKey
     profileBlockHintAt = Date.now()
+    clearProfileUnblockedHint()
+    return true
+}
+
+function clearProfileUnblockedHint() {
+    profileUnblockedHintKey = null
+    profileUnblockedHintAt = 0
+}
+
+function rememberProfileUnblocked(href = location.href) {
+    const profileKey = getProfileKey(href)
+    if(!profileKey) return false
+
+    clearProfileBlockHint()
+    profileUnblockedHintKey = profileKey
+    profileUnblockedHintAt = Date.now()
     return true
 }
 
@@ -3141,10 +4884,24 @@ function noteProfileBlockMutation() {
     rememberProfileBlocked()
 }
 
+async function waitForVerifiedProfileBlocked(timeoutMs = WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS) {
+    const directBlocked = await waitForCondition(() => isProfileBlocked({ignoreHints: true}), timeoutMs, intervalMs)
+    if(directBlocked) return true
+
+    const menuBlocked = await waitForProfileMenuState('inverse', isBlockActionLabel, isUnblockActionLabel, 6000, 500)
+    return !!menuBlocked
+}
+
 function hasRecentProfileBlockHint(maxAgeMs = 20000) {
     const profileKey = getProfileKey()
     if(!profileKey || profileBlockHintKey !== profileKey || !profileBlockHintAt) return false
     return Date.now() - profileBlockHintAt <= maxAgeMs
+}
+
+function hasRecentProfileUnblockedHint(maxAgeMs = 60000) {
+    const profileKey = getProfileKey()
+    if(!profileKey || profileUnblockedHintKey !== profileKey || !profileUnblockedHintAt) return false
+    return Date.now() - profileUnblockedHintAt <= maxAgeMs
 }
 
 function clearCloseTabFollowUps() {
@@ -3172,7 +4929,6 @@ function scheduleBlockedProfileCloseChecks(delays = [0, 100, 250, 500, 1000, 200
 
             if(isProfileBlocked()) {
                 void (async () => {
-                    await confirmCurrentProfileBlockedSpaceFeedEntries()
                     await notifyQueuedTabComplete()
                     await requestCloseTab(2, 100, true)
                 })()
@@ -3184,7 +4940,6 @@ function scheduleBlockedProfileCloseChecks(delays = [0, 100, 250, 500, 1000, 200
                     const menuBlocked = await readProfileMenuState(isBlockActionLabel, isUnblockActionLabel, 700, 100)
                     if(menuBlocked === 'inverse') {
                         rememberProfileBlocked()
-                        await confirmCurrentProfileBlockedSpaceFeedEntries()
                         await notifyQueuedTabComplete()
                         await requestCloseTab(2, 100, true)
                     }
@@ -3213,9 +4968,13 @@ async function requestCloseTab(attempts = 3, delayMs = 150, scheduleFollowUps = 
 
     for(let attempt = 0; attempt < attempts; attempt++) {
         try {
-            const result = await safeSendRuntimeMessage({action: 'close-tab'}, null)
+            const result = await safeSendRuntimeMessageWithTimeout({
+                action: 'close-tab',
+                attemptId: activeQueuedAttemptId || ''
+            }, null, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
             const closed = !!result?.closed
             if(closed) return true
+            if(result?.staleAttempt) return false
         }
         catch(error) {
             if(!isRuntimeConnectionError(error) && !isExtensionContextInvalidatedError(error)) {
@@ -3236,7 +4995,7 @@ async function requestCloseTab(attempts = 3, delayMs = 150, scheduleFollowUps = 
     return false
 }
 
-async function waitForProfileActionReady(timeoutMs = 5000) {
+async function waitForProfileActionReady(timeoutMs = WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS) {
     if(isProfileBlocked()) return true
     return waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton(), timeoutMs, 100)
 }
@@ -3248,14 +5007,10 @@ function shouldDeferBlockedCloseTab(target) {
 function insertProfileActionButton(btn, target, kind) {
     btn.dataset.mbProfileBtnKind = kind
 
-    if(target.type === 'before-menu') {
-        target.element.insertAdjacentElement('beforebegin', btn)
-        normalizeProfileActionButtonOrder(target)
-        return
-    }
-
-    target.element.insertAdjacentElement('afterend', btn)
-    normalizeProfileActionButtonOrder(target)
+    const rail = getOrCreateProfileButtonRail()
+    rail.appendChild(btn)
+    reorderProfileButtonRail(rail)
+    positionProfileButtonRail(target)
 }
 
 function bindSinglePressAction(button, action) {
@@ -3320,6 +5075,11 @@ function toggleMuteBlockBtn() {
         existingBtn?.remove()
     }
     else {
+        // Not inserted until Quora's own profile menu exists: a press before that fails at once.
+        if(!getProfileMenuButton()) {
+            existingBtn?.remove()
+            return
+        }
         let target = getProfileButtonInsertionTarget()
         if(!target) return
 
@@ -3336,6 +5096,29 @@ function toggleMuteBlockBtn() {
     }
 }
 
+function toggleUnblockUnmuteBtn() {
+    let existingBtn = document.querySelector('.mb-ext_unblock-unmute-btn')
+
+    if(!isProfileBlocked()) {
+        existingBtn?.remove()
+    }
+    else {
+        let target = getProfileButtonInsertionTarget()
+        if(!target) return
+
+        if(existingBtn && isProfileTargetPlacement(existingBtn, target)) return
+        existingBtn?.remove()
+
+        let btn = document.createElement('button')
+        btn.innerText = 'Unblock Unmute'
+        btn.classList.add('mb-ext_unblock-unmute-btn')
+        setMuteBlockHelp(btn, 'Unblock and unmute this profile')
+
+        bindSinglePressAction(btn, () => handleUnblockUnmuteClick(btn))
+        insertProfileActionButton(btn, target, 'unblock-unmute')
+    }
+}
+
 function toggleMuteBlockCloseBtn() {
     let existingBtn = document.querySelector('.mb-ext_mute-block-close-btn')
 
@@ -3343,6 +5126,10 @@ function toggleMuteBlockCloseBtn() {
         existingBtn?.remove()
     }
     else {
+        if(!getProfileMenuButton()) {
+            existingBtn?.remove()
+            return
+        }
         let target = getProfileButtonInsertionTarget()
         if(!target) return
 
@@ -3365,15 +5152,17 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
     profileActionInProgress = true
 
     const closeBtn = document.querySelector('.mb-ext_close-tab-btn')
+    const unblockBtn = document.querySelector('.mb-ext_unblock-unmute-btn')
     const muteBtn = document.querySelector('.mb-ext_mute-block-btn')
     const muteCloseBtn = document.querySelector('.mb-ext_mute-block-close-btn')
     const originalText = button.innerText
     const originalCloseText = closeBtn?.innerText || ''
+    const originalUnblockText = unblockBtn?.innerText || ''
     const originalMuteText = muteBtn?.innerText || ''
     const originalMuteCloseText = muteCloseBtn?.innerText || ''
 
     button.innerText = 'Working...'
-    for(const managedButton of [closeBtn, muteBtn, muteCloseBtn]) {
+    for(const managedButton of [closeBtn, unblockBtn, muteBtn, muteCloseBtn]) {
         if(managedButton) managedButton.disabled = true
     }
 
@@ -3382,85 +5171,136 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
     }
 
     try {
-        const ready = await waitForProfileActionReady()
-        if(!ready) {
-            const unavailableReason = getProfileUnavailableReason()
-            if(unavailableReason) {
-                await removePendingSpaceFeedUrls([location.href])
-                alert(unavailableReason)
-                return
-            }
-
-            logProfileActionDebug('Profile actions not ready')
-            alert('Profile actions not ready')
-            return
-        }
-
-        const unavailableReason = getProfileUnavailableReason()
-        if(unavailableReason) {
-            await removePendingSpaceFeedUrls([location.href])
-            alert(unavailableReason)
-            return
-        }
-
-        if(isProfileBlocked()) {
-            await confirmCurrentProfileBlockedSpaceFeedEntries()
-            if(closeAfterSuccess) {
-                button.innerText = 'Closing...'
-                await new Promise(resolve => requestAnimationFrame(resolve))
-
-                const closed = await requestCloseTab()
-                if(closed) return
-            }
-
-            return
-        }
-
-        const completed = await muteProfile()
-
-        if(completed || isProfileBlocked()) {
-            await confirmCurrentProfileBlockedSpaceFeedEntries()
-        }
-
-        if(completed && closeAfterSuccess) {
-            button.innerText = 'Closing...'
-            await new Promise(resolve => requestAnimationFrame(resolve))
-
-            const closed = await requestCloseTab()
-            if(closed) return
-        }
+        const completed = await muteProfile({
+            allowBlockFallback: true,
+            silent: false,
+            allowForegroundFallback: false
+        })
 
         if(!completed && !isProfileBlocked()) {
-            button.innerText = originalText
-
-            if(closeBtn) {
-                closeBtn.disabled = false
-                closeBtn.innerText = originalCloseText
-            }
-
-            if(muteBtn) {
-                muteBtn.disabled = false
-                muteBtn.innerText = originalMuteText || 'Mute Block'
-            }
-
-            if(muteCloseBtn) {
-                muteCloseBtn.disabled = false
-                muteCloseBtn.innerText = originalMuteCloseText || 'Mute Block Close'
-            }
+            button.innerText = 'Retry'
+            return
         }
+
+        if(closeAfterSuccess) {
+            button.innerText = 'Closing...'
+            const closed = await requestCloseTab()
+            if(!closed) button.innerText = 'Retry'
+            return
+        }
+
+        button.innerText = 'Blocked'
+    }
+    catch(error) {
+        const message = `${error?.message || error || 'Profile action failed'}`
+        console.error(error)
+        await recordCurrentProfileNukeProgress({
+            status: 'error',
+            finalError: message,
+            event: `Direct profile action failed: ${message}`
+        })
+        reportActionIssue(message, false)
     }
     finally {
         profileActionInProgress = false
 
-        if(!isProfileBlocked()) {
-            ensureProfileButtons()
-        }
-        else if(closeBtn && document.body.contains(closeBtn)) {
+        if(closeBtn && document.body.contains(closeBtn)) {
             closeBtn.disabled = false
             if(closeBtn.innerText === 'Please wait...') {
                 closeBtn.innerText = originalCloseText || 'Close tab'
             }
         }
+        if(unblockBtn && document.body.contains(unblockBtn)) {
+            unblockBtn.disabled = false
+            if(unblockBtn.innerText === 'Working...') {
+                unblockBtn.innerText = originalUnblockText || 'Unblock Unmute'
+            }
+        }
+        if(muteBtn && document.body.contains(muteBtn)) {
+            muteBtn.disabled = false
+            if(muteBtn.innerText === 'Working...') {
+                muteBtn.innerText = originalMuteText || 'Mute Block'
+            }
+        }
+        if(muteCloseBtn && document.body.contains(muteCloseBtn)) {
+            muteCloseBtn.disabled = false
+            if(muteCloseBtn.innerText === 'Working...') {
+                muteCloseBtn.innerText = originalMuteCloseText || 'Mute Block Close'
+            }
+        }
+
+        ensureProfileButtons()
+    }
+}
+
+async function handleUnblockUnmuteClick(button) {
+    if(profileActionInProgress) return
+
+    profileActionInProgress = true
+
+    const closeBtn = document.querySelector('.mb-ext_close-tab-btn')
+    const unblockBtn = document.querySelector('.mb-ext_unblock-unmute-btn')
+    const muteBtn = document.querySelector('.mb-ext_mute-block-btn')
+    const muteCloseBtn = document.querySelector('.mb-ext_mute-block-close-btn')
+    const originalText = button.innerText
+    const originalCloseText = closeBtn?.innerText || ''
+    const originalUnblockText = unblockBtn?.innerText || ''
+    const originalMuteText = muteBtn?.innerText || ''
+    const originalMuteCloseText = muteCloseBtn?.innerText || ''
+
+    button.innerText = 'Working...'
+    for(const managedButton of [closeBtn, unblockBtn, muteBtn, muteCloseBtn]) {
+        if(managedButton) managedButton.disabled = true
+    }
+
+    if(closeBtn) {
+        closeBtn.innerText = 'Please wait...'
+    }
+
+    try {
+        const result = await unblockUnmuteProfile({
+            silent: false,
+            allowForegroundFallback: false,
+            clearNukeState: true
+        })
+
+        button.innerText = result?.ok ? 'Unblocked' : 'Retry'
+    }
+    catch(error) {
+        const message = `${error?.message || error || 'Unblock Unmute failed'}`
+        console.error(error)
+        await recordCurrentProfileNukeProgress({
+            status: 'error',
+            finalError: message,
+            event: `Unblock Unmute action failed: ${message}`
+        })
+        button.innerText = 'Retry'
+    }
+    finally {
+        profileActionInProgress = false
+
+        if(closeBtn && document.body.contains(closeBtn)) {
+            closeBtn.disabled = false
+            if(closeBtn.innerText === 'Please wait...') {
+                closeBtn.innerText = originalCloseText || 'Close tab'
+            }
+        }
+        if(unblockBtn && document.body.contains(unblockBtn)) {
+            unblockBtn.disabled = false
+            if(unblockBtn.innerText === 'Working...') {
+                unblockBtn.innerText = originalUnblockText || 'Unblock Unmute'
+            }
+        }
+        if(muteBtn && document.body.contains(muteBtn)) {
+            muteBtn.disabled = false
+            muteBtn.innerText = originalMuteText || 'Mute Block'
+        }
+        if(muteCloseBtn && document.body.contains(muteCloseBtn)) {
+            muteCloseBtn.disabled = false
+            muteCloseBtn.innerText = originalMuteCloseText || 'Mute Block Close'
+        }
+
+        ensureProfileButtons()
     }
 }
 
@@ -3752,6 +5592,7 @@ function getProfileUrlsFromText(text) {
 
         const cleanedHref = rawHref.replace(/[),.;:!?]+$/g, '')
         const href = normalizeQuoraProfileHref(cleanedHref)
+        if(!isLikelyExplicitProfileTargetHref(href)) continue
         if(!href || seen.has(href)) continue
 
         seen.add(href)
@@ -3761,15 +5602,83 @@ function getProfileUrlsFromText(text) {
     return urls
 }
 
+function makeSpaceFeedCandidateEvidence(collector = 'profile-links', confidence = SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH, extra = {}) {
+    return {
+        collector,
+        confidence,
+        ...extra
+    }
+}
+
+function attachSpaceFeedCandidateMetadata(urls, evidenceByHref = {}, needsSourceResolution = false) {
+    Object.defineProperty(urls, 'candidateEvidenceByHref', {
+        configurable: true,
+        enumerable: false,
+        value: evidenceByHref
+    })
+    Object.defineProperty(urls, 'needsSourceResolution', {
+        configurable: true,
+        enumerable: false,
+        value: needsSourceResolution
+    })
+    return urls
+}
+
+function normalizeSpaceFeedCandidateEvidenceByHref(evidenceByHref = {}, urls = []) {
+    const normalized = {}
+
+    for(const href of urls || []) {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref) continue
+
+        const evidence = evidenceByHref[href] || evidenceByHref[normalizedHref] || null
+        if(evidence) {
+            normalized[normalizedHref] = {
+                collector: evidence.collector || 'profile-links',
+                confidence: evidence.confidence || '',
+                source: evidence.source || '',
+                rawSlug: evidence.rawSlug || '',
+                candidateHref: normalizedHref
+            }
+        }
+    }
+
+    return normalized
+}
+
+function mergeSpaceFeedCandidateEvidenceByHref(...maps) {
+    const merged = {}
+
+    for(const map of maps) {
+        for(const [href, evidence] of Object.entries(map || {})) {
+            const normalizedHref = normalizeQuoraProfileHref(href)
+            if(!normalizedHref || !evidence) continue
+
+            merged[normalizedHref] = {
+                ...(merged[normalizedHref] || {}),
+                ...evidence,
+                candidateHref: normalizedHref
+            }
+        }
+    }
+
+    return merged
+}
+
 function isTruncatedQuoraProfileTextUrl(href) {
     return /\/profile\/[^/\s<>"'`)\]]*(?:\.{3,}|…)/i.test(`${href || ''}`)
 }
 
-function getProfileUrlsFromSpacePostHref(href) {
+function isLowConfidenceSpacePostProfileSlug(slug) {
+    const tokens = `${slug || ''}`.split('-').filter(Boolean)
+    return tokens.length < 2
+}
+
+function getProfileUrlCandidatesFromSpacePostHref(href) {
     const normalizedPostHref = normalizeQuoraPostHref(href)
     if(!normalizedPostHref) return []
 
-    const urls = []
+    const candidates = []
     const seen = new Set()
     const addSlug = slug => {
         const cleanSlug = sanitizeProfileHrefSlug(slug)
@@ -3779,7 +5688,18 @@ function getProfileUrlsFromSpacePostHref(href) {
         if(!profileHref || seen.has(profileHref)) return
 
         seen.add(profileHref)
-        urls.push(profileHref)
+        const confidence = isLikelyExplicitProfileTargetSlug(cleanSlug)
+            ? (isLowConfidenceSpacePostProfileSlug(cleanSlug)
+                ? SPACE_FEED_CANDIDATE_CONFIDENCE_LOW
+                : SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM)
+            : SPACE_FEED_CANDIDATE_CONFIDENCE_LOW
+        candidates.push({
+            href: profileHref,
+            collector: 'space-post-url-artifact',
+            confidence,
+            source: 'post-url',
+            rawSlug: `${slug || ''}`
+        })
     }
 
     try {
@@ -3794,10 +5714,16 @@ function getProfileUrlsFromSpacePostHref(href) {
         }
     }
     catch {
-        return urls
+        return candidates
     }
 
-    return urls
+    return candidates
+}
+
+function getProfileUrlsFromSpacePostHref(href) {
+    return getProfileUrlCandidatesFromSpacePostHref(href)
+        .filter(candidate => candidate.confidence !== SPACE_FEED_CANDIDATE_CONFIDENCE_LOW)
+        .map(candidate => candidate.href)
 }
 
 function normalizeRememberedProfileDisplayName(label) {
@@ -3964,7 +5890,9 @@ function getOriginalPosterProfileHrefFromInlineData() {
         /\\"contentObject\\":\{\\"__typename\\":\\"Question\\"[\s\S]{0,12000}?\\"asker\\":\{[\s\S]{0,4000}?\\"profileUrl\\":\\"(\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
         /"contentObject":\{"__typename":"Question"[\s\S]{0,12000}?"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/,
         /\\"asker\\":\{[\s\S]{0,4000}?\\"profileUrl\\":\\"(\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
-        /"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/
+        /"asker":\{[\s\S]{0,4000}?"profileUrl":"(\/profile\/[^"?#]+)(?:[?#][^"]*)?"/,
+        /\\"feedReason\\":\{[\s\S]{0,8000}?\\"user(?:Names|Photos)\\"\\s*:\\s*\\[\\{[\s\S]{0,4000}?\\"profileUrl\\":\\"((?:https?:\/\/(?:www\\.)?quora\\.com)?\/profile\/[^"\\?#]+)(?:[?#][^"\\]*)?\\"/,
+        /"feedReason":\{[\s\S]{0,8000}?"user(?:Names|Photos)"\s*:\s*\[\{[\s\S]{0,4000}?"profileUrl":"((?:https?:\/\/(?:www\.)?quora\.com)?\/profile\/[^"?#]+)(?:[?#][^"]*)?"/
     ]
 
     for(const script of Array.from(document.scripts || [])) {
@@ -3983,6 +5911,29 @@ function getOriginalPosterProfileHrefFromInlineData() {
     return null
 }
 
+function getOriginalPosterProfileHrefFromParsedInlinePayload(data = null) {
+    const directCandidates = [
+        data?.data?.contentObject?.asker?.profileUrl,
+        data?.data?.contentObject?.author?.profileUrl,
+        data?.data?.contentObject?.tribeItem?.author?.profileUrl,
+        data?.data?.question?.asker?.profileUrl,
+        data?.data?.question?.author?.profileUrl
+    ]
+    for(const candidate of directCandidates) {
+        const href = normalizeQuoraProfileHref(candidate)
+        if(href) return href
+    }
+
+    const feedReason = data?.data?.feedReason || data?.data?.question?.feedReason || null
+    const relevantUsers = [
+        ...(Array.isArray(feedReason?.userNames) ? feedReason.userNames : []),
+        ...(Array.isArray(feedReason?.userPhotos) ? feedReason.userPhotos : []),
+        ...(Array.isArray(feedReason?.relevantUsers) ? feedReason.relevantUsers : [])
+    ]
+    const hrefs = getNormalizedProfileHrefList(relevantUsers.map(user => user?.profileUrl || ''))
+    return hrefs.length === 1 ? hrefs[0] : null
+}
+
 function getOriginalPosterProfileHrefFromInlinePayloads() {
     for(const script of Array.from(document.scripts || [])) {
         const text = script.textContent || ''
@@ -3996,7 +5947,7 @@ function getOriginalPosterProfileHrefFromInlinePayloads() {
             try {
                 const payload = JSON.parse(`"${escapedPayload}"`)
                 const data = JSON.parse(payload)
-                const href = normalizeQuoraProfileHref(data?.data?.contentObject?.asker?.profileUrl)
+                const href = getOriginalPosterProfileHrefFromParsedInlinePayload(data)
                 if(href) return href
             }
             catch {
@@ -4398,6 +6349,51 @@ function getSpacePostListedProfileLinks() {
     return urls
 }
 
+function getSpacePostResolutionProfileLinkCandidates() {
+    const candidates = []
+    const seen = new Set()
+    const addHref = (href, source = '') => {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref || seen.has(normalizedHref)) return
+
+        seen.add(normalizedHref)
+        candidates.push({href: normalizedHref, source})
+    }
+
+    for(const href of getProfileUrlsFromText(document.title || '')) {
+        addHref(href, 'title')
+    }
+
+    const root = getSpacePostContentRoot()
+    if(root) {
+        for(const href of getProfileUrlsFromText(getElementText(root))) {
+            addHref(href, 'body-text')
+        }
+    }
+
+    for(const href of getSpacePostListedProfileLinks()) {
+        addHref(href, 'listed-profile-link')
+    }
+
+    return candidates
+}
+
+function getSpacePostResolutionProfileLinks() {
+    return getSpacePostResolutionProfileLinkCandidates().map(candidate => candidate.href)
+}
+
+function getSingleSpacePostResolutionProfileHref(options = {}) {
+    const candidates = getSpacePostResolutionProfileLinkCandidates()
+        .filter(candidate => {
+            if(options.explicitOnly !== true) return true
+            return candidate.source === 'title' ||
+                candidate.source === 'body-text' ||
+                candidate.source === 'listed-profile-link'
+        })
+    const urls = getNormalizedProfileHrefList(candidates.map(candidate => candidate.href))
+    return urls.length === 1 ? urls[0] : null
+}
+
 function setSpacePostNukeUrls(button, urls) {
     if(!button) return
     button.dataset.mbNukeUrls = JSON.stringify(getNormalizedProfileHrefList(urls))
@@ -4501,24 +6497,23 @@ function injectSpacePostNukeBtn() {
             setNukeButtonWorking(btn)
 
             try {
-                const result = await safeSendRuntimeMessage({
-                    action: 'enqueue-tabs',
+                const result = await enqueueCoordinatorProfileUrls({
                     urls: currentUrls,
-                    tabAction: 'nuke',
+                    sourceType: 'space-post',
+                    event: 'Queued from space post',
                     maxConcurrent: getProfilesPerBatch()
-                }, {queued: 0})
+                })
 
-                if((result?.queued || 0) > 0) {
-                    await waitForOwnedNukeTabsToDrain(btn)
+                if((result?.executionQueued || result?.queued || result?.merged || 0) > 0) {
+                    await waitForOwnedNukeTabsToDrain(btn, 180000, 1000, {runId: result?.runId || ''})
                 }
                 else {
                     const sweep = await sweepBlockedProfileTabs()
                     if(sweep.owned > 0) {
-                        await waitForOwnedNukeTabsToDrain(btn)
+                        await waitForOwnedNukeTabsToDrain(btn, 180000, 1000, {runId: result?.runId || ''})
                     }
                     else {
-                        setNukeButtonIdle(btn)
-                        alert('Nothing was queued')
+                        setNukeButtonNotice(btn, 'Nothing queued')
                     }
                 }
             }
@@ -4662,7 +6657,6 @@ function getSpaceHeaderActionInsertBefore(row) {
 
 function resolveCurrentSpaceDescriptor() {
     const header = getSpaceHeaderContainer()
-    if(!header) return null
 
     const url = normalizeSpaceUrl(getDocumentCanonicalUrl(document))
     if(!url) return null
@@ -4830,7 +6824,7 @@ async function setCurrentSpaceCategory(space, category) {
 
     syncSpaceClassificationControls()
     scheduleSpaceAssetNukeControls(0)
-    await safeStorageSet({[SPACE_REGISTRY_KEY]: spaceRegistry})
+    await safeSendRuntimeMessage({action: 'set-space-registry', spaceRegistry}, null)
 }
 
 function getClosestCommonAncestor(nodes) {
@@ -4904,29 +6898,46 @@ function getSpaceFeedBar() {
     return bar
 }
 
-function getSpaceFeedTopButtonHost() {
+function getSpaceFeedToolbar() {
     const bar = getSpaceFeedBar()
     if(!bar) return null
 
-    let host = bar.querySelector(':scope > .mb-ext_space-feed-nuke-host')
+    let toolbar = bar.querySelector(':scope > .mb-ext_space-feed-toolbar')
+    if(toolbar) return toolbar
+
+    toolbar = document.createElement('div')
+    toolbar.className = 'mb-ext_space-feed-toolbar'
+    bar.appendChild(toolbar)
+    return toolbar
+}
+
+function getSpaceFeedTopButtonHost() {
+    const toolbar = getSpaceFeedToolbar()
+    if(!toolbar) return null
+
+    let host = toolbar.querySelector(':scope > .mb-ext_space-feed-nuke-host')
     if(host) return host
 
     host = document.createElement('div')
     host.className = 'mb-ext_space-feed-nuke-host'
-    bar.appendChild(host)
+    const statusHost = toolbar.querySelector(':scope > .mb-ext_space-feed-status-host')
+    if(statusHost?.nextSibling) toolbar.insertBefore(host, statusHost.nextSibling)
+    else toolbar.appendChild(host)
     return host
 }
 
 function getSpaceFeedStatusHost() {
-    const bar = getSpaceFeedBar()
-    if(!bar) return null
+    const toolbar = getSpaceFeedToolbar()
+    if(!toolbar) return null
 
-    let host = bar.querySelector(':scope > .mb-ext_space-feed-status-host')
+    let host = toolbar.querySelector(':scope > .mb-ext_space-feed-status-host')
     if(host) return host
 
     host = document.createElement('div')
     host.className = 'mb-ext_space-feed-status-host'
-    bar.appendChild(host)
+    const nukeHost = toolbar.querySelector(':scope > .mb-ext_space-feed-nuke-host')
+    if(nukeHost) toolbar.insertBefore(host, nukeHost)
+    else toolbar.appendChild(host)
     return host
 }
 
@@ -4934,40 +6945,46 @@ function syncSpaceFeedTopBarLayout() {
     const bar = getSpaceFeedBar()
     if(!bar) return false
 
-    const nukeButton = bar.querySelector('.mb-ext_space-feed-nuke-btn')
-    const statusButton = bar.querySelector('.mb-ext_space-feed-status-btn')
     const nukeHost = bar.querySelector('.mb-ext_space-feed-nuke-host')
     const statusHost = bar.querySelector('.mb-ext_space-feed-status-host')
     if(!nukeHost || !statusHost) return false
 
-    const nukeWidth = Math.ceil(nukeButton?.getBoundingClientRect?.().width || 0)
-    const statusWidth = Math.ceil(statusButton?.getBoundingClientRect?.().width || 0)
-    const gap = nukeWidth && statusWidth ? 12 : 0
-
-    statusHost.style.right = `${nukeWidth + gap}px`
-    bar.style.paddingRight = `${Math.max(360, nukeWidth + statusWidth + gap + 24)}px`
+    statusHost.style.right = ''
+    nukeHost.style.right = ''
+    bar.style.paddingRight = ''
     return true
 }
 
 function getSpaceFeedContentRoot() {
-    return document.querySelector('main, [role="main"], #mainContent') || document.body
+    const candidates = Array.from(document.querySelectorAll('#mainContent, main, [role="main"]'))
+        .filter(candidate => candidate instanceof Element)
+    if(!candidates.length) return document.body
+
+    return candidates
+        .map((candidate, index) => ({
+            candidate,
+            index,
+            timestampCount: candidate.querySelectorAll?.('a.post_timestamp').length || 0
+        }))
+        .sort((left, right) => right.timestampCount - left.timestampCount || left.index - right.index)[0]
+        .candidate || document.body
 }
 
-function getSpaceFeedTimestampScanDistance(timestamp) {
+function getSpaceFeedTimestampScanDistance(timestamp, precomputedRect = null) {
     const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
-    const rect = timestamp?.getBoundingClientRect?.() || null
+    const rect = precomputedRect || timestamp?.getBoundingClientRect?.() || null
     if(!rect) return Number.POSITIVE_INFINITY
     if(rect.bottom >= 0 && rect.top <= viewportHeight) return 0
     if(rect.top > viewportHeight) return rect.top - viewportHeight
     return Math.abs(rect.bottom)
 }
 
-function isSpaceFeedTimestampInScanWindow(timestamp) {
+function isSpaceFeedTimestampInScanWindow(timestamp, precomputedRect = null) {
     const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0
-    const rect = timestamp?.getBoundingClientRect?.() || null
+    const rect = precomputedRect || timestamp?.getBoundingClientRect?.() || null
     if(!rect) return false
 
-    return rect.bottom >= -SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX &&
+    return rect.bottom >= -SPACE_FEED_SCAN_ABOVE_VIEWPORT_MARGIN_PX &&
         rect.top <= viewportHeight + SPACE_FEED_SCAN_VIEWPORT_MARGIN_PX
 }
 
@@ -5055,15 +7072,26 @@ function getViewportSampledSpaceFeedTimestamps() {
 }
 
 function getBoundedVisibleSpaceFeedTimestamps() {
-    const nodes = Array.from(document.querySelectorAll('a.post_timestamp'))
-        .slice(0, SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES)
+    // Scoped to the feed's own content root (falls back to document.body
+    // when unresolved, same as an unscoped query) rather than the whole
+    // document, and each node's bounding rect is measured once and reused
+    // for both the window check and the distance calculation below --
+    // measuring twice per node here was forcing a redundant layout reflow
+    // for every post ever loaded into this (non-virtualized) feed on every
+    // scan.
+    const scanRoot = getSpaceFeedContentRoot() || document
+    const nodes = Array.from(scanRoot.querySelectorAll('a.post_timestamp'))
     const timestamps = nodes
-        .map((timestamp, index) => ({
-            timestamp,
-            index,
-            distance: getSpaceFeedTimestampScanDistance(timestamp)
-        }))
-        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp))
+        .map((timestamp, index) => {
+            const rect = timestamp?.getBoundingClientRect?.() || null
+            return {
+                timestamp,
+                index,
+                rect,
+                distance: getSpaceFeedTimestampScanDistance(timestamp, rect)
+            }
+        })
+        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp, entry.rect))
 
     if(timestamps.length <= SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
         return timestamps.map(entry => entry.timestamp)
@@ -5076,28 +7104,46 @@ function getBoundedVisibleSpaceFeedTimestamps() {
         .map(entry => entry.timestamp)
 }
 
-function getVisibleSpaceFeedTimestamps() {
-    const sampledTimestamps = getViewportSampledSpaceFeedTimestamps()
-    if(sampledTimestamps.length) return sampledTimestamps
-    if(hasActivePendingSpaceFeedWork()) return getBoundedVisibleSpaceFeedTimestamps()
+function mergeSpaceFeedTimestampScanResults(...groups) {
+    const seen = new Set()
+    const timestamps = []
 
-    const timestamps = Array.from(document.querySelectorAll('a.post_timestamp'))
-        .map((timestamp, index) => ({
-            timestamp,
-            index,
-            distance: getSpaceFeedTimestampScanDistance(timestamp)
-        }))
-        .filter(entry => isSpaceFeedTimestampInScanWindow(entry.timestamp))
+    for(const group of groups) {
+        for(const timestamp of Array.isArray(group) ? group : []) {
+            if(!(timestamp instanceof Element)) continue
+            if(seen.has(timestamp)) continue
+            if(!isSpaceFeedTimestampInScanWindow(timestamp)) continue
+
+            seen.add(timestamp)
+            timestamps.push({
+                timestamp,
+                index: timestamps.length,
+                distance: getSpaceFeedTimestampScanDistance(timestamp)
+            })
+        }
+    }
 
     if(timestamps.length <= SPACE_FEED_SCAN_MAX_TIMESTAMPS) {
-        return timestamps.map(entry => entry.timestamp)
+        return timestamps
+            .map(entry => entry.timestamp)
+            .sort(compareElementsByDocumentOrder)
     }
 
     return timestamps
         .sort((left, right) => left.distance - right.distance || left.index - right.index)
         .slice(0, SPACE_FEED_SCAN_MAX_TIMESTAMPS)
-        .sort((left, right) => left.index - right.index)
         .map(entry => entry.timestamp)
+        .sort(compareElementsByDocumentOrder)
+}
+
+function getVisibleSpaceFeedTimestamps() {
+    const sampledTimestamps = getViewportSampledSpaceFeedTimestamps()
+    const boundedTimestamps = getBoundedVisibleSpaceFeedTimestamps()
+    const timestamps = mergeSpaceFeedTimestampScanResults(sampledTimestamps, boundedTimestamps)
+    if(timestamps.length) return timestamps
+    if(hasActivePendingSpaceFeedWork()) return boundedTimestamps
+
+    return []
 }
 
 function isSpaceFeedRootCandidate(node, timestamp) {
@@ -5189,6 +7235,70 @@ function getSpaceFeedPostKey(postRoot, timestamp) {
     return `space-post-text:${snippet.toLowerCase()}`
 }
 
+function getSpaceFeedProfileLinkCardRoot(link) {
+    if(!(link instanceof Element) || !isVisible(link)) return null
+
+    const root = link.closest('a[href*="/profile/"]')
+    if(!(root instanceof HTMLAnchorElement) || !isVisible(root)) return null
+    if(isExtensionOwnedNode(root)) return null
+    // 2026-10-08 (Franklin Veaux incident): this scanner looks for Quora's
+    // own standalone "profile card" widget, but that widget shares its
+    // q-box/puppeteer_test_link markup with the author byline Quora renders
+    // for an embedded/quoted sub-post (a feature card, a Quora-native embed,
+    // or a hyperlink embed) -- the exact class of false positive the
+    // SPACE_FEED_EMBED_SCOPE_SELECTOR exclusion was already added for in
+    // getSpaceFeedPosterProfileUrls (2026-09-27) and the asset/target split
+    // in getSpaceFeedPostCandidateProfileUrls (2026-09-25), neither of which
+    // this separate scanner goes through. A genuine contributor's answer to
+    // an unrelated question got embedded/quoted in a troll-patrol post, his
+    // byline rendered as this same card shape, and he was queued for
+    // mute-block with no further scrutiny as a result.
+    if(root.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return null
+    if(root.querySelector('a.post_timestamp, .post_timestamp')) return null
+    if(root.closest('.mb-ext_space-feed-post-nuke-host')) return null
+    if(!root.classList.contains('q-box') && !root.classList.contains('puppeteer_test_link')) return null
+
+    const href = normalizeQuoraProfileHref(root.href)
+    if(!href) return null
+
+    const text = getElementText(root)
+    if(!/\/profile\//i.test(text) && !text.includes(href.split('/').pop() || '')) return null
+
+    return root
+}
+
+function getSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
+    if(!isAssetSpacePage()) return []
+
+    const contentRoot = getSpaceFeedContentRoot()
+    if(!contentRoot) return []
+
+    const entries = []
+    const seenRoots = new Set()
+    const seenHrefs = new Set()
+
+    for(const link of Array.from(contentRoot.querySelectorAll('a[href*="/profile/"]'))) {
+        const root = getSpaceFeedProfileLinkCardRoot(link)
+        if(!root || seenRoots.has(root)) continue
+
+        const href = normalizeQuoraProfileHref(root.href)
+        if(!href || seenHrefs.has(href)) continue
+
+        const postKey = `space-profile-link:${href}`
+        seenRoots.add(root)
+        seenHrefs.add(href)
+        activeKeys.add(postKey)
+        entries.push({
+            postKey,
+            postRoot: root,
+            postUrl: href,
+            candidateUrls: [href]
+        })
+    }
+
+    return entries
+}
+
 function getSpaceFeedPostHeaderProfileHref(postRoot, timestamp) {
     if(!postRoot) return null
 
@@ -5217,9 +7327,7 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
     const seen = new Set()
     const timestamps = []
     const posterScopeSelector =
-        '.standalone_featurable,' +
-        '[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
+        `${SPACE_FEED_EMBED_SCOPE_SELECTOR},` +
         '.puppeteer_test_tribe_post_item_feed_story,' +
         '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
         'article,' +
@@ -5244,7 +7352,20 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
 
     addTimestamp(timestamp)
 
+    // 2026-09-27: postRoot.querySelectorAll finds every timestamp nested
+    // inside postRoot, including ones belonging to an embedded/quoted
+    // sub-post (a feature card, Quora-native embed, or hyperlink embed).
+    // Each one used to resolve to that sub-post's own author as a "poster"
+    // -- exactly the failure mode the isTargetSpacePage()/asset-space split
+    // above was added for (see that comment), except this loop still hit
+    // it independently of which branch calls it, because it runs before
+    // either branch sees the result. Skipping embedded timestamps here
+    // fixes it at the source for both branches instead of re-patching each
+    // caller.
     for(const candidate of Array.from(postRoot.querySelectorAll('a.post_timestamp'))) {
+        const embedAncestor = candidate.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)
+        if(embedAncestor instanceof Element && embedAncestor !== postRoot && postRoot.contains(embedAncestor)) continue
+
         addTimestamp(candidate)
     }
 
@@ -5284,79 +7405,26 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
     return urls
 }
 
-function getSpaceFeedEmbeddedPosterProfileUrls(postRoot) {
-    if(!postRoot) return []
-
-    const urls = []
-    const seen = new Set()
-    const posterScopeSelector =
-        '.standalone_featurable,' +
-        '[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
-        '.puppeteer_test_tribe_post_item_feed_story,' +
-        '.dom_annotate_multifeed_bundle_TribeContentBundle,' +
-        'article,' +
-        '[role="article"],' +
-        '.q-box'
-    const embedRoots = []
-    const addEmbedRoot = root => {
-        if(!(root instanceof Element) || !postRoot.contains(root) || embedRoots.includes(root)) return
-        embedRoots.push(root)
-    }
-    const addPosterHref = href => {
-        const normalizedHref = normalizeQuoraProfileHref(href)
-        if(!normalizedHref || seen.has(normalizedHref)) return
-
-        seen.add(normalizedHref)
-        urls.push(normalizedHref)
-    }
-
-    for(const embed of Array.from(postRoot.querySelectorAll(
-        '.standalone_featurable[data-is-quora-embed="true"],' +
-        '[data-type="hyperlink_embed"],' +
-        'a[href^="https://qr.ae/"]'
-    ))) {
-        addEmbedRoot(embed.closest('.standalone_featurable, [data-is-quora-embed="true"], [data-type="hyperlink_embed"]') || embed)
-    }
-
-    for(const embedRoot of embedRoots) {
-        if(hasVisibleFollowProxy(embedRoot)) {
-            for(const link of getQuoraProfileLinks(embedRoot)) {
-                addPosterHref(link.href)
-            }
-        }
-
-        let scope = embedRoot.closest(posterScopeSelector) || embedRoot.parentElement
-        const scopes = []
-
-        while(scope && scope !== postRoot) {
-            if(postRoot.contains(scope) && !scopes.includes(scope)) {
-                scopes.push(scope)
-            }
-            scope = scope.parentElement
-        }
-
-        if(!scopes.includes(postRoot)) {
-            scopes.push(postRoot)
-        }
-
-        for(const candidateScope of scopes) {
-            if(!hasVisibleFollowProxy(candidateScope)) continue
-            addPosterHref(getSpaceFeedPostHeaderProfileHref(candidateScope, embedRoot))
-        }
-    }
-
-    return urls
-}
-
 function getSpaceFeedPostContentScopes(postRoot) {
     if(!postRoot) return []
 
     const scopes = []
     const addScope = scope => {
-        if(scope && !scopes.includes(scope)) {
-            scopes.push(scope)
-        }
+        if(!scope || scopes.includes(scope)) return
+        // 2026-10-08 (Franklin Veaux pattern, third+fourth occurrence): a
+        // scope nested inside -- or itself matching -- an embedded/quoted
+        // sub-post marker is the embed's own content, not the actual
+        // poster's. Both consumers of this scope list (the dom-profile-link
+        // loop and the text-profile-url fallback, both in
+        // getSpaceFeedPostCandidateProfileUrls) have no embed-awareness of
+        // their own, so a link or plain-text URL inside an embed -- most
+        // commonly the embedded answer's own author byline -- was
+        // previously indistinguishable from something the actual poster
+        // deliberately wrote. Excluding these scopes entirely matches how
+        // getSpaceFeedPosterProfileUrls (2026-09-27) and
+        // getSpaceFeedProfileLinkCardRoot (2026-10-08) already handle this.
+        if(scope !== postRoot && scope.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return
+        scopes.push(scope)
     }
 
     for(const scope of Array.from(postRoot.querySelectorAll(
@@ -5404,26 +7472,38 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
 
     const headerProfileHref = getSpaceFeedPostHeaderProfileHref(postRoot, timestamp)
     const posterProfileUrls = getSpaceFeedPosterProfileUrls(postRoot, timestamp)
-    const sharedPosterUrls = posterProfileUrls.filter(href => href !== headerProfileHref)
     if(isTargetSpacePage()) {
-        return posterProfileUrls
+        return posterProfileUrls.length
+            ? posterProfileUrls
+            : getNormalizedProfileHrefList([headerProfileHref])
     }
+    // 2026-09-25: asset-space pages used to also treat any *other* poster
+    // surfaced via an embedded/quoted sub-post (getSpaceFeedEmbeddedPosterProfileUrls,
+    // removed) as a high-confidence candidate, the same tier as a genuine
+    // scam-target link found in a post's own content. That conflated two
+    // different things: "this person authored/posted content" (true of the
+    // primary header author too, which this function already excludes) and
+    // "this profile is being called out within someone else's post" -- a
+    // real incident (Franklin Veaux, a genuine contributor whose post got
+    // embedded/quoted for an unrelated reason) got queued for mute-block
+    // because of this. isTargetSpacePage() above is the deliberate
+    // exception: on that page type, "poster" and "target" genuinely are the
+    // same thing by the space's own design, which is why that branch still
+    // returns posterProfileUrls directly. Asset pages don't have that
+    // property, so a poster there -- however discovered -- is not a
+    // candidate.
 
     const urls = []
     const seen = new Set()
-    const addUrl = href => {
+    const candidateEvidenceByHref = {}
+    let needsSourceResolution = false
+    const addUrl = (href, evidence = null) => {
         if(!href || href === headerProfileHref || seen.has(href)) return
 
         seen.add(href)
         urls.push(href)
-    }
-
-    if(isAssetSpacePage()) {
-        for(const href of [
-            ...sharedPosterUrls,
-            ...getSpaceFeedEmbeddedPosterProfileUrls(postRoot)
-        ]) {
-            addUrl(href)
+        if(evidence) {
+            candidateEvidenceByHref[href] = evidence
         }
     }
 
@@ -5433,7 +7513,7 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
 
             const href = normalizeQuoraProfileHref(link.href)
             if(!href) continue
-            addUrl(href)
+            addUrl(href, makeSpaceFeedCandidateEvidence('dom-profile-link', SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH))
         }
     }
 
@@ -5442,12 +7522,24 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
     ]
 
     for(const href of fallbackUrls) {
-        addUrl(href)
+        addUrl(href, makeSpaceFeedCandidateEvidence('text-profile-url', SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM))
     }
 
     if(!urls.length && isAssetSpacePage()) {
-        for(const href of getProfileUrlsFromSpacePostHref(timestamp?.href || '')) {
-            addUrl(href)
+        for(const candidate of getProfileUrlCandidatesFromSpacePostHref(timestamp?.href || '')) {
+            if(candidate.confidence === SPACE_FEED_CANDIDATE_CONFIDENCE_LOW) {
+                needsSourceResolution = true
+                continue
+            }
+
+            addUrl(candidate.href, makeSpaceFeedCandidateEvidence(
+                candidate.collector,
+                candidate.confidence,
+                {
+                    source: candidate.source,
+                    rawSlug: candidate.rawSlug
+                }
+            ))
         }
     }
 
@@ -5456,15 +7548,37 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
         const titleNameCandidate = getTrailingTitleNameCandidate(getElementText(titleAnchor) || getElementText(postRoot))
 
         for(const href of getNearbyProfileUrlsForName(postRoot, titleNameCandidate, headerProfileHref)) {
-            addUrl(href)
+            addUrl(href, makeSpaceFeedCandidateEvidence('nearby-profile-name', SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM))
         }
     }
 
-    return urls
+    return attachSpaceFeedCandidateMetadata(urls, candidateEvidenceByHref, needsSourceResolution)
 }
 
-function isSpaceFeedPostNuked(postKey) {
-    return !!(postKey && spaceNukedPosts?.[postKey])
+function getRememberedSpaceFeedPostUrlSet(postKey) {
+    const record = postKey ? spaceNukedPosts?.[postKey] : null
+    return new Set(getStoredSpaceFeedRecordUrls(record, 'allUrls'))
+}
+
+function isSpaceFeedPostNuked(postKey, candidateUrls = null) {
+    const rememberedUrls = getRememberedSpaceFeedPostUrlSet(postKey)
+    if(!rememberedUrls.size) return false
+
+    const urls = getNormalizedProfileHrefList(candidateUrls || [])
+    if(!urls.length) return true
+
+    return urls.every(url => rememberedUrls.has(url) || isProfileNukeSucceeded(url))
+}
+
+function isSpaceFeedEntryNuked(entry) {
+    return isSpaceFeedPostNuked(entry?.postKey, entry?.candidateUrls || [])
+}
+
+function isRememberedSpaceFeedPostProfile(postKey, profileHref) {
+    const href = normalizeQuoraProfileHref(profileHref)
+    if(!href) return false
+
+    return getRememberedSpaceFeedPostUrlSet(postKey).has(href)
 }
 
 function isSpaceFeedPostNuking(postKey) {
@@ -5472,6 +7586,8 @@ function isSpaceFeedPostNuking(postKey) {
 }
 
 function isSpaceFeedPostPending(postKey) {
+    if(postKey && spacePendingNukedPosts?.[postKey]?.resolverPending) return true
+    if(hasPendingCoordinatorSpaceFeedPost(postKey)) return true
     return getActivePendingSpaceFeedUrls(postKey).length > 0
 }
 
@@ -5495,7 +7611,7 @@ function clearStaleLocalSpaceFeedBusyState() {
     const queueingButtons = document.querySelectorAll('.mb-ext_space-feed-nuke-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-queue-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-nuke-btn[data-mb-queueing="true"]')
 
     if(!spaceFeedNukingPostKeys.size && !queueingButtons.length) return false
-    if(hasOwnedNukeWorkInFlight() || hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
+    if(hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
 
     spaceFeedNukingPostKeys.clear()
     for(const button of Array.from(queueingButtons)) {
@@ -5525,11 +7641,277 @@ function getStoredSpaceFeedRecordUrls(record, preferredKey = 'remainingUrls') {
     return getNormalizedProfileHrefList(urls)
 }
 
+function getPendingSpaceFeedJobKeyPatch(record = {}, remainingUrls = []) {
+    const remaining = getNormalizedProfileHrefList(remainingUrls)
+    const existingByHref = record?.jobKeysByProfileHref && typeof record.jobKeysByProfileHref === 'object'
+        ? record.jobKeysByProfileHref
+        : {}
+    const jobKeysByProfileHref = {}
+
+    for(const href of remaining) {
+        jobKeysByProfileHref[href] = normalizeQuoraProfileHref(existingByHref[href] || href) || href
+    }
+
+    return {
+        jobKeys: getNormalizedProfileHrefList(Object.values(jobKeysByProfileHref)),
+        jobKeysByProfileHref
+    }
+}
+
 function getPendingSpaceFeedUrlSet(postKey) {
     return new Set(getActivePendingSpaceFeedUrls(postKey))
 }
 
+function isPendingSpaceFeedRecordForSpace(record = null, space = null) {
+    if(!record || !space?.key) return false
+
+    return `${record.spaceKey || ''}` === `${space.key || ''}`
+}
+
+function normalizeCoordinatorQueue(records = {}) {
+    return records && typeof records === 'object' ? records : {}
+}
+
+function isPendingCoordinatorStatus(status = '') {
+    return PENDING_COORDINATOR_STATUSES.has(`${status || ''}`.trim())
+}
+
+function getCoordinatorItemSources(item = {}) {
+    const sources = []
+    if(item?.source && typeof item.source === 'object') sources.push(item.source)
+    if(Array.isArray(item?.sources)) {
+        sources.push(...item.sources.filter(source => source && typeof source === 'object'))
+    }
+    if(Array.isArray(item?.evidence)) {
+        for(const evidence of item.evidence) {
+            if(!evidence || typeof evidence !== 'object' || !evidence.sourcePageUrl) continue
+            sources.push({
+                type: 'space-feed',
+                pageUrl: evidence.sourcePageUrl
+            })
+        }
+    }
+    return sources
+}
+
+function isCoordinatorSourceForSpace(source = null, space = null) {
+    if(!source || !space?.key) return false
+
+    if(source.spaceKey && `${source.spaceKey}` === `${space.key}`) return true
+
+    const sourceUrl = normalizeSpaceUrl(source.spaceUrl || source.pageUrl || '')
+    return !!(sourceUrl && space.url && sourceUrl === space.url)
+}
+
+function isPendingCoordinatorSpaceFeedItemForSpace(item = null, space = null) {
+    if(!item || !isPendingCoordinatorStatus(item.status)) return false
+
+    return getCoordinatorItemSources(item).some(source => isCoordinatorSourceForSpace(source, space))
+}
+
+function getPendingCoordinatorSpaceFeedWorkCountForSpace(space = resolveCurrentSpaceDescriptor()) {
+    if(!space?.key) return 0
+
+    return Object.values(coordinatorQueue || {})
+        .filter(item => isPendingCoordinatorSpaceFeedItemForSpace(item, space))
+        .length
+}
+
+function getCoordinatorItemProfileHref(itemKey = '', item = null) {
+    return normalizeQuoraProfileHref(
+        item?.targetProfileHref ||
+        item?.profileHref ||
+        (/^https:\/\/www\.quora\.com\/profile\//i.test(itemKey) ? itemKey : '') ||
+        ''
+    )
+}
+
+function getPendingCoordinatorProfileHrefEntries(profileHref = '') {
+    const href = normalizeQuoraProfileHref(profileHref)
+    if(!href) return []
+
+    return Object.entries(coordinatorQueue || {})
+        .filter(([itemKey, item]) => {
+            return isPendingCoordinatorStatus(item?.status) &&
+                getCoordinatorItemProfileHref(itemKey, item) === href
+        })
+        .map(([itemKey, item]) => ({itemKey, item}))
+}
+
+function isCurrentProfileSearchRuntimeCoordinatorItem(item = null) {
+    return !!(
+        item &&
+        profileSearchLastRunId &&
+        `${item.runId || ''}` === profileSearchLastRunId
+    )
+}
+
+function isStaleCurrentProfileSearchCoordinatorItem(item = null) {
+    return !!(
+        item &&
+        !isCurrentProfileSearchRuntimeCoordinatorItem(item) &&
+        getCoordinatorItemSources(item).some(isCoordinatorSourceForCurrentProfileSearch)
+    )
+}
+
+function isPendingCoordinatorProfileHref(profileHref = '', options = {}) {
+    return getPendingCoordinatorProfileHrefEntries(profileHref).some(({item}) => {
+        if(options.ignoreStaleCurrentProfileSearchPending === true &&
+            isStaleCurrentProfileSearchCoordinatorItem(item)) {
+            return false
+        }
+
+        return true
+    })
+}
+
+function getCurrentProfilePendingCoordinatorQueueEntry() {
+    if(getPageType() !== 'profile') return null
+
+    const href = normalizeQuoraProfileHref(location.href)
+    if(!href) return null
+
+    for(const [itemKey, item] of Object.entries(coordinatorQueue || {})) {
+        if(!isPendingCoordinatorStatus(item?.status)) continue
+        if(getCoordinatorItemProfileHref(itemKey, item) !== href) continue
+        return {itemKey, item, href}
+    }
+
+    return null
+}
+
+function hasCurrentProfilePendingCoordinatorQueueItem() {
+    return !!getCurrentProfilePendingCoordinatorQueueEntry()
+}
+
+function scheduleCurrentProfilePendingClaimRescue(delayMs = QUEUED_ACTION_CLAIM_RESCUE_INTERVAL_MS) {
+    if(autoProfileActionRescueTimeout || getPageType() !== 'profile') return
+    if(autoProfileActionPending || !hasCurrentProfilePendingCoordinatorQueueItem()) return
+
+    autoProfileActionRescueTimeout = setTimeout(() => {
+        autoProfileActionRescueTimeout = null
+        if(autoProfileActionPending || !hasCurrentProfilePendingCoordinatorQueueItem()) return
+
+        autoProfileAction = undefined
+        void maybeRunAutoProfileAction()
+        scheduleCurrentProfilePendingClaimRescue()
+    }, Math.max(250, Number.parseInt(delayMs, 10) || QUEUED_ACTION_CLAIM_RESCUE_INTERVAL_MS))
+}
+
+function nudgeCurrentProfilePendingClaim() {
+    if(getPageType() !== 'profile' || !hasCurrentProfilePendingCoordinatorQueueItem()) return
+
+    void maybeRecordAlreadyBlockedCoordinatorProfile()
+    void maybeRunAutoProfileAction()
+    scheduleCurrentProfilePendingClaimRescue()
+}
+
+function normalizeCurrentProfileSearchPageUrl() {
+    try {
+        const url = new URL(location.href)
+        url.hash = ''
+        return url.href
+    }
+    catch {
+        return `${location.href || ''}`.split('#')[0]
+    }
+}
+
+function isCoordinatorSourceForCurrentProfileSearch(source = null) {
+    if(!source || `${source.type || ''}` !== 'profile-search') return false
+
+    const currentUrl = normalizeCurrentProfileSearchPageUrl()
+    const sourceUrl = `${source.pageUrl || ''}`.split('#')[0]
+    if(sourceUrl && sourceUrl === currentUrl) return true
+
+    const currentQuery = new URLSearchParams(location.search).get('q') || ''
+    return !!currentQuery &&
+        `${source.searchQuery || ''}`.trim().toLowerCase() === currentQuery.trim().toLowerCase()
+}
+
+function isCoordinatorItemForCurrentProfileSearch(item = null) {
+    if(!item) return false
+    if(isCurrentProfileSearchRuntimeCoordinatorItem(item)) return true
+
+    return getCoordinatorItemSources(item).some(isCoordinatorSourceForCurrentProfileSearch)
+}
+
+function getPendingCoordinatorProfileSearchWorkCount() {
+    const currentSearchItems = Object.values(coordinatorQueue || {})
+        .filter(isCoordinatorItemForCurrentProfileSearch)
+    const count = currentSearchItems
+        .filter(item => isPendingCoordinatorStatus(item?.status))
+        .length
+
+    if(count > 0) return count
+    if(currentSearchItems.length > 0) return 0
+    if(profileSearchLastQueuedCount > 0 && Date.now() - profileSearchLastQueuedAt < 30000) {
+        return profileSearchLastQueuedCount
+    }
+
+    return 0
+}
+
+function hasPendingCoordinatorSpaceFeedPost(postKey = '') {
+    const key = `${postKey || ''}`.trim()
+    if(!key) return false
+
+    return Object.values(coordinatorQueue || {}).some(item => {
+        if(!isPendingCoordinatorStatus(item?.status)) return false
+        return Array.isArray(item?.evidence) && item.evidence.some(evidence => `${evidence?.postKey || ''}` === key)
+    })
+}
+
+function getActivePendingSpaceFeedRecordWorkCount(postKey = '', record = null) {
+    if(!record) return 0
+
+    let count = getActivePendingSpaceFeedUrls(postKey || record.postKey || '').length
+    if(record.resolverPending === true) count += 1
+    return count
+}
+
+function getStoredPendingSpaceFeedRecordWorkCount(postKey = '', record = null) {
+    if(!record) return 0
+
+    const key = postKey || record.postKey || ''
+    let count = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+        .filter(url => !isRememberedSpaceFeedPostProfile(key, url))
+        .length
+    if(record.resolverPending === true) count += 1
+    return count
+}
+
+function getActivePendingSpaceFeedWorkCountForSpace(space = resolveCurrentSpaceDescriptor()) {
+    if(!space?.key) return 0
+
+    let count = 0
+    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
+        if(!isPendingSpaceFeedRecordForSpace(record, space)) continue
+        count += getActivePendingSpaceFeedRecordWorkCount(postKey, record)
+    }
+
+    return count
+}
+
+function getStoredPendingSpaceFeedWorkCountForSpace(space = resolveCurrentSpaceDescriptor()) {
+    if(!space?.key) return 0
+
+    let count = 0
+    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
+        if(!isPendingSpaceFeedRecordForSpace(record, space)) continue
+        count += getStoredPendingSpaceFeedRecordWorkCount(postKey, record)
+    }
+
+    return count
+}
+
 function isSuccessfulProfileNukeRecord(record) {
+    if(record?.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
+        return !!record.unblockSucceeded ||
+            record.status === 'unblocked' ||
+            record.status === 'already-unblocked'
+    }
+
     return !!record && (
         !!record.blockSucceeded ||
         record.status === 'blocked' ||
@@ -5569,6 +7951,12 @@ function isProfileNukeRetryBlocked(href) {
     return isSettledProfileNukeRecord(record) && !isRetryableProfileNukeRecord(record)
 }
 
+function isResolvableSpaceFeedEntry(entry) {
+    return !!entry?.resolveProfileFromPage &&
+        !!entry?.postKey &&
+        !!normalizeQuoraPostHref(entry?.postUrl || '')
+}
+
 function getUnsuccessfulProfileNukeUrls(urls) {
     return getNormalizedProfileHrefList(urls || []).filter(url => !isProfileNukeSucceeded(url))
 }
@@ -5586,11 +7974,7 @@ function isActivePendingSpaceFeedProfileUrl(url) {
 function getActivePendingSpaceFeedUrls(postKey) {
     const record = postKey ? spacePendingNukedPosts?.[postKey] : null
     return getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        .filter(url => isActivePendingSpaceFeedProfileUrl(url))
-}
-
-function getSuccessfulProfileNukeUrls(urls) {
-    return getNormalizedProfileHrefList(urls || []).filter(url => isProfileNukeSucceeded(url))
+        .filter(url => !isRememberedSpaceFeedPostProfile(postKey, url) && isActivePendingSpaceFeedProfileUrl(url))
 }
 
 function getSucceededSpaceFeedEntryUrls(entry) {
@@ -5603,10 +7987,278 @@ function isSpaceFeedPostEffectivelyNuked(entry) {
 }
 
 function getQueueableSpaceFeedEntryUrls(entry) {
-    if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
+    if(!entry?.postKey) return []
 
     const pendingUrls = getPendingSpaceFeedUrlSet(entry.postKey)
-    return getNormalizedProfileHrefList(entry.candidateUrls || []).filter(url => !pendingUrls.has(url) && !isProfileNukeRetryBlocked(url))
+    return getNormalizedProfileHrefList(entry.candidateUrls || [])
+        .filter(url => !pendingUrls.has(url) &&
+            !isPendingCoordinatorProfileHref(url) &&
+            !isProfileNukeRetryBlocked(url) &&
+            !isRememberedSpaceFeedPostProfile(entry.postKey, url))
+}
+
+function isQueueableSpaceFeedResolverEntry(entry) {
+    if(!isResolvableSpaceFeedEntry(entry)) return false
+    if(getQueueableSpaceFeedEntryUrls(entry).length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) return false
+    if(`${entry?.resolutionReason || ''}`.trim() === 'low-confidence-profile-artifact') return false
+    if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
+    if(isSpaceFeedEntryNuked(entry)) return false
+    if(isSpaceFeedPostPending(entry.postKey)) return false
+
+    return true
+}
+
+function getSpaceFeedQueuedWorkCount(entries = []) {
+    let count = 0
+
+    for(const entry of Array.isArray(entries) ? entries : []) {
+        count += getNormalizedProfileHrefList(entry?.candidateUrls || []).length
+        if(isQueueableSpaceFeedResolverEntry(entry) || (isResolvableSpaceFeedEntry(entry) && spacePendingNukedPosts?.[entry.postKey]?.resolverPending)) {
+            count += 1
+        }
+    }
+
+    return count
+}
+
+function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
+    const pendingCoordinatorProfileHrefs = new Set()
+    const pendingCoordinatorPostKeys = new Set()
+    let coordinatorSpaceWorkCount = 0
+
+    for(const [itemKey, item] of Object.entries(coordinatorQueue || {})) {
+        if(!isPendingCoordinatorStatus(item?.status)) continue
+
+        const profileHref = getCoordinatorItemProfileHref(itemKey, item)
+        if(profileHref) pendingCoordinatorProfileHrefs.add(profileHref)
+
+        if(Array.isArray(item?.evidence)) {
+            for(const evidence of item.evidence) {
+                const postKey = `${evidence?.postKey || ''}`.trim()
+                if(postKey) pendingCoordinatorPostKeys.add(postKey)
+            }
+        }
+
+        if(isPendingCoordinatorSpaceFeedItemForSpace(item, space)) {
+            coordinatorSpaceWorkCount += 1
+        }
+    }
+
+    return {
+        space,
+        pendingCoordinatorProfileHrefs,
+        pendingCoordinatorPostKeys,
+        coordinatorSpaceWorkCount,
+        rememberedPostUrls: new Map(),
+        activePendingUrls: new Map()
+    }
+}
+
+function getRememberedSpaceFeedPostUrlSetForRender(postKey = '', context = null) {
+    if(!context) return getRememberedSpaceFeedPostUrlSet(postKey)
+    const key = `${postKey || ''}`.trim()
+    if(!key) return new Set()
+    if(!context.rememberedPostUrls.has(key)) {
+        context.rememberedPostUrls.set(key, getRememberedSpaceFeedPostUrlSet(key))
+    }
+
+    return context.rememberedPostUrls.get(key)
+}
+
+function isRememberedSpaceFeedPostProfileForRender(postKey = '', profileHref = '', context = null) {
+    const href = normalizeQuoraProfileHref(profileHref)
+    if(!href) return false
+
+    return getRememberedSpaceFeedPostUrlSetForRender(postKey, context).has(href)
+}
+
+function isSpaceFeedPostNukedForRender(postKey = '', candidateUrls = null, context = null) {
+    const rememberedUrls = getRememberedSpaceFeedPostUrlSetForRender(postKey, context)
+    if(!rememberedUrls.size) return false
+
+    const urls = getNormalizedProfileHrefList(candidateUrls || [])
+    if(!urls.length) return true
+
+    return urls.every(url => rememberedUrls.has(url) || isProfileNukeSucceeded(url))
+}
+
+function getActivePendingSpaceFeedUrlsForRender(postKey = '', context = null) {
+    const key = `${postKey || ''}`.trim()
+    if(!key) return []
+    if(context?.activePendingUrls?.has(key)) return context.activePendingUrls.get(key)
+
+    const record = spacePendingNukedPosts?.[key] || null
+    const urls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+        .filter(url => !isRememberedSpaceFeedPostProfileForRender(key, url, context) && isActivePendingSpaceFeedProfileUrl(url))
+
+    if(context?.activePendingUrls) context.activePendingUrls.set(key, urls)
+    return urls
+}
+
+function isSpaceFeedPostPendingForRender(postKey = '', context = null) {
+    const key = `${postKey || ''}`.trim()
+    if(!key) return false
+    if(spacePendingNukedPosts?.[key]?.resolverPending) return true
+    if(context?.pendingCoordinatorPostKeys?.has(key)) return true
+    return getActivePendingSpaceFeedUrlsForRender(key, context).length > 0
+}
+
+function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null) {
+    if(!entry?.postKey) return []
+
+    const pendingUrls = new Set(getActivePendingSpaceFeedUrlsForRender(entry.postKey, context))
+    const pendingCoordinatorProfileHrefs = context?.pendingCoordinatorProfileHrefs || new Set()
+    return getNormalizedProfileHrefList(entry.candidateUrls || [])
+        .filter(url => !pendingUrls.has(url) &&
+            !pendingCoordinatorProfileHrefs.has(url) &&
+            !isProfileNukeRetryBlocked(url) &&
+            !isRememberedSpaceFeedPostProfileForRender(entry.postKey, url, context))
+}
+
+function isSpaceFeedEntryNukedForRender(entry = null, context = null) {
+    return isSpaceFeedPostNukedForRender(entry?.postKey || '', entry?.candidateUrls || [], context)
+}
+
+function isQueueableSpaceFeedResolverEntryForRender(entry = null, context = null) {
+    if(!isResolvableSpaceFeedEntry(entry)) return false
+    if(getQueueableSpaceFeedEntryUrlsForRender(entry, context).length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) return false
+    if(`${entry?.resolutionReason || ''}`.trim() === 'low-confidence-profile-artifact') return false
+    if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
+    if(isSpaceFeedEntryNukedForRender(entry, context)) return false
+    if(isSpaceFeedPostPendingForRender(entry.postKey, context)) return false
+
+    return true
+}
+
+function buildSpaceFeedRenderEntry(entry = null, context = null) {
+    const candidateUrls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+    const postNuked = isSpaceFeedEntryNukedForRender(entry, context)
+    const activePendingUrls = postNuked ? [] : getActivePendingSpaceFeedUrlsForRender(entry?.postKey || '', context)
+    const queueableUrls = postNuked ? [] : getQueueableSpaceFeedEntryUrlsForRender(entry, context)
+    const hasResolver = !postNuked && isQueueableSpaceFeedResolverEntryForRender(entry, context)
+    const liveUrls = postNuked ? [] : getNormalizedProfileHrefList([...activePendingUrls, ...queueableUrls])
+    const resolverPending = isResolvableSpaceFeedEntry(entry) && spacePendingNukedPosts?.[entry?.postKey]?.resolverPending === true
+    const postBusy = !postNuked && (isSpaceFeedPostNuking(entry?.postKey) || isSpaceFeedPostPendingForRender(entry?.postKey || '', context))
+    const queueableWorkCount = queueableUrls.length + (hasResolver ? 1 : 0)
+    const liveWorkCount = liveUrls.length + (resolverPending ? 1 : 0)
+
+    return {
+        ...entry,
+        candidateUrls,
+        postNuked,
+        activePendingUrls,
+        queueableUrls,
+        hasResolver,
+        liveUrls,
+        resolverPending,
+        postBusy,
+        hasCandidates: queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES || hasResolver,
+        queueableWorkCount,
+        liveWorkCount
+    }
+}
+
+function makeSpaceFeedQueueableEntry(entry = null) {
+    if(!entry?.queueableWorkCount) return null
+    if(entry.queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) {
+        return {
+            ...entry,
+            candidateUrls: [...entry.queueableUrls]
+        }
+    }
+    if(entry.hasResolver) {
+        return {
+            ...entry,
+            candidateUrls: [],
+            resolveProfileFromPage: true
+        }
+    }
+
+    return null
+}
+
+function makeSpaceFeedLiveEntry(entry = null) {
+    if(!entry?.liveWorkCount && !entry?.hasResolver) return null
+    if(entry.liveUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES) {
+        return {
+            ...entry,
+            candidateUrls: [...entry.liveUrls]
+        }
+    }
+    if(entry.hasResolver) {
+        return {
+            ...entry,
+            candidateUrls: [],
+            resolveProfileFromPage: true
+        }
+    }
+
+    return null
+}
+
+function getSpaceFeedRenderEntriesWorkCount(entries = []) {
+    return (Array.isArray(entries) ? entries : [])
+        .reduce((total, entry) => total + (Number.parseInt(entry?.workCount, 10) || 0), 0)
+}
+
+function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scannedEntries) {
+    const context = buildSpaceFeedRenderContext()
+    const totalEntries = (Array.isArray(aggregateEntries) ? aggregateEntries : []).map(entry => buildSpaceFeedRenderEntry(entry, context))
+    const visibleEntries = (Array.isArray(scannedEntries) ? scannedEntries : []).map(entry => buildSpaceFeedRenderEntry(entry, context))
+    const actionableEntries = totalEntries.filter(entry =>
+        entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES ||
+        entry.hasResolver ||
+        isResolvableSpaceFeedEntry(entry)
+    )
+    const liveEntries = totalEntries
+        .map(makeSpaceFeedLiveEntry)
+        .filter(Boolean)
+        .map(entry => ({...entry, workCount: entry.liveWorkCount || entry.queueableWorkCount || 0}))
+    const pendingEntries = actionableEntries.filter(entry => entry.postBusy)
+    const queueableEntries = actionableEntries
+        .map(makeSpaceFeedQueueableEntry)
+        .filter(Boolean)
+        .map(entry => ({...entry, workCount: entry.queueableWorkCount || 0}))
+    const queueableCount = getSpaceFeedRenderEntriesWorkCount(queueableEntries)
+    const busyEntries = actionableEntries.filter(entry => entry.postBusy)
+    const hasNukedEntries = totalEntries.some(entry => entry.postNuked)
+    const allActionableEntriesSettled = actionableEntries.length > 0 &&
+        actionableEntries.every(entry => isSpaceFeedPostSettled(entry) || entry.postNuked)
+    const allActionableEntriesNuked = actionableEntries.length > 0 &&
+        actionableEntries.every(entry => entry.postNuked)
+    const storedSpaceWorkCount = getStoredPendingSpaceFeedWorkCountForSpace(context.space)
+    const activeSpaceWorkCount = getActivePendingSpaceFeedWorkCountForSpace(context.space)
+    const displaySpaceWorkCount = Math.max(activeSpaceWorkCount, context.coordinatorSpaceWorkCount)
+    const hasActiveSpaceWork = displaySpaceWorkCount > 0
+    const localBusy = !!(hasActiveSpaceWork || busyEntries.length || pendingEntries.length)
+
+    return {
+        context,
+        space: context.space,
+        totalEntries,
+        visibleEntries,
+        actionableEntries,
+        liveEntries,
+        pendingEntries,
+        queueableEntries,
+        queueableCount,
+        queueableUrls: getDedupedSpaceFeedUrls(queueableEntries),
+        busyEntries,
+        hasNukedEntries,
+        allActionableEntriesSettled,
+        allActionableEntriesNuked,
+        ownerPaused: ownedNukeStatusCache.paused,
+        ownerRunning: hasOwnedNukeWorkInFlight(),
+        storedSpaceWorkCount,
+        activeSpaceWorkCount,
+        coordinatorSpaceWorkCount: context.coordinatorSpaceWorkCount,
+        displaySpaceWorkCount,
+        hasActiveSpaceWork,
+        localBusy,
+        batchNukeActive: isActiveSpaceFeedNukeMode('batch', localBusy, context.space),
+        singleNukeActive: isActiveSpaceFeedNukeMode('single', localBusy, context.space),
+        unknownNukeActive: isUnknownSpaceFeedNukeActive(localBusy)
+    }
 }
 
 function getSpaceFeedActionElements(postRoot) {
@@ -5688,9 +8340,57 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
     return host
 }
 
+function syncSpaceFeedPostHeaderReservedSpace(postRoot, host) {
+    if(!postRoot || !host) return
+
+    const timestamp = postRoot.querySelector('a.post_timestamp')
+    const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
+    if(!headerContainer || !postRoot.contains(headerContainer)) return
+
+    // The button host is absolutely positioned over the header row (see
+    // .mb-ext_post-nuke-slot), so it doesn't push byline text out of the
+    // way on its own -- the header's own padding-right has to reserve
+    // enough space. The static CSS default (.mb-ext_post-header-host) only
+    // covers the single-badge "already nuked" case; the two-button
+    // idle/queueable state (variable-length "Nuke 'Em N" counter beside
+    // "Mute-Block") can be noticeably wider, so measure the host's actual
+    // rendered width instead of guessing a fixed constant.
+    const reserved = Math.ceil(host.getBoundingClientRect().width) + 24
+    headerContainer.style.paddingRight = `${Math.max(reserved, 0)}px`
+}
+
 function setSpaceFeedButtonUrls(button, urls) {
     if(!button) return
     button.dataset.mbSpaceFeedUrls = JSON.stringify(getNormalizedProfileHrefList(urls))
+}
+
+function normalizeSpaceFeedButtonEntries(entries = []) {
+    return (Array.isArray(entries) ? entries : []).flatMap(entry => {
+        const postKey = `${entry?.postKey || ''}`.trim()
+        const candidateUrls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+        const resolveProfileFromPage = !candidateUrls.length &&
+            (entry?.resolveProfileFromPage === true || isResolvableSpaceFeedEntry(entry)) &&
+            isResolvableSpaceFeedEntry(entry)
+        if(!postKey || (!candidateUrls.length && !resolveProfileFromPage)) return []
+
+        return [{
+            postKey,
+            postUrl: entry?.postUrl || '',
+            candidateUrls,
+            resolveProfileFromPage,
+            resolutionReason: `${entry?.resolutionReason || ''}`.trim()
+        }]
+    })
+}
+
+function setSpaceFeedButtonEntries(button, entries) {
+    if(!button) return
+    button.dataset.mbSpaceFeedEntries = JSON.stringify(normalizeSpaceFeedButtonEntries(entries))
+}
+
+function setSpaceFeedButtonSelection(button, entries) {
+    setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(entries))
+    setSpaceFeedButtonEntries(button, entries)
 }
 
 function ensureCurrentInstanceClickHandler(button, handlerKey, handler) {
@@ -5725,6 +8425,17 @@ function getSpaceFeedButtonUrls(button) {
     }
 }
 
+function getSpaceFeedButtonEntries(button) {
+    if(!button) return []
+
+    try {
+        return normalizeSpaceFeedButtonEntries(JSON.parse(button.dataset.mbSpaceFeedEntries || '[]'))
+    }
+    catch {
+        return []
+    }
+}
+
 function getSpaceFeedPostEntries() {
     const entries = []
     const roots = getSpaceFeedCardRoots()
@@ -5742,27 +8453,41 @@ function getSpaceFeedPostEntries() {
         const postUrl = getSpaceFeedPostUrl(timestamp)
         const cached = spaceFeedEntryCache.get(postKey)
         let candidateUrls = null
+        let candidateEvidenceByHref = {}
+        let needsSourceResolution = false
 
         if(cached?.postRoot === postRoot && cached.postUrl === postUrl && postRoot.isConnected) {
             candidateUrls = [...cached.candidateUrls]
+            candidateEvidenceByHref = cached.candidateEvidenceByHref || {}
+            needsSourceResolution = cached.needsSourceResolution === true
         }
         else {
             candidateUrls = getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)
+            candidateEvidenceByHref = candidateUrls.candidateEvidenceByHref || {}
+            needsSourceResolution = candidateUrls.needsSourceResolution === true
             let node = postRoot.parentElement
 
             while(!candidateUrls.length && node && node !== contentRoot) {
                 if(isSpaceFeedRootCandidate(node, timestamp)) {
                     candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
+                    candidateEvidenceByHref = mergeSpaceFeedCandidateEvidenceByHref(
+                        candidateEvidenceByHref,
+                        candidateUrls.candidateEvidenceByHref || {}
+                    )
+                    needsSourceResolution = needsSourceResolution || candidateUrls.needsSourceResolution === true
                 }
 
                 node = node.parentElement
             }
 
             candidateUrls = getNormalizedProfileHrefList(candidateUrls)
+            candidateEvidenceByHref = normalizeSpaceFeedCandidateEvidenceByHref(candidateEvidenceByHref, candidateUrls)
             spaceFeedEntryCache.set(postKey, {
                 postRoot,
                 postUrl,
-                candidateUrls
+                candidateUrls,
+                candidateEvidenceByHref,
+                needsSourceResolution
             })
         }
 
@@ -5770,9 +8495,14 @@ function getSpaceFeedPostEntries() {
             postKey,
             postRoot,
             postUrl,
-            candidateUrls
+            candidateUrls,
+            candidateEvidenceByHref,
+            resolveProfileFromPage: isAssetSpacePage() && !!postUrl && needsSourceResolution,
+            resolutionReason: needsSourceResolution ? 'low-confidence-profile-artifact' : ''
         })
     }
+
+    entries.push(...getSpaceFeedProfileLinkCardEntries(activeKeys))
 
     for(const [postKey, cached] of spaceFeedEntryCache) {
         if(!activeKeys.has(postKey) || !cached?.postRoot?.isConnected) {
@@ -5793,6 +8523,12 @@ function buildSpaceFeedEntrySnapshot(entry, previous = null) {
         postKey: entry?.postKey || previous?.postKey || '',
         postUrl: entry?.postUrl || previous?.postUrl || '',
         candidateUrls: getNormalizedProfileHrefList([...previousUrls, ...currentUrls]),
+        candidateEvidenceByHref: mergeSpaceFeedCandidateEvidenceByHref(
+            previous?.candidateEvidenceByHref || {},
+            entry?.candidateEvidenceByHref || {}
+        ),
+        resolveProfileFromPage: !!(entry?.resolveProfileFromPage || previous?.resolveProfileFromPage),
+        resolutionReason: entry?.resolutionReason || previous?.resolutionReason || '',
         postRoot: entry?.postRoot?.isConnected
             ? entry.postRoot
             : previous?.postRoot?.isConnected
@@ -5808,7 +8544,7 @@ function rememberDiscoveredSpaceFeedEntries(entries) {
         if(!entry?.postKey) continue
 
         const snapshot = buildSpaceFeedEntrySnapshot(entry, discoveredSpaceFeedEntries.get(entry.postKey))
-        if(!snapshot.candidateUrls.length) continue
+        if(!snapshot.candidateUrls.length && !snapshot.resolveProfileFromPage) continue
 
         discoveredSpaceFeedEntries.set(snapshot.postKey, snapshot)
     }
@@ -5820,6 +8556,9 @@ function getDiscoveredSpaceFeedEntries() {
         postKey: entry.postKey,
         postUrl: entry.postUrl,
         candidateUrls: [...entry.candidateUrls],
+        candidateEvidenceByHref: entry.candidateEvidenceByHref || {},
+        resolveProfileFromPage: !!entry.resolveProfileFromPage,
+        resolutionReason: entry.resolutionReason || '',
         postRoot: entry.postRoot || null
     }))
 }
@@ -5833,6 +8572,8 @@ function setLatestSpaceFeedEntries(entries) {
             postKey: entry?.postKey || '',
             postUrl: entry?.postUrl || '',
             candidateUrls: getNormalizedProfileHrefList(entry?.candidateUrls || []),
+            resolveProfileFromPage: !!entry?.resolveProfileFromPage,
+            resolutionReason: entry?.resolutionReason || '',
             postRoot: entry?.postRoot || null,
             viewportTop: rect?.top ?? null,
             viewportBottom: rect?.bottom ?? null
@@ -5845,7 +8586,9 @@ function getLatestSpaceFeedEntries() {
         ...getUpdatedSpaceFeedEntryViewport(entry),
         postKey: entry.postKey,
         postUrl: entry.postUrl,
-        candidateUrls: [...entry.candidateUrls]
+        candidateUrls: [...entry.candidateUrls],
+        resolveProfileFromPage: !!entry.resolveProfileFromPage,
+        resolutionReason: entry.resolutionReason || ''
     }))
 }
 
@@ -5869,7 +8612,11 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
         rememberDiscoveredSpaceFeedEntries(getSpaceFeedPostEntries())
     }
     const nextEntries = Array.isArray(entries) ? entries : getDiscoveredSpaceFeedEntries()
-    const actionableEntries = nextEntries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
+    const actionableEntries = nextEntries.filter(entry =>
+        entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES ||
+        isQueueableSpaceFeedResolverEntry(entry) ||
+        isResolvableSpaceFeedEntry(entry)
+    )
     const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
     const expectedPostButtons = getExpectedSpaceFeedPostButtonCount(nextEntries)
     const actionableUrls = getDedupedSpaceFeedUrls(actionableEntries)
@@ -6311,7 +9058,8 @@ async function showCopyableText(title, text) {
     report.status.textContent = copied ? 'Copied to clipboard.' : 'Clipboard copy failed. Manual copy is still available below.'
     report.textarea.value = message
     report.textarea.focus()
-    report.textarea.select()
+    report.textarea.setSelectionRange(0, 0)
+    report.textarea.scrollTop = 0
 }
 
 function syncSpaceFeedStatusButton(entries = null) {
@@ -6334,38 +9082,8 @@ function syncSpaceFeedStatusButton(entries = null) {
     }
 
     button.textContent = formatSpaceFeedStatusLabel(entries)
-    setMuteBlockHelp(button, 'Open the full candidate/progress report for this space page')
+    setMuteBlockHelp(button, `Mute-Block ${getExtensionVersion()}, click for more`)
     return true
-}
-
-async function markSpaceFeedPostsNuked(space, entries) {
-    if(!space?.key || !Array.isArray(entries) || !entries.length) return
-
-    let changed = false
-    const nextRecords = {
-        ...spaceNukedPosts
-    }
-
-    for(const entry of entries) {
-        if(!entry?.postKey) continue
-
-        nextRecords[entry.postKey] = {
-            ...(spaceNukedPosts?.[entry.postKey] || {}),
-            postKey: entry.postKey,
-            postUrl: entry.postUrl || spaceNukedPosts?.[entry.postKey]?.postUrl || '',
-            spaceKey: space.key,
-            spaceUrl: space.url,
-            urls: Array.from(new Set(entry.candidateUrls || [])),
-            updatedAt: Date.now()
-        }
-        changed = true
-    }
-
-    if(!changed) return
-
-    spaceNukedPosts = pruneRememberedSpaceNukes(nextRecords)
-    syncSpaceFeedNukeControls()
-    await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
 }
 
 async function registerPendingSpaceFeedEntries(space, entries) {
@@ -6378,15 +9096,27 @@ async function registerPendingSpaceFeedEntries(space, entries) {
 
     for(const entry of entries) {
         if(!entry?.postKey) continue
+        if(isSpaceFeedEntryNuked(entry)) continue
 
         const entryUrls = getNormalizedProfileHrefList(entry.candidateUrls || [])
-        if(!entryUrls.length) continue
+            .filter(url => !isRememberedSpaceFeedPostProfile(entry.postKey, url) && !isProfileNukeSucceeded(url))
+        const resolverPending = isResolvableSpaceFeedEntry(entry) && !entryUrls.length
+        if(!entryUrls.length && !resolverPending) continue
 
         const existing = nextRecords[entry.postKey] || {}
         const existingAllUrls = getStoredSpaceFeedRecordUrls(existing, 'allUrls')
         const existingRemainingUrls = getStoredSpaceFeedRecordUrls(existing, 'remainingUrls')
         const allUrls = getNormalizedProfileHrefList([...existingAllUrls, ...entryUrls])
         const remainingUrls = getNormalizedProfileHrefList([...existingRemainingUrls, ...entryUrls])
+        const existingJobKeysByProfileHref = existing.jobKeysByProfileHref && typeof existing.jobKeysByProfileHref === 'object'
+            ? existing.jobKeysByProfileHref
+            : {}
+        const jobKeysByProfileHref = {
+            ...existingJobKeysByProfileHref
+        }
+        for(const href of entryUrls) {
+            jobKeysByProfileHref[href] = href
+        }
 
         nextRecords[entry.postKey] = {
             ...existing,
@@ -6396,6 +9126,13 @@ async function registerPendingSpaceFeedEntries(space, entries) {
             spaceUrl: space.url,
             allUrls,
             remainingUrls,
+            resolverPending: resolverPending || existing.resolverPending === true,
+            resolverUrl: resolverPending ? entry.postUrl || existing.resolverUrl || '' : existing.resolverUrl || '',
+            jobKeys: getNormalizedProfileHrefList([
+                ...(Array.isArray(existing.jobKeys) ? existing.jobKeys : []),
+                ...entryUrls
+            ]),
+            jobKeysByProfileHref,
             updatedAt: Date.now()
         }
         changed = true
@@ -6404,7 +9141,8 @@ async function registerPendingSpaceFeedEntries(space, entries) {
     if(!changed) return
 
     spacePendingNukedPosts = nextRecords
-    await safeStorageSet({[SPACE_PENDING_NUKED_POSTS_KEY]: nextRecords})
+    // The worker owns the pending nuked-post key (set-space-pending-nuked-posts).
+    await safeSendRuntimeMessage({action: 'set-space-pending-nuked-posts', pendingNukedPosts: nextRecords}, null)
 }
 
 async function removePendingSpaceFeedUrls(urls) {
@@ -6421,41 +9159,31 @@ async function removePendingSpaceFeedUrls(urls) {
         }
         return
     }
+}
 
-    let changed = false
-    const nextRecords = {
-        ...spacePendingNukedPosts
+async function removePendingSpaceFeedEntries(entries = []) {
+    const entryList = Array.isArray(entries) ? entries : []
+    const urls = getDedupedSpaceFeedUrls(entryList)
+    if(urls.length) {
+        await removePendingSpaceFeedUrls(urls)
     }
 
-    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
-        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        const nextAllUrls = allUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileHref(url)))
-        const nextRemainingUrls = remainingUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileHref(url)))
+    const resolverPostKeys = Array.from(new Set(entryList
+        .filter(entry => isResolvableSpaceFeedEntry(entry) && !getNormalizedProfileHrefList(entry?.candidateUrls || []).length)
+        .map(entry => `${entry?.postKey || ''}`.trim())
+        .filter(Boolean)))
+    if(!resolverPostKeys.length) return
 
-        if(nextAllUrls.length === allUrls.length && nextRemainingUrls.length === remainingUrls.length) {
-            continue
+    const serviceResult = await safeSendRuntimeMessage({
+        action: 'remove-pending-space-feed-entries',
+        postKeys: resolverPostKeys
+    }, null)
+    if(serviceResult) {
+        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
+            spacePendingNukedPosts = serviceResult.pendingPosts
         }
-
-        changed = true
-
-        if(nextRemainingUrls.length <= 0) {
-            delete nextRecords[postKey]
-            continue
-        }
-
-        nextRecords[postKey] = {
-            ...record,
-            allUrls: nextAllUrls,
-            remainingUrls: nextRemainingUrls,
-            updatedAt: Date.now()
-        }
+        return
     }
-
-    if(!changed) return
-
-    spacePendingNukedPosts = nextRecords
-    await safeStorageSet({[SPACE_PENDING_NUKED_POSTS_KEY]: nextRecords})
 }
 
 function getResolvedSpaceFeedProfileHrefs(profileHref = '') {
@@ -6490,115 +9218,57 @@ function getQueuedProfileRemapTarget(profileHref = '') {
     return resolvedHref
 }
 
-async function confirmSpaceFeedProfileBlocked(profileHref) {
-    const confirmedHref = normalizeQuoraProfileHref(profileHref)
-    if(!confirmedHref) return false
-
-    const serviceResult = await safeSendRuntimeMessage({
-        action: 'confirm-space-feed-profiles-blocked',
-        profileHrefs: [confirmedHref]
-    }, null)
-    if(serviceResult) {
-        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
-            spacePendingNukedPosts = serviceResult.pendingPosts
-        }
-        if(serviceResult.nukedPosts && typeof serviceResult.nukedPosts === 'object') {
-            spaceNukedPosts = pruneRememberedSpaceNukes(serviceResult.nukedPosts)
-        }
-        return !!serviceResult.confirmed
-    }
-
-    let changedPending = false
-    let changedNuked = false
-    const nextPending = {
-        ...spacePendingNukedPosts
-    }
-    const nextNuked = {
-        ...spaceNukedPosts
-    }
-
-    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
-        const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-        const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        if(!remainingUrls.includes(confirmedHref)) continue
-
-        const nextRemainingUrls = remainingUrls.filter(url => url !== confirmedHref)
-        changedPending = true
-
-        if(nextRemainingUrls.length > 0) {
-            nextPending[postKey] = {
-                ...record,
-                remainingUrls: nextRemainingUrls,
-                updatedAt: Date.now()
-            }
-            continue
-        }
-
-        delete nextPending[postKey]
-        nextNuked[postKey] = {
-            ...(spaceNukedPosts?.[postKey] || {}),
-            postKey,
-            postUrl: record.postUrl || spaceNukedPosts?.[postKey]?.postUrl || '',
-            spaceKey: record.spaceKey || spaceNukedPosts?.[postKey]?.spaceKey || '',
-            spaceUrl: record.spaceUrl || spaceNukedPosts?.[postKey]?.spaceUrl || '',
-            urls: getNormalizedProfileHrefList(allUrls.length ? allUrls : remainingUrls),
-            updatedAt: Date.now()
-        }
-        changedNuked = true
-    }
-
-    if(!changedPending && !changedNuked) return false
-
-    spacePendingNukedPosts = nextPending
-    if(changedNuked) {
-        spaceNukedPosts = pruneRememberedSpaceNukes(nextNuked)
-    }
-
-    const payload = {
-        [SPACE_PENDING_NUKED_POSTS_KEY]: nextPending
-    }
-
-    if(changedNuked) {
-        payload[SPACE_NUKED_POSTS_KEY] = spaceNukedPosts
-    }
-
-    await safeStorageSet(payload)
-    return true
+function isSourcePostResolutionReason(reason = '') {
+    return [
+        'failed-target-source-post-revisit',
+        'manual-source-post-retest',
+        'source-post-needs-profile-resolution'
+    ].includes(`${reason || ''}`.trim())
 }
 
-async function confirmSucceededSpaceFeedProfiles(urls) {
-    const succeededUrls = getSuccessfulProfileNukeUrls(urls)
-    if(!succeededUrls.length) return []
+function getQueuedPageResolvedProfileHref(claimedAction = {}) {
+    const pageType = getPageType()
+    if(pageType === 'profile') return normalizeQuoraProfileHref(location.href)
+    if(pageType === 'space-post') {
+        const resolutionReason = `${claimedAction?.resolutionReason || ''}`.trim()
+        const explicitProfileHref = getSingleSpacePostResolutionProfileHref({explicitOnly: true})
+        const isQueuedResolution = claimedAction?.resolveProfileFromPage === true ||
+            `${claimedAction?.resolutionMode || ''}`.trim() === QUEUED_PROFILE_RESOLUTION_MODE ||
+            isSourcePostResolutionReason(resolutionReason)
+        if(resolutionReason === 'low-confidence-profile-artifact') {
+            return explicitProfileHref
+        }
+        if(isQueuedResolution) {
+            if(isAssetSpacePage()) return explicitProfileHref
 
-    const serviceResult = await safeSendRuntimeMessage({
-        action: 'confirm-space-feed-profiles-blocked',
-        profileHrefs: succeededUrls
-    }, null)
-    if(serviceResult) {
-        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
-            spacePendingNukedPosts = serviceResult.pendingPosts
+            return getSpacePostHeaderProfileHref() ||
+                getOriginalPosterProfileHref() ||
+                explicitProfileHref
         }
-        if(serviceResult.nukedPosts && typeof serviceResult.nukedPosts === 'object') {
-            spaceNukedPosts = pruneRememberedSpaceNukes(serviceResult.nukedPosts)
-        }
-        return succeededUrls
+        const listedProfileLinks = getSpacePostListedProfileLinks()
+        if(listedProfileLinks.length === 1) return listedProfileLinks[0]
+
+        return getSpacePostHeaderProfileHref() ||
+            getOriginalPosterProfileHref() ||
+            null
+    }
+    if(pageType === 'question' || pageType === 'question-log') {
+        return getOriginalPosterProfileHref()
     }
 
-    for(const url of succeededUrls) {
-        await confirmSpaceFeedProfileBlocked(url)
-    }
-    return succeededUrls
+    return null
 }
 
-async function confirmCurrentProfileBlockedSpaceFeedEntries(profileHref = '') {
-    if(getPageType() !== 'profile') return false
+function canResolveQueuedProfileFromCurrentPage(claimedAction = {}) {
+    if(getPageType() === 'profile') return false
+    if(isSecurityVerificationPage() || getProfileUnavailableReason()) return false
 
-    let confirmed = false
-    for(const href of getResolvedSpaceFeedProfileHrefs(profileHref)) {
-        confirmed = (await confirmSpaceFeedProfileBlocked(href)) || confirmed
+    const mode = `${claimedAction?.resolutionMode || ''}`.trim()
+    if(mode === QUEUED_PROFILE_RESOLUTION_MODE || claimedAction?.resolveProfileFromPage === true) {
+        return true
     }
 
-    return confirmed
+    return ['question', 'question-log', 'space-post'].includes(getPageType())
 }
 
 function removeSpaceFeedNukeButtons() {
@@ -6626,10 +9296,13 @@ function getExpectedSpaceFeedPostButtonCount(entries) {
     const list = Array.isArray(entries) ? entries : []
 
     return list.filter(entry => {
+        if(isSpaceFeedEntryNuked(entry)) return true
+
         const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
-        const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES
+        const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES ||
+            isQueueableSpaceFeedResolverEntry(entry)
         const postBusy = isSpaceFeedPostBusy(entry.postKey)
-        return hasCandidates || postBusy || isSpaceFeedPostNuked(entry.postKey)
+        return hasCandidates || postBusy
     }).length
 }
 
@@ -6651,7 +9324,7 @@ function scheduleSpaceFeedProgressReconciliation(entries = null, delay = 80) {
         void (async () => {
             try {
                 const list = Array.isArray(entries) ? entries : getSpaceFeedPostEntries()
-                const completedEntries = list.filter(entry => !isSpaceFeedPostNuked(entry.postKey) && isSpaceFeedPostEffectivelyNuked(entry))
+                const completedEntries = list.filter(entry => !isSpaceFeedEntryNuked(entry) && isSpaceFeedPostEffectivelyNuked(entry))
                 if(!completedEntries.length) return
 
                 const succeededUrls = getDedupedSpaceFeedUrls(completedEntries.map(entry => ({
@@ -6660,15 +9333,16 @@ function scheduleSpaceFeedProgressReconciliation(entries = null, delay = 80) {
                 })))
 
                 if(succeededUrls.length) {
-                    await removePendingSpaceFeedUrls(succeededUrls)
-                }
-
-                const space = resolveCurrentSpaceDescriptor()
-                if(space) {
-                    await markSpaceFeedPostsNuked(space, completedEntries.map(entry => ({
-                        ...entry,
-                        candidateUrls: getSucceededSpaceFeedEntryUrls(entry)
-                    })))
+                    const result = await safeSendRuntimeMessageWithTimeout({
+                        action: 'settle-terminal-coordinator-items',
+                        profileHrefs: succeededUrls
+                    }, null, 2500)
+                    if(result?.pendingPosts && typeof result.pendingPosts === 'object') {
+                        spacePendingNukedPosts = result.pendingPosts
+                    }
+                    if(result?.nukedPosts && typeof result.nukedPosts === 'object') {
+                        spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
+                    }
                 }
             }
             finally {
@@ -6680,7 +9354,7 @@ function scheduleSpaceFeedProgressReconciliation(entries = null, delay = 80) {
 }
 
 function getLiveSpaceFeedEntryUrls(entry) {
-    if(!entry?.postKey || isSpaceFeedPostNuked(entry.postKey)) return []
+    if(!entry?.postKey || isSpaceFeedEntryNuked(entry)) return []
 
     const pendingUrls = Array.from(getPendingSpaceFeedUrlSet(entry.postKey))
         .filter(url => !isProfileNukeSucceeded(url))
@@ -6734,7 +9408,15 @@ function orderSpaceFeedEntriesForNuking(entries) {
 function getLiveSpaceFeedEntries(entries) {
     return orderSpaceFeedEntriesForNuking(entries).flatMap(entry => {
         const liveUrls = getLiveSpaceFeedEntryUrls(entry)
-        if(liveUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) return []
+        if(liveUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) {
+            return isQueueableSpaceFeedResolverEntry(entry)
+                ? [{
+                    ...entry,
+                    candidateUrls: [],
+                    resolveProfileFromPage: true
+                }]
+                : []
+        }
 
         return [{
             ...entry,
@@ -6746,7 +9428,15 @@ function getLiveSpaceFeedEntries(entries) {
 function getQueueableSpaceFeedEntries(entries) {
     return entries.flatMap(entry => {
         const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
-        if(queueableUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) return []
+        if(queueableUrls.length < SPACE_FEED_POST_NUKE_MIN_PROFILES) {
+            return isQueueableSpaceFeedResolverEntry(entry)
+                ? [{
+                    ...entry,
+                    candidateUrls: [],
+                    resolveProfileFromPage: true
+                }]
+                : []
+        }
 
         return [{
             ...entry,
@@ -6757,6 +9447,8 @@ function getQueueableSpaceFeedEntries(entries) {
 
 function getButtonFallbackSpaceFeedEntries(button) {
     const urls = getSpaceFeedButtonUrls(button)
+    const entries = getSpaceFeedButtonEntries(button)
+    if(entries.length) return entries
     if(!urls.length) return []
 
     return [{
@@ -6783,6 +9475,11 @@ function getSpaceFeedEntriesMatchingUrls(entries, urls) {
 }
 
 function getClickedSpaceFeedEntries(button, currentEntries) {
+    const buttonEntries = getSpaceFeedButtonEntries(button)
+    if(buttonEntries.length) {
+        return getLiveSpaceFeedEntries(buttonEntries)
+    }
+
     const buttonUrls = getSpaceFeedButtonUrls(button)
     if(buttonUrls.length) {
         const matchedEntries = getSpaceFeedEntriesMatchingUrls(currentEntries, buttonUrls)
@@ -6798,21 +9495,62 @@ function getDedupedSpaceFeedUrls(entries) {
     return getSpaceFeedProfilePostAssociations(entries).map(association => association.profileHref)
 }
 
+function getResolvableSpaceFeedPostAssociations(entries) {
+    const associations = new Map()
+
+    for(const entry of entries || []) {
+        if(!isResolvableSpaceFeedEntry(entry)) continue
+        if(getNormalizedProfileHrefList(entry.candidateUrls || []).length) continue
+
+        const postKey = entry.postKey || ''
+        const postUrl = normalizeQuoraPostHref(entry.postUrl || '')
+        if(!postKey || !postUrl || associations.has(postKey)) continue
+
+        associations.set(postKey, {
+            profileHref: '',
+            postKey,
+            postUrl,
+            postKeys: [postKey],
+            postUrls: [postUrl],
+            resolveProfileFromPage: true,
+            resolutionMode: QUEUED_PROFILE_RESOLUTION_MODE,
+            resolutionReason: entry.resolutionReason || 'source-post-needs-profile-resolution',
+            evidence: [{
+                postKey,
+                postUrl,
+                collector: entry.resolutionReason === 'low-confidence-profile-artifact'
+                    ? 'low-confidence-profile-artifact'
+                    : 'source-post-resolution',
+                confidence: SPACE_FEED_CANDIDATE_CONFIDENCE_LOW,
+                resolutionReason: entry.resolutionReason || '',
+                sourcePageUrl: location.href
+            }]
+        })
+    }
+
+    return Array.from(associations.values())
+}
+
 function getSpaceFeedProfilePostAssociations(entries) {
     const associations = new Map()
 
     for(const entry of entries) {
         const postKey = entry?.postKey || ''
         const postUrl = entry?.postUrl || ''
+        const candidateEvidenceByHref = entry?.candidateEvidenceByHref || {}
 
         for(const url of entry.candidateUrls || []) {
             const normalized = normalizeQuoraProfileHref(url)
             if(!normalized) continue
+            const candidateEvidence = candidateEvidenceByHref[normalized] ||
+                candidateEvidenceByHref[url] ||
+                makeSpaceFeedCandidateEvidence('profile-links', SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH)
 
             let association = associations.get(normalized)
             if(!association) {
                 association = {
                     profileHref: normalized,
+                    candidateEvidence,
                     postKeys: [],
                     postUrls: [],
                     evidence: []
@@ -6832,7 +9570,10 @@ function getSpaceFeedProfilePostAssociations(entries) {
                 association.evidence.push({
                     postKey,
                     postUrl,
-                    collector: 'profile-links',
+                    collector: candidateEvidence.collector || 'profile-links',
+                    confidence: candidateEvidence.confidence || '',
+                    source: candidateEvidence.source || '',
+                    rawSlug: candidateEvidence.rawSlug || '',
                     sourcePageUrl: location.href
                 })
             }
@@ -6842,7 +9583,170 @@ function getSpaceFeedProfilePostAssociations(entries) {
     return Array.from(associations.values())
 }
 
-async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations) {
+function formatSpaceFeedPreFilterBreakdown(preFilter) {
+    const parts = []
+    if(preFilter?.alreadyNuked) parts.push(`${preFilter.alreadyNuked} already nuked`)
+    if(preFilter?.duplicateProfile) parts.push(`${preFilter.duplicateProfile} duplicate profile`)
+    if(preFilter?.unqueueable) parts.push(`${preFilter.unqueueable} unresolvable`)
+    return parts.join(', ')
+}
+
+// The service worker can legitimately outlive a chunk message's own response
+// channel: a busy write chain can take long enough that the SW recycles
+// mid-request. A respawned SW resumes and finishes the durable write
+// (persistLastCoordinatorEnqueueSummary still runs), but nothing can ever
+// call back on the original chrome.runtime.sendMessage connection, so
+// awaiting it directly hangs forever -- confirmed live 2026-09-19 (a
+// 657-candidate batch finished durably while the button stayed on
+// "Nuking..." indefinitely, back when one batch was one message). Falling
+// back to polling that same durable summary by runId once the direct
+// response times out recovers the real outcome instead of leaving the
+// caller stuck. Now used per-chunk by sendCoordinatorEnqueueChunked below,
+// not just once for a whole batch -- the summary it recovers already
+// reflects the durable running total through this chunk (see
+// persistLastCoordinatorEnqueueSummary's runSummary handling in sw.js), not
+// just this one chunk's own contribution.
+async function waitForCoordinatorEnqueueSummary(runId, timeoutMs, intervalMs = SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS) {
+    const deadline = Date.now() + timeoutMs
+    while(Date.now() < deadline) {
+        const stored = await safeStorageGet({[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: null})
+        const summary = stored[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]
+        if(summary?.runId === runId) {
+            return {
+                queued: summary.queued,
+                merged: summary.merged,
+                executionQueued: 0,
+                runId,
+                durable: true,
+                recoveredFromSummary: true
+            }
+        }
+        await sleep(intervalMs)
+    }
+    return null
+}
+
+// Posts a large coordinator-items enqueue as several separate
+// enqueue-coordinator-items messages, COORDINATOR_ENQUEUE_CHUNK_SIZE items
+// at a time, instead of one big message -- see live-batch-fixes-worklist-
+// 2026-09-19.md items 3/4 and coordinatorEnqueueChunking.js's header for
+// why. This used to be sw.js's job: one message in, split internally in a
+// tight awaited loop. That loop's chunks re-entered the shared serialized
+// write chain via a pure microtask continuation with no real yield between
+// them, so a big batch still monopolized that chain for its whole duration
+// and starved every other pending durable write -- and the obvious fix
+// (a timer-based yield between chunks) turned out to need the sw.js test
+// harness's fake clock manually advanced everywhere that path is exercised,
+// with a silent, hard-to-notice failure mode when a test doesn't (see
+// COORDINATOR_ENQUEUE_CHUNK_THRESHOLD's comment in sw.js). Chunking here
+// instead means the gap between two chunks is a real chrome.runtime.sendMessage
+// round trip -- a genuine macrotask in production, and nothing that needs a
+// clock in tests, since it's just two separate calls.
+//
+// payload carries the run/source/execute fields every chunk shares;
+// payload.run.id must already be set by the caller so every chunk pins to
+// the same run (every caller here generates its own runId up front).
+// onProgress(queuedSoFar, mergedSoFar, totalItems), if given, fires after
+// each chunk settles so a caller can show live progress (e.g. the "Nuke 'Em"
+// button's remaining count) instead of only updating once at the very end.
+async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
+    const items = Array.isArray(payload.items) ? payload.items : []
+    const runId = payload.run?.id || ''
+    const totalItems = items.length
+    if(!totalItems) return {queued: 0, merged: 0, executionQueued: 0, runId}
+
+    const chunks = []
+    for(let offset = 0; offset < items.length; offset += COORDINATOR_ENQUEUE_CHUNK_SIZE) {
+        chunks.push(items.slice(offset, offset + COORDINATOR_ENQUEUE_CHUNK_SIZE))
+    }
+
+    let queued = 0
+    let merged = 0
+    let durable = false
+    let storageTimedOut = false
+    let stopReason = ''
+    const resetCleanupTargets = []
+
+    for(let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+        // A failed/timed-out attempt below has no partial-success state to
+        // worry about (see SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS's comment in
+        // timeouts.js): either the durable write already landed, in which
+        // case waitForCoordinatorEnqueueSummary already found it and this
+        // isn't a failure at all, or it never landed, in which case
+        // resending the identical chunk is safe and can't double-count. So
+        // retry the SAME chunk in place with backoff rather than abandoning
+        // every chunk after it -- a user-visible "add again" step is not an
+        // acceptable substitute for this actually completing on its own.
+        let settled = null
+        for(let attempt = 1; attempt <= SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS; attempt += 1) {
+            const chunkResult = await safeSendRuntimeMessageWithTimeout({
+                action: 'enqueue-coordinator-items',
+                run: payload.run,
+                source: payload.source,
+                execute: payload.execute,
+                items: chunks[chunkIndex],
+                runSummary: {
+                    requested: totalItems,
+                    priorQueued: queued,
+                    priorMerged: merged,
+                    ...(chunkIndex === 0 && payload.source?.preFilter ? {preFilter: payload.source.preFilter} : {})
+                }
+            }, null, SPACE_FEED_ENQUEUE_MESSAGE_TIMEOUT_MS)
+
+            settled = chunkResult || await waitForCoordinatorEnqueueSummary(runId, SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS)
+            const chunkFailed = !settled || settled.storageTimedOut === true || settled.durable === false
+            if(!chunkFailed) break
+            if(attempt < SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS) {
+                await sleep(SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)))
+            }
+        }
+
+        if(!settled) {
+            storageTimedOut = true
+            stopReason = 'chunk-enqueue-no-response'
+            break
+        }
+
+        // A recovered summary already carries the durable running total
+        // through this chunk (see waitForCoordinatorEnqueueSummary's own
+        // comment above), so it replaces the tally instead of adding to it;
+        // a direct chunkResult only ever carries this one chunk's own count.
+        if(settled.recoveredFromSummary) {
+            queued = Number.parseInt(settled.queued, 10) || queued
+            merged = Number.parseInt(settled.merged, 10) || merged
+        }
+        else {
+            queued += Number.parseInt(settled.queued, 10) || 0
+            merged += Number.parseInt(settled.merged, 10) || 0
+        }
+        if(Array.isArray(settled.resetCleanupTargets)) resetCleanupTargets.push(...settled.resetCleanupTargets)
+        if(settled.durable === true || settled.recoveredFromSummary) durable = true
+        if(onProgress) onProgress(queued, merged, totalItems)
+
+        if(settled.storageTimedOut === true) {
+            storageTimedOut = true
+            stopReason = 'chunk-storage-timeout'
+            break
+        }
+        if(settled.durable === false) {
+            stopReason = settled.reason || 'chunk-enqueue-save-failed'
+            break
+        }
+    }
+
+    return {
+        queued,
+        merged,
+        executionQueued: 0,
+        runId,
+        durable,
+        storageTimedOut,
+        resetCleanupTargets,
+        reason: stopReason || undefined
+    }
+}
+
+async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations, preFilter = null, onProgress = null) {
     if(!space || !runId || !Array.isArray(profileAssociations) || !profileAssociations.length) {
         return null
     }
@@ -6851,11 +9755,11 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
         type: 'space-feed',
         pageUrl: location.href,
         spaceKey: space.key || '',
-        spaceCategory: getStoredSpaceCategory(space)
+        spaceCategory: getStoredSpaceCategory(space),
+        ...(preFilter ? {preFilter} : {})
     }
 
-    return safeSendRuntimeMessage({
-        action: 'enqueue-coordinator-items',
+    return sendCoordinatorEnqueueChunked({
         run: {
             id: runId,
             sourceType: 'space-feed',
@@ -6865,17 +9769,81 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
         execute: {
             tabAction: 'nuke',
             maxConcurrent: getSpaceFeedProfilesPerBatch(),
-            noForegroundFallback: true
+            noForegroundFallback: false
         },
-        items: profileAssociations.map(association => ({
+        items: profileAssociations.map(association => {
+            if(association.resolveProfileFromPage) {
+                const requestedUrl = normalizeQuoraPostHref(association.postUrl || '')
+                return {
+                    runId,
+                    dedupeKey: `resolve-profile:${requestedUrl || association.postKey || ''}`,
+                    targetProfileHref: '',
+                    requestedUrl,
+                    resolutionMode: QUEUED_PROFILE_RESOLUTION_MODE,
+                    resolveProfileFromPage: true,
+                    resolutionReason: association.resolutionReason || '',
+                    source,
+                    evidence: association.evidence || []
+                }
+            }
+
+            return {
+                runId,
+                dedupeKey: association.profileHref,
+                targetProfileHref: association.profileHref,
+                requestedUrl: association.profileHref,
+                candidateConfidence: association.candidateEvidence?.confidence || '',
+                candidateCollector: association.candidateEvidence?.collector || '',
+                source,
+                evidence: association.evidence || []
+            }
+        })
+    }, onProgress)
+}
+
+async function enqueueCoordinatorProfileUrls(options = {}) {
+    const {
+        urls = [],
+        sourceType = 'profile-list',
+        event = 'Queued profile action',
+        maxConcurrent = getProfilesPerBatch(),
+        noForegroundFallback = false,
+        maxRetries = null,
+        sourceExtra = {}
+    } = options
+    const profileHrefs = getNormalizedProfileHrefList(urls)
+    if(!profileHrefs.length) return {queued: 0, merged: 0, executionQueued: 0}
+
+    const runId = `${sourceType}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const source = {
+        type: sourceType,
+        pageUrl: location.href,
+        ...sourceExtra
+    }
+
+    return sendCoordinatorEnqueueChunked({
+        run: {
+            id: runId,
+            sourceType,
+            sourcePageUrl: location.href
+        },
+        source,
+        execute: {
+            tabAction: 'nuke',
+            maxConcurrent,
+            noForegroundFallback,
+            ...(Number.isFinite(Number.parseInt(maxRetries, 10)) && Number.parseInt(maxRetries, 10) >= 0
+                ? {maxRetries: Number.parseInt(maxRetries, 10)}
+                : {})
+        },
+        items: profileHrefs.map(profileHref => ({
             runId,
-            dedupeKey: association.profileHref,
-            targetProfileHref: association.profileHref,
-            requestedUrl: association.profileHref,
-            source,
-            evidence: association.evidence || []
+            dedupeKey: profileHref,
+            targetProfileHref: profileHref,
+            requestedUrl: profileHref,
+            source
         }))
-    }, null)
+    })
 }
 
 async function nukeSpaceFeedEntries(button, entries) {
@@ -6884,23 +9852,58 @@ async function nukeSpaceFeedEntries(button, entries) {
     const space = resolveCurrentSpaceDescriptor()
     if(!space) return false
 
-    await confirmSucceededSpaceFeedProfiles(entries.flatMap(entry => entry.candidateUrls || []))
-
+    let alreadyNukedCount = 0
+    let unqueueableCount = 0
     const unfinishedEntries = entries.flatMap(entry => {
-        const candidateUrls = getUnsuccessfulProfileNukeUrls(entry?.candidateUrls || [])
-        if(!candidateUrls.length) return []
+        if(isSpaceFeedEntryNuked(entry)) {
+            alreadyNukedCount += 1
+            return []
+        }
+
+        const candidateUrls = getQueueableSpaceFeedEntryUrls(entry)
+        const resolveProfileFromPage = !candidateUrls.length && isQueueableSpaceFeedResolverEntry(entry)
+        if(!candidateUrls.length && !resolveProfileFromPage) {
+            unqueueableCount += 1
+            return []
+        }
 
         return [{
             ...entry,
-            candidateUrls
+            candidateUrls,
+            resolveProfileFromPage
         }]
     })
     const profileAssociations = getSpaceFeedProfilePostAssociations(unfinishedEntries)
+    const resolverAssociations = getResolvableSpaceFeedPostAssociations(unfinishedEntries)
+    const workAssociations = profileAssociations.concat(resolverAssociations)
     const urls = profileAssociations.map(association => association.profileHref)
     const runId = `space-feed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    if(!urls.length) {
+    // getSpaceFeedProfilePostAssociations collapses multiple feed entries
+    // that point at the same profile (the same author's several posts) into
+    // one association -- entries.length routinely looks much bigger than
+    // what actually gets enqueued for reasons that have nothing to do with
+    // dedup-against-already-queued-rows (that part is already surfaced via
+    // enqueueQueuedCount/enqueueMergedCount below). Carrying this breakdown
+    // through to the enqueue summary is what lets both the page that queued
+    // this batch and the dashboard show why a big selection shrank instead
+    // of leaving it looking like most of it silently vanished.
+    // rawWorkItems counts one per (post, profile) pair this click submits, the
+    // same unit the nuke button's count is built from. workAssociations has one
+    // per unique profile, so the difference is the duplicates collapsed across
+    // posts (or repeated within one post).
+    const rawWorkItems = unfinishedEntries.reduce((total, entry) =>
+        total + (entry.candidateUrls.length || (entry.resolveProfileFromPage ? 1 : 0)), 0)
+    const preFilter = {
+        totalCandidates: entries.length,
+        rawWorkItems,
+        alreadyNuked: alreadyNukedCount,
+        unqueueable: unqueueableCount,
+        duplicateProfile: Math.max(0, rawWorkItems - workAssociations.length)
+    }
+    if(!workAssociations.length) {
         syncSpaceFeedNukeControls()
-        setNukeButtonDone(button, 'Done')
+        const skippedBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+        setNukeButtonDone(button, skippedBreakdown ? `Done (${skippedBreakdown})` : 'Done')
         return true
     }
 
@@ -6908,7 +9911,7 @@ async function nukeSpaceFeedEntries(button, entries) {
 
     updateOwnedNukeStatusCache({
         ...ownedNukeStatusCache,
-        queued: (Number.parseInt(ownedNukeStatusCache?.queued, 10) || 0) + urls.length,
+        queued: (Number.parseInt(ownedNukeStatusCache?.queued, 10) || 0) + workAssociations.length,
         paused: false
     })
     button.dataset.mbQueueing = 'true'
@@ -6921,24 +9924,47 @@ async function nukeSpaceFeedEntries(button, entries) {
     setNukeButtonWorking(button, 'Queueing...')
 
     try {
-        await recordProfileNukeProgressBatch(profileAssociations.map((association, index) => ({
-            profileHref: association.profileHref,
-            patch: buildQueuedProfileProgressPatch('Queued from space feed', {
-                runId,
-                queueIndex: index + 1,
-                postKeys: association.postKeys,
-                postUrls: association.postUrls
-            })
-        })))
         await registerPendingSpaceFeedEntries(space, unfinishedEntries)
         syncSpaceFeedNukeControls()
         setNukeButtonWorking(button, formatSpaceFeedNukingLabel(unfinishedEntries))
 
-        const result = await enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations)
+        // Each chunk (see sendCoordinatorEnqueueChunked) settles as its own
+        // separate message, so the remaining count can visibly drop chunk by
+        // chunk instead of sitting on one static label until the whole batch
+        // finishes.
+        const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations, preFilter, (queuedSoFar, mergedSoFar, totalItems) => {
+            const remaining = Math.max(0, totalItems - Math.min(totalItems, queuedSoFar + mergedSoFar))
+            setNukeButtonWorking(button, remaining > 0 ? `Queueing... ${remaining} of ${totalItems}` : 'Queueing...')
+        })
+        const enqueueQueuedCount = Number.parseInt(result?.queued, 10) || 0
+        const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
 
-        if((result?.executionQueued || result?.queued || result?.merged || 0) > 0) {
+        if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
-            setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())))
+            const workingLabel = formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries()))
+            // Merged rows (already-known key: currently queued, or a past
+            // terminal outcome) are silently absorbed into the existing row
+            // rather than added as new work, and preFilter's counts (see
+            // above) never even reached the enqueue call at all -- surface
+            // both breakdowns together for a beat instead of jumping
+            // straight to the generic working label, so a big selection
+            // that shrank a lot doesn't look like most of it silently
+            // vanished.
+            const noticeParts = []
+            if(enqueueMergedCount > 0) noticeParts.push(`${enqueueMergedCount} already known`)
+            const preFilterBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+            if(preFilterBreakdown) noticeParts.push(preFilterBreakdown)
+
+            if(noticeParts.length) {
+                setNukeButtonNotice(
+                    button,
+                    `Queued ${enqueueQueuedCount} new of ${preFilter.totalCandidates} (${noticeParts.join('; ')})`,
+                    workingLabel
+                )
+            }
+            else {
+                setNukeButtonWorking(button, workingLabel)
+            }
             return true
         }
 
@@ -6949,9 +9975,9 @@ async function nukeSpaceFeedEntries(button, entries) {
             return true
         }
 
-        await removePendingSpaceFeedUrls(urls)
-        setNukeButtonIdle(button)
-        alert('Nothing was queued')
+        await removePendingSpaceFeedEntries(unfinishedEntries)
+        const nothingQueuedBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
+        setNukeButtonNotice(button, nothingQueuedBreakdown ? `Nothing queued (${nothingQueuedBreakdown})` : 'Nothing queued')
         return false
     }
     finally {
@@ -6974,45 +10000,85 @@ async function pauseSpaceFeedQueue(button) {
     const result = await safeSendRuntimeMessage({action: 'pause-coordinator-nukes'}, null) ||
         await safeSendRuntimeMessage({action: 'pause-owner-nukes'}, {canceledUrls: []})
     const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
+    const pausedUrls = getNormalizedProfileHrefList(result?.pausedUrls || [])
     updateOwnedNukeStatusCache({
         ...ownedNukeStatusCache,
         queued: 0,
         paused: true
     })
-    if(canceledUrls.length) {
+    if(canceledUrls.length && !result?.paused) {
         await removePendingSpaceFeedUrls(canceledUrls)
     }
 
     setNukeButtonIdle(button)
     scheduleSpaceAssetNukeControls(0)
-    return canceledUrls.length > 0
+    return pausedUrls.length > 0 || canceledUrls.length > 0 || result?.paused === true
 }
 
-function syncSpaceFeedTopNukeButton(entries) {
+function syncSpaceFeedTopPauseButton(host, workingButton, model = {}, activeWork = false) {
+    let pauseButton = host.querySelector('.mb-ext_space-feed-pause-btn')
+    if(!activeWork && !model?.ownerPaused) {
+        pauseButton?.remove()
+        return
+    }
+
+    if(!pauseButton) {
+        pauseButton = document.createElement('button')
+        pauseButton.type = 'button'
+        pauseButton.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-pause-btn'
+        pauseButton.textContent = 'Pause'
+        setMuteBlockHelp(pauseButton, 'Pause Current Work without canceling jobs')
+        host.appendChild(pauseButton)
+    }
+
+    pauseButton = ensureCurrentInstanceClickHandler(pauseButton, 'space-feed-pause', event => {
+        event.preventDefault()
+        const activeButton = event.currentTarget
+        activeButton.disabled = true
+        void pauseSpaceFeedQueue(workingButton || activeButton)
+    })
+    pauseButton.disabled = false
+    pauseButton.textContent = 'Pause'
+    setMuteBlockHelp(pauseButton, 'Pause Current Work without canceling jobs')
+}
+
+function syncSpaceFeedTopNukeButton(renderModel) {
     const host = getSpaceFeedTopButtonHost()
     if(!host) return false
 
-    const totalEntries = Array.isArray(entries) ? entries : []
-    const actionableEntries = entries.filter(entry => entry.candidateUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES)
-    const liveEntries = getLiveSpaceFeedEntries(totalEntries)
-    const pendingEntries = getPendingSpaceFeedEntries(actionableEntries)
-    const queueableEntries = getQueueableSpaceFeedEntries(actionableEntries)
-    const busyEntries = actionableEntries.filter(entry => isSpaceFeedPostBusy(entry.postKey))
-    const hasNukedEntries = totalEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))
-    const allActionableEntriesSettled = actionableEntries.length > 0 &&
-        actionableEntries.every(entry => isSpaceFeedPostSettled(entry) || isSpaceFeedPostNuked(entry.postKey))
-    const allActionableEntriesNuked = actionableEntries.length > 0 &&
-        actionableEntries.every(entry => isSpaceFeedPostNuked(entry.postKey))
-    const ownerPaused = ownedNukeStatusCache.paused
-    const ownerRunning = hasOwnedNukeWorkInFlight()
-    const localBusy = !!(ownerRunning || busyEntries.length || pendingEntries.length)
-    const batchNukeActive = isActiveSpaceFeedNukeMode('batch', localBusy)
-    const singleNukeActive = isActiveSpaceFeedNukeMode('single', localBusy)
-    const unknownNukeActive = isUnknownSpaceFeedNukeActive(localBusy)
-    const displayEntries = singleNukeActive ? queueableEntries : liveEntries
-    const shouldPromptScroll = !ownerRunning && !ownerPaused && !busyEntries.length && !queueableEntries.length && !liveEntries.length && totalEntries.length > 0 && !hasNukedEntries
+    // getSpaceFeedBar's tab row is shared navigation present on every Space
+    // sub-page (About, Members, ...), not just the ones that actually list
+    // posts -- previously this button still showed up (as an inert
+    // "Scanning..." state, see the totalEntries.length === 0 branch below)
+    // on any of them. Reported live by a user (qr.ae/pFJLuz) as a confusing,
+    // unexplained control on a page with no posts to nuke. a.post_timestamp
+    // is the same signal getSpaceFeedContentRoot() already uses to confirm
+    // a page actually has posts; require it here too before showing
+    // anything, rather than only checking it indirectly via this
+    // extension's own (slower) profile-href scan.
+    if(!document.querySelector('a.post_timestamp')) {
+        host.querySelector('.mb-ext_space-feed-nuke-btn')?.remove()
+        return false
+    }
 
+    const model = Array.isArray(renderModel) ? buildSpaceFeedRenderModel(renderModel) : renderModel
+    const totalEntries = model?.totalEntries || []
+    const liveEntries = model?.liveEntries || []
+    const queueableEntries = model?.queueableEntries || []
+    const queueableCount = Number.parseInt(model?.queueableCount, 10) || 0
     let button = host.querySelector('.mb-ext_space-feed-nuke-btn')
+    const busyEntries = model?.busyEntries || []
+    const ownerRunningForThisSpace = model?.ownerRunning && (model.localBusy || button?.dataset?.mbQueueing === 'true')
+    const displayEntries = model?.singleNukeActive ? queueableEntries : liveEntries
+    const displayEntryWorkCount = getSpaceFeedRenderEntriesWorkCount(displayEntries)
+    const shouldPromptScroll = !ownerRunningForThisSpace &&
+        !model?.ownerPaused &&
+        !busyEntries.length &&
+        !queueableEntries.length &&
+        !liveEntries.length &&
+        totalEntries.length > 0 &&
+        !model?.hasNukedEntries
+
     if(!button) {
         button = document.createElement('button')
         button.type = 'button'
@@ -7023,14 +10089,13 @@ function syncSpaceFeedTopNukeButton(entries) {
     button = ensureCurrentInstanceClickHandler(button, 'space-feed-top', event => {
         const activeButton = event.currentTarget
         if(activeButton.dataset.mbNukeState === 'working') {
-            void pauseSpaceFeedQueue(activeButton)
             return
         }
 
         const currentEntries = getLatestSpaceFeedEntries()
         const entriesToNuke = getClickedSpaceFeedEntries(activeButton, currentEntries)
         if(!entriesToNuke.length) {
-            if(currentEntries.some(entry => isSpaceFeedPostNuked(entry.postKey))) {
+            if(currentEntries.some(entry => isSpaceFeedEntryNuked(entry))) {
                 setNukeButtonDone(activeButton)
                 return
             }
@@ -7043,31 +10108,42 @@ function syncSpaceFeedTopNukeButton(entries) {
     })
 
     const queueSubmissionPending = button.dataset.mbQueueing === 'true'
+    const activeSpaceWork = model?.hasActiveSpaceWork ||
+        (queueSubmissionPending && (busyEntries.length || queueableEntries.length || model?.ownerRunning)) ||
+        model?.batchNukeActive ||
+        model?.unknownNukeActive
 
     if(!totalEntries.length) {
-        setSpaceFeedButtonUrls(button, [])
+        setSpaceFeedButtonSelection(button, [])
         setMuteBlockHelp(button, 'Scanning visible posts in this space for profiles to nuke')
         setNukeButtonIdle(button, 'Scanning...')
         button.disabled = true
+        syncSpaceFeedTopPauseButton(host, button, model, false)
         return true
     }
 
-    setSpaceFeedButtonUrls(button, getDedupedSpaceFeedUrls(displayEntries))
+    setSpaceFeedButtonSelection(button, displayEntries)
     setMuteBlockHelp(button, shouldPromptScroll ? 'No visible targets. Scroll for more posts to scan.' : buildNukeTargetsHelpText('Queue detected profiles from visible posts in this space for mute and block', getSpaceFeedButtonUrls(button)))
 
-    if((queueSubmissionPending && (busyEntries.length || queueableEntries.length || ownerRunning)) || batchNukeActive || unknownNukeActive) {
-        setNukeButtonWorking(button, formatSpaceFeedNukingLabel(liveEntries))
-        button.disabled = false
+    if(activeSpaceWork) {
+        setSpaceFeedButtonSelection(button, [])
+        setMuteBlockHelp(button, queueableEntries.length
+            ? 'This space has active queued work. Use the black post buttons to add newly visible candidates.'
+            : 'This space has active queued work.')
+        setNukeButtonWorking(button, model.displaySpaceWorkCount > 0
+            ? formatSpaceFeedGlobalWorkLabel(model.displaySpaceWorkCount)
+            : formatSpaceFeedGlobalWorkLabel(displayEntryWorkCount))
+        button.disabled = true
     }
-    else if(ownerPaused && hasOwnedNukeWorkInFlight(ownedNukeStatusCache) && busyEntries.length) {
+    else if(model?.ownerPaused && ownerRunningForThisSpace && busyEntries.length) {
         setNukeButtonIdle(button, formatNukeProgressLabel('Paused', ownedNukeStatusCache))
         button.disabled = false
     }
-    else if(singleNukeActive && queueableEntries.length) {
-        setNukeButtonIdle(button)
+    else if(model?.singleNukeActive && queueableEntries.length) {
+        setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
-    else if(singleNukeActive) {
+    else if(model?.singleNukeActive) {
         setNukeButtonIdle(button)
         button.disabled = true
     }
@@ -7076,14 +10152,14 @@ function syncSpaceFeedTopNukeButton(entries) {
         button.disabled = false
     }
     else if(queueableEntries.length) {
-        setNukeButtonIdle(button)
+        setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
-    else if(allActionableEntriesNuked) {
+    else if(model?.allActionableEntriesNuked) {
         setNukeButtonDone(button)
         button.disabled = true
     }
-    else if(allActionableEntriesSettled) {
+    else if(model?.allActionableEntriesSettled) {
         setNukeButtonDone(button, 'Done')
         button.disabled = true
     }
@@ -7092,29 +10168,24 @@ function syncSpaceFeedTopNukeButton(entries) {
         button.disabled = true
     }
 
+    syncSpaceFeedTopPauseButton(host, button, model, activeSpaceWork)
     return true
 }
 
-function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
+function syncSpaceFeedPostButtons(renderModel) {
+    const model = Array.isArray(renderModel) ? buildSpaceFeedRenderModel(renderModel) : renderModel
     const activeKeys = new Set()
-    const aggregateEntries = getLiveSpaceFeedEntries(aggregateSourceEntries)
-    const queueableAggregateEntries = getQueueableSpaceFeedEntries(aggregateSourceEntries)
-    const ownerRunning = hasOwnedNukeWorkInFlight()
-    const aggregateBusy = aggregateSourceEntries.some(entry => isSpaceFeedPostBusy(entry.postKey))
-    const batchNukeActive = isActiveSpaceFeedNukeMode('batch', ownerRunning || aggregateBusy)
-    const singleNukeActive = isActiveSpaceFeedNukeMode('single', ownerRunning || aggregateBusy)
-    const unknownNukeActive = isUnknownSpaceFeedNukeActive(ownerRunning || aggregateBusy)
-    const aggregateButtonEntries = singleNukeActive ? queueableAggregateEntries : aggregateEntries
-    const aggregateUrls = getDedupedSpaceFeedUrls(aggregateButtonEntries)
-    const aggregateCount = aggregateUrls.length
+    const entries = model?.visibleEntries || []
+    const aggregateUrls = model?.queueableUrls || []
+    const aggregateCount = Number.parseInt(model?.queueableCount, 10) || 0
 
     for(const entry of entries) {
-        const liveUrls = getLiveSpaceFeedEntryUrls(entry)
-        const queueableUrls = getQueueableSpaceFeedEntryUrls(entry)
-        const hasCandidates = queueableUrls.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES
-        const postBusy = isSpaceFeedPostBusy(entry.postKey)
-        const postNuked = isSpaceFeedPostNuked(entry.postKey)
-        const shouldShowControls = aggregateCount > 0 || hasCandidates || postBusy || postNuked
+        const liveUrls = entry.liveUrls || []
+        const hasResolver = entry.hasResolver === true
+        const hasCandidates = entry.hasCandidates === true
+        const postBusy = entry.postBusy === true
+        const postNuked = entry.postNuked === true
+        const shouldShowControls = postNuked || aggregateCount > 0 || hasCandidates || postBusy
         if(!shouldShowControls) {
             delete entry.postRoot.dataset.mbSpaceFeedPostKey
             continue
@@ -7125,6 +10196,27 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
 
         entry.postRoot.dataset.mbSpaceFeedPostKey = entry.postKey
         activeKeys.add(entry.postKey)
+
+        if(postNuked) {
+            host.querySelector('.mb-ext_space-feed-post-queue-btn')?.remove()
+
+            let doneButton = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
+            if(!doneButton) {
+                doneButton = document.createElement('button')
+                doneButton.type = 'button'
+                doneButton.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-post-nuke-btn mb-ext_space-feed-post-single-nuke-btn'
+                host.appendChild(doneButton)
+            }
+            doneButton.dataset.mbPostKey = entry.postKey
+            doneButton.dataset.mbPostUrl = entry.postUrl || ''
+            setSpaceFeedButtonUrls(doneButton, liveUrls)
+            doneButton.classList.remove('mb-ext_space-feed-post-single-nuke-btn--neutral')
+            setMuteBlockHelp(doneButton, 'This post has already been nuked')
+            setNukeButtonDone(doneButton)
+            doneButton.disabled = true
+            syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
+            continue
+        }
 
         let queueButton = host.querySelector('.mb-ext_space-feed-post-queue-btn')
         if(!queueButton) {
@@ -7137,7 +10229,6 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
         queueButton = ensureCurrentInstanceClickHandler(queueButton, 'space-feed-post-queue', event => {
             const activeButton = event.currentTarget
             if(activeButton.dataset.mbNukeState === 'working') {
-                void pauseSpaceFeedQueue(activeButton)
                 return
             }
 
@@ -7162,12 +10253,11 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
         singleButton = ensureCurrentInstanceClickHandler(singleButton, 'space-feed-post-single', event => {
             const activeButton = event.currentTarget
             if(activeButton.dataset.mbNukeState === 'working') {
-                void pauseSpaceFeedQueue(activeButton)
                 return
             }
 
             const postKey = activeButton.dataset.mbPostKey || ''
-            if(!postKey || isSpaceFeedPostNuked(postKey)) {
+            if(!postKey || isSpaceFeedPostNuked(postKey, getSpaceFeedButtonUrls(activeButton))) {
                 setNukeButtonDone(activeButton)
                 activeButton.disabled = true
                 return
@@ -7176,24 +10266,26 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
             const liveEntry = getLatestSpaceFeedEntries().find(candidate => candidate.postKey === postKey)
             const liveUrls = getQueueableSpaceFeedEntryUrls(liveEntry)
             const urls = liveUrls.length ? liveUrls : getSpaceFeedButtonUrls(activeButton)
-            if(!urls.length) return
+            const resolveProfileFromPage = !urls.length && isQueueableSpaceFeedResolverEntry(liveEntry)
+            if(!urls.length && !resolveProfileFromPage) return
 
             void nukeSpaceFeedEntries(activeButton, [{
                 postKey,
                 postUrl: liveEntry?.postUrl || activeButton.dataset.mbPostUrl || '',
-                candidateUrls: urls
+                candidateUrls: urls,
+                resolveProfileFromPage
             }])
         })
 
         queueButton.dataset.mbPostKey = entry.postKey
-        setSpaceFeedButtonUrls(queueButton, aggregateUrls)
+        setSpaceFeedButtonSelection(queueButton, model?.queueableEntries || [])
         setMuteBlockHelp(queueButton, aggregateCount > 0
-            ? buildNukeTargetsHelpText(`Queue ${aggregateCount} currently detected profile${aggregateCount === 1 ? '' : 's'} from visible posts in this space`, aggregateUrls)
-            : 'No currently detected profiles are queueable from visible posts in this space')
+            ? buildNukeTargetsHelpText(`Queue ${aggregateCount} current target${aggregateCount === 1 ? '' : 's'} from visible posts in this space`, aggregateUrls)
+            : 'No currently detected targets are queueable from visible posts in this space')
 
-        if(batchNukeActive || unknownNukeActive) {
-            setNukeButtonWorking(queueButton, formatSpaceFeedNukingLabel(aggregateEntries))
-            queueButton.disabled = false
+        if(queueButton.dataset.mbQueueing === 'true') {
+            setNukeButtonWorking(queueButton, `Nuking ${aggregateCount}`)
+            queueButton.disabled = true
         }
         else {
             setNukeButtonIdle(queueButton, `Nuke 'Em ${aggregateCount}`)
@@ -7203,24 +10295,18 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
         singleButton.dataset.mbPostKey = entry.postKey
         singleButton.dataset.mbPostUrl = entry.postUrl || ''
         setSpaceFeedButtonUrls(singleButton, liveUrls)
-        setMuteBlockHelp(singleButton, buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton)))
+        setMuteBlockHelp(singleButton, hasResolver
+            ? 'Queue this post for author profile resolution and mute-block'
+            : buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton)))
         singleButton.classList.remove('mb-ext_space-feed-post-single-nuke-btn--neutral')
 
         if(postNuked) {
             setNukeButtonDone(singleButton)
             singleButton.disabled = true
         }
-        else if(batchNukeActive || unknownNukeActive) {
-            setNukeButtonIdle(singleButton, 'Mute-Block')
-            singleButton.classList.add('mb-ext_space-feed-post-single-nuke-btn--neutral')
-            singleButton.disabled = true
-        }
         else if(postBusy) {
-            setNukeButtonWorking(singleButton, formatSpaceFeedNukingLabel([{
-                ...entry,
-                candidateUrls: liveUrls
-            }]))
-            singleButton.disabled = false
+            setNukeButtonWorking(singleButton, formatSpaceFeedPostWorkLabel(entry.liveWorkCount || entry.queueableWorkCount || 0))
+            singleButton.disabled = true
         }
         else if(hasCandidates) {
             setNukeButtonIdle(singleButton, 'Mute-Block')
@@ -7230,6 +10316,8 @@ function syncSpaceFeedPostButtons(entries, aggregateSourceEntries = entries) {
             setNukeButtonIdle(singleButton, 'Mute-Block')
             singleButton.disabled = true
         }
+
+        syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
     }
 
     for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
@@ -7270,10 +10358,13 @@ function syncSpaceFeedNukeControls() {
     const scannedEntries = getSpaceFeedPostEntries()
     setLatestSpaceFeedEntries(scannedEntries)
     const entries = getLatestSpaceFeedEntries()
+    scheduleSpaceFeedScopedStateRefresh(entries)
+    const renderModel = buildSpaceFeedRenderModel(scannedEntries, entries)
+    recordSpaceMarkPerf('render', {entries: entries.length, coordinatorReady: coordinatorQueueLoaded})
     scheduleSpaceFeedProgressReconciliation(entries)
     clearStaleLocalSpaceFeedBusyState()
     clearInactiveSpaceFeedNukeMode()
-    const main = document.querySelector('#mainContent')
+    const main = getSpaceFeedContentRoot()
     if(main) {
         main.dataset.mbSpaceFeedTimestampCount = `${entries.length}`
         main.dataset.mbSpaceFeedCardCount = `${entries.length}`
@@ -7289,10 +10380,710 @@ function syncSpaceFeedNukeControls() {
         return true
     }
 
-    syncSpaceFeedTopNukeButton(entries)
+    syncSpaceFeedTopNukeButton(renderModel)
     syncSpaceFeedTopBarLayout()
-    syncSpaceFeedPostButtons(scannedEntries, entries)
+    syncSpaceFeedPostButtons(renderModel)
+    if(getStoredPendingSpaceFeedWorkCountForSpace() > 0 || hasActivePendingSpaceFeedWork(entries)) {
+        scheduleSpaceAssetNukeControls(1200)
+    }
     return true
+}
+
+function resetProfileSearchControls() {
+    clearTimeout(profileSearchControlsTimeout)
+    profileSearchControlsPending = false
+    profileSearchCollectStopRequested = true
+    resetProfileSearchCollectionState()
+    clearProfileSearchFollowUps()
+    clearProfileSearchPendingRefresh()
+    document.querySelector('.mb-ext_profile-search-toolbar')?.remove()
+    for(const host of Array.from(document.querySelectorAll('.mb-ext_profile-search-action-host'))) {
+        host.remove()
+    }
+    for(const row of Array.from(document.querySelectorAll('[data-mb-profile-search-href]'))) {
+        delete row.dataset.mbProfileSearchHref
+    }
+}
+
+function scheduleProfileSearchControls(delay = 120) {
+    if(profileSearchControlsPending && delay !== 0) return
+
+    profileSearchControlsPending = true
+    clearTimeout(profileSearchControlsTimeout)
+    profileSearchControlsTimeout = setTimeout(() => {
+        void (async () => {
+            try {
+                await refreshContentPageCoordinatorStateFromRuntime()
+                syncProfileSearchControls()
+            }
+            finally {
+                profileSearchControlsPending = false
+                profileSearchControlsTimeout = null
+            }
+        })()
+    }, Math.max(0, delay))
+}
+
+function clearProfileSearchFollowUps() {
+    for(const timeoutId of profileSearchFollowUpTimeouts) {
+        clearTimeout(timeoutId)
+    }
+
+    profileSearchFollowUpTimeouts = []
+}
+
+function clearProfileSearchPendingRefresh() {
+    clearTimeout(profileSearchPendingRefreshTimeout)
+    profileSearchPendingRefreshTimeout = null
+}
+
+function scheduleProfileSearchPendingRefresh(delayMs = PROFILE_SEARCH_PENDING_REFRESH_MS) {
+    if(profileSearchPendingRefreshTimeout || getPageType() !== 'profile-search') return
+
+    profileSearchPendingRefreshTimeout = setTimeout(() => {
+        profileSearchPendingRefreshTimeout = null
+        if(getPageType() !== 'profile-search') return
+
+        void (async () => {
+            await refreshContentPageCoordinatorStateFromRuntime({force: true})
+            syncProfileSearchControls()
+        })()
+    }, Math.max(CONTENT_PAGE_STATE_REFRESH_MIN_INTERVAL_MS, Number.parseInt(delayMs, 10) || PROFILE_SEARCH_PENDING_REFRESH_MS))
+}
+
+function scheduleProfileSearchFollowUps() {
+    clearProfileSearchFollowUps()
+
+    const delays = [800, 2000, 5000, 10000]
+    for(const delay of delays) {
+        const timeoutId = setTimeout(() => {
+            if(getPageType() === 'profile-search') {
+                scheduleProfileSearchControls(0)
+            }
+        }, delay)
+
+        profileSearchFollowUpTimeouts.push(timeoutId)
+    }
+}
+
+function getProfileSearchQueryLabel() {
+    const params = new URLSearchParams(location.search)
+    const query = `${params.get('q') || ''}`.trim()
+    return query ? `Search: ${query}` : 'Profile Search'
+}
+
+function normalizeProfileSearchMatchTokens(value = '') {
+    return `${value || ''}`
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .map(token => token.trim())
+        .filter(token =>
+            token.length > 1 &&
+            !/^\d+$/.test(token) &&
+            !PROFILE_SEARCH_MATCH_IGNORED_TOKENS.has(token))
+}
+
+function getProfileSearchQueryTokens() {
+    const query = `${new URLSearchParams(location.search).get('q') || ''}`.trim()
+    return normalizeProfileSearchMatchTokens(query)
+}
+
+function getProfileSearchHrefSlugTokens(href = '') {
+    try {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref) return []
+        const slug = new URL(normalizedHref).pathname.split('/').filter(Boolean).pop() || ''
+        return normalizeProfileSearchMatchTokens(decodeURIComponent(slug))
+    }
+    catch {
+        return []
+    }
+}
+
+function isProfileSearchHrefMatchForCurrentQuery(href = '') {
+    const queryTokens = getProfileSearchQueryTokens()
+    if(!queryTokens.length) return false
+
+    const hrefTokens = new Set(getProfileSearchHrefSlugTokens(href))
+    if(!hrefTokens.size) return false
+    return queryTokens.every(token => hrefTokens.has(token))
+}
+
+function isProfileSearchRowMatchForCurrentQuery(row = {}) {
+    return isProfileSearchHrefMatchForCurrentQuery(row?.href || '')
+}
+
+function getProfileSearchCollectionKey() {
+    return `${location.origin}${location.pathname}?${new URLSearchParams(location.search).toString()}`
+}
+
+function resetProfileSearchCollectionState(options = {}) {
+    const keepCursor = options.keepCursor === true
+    profileSearchStagedHrefs = []
+    profileSearchStagedHrefSet = new Set()
+    if(!keepCursor) {
+        profileSearchCollectCursorScrollY = 0
+        profileSearchCollectCursorHref = ''
+    }
+}
+
+function ensureProfileSearchCollectionStateForCurrentSearch() {
+    const key = getProfileSearchCollectionKey()
+    if(profileSearchCollectionKey === key) return
+
+    profileSearchCollectionKey = key
+    resetProfileSearchCollectionState()
+}
+
+function getProfileSearchScrollY() {
+    return Math.round(window.scrollY || document.documentElement.scrollTop || 0)
+}
+
+function saveProfileSearchCollectCursor(rows = []) {
+    profileSearchCollectCursorScrollY = Math.max(profileSearchCollectCursorScrollY, getProfileSearchScrollY())
+
+    const lastVisibleRow = rows
+        .filter(row => row?.href && row.viewportBottom >= -80)
+        .sort((left, right) => (left.viewportBottom - right.viewportBottom) || (left.viewportTop - right.viewportTop))
+        .pop()
+    if(lastVisibleRow?.href) profileSearchCollectCursorHref = normalizeQuoraProfileHref(lastVisibleRow.href) || profileSearchCollectCursorHref
+}
+
+async function restoreProfileSearchCollectCursor() {
+    if(profileSearchCollectCursorScrollY <= getProfileSearchScrollY() + 80) return
+
+    window.scrollTo({
+        top: profileSearchCollectCursorScrollY,
+        left: 0,
+        behavior: 'auto'
+    })
+    await sleep(120)
+}
+
+function getProfileSearchStagedHrefs() {
+    ensureProfileSearchCollectionStateForCurrentSearch()
+
+    const next = []
+    const seen = new Set()
+    for(const href of profileSearchStagedHrefs) {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref || seen.has(normalizedHref)) continue
+        if(!isProfileSearchProfileNukeable(normalizedHref, {
+            ignoreStaleCurrentProfileSearchPending: true
+        })) continue
+        if(!isProfileSearchHrefMatchForCurrentQuery(normalizedHref)) continue
+
+        seen.add(normalizedHref)
+        next.push(normalizedHref)
+    }
+
+    profileSearchStagedHrefs = next
+    profileSearchStagedHrefSet = seen
+    return profileSearchStagedHrefs.slice()
+}
+
+function stageProfileSearchHrefs(hrefs = []) {
+    ensureProfileSearchCollectionStateForCurrentSearch()
+    getProfileSearchStagedHrefs()
+
+    let added = 0
+    for(const href of hrefs) {
+        const normalizedHref = normalizeQuoraProfileHref(href)
+        if(!normalizedHref || profileSearchStagedHrefSet.has(normalizedHref)) continue
+        if(!isProfileSearchProfileNukeable(normalizedHref, {
+            ignoreStaleCurrentProfileSearchPending: true
+        })) continue
+        if(!isProfileSearchHrefMatchForCurrentQuery(normalizedHref)) continue
+
+        profileSearchStagedHrefSet.add(normalizedHref)
+        profileSearchStagedHrefs.push(normalizedHref)
+        added += 1
+    }
+
+    return added
+}
+
+function hasUnstagedProfileSearchQueueableRow(rows = getProfileSearchRows({fromCurrentViewport: true})) {
+    ensureProfileSearchCollectionStateForCurrentSearch()
+    getProfileSearchStagedHrefs()
+
+    return getProfileSearchQueueableRows(rows, {allowRetry: false})
+        .some(row => {
+            const href = normalizeQuoraProfileHref(row.href)
+            return href && !profileSearchStagedHrefSet.has(href)
+        })
+}
+
+function getProfileSearchScrollHeight() {
+    return Math.round(document.documentElement.scrollHeight || document.body?.scrollHeight || 0)
+}
+
+function isProfileSearchAtBottom() {
+    return Math.ceil(getProfileSearchScrollY() + (window.innerHeight || 0)) >= getProfileSearchScrollHeight() - 2
+}
+
+function isProfileSearchEndOfResultsVisible() {
+    const text = `${document.body?.innerText || ''}`.replace(/\s+/g, ' ').trim()
+    return /couldn['’]?t find any more results/i.test(text) ||
+        /\bno more results\b/i.test(text)
+}
+
+function hasProfileSearchLoadingIndicator() {
+    return Array.from(document.querySelectorAll('[role="progressbar"], [aria-busy="true"], [class*="LoadingDots"], [class*="loading" i], [class*="spinner" i]'))
+        .some(node => {
+            const rect = node.getBoundingClientRect()
+            return rect.width > 0 && rect.height > 0
+        })
+}
+
+function nudgeProfileSearchLazyLoad() {
+    if(isProfileSearchAtBottom()) {
+        window.scrollTo({
+            top: getProfileSearchScrollHeight(),
+            left: 0,
+            behavior: 'auto'
+        })
+        return
+    }
+
+    window.scrollBy({
+        top: Math.max(500, Math.floor((window.innerHeight || 800) * 0.82)),
+        left: 0,
+        behavior: 'auto'
+    })
+}
+
+function getProfileSearchCollectLimit() {
+    return PROFILE_SEARCH_COLLECT_LIMIT
+}
+
+function isProfileSearchFollowButton(button) {
+    if(!button || isExtensionOwnedNode(button) || !isVisible(button)) return false
+
+    const labels = [
+        button.getAttribute('aria-label') || '',
+        getElementText(button)
+    ].map(label => `${label}`.replace(/\s+/g, ' ').trim()).filter(Boolean)
+    if(labels.some(label => /\bfollowing\b|\bfollowed\b/i.test(label))) return false
+    return labels.some(label => /^follow(?:\s*·\s*\d+)?$/i.test(label))
+}
+
+function getProfileSearchPrimaryHref(row) {
+    const links = Array.from(row?.querySelectorAll?.('a[href*="/profile/"]') || [])
+        .filter(link => !isExtensionOwnedNode(link) && isVisible(link))
+        .map(link => {
+            const href = normalizeQuoraProfileHref(link.href)
+            const rect = link.getBoundingClientRect()
+            return href ? {href, rect} : null
+        })
+        .filter(Boolean)
+        .sort((left, right) => (left.rect.left - right.rect.left) || (left.rect.top - right.rect.top))
+
+    return links[0]?.href || ''
+}
+
+function getProfileSearchRowForFollowButton(button) {
+    let current = button?.parentElement || null
+    let fallback = null
+
+    for(let depth = 0; current && current !== document.body && depth < 10; depth += 1, current = current.parentElement) {
+        if(isExtensionOwnedNode(current)) continue
+
+        const rect = current.getBoundingClientRect()
+        const hasProfileLink = !!Array.from(current.querySelectorAll?.('a[href*="/profile/"]') || [])
+            .find(link => !isExtensionOwnedNode(link) && isVisible(link) && normalizeQuoraProfileHref(link.href))
+        const hasFollowButton = Array.from(current.querySelectorAll?.('button, [role="button"]') || [])
+            .some(candidate => candidate === button || isProfileSearchFollowButton(candidate))
+        if(!hasProfileLink || !hasFollowButton) continue
+
+        const plausibleRow = rect.width >= 260 && rect.height >= 36 && rect.height <= 180
+        if(plausibleRow) return current
+        fallback = fallback || current
+    }
+
+    return fallback
+}
+
+function getProfileSearchRows(options = {}) {
+    if(getPageType() !== 'profile-search') return []
+
+    const fromCurrentViewport = !!options.fromCurrentViewport
+    const rows = []
+    const seen = new Set()
+    const followButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .filter(isProfileSearchFollowButton)
+
+    for(const followButton of followButtons) {
+        const row = getProfileSearchRowForFollowButton(followButton)
+        if(!row) continue
+
+        const rect = row.getBoundingClientRect()
+        if(fromCurrentViewport && rect.bottom < -80) continue
+
+        const href = getProfileSearchPrimaryHref(row)
+        if(!href || seen.has(href)) continue
+        seen.add(href)
+
+        rows.push({
+            href,
+            row,
+            followButton,
+            rowText: getElementText(row),
+            viewportTop: rect.top,
+            viewportBottom: rect.bottom
+        })
+    }
+
+    return rows
+}
+
+function isProfileSearchProfileNukeable(href, options = {}) {
+    const normalizedHref = normalizeQuoraProfileHref(href)
+    if(!normalizedHref) return false
+    if(isPendingCoordinatorProfileHref(normalizedHref, {
+        ignoreStaleCurrentProfileSearchPending: options.ignoreStaleCurrentProfileSearchPending === true
+    })) return false
+
+    const record = getProfileNukeProgressRecord(normalizedHref)
+    if(!record) return true
+    if(isSuccessfulProfileNukeRecord(record)) return false
+    if(isSettledProfileNukeRecord(record)) {
+        return !!options.allowRetry && isRetryableProfileNukeRecord(record)
+    }
+
+    return false
+}
+
+function getProfileSearchQueueableRows(rows = getProfileSearchRows(), options = {}) {
+    return rows.filter(row => {
+        if(!isProfileSearchRowMatchForCurrentQuery(row)) return false
+        return isProfileSearchProfileNukeable(row.href, {
+            ignoreStaleCurrentProfileSearchPending: true,
+            ...options
+        })
+    })
+}
+
+function getProfileSearchToolbar() {
+    let toolbar = document.querySelector('.mb-ext_profile-search-toolbar')
+    if(toolbar) return toolbar
+
+    toolbar = document.createElement('div')
+    toolbar.className = 'mb-ext_profile-search-toolbar'
+
+    const batchButton = document.createElement('button')
+    batchButton.type = 'button'
+    batchButton.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-batch-btn'
+    toolbar.appendChild(batchButton)
+
+    const collectButton = document.createElement('button')
+    collectButton.type = 'button'
+    collectButton.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-collect-btn'
+    toolbar.appendChild(collectButton)
+
+    document.body.appendChild(toolbar)
+    return toolbar
+}
+
+function getProfileSearchToolbarButtons() {
+    const toolbar = getProfileSearchToolbar()
+    return {
+        toolbar,
+        batch: toolbar.querySelector('.mb-ext_profile-search-batch-btn'),
+        collect: toolbar.querySelector('.mb-ext_profile-search-collect-btn')
+    }
+}
+
+function syncProfileSearchRowButtons(rows = getProfileSearchRows()) {
+    const activeHrefs = new Set()
+
+    for(const entry of rows) {
+        const href = normalizeQuoraProfileHref(entry.href)
+        if(!href) continue
+
+        activeHrefs.add(href)
+        entry.row.dataset.mbProfileSearchHref = href
+
+        let host = entry.row.querySelector('.mb-ext_profile-search-action-host')
+        if(!host) {
+            host = document.createElement('span')
+            host.className = 'mb-ext_profile-search-action-host'
+            if(entry.followButton?.parentElement) {
+                entry.followButton.insertAdjacentElement('afterend', host)
+            }
+            else {
+                entry.row.appendChild(host)
+            }
+        }
+        host.dataset.mbProfileSearchHref = href
+
+        let button = host.querySelector('.mb-ext_profile-search-row-btn')
+        if(!button) {
+            button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-row-btn'
+            host.appendChild(button)
+        }
+
+        button.dataset.mbProfileSearchHref = href
+        button = ensureCurrentInstanceClickHandler(button, 'profile-search-row', event => {
+            const activeButton = event.currentTarget
+            const profileHref = activeButton.dataset.mbProfileSearchHref || ''
+            if(!isProfileSearchHrefMatchForCurrentQuery(profileHref)) {
+                syncProfileSearchControls()
+                return
+            }
+            if(!isProfileSearchProfileNukeable(profileHref, {allowRetry: true})) {
+                syncProfileSearchControls()
+                return
+            }
+
+            void nukeProfileSearchHrefs(activeButton, [profileHref], {
+                event: 'Queued from profile search row',
+                allowRetry: true
+            })
+        })
+
+        const record = getProfileNukeProgressRecord(href)
+        if(!isProfileSearchRowMatchForCurrentQuery(entry)) {
+            setNukeButtonNotice(button, 'Not Match', 'Not Match')
+            button.disabled = true
+            setMuteBlockHelp(button, `Search result does not match ${getProfileSearchQueryLabel()}`)
+        }
+        else if(isPendingCoordinatorProfileHref(href)) {
+            setNukeButtonWorking(button, 'Nuking...')
+            button.disabled = true
+        }
+        else if(isSuccessfulProfileNukeRecord(record)) {
+            setNukeButtonDone(button)
+            button.disabled = true
+        }
+        else if(isSettledProfileNukeRecord(record)) {
+            if(isRetryableProfileNukeRecord(record)) {
+                setNukeButtonIdle(button, 'Retry')
+                button.disabled = false
+                setMuteBlockHelp(button, `Retry mute and block for ${href}`)
+            }
+            else {
+                setNukeButtonDone(button, 'Done')
+                button.disabled = true
+            }
+        }
+        else {
+            setNukeButtonIdle(button, 'Mute-Block')
+            button.disabled = false
+            setMuteBlockHelp(button, `Queue ${href} for mute and block`)
+        }
+    }
+
+    for(const host of Array.from(document.querySelectorAll('.mb-ext_profile-search-action-host'))) {
+        const href = normalizeQuoraProfileHref(host.dataset.mbProfileSearchHref || '')
+        if(!href || !activeHrefs.has(href)) host.remove()
+    }
+}
+
+function getProfileSearchBatchHrefs(rows = getProfileSearchRows(), options = {}) {
+    const stagedHrefs = getProfileSearchStagedHrefs()
+    if(stagedHrefs.length) return stagedHrefs
+
+    const limit = Number.parseInt(options.limit, 10) || getProfileSearchCollectLimit()
+    return getProfileSearchQueueableRows(rows, {allowRetry: false})
+        .slice(0, limit)
+        .map(row => row.href)
+}
+
+function syncProfileSearchControls() {
+    if(getPageType() !== 'profile-search') {
+        resetProfileSearchControls()
+        return false
+    }
+
+    ensureProfileSearchCollectionStateForCurrentSearch()
+    const rows = getProfileSearchRows()
+    syncProfileSearchRowButtons(rows)
+
+    const buttons = getProfileSearchToolbarButtons()
+    const limit = getProfileSearchCollectLimit()
+    const batchHrefs = getProfileSearchBatchHrefs(rows, {limit})
+    const pendingSearchCount = getPendingCoordinatorProfileSearchWorkCount()
+
+    buttons.batch = ensureCurrentInstanceClickHandler(buttons.batch, 'profile-search-batch', event => {
+        const activeButton = event.currentTarget
+
+        const hrefs = getProfileSearchBatchHrefs(getProfileSearchRows(), {
+            limit: getProfileSearchCollectLimit()
+        })
+        void (async() => {
+            const queued = await nukeProfileSearchHrefs(activeButton, hrefs, {
+                event: 'Queued from profile search'
+            })
+            if(queued) resetProfileSearchCollectionState({keepCursor: true})
+            scheduleProfileSearchControls(0)
+        })()
+    })
+    buttons.collect = ensureCurrentInstanceClickHandler(buttons.collect, 'profile-search-collect', event => {
+        void collectMoreProfileSearchResults(event.currentTarget)
+    })
+
+    if(profileSearchCollecting) {
+        setNukeButtonWorking(buttons.collect, buttons.collect.innerText || `Collecting 0 / ${limit}`)
+        buttons.collect.disabled = false
+        buttons.batch.disabled = !batchHrefs.length
+    }
+    else if(pendingSearchCount > 0) {
+        setNukeButtonWorking(buttons.collect, `Nuking ${pendingSearchCount} left`)
+        buttons.collect.disabled = true
+        buttons.batch.disabled = true
+        scheduleProfileSearchPendingRefresh()
+    }
+    else {
+        clearProfileSearchPendingRefresh()
+        setNukeButtonIdle(buttons.collect, `Collect ${limit} More`)
+        buttons.collect.disabled = false
+        buttons.batch.disabled = !batchHrefs.length
+    }
+
+    setNukeButtonIdle(buttons.batch, batchHrefs.length ? `Nuke 'Em ${batchHrefs.length}` : 'Nuke \'Em 0')
+    const hasStagedHrefs = getProfileSearchStagedHrefs().length > 0
+    setMuteBlockHelp(buttons.batch, batchHrefs.length
+        ? buildNukeTargetsHelpText(hasStagedHrefs
+            ? 'Queue collected profile-search results'
+            : 'Queue currently loaded profile-search results with Follow buttons', batchHrefs)
+        : 'No currently loaded profile-search results with Follow buttons are queueable')
+    setMuteBlockHelp(buttons.collect, `Scroll this search page and collect up to ${limit} more Follow-button profile results`)
+
+    return true
+}
+
+async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
+    const profileHrefs = getNormalizedProfileHrefList(hrefs)
+        .filter(href => isProfileSearchHrefMatchForCurrentQuery(href))
+        .filter(href => isProfileSearchProfileNukeable(href, {
+            allowRetry: !!options.allowRetry,
+            ignoreStaleCurrentProfileSearchPending: true
+        }))
+
+    if(!profileHrefs.length) {
+        setNukeButtonNotice(button, 'Nothing queued', button?.innerText || `Nuke 'Em`)
+        scheduleProfileSearchControls(0)
+        return false
+    }
+
+    updateOwnedNukeStatusCache({
+        ...ownedNukeStatusCache,
+        queued: (Number.parseInt(ownedNukeStatusCache?.queued, 10) || 0) + profileHrefs.length,
+        paused: false
+    })
+    await animateNukeButtonPress(button)
+    setNukeButtonWorking(button, `Queueing... ${profileHrefs.length}`)
+
+    const result = await enqueueCoordinatorProfileUrls({
+        urls: profileHrefs,
+        sourceType: 'profile-search',
+        event: options.event || 'Queued from profile search',
+        maxConcurrent: getProfileSearchProfilesPerBatch(),
+        noForegroundFallback: true,
+        maxRetries: 2,
+        sourceExtra: {
+            searchQuery: new URLSearchParams(location.search).get('q') || '',
+            sourceLabel: getProfileSearchQueryLabel()
+        }
+    })
+    const queued = Number.parseInt(result?.executionQueued || result?.queued || result?.merged || 0, 10) || 0
+    if(queued > 0) {
+        profileSearchLastRunId = result?.runId || profileSearchLastRunId
+        profileSearchLastQueuedAt = Date.now()
+        profileSearchLastQueuedCount = queued
+        setNukeButtonWorking(button, `Nuking ${queued} left`)
+        scheduleProfileSearchControls(250)
+        scheduleProfileSearchPendingRefresh()
+        return true
+    }
+
+    setNukeButtonNotice(button, 'Nothing queued', `Nuke 'Em`)
+    scheduleProfileSearchControls(250)
+    clearProfileSearchPendingRefresh()
+    return false
+}
+
+async function collectMoreProfileSearchResults(button) {
+    const limit = getProfileSearchCollectLimit()
+    if(profileSearchCollecting) {
+        profileSearchCollectStopRequested = true
+        setNukeButtonWorking(button, 'Stopping...')
+        return false
+    }
+
+    ensureProfileSearchCollectionStateForCurrentSearch()
+    profileSearchCollecting = true
+    profileSearchCollectStopRequested = false
+    const initialStagedCount = getProfileSearchStagedHrefs().length
+    const targetStagedCount = initialStagedCount + limit
+    let collectedCount = 0
+    let stalledStartedAt = 0
+    let scrollPasses = 0
+
+    await animateNukeButtonPress(button)
+    await restoreProfileSearchCollectCursor()
+
+    try {
+        while(!profileSearchCollectStopRequested &&
+            collectedCount < limit &&
+            scrollPasses < PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES) {
+            const beforeCount = collectedCount
+            const beforeY = getProfileSearchScrollY()
+            const beforeHeight = getProfileSearchScrollHeight()
+            const rows = getProfileSearchRows({fromCurrentViewport: true})
+            for(const row of getProfileSearchQueueableRows(rows, {allowRetry: false})) {
+                if(collectedCount >= limit) break
+                collectedCount += stageProfileSearchHrefs([row.href])
+            }
+
+            saveProfileSearchCollectCursor(rows)
+            setNukeButtonWorking(button, `Collecting ${getProfileSearchStagedHrefs().length} / ${targetStagedCount}`)
+            syncProfileSearchControls()
+
+            if(collectedCount >= limit) break
+
+            if(isProfileSearchEndOfResultsVisible() && !hasUnstagedProfileSearchQueueableRow() && !hasProfileSearchLoadingIndicator()) break
+
+            nudgeProfileSearchLazyLoad()
+            scrollPasses += 1
+            await sleep(700)
+
+            const afterY = getProfileSearchScrollY()
+            const afterHeight = getProfileSearchScrollHeight()
+            profileSearchCollectCursorScrollY = Math.max(profileSearchCollectCursorScrollY, afterY)
+            const madeProgress = collectedCount > beforeCount || afterY > beforeY || afterHeight > beforeHeight
+            if(madeProgress) {
+                stalledStartedAt = 0
+            }
+            else {
+                stalledStartedAt = stalledStartedAt || Date.now()
+                if(Date.now() - stalledStartedAt >= PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS) break
+            }
+        }
+
+        if(profileSearchCollectStopRequested) {
+            setNukeButtonNotice(button, 'Stopped', `Collect ${limit} More`)
+            return false
+        }
+
+        if(collectedCount < 1) {
+            setNukeButtonNotice(button, 'No new candidates', `Collect ${limit} More`)
+            return false
+        }
+
+        setNukeButtonNotice(button, `Collected ${collectedCount}`, `Collect ${limit} More`)
+        return true
+    }
+    finally {
+        profileSearchCollecting = false
+        profileSearchCollectStopRequested = false
+        scheduleProfileSearchControls(0)
+    }
 }
 
 function injectModalOpenProfilesBtn() {
@@ -7375,6 +11166,18 @@ function getProfilesPerBatch() {
 
 function getSpaceFeedProfilesPerBatch() {
     return SPACE_FEED_PROFILES_PER_BATCH
+}
+
+function getProfileSearchProfilesPerBatch() {
+    const value = Number.parseInt(settings.profilesPerBatch, 10)
+    if(!Number.isFinite(value) || value < 1) return PROFILE_SEARCH_PROFILES_PER_BATCH
+    return Math.min(value, PROFILE_SEARCH_PROFILES_PER_BATCH)
+}
+
+function getModalProfileNukeProfilesPerBatch() {
+    const value = Number.parseInt(settings.profilesPerBatch, 10)
+    if(!Number.isFinite(value) || value < 1) return MODAL_PROFILE_NUKE_PROFILES_PER_BATCH
+    return Math.min(value, MODAL_PROFILE_NUKE_PROFILES_PER_BATCH)
 }
 
 function getModalProfileActionButtons(modal = getProfilePeopleModal()) {
@@ -7567,14 +11370,16 @@ async function nukeModalProfiles() {
     disableModalProfileActionButtons(modal)
 
     try {
-        const maxConcurrent = getProfilesPerBatch()
+        const maxConcurrent = getModalProfileNukeProfilesPerBatch()
+        const queueLimit = maxConcurrent
         const urlsToQueue = []
         const queuedUrls = new Set()
         let idlePasses = 0
         let scrollPasses = 0
 
         while(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES &&
-            scrollPasses < MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES) {
+            scrollPasses < MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES &&
+            urlsToQueue.length < queueLimit) {
             items = getNukeableProfileModalItems(modal)
 
             if(items.length) {
@@ -7582,14 +11387,16 @@ async function nukeModalProfiles() {
 
                 if(urls.length) {
                     for(const url of urls) {
+                        if(urlsToQueue.length >= queueLimit) break
                         queuedUrls.add(url)
                         urlsToQueue.push(url)
                     }
 
-                    markModalItemsNukeQueued(items, '#f8d7da')
+                    const queuedUrlSet = new Set(urlsToQueue)
+                    markModalItemsNukeQueued(items.filter(item => queuedUrlSet.has(getModalItemProfileHref(item))), '#f8d7da')
                     idlePasses = 0
                     items[items.length - 1].scrollIntoView({block: 'nearest'})
-                    if(await scrollProfileModalForMore(modal)) {
+                    if(urlsToQueue.length < queueLimit && await scrollProfileModalForMore(modal)) {
                         scrollPasses += 1
                         idlePasses = 0
                     }
@@ -7612,23 +11419,19 @@ async function nukeModalProfiles() {
         }
 
         if(urlsToQueue.length) {
-            await recordProfileNukeProgressBatch(urlsToQueue.map(url => ({
-                profileHref: url,
-                patch: buildQueuedProfileProgressPatch('Queued from modal')
-            })))
-            const result = await safeSendRuntimeMessageWithTimeout({
-                action: 'enqueue-tabs',
+            const result = await enqueueCoordinatorProfileUrls({
                 urls: urlsToQueue,
-                tabAction: 'nuke',
-                noForegroundFallback: true,
+                sourceType: 'profile-modal',
+                event: 'Queued from modal',
+                noForegroundFallback: false,
                 maxConcurrent
-            }, {queued: 0, timedOut: true})
+            })
 
-            if((result?.queued || 0) <= 0) {
+            if((result?.executionQueued || result?.queued || result?.merged || 0) <= 0) {
                 await sweepBlockedProfileTabs()
             }
 
-            await waitForOwnedNukeTabsToDrain(buttons.nuke)
+            await waitForOwnedNukeTabsToDrain(buttons.nuke, 180000, 1000, {runId: result?.runId || ''})
         }
     }
     finally {
@@ -7646,15 +11449,53 @@ async function nukeModalProfiles() {
 }
 
 async function maybeRunAutoProfileAction() {
-    if(autoProfileActionPending) return
+    if(autoProfileActionPending || autoProfileActionClaimPending) return
+
+    maybeReportCloudflareChallenge()
 
     if(autoProfileAction === undefined) {
         autoProfileActionAttempts += 1
-        autoProfileAction = await safeSendRuntimeMessage({action: 'claim-tab-action'}, null)
+        if(getPageType() === 'profile' && !coordinatorQueueLoaded) {
+            // init() only calls refreshCoordinatorQueueFromRuntime once, with
+            // a 3s budget -- if the SW is busy right at page load (e.g. mid
+            // reconcile of a large backlog) that one attempt can time out,
+            // and nothing else ever retries it. Without this, that leaves
+            // coordinatorQueueLoaded permanently false for the rest of this
+            // page's life, so this branch loops forever re-checking the same
+            // stale flag and claim-tab-action is never even attempted --
+            // even though other message handlers (close-if-blocked) keep
+            // responding fine, since they don't depend on this flag. Kicking
+            // the sync again here (it has its own throttle/dedup) gives a
+            // transient SW hiccup a chance to self-heal instead of stranding
+            // the tab for its full retry-budget lifetime.
+            void refreshContentPageCoordinatorStateFromRuntime()
+            setTimeout(() => void maybeRunAutoProfileAction(), QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS)
+            return
+        }
+    }
 
-        if(!autoProfileAction && autoProfileActionAttempts < 6) {
+    if(autoProfileAction === undefined) {
+        autoProfileActionClaimPending = true
+        try {
+            autoProfileAction = await safeSendRuntimeMessageWithTimeout({
+                action: 'claim-tab-action'
+            }, null, QUEUED_ACTION_CLAIM_MESSAGE_TIMEOUT_MS)
+        }
+        finally {
+            autoProfileActionClaimPending = false
+        }
+
+        if(!autoProfileAction) {
             autoProfileAction = undefined
-            setTimeout(() => void maybeRunAutoProfileAction(), 500)
+            const shouldKeepRetrying = autoProfileActionAttempts < QUEUED_ACTION_CLAIM_FAST_ATTEMPTS ||
+                hasCurrentProfilePendingCoordinatorQueueItem()
+            if(shouldKeepRetrying) {
+                const retryDelay = autoProfileActionAttempts < QUEUED_ACTION_CLAIM_FAST_ATTEMPTS
+                    ? QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS
+                    : QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS
+                setTimeout(() => void maybeRunAutoProfileAction(), retryDelay)
+                scheduleCurrentProfilePendingClaimRescue(retryDelay)
+            }
             return
         }
     }
@@ -7663,14 +11504,30 @@ async function maybeRunAutoProfileAction() {
         ? {action: autoProfileAction, targetUrl: ''}
         : autoProfileAction
 
-    if(claimedAction?.action !== 'nuke') return
-    const allowForegroundFallback = !claimedAction?.noForegroundFallback
+    if(claimedAction?.action !== 'nuke' && claimedAction?.action !== UNBLOCK_UNMUTE_ACTION_KIND) {
+        autoProfileAction = undefined
+        if(hasCurrentProfilePendingCoordinatorQueueItem()) {
+            setTimeout(() => void maybeRunAutoProfileAction(), QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS)
+            scheduleCurrentProfilePendingClaimRescue()
+        }
+        return
+    }
+    const claimedActionSurfaceMode = `${claimedAction?.actionSurfaceMode || ''}`.trim()
+    const allowForegroundFallback = !claimedAction?.noForegroundFallback || claimedActionSurfaceMode === 'worker-window'
+    const claimedActionKind = claimedAction?.action === UNBLOCK_UNMUTE_ACTION_KIND
+        ? UNBLOCK_UNMUTE_ACTION_KIND
+        : 'mute-block'
 
     autoProfileActionPending = true
     autoProfileAction = null
     autoProfileActionAttempts = 0
 
-    const queuedProfileHref = normalizeQuoraProfileHref(claimedAction?.targetUrl || '') || normalizeQuoraProfileHref(location.href) || ''
+    let queuedProfileHref = normalizeQuoraProfileHref(claimedAction?.targetUrl || '') || normalizeQuoraProfileHref(location.href) || ''
+    activeQueuedAttemptId = `${claimedAction?.attemptId || ''}`.trim()
+    activeQueuedAttemptNumber = Number.parseInt(claimedAction?.attemptNumber, 10) || 0
+    activeQueuedAttemptProfileHref = queuedProfileHref
+    activeQueuedNoForegroundFallback = claimedAction?.noForegroundFallback === true
+    activeQueuedActionSurfaceMode = claimedActionSurfaceMode
     const recordQueuedProfileProgress = patch => {
         const resolvedProfileHref = getPageType() === 'profile'
             ? normalizeQuoraProfileHref(location.href)
@@ -7682,6 +11539,7 @@ async function maybeRunAutoProfileAction() {
             resolvedProfileHref: resolvedProfileHref || '',
             remappedFromRequested,
             pageType: getPageType() || 'unknown',
+            actionKind: claimedActionKind,
             securityVerification: !!securityVerificationReason,
             securityVerificationReason,
             unavailableReason: getProfileUnavailableReason() || '',
@@ -7699,6 +11557,13 @@ async function maybeRunAutoProfileAction() {
             tabOpenedAt: Date.now(),
             contentOpenedAt: Date.now(),
             openedViablePage: false,
+            closeRequestedAt: 0,
+            closedByExtension: false,
+            closeReason: '',
+            tabClosedAt: 0,
+            slotReleasedAt: 0,
+            finalError: '',
+            errorPageUrl: '',
             event: 'Queued tab opened'
         })
 
@@ -7715,8 +11580,13 @@ async function maybeRunAutoProfileAction() {
             return queuedTabReleased
         }
         const closeQueuedBlockedTab = async (patch = {}) => {
+            const swept = await sweepServiceWorkerBlockedProfileTabs().catch(() => ({signaled: 0}))
+            if(swept.signaled) {
+                return true
+            }
+
             const foundBlockedBeforeQueue = !!patch.foundBlockedBeforeQueue
-            await recordQueuedProfileProgress({
+            const progress = await recordQueuedProfileProgress({
                 status: foundBlockedBeforeQueue ? 'already-blocked' : 'blocked',
                 blockSucceeded: true,
                 blockedAt: Date.now(),
@@ -7724,45 +11594,584 @@ async function maybeRunAutoProfileAction() {
                 event: foundBlockedBeforeQueue ? 'Profile confirmed already blocked' : 'Profile confirmed blocked',
                 ...patch
             })
+            if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+                console.info('Queued terminal success was not recorded; leaving tab open for retry')
+                setTimeout(() => {
+                    void sweepServiceWorkerBlockedProfileTabs()
+                }, 1000)
+                return false
+            }
             await releaseQueuedTabSlot()
             await requestCloseTab()
+            return true
         }
         const skipQueuedUnavailableTab = async message => {
             console.info(message)
-            await recordQueuedProfileProgress({
-                status: 'profile-unavailable',
-                openedViablePage: false,
-                finalError: message,
-                unavailableReason: getProfileUnavailableReason() || message,
-                event: message
-            })
-            await removePendingSpaceFeedUrls(getResolvedSpaceFeedProfileHrefs(queuedProfileHref || location.href))
+            const unavailableReason = getProfileUnavailableReason() || message
+            if(unavailableReason === 'Profile banned') {
+                // Quora banned/deactivated the account itself -- there is no
+                // block control to interact with and never will be, so this
+                // is functionally identical to an already-blocked profile.
+                // Record it the same way a real block success is recorded
+                // (status/blockSucceeded/blockedAt) so every downstream
+                // dedup/skip check -- the space-feed "Nuked" badge, future
+                // queue-building -- treats it as done without needing to
+                // reopen a tab for it again.
+                await recordQueuedProfileProgress({
+                    status: 'blocked',
+                    openedViablePage: false,
+                    blockSucceeded: true,
+                    blockedAt: Date.now(),
+                    finalError: '',
+                    blockReason: 'quora-banned',
+                    unavailableReason,
+                    event: 'Profile is banned/deactivated by Quora; treated as already blocked'
+                })
+            }
+            else {
+                await recordQueuedProfileProgress({
+                    status: 'profile-unavailable',
+                    openedViablePage: false,
+                    finalError: message,
+                    unavailableReason,
+                    event: message
+                })
+            }
             await releaseQueuedTabSlot()
             await requestCloseTab(2, 100, true)
         }
-        const abandonQueuedTab = async message => {
+        const abandonQueuedTab = async (message, extraPatch = {}) => {
             console.info(message)
             await recordQueuedProfileProgress({
                 status: 'error',
                 openedViablePage: false,
                 finalError: message,
                 errorPageUrl: location.href,
-                event: message
+                event: message,
+                ...extraPatch
             })
             await failCurrentQueuedProfile(getResolvedSpaceFeedProfileHrefs(queuedProfileHref || location.href))
             await releaseQueuedTabSlot()
             await requestCloseTab(2, 100, true)
+        }
+        const abandonQueuedResolution = async message => {
+            console.info(message)
+            await safeSendRuntimeMessageWithTimeout({
+                action: 'resolve-queued-profile-target-failed',
+                coordinatorKey: claimedAction?.coordinatorKey || '',
+                requestedUrl: claimedAction?.requestedUrl || location.href,
+                resolutionReason: claimedAction?.resolutionReason || '',
+                error: message,
+                outcome: 'unresolved-target',
+                attemptId: activeQueuedAttemptId || '',
+                attemptNumber: activeQueuedAttemptNumber || 0
+            }, null, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
+            await releaseQueuedTabSlot()
+            await requestCloseTab(2, 100, true)
+        }
+        const resolveQueuedProfileFromCurrentPage = async () => {
+            if(!canResolveQueuedProfileFromCurrentPage(claimedAction)) return false
+
+            let resolvedProfileHref = ''
+            for(let attempt = 0; attempt < 10; attempt += 1) {
+                resolvedProfileHref = normalizeQuoraProfileHref(getQueuedPageResolvedProfileHref(claimedAction) || '') || ''
+                if(resolvedProfileHref) break
+                await sleep(350 + attempt * 100)
+            }
+
+            if(!resolvedProfileHref) return false
+
+            const response = await sendQueuedProfileResolutionMessageWithRetry({
+                action: 'resolve-queued-profile-target',
+                coordinatorKey: claimedAction?.coordinatorKey || '',
+                requestedUrl: claimedAction?.requestedUrl || location.href,
+                profileHref: resolvedProfileHref,
+                attemptId: activeQueuedAttemptId || '',
+                attemptNumber: activeQueuedAttemptNumber || 0
+            })
+
+            if(response?.resolved !== true) return false
+
+            queuedProfileHref = resolvedProfileHref
+            activeQueuedAttemptProfileHref = resolvedProfileHref
+            await recordQueuedProfileProgress({
+                status: 'tab-opened',
+                openedViablePage: false,
+                resolvedProfileHref,
+                remappedFromRequested: true,
+                closeRequestedAt: 0,
+                closedByExtension: false,
+                closeReason: '',
+                tabClosedAt: 0,
+                slotReleasedAt: 0,
+                finalError: '',
+                errorPageUrl: '',
+                event: `Resolved queued page target to ${resolvedProfileHref}`
+            })
+            location.replace(resolvedProfileHref)
+            return true
+        }
+        const isQueuedResolutionAction = () => {
+            return claimedAction?.resolveProfileFromPage === true ||
+                `${claimedAction?.resolutionMode || ''}`.trim() === QUEUED_PROFILE_RESOLUTION_MODE
+        }
+        let queuedActionLeaseHeld = false
+        let queuedActionLeaseDeniedReason = ''
+        const beginQueuedProfileAction = async (reason, readyPredicate = null) => {
+            const waitStartedAt = Date.now()
+            let lastCoordinatorProgressAt = waitStartedAt
+            let lastWaitEventAt = 0
+            let waitingForActionLeaseAt = 0
+            queuedActionLeaseDeniedReason = ''
+
+            const recordActionGateProgress = async patch => {
+                const now = Date.now()
+                const progress = await recordQueuedProfileProgress({
+                    foregroundWaitLastEventAt: now,
+                    ...patch
+                })
+                if(progress?.runtimeRecorded) lastCoordinatorProgressAt = now
+                return progress
+            }
+
+            const getMatchingActionGateProgress = () => {
+                const record = getProfileNukeProgressRecord(queuedProfileHref || location.href)
+                if(!record) return null
+
+                const recordAttemptId = getAttemptIdFromValue(record)
+                if(activeQueuedAttemptId && recordAttemptId && recordAttemptId !== activeQueuedAttemptId) return null
+
+                const recordAttemptNumber = getAttemptNumberFromValue(record)
+                if(activeQueuedAttemptNumber && recordAttemptNumber && recordAttemptNumber !== activeQueuedAttemptNumber) return null
+
+                return record
+            }
+
+            const canProceedWithoutForegroundGate = () => {
+                const readyForLocalAction = typeof readyPredicate !== 'function' ||
+                    readyPredicate() ||
+                    !!getProfileUnavailableReason()
+                if(!readyForLocalAction) return false
+
+                return !allowForegroundFallback ||
+                    (claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible')
+            }
+
+            const beginLocalNoForegroundActionGate = async () => {
+                if(document.visibilityState === 'visible' || claimedAction?.noForegroundFallback !== true) return false
+
+                const readyNow = typeof readyPredicate !== 'function' ||
+                    readyPredicate() ||
+                    !!getProfileUnavailableReason()
+                const readySoon = readyNow || await waitForCondition(
+                    () => typeof readyPredicate !== 'function' || readyPredicate() || !!getProfileUnavailableReason(),
+                    Math.min(FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS, 2500),
+                    100
+                )
+                if(!readySoon) return false
+
+                return waitForProfileActionReadiness({
+                    begun: true,
+                    granted: true,
+                    localActionGateFallback: true,
+                    localNoForegroundGate: true,
+                    foregroundLeaseAcquiredAt: Date.now()
+                })
+            }
+
+            const getRecoveredBeginResponseFromProgress = () => {
+                const record = getMatchingActionGateProgress()
+                if(!record) return null
+
+                const foregroundPromotedAt = Number.parseInt(record.foregroundPromotedAt, 10) || 0
+                const foregroundLeaseAcquiredAt = Number.parseInt(record.foregroundLeaseAcquiredAt, 10) || 0
+                if(Math.max(foregroundPromotedAt, foregroundLeaseAcquiredAt) < waitStartedAt) return null
+
+                const foregroundPromotionReason = `${record.foregroundPromotionReason || ''}`.trim()
+                if(foregroundPromotionReason && reason && foregroundPromotionReason !== reason) return null
+
+                return {
+                    begun: true,
+                    granted: true,
+                    recoveredFromBeginTimeout: true,
+                    foregroundLeaseAcquiredAt: foregroundLeaseAcquiredAt || foregroundPromotedAt || Date.now(),
+                    foregroundPromotedAt: foregroundPromotedAt || foregroundLeaseAcquiredAt || Date.now()
+                }
+            }
+
+            const waitForProfileActionReadiness = async response => {
+                queuedActionLeaseHeld = response?.localActionGateFallback !== true
+                lastCoordinatorProgressAt = Date.now()
+
+                await recordActionGateProgress({
+                    waitingForForegroundAt: 0,
+                    foregroundWaitReason: '',
+                    foregroundLeaseAcquiredAt: response?.foregroundLeaseAcquiredAt || response?.actionLease?.grantedAt || Date.now(),
+                    foregroundPromotedAt: response?.foregroundPromotedAt || 0,
+                    foregroundPromotionReason: `${reason || ''}`.trim(),
+                    event: response?.workerWindowActionGate
+                        ? 'Queued tab proceeded locally using worker-window action surface'
+                        : response?.localNoForegroundGate
+                        ? 'Queued tab proceeded locally without foreground action gate'
+                        : response?.localActionGateFallback
+                        ? 'Queued tab proceeded locally after durable profile action gate timeout'
+                        : response?.recoveredFromBeginTimeout
+                        ? 'Queued tab recovered durable profile action gate after begin timeout'
+                        : 'Queued tab received durable profile action gate'
+                })
+
+                if(typeof readyPredicate !== 'function') return true
+
+                const readyWaitStartedAt = Date.now()
+                let lastReadyEventAt = 0
+
+                while(Date.now() - readyWaitStartedAt < ACTION_LEASE_WAIT_MS) {
+                    if(readyPredicate() || !!getProfileUnavailableReason()) return true
+
+                    const now = Date.now()
+                    if(now - lastReadyEventAt >= QUEUED_ACTION_HEARTBEAT_MS) {
+                        lastReadyEventAt = now
+                        await recordActionGateProgress({
+                            waitingForForegroundAt: readyWaitStartedAt,
+                            foregroundWaitReason: 'profile-action-ready-wait',
+                            event: 'Queued tab waiting for profile actions after durable gate'
+                        })
+
+                        const heartbeat = await heartbeatQueuedActionLease({probe: true})
+                        if(heartbeat?.heartbeat) {
+                            lastCoordinatorProgressAt = Date.now()
+                        }
+                        else if(heartbeat?.actionLeaseLost) {
+                            queuedActionLeaseDeniedReason = 'action-lease-lost'
+                            return false
+                        }
+                    }
+
+                    await sleep(250)
+                }
+
+                queuedActionLeaseDeniedReason = 'foreground-ready-timeout'
+                await releaseQueuedActionLease('foreground-ready-timeout')
+                    return false
+            }
+
+            const localNoForegroundReady = await beginLocalNoForegroundActionGate()
+            if(localNoForegroundReady) return true
+
+            if(canProceedWithoutForegroundGate()) {
+                return waitForProfileActionReadiness({
+                    begun: true,
+                    granted: true,
+                    localActionGateFallback: true,
+                    workerWindowActionGate: claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible',
+                    foregroundLeaseAcquiredAt: Date.now()
+                })
+            }
+
+            while(Date.now() - lastCoordinatorProgressAt < ACTION_LEASE_WAIT_MS) {
+                let response = await safeSendRuntimeMessageWithTimeout({
+                    action: 'begin-profile-action',
+                    profileHref: queuedProfileHref || location.href,
+                    actionKind: claimedActionKind,
+                    reason,
+                    attemptId: activeQueuedAttemptId || '',
+                    attemptNumber: activeQueuedAttemptNumber || 0
+                }, {
+                    begun: false,
+                    actionLeaseBusy: true,
+                    reason: 'begin-profile-action-timeout'
+                }, FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS)
+
+                if(!response?.begun && response?.reason === 'begin-profile-action-timeout') {
+                    const heartbeat = await heartbeatQueuedActionLease({
+                        probe: true,
+                        timeoutMs: FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS
+                    })
+                    if(heartbeat?.heartbeat) {
+                        response = {
+                            ...response,
+                            ...heartbeat,
+                            begun: true,
+                            granted: true,
+                            recoveredFromBeginTimeout: true
+                        }
+                    }
+                    else {
+                        const recovered = getRecoveredBeginResponseFromProgress()
+                        if(recovered) {
+                            response = {
+                                ...response,
+                                ...recovered
+                            }
+                        }
+                        else if(canProceedWithoutForegroundGate()) {
+                            response = {
+                                ...response,
+                                begun: true,
+                                granted: true,
+                                localActionGateFallback: true,
+                                workerWindowActionGate: claimedActionSurfaceMode === 'worker-window' && document.visibilityState === 'visible',
+                                foregroundLeaseAcquiredAt: Date.now()
+                            }
+                        }
+                    }
+                }
+
+                if(response?.begun) {
+                    return await waitForProfileActionReadiness(response)
+                }
+                if(response?.staleAttempt) {
+                    queuedActionLeaseDeniedReason = response?.reason || 'stale-attempt'
+                    return false
+                }
+                if(response?.actionLeaseBusy || response?.foregroundBusy) {
+                    const now = Date.now()
+                    const coordinatorStillBusy = response?.reason !== 'begin-profile-action-timeout' &&
+                        (!!response?.leaseTabId || !!response?.leaseExpiresAt || response?.reason === 'action-lease-busy' || response?.foregroundBusy)
+
+                    if(coordinatorStillBusy) lastCoordinatorProgressAt = now
+                    waitingForActionLeaseAt = waitingForActionLeaseAt || now
+
+                    if(now - lastWaitEventAt >= QUEUED_ACTION_HEARTBEAT_MS) {
+                        lastWaitEventAt = now
+                        const progress = await recordQueuedProfileProgress({
+                            waitingForForegroundAt: waitingForActionLeaseAt,
+                            foregroundWaitLastEventAt: now,
+                            foregroundWaitReason: `${response?.reason || 'action-lease-busy'}`.trim(),
+                            event: 'Queued tab waiting for durable profile action gate'
+                        })
+                        if(progress?.runtimeRecorded) lastCoordinatorProgressAt = now
+                    }
+                    await sleep(ACTION_LEASE_POLL_MS)
+                    continue
+                }
+
+                queuedActionLeaseDeniedReason = response?.reason || 'request-denied'
+                await recordQueuedProfileProgress({
+                    event: `Queued tab durable profile action gate denied (${queuedActionLeaseDeniedReason})`
+                })
+                return false
+            }
+
+            queuedActionLeaseDeniedReason = 'timed-out-waiting'
+            return false
+        }
+        async function heartbeatQueuedActionLease(options = {}) {
+            if(!queuedActionLeaseHeld && !options.probe) return {heartbeat: false, skipped: true}
+            const timeoutMs = Number.parseInt(options.timeoutMs, 10) || QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS
+
+            const response = await safeSendRuntimeMessageWithTimeout({
+                action: 'heartbeat-action-lease',
+                profileHref: queuedProfileHref || location.href,
+                actionKind: claimedActionKind,
+                attemptId: activeQueuedAttemptId || '',
+                attemptNumber: activeQueuedAttemptNumber || 0
+            }, {heartbeat: false}, timeoutMs)
+
+            if(response?.heartbeat) queuedActionLeaseHeld = true
+            if(response?.actionLeaseLost) queuedActionLeaseHeld = false
+
+            return response
+        }
+
+        async function releaseQueuedActionLease(reason) {
+            if(!queuedActionLeaseHeld) return false
+            queuedActionLeaseHeld = false
+
+            const response = await safeSendRuntimeMessageWithTimeout({
+                action: 'release-action-lease',
+                profileHref: queuedProfileHref || location.href,
+                actionKind: claimedActionKind,
+                reason,
+                attemptId: activeQueuedAttemptId || '',
+                attemptNumber: activeQueuedAttemptNumber || 0
+            }, {released: false}, QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS)
+
+            return !!response?.released
+        }
+        const startQueuedActionHeartbeat = patchFactory => {
+            let stopped = false
+            let heartbeatTimeout = null
+            let inFlight = false
+
+            const tick = async () => {
+                heartbeatTimeout = null
+                if(stopped || inFlight) return
+
+                inFlight = true
+                try {
+                    const patch = typeof patchFactory === 'function' ? patchFactory() : patchFactory
+                    if(patch) await recordQueuedProfileProgress(patch)
+                    await heartbeatQueuedActionLease()
+                }
+                catch {}
+                finally {
+                    inFlight = false
+                    if(!stopped) heartbeatTimeout = setTimeout(tick, QUEUED_ACTION_HEARTBEAT_MS)
+                }
+            }
+
+            heartbeatTimeout = setTimeout(tick, QUEUED_ACTION_HEARTBEAT_MS)
+
+            return () => {
+                stopped = true
+                if(heartbeatTimeout) clearTimeout(heartbeatTimeout)
+            }
+        }
+        const runQueuedUnblockUnmuteAction = async () => {
+            if(getProfileUnavailableReason()) {
+                await skipQueuedUnavailableTab('Profile unavailable')
+                return
+            }
+
+            if(getPageType() !== 'profile') {
+                await waitForCondition(() => getPageType() === 'profile' || !!getProfileUnavailableReason() || isSecurityVerificationPage(), 5000, 250)
+            }
+
+            if(getProfileUnavailableReason()) {
+                await skipQueuedUnavailableTab('Profile unavailable')
+                return
+            }
+
+            if(getPageType() !== 'profile') {
+                if(await resolveQueuedProfileFromCurrentPage()) return
+
+                const pageType = getPageType() || 'unknown'
+                const message = isSecurityVerificationPage()
+                    ? 'Queued tab landed on a security verification page'
+                    : `Queued tab did not land on a profile page (${pageType}: ${location.pathname})`
+                if(isQueuedResolutionAction() && !isSecurityVerificationPage()) {
+                    await abandonQueuedResolution(message)
+                    return
+                }
+                await abandonQueuedTab(message)
+                return
+            }
+
+            const initialReadyTimeoutMs = document.visibilityState === 'visible'
+                ? VISIBLE_PROFILE_READY_MS
+                : allowForegroundFallback
+                    ? HIDDEN_PROFILE_READY_FAST_PROBE_MS
+                    : HIDDEN_PROFILE_READY_NO_FOREGROUND_MS
+            let ready = await waitForCondition(() => !!getProfileMenuButton() || !!getProfileUnavailableReason(), initialReadyTimeoutMs, 250)
+            if(!ready && document.visibilityState !== 'visible' && allowForegroundFallback) {
+                await recordQueuedProfileProgress({
+                    event: 'Unblock Unmute actions stalled in a background tab; waiting for durable profile action gate'
+                })
+            }
+
+            if(!ready && (document.visibilityState === 'visible' || !allowForegroundFallback)) {
+                logProfileActionDebug('Profile actions not ready')
+                await abandonQueuedTab('Profile actions not ready')
+                return
+            }
+
+            const profileActionReady = await beginQueuedProfileAction(
+                'unblock-unmute-profile-menu-action',
+                () => !!getProfileMenuButton()
+            )
+            if(!profileActionReady) {
+                const reason = queuedActionLeaseDeniedReason ? `: ${queuedActionLeaseDeniedReason}` : ''
+                await abandonQueuedTab(`Queued Unblock Unmute did not receive profile action gate${reason}`)
+                return
+            }
+
+            if(getProfileUnavailableReason()) {
+                await releaseQueuedActionLease('profile-unavailable-after-action-begin')
+                await skipQueuedUnavailableTab('Profile unavailable')
+                return
+            }
+
+            try {
+                await recordQueuedProfileProgress({
+                    status: 'page-ready',
+                    openedViablePage: true,
+                    actionReadyAt: Date.now(),
+                    event: 'Unblock Unmute profile actions became available'
+                })
+
+                const wasBlocked = isProfileBlocked()
+                await recordQueuedProfileProgress({
+                    status: wasBlocked ? 'unblocking' : 'unmuting',
+                    openedViablePage: true,
+                    event: wasBlocked ? 'Queued Unblock Unmute action started' : 'Queued Unmute action started'
+                })
+                const stopHeartbeat = startQueuedActionHeartbeat(() => ({
+                    status: wasBlocked ? 'unblocking' : 'unmuting',
+                    openedViablePage: true,
+                    event: wasBlocked ? 'Queued Unblock Unmute action still running' : 'Queued Unmute action still running'
+                }))
+                let result = null
+                try {
+                    result = await unblockUnmuteProfile({silent: true, allowForegroundFallback, clearNukeState: false})
+                }
+                finally {
+                    stopHeartbeat()
+                }
+                const verified = result?.ok && await waitForVerifiedProfileUnblocked(3500, 250, true, allowForegroundFallback)
+                if(!verified) {
+                    await recordQueuedProfileProgress({
+                        status: 'error',
+                        openedViablePage: true,
+                        finalError: result?.reason || 'Queued Unblock Unmute did not complete',
+                        event: result?.reason || 'Queued Unblock Unmute did not complete'
+                    })
+                    await failCurrentQueuedProfile(getResolvedSpaceFeedProfileHrefs(queuedProfileHref || location.href))
+                    await releaseQueuedTabSlot()
+                    await requestCloseTab(2, 100, true)
+                    return
+                }
+
+                const progress = await recordQueuedProfileProgress({
+                    status: wasBlocked ? 'unblocked' : 'already-unblocked',
+                    openedViablePage: true,
+                    unblockSucceeded: true,
+                    unblockedAt: Date.now(),
+                    finalError: '',
+                    event: wasBlocked ? 'Queued Unblock Unmute completed' : 'Queued profile was already unblocked'
+                })
+                if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+                    console.info('Queued terminal unblock/unmute success was not recorded; leaving tab open for retry')
+                    return
+                }
+                await releaseQueuedTabSlot()
+                await requestCloseTab()
+            }
+            finally {
+                await releaseQueuedActionLease('unblock-unmute-action-finished')
+            }
+        }
+
+        if(claimedAction?.action === UNBLOCK_UNMUTE_ACTION_KIND) {
+            await runQueuedUnblockUnmuteAction()
+            return
+        }
+
+        if(getProfileUnavailableReason()) {
+            await skipQueuedUnavailableTab('Profile unavailable')
+            return
         }
 
         if(getPageType() !== 'profile') {
             await waitForCondition(() => getPageType() === 'profile' || !!getProfileUnavailableReason() || isSecurityVerificationPage(), 5000, 250)
         }
 
+        if(getProfileUnavailableReason()) {
+            await skipQueuedUnavailableTab('Profile unavailable')
+            return
+        }
+
         if(getPageType() !== 'profile') {
+            if(await resolveQueuedProfileFromCurrentPage()) return
+
             const pageType = getPageType() || 'unknown'
             const message = isSecurityVerificationPage()
                 ? 'Queued tab landed on a security verification page'
                 : `Queued tab did not land on a profile page (${pageType}: ${location.pathname})`
+            if(isQueuedResolutionAction() && !isSecurityVerificationPage()) {
+                await abandonQueuedResolution(message)
+                return
+            }
             await abandonQueuedTab(message)
             return
         }
@@ -7783,7 +12192,6 @@ async function maybeRunAutoProfileAction() {
                 blockedAt: Date.now(),
                 event: 'Profile was already blocked before actions'
             })
-            await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
             return
         }
 
@@ -7792,23 +12200,19 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
-        const initialReadyTimeoutMs = document.visibilityState === 'visible' || !allowForegroundFallback ? 25000 : 3500
+        const initialReadyTimeoutMs = document.visibilityState === 'visible'
+            ? VISIBLE_PROFILE_READY_MS
+            : allowForegroundFallback
+                ? HIDDEN_PROFILE_READY_FAST_PROBE_MS
+                : HIDDEN_PROFILE_READY_NO_FOREGROUND_MS
         let ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton() || !!getProfileUnavailableReason(), initialReadyTimeoutMs, 250)
         if(!ready && document.visibilityState !== 'visible' && allowForegroundFallback) {
             await recordQueuedProfileProgress({
-                event: 'Profile actions stalled in a background tab; requesting foreground fallback'
+                event: 'Profile actions stalled in a background tab; waiting for durable profile action gate'
             })
-
-            const promoted = await promoteCurrentQueuedTab('profile-actions-not-ready', allowForegroundFallback)
-            if(promoted) {
-                await recordQueuedProfileProgress({
-                    event: 'Queued tab promoted to the foreground after hidden-tab stall'
-                })
-                ready = await waitForCondition(() => isProfileBlocked() || !!getProfileMenuButton() || !!getProfileUnavailableReason(), 15000, 250)
-            }
         }
 
-        if(!ready) {
+        if(!ready && (document.visibilityState === 'visible' || !allowForegroundFallback)) {
             logProfileActionDebug('Profile actions not ready')
             await abandonQueuedTab('Profile actions not ready')
             return
@@ -7828,54 +12232,114 @@ async function maybeRunAutoProfileAction() {
                 blockedAt: Date.now(),
                 event: 'Profile reached blocked state before mute/block actions'
             })
-            await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
             return
         }
 
-        await recordQueuedProfileProgress({
-            status: 'page-ready',
-            openedViablePage: true,
-            actionReadyAt: Date.now(),
-            event: 'Profile actions became available'
-        })
+        if(getProfileUnavailableReason()) {
+            await skipQueuedUnavailableTab('Profile unavailable')
+            return
+        }
 
-        if(!isProfileBlocked()) {
-            const completed = await muteProfile({allowBlockFallback: true, silent: true, allowForegroundFallback})
-            if(!completed && !isProfileBlocked()) {
+        if(isProfileBlocked()) {
+            await closeQueuedBlockedTab({
+                status: 'already-blocked',
+                openedViablePage: true,
+                foundBlockedBeforeQueue: true,
+                blockSucceeded: true,
+                blockedAt: Date.now(),
+                event: 'Profile reached blocked state before mute/block actions'
+            })
+            return
+        }
+
+        const profileActionReady = await beginQueuedProfileAction(
+            'mute-block-profile-menu-action',
+            () => isProfileBlocked() || !!getProfileMenuButton()
+        )
+        if(!profileActionReady) {
+            const reason = queuedActionLeaseDeniedReason ? `: ${queuedActionLeaseDeniedReason}` : ''
+            await abandonQueuedTab(`Queued profile action did not receive profile action gate${reason}`)
+            return
+        }
+
+        if(getProfileUnavailableReason()) {
+            await releaseQueuedActionLease('profile-unavailable-after-action-begin')
+            await skipQueuedUnavailableTab('Profile unavailable')
+            return
+        }
+
+        try {
+            await recordQueuedProfileProgress({
+                status: 'page-ready',
+                openedViablePage: true,
+                actionReadyAt: Date.now(),
+                event: 'Profile actions became available'
+            })
+
+            if(!isProfileBlocked()) {
+                await recordQueuedProfileProgress({
+                    status: 'blocking',
+                    openedViablePage: true,
+                    event: 'Queued Mute Block skipped mute and started block directly'
+                })
+                const stopHeartbeat = startQueuedActionHeartbeat(() => ({
+                    status: 'blocking',
+                    openedViablePage: true,
+                    event: 'Queued direct block action still running'
+                }))
+                let blockedDirectly = false
+                try {
+                    blockedDirectly = await blockProfile({silent: true, allowForegroundFallback})
+                }
+                finally {
+                    stopHeartbeat()
+                }
+                if(blockedDirectly || isProfileBlocked()) {
+                    await closeQueuedBlockedTab()
+                    return
+                }
                 if(getProfileUnavailableReason()) {
                     await skipQueuedUnavailableTab('Profile unavailable')
                     return
                 }
 
-                await abandonQueuedTab('Queued profile action did not complete')
+                await abandonQueuedTab('Queued direct block action did not complete', {
+                    directBlockFailureDetail: getDirectBlockActionDiagnostic('queued-direct-block-action-did-not-complete', {
+                        finalBlockedState: isProfileBlocked(),
+                        previousBlockError: getProfileNukeProgressRecord(queuedProfileHref || location.href)?.blockError || ''
+                    })
+                })
                 return
             }
-        }
 
-        if(isProfileBlocked()) {
-            await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
-            await closeQueuedBlockedTab()
-            return
-        }
+            if(isProfileBlocked()) {
+                await closeQueuedBlockedTab()
+                return
+            }
 
-        const blocked = await waitForCondition(() => isProfileBlocked(), 2500, 250)
-        if(blocked || isProfileBlocked()) {
-            await confirmCurrentProfileBlockedSpaceFeedEntries(queuedProfileHref)
-            await closeQueuedBlockedTab()
+            const blocked = await waitForCondition(() => isProfileBlocked(), 2500, 250)
+            if(blocked || isProfileBlocked()) {
+                await closeQueuedBlockedTab()
+            }
+            else {
+                await abandonQueuedTab('Queued profile never reached blocked state')
+            }
         }
-        else {
-            await abandonQueuedTab('Queued profile never reached blocked state')
+        finally {
+            await releaseQueuedActionLease('mute-block-action-finished')
         }
     }
     catch(error) {
         console.error(error)
         const message = `${error?.message || ''}`.trim() || 'Queued profile action failed unexpectedly'
+        const stack = `${error?.stack || ''}`.trim().slice(0, 4000)
 
         try {
             await recordQueuedProfileProgress({
                 status: 'error',
                 openedViablePage: false,
                 finalError: message,
+                finalErrorStack: stack,
                 errorPageUrl: location.href,
                 event: message
             })
@@ -7887,26 +12351,988 @@ async function maybeRunAutoProfileAction() {
     }
     finally {
         autoProfileActionPending = false
+        activeQueuedAttemptId = ''
+        activeQueuedAttemptNumber = 0
+        activeQueuedAttemptProfileHref = ''
+        activeQueuedNoForegroundFallback = false
+        activeQueuedActionSurfaceMode = ''
     }
 }
 
 function reportActionIssue(message, silent = false) {
     if(silent) return
-    console.warn(message)
+    console.info(message)
     if(getPageType() === 'profile') {
         logProfileActionDebug(message)
     }
-    alert(message)
+}
+
+function getUnblockConfirmAction() {
+    const preferred = /\bun[\s-]*block\b|\bconfirm\b|\bcontinue\b/i
+    const modalSubmit = Array.from(document.querySelectorAll('.puppeteer_test_modal_submit, button, [role="button"], a'))
+        .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
+        .find(button => {
+            if(!String(button.className || '').includes('puppeteer_test_modal_submit')) return false
+            if(!isUnblockConfirmButtonLabel(getActionCandidateLabel(button))) return false
+            if(hasUnblockActionText(getActionCandidateLabel(button))) return true
+
+            const context = getBestActionContext(button)
+            return isUnblockConfirmContextText(context?.text || '')
+        })
+    if(modalSubmit) return modalSubmit
+
+    const container = getUnblockConfirmContainer()
+    if(container) {
+        const containerButtons = getVisibleActionButtons(container)
+            .filter(button => isUnblockConfirmButtonLabel(getActionCandidateLabel(button)))
+            .map(button => ({button, score: scoreActionCandidate(button, preferred, getElementText(container)) + 500}))
+
+        containerButtons.sort((left, right) => right.score - left.score)
+        if(containerButtons.length) return containerButtons[0].button
+    }
+
+    const dialogPrimary = getContextualDialogPrimaryAction(
+        getDialogRoots(),
+        preferred,
+        isUnblockConfirmContextText,
+        button => isUnblockConfirmButtonLabel(getActionCandidateLabel(button))
+    )
+    if(dialogPrimary) return dialogPrimary
+
+    return null
+}
+
+function getUnmuteConfirmAction() {
+    const candidates = getUnmuteConfirmCandidates()
+    if(candidates.length) return candidates[0].button
+
+    const inPageConfirm = getInPageConfirmPairAction(/\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i)
+    if(inPageConfirm) return inPageConfirm
+
+    const container = getUnmuteConfirmContainer()
+    if(container) {
+        const containerButtons = getVisibleActionButtons(container)
+            .filter(button => isUnmuteConfirmButtonLabel(getActionCandidateLabel(button)))
+            .map(button => ({button, score: scoreActionCandidate(button, /\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i, getElementText(container)) + 500}))
+
+        containerButtons.sort((left, right) => right.score - left.score)
+        if(containerButtons.length) return containerButtons[0].button
+    }
+
+    return getContextualDialogPrimaryAction(
+        getDialogRoots(),
+        /\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i,
+        isUnmuteConfirmContextText,
+        button => isUnmuteConfirmButtonLabel(getActionCandidateLabel(button))
+    )
+}
+
+function isUnblockConfirmContextText(text) {
+    const value = text || ''
+    return hasUnblockActionText(value) &&
+        !hasUnmuteActionText(value) &&
+        !/\bmute\b|\bmuted\b|\bmuting\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(value)
+}
+
+function getUnblockConfirmContainer() {
+    const candidates = Array.from(document.querySelectorAll('div, section, aside'))
+        .filter(isVisible)
+        .filter(element => {
+            const text = getElementText(element)
+            if(!isUnblockConfirmContextText(text)) return false
+
+            const buttons = getVisibleActionButtons(element)
+            return buttons.some(button => isUnblockConfirmButtonLabel(getActionCandidateLabel(button))) &&
+                buttons.some(button => /\bcancel\b|\bdismiss\b|\bclose\b|\bno\b/i.test(getActionCandidateLabel(button)))
+        })
+        .map(element => {
+            const rect = element.getBoundingClientRect()
+            const area = rect.width * rect.height
+            const text = getElementText(element)
+            return {element, area, text}
+        })
+
+    candidates.sort((left, right) => left.area - right.area)
+    return candidates[0]?.element || null
+}
+
+function getUnmuteConfirmContainer() {
+    const candidates = Array.from(document.querySelectorAll('div, section, aside'))
+        .filter(isVisible)
+        .filter(element => {
+            const text = getElementText(element)
+            if(!isUnmuteConfirmContextText(text)) return false
+
+            const buttons = getVisibleActionButtons(element)
+            return buttons.some(button => isUnmuteConfirmButtonLabel(getActionCandidateLabel(button))) &&
+                buttons.some(button => /\bcancel\b|\bdismiss\b|\bclose\b|\bno\b/i.test(getElementText(button)))
+        })
+        .map(element => {
+            const rect = element.getBoundingClientRect()
+            const area = rect.width * rect.height
+            const text = getElementText(element)
+            return {element, area, text}
+        })
+
+    candidates.sort((left, right) => left.area - right.area)
+    return candidates[0]?.element || null
+}
+
+function isUnmuteConfirmContextText(text) {
+    const value = text || ''
+    return hasUnmuteActionText(value) &&
+        !hasUnblockActionText(value) &&
+        !/\bblock\b|\bblocked\b|\bblocking\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(value)
+}
+
+function isUnblockConfirmPending() {
+    return !!getUnblockConfirmAction()
+}
+
+function getUnmuteConfirmCandidates() {
+    const dialogRoots = getDialogRoots()
+    const confirmContainer = getUnmuteConfirmContainer()
+    const isInUnmuteConfirmSurface = button => {
+        if(confirmContainer?.contains(button)) return true
+        return dialogRoots.some(root => root.contains(button))
+    }
+
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
+        .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
+        .filter(isInUnmuteConfirmSurface)
+        .filter(button => isUnmuteConfirmButtonLabel(getActionCandidateLabel(button)))
+        .map(button => {
+            const context = getBestActionContext(button)
+            const contextText = context?.text || ''
+            let score = scoreActionCandidate(button, /\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i, contextText)
+
+            if(isUnmuteConfirmContextText(contextText)) score += 1200
+            if(hasUnblockActionText(contextText) ||
+                /\bblock\b|\bblocked\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 1500
+            if(/\bcancel\b/i.test(contextText) && !isUnmuteConfirmContextText(contextText)) score -= 500
+
+            return {button, score, contextText}
+        })
+        .filter(candidate => isUnmuteConfirmContextText(candidate.contextText))
+
+    candidates.sort((left, right) => right.score - left.score)
+    return candidates
+}
+
+function isUnmuteConfirmPending() {
+    return !!getUnmuteConfirmAction()
+}
+
+function getInPageConfirmPairAction(preferredRegex) {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
+        .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
+        .filter(button => preferredRegex.test(getActionCandidateLabel(button)))
+        .map(button => {
+            const label = getActionCandidateLabel(button)
+            const context = getBestActionContext(button)
+            const contextElement = context?.element || button.parentElement
+            const contextText = context?.text || getElementText(contextElement || button)
+            const contextButtons = contextElement
+                ? getVisibleActionButtons(contextElement)
+                : []
+            const hasCancelPeer = contextButtons.some(peer => peer !== button && /\bcancel\b|\bdismiss\b|\bclose\b|\bno\b/i.test(getActionCandidateLabel(peer)))
+            let score = scoreActionCandidate(button, preferredRegex, contextText)
+
+            if(hasCancelPeer) score += 900
+            if(isUnmuteConfirmContextText(contextText)) score += 600
+            if(hasUnblockActionText(contextText) ||
+                /\bblock\b|\bblocked\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 900
+            if(!hasCancelPeer && !isUnmuteConfirmContextText(contextText)) score -= 1200
+
+            return {button, score, label, contextText}
+        })
+        .filter(candidate => candidate.score > 0 &&
+            (hasUnmuteActionText(candidate.label) || isUnmuteConfirmContextText(candidate.contextText)))
+
+    candidates.sort((left, right) => right.score - left.score)
+    return candidates[0]?.button || null
+}
+
+async function dismissProfileActionSurface() {
+    const cancel = getDialogPrimaryAction(getDialogRoots(), /\bcancel\b|\bdismiss\b|\bclose\b|\bno\b/i) ||
+        getGlobalPrimaryAction(/\bcancel\b|\bdismiss\b|\bclose\b|\bno\b/i)
+
+    if(cancel) {
+        cancel.click()
+        await sleep(250)
+        return true
+    }
+
+    if(isProfileMenuOpen()) return closeProfileMenu()
+    return false
+}
+
+function isProfileLoadedAndUnblocked() {
+    return getPageType() === 'profile' &&
+        document.readyState !== 'loading' &&
+        !isProfileBlocked() &&
+        !!getProfileMenuButton()
+}
+
+function activateActionElement(element) {
+    if(!element) return false
+
+    const rect = element.getBoundingClientRect()
+    const clientX = rect.left + Math.max(1, Math.min(rect.width / 2, rect.width - 1))
+    const clientY = rect.top + Math.max(1, Math.min(rect.height / 2, rect.height - 1))
+    const base = {bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, button: 0}
+
+    try {
+        element.dispatchEvent(new PointerEvent('pointerdown', {...base, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 1}))
+        element.dispatchEvent(new MouseEvent('mousedown', {...base, buttons: 1}))
+        element.dispatchEvent(new PointerEvent('pointerup', {...base, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0}))
+        element.dispatchEvent(new MouseEvent('mouseup', {...base, buttons: 0}))
+        element.dispatchEvent(new MouseEvent('click', {...base, buttons: 0}))
+        return true
+    }
+    catch {
+        element.click()
+        return true
+    }
+}
+
+function getConfirmationActionDebugSnapshot(element, confirmationKind = '') {
+    if(!element) return {}
+
+    const context = getBestActionContext(element)
+    return {
+        confirmationKind: confirmationKind || '',
+        confirmationActionLabel: getActionDebugLabel(element),
+        confirmationActionRect: getActionDebugRect(element),
+        confirmationContextSnippet: compactElementText(context?.text || '', 320)
+    }
+}
+
+function getConfirmationKindMismatchReason(element, confirmationKind = '') {
+    const kind = `${confirmationKind || ''}`.trim().toLowerCase()
+    if(!element || !kind) return ''
+
+    const label = getActionDebugLabel(element)
+    const context = getBestActionContext(element)
+    const contextText = context?.text || ''
+    if(kind === 'block') {
+        if(hasUnblockActionText(label) || hasUnblockActionText(contextText)) return 'inverse-unblock-confirmation'
+        if(!isBlockConfirmButtonLabel(label) || !isBlockConfirmContextText(contextText)) return 'not-block-confirmation'
+    }
+    else if(kind === 'mute') {
+        if(hasUnmuteActionText(label) || hasUnmuteActionText(contextText)) return 'inverse-unmute-confirmation'
+        if(!isMuteConfirmButtonLabel(label) || !isMuteConfirmContextText(contextText)) return 'not-mute-confirmation'
+    }
+    else if(kind === 'unblock') {
+        if(!isUnblockConfirmButtonLabel(label) || !isUnblockConfirmContextText(contextText)) return 'not-unblock-confirmation'
+    }
+    else if(kind === 'unmute') {
+        if(!isUnmuteConfirmButtonLabel(label) || !isUnmuteConfirmContextText(contextText)) return 'not-unmute-confirmation'
+    }
+
+    return ''
+}
+
+async function activateConfirmationElement(element, isStillPending, confirmationKind = '') {
+    if(!element) return {activated: false, ok: false, skipped: true, reason: 'missing-confirmation-element'}
+
+    const mismatchReason = getConfirmationKindMismatchReason(element, confirmationKind)
+    if(mismatchReason) {
+        noteCurrentProfileNukeProgress({
+            event: `${formatConfirmationKind(confirmationKind)} confirmation activation skipped: ${mismatchReason}`,
+            confirmationActivationSkipped: true,
+            confirmationMismatchReason: mismatchReason,
+            ...getConfirmationActionDebugSnapshot(element, confirmationKind)
+        })
+        return {
+            activated: false,
+            ok: false,
+            skipped: true,
+            reason: mismatchReason
+        }
+    }
+
+    const foreground = await ensureForegroundForConfirmation(confirmationKind)
+    if(!foreground.ok) {
+        noteCurrentProfileNukeProgress({
+            event: `${formatConfirmationKind(confirmationKind)} confirmation activation skipped: ${foreground.reason}`,
+            confirmationForegroundRequired: true,
+            confirmationForegroundReason: foreground.reason || ''
+        })
+        return {
+            activated: false,
+            ok: false,
+            skipped: true,
+            foregroundRequired: true,
+            foregroundAvailable: false,
+            reason: foreground.reason || 'confirmation-foreground-unavailable'
+        }
+    }
+
+    const pendingBefore = typeof isStillPending === 'function' ? !!isStillPending() : false
+    noteCurrentProfileNukeProgress({
+        event: `${formatConfirmationKind(confirmationKind)} confirmation activation attempted`,
+        confirmationActivationAttemptedAt: Date.now(),
+        confirmationForegroundRequired: foreground.required === true,
+        confirmationForegroundPromoted: foreground.promoted === true,
+        confirmationPendingBeforeActivation: pendingBefore,
+        ...getConfirmationActionDebugSnapshot(element, confirmationKind)
+    })
+
+    let activated = activateActionElement(element)
+    await sleep(100)
+    if(typeof isStillPending === 'function' && isStillPending()) {
+        dispatchActivationKey(element, 'Enter')
+        await sleep(100)
+        if(isStillPending()) {
+            dispatchActivationKey(element, ' ')
+            await sleep(100)
+            if(isStillPending()) {
+                try {
+                    element.click()
+                }
+                catch {}
+                await sleep(100)
+                if(isStillPending()) {
+                    const pageWorldResult = await activateConfirmationElementInPageWorld(element, confirmationKind)
+                    activated = activated || !!pageWorldResult?.clicked
+                    noteCurrentProfileNukeProgress({
+                        event: pageWorldResult?.clicked
+                            ? `${confirmationKind || 'Confirmation'} page-world activation clicked`
+                            : `${confirmationKind || 'Confirmation'} page-world activation did not click: ${pageWorldResult?.reason || 'unknown'}`
+                    })
+                    await sleep(150)
+                }
+            }
+        }
+    }
+    let pendingAfter = false
+    if(typeof isStillPending === 'function') {
+        pendingAfter = !!isStillPending()
+        noteCurrentProfileNukeProgress({
+            event: pendingAfter
+                ? `${formatConfirmationKind(confirmationKind)} confirmation still pending after activation`
+                : `${formatConfirmationKind(confirmationKind)} confirmation no longer pending after activation`,
+            confirmationActivationDispatched: activated,
+            confirmationStillPendingAfterActivation: pendingAfter
+        })
+    }
+    return {
+        activated,
+        ok: activated && !pendingAfter,
+        skipped: false,
+        foregroundRequired: foreground.required === true,
+        foregroundAvailable: true,
+        pendingAfter,
+        reason: pendingAfter ? 'confirmation-still-pending' : 'activation-dispatched'
+    }
+}
+
+function formatConfirmationKind(confirmationKind = '') {
+    const normalized = `${confirmationKind || 'Confirmation'}`.trim()
+    return normalized ? normalized[0].toUpperCase() + normalized.slice(1) : 'Confirmation'
+}
+
+function isConfirmationForegroundUnavailable(result = null) {
+    return result?.skipped === true &&
+        result?.foregroundRequired === true &&
+        result?.foregroundAvailable === false
+}
+
+async function ensureForegroundForConfirmation(confirmationKind = '') {
+    if(activeQueuedNoForegroundFallback && activeQueuedActionSurfaceMode !== 'worker-window') {
+        return {ok: false, required: true, reason: 'foreground-fallback-disabled'}
+    }
+    if(document.visibilityState === 'visible') {
+        return {ok: true, required: false, reason: 'visible'}
+    }
+    if(!activeQueuedAttemptId || !activeQueuedAttemptNumber) {
+        return {ok: false, required: true, reason: 'hidden-nonqueued-confirmation'}
+    }
+
+    const kind = `${confirmationKind || ''}`.trim().toLowerCase()
+    const actionKind = kind === 'unmute' || kind === 'unblock'
+        ? UNBLOCK_UNMUTE_ACTION_KIND
+        : 'mute-block'
+    const reason = `${kind || 'profile'}-confirmation`
+
+    noteCurrentProfileNukeProgress({
+        event: `${formatConfirmationKind(confirmationKind)} confirmation waiting for foreground`,
+        confirmationForegroundRequired: true,
+        waitingForForegroundAt: Date.now(),
+        foregroundWaitReason: reason
+    })
+
+    const response = await safeSendRuntimeMessageWithTimeout({
+        action: 'begin-profile-action',
+        profileHref: activeQueuedAttemptProfileHref || normalizeQuoraProfileHref(location.href) || location.href,
+        actionKind,
+        reason,
+        attemptId: activeQueuedAttemptId || '',
+        attemptNumber: activeQueuedAttemptNumber || 0
+    }, {
+        begun: false,
+        reason: 'confirmation-foreground-timeout'
+    }, FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS)
+
+    if(activeQueuedNoForegroundFallback && activeQueuedActionSurfaceMode === 'worker-window') {
+        const responseReason = response?.reason || ''
+        const timedOut = !response?.begun && /timeout/i.test(responseReason)
+        if(!response?.begun && !timedOut) {
+            return {ok: false, required: true, reason: responseReason || 'confirmation-foreground-denied'}
+        }
+        let promoted = response?.foregroundPromoted === true
+        if(timedOut) {
+            const retry = await promoteCurrentQueuedTab(reason, true)
+            promoted = promoted || retry?.promoted === true
+        }
+        noteCurrentProfileNukeProgress({
+            event: timedOut
+                ? `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface after foreground timeout`
+                : `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface`,
+            confirmationForegroundRequired: true,
+            confirmationForegroundPromoted: promoted,
+            confirmationWorkerWindowActionSurface: true,
+            confirmationWorkerWindowTimeoutRecovered: timedOut,
+            foregroundWaitReason: reason
+        })
+        return {
+            ok: true,
+            required: true,
+            promoted,
+            workerWindowActionSurface: true,
+            reason: 'worker-window-action-surface'
+        }
+    }
+
+    if(!response?.begun) {
+        return {ok: false, required: true, reason: response?.reason || 'confirmation-foreground-denied'}
+    }
+
+    let promoted = response?.foregroundPromoted === true
+    let visible = document.visibilityState === 'visible' ||
+        await waitForCondition(() => document.visibilityState === 'visible', 2500, 100)
+    if(!visible) {
+        noteCurrentProfileNukeProgress({
+            event: `${formatConfirmationKind(confirmationKind)} confirmation foreground not visible after promotion; retrying`,
+            confirmationForegroundRequired: true,
+            confirmationForegroundRetryAt: Date.now(),
+            foregroundWaitReason: reason
+        })
+        const retry = await promoteCurrentQueuedTab(reason, true)
+        promoted = promoted || retry?.promoted === true
+        if(retry?.promoted) {
+            visible = document.visibilityState === 'visible' ||
+                await waitForCondition(() => document.visibilityState === 'visible', 3500, 100)
+        }
+    }
+    return {
+        ok: visible,
+        required: true,
+        promoted,
+        reason: visible ? 'foreground-ready' : 'foreground-not-visible'
+    }
+}
+
+async function dismissPendingConfirmationAfterFailure(confirmationKind = '', reason = 'confirmation-failed') {
+    const pendingBefore = isAnyProfileConfirmationPending()
+    const dismissed = pendingBefore ? await dismissProfileActionSurface() : false
+    const pendingAfter = isAnyProfileConfirmationPending()
+    await recordCurrentProfileNukeProgress({
+        event: `${formatConfirmationKind(confirmationKind)} confirmation cleanup after failure`,
+        confirmationCleanupReason: reason,
+        confirmationPendingBeforeCleanup: pendingBefore,
+        confirmationDismissedAfterFailure: dismissed,
+        confirmationPendingAfterCleanup: pendingAfter
+    })
+    return {pendingBefore, dismissed, pendingAfter}
+}
+
+function isAnyProfileConfirmationPending() {
+    return !!(
+        getMuteConfirmAction() ||
+        getBlockConfirmAction() ||
+        getUnmuteConfirmAction() ||
+        getUnblockConfirmAction()
+    )
+}
+
+async function activateConfirmationElementInPageWorld(element, confirmationKind = '') {
+    if(!element?.setAttribute) return {clicked: false, reason: 'invalid-element'}
+
+    const token = `confirm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    try {
+        element.setAttribute(PAGE_WORLD_CONFIRM_ACTIVATION_ATTR, token)
+        return await safeSendRuntimeMessageWithTimeout({
+            action: 'activate-confirmation-in-page-world',
+            token,
+            confirmationKind
+        }, {clicked: false, reason: 'message-failed'}, 3500)
+    }
+    catch(error) {
+        if(isExtensionContextInvalidatedError(error) || isRuntimeConnectionError(error)) {
+            return {clicked: false, reason: 'runtime-unavailable'}
+        }
+        throw error
+    }
+    finally {
+        try {
+            if(element.getAttribute(PAGE_WORLD_CONFIRM_ACTIVATION_ATTR) === token) {
+                element.removeAttribute(PAGE_WORLD_CONFIRM_ACTIVATION_ATTR)
+            }
+        }
+        catch {}
+    }
+}
+
+function dispatchActivationKey(element, key = 'Enter') {
+    if(!element) return false
+
+    const code = key === ' ' ? 'Space' : key
+    const keyCode = key === ' ' ? 32 : 13
+    const eventInit = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        key,
+        code,
+        keyCode,
+        which: keyCode
+    }
+
+    try {
+        element.dispatchEvent(new KeyboardEvent('keydown', eventInit))
+        element.dispatchEvent(new KeyboardEvent('keyup', eventInit))
+        return true
+    }
+    catch {
+        return false
+    }
+}
+
+async function unblockProfile(options = {}) {
+    const {silent = false, allowForegroundFallback = false, clearNukeState = true} = options
+    if(!getProfileMenuButton()) {
+        await waitForCondition(() => !!getProfileMenuButton(), 5000, 100)
+    }
+
+    const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
+    if(!menuOpened) return {ok: false, changed: false, reason: 'profile-menu-not-open'}
+
+    await sleep(300)
+    await recordReverseActionProgress({
+        event: 'Reverse action opened profile menu for unblock',
+        ...getReverseActionDebugSnapshot()
+    })
+
+    const unblockState = await waitForMenuStateWithForegroundFallback(isUnblockActionLabel, isBlockActionLabel, {
+        timeoutMs: 5000,
+        intervalMs: 250,
+        promotionReason: 'unblock-option-not-found',
+        silent,
+        allowForegroundFallback
+    })
+
+    if(unblockState?.state === 'inverse') {
+        await recordReverseActionProgress({
+            event: 'Reverse action found profile already unblocked',
+            selectedActionLabel: getActionDebugLabel(unblockState.button),
+            selectedActionRect: getActionDebugRect(unblockState.button),
+            ...getReverseActionDebugSnapshot()
+        })
+        await closeProfileMenu()
+        return {ok: true, changed: false, reason: 'already-unblocked'}
+    }
+
+    const unblockButton = unblockState?.button || getMenuAction(isUnblockActionLabel)
+    if(!unblockButton) {
+        await closeProfileMenu()
+        await sleep(250)
+        const reopened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
+        if(reopened) {
+            await sleep(300)
+            const retryUnblockButton = getMenuAction(isUnblockActionLabel)
+            if(retryUnblockButton) {
+                await recordReverseActionProgress({
+                    event: 'Reverse action selected unblock after reopening profile menu',
+                    selectedActionLabel: getActionDebugLabel(retryUnblockButton),
+                    selectedActionRect: getActionDebugRect(retryUnblockButton),
+                    ...getReverseActionDebugSnapshot()
+                })
+                activateActionElement(retryUnblockButton)
+                return finishUnblockProfileAction({silent, clearNukeState})
+            }
+        }
+
+        await recordReverseActionProgress({
+            event: 'Reverse action could not find an unblock option',
+            ...getReverseActionDebugSnapshot()
+        })
+        reportActionIssue('Unblock option not found', silent)
+        return {ok: false, changed: false, reason: 'unblock-option-not-found', labels: getVisibleProfileMenuActionLabels()}
+    }
+
+    await recordReverseActionProgress({
+        event: 'Reverse action selected unblock',
+        selectedActionLabel: getActionDebugLabel(unblockButton),
+        selectedActionRect: getActionDebugRect(unblockButton),
+        ...getReverseActionDebugSnapshot()
+    })
+    activateActionElement(unblockButton)
+
+    return finishUnblockProfileAction({silent, clearNukeState})
+}
+
+async function finishUnblockProfileAction(options = {}) {
+    const {silent = false, clearNukeState = true} = options
+    let confirmButton = await waitForAction(() => {
+        const button = getUnblockConfirmAction()
+        if(button) return button
+        if(getMenuAction(isBlockActionLabel)) return {alreadyDone: true}
+        return null
+    }, 5000, 250)
+    if(!confirmButton) {
+        const retryUnblockButton = getMenuAction(isUnblockActionLabel)
+        if(retryUnblockButton) {
+            activateActionElement(retryUnblockButton)
+            confirmButton = await waitForAction(() => {
+                const button = getUnblockConfirmAction()
+                if(button) return button
+                if(getMenuAction(isBlockActionLabel)) return {alreadyDone: true}
+                return null
+            }, 3000, 250)
+        }
+    }
+
+    if(confirmButton && !confirmButton.alreadyDone) {
+        await recordReverseActionProgress({
+            event: 'Reverse action confirmed unblock',
+            selectedActionLabel: getActionDebugLabel(confirmButton),
+            selectedActionRect: getActionDebugRect(confirmButton),
+            ...getReverseActionDebugSnapshot()
+        })
+        activateActionElement(confirmButton)
+    }
+    else if(confirmButton?.alreadyDone) {
+        await recordReverseActionProgress({
+            event: 'Reverse action observed unblock already completed',
+            ...getReverseActionDebugSnapshot()
+        })
+    }
+    else {
+        await recordReverseActionProgress({
+            event: 'Reverse action did not find an unblock confirmation',
+            ...getReverseActionDebugSnapshot()
+        })
+    }
+
+    let unblocked = await waitForVerifiedProfileUnblocked(
+        confirmButton?.alreadyDone ? 2500 : 8000,
+        250,
+        silent
+    )
+
+    if(!unblocked && isUnblockConfirmPending()) {
+        const retryConfirmButton = getUnblockConfirmAction()
+        if(retryConfirmButton) {
+            await recordReverseActionProgress({
+                event: 'Reverse action retried unblock confirmation',
+                selectedActionLabel: getActionDebugLabel(retryConfirmButton),
+                selectedActionRect: getActionDebugRect(retryConfirmButton),
+                ...getReverseActionDebugSnapshot()
+            })
+            activateActionElement(retryConfirmButton)
+            unblocked = await waitForVerifiedProfileUnblocked(8000, 250, silent)
+        }
+    }
+
+    if(!unblocked) {
+        await recordReverseActionProgress({
+            event: 'Reverse action unblock verification failed',
+            ...getReverseActionDebugSnapshot()
+        })
+        reportActionIssue('Unblock did not take effect', silent)
+        return {ok: false, changed: false, reason: 'unblock-did-not-take-effect'}
+    }
+
+    rememberProfileUnblocked()
+    if(clearNukeState) {
+        await maybeClearCurrentProfileNukeStateFromLiveUnblocked()
+    }
+    return {ok: true, changed: true, reason: 'unblocked'}
+}
+
+async function unmuteProfile(options = {}) {
+    const {silent = false, allowForegroundFallback = false} = options
+    const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
+    if(!menuOpened) return {ok: false, changed: false, reason: 'profile-menu-not-open'}
+
+    await sleep(300)
+
+    const unmuteState = await waitForMenuStateWithForegroundFallback(isUnmuteActionLabel, isMuteActionLabel, {
+        timeoutMs: 5000,
+        intervalMs: 250,
+        promotionReason: 'unmute-option-not-found',
+        silent,
+        allowForegroundFallback
+    })
+
+    if(unmuteState?.state === 'inverse') {
+        await closeProfileMenu()
+        return {ok: true, changed: false, reason: 'already-unmuted'}
+    }
+
+    const unmuteButton = unmuteState?.button || getMenuAction(isUnmuteActionLabel)
+    if(!unmuteButton) {
+        reportActionIssue('Unmute option not found', silent)
+        return {ok: false, changed: false, reason: 'unmute-option-not-found', labels: getVisibleProfileMenuActionLabels()}
+    }
+
+    activateActionElement(unmuteButton)
+
+    const confirmButton = await waitForAction(() => getUnmuteConfirmAction(), 1500, 250)
+    if(confirmButton) {
+        await activateConfirmationElement(confirmButton, isUnmuteConfirmPending, 'unmute')
+    }
+    else {
+        const unmutedWithoutConfirm = await waitForProfileMenuState('inverse', isUnmuteActionLabel, isMuteActionLabel, 2500, 500, silent, allowForegroundFallback)
+        if(unmutedWithoutConfirm) {
+            await closeProfileMenu()
+            return {ok: true, changed: true, reason: 'unmuted'}
+        }
+
+        await dismissProfileActionSurface()
+        const unmutedAfterDismiss = await waitForProfileMenuState('inverse', isUnmuteActionLabel, isMuteActionLabel, 5000, 500, silent, allowForegroundFallback)
+        if(unmutedAfterDismiss) {
+            await closeProfileMenu()
+            return {ok: true, changed: true, reason: 'unmuted'}
+        }
+
+        return {ok: false, changed: true, reason: 'unmute-confirm-not-found'}
+    }
+
+    const unmuted = await waitForProfileMenuState('inverse', isUnmuteActionLabel, isMuteActionLabel, 8000, 500, silent, allowForegroundFallback)
+    if(!unmuted) {
+        await dismissProfileActionSurface()
+        reportActionIssue('Unmute did not take effect', silent)
+        return {ok: false, changed: true, reason: 'unmute-did-not-take-effect'}
+    }
+
+    await closeProfileMenu()
+    return {ok: true, changed: true, reason: 'unmuted'}
+}
+
+async function unmuteProfileBestEffort(options = {}) {
+    const {silent = true, allowForegroundFallback = false} = options
+    if(getPageType() !== 'profile') return {ok: false, changed: false, reason: 'not-profile-page'}
+
+    if(!getProfileMenuButton()) {
+        await waitForCondition(() => !!getProfileMenuButton(), 1500, 100)
+    }
+
+    const menuOpened = await ensureProfileMenuOpen(1500, true, allowForegroundFallback)
+    if(!menuOpened) return {ok: false, changed: false, reason: 'profile-menu-not-open'}
+
+    await sleep(150)
+
+    const unmuteState = await waitForMenuStateWithForegroundFallback(isUnmuteActionLabel, isMuteActionLabel, {
+        timeoutMs: 2000,
+        intervalMs: 150,
+        promotionReason: 'unmute-option-not-found',
+        silent: true,
+        allowForegroundFallback
+    })
+
+    if(unmuteState?.state === 'inverse') {
+        await closeProfileMenu()
+        return {ok: true, changed: false, reason: 'already-unmuted'}
+    }
+
+    const unmuteButton = unmuteState?.button || getMenuAction(isUnmuteActionLabel)
+    if(!unmuteButton) {
+        await closeProfileMenu()
+        return {ok: true, changed: false, reason: 'unmute-option-not-offered'}
+    }
+
+    activateActionElement(unmuteButton)
+
+    const confirmButton = await waitForAction(() => getUnmuteConfirmAction(), 1000, 150)
+    if(confirmButton) {
+        await activateConfirmationElement(confirmButton, isUnmuteConfirmPending, 'unmute')
+        await waitForCondition(() => !isUnmuteConfirmPending(), 2500, 200)
+    }
+
+    const unmuted = await waitForProfileMenuState('inverse', isUnmuteActionLabel, isMuteActionLabel, 2500, 250, true, allowForegroundFallback)
+    if(unmuted) return {ok: true, changed: true, reason: 'unmuted'}
+
+    await dismissProfileActionSurface()
+    if(!silent) reportActionIssue('Unmute could not be verified', true)
+    // The click was dispatched but the menu never reported the inverse state,
+    // so the profile may still be muted. This must not read as success: callers
+    // gate terminal unblock-unmute success on ok.
+    return {ok: false, changed: true, reason: 'unmute-clicked-unverified'}
+}
+
+async function waitForCanonicalProfileActionRoute(profileHref, timeoutMs = WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS) {
+    if(!profileHref) return false
+
+    let canonicalPath = ''
+    try {
+        canonicalPath = new URL(profileHref).pathname
+    }
+    catch {
+        return false
+    }
+
+    const isCanonical = () => {
+        return getProfileKey(location.href) === profileHref &&
+            location.pathname === canonicalPath &&
+            document.readyState !== 'loading'
+    }
+
+    if(isCanonical()) return true
+
+    if(getProfileKey(location.href) === profileHref && location.pathname !== canonicalPath) {
+        maybeRedirectToCanonicalProfileUrl()
+    }
+
+    return waitForCondition(isCanonical, timeoutMs, 200)
+}
+
+async function unblockUnmuteProfile(options = {}) {
+    const {silent = false, allowForegroundFallback = false, clearNukeState = true} = options
+    if(getPageType() !== 'profile') return {ok: false, reason: 'not-profile-page'}
+
+    const ready = await waitForProfileActionReady()
+    if(!ready) return {ok: false, reason: 'profile-actions-not-ready'}
+
+    const profileHref = getProfileKey(location.href) || location.href
+    const startedBlocked = isProfileBlocked()
+    let unblock = {ok: true, changed: false, reason: 'already-unblocked'}
+    let unmute = {ok: true, changed: false, reason: 'not-needed'}
+
+    if(startedBlocked) {
+        const maxReverseAttempts = 3
+        let verified = false
+
+        for(let attempt = 1; attempt <= maxReverseAttempts; attempt += 1) {
+            await recordReverseActionProgress({
+                event: attempt === 1
+                    ? 'Reverse action started blocked-profile flow'
+                    : 'Reverse action retrying blocked-profile flow after transient failure',
+                reverseAttempt: attempt,
+                ...getReverseActionDebugSnapshot()
+            })
+
+            await waitForCanonicalProfileActionRoute(profileHref, 5000)
+            unblock = await unblockProfile({silent: true, allowForegroundFallback, clearNukeState})
+            verified = unblock?.ok && await waitForVerifiedProfileUnblocked(3500, 250, true, allowForegroundFallback)
+
+            await recordReverseActionProgress({
+                event: verified
+                    ? 'Reverse action unblock step verified'
+                    : 'Reverse action unblock step did not verify',
+                reverseAttempt: attempt,
+                unblockReason: unblock?.reason || '',
+                unblockOk: !!unblock?.ok,
+                ...getReverseActionDebugSnapshot()
+            })
+
+            if(verified) {
+                unmute = await unmuteProfileBestEffort({silent: true, allowForegroundFallback})
+                await recordReverseActionProgress({
+                    event: 'Reverse action post-unblock unmute step completed',
+                    reverseAttempt: attempt,
+                    unmuteReason: unmute?.reason || '',
+                    unmuteOk: !!unmute?.ok,
+                    ...getReverseActionDebugSnapshot()
+                })
+                break
+            }
+            if(attempt >= maxReverseAttempts) break
+
+            unmute = await unmuteProfileBestEffort({silent: true, allowForegroundFallback})
+            await recordReverseActionProgress({
+                event: 'Reverse action pre-retry unmute step completed',
+                reverseAttempt: attempt,
+                unmuteReason: unmute?.reason || '',
+                unmuteOk: !!unmute?.ok,
+                ...getReverseActionDebugSnapshot()
+            })
+
+            await dismissProfileActionSurface()
+            await waitForCanonicalProfileActionRoute(profileHref, 5000)
+            await sleep(750)
+        }
+
+        if(!verified) {
+            return {ok: false, reason: unblock.reason || 'unblock-failed', unblock, unmute}
+        }
+
+        rememberProfileUnblocked(profileHref)
+        // The unblock verified, but a profile that is still muted is not a
+        // completed reverse action. Keep the nuke state so the retry runs again.
+        if(unmute?.reason === 'unmute-clicked-unverified') {
+            return {ok: false, reason: unmute.reason, unblock, unmute}
+        }
+        if(clearNukeState) {
+            await clearProfileNukeState(profileHref, 'Unblock Unmute action unblocked the profile')
+        }
+    }
+    else {
+        // Unlike the startedBlocked branch above, unmuteProfileBestEffort()
+        // never records any progress patch of its own -- without this call,
+        // a fresh href taking this path (already unblocked, just needs
+        // unmuting) could complete the whole action with actionKind left
+        // blank in the persisted record.
+        await recordReverseActionProgress({
+            event: 'Reverse action started already-unblocked flow',
+            ...getReverseActionDebugSnapshot()
+        })
+        unmute = await unmuteProfileBestEffort({silent, allowForegroundFallback})
+        if(!unmute.ok && unmute.reason !== 'unmute-option-not-found' && unmute.reason !== 'unmute-option-not-offered') {
+            return {ok: false, reason: unmute.reason || 'unmute-failed', unmute}
+        }
+    }
+
+    if(isProfileBlocked({ignoreHints: true}) && !isProfileVisiblyUnblocked()) {
+        return {ok: false, reason: 'profile-still-blocked', unblock, unmute}
+    }
+
+    rememberProfileUnblocked(profileHref)
+    if(clearNukeState) {
+        await clearProfileNukeState(profileHref, 'Unblock Unmute action completed on a live unblocked profile')
+    }
+    scheduleProfileButtonsRefresh(150)
+    return {
+        ok: true,
+        unblock,
+        unmute,
+        profileHref
+    }
 }
 
 async function muteProfile(options = {}) {
-    const {allowBlockFallback = false, silent = false, allowForegroundFallback = true} = options
-    await recordCurrentProfileNukeProgress({
+    const {allowBlockFallback = false, silent = false, allowForegroundFallback = false} = options
+    // muteProfile() has exactly one caller -- handleMuteBlockClick, the
+    // legacy direct profile-page button -- so this is the one place that
+    // needs to stamp actionKind for that whole flow (blockProfile() is only
+    // ever reached through here). Without it, every patch in the sequence
+    // spreads `actionKind` forward from an empty `previous`, leaving the
+    // persisted record's actionKind blank forever: harmless behaviorally
+    // (nothing branches on it for the mute-block path), but useless for the
+    // recorded history this exists to support.
+    // Sent now but not awaited. It used to hold up the menu until the worker
+    // had written it through the storage queue, which under load was seconds.
+    // The message is still sent first, so the write stays ahead of the later
+    // milestones; a failure is caught below and does not stop the flow.
+    void recordCurrentProfileNukeProgress({
+        actionKind: 'mute-block',
         status: 'muting',
         muteAttempted: true,
         muteAttemptedAt: Date.now(),
         event: 'Mute flow started'
-    })
+    }).catch(() => null)
 
     const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
@@ -7918,7 +13344,7 @@ async function muteProfile(options = {}) {
         return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
     }
 
-    await sleep(500)
+    // No fixed sleep here: the menu-state wait below polls until the items render.
 
     const muteState = await waitForMenuStateWithForegroundFallback(isMuteActionLabel, isUnmuteActionLabel, {
         timeoutMs: 5000,
@@ -7933,7 +13359,6 @@ async function muteProfile(options = {}) {
             mutedAt: Date.now(),
             event: 'Profile was already muted'
         })
-        await closeProfileMenu()
     }
     else {
         let muteBtn = muteState?.button || getMenuAction(isMuteActionLabel)
@@ -7948,7 +13373,7 @@ async function muteProfile(options = {}) {
             return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
-        muteBtn.click()
+        activateActionElement(muteBtn)
 
         let confirmBtn = await waitForAction(() => getMuteConfirmAction(), 8000, 250)
         if(!confirmBtn) {
@@ -7957,16 +13382,43 @@ async function muteProfile(options = {}) {
                 muteError: 'Confirm button not found',
                 event: 'Mute confirm button not found'
             })
+            await dismissPendingConfirmationAfterFailure('mute', 'confirm-button-not-found')
             reportActionIssue('Confirm button not found', silent)
             return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
 
-        confirmBtn.click()
+        let activation = await activateConfirmationElement(confirmBtn, isMuteConfirmPending, 'mute')
+        if(isConfirmationForegroundUnavailable(activation)) {
+            await recordCurrentProfileNukeProgress({
+                muteSucceeded: false,
+                muteError: 'Mute confirm foreground unavailable',
+                finalError: `Mute confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+                event: 'Mute confirm foreground unavailable',
+                confirmationForegroundReason: activation.reason || ''
+            })
+            await dismissPendingConfirmationAfterFailure('mute', 'confirm-foreground-unavailable')
+            reportActionIssue('Mute confirm foreground unavailable', silent)
+            return false
+        }
 
         let confirmClosed = await waitForCondition(() => !isMuteConfirmPending(), 2500, 250)
         if(!confirmClosed) {
             confirmBtn = getMuteConfirmAction()
-            if(confirmBtn) confirmBtn.click()
+            if(confirmBtn) {
+                activation = await activateConfirmationElement(confirmBtn, isMuteConfirmPending, 'mute')
+                if(isConfirmationForegroundUnavailable(activation)) {
+                    await recordCurrentProfileNukeProgress({
+                        muteSucceeded: false,
+                        muteError: 'Mute confirm foreground unavailable',
+                        finalError: `Mute confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+                        event: 'Mute confirm foreground unavailable',
+                        confirmationForegroundReason: activation.reason || ''
+                    })
+                    await dismissPendingConfirmationAfterFailure('mute', 'confirm-foreground-unavailable')
+                    reportActionIssue('Mute confirm foreground unavailable', silent)
+                    return false
+                }
+            }
             confirmClosed = await waitForCondition(() => !isMuteConfirmPending(), 6000, 250)
         }
 
@@ -7976,8 +13428,9 @@ async function muteProfile(options = {}) {
                 muteError: 'Mute confirm did not complete',
                 event: 'Mute confirm did not complete'
             })
+            await dismissPendingConfirmationAfterFailure('mute', 'confirm-did-not-complete')
             reportActionIssue('Mute confirm did not complete', silent)
-            return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
+            return false
         }
 
         const mutedApplied = await waitForProfileMenuState('inverse', isMuteActionLabel, isUnmuteActionLabel, 8000, 500)
@@ -7987,6 +13440,7 @@ async function muteProfile(options = {}) {
                 muteError: 'Mute did not take effect',
                 event: 'Mute did not take effect'
             })
+            await dismissPendingConfirmationAfterFailure('mute', 'mute-did-not-take-effect')
             reportActionIssue('Mute did not take effect', silent)
             return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
         }
@@ -8004,9 +13458,29 @@ async function muteProfile(options = {}) {
 }
 
 async function blockProfile(options = {}) {
-    const {silent = false, allowForegroundFallback = true} = options
+    const {silent = false, allowForegroundFallback = false} = options
 
-    if(isProfileBlocked()) {
+    // Checked before anything else: a candidate the current user already
+    // follows should never be blocked, regardless of how it got queued (a
+    // maintained followers list isn't practical to get out of Quora, so
+    // this is a page-DOM check at the moment of action, not a lookup).
+    // Terminal and counted, not silently dropped, so a run where this fires
+    // a lot is visible rather than looking like candidates quietly
+    // vanished.
+    if(isProfileFollowedByCurrentUser()) {
+        await recordCurrentProfileNukeProgress({
+            status: 'block-attempt-on-following',
+            blockAttempted: false,
+            blockSucceeded: false,
+            event: 'Block flow skipped because the profile is already followed'
+        })
+        return true
+    }
+
+    const alreadyBlockedOnEntry = isProfileBlocked()
+    reportInitialBlockedStateIfQueued(alreadyBlockedOnEntry)
+
+    if(alreadyBlockedOnEntry) {
         await recordCurrentProfileNukeProgress({
             status: 'already-blocked',
             foundBlockedBeforeQueue: true,
@@ -8018,6 +13492,18 @@ async function blockProfile(options = {}) {
         return true
     }
 
+    const pendingBlockConfirm = getBlockConfirmAction()
+    if(pendingBlockConfirm) {
+        await recordCurrentProfileNukeProgress({
+            status: 'blocking',
+            blockAttempted: true,
+            blockAttemptedAt: Date.now(),
+            event: 'Block flow resumed from pending confirmation'
+        })
+
+        if(await completePendingBlockConfirmation(pendingBlockConfirm, silent)) return true
+    }
+
     await recordCurrentProfileNukeProgress({
         status: 'blocking',
         blockAttempted: true,
@@ -8027,23 +13513,53 @@ async function blockProfile(options = {}) {
 
     const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
+        const diagnostic = getDirectBlockActionDiagnostic('profile-menu-did-not-open', {
+            menuOpenResult: false,
+            finalBlockedState: isProfileBlocked()
+        })
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Profile menu did not open',
+            directBlockFailureDetail: diagnostic,
             event: 'Block flow failed because the profile menu did not open'
         })
         return false
     }
 
+    noteCurrentProfileNukeProgress({
+        event: 'Block profile menu opened'
+    })
     await sleep(500)
 
-    const blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
+    let blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
         timeoutMs: 5000,
         intervalMs: 250,
         promotionReason: 'block-option-not-found',
         silent,
         allowForegroundFallback
     })
+    if(!blockState) {
+        await recordCurrentProfileNukeProgress({
+            event: 'Block option was not found on the first menu read; reopening profile menu',
+            menuActionLabels: getVisibleProfileMenuActionLabels(),
+            profileMenuOpen: isProfileMenuOpen(),
+            profileMenuButtonRect: getProfileMenuButtonDebugRect()
+        })
+
+        await closeProfileMenu()
+        await sleep(250)
+        const reopened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
+        if(reopened) {
+            await sleep(500)
+            blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
+                timeoutMs: 3000,
+                intervalMs: 200,
+                promotionReason: 'block-option-not-found-after-reopen',
+                silent,
+                allowForegroundFallback
+            })
+        }
+    }
     if(blockState?.state === 'inverse') {
         await closeProfileMenu()
         rememberProfileBlocked()
@@ -8073,14 +13589,26 @@ async function blockProfile(options = {}) {
             blockSucceeded: false,
             blockError: 'Block option not found',
             menuActionLabels: getVisibleProfileMenuActionLabels(),
+            profileMenuOpen: isProfileMenuOpen(),
+            profileMenuButtonRect: getProfileMenuButtonDebugRect(),
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-option-not-found', {
+                blockOptionLookupResult: false,
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block option not found'
         })
         reportActionIssue('Block option not found', silent)
         return false
     }
 
+    noteCurrentProfileNukeProgress({
+        event: 'Block option found'
+    })
     const initialMutationCount = profileBlockMutationCount
-    blockOpt.click()
+    activateActionElement(blockOpt)
+    noteCurrentProfileNukeProgress({
+        event: 'Block option clicked'
+    })
 
     const confirmState = await waitForAction(() => {
         const confirmButton = getBlockConfirmAction()
@@ -8106,8 +13634,13 @@ async function blockProfile(options = {}) {
         await recordCurrentProfileNukeProgress({
             blockSucceeded: false,
             blockError: 'Block button not found',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-button-not-found', {
+                confirmLookupResult: false,
+                finalBlockedState: isProfileBlocked()
+            }),
             event: 'Block confirm button not found'
         })
+        await dismissPendingConfirmationAfterFailure('block', 'confirm-button-not-found')
         reportActionIssue('Block button not found', silent)
         return false
     }
@@ -8124,15 +13657,146 @@ async function blockProfile(options = {}) {
     }
 
     let blockBtn = confirmState.button
-    blockBtn.click()
+    noteCurrentProfileNukeProgress({
+        event: 'Block confirm found'
+    })
+    let activation = await activateConfirmationElement(blockBtn, isBlockConfirmPending, 'block')
+    noteCurrentProfileNukeProgress({
+        event: 'Block confirm activation attempted'
+    })
+    if(isConfirmationForegroundUnavailable(activation)) {
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Block confirm foreground unavailable',
+            finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-foreground-unavailable', {
+                confirmLookupResult: true,
+                confirmActivationResult: activation,
+                finalBlockedState: isProfileBlocked()
+            }),
+            event: 'Block confirm foreground unavailable',
+            confirmationForegroundReason: activation.reason || ''
+        })
+        await dismissPendingConfirmationAfterFailure('block', 'confirm-foreground-unavailable')
+        reportActionIssue('Block confirm foreground unavailable', silent)
+        return false
+    }
 
-    const mutationSeen = await waitForCondition(() => profileBlockMutationCount > initialMutationCount, 5000, 250)
-    if(mutationSeen) rememberProfileBlocked()
+    await waitForCondition(() => profileBlockMutationCount > initialMutationCount, 5000, 250)
 
-    let blockClosed = mutationSeen || await waitForCondition(() => !isBlockConfirmPending(), 2500, 250)
+    let blockClosed = await waitForCondition(() => !isBlockConfirmPending(), 2500, 250)
     if(!blockClosed) {
         blockBtn = getBlockConfirmAction()
-        if(blockBtn) blockBtn.click()
+        if(blockBtn) {
+            activation = await activateConfirmationElement(blockBtn, isBlockConfirmPending, 'block')
+            if(isConfirmationForegroundUnavailable(activation)) {
+                await recordCurrentProfileNukeProgress({
+                    blockSucceeded: false,
+                    blockError: 'Block confirm foreground unavailable',
+                    finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+                    directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-foreground-unavailable-retry', {
+                        confirmLookupResult: true,
+                        confirmActivationResult: activation,
+                        finalBlockedState: isProfileBlocked()
+                    }),
+                    event: 'Block confirm foreground unavailable',
+                    confirmationForegroundReason: activation.reason || ''
+                })
+                await dismissPendingConfirmationAfterFailure('block', 'confirm-foreground-unavailable')
+                reportActionIssue('Block confirm foreground unavailable', silent)
+                return false
+            }
+        }
+        blockClosed = await waitForCondition(() => !isBlockConfirmPending(), 6000, 250)
+    }
+
+    if(!blockClosed && !isProfileBlocked()) {
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Block confirm did not complete',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-confirm-did-not-complete', {
+                confirmLookupResult: !!getBlockConfirmAction(),
+                finalBlockedState: isProfileBlocked()
+            }),
+            event: 'Block confirm did not complete'
+        })
+        await dismissPendingConfirmationAfterFailure('block', 'confirm-did-not-complete')
+        reportActionIssue('Block confirm did not complete', silent)
+        return false
+    }
+
+    const blockedApplied = await waitForVerifiedProfileBlocked(8000, 250)
+    if(!blockedApplied) {
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Block did not take effect',
+            directBlockFailureDetail: getDirectBlockActionDiagnostic('block-did-not-take-effect', {
+                finalBlockedState: isProfileBlocked()
+            }),
+            event: 'Block did not take effect'
+        })
+        reportActionIssue('Block did not take effect', silent)
+        return false
+    }
+
+    rememberProfileBlocked()
+    await recordCurrentProfileNukeProgress({
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: Date.now(),
+        finalError: '',
+        event: 'Block completed'
+    })
+    scheduleProfileButtonsRefresh(150)
+    await waitForCondition(() => !document.querySelector('.mb-ext_mute-block-btn'), 3000, 150)
+    return true
+}
+
+async function completePendingBlockConfirmation(initialButton = null, silent = false) {
+    const initialMutationCount = profileBlockMutationCount
+    let blockBtn = initialButton || getBlockConfirmAction()
+    if(!blockBtn) return false
+
+    noteCurrentProfileNukeProgress({
+        event: 'Block confirm found'
+    })
+    let activation = await activateConfirmationElement(blockBtn, isBlockConfirmPending, 'block')
+    noteCurrentProfileNukeProgress({
+        event: 'Block confirm activation attempted'
+    })
+    if(isConfirmationForegroundUnavailable(activation)) {
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Block confirm foreground unavailable',
+            finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+            event: 'Block confirm foreground unavailable',
+            confirmationForegroundReason: activation.reason || ''
+        })
+        await dismissPendingConfirmationAfterFailure('block', 'confirm-foreground-unavailable')
+        reportActionIssue('Block confirm foreground unavailable', silent)
+        return false
+    }
+
+    await waitForCondition(() => profileBlockMutationCount > initialMutationCount, 5000, 250)
+
+    let blockClosed = await waitForCondition(() => !isBlockConfirmPending(), 2500, 250)
+    if(!blockClosed) {
+        blockBtn = getBlockConfirmAction()
+        if(blockBtn) {
+            activation = await activateConfirmationElement(blockBtn, isBlockConfirmPending, 'block')
+            if(isConfirmationForegroundUnavailable(activation)) {
+                await recordCurrentProfileNukeProgress({
+                    blockSucceeded: false,
+                    blockError: 'Block confirm foreground unavailable',
+                    finalError: `Block confirm foreground unavailable: ${activation.reason || 'unknown'}`,
+                    event: 'Block confirm foreground unavailable',
+                    confirmationForegroundReason: activation.reason || ''
+                })
+                await dismissPendingConfirmationAfterFailure('block', 'confirm-foreground-unavailable')
+                reportActionIssue('Block confirm foreground unavailable', silent)
+                return false
+            }
+        }
         blockClosed = await waitForCondition(() => !isBlockConfirmPending(), 6000, 250)
     }
 
@@ -8142,22 +13806,20 @@ async function blockProfile(options = {}) {
             blockError: 'Block confirm did not complete',
             event: 'Block confirm did not complete'
         })
+        await dismissPendingConfirmationAfterFailure('block', 'confirm-did-not-complete')
         reportActionIssue('Block confirm did not complete', silent)
         return false
     }
 
-    const blockedApplied = mutationSeen || await waitForCondition(() => isProfileBlocked(), 8000, 250)
+    const blockedApplied = await waitForVerifiedProfileBlocked(8000, 250)
     if(!blockedApplied) {
-            const blockedViaMenu = await waitForProfileMenuState('inverse', isBlockActionLabel, isUnblockActionLabel, 6000, 500)
-        if(!blockedViaMenu) {
-            await recordCurrentProfileNukeProgress({
-                blockSucceeded: false,
-                blockError: 'Block did not take effect',
-                event: 'Block did not take effect'
-            })
-            reportActionIssue('Block did not take effect', silent)
-            return false
-        }
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Block did not take effect',
+            event: 'Block did not take effect'
+        })
+        reportActionIssue('Block did not take effect', silent)
+        return false
     }
 
     rememberProfileBlocked()
@@ -8180,36 +13842,118 @@ function toggleMenu(silent = false) {
         return false
     }
 
-    menu.click()
-    return true
+    try {
+        menu.scrollIntoView({block: 'center', inline: 'nearest'})
+    }
+    catch {}
+
+    try {
+        menu.focus({preventScroll: true})
+    }
+    catch {
+        try {
+            menu.focus()
+        }
+        catch {}
+    }
+
+    return activateActionElement(menu)
 }
 
 function isProfileMenuOpen() {
-    const menuButton = getProfileMenuButton()
-    if(menuButton?.getAttribute('aria-expanded') === 'true') return true
-
-    return getOverlayRoots(false).some(root => {
-        return root.matches('[role="menu"]') || root.querySelector?.('[role="menuitem"]')
-    })
+    return isProfileActionMenuOpen()
 }
 
-async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowForegroundFallback = true) {
+async function dismissNonProfileMenuSurface() {
+    if(isProfileActionMenuOpen()) return false
+    if(!getOverlayRoots(false).length) return false
+
+    dispatchEscapeKey()
+    await sleep(200)
+    return true
+}
+
+function dispatchEscapeKey() {
+    const eventInit = {
+        bubbles: true,
+        cancelable: true,
+        key: 'Escape',
+        code: 'Escape',
+        keyCode: 27,
+        which: 27
+    }
+
+    document.dispatchEvent(new KeyboardEvent('keydown', eventInit))
+    document.dispatchEvent(new KeyboardEvent('keyup', eventInit))
+}
+
+async function ensureProfileMenuOpen(timeoutMs = ENSURE_PROFILE_MENU_OPEN_DEFAULT_TIMEOUT_MS, silent = false, allowForegroundFallback = false) {
     if(isProfileMenuOpen()) return true
+
+    await dismissNonProfileMenuSurface()
     if(!toggleMenu(silent)) return false
 
-    let opened = await waitForCondition(() => isProfileMenuOpen(), timeoutMs, 100)
+    let opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), timeoutMs, 100)
+    if(!opened) {
+        const menu = getProfileMenuButton()
+        if(menu) {
+            dispatchActivationKey(menu, 'Enter')
+            opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), Math.min(timeoutMs, 1200), 100)
+        }
+    }
+    if(!opened) {
+        const menu = getProfileMenuButton()
+        if(menu) {
+            dispatchActivationKey(menu, ' ')
+            opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), Math.min(timeoutMs, 1200), 100)
+        }
+    }
     if(!opened && document.visibilityState !== 'visible' && allowForegroundFallback) {
-        const promoted = await promoteCurrentQueuedTab('profile-menu-not-open', allowForegroundFallback)
-        if(promoted) {
+        await recordCurrentProfileNukeProgress({
+            event: 'Profile menu did not open in the background; requesting foreground fallback'
+        })
+        const promotion = await promoteCurrentQueuedTab('profile-menu-not-open', allowForegroundFallback)
+        if(!promotion.promoted) {
+            await recordCurrentProfileNukeProgress({
+                event: 'Foreground fallback did not promote the tab while opening profile menu',
+                foregroundPromotionDeniedReason: promotion.reason || ''
+            })
+            return false
+        }
+        if(promotion.promoted) {
             await sleep(300)
-            if(!isProfileMenuOpen()) {
+            opened = isProfileMenuOpen()
+            for(let attempt = 0; attempt < 2 && !isProfileMenuOpen(); attempt += 1) {
+                await dismissNonProfileMenuSurface()
                 toggleMenu(true)
+                opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), timeoutMs, 100)
+                if(opened) break
+                await sleep(250)
             }
-            opened = await waitForCondition(() => isProfileMenuOpen(), timeoutMs, 100)
         }
     }
 
+    for(let attempt = 0; attempt < 2 && !opened; attempt += 1) {
+        dispatchEscapeKey()
+        await sleep(200)
+        await dismissNonProfileMenuSurface()
+        if(!toggleMenu(true)) break
+        opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), Math.min(timeoutMs, 1800), 100)
+        if(!opened) {
+            const menu = getProfileMenuButton()
+            if(menu) {
+                dispatchActivationKey(menu, 'Enter')
+                opened = await waitForConditionOrDomMutation(() => isProfileMenuOpen(), Math.min(timeoutMs, 1200), 100)
+            }
+        }
+        if(!opened) await sleep(250)
+    }
+
     if(!opened) {
+        await recordCurrentProfileNukeProgress({
+            event: 'Profile menu did not open after retries',
+            ...getReverseActionDebugSnapshot()
+        })
         reportActionIssue('Profile menu did not open', silent)
         return false
     }
@@ -8217,10 +13961,19 @@ async function ensureProfileMenuOpen(timeoutMs = 2500, silent = false, allowFore
     return true
 }
 
-async function closeProfileMenu(timeoutMs = 1500) {
+async function closeProfileMenu(timeoutMs = CLOSE_PROFILE_MENU_DEFAULT_TIMEOUT_MS) {
     if(!isProfileMenuOpen()) return true
-    if(!toggleMenu()) return false
 
+    dispatchEscapeKey()
+    const firstCloseWindowMs = Math.min(timeoutMs, 600)
+    let closed = await waitForCondition(() => !isProfileMenuOpen(), firstCloseWindowMs, 100)
+    if(closed) return true
+
+    if(!toggleMenu(true)) return false
+    closed = await waitForCondition(() => !isProfileMenuOpen(), timeoutMs, 100)
+    if(closed) return true
+
+    dispatchEscapeKey()
     return waitForCondition(() => !isProfileMenuOpen(), timeoutMs, 100)
 }
 

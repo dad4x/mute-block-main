@@ -1,24 +1,58 @@
+html,
+body {
+    height: 100%;
+}
+
 body {
     margin: 0;
     font: 14px/1.4 system-ui, sans-serif;
-    background: #f4f5f7;
-    color: #1f2937;
+    background: var(--mb-grey-page);
+    color: var(--mb-grey-800);
+    min-height: 100vh;
+}
+
+/* .coordinator/.worker-bar both set their own `display`, at the same
+   specificity as the browser's built-in [hidden] rule -- author styles win
+   that tie regardless of source order, so setting element.hidden = true on
+   dashboardView/workerBarView/historyView (applyCoordinatorViewMode) was
+   silently doing nothing and all three views rendered stacked together on
+   every page load. Confirmed live 2026-09-29. */
+[hidden] {
+    display: none !important;
 }
 
 .coordinator {
+    align-content: start;
+    box-sizing: border-box;
+    display: grid;
+    gap: 16px;
+    grid-template-rows: auto auto;
     margin: 0 auto;
     max-width: 1120px;
+    min-height: 100vh;
     padding: 20px;
+}
+
+/* The history page is a short list, not a full control panel -- it
+   shouldn't force itself to fill the viewport height like the real
+   dashboard does. */
+#historyView {
+    min-height: 0;
+}
+
+/* Room for the fixed dashboard-bottom-bar below so the last panel doesn't
+   sit underneath it. */
+#dashboardView {
+    padding-bottom: 76px;
 }
 
 .coordinator-header {
     align-items: center;
-    background: #fff;
-    border: 1px solid #e5e7eb;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-200);
     border-radius: 8px;
     display: flex;
     justify-content: space-between;
-    margin-bottom: 16px;
     padding: 16px 18px;
 }
 
@@ -39,6 +73,7 @@ body {
 .header-status {
     align-items: center;
     display: flex;
+    gap: 10px;
     flex-shrink: 0;
 }
 
@@ -57,67 +92,209 @@ h2 {
 }
 
 .version {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     margin-top: 4px;
 }
 
 .status-pill {
-    background: #eef2ff;
-    border-radius: 999px;
-    color: #3730a3;
+    background: var(--mb-indigo-50);
+    border-radius: 3px;
+    color: var(--mb-indigo-800);
     font-size: 12px;
     font-weight: 700;
     padding: 6px 10px;
 }
 
+.dev-mode-toggle {
+    align-items: center;
+    cursor: pointer;
+    display: flex;
+    gap: 8px;
+    color: var(--mb-grey-700);
+    font-size: 12px;
+    user-select: none;
+}
+
+.dev-mode-toggle input {
+    height: 0;
+    opacity: 0;
+    position: absolute;
+    width: 0;
+}
+
+.dev-mode-toggle-track {
+    background: var(--mb-grey-300);
+    border-radius: 999px;
+    display: inline-block;
+    flex-shrink: 0;
+    height: 18px;
+    position: relative;
+    transition: background 0.15s ease;
+    width: 32px;
+}
+
+.dev-mode-toggle-thumb {
+    background: var(--mb-white);
+    border-radius: 50%;
+    height: 14px;
+    left: 2px;
+    position: absolute;
+    top: 2px;
+    transition: transform 0.15s ease;
+    width: 14px;
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track {
+    background: var(--mb-indigo-600);
+}
+
+.dev-mode-toggle input:checked ~ .dev-mode-toggle-track .dev-mode-toggle-thumb {
+    transform: translateX(14px);
+}
+
+.dev-mode-toggle input:focus-visible ~ .dev-mode-toggle-track {
+    outline: 2px solid var(--mb-indigo-600);
+    outline-offset: 2px;
+}
+
 .summary-grid {
     display: grid;
     gap: 12px;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    margin-bottom: 16px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .summary-tile,
 .panel {
-    background: #fff;
-    border: 1px solid #e5e7eb;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-200);
     border-radius: 8px;
 }
 
 .summary-tile {
-    padding: 14px;
+    padding: 10px 12px;
 }
 
 .summary-label {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
 }
 
 .summary-value {
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 800;
+    line-height: 1.1;
     margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.summary-detail {
+    color: var(--mb-grey-500);
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .panel {
-    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     overflow: hidden;
+}
+
+/* .panel's own `display: flex` (an author rule) otherwise beats the
+   user-agent stylesheet's `[hidden] { display: none }` regardless of
+   specificity, since author styles always win over UA styles in the
+   cascade -- this reasserts it as an author rule so hiding a dev-mode
+   panel (or a collapsed one) actually hides it. */
+.panel[hidden] {
+    display: none;
+}
+
+.panel-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.panel-stack .panel {
+    flex: 0 0 auto;
+}
+
+.panel-stack > .summary-grid {
+    flex: 0 0 auto;
+}
+
+.panel-stack .panel[data-panel-scroll-target="queueList"] {
+    max-height: 42vh;
+}
+
+.panel-stack .panel[data-panel-scroll-target="metricsJournal"] {
+    max-height: none;
+}
+
+.panel-stack .panel[data-panel-scroll-target="runList"],
+.panel-stack .panel[data-panel-scroll-target="eventList"],
+.panel-stack .panel[data-panel-scroll-target="eventHistogram"] {
+    max-height: 28vh;
+}
+
+.panel-stack .panel[data-panel-scroll-target="eventHistogram"] .histogram-container {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.panel-stack .panel.panel--collapsed {
+    flex: 0 0 auto;
 }
 
 .panel-head {
     align-items: center;
-    border-bottom: 1px solid #e5e7eb;
+    border-bottom: 1px solid var(--mb-grey-200);
     display: flex;
+    gap: 12px;
     justify-content: space-between;
     padding: 12px 14px;
 }
 
+.panel-title {
+    align-items: center;
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+}
+
+.panel-toggle {
+    align-items: center;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 6px;
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 800;
+    height: 26px;
+    justify-content: center;
+    line-height: 1;
+    padding: 0;
+    width: 26px;
+}
+
+.panel-toggle:hover {
+    background: var(--mb-grey-50);
+}
+
 .panel-head span,
 .panel-actions span {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     font-weight: 700;
 }
@@ -125,14 +302,71 @@ h2 {
 .panel-actions {
     align-items: center;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
+    justify-content: flex-end;
+    min-width: 0;
+}
+
+.panel-actions--queue {
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.panel-actions-row {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.panel-action-buttons {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.panel-action-state {
+    color: var(--mb-grey-500);
+    font-size: 12px;
+    font-weight: 700;
+    text-align: right;
+}
+
+/* Dev-mode resume limits and the flight-recorder save; hidden with the other dev-mode panels. */
+.dev-mode-select {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--mb-grey-600);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.debug-run-countdown {
+    color: var(--mb-blue-700);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.dev-mode-select select {
+    font: inherit;
+    padding: 4px 6px;
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 4px;
+    background: var(--mb-grey-50);
+    color: var(--mb-grey-800);
 }
 
 .clear-button {
-    background: #fff;
-    border: 1px solid #d1d5db;
-    border-radius: 6px;
-    color: #374151;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 999px;
+    color: var(--mb-grey-700);
     cursor: pointer;
     font: inherit;
     font-size: 12px;
@@ -141,8 +375,79 @@ h2 {
     padding: 7px 10px;
 }
 
-.clear-button:hover {
-    background: #f9fafb;
+.clear-button:hover:not(:disabled) {
+    background: var(--mb-grey-50);
+}
+
+.clear-button--danger {
+    border-color: var(--mb-red-200);
+    color: var(--mb-red-800);
+}
+
+.clear-button--danger:hover:not(:disabled) {
+    background: var(--mb-red-50);
+}
+
+.clear-button[aria-pressed="true"] {
+    background: var(--mb-indigo-50);
+    border-color: var(--mb-indigo-400);
+    color: var(--mb-indigo-800);
+}
+
+.clear-button--pause-active {
+    background: var(--mb-emerald-50);
+    border-color: var(--mb-emerald-400);
+    color: var(--mb-emerald-700);
+}
+
+.clear-button--flash {
+    animation: button-flash 650ms ease-out;
+}
+
+.pause-state {
+    background: var(--mb-grey-100);
+    border: 1px solid var(--mb-grey-200);
+    border-radius: 3px;
+    color: var(--mb-grey-600);
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1;
+    padding: 7px 10px;
+}
+
+.pause-state--paused {
+    background: var(--mb-emerald-50);
+    border-color: var(--mb-emerald-400);
+    color: var(--mb-emerald-700);
+}
+
+.pause-state--running {
+    background: var(--mb-cyan-100);
+    border-color: var(--mb-cyan-300);
+    color: var(--mb-cyan-800);
+}
+
+.pause-state--pending {
+    background: var(--mb-amber-50);
+    border-color: var(--mb-amber-500);
+    color: var(--mb-amber-800);
+}
+
+@keyframes button-flash {
+    0% {
+        box-shadow: 0 0 0 0 rgba(var(--mb-blue-600-rgb), 0.45);
+        transform: translateY(0);
+    }
+
+    35% {
+        box-shadow: 0 0 0 5px rgba(var(--mb-blue-600-rgb), 0.16);
+        transform: translateY(-1px);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(var(--mb-blue-600-rgb), 0);
+        transform: translateY(0);
+    }
 }
 
 .clear-button:disabled {
@@ -151,8 +456,8 @@ h2 {
 }
 
 .panel-note {
-    border-bottom: 1px solid #f0f1f3;
-    color: #6b7280;
+    border-bottom: 1px solid var(--mb-grey-110);
+    color: var(--mb-grey-500);
     font-size: 12px;
     font-weight: 700;
     padding: 8px 14px;
@@ -161,21 +466,194 @@ h2 {
 .list {
     display: flex;
     flex-direction: column;
-    max-height: 360px;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
 }
 
-.list--compact {
-    max-height: 260px;
+.list[hidden] {
+    display: none;
+}
+
+.metrics-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+}
+
+.metrics-panel[hidden] {
+    display: none;
+}
+
+.metrics-grid {
+    border-bottom: 1px solid var(--mb-grey-110);
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    padding: 10px 12px;
+}
+
+.metric-card {
+    background: var(--mb-grey-50);
+    border: 1px solid var(--mb-grey-200);
+    border-radius: 6px;
+    padding: 8px;
+    min-width: 0;
+}
+
+.metric-card--alert {
+    background: var(--mb-red-50);
+    border-color: var(--mb-red-200);
+}
+
+.metric-card--alert .metric-value {
+    color: var(--mb-red-800);
+}
+
+.metric-card--trend-up {
+    background: var(--mb-red-50);
+    border-color: var(--mb-red-200);
+}
+
+.metric-card--trend-up .metric-value {
+    color: var(--mb-red-800);
+}
+
+.metric-card--trend-down {
+    background: var(--mb-green-100);
+    border-color: var(--mb-green-300);
+}
+
+.metric-card--trend-down .metric-value {
+    color: var(--mb-green-800);
+}
+
+.metric-label {
+    color: var(--mb-grey-500);
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1.15;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.metric-value {
+    color: var(--mb-grey-900);
+    font-size: 16px;
+    font-weight: 800;
+    line-height: 1.15;
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.metric-detail {
+    color: var(--mb-grey-500);
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.panel-subhead {
+    align-items: center;
+    border-top: 1px solid var(--mb-grey-110);
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+}
+
+.panel-subhead h3 {
+    color: var(--mb-grey-700);
+    flex: 1 1 auto;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1.2;
+    margin: 0;
+    min-width: 0;
+    text-transform: uppercase;
+}
+
+.panel-subhead span {
+    color: var(--mb-grey-500);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.panel-subhead .panel-toggle {
+    height: 22px;
+    width: 22px;
+}
+
+.metrics-journal {
+    flex: 0 0 auto;
+    max-height: 28vh;
+    overflow-y: auto;
 }
 
 .empty {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     padding: 18px 14px;
 }
 
+.histogram-container {
+    flex: 0 0 auto;
+    padding: 12px 14px;
+}
+
+.histogram-row {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.histogram-row:last-child {
+    margin-bottom: 0;
+}
+
+.histogram-label {
+    color: var(--mb-grey-700);
+    flex: 0 0 150px;
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 150px;
+}
+
+.histogram-bar-container {
+    align-items: center;
+    display: flex;
+    flex: 1 1 auto;
+    gap: 8px;
+    min-width: 0;
+}
+
+.histogram-bar {
+    background: var(--mb-blue-500);
+    border-radius: 4px;
+    flex: 0 0 auto;
+    height: 24px;
+    position: relative;
+}
+
+.histogram-bar-label {
+    color: var(--mb-grey-700);
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 80px;
+    text-align: right;
+}
+
 .row {
-    border-bottom: 1px solid #f0f1f3;
+    border-bottom: 1px solid var(--mb-grey-110);
     display: grid;
     gap: 12px;
     grid-template-columns: minmax(180px, 1fr) 120px 140px 160px;
@@ -190,7 +668,56 @@ h2 {
     grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
 }
 
+.row--queue {
+    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
+}
+
+.row-time-cell {
+    line-height: 1.25;
+    white-space: normal;
+}
+
+.row-time-line {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.row-time-line--detail {
+    color: var(--mb-grey-700);
+    margin-top: 2px;
+}
+
+.row-action-cell {
+    align-self: start;
+    display: flex;
+    justify-content: flex-end;
+    min-width: 0;
+}
+
+.row-cancel-cell {
+    align-self: start;
+    display: flex;
+    justify-content: flex-start;
+    min-width: 0;
+}
+
+.row-action-button {
+    padding: 6px 10px;
+    white-space: nowrap;
+}
+
+.row-cancel-button {
+    border-color: var(--mb-red-200);
+    color: var(--mb-red-800);
+}
+
+.row-cancel-button:hover:not(:disabled) {
+    background: var(--mb-red-50);
+}
+
 .row-title {
+    color: inherit;
     font-weight: 700;
     min-width: 0;
     overflow: hidden;
@@ -199,7 +726,7 @@ h2 {
 }
 
 .row-subtitle {
-    color: #6b7280;
+    color: var(--mb-grey-500);
     font-size: 12px;
     margin-top: 2px;
     min-width: 0;
@@ -208,11 +735,23 @@ h2 {
     white-space: nowrap;
 }
 
+a.row-title,
+a.row-subtitle {
+    display: block;
+    text-decoration: none;
+}
+
+a.row-title:hover,
+a.row-subtitle:hover {
+    color: var(--mb-blue-700);
+    text-decoration: underline;
+}
+
 .badge {
     align-self: start;
-    background: #e5e7eb;
-    border-radius: 999px;
-    color: #374151;
+    background: var(--mb-grey-200);
+    border-radius: 3px;
+    color: var(--mb-grey-700);
     display: inline-block;
     font-size: 12px;
     font-weight: 700;
@@ -220,48 +759,226 @@ h2 {
     text-align: center;
 }
 
-.badge--active,
 .badge--queued {
-    background: #fee2e2;
-    color: #991b1b;
+    background: var(--mb-indigo-50);
+    color: var(--mb-indigo-800);
+}
+
+.badge--opening,
+.badge--active,
+.badge--acting,
+.badge--settling,
+.badge--running {
+    background: var(--mb-cyan-100);
+    border: 1px solid var(--mb-cyan-300);
+    color: var(--mb-cyan-800);
 }
 
 .badge--succeeded {
-    background: #dcfce7;
-    color: #166534;
+    background: var(--mb-green-100);
+    color: var(--mb-green-800);
 }
 
 .badge--failed,
 .badge--canceled,
 .badge--enqueued {
-    background: #f3f4f6;
-    color: #374151;
-}
-
-.legacy-grid {
-    display: grid;
-    gap: 12px;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    padding: 14px;
-}
-
-.legacy-value {
-    font-size: 22px;
-    font-weight: 800;
-    margin-top: 4px;
+    background: var(--mb-grey-100);
+    color: var(--mb-grey-700);
 }
 
 @media (max-width: 760px) {
     .coordinator {
+        display: block;
+        min-height: 0;
         padding: 12px;
     }
 
-    .summary-grid,
-    .legacy-grid {
+    .summary-grid {
         grid-template-columns: 1fr;
+        margin-bottom: 12px;
+    }
+
+    .metrics-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .coordinator-header,
+    .panel {
+        margin-bottom: 12px;
+    }
+
+    .panel-stack {
+        display: block;
     }
 
     .row {
         grid-template-columns: 1fr;
     }
+}
+
+/* Worker window "idiot light" status bar -- deliberately not the full
+   control-panel dashboard: a window-width strip with a progress fill and a
+   handled/total count, plus the handful of actions relevant to a background
+   worker window (pause/resume, cancel, jump to the real dashboard or
+   history). */
+.worker-bar {
+    align-items: center;
+    background: var(--mb-white);
+    border-bottom: 1px solid var(--mb-grey-200);
+    box-sizing: border-box;
+    color: var(--mb-grey-800);
+    display: flex;
+    gap: 16px;
+    padding: 12px 16px;
+    width: 100%;
+}
+
+.worker-bar-brand {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-logo {
+    display: block;
+    height: 40px;
+    object-fit: contain;
+    width: 40px;
+}
+
+.worker-bar-title {
+    font-size: 13px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-progress {
+    background: var(--mb-grey-100);
+    border: 1px solid var(--mb-grey-200);
+    border-radius: 999px;
+    flex: 1 1 auto;
+    height: 14px;
+    overflow: hidden;
+    position: relative;
+}
+
+.worker-bar-fill {
+    background: var(--mb-brand-red);
+    height: 100%;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.worker-bar-count {
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.worker-bar-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.worker-bar-button {
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 999px;
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 7px 12px;
+    white-space: nowrap;
+}
+
+.worker-bar-button:hover {
+    background: var(--mb-grey-50);
+}
+
+.worker-bar-button--danger {
+    border-color: var(--mb-red-200);
+    color: var(--mb-red-800);
+}
+
+.worker-bar-button--danger:hover {
+    background: var(--mb-red-50);
+}
+
+.worker-bar-button--danger:hover {
+    background: var(--mb-red-950);
+}
+
+/* Dashboard-page footer bar -- a persistent, window-width progress strip
+   pinned to the bottom of the real control-panel dashboard (not the
+   worker-window's own .worker-bar above, though it borrows that look).
+   The logo is a "jump to the real dashboard" shortcut, meant to work the
+   same way wherever this bar ends up rendering -- a no-op when the page
+   showing it is already the plain dashboard (see the click handler in
+   coordinator.js). Brand red (var(--mb-brand-red)), matching the extension's icon and
+   popup/content accent color, rather than the worker-bar's neutral fill. */
+.dashboard-bottom-bar {
+    align-items: center;
+    background: var(--mb-white);
+    border-top: 1px solid var(--mb-grey-200);
+    bottom: 0;
+    box-shadow: 0 -2px 8px rgba(var(--mb-black-rgb), 0.06);
+    box-sizing: border-box;
+    display: flex;
+    gap: 12px;
+    left: 0;
+    padding: 10px 16px;
+    position: fixed;
+    right: 0;
+    width: 100%;
+    z-index: 10;
+}
+
+.dashboard-bottom-bar-logo {
+    background: none;
+    border: none;
+    cursor: pointer;
+    display: block;
+    flex: 0 0 auto;
+    line-height: 0;
+    padding: 0;
+}
+
+.dashboard-bottom-bar-logo img {
+    display: block;
+    height: 28px;
+    object-fit: contain;
+    width: 28px;
+}
+
+.dashboard-bottom-bar-progress {
+    background: var(--mb-grey-100);
+    border: 1px solid var(--mb-grey-200);
+    border-radius: 999px;
+    flex: 1 1 auto;
+    height: 12px;
+    overflow: hidden;
+    position: relative;
+}
+
+.dashboard-bottom-bar-fill {
+    background: var(--mb-brand-red);
+    height: 100%;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.dashboard-bottom-bar-count {
+    color: var(--mb-grey-800);
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    white-space: nowrap;
 }

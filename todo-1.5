@@ -1,0 +1,28 @@
+# Closed 1.5 Todo Note
+
+The `1.5` series is closed for new feature work. Keep this file only as a
+pointer for old scratch items that have been promoted into the `1.6`/`2.0`
+planning lane.
+
+Current canonical notes:
+
+- `refactor-1.6-plan.md`: active `1.6` plan and `2.0` precursor scope.
+- `top-level-rethink-1.5-execution-plan.md`: historical filename, now the
+  detailed `1.6` execution checklist.
+- `regression-test-suite-ideas-2026-05-18.md`: regression test suite ideas.
+- `atproto-moderation-model.md` and `quora-labeler-bridge.md`: shared
+  moderation and labeler model background.
+
+Promoted shared-moderation todo:
+
+- Publish lists to a Quora space using marked JSON blocks:
+  `MBLOCK:BEGIN v=1` through `MBLOCK:END`.
+- Use Quora-safe subjects like `quora-profile:<slug>` instead of raw profile
+  URLs because Quora may rewrite rendered profile URL text.
+- Import lists with source/report provenance, not just target profiles.
+- Preserve source post URL, publisher, document id, entry id/hash, fetched time,
+  published time, purpose, intent, reason, tags, and confidence.
+- Store local policy decisions separately from publisher intent.
+- Keep an import/delta log for reconciliation and later republishing.
+- Align with the ATproto moderation model: typed lists/labels,
+  source-attributed judgments, stackable sources, and local user control.

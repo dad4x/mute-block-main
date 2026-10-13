@@ -1,5 +1,12 @@
 # Top-Level Rethink 1.5
 
+Status: historical architecture source.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). This note remains
+useful for the durable-job model that fed the `1.6` reset, but current design
+decisions should be reconciled through `architecture.md`.
+
 This note turns `notes-1.5` into a concrete durable job model for the `1.5`
 queue/coordinator reset. It is a design artifact only: no behavior should be
 changed until an implementation slice is chosen from the plan below. The

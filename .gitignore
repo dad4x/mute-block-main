@@ -5,4 +5,8 @@ mix-manifest.json
 *.zip
 node_modules
 chrome
+chrome-dev
 firefox
+tmp/upgrade-regression/
+tmp/mix-shared/
+.fallow/

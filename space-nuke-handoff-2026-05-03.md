@@ -1,5 +1,11 @@
 # Space Nuke Handoff 2026-05-03
 
+Status: historical handoff.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). This note explains
+older `1.4`/early refactor context and should not drive current work directly.
+
 This note captures older `1.4` local state after the `Nuke 'Em` hover update and the user-reported unresponsive-page behavior during large space nukes.
 
 Status update: this note is now superseded by [refactor-1.5-plan.md](refactor-1.5-plan.md) for the active `1.5` architecture reset. The event-churn hypothesis below remains useful historical context for why progress and queue state are being refactored.

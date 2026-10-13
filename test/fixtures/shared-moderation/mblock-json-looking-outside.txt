@@ -1,0 +1,26 @@
+This post discusses a JSON object:
+
+{"schema":"not actually an MBLOCK document","events":[{"event_id":"ignored"}]}
+
+It also mentions MBLOCK:BEGIN in prose without an end marker on the same line.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:json-looking-outside",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "events": [
+    {
+      "event_id": "evt-fixture-json-looking-outside-001",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Outside-Json",
+      "occurred_at": "2026-05-20T00:13:00Z"
+    }
+  ]
+}
+MBLOCK:END

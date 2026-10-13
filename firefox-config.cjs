@@ -9,6 +9,6 @@ module.exports = {
 	},
 	run: {
 		startUrl: ['https://www.google.com.pk'],
-		firefox: 'deved',
+		firefox: '/usr/bin/firefox',
 	}
 }

@@ -1,0 +1,26 @@
+Human-readable intro paragraph.
+
+MBLOCK:BEGIN   v=1
+
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:whitespace",
+  "publisher": {
+    "quora_profile": "quora-profile:Mock-Publisher",
+    "atproto_did": null,
+    "display_name": "Mock Publisher"
+  },
+  "events": [
+    {
+      "event_id": "evt-fixture-whitespace-001",
+      "type": "profile.mute.add",
+      "subject": "https://www.quora.com/profile/Whitespace-User/answers",
+      "occurred_at": "2026-05-20T00:06:00Z"
+    }
+  ]
+}
+
+MBLOCK:END
+
+Human-readable footer paragraph.

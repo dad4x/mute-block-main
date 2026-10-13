@@ -1,0 +1,49 @@
+Introductory text that Quora may render before a shared block.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:multi-001",
+  "publisher": {
+    "quora_profile": "quora-profile:Publisher-One",
+    "atproto_did": null,
+    "display_name": "Publisher One"
+  },
+  "events": [
+    {
+      "event_id": "evt-multi-001",
+      "type": "profile.block.add",
+      "subject": "quora-profile:Multi-One",
+      "occurred_at": "2026-05-20T00:00:00Z"
+    }
+  ]
+}
+MBLOCK:END
+
+Intervening human-readable text.
+
+MBLOCK:BEGIN v=1
+{
+  "schema": "com.muteblock.eventJournal",
+  "schema_version": 1,
+  "document_id": "mbj:fixture:2026-05-20:multi-002",
+  "publisher": {
+    "quora_profile": "quora-profile:Publisher-Two",
+    "atproto_did": null,
+    "display_name": "Publisher Two"
+  },
+  "events": [
+    {
+      "event_id": "evt-multi-002",
+      "type": "space.classification.set",
+      "space": "https://multi-space.quora.com/",
+      "classification": {
+        "category": "asset",
+        "mode": "manual"
+      },
+      "occurred_at": "2026-05-20T00:01:00Z"
+    }
+  ]
+}
+MBLOCK:END

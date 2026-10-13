@@ -1,5 +1,11 @@
 # atproto Moderation Model Notes for `mute-block-main`
 
+Status: research/design context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). Use this as
+background for shared moderation, not as an active implementation plan.
+
 This note captures the parts of the atproto / Bluesky moderation model that are directly relevant to shared mute/block lists in `mute-block-main`.
 
 The goal is to avoid inventing a parallel system when the protocol has already worked through many of the important design questions.
@@ -333,6 +339,30 @@ Typed profile collections.
   "signature": "..."
 }
 ```
+
+### Quora shared-post transport
+
+When the transport is a Quora post rather than a fetched JSON document, use a
+marked block:
+
+```text
+MBLOCK:BEGIN v=1
+{ ... }
+MBLOCK:END
+```
+
+A live experiment in `https://muteblockexperimental.quora.com/` showed that
+Quora preserves a parseable JSON block between those markers, but raw Quora
+profile URLs may be linkified and rendered back as display names. For Quora
+post transport, subjects should therefore be encoded as:
+
+```text
+quora-profile:Some-User-123
+```
+
+The extension should canonicalize that transport subject locally to the normal
+profile URL form. This is a transport constraint, not a rejection of canonical
+HTTPS subjects for internal storage or ATproto-facing compatibility.
 
 ### Local policy model
 

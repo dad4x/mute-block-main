@@ -1,26 +1,43 @@
 {
   "name": "mute-block",
-  "version": "1.6.0",
+  "version": "1.6.1400",
   "type": "commonjs",
   "scripts": {
     "dev": "npx mix",
     "prod": "npx mix --production",
+    "build:chrome-dev": "node tools/build-chrome-dev.js",
+    "launch:chrome-dev": "node tools/cdp/launch-local-chrome.js",
+    "reload:chrome-dev": "node tools/cdp/reload-chrome-dev.js --extension-id auto",
+    "reset:chrome-dev-tabs": "node tools/cdp/reset-chrome-dev-tabs.js --extension-id auto",
+    "dev:text-replace": "node tools/dev/text-replace.js",
+    "live:phase": "node tools/cdp/live-test-loop.js",
     "build:chrome": "web-ext build --config=chrome-config.cjs",
     "build:firefox": "web-ext build --config=firefox-config.cjs",
     "chrome": "web-ext run --config=chrome-config.cjs",
     "firefox": "web-ext run --config=firefox-config.cjs",
-    "test": "node test/subject.test.js"
+    "test": "node test/subject.test.js && node test/jobState.test.js && node test/swQueueRuntime.test.js && node test/walSnapshotStore.test.js && node test/walCheckpointShards.test.js && node test/walKeyedRead.test.js && node test/walIncrementalVerify.test.js && node test/walSnapshotStoreFuzz.test.js && node test/storageInvariants.test.js && node test/rawReportPages.test.js && node test/sharedModeration.test.js && node test/sharedModerationFuzz.test.js && node test/contentActionSelectors.test.js && node test/contentUnmuteVerification.test.js && node test/contentSpaceScopedState.test.js && node test/contentSourcePostResolution.test.js && node test/contentEnqueueChunkRetry.test.js && node test/contentInlineResolution.test.js && node test/cdpClickProfileExtensionAction.test.js && node test/requeueFailures.test.js && node test/swStorageMetrics.test.js && node test/p1-contract.test.js && node test/swSynthetic.test.js && node test/swScenarioFuzz.test.js",
+    "test:parallel": "node tools/run-tests-parallel.js",
+    "test:wal-fuzz": "node test/walSnapshotStoreFuzz.test.js",
+    "test:wal-fuzz:long": "WAL_FUZZ_PROFILE=long WAL_FUZZ_SEEDS=200 WAL_FUZZ_ROUNDS=300 WAL_FUZZ_ACTORS_MAX=8 node test/walSnapshotStoreFuzz.test.js",
+    "test:sw-fuzz": "node test/swScenarioFuzz.test.js",
+    "lint:correctness": "node tools/lint-correctness.js",
+    "lint:queue-boundary": "node tools/lint-sw-queue-boundary.js",
+    "lint:duplicates": "jscpd --config .jscpd.json",
+    "lint:block-classification": "node tools/lint-block-confirmation-classification.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "eslint": "^8.56.0",
+    "fallow": "^3.27.0",
+    "jscpd": "^5.2.1",
     "laravel-mix": "^6.0.49",
     "web-ext-plugin": "^2.9.0",
     "webextension-polyfill": "^0.12.0"
   },
   "dependencies": {
-    "puppeteer-core": "^24.43.0"
+    "fflate": "^0.8.3"
   }
 }

@@ -1,0 +1,10 @@
+{
+  "path": ["shared/js"],
+  "ignore": ["**/node_modules/**", "**/*.min.js"],
+  "minTokens": 60,
+  "minLines": 8,
+  "reporters": ["consoleFull"],
+  "format": ["javascript"],
+  "absolute": false,
+  "gitignore": true
+}

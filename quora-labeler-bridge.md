@@ -1,5 +1,12 @@
 # Quora Labeler Bridge Design
 
+Status: future architecture context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). This note informs
+future shared-moderation publication architecture, but it is not an active
+runtime plan.
+
 This note describes a concrete design for using **atproto labelers** as the publication layer for `mute-block-main`.
 
 The goal is:
@@ -462,9 +469,15 @@ Possibly something like:
 
 Current recommendation:
 
-- no, start with canonical HTTPS URLs
+- internally and for direct ATproto-style compatibility, start with canonical
+  HTTPS URLs
 
-Only introduce a custom scheme if URL instability becomes a major problem.
+For Quora shared-post transport, use `quora-profile:<slug>` in the posted JSON
+because Quora may rewrite rendered raw profile URL text. The extension can map
+that transport subject back to canonical HTTPS locally.
+
+Only introduce a broader custom subject scheme if URL instability becomes a
+major problem outside the Quora-post transport.
 
 ### 3. How should reasons/evidence be surfaced?
 

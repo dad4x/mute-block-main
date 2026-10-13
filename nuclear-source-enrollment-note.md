@@ -1,5 +1,12 @@
 # Space Classification And Nuclear Workflow Note
 
+Status: future workflow design context.
+
+Canonical planning now starts at [planning.md](planning.md). Canonical
+architecture starts at [architecture.md](architecture.md). This note remains
+useful for future Space workflow evolution, but the active lane is queue
+stabilization and reconciler/storage authority.
+
 This note is for design review only.
 
 It does not propose immediate implementation. The goal is to clarify how `mute-block-main` could evolve from its current direct-action `Nuke 'Em` behavior into a stateful workflow for classified Quora spaces and related feeds.

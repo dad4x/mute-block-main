@@ -1,0 +1,61 @@
+{
+  "localPublisher": {
+    "quora_profile": "quora-profile:Local-Publisher",
+    "atproto_did": null,
+    "display_name": "Local Publisher"
+  },
+  "journals": [
+    {
+      "schema": "com.muteblock.eventJournal",
+      "schema_version": 1,
+      "document_id": "mbj:fixture:2026-05-20:import-external",
+      "publisher": {
+        "quora_profile": "quora-profile:Other-Publisher",
+        "atproto_did": null,
+        "display_name": "Other Publisher"
+      },
+      "events": [
+        {
+          "event_id": "evt-import-profile-block-001",
+          "type": "profile.block.add",
+          "subject": "quora-profile:External-Target",
+          "occurred_at": "2026-05-20T00:07:00Z"
+        },
+        {
+          "event_id": "evt-import-profile-mute-001",
+          "type": "profile.mute.add",
+          "subject": "https://www.quora.com/profile/Noisy-Target/answers",
+          "occurred_at": "2026-05-20T00:08:00Z"
+        },
+        {
+          "event_id": "evt-import-space-001",
+          "type": "space.classification.set",
+          "space": "https://target-space.quora.com/",
+          "classification": {
+            "category": "target",
+            "mode": "reviewed"
+          },
+          "occurred_at": "2026-05-20T00:09:00Z"
+        }
+      ]
+    },
+    {
+      "schema": "com.muteblock.eventJournal",
+      "schema_version": 1,
+      "document_id": "mbj:fixture:2026-05-20:import-self",
+      "publisher": {
+        "quora_profile": "quora-profile:Local-Publisher",
+        "atproto_did": null,
+        "display_name": "Local Publisher"
+      },
+      "events": [
+        {
+          "event_id": "evt-import-self-profile-block-001",
+          "type": "profile.block.add",
+          "subject": "quora-profile:Already-Local",
+          "occurred_at": "2026-05-20T00:10:00Z"
+        }
+      ]
+    }
+  ]
+}
