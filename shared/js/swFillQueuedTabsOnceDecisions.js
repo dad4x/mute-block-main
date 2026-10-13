@@ -169,7 +169,7 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
         if(openReservationHref) {
             return {outcome: 'proceed', openReservationHref}
         }
-        releaseQueuedActivationGuard(next)
+        // The activation guard is claimed after the reservation now, so there is no guard to release here.
         if(openingActionKey) getQueuedTabFillOpeningActionKeys().delete(openingActionKey)
         queueRuntime.requeueActivationIntent(next, {
             source: 'runtime-effect'

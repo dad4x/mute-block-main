@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard</title>
-    <link rel="stylesheet" href="css/coordinator.css">
+        <link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/coordinator.css">
 </head>
 <body>
     <div class="worker-bar" id="workerBarView" hidden>
@@ -86,7 +87,7 @@
                             <span class="queue-count" id="queueCount" hidden>0 jobs</span>
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="startCoordinatorButton" type="button" hidden>Start</button>
-                                <button class="clear-button" id="pauseCurrentWorkButton" type="button">Pause</button>
+                                <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled>Loading...</button>
                                 <button class="clear-button clear-button--danger" id="cancelCurrentWorkButton" type="button">Cancel Queue</button>
                                 <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Cancel and remove all Current Work rows">Clear</button>
                                 <button class="clear-button" id="requeueFailedButton" type="button">Requeue</button>
@@ -94,6 +95,31 @@
                             </div>
                         </div>
                         <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
+                        <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
+                            <div class="panel-action-buttons">
+                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Download the service worker's flight recorder as JSON">Save flight recorder</button>
+                                <label class="dev-mode-select">Run for
+                                    <select id="debugResumeMinutesSelect">
+                                        <option value="0">No time limit</option>
+                                        <option value="1">1 minute</option>
+                                        <option value="5">5 minutes</option>
+                                        <option value="10">10 minutes</option>
+                                        <option value="20">20 minutes</option>
+                                    </select>
+                                    <span class="debug-run-countdown" id="debugRunTimeLeft"></span>
+                                </label>
+                                <label class="dev-mode-select">Until
+                                    <select id="debugResumeTargetsSelect">
+                                        <option value="0">No target limit</option>
+                                        <option value="1">1 target</option>
+                                        <option value="5">5 targets</option>
+                                        <option value="10">10 targets</option>
+                                        <option value="20">20 targets</option>
+                                    </select>
+                                    <span class="debug-run-countdown" id="debugRunTargetsLeft"></span>
+                                </label>
+                            </div>
+                        </div>
                         <div class="panel-action-state" id="lastEnqueueSummary" hidden></div>
                     </div>
                 </div>

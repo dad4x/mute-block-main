@@ -16,14 +16,6 @@
 // onto bare names in sw.js, same as every other still-ambient sw.js
 // function this module depends on (getActiveStorageContext).
 //
-// notifyCoordinatorAuthorityPersistedSnapshot reads coordinatorAuthoritySnapshotObserver,
-// a module-level `let` in sw.js assigned once well after this module is
-// constructed (coordinatorAuthority.absorbPersistedSnapshot is wired up
-// later in sw.js's initialization order). It's threaded through as a live
-// getSnapshotObserver() accessor, following the same get/set-accessor
-// convention swQueueWakeupMetricsShape.js uses for state it doesn't own,
-// so this module always sees the current value at call time rather than
-// whatever was assigned (or not yet assigned) at construction time.
 
 function createStorageMetrics(deps = {}) {
     const {
@@ -52,9 +44,6 @@ function createStorageMetrics(deps = {}) {
         setActiveStorageMetricDetail,
         getActiveStorageContext
     } = deps.handlers || {}
-    const {
-        getSnapshotObserver = () => null
-    } = deps.state || {}
 
     const SNAPSHOT_WRITE_REASONS = new Set([
         'ordinaryMutation',
@@ -336,23 +325,6 @@ function createStorageMetrics(deps = {}) {
         setActiveStorageMetricDetail('readPayloadPath', normalizeStorageMetricPathName(pathName))
     }
 
-    function notifyCoordinatorAuthorityPersistedSnapshot(payload = {}) {
-        const snapshotObserver = getSnapshotObserver()
-        if(typeof snapshotObserver !== 'function') return
-        if(payload &&
-            typeof payload === 'object' &&
-            Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY)) {
-            incrementQueueWakeupMetric('coordinatorAuthority.rawQueueSnapshotObserverIgnored')
-            return
-        }
-        try {
-            snapshotObserver(payload)
-        }
-        catch(error) {
-            incrementQueueWakeupMetric('coordinatorAuthority.snapshotObserverFailed')
-        }
-    }
-
     return {
         getStorageMetricKeyName,
         getJsonByteSize,
@@ -369,8 +341,7 @@ function createStorageMetrics(deps = {}) {
         recordQueueWriteOperationMetricValue,
         recordQueueWriteOperationMetrics,
         recordStoragePayloadMetrics,
-        recordStorageReadPayloadMetrics,
-        notifyCoordinatorAuthorityPersistedSnapshot
+        recordStorageReadPayloadMetrics
     }
 }
 

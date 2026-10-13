@@ -20,6 +20,103 @@ function registerServiceWorkerListeners(deps = {}) {
     const {
         browser
     } = deps
+
+    // Times a request a content script awaits before it acts (profile pages wait on these), so a slow
+    // worker shows up in the flight recorder as a content-request event. Diagnostic only.
+    function timeContentRequest(action, run) {
+        const startedAt = Date.now()
+        const record = accepted => recordFlightRecorderEvent({
+            kind: 'content-request',
+            source: 'swBootstrap',
+            reason: action,
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+            accepted,
+            changed: false
+        })
+        return Promise.resolve().then(run).then(
+            result => {
+                record(true)
+                return result
+            },
+            error => {
+                record(false)
+                throw error
+            }
+        )
+    }
+    // D4: the message actions that read coordinator state. Each waits for the resident authority before its handler runs.
+    // Every other action dispatches at once: the five that read only settings, metrics, the flight recorder, or in-memory debug
+    // status (get-debug-resume-limit-status, refresh-queue-wakeup-metrics-view, reset-queue-wakeup-metrics, get-flight-recorder,
+    // record-page-event) and any action no handler matches, which gets no response as before. An
+    // action added to the dispatch chain without an entry here runs ungated, so a read of an unloaded authority fails loudly.
+    const RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY = new Set([
+        'cloudflare-challenge-detected',
+        'create-tab',
+        'enqueue-coordinator-items',
+        'open-coordinator',
+        'open-coordinator-history',
+        'coordinator-page-ready',
+        'pause-coordinator-nukes',
+        'clear-coordinator-events',
+        'set-space-nuked-posts',
+        'set-space-pending-nuked-posts',
+        'set-coordinator-retry-failed-enabled',
+        'resume-paused-coordinator-nukes',
+        'cancel-coordinator-current-work',
+        'cancel-coordinator-current-work-item',
+        'clear-coordinator-current-work',
+        'reconcile-coordinator-storage',
+        'refresh-coordinator-queue-view',
+        'refresh-coordinator-runs-view',
+        'refresh-coordinator-dashboard-views',
+        'get-coordinator-queue-accounting',
+        'get-coordinator-why-not-running',
+        'clear-coordinator-terminal-stats',
+        'get-content-page-coordinator-state',
+        'resume-coordinator-queue',
+        'retry-coordinator-failed',
+        'requeue-coordinator-failed',
+        'claim-tab-action',
+        'resolve-queued-profile-target',
+        'resolve-queued-profile-target-failed',
+        'promote-queued-tab',
+        'activate-confirmation-in-page-world',
+        'begin-profile-action',
+        'request-action-lease',
+        'record-initial-blocked-state',
+        'heartbeat-action-lease',
+        'release-action-lease',
+        'release-job-tab',
+        'cancel-queued-owner-nukes',
+        'pause-owner-nukes',
+        'close-tab',
+        'record-job-milestone',
+        'record-job-terminal',
+        'record-direct-profile-progress',
+        'clear-profile-nuke-state',
+        'settle-terminal-coordinator-items',
+        'remove-pending-space-feed-urls',
+        'remove-pending-space-feed-entries',
+        'confirm-space-feed-profiles-blocked',
+        'get-owned-nuke-status',
+        'get-coordinator-queue-runtime-state',
+        'cleanup-owned-nuke-status',
+        'sweep-owned-blocked-profile-tabs',
+        'sweep-service-worker-blocked-profile-tabs'
+    ])
+
+    // The choke point (D4). A listener that can touch coordinator state runs only once the resident authority is loaded. A
+    // hydrated authority makes ensureCoordinatorAuthorityHydrated return null, so the run starts at once with no added await.
+    // A load that fails never reaches the handler: a listener that responds rejects, so the sender gets an error rather than a
+    // hang; a fire-and-forget listener drops it (the failed load is already recorded as a coordinator-authority-unavailable
+    // diagnostic).
+    function runAfterCoordinatorAuthorityReady(run, {respond = false} = {}) {
+        const pending = ensureCoordinatorAuthorityHydrated()
+        if(!pending) return run()
+        const ready = pending.then(() => run())
+        return respond ? ready : ready.catch(() => null)
+    }
+
     const {
         defaults,
         COORDINATOR_RESUME_ALARM_NAME,
@@ -74,6 +171,7 @@ function registerServiceWorkerListeners(deps = {}) {
         getCoordinatorWhyNotRunning,
         getErrorPageUrl,
         getFlightRecorder,
+        getDebugResumeLimitStatus,
         getLiveOwnedTabIds,
         getOwnedNukeStatus,
         getQueuedTabMetadata,
@@ -106,6 +204,17 @@ function registerServiceWorkerListeners(deps = {}) {
         openCoordinatorPage,
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
+        clearCoordinatorEventsRequested,
+        setSpaceNukedPostsRequested,
+        setSpacePendingNukedPostsRequested,
+        setCoordinatorRetryFailedEnabledRequested,
+        setExtensionSettingsRequested,
+        setSpaceSortRequested,
+        setSpaceRegistryRequested,
+        setDevModeEnabledRequested,
+        setHiddenRunIdsRequested,
+        claimDebugRunAutosaveRequested,
+        registerQueuedWorkerActionSurfaceRequested,
         promoteQueuedTab,
         reconcileCoordinatorStorageBestEffort,
         reconcileReleasedActiveCoordinatorTab,
@@ -133,6 +242,7 @@ function registerServiceWorkerListeners(deps = {}) {
         retryCoordinatorFailedItems,
         runPersistentFailedRetryTick,
         runScheduledCoordinatorQueueResume,
+        handleDebugResumeLimitAlarm,
         runScheduledCoordinatorReconcileTick,
         scheduleCoordinatorQueueResume,
         scheduleCoordinatorReconcile,
@@ -151,9 +261,12 @@ function registerServiceWorkerListeners(deps = {}) {
         terminalizeQueuedTabNonProfileLandingFromMetadata,
         terminalizeQueuedTabProfileRedirectMismatchFromMetadata,
         validateQueuedTabAttempt,
+        ensureCoordinatorAuthorityHydrated,
+        retireUnusedVersion15StorageKeys
     } = deps.handlers || {}
 
-    browser.runtime.onInstalled.addListener(details => {
+    function handleRuntimeInstalled(details) {
+        void retireUnusedVersion15StorageKeys().catch(() => null)
         const resetReason = details.reason === 'install'
             ? 'extension-installed'
             : 'extension-updated'
@@ -170,12 +283,18 @@ function registerServiceWorkerListeners(deps = {}) {
             scheduleStoredWorkRearmAfterExtensionReload(resetReason)
             return null
         })
-    })
-    browser.runtime.onStartup.addListener(() => {
+    }
+    function handleRuntimeStartup() {
+        void retireUnusedVersion15StorageKeys().catch(() => null)
         return handleCoordinatorBrowserStartup()
-    })
+    }
+    browser.runtime.onInstalled.addListener(details => runAfterCoordinatorAuthorityReady(() => handleRuntimeInstalled(details)))
+    browser.runtime.onStartup.addListener(() => runAfterCoordinatorAuthorityReady(() => handleRuntimeStartup()))
     if(browser.alarms?.onAlarm) {
-        browser.alarms.onAlarm.addListener(async alarm => {
+        const handleAlarm = async alarm => {
+            if(handleDebugResumeLimitAlarm(alarm?.name)) {
+                return null
+            }
             if(alarm?.name === COORDINATOR_RESUME_ALARM_NAME) {
                 if(isSuppressedStaleCoordinatorResumeAlarm(alarm)) {
                     incrementQueueWakeupMetric('pump.alarmStale')
@@ -214,9 +333,17 @@ function registerServiceWorkerListeners(deps = {}) {
                 }
                 void runPersistentFailedRetryTick()
             }
-        })
+        }
+        browser.alarms.onAlarm.addListener(alarm => runAfterCoordinatorAuthorityReady(() => handleAlarm(alarm)))
     }
-    browser.tabs.onRemoved.addListener(tabId => {
+    function handleTabRemoved(tabId) {
+        recordFlightRecorderEvent({
+            kind: 'tab-removed',
+            source: 'tabs.onRemoved',
+            tabId,
+            accepted: true,
+            changed: false
+        })
         notifyQueuedWorkerActionSurfaceSlotMaybeFreed()
 
         if(normalizeTabId(tabId) === normalizeTabId(getQueuedActionSurfaceAnchorTabId())) {
@@ -361,8 +488,9 @@ function registerServiceWorkerListeners(deps = {}) {
                 })
             }
         })
-    })
-    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    }
+    browser.tabs.onRemoved.addListener(tabId => runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId)))
+    function handleTabUpdated(tabId, changeInfo, tab) {
         const observedUrl = `${changeInfo.url || tab?.url || ''}`.trim()
         if(isQuoraRuntimeUrl(observedUrl)) {
             markQuoraRuntimeActivated('quora-tab-updated')
@@ -454,8 +582,9 @@ function registerServiceWorkerListeners(deps = {}) {
         queueRuntime.pauseQueuedOwner(tabId)
         const canceledUrls = cancelQueuedOwnerActions(tabId, 'nuke')
         rememberCanceledOwnerUrls(tabId, canceledUrls)
-    })
-    browser.storage.onChanged.addListener((changes, areaName) => {
+    }
+    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => runAfterCoordinatorAuthorityReady(() => handleTabUpdated(tabId, changeInfo, tab)))
+    function handleStorageChanged(changes, areaName) {
         if(areaName !== 'local') return
     
         if(getQuoraRuntimeActivated() && changes?.[COORDINATOR_RETRY_FAILED_ENABLED_KEY]?.newValue) {
@@ -495,11 +624,19 @@ function registerServiceWorkerListeners(deps = {}) {
                 allowBeforeQuora: true
             })
         }
-    })
+    }
+    browser.storage.onChanged.addListener((changes, areaName) => areaName === 'local'
+        ? runAfterCoordinatorAuthorityReady(() => handleStorageChanged(changes, areaName))
+        : undefined)
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = normalizeRuntimeMessageAction(request)
         request = {...(request || {}), action}
         markQuoraRuntimeActivatedFromRequest(request, sender, `message:${describeRuntimeMessage(request)}`)
+        if(!RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.has(request.action)) return dispatchRuntimeMessage(request, sender)
+        return runAfterCoordinatorAuthorityReady(() => dispatchRuntimeMessage(request, sender), {respond: true})
+    })
+
+    function dispatchRuntimeMessage(request, sender) {
     
         if(request.action === 'create-tab') {
             return createOwnedTab({
@@ -522,11 +659,10 @@ function registerServiceWorkerListeners(deps = {}) {
             return enqueueCoordinatorItems(request, sender)
         }
         else if(request.action === 'open-coordinator') {
-            // sender.tab is only populated for messages from a content
-            // script in a tab -- the popup has no tab of its own, so it
-            // sends its own window id explicitly (see popup.js). Prefer
-            // that when present; sender.tab?.windowId covers any other
-            // caller that IS a content script.
+            // sender.tab is only populated for messages from a tab. The
+            // preferences page sends its own window id as well (see
+            // preferences.js). Prefer that when present; sender.tab?.windowId
+            // covers any other caller that is a tab.
             return openCoordinatorPage({
                 windowId: Number.parseInt(request.windowId, 10) || sender.tab?.windowId || null,
                 active: request.active === true
@@ -555,8 +691,41 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'pause-coordinator-nukes') {
             return pauseCoordinatorNukes()
         }
+        else if(request.action === 'clear-coordinator-events') {
+            return clearCoordinatorEventsRequested()
+        }
+        else if(request.action === 'set-space-nuked-posts') {
+            return setSpaceNukedPostsRequested(request.nukedPosts)
+        }
+        else if(request.action === 'set-space-pending-nuked-posts') {
+            return setSpacePendingNukedPostsRequested(request.pendingNukedPosts)
+        }
+        else if(request.action === 'set-coordinator-retry-failed-enabled') {
+            return setCoordinatorRetryFailedEnabledRequested(request.enabled === true)
+        }
+        else if(request.action === 'set-extension-settings') {
+            return setExtensionSettingsRequested(request.settings)
+        }
+        else if(request.action === 'set-space-sort') {
+            return setSpaceSortRequested(request.sortBy)
+        }
+        else if(request.action === 'set-space-registry') {
+            return setSpaceRegistryRequested(request.spaceRegistry)
+        }
+        else if(request.action === 'set-dev-mode-enabled') {
+            return setDevModeEnabledRequested(request.enabled === true)
+        }
+        else if(request.action === 'set-hidden-run-ids') {
+            return setHiddenRunIdsRequested(request.runIds)
+        }
+        else if(request.action === 'claim-debug-run-autosave') {
+            return claimDebugRunAutosaveRequested(request.limitId)
+        }
+        else if(request.action === 'register-queued-worker-action-surface') {
+            return registerQueuedWorkerActionSurfaceRequested(sender)
+        }
         else if(request.action === 'resume-paused-coordinator-nukes') {
-            return resumePausedCoordinatorNukes()
+            return resumePausedCoordinatorNukes({debugLimit: request.debugLimit || null})
         }
         else if(request.action === 'cancel-coordinator-current-work') {
             return cancelCoordinatorCurrentWork()
@@ -656,6 +825,11 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'get-flight-recorder') {
             return getFlightRecorder(request)
         }
+        else if(request.action === 'get-debug-resume-limit-status') {
+            // Must be a promise: a plain return value gets no response from the listener, so the
+            // dashboard countdown never received an answer.
+            return Promise.resolve(getDebugResumeLimitStatus())
+        }
         else if(request.action === 'refresh-queue-wakeup-metrics-view') {
             return refreshQueueWakeupMetricsViewForDashboard(request.reason || 'dashboard-refresh')
         }
@@ -666,7 +840,7 @@ function registerServiceWorkerListeners(deps = {}) {
             return clearCoordinatorTerminalStats()
         }
         else if(request.action === 'get-content-page-coordinator-state') {
-            return getContentPageCoordinatorState(request, sender)
+            return timeContentRequest('get-content-page-coordinator-state', () => getContentPageCoordinatorState(request, sender))
         }
         else if(request.action === 'resume-coordinator-queue') {
             const userInitiated = request.userInitiated === true
@@ -754,6 +928,22 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'request-action-lease') {
             return requestCoordinatorActionLease(request, sender)
         }
+        else if(request.action === 'record-page-event') {
+            // Events the profile page reports about itself (a click on a block control, or the page's blocked
+            // state changing). clientAt is the page's own clock, so it is not the moment the message arrived.
+            recordFlightRecorderEvent({
+                kind: 'page-event',
+                source: 'content',
+                reason: `${request.event || ''}`.slice(0, 40),
+                statusAfter: `${request.detail || ''}`.slice(0, 80),
+                targetUrl: `${sender.tab?.url || ''}`.slice(0, 200),
+                tabId: sender.tab?.id || null,
+                at: Number.parseInt(request.clientAt, 10) || undefined,
+                accepted: true,
+                changed: false
+            })
+            return Promise.resolve({recorded: true})
+        }
         else if(request.action === 'record-initial-blocked-state') {
             return recordInitialBlockedStateFromRequest(request, sender)
         }
@@ -781,11 +971,13 @@ function registerServiceWorkerListeners(deps = {}) {
                 })
         }
         else if(request.action === 'cancel-queued-owner-nukes') {
-            const ownerTabId = sender.tab?.id || null
-            const canceledUrls = consumeCanceledOwnerUrls(ownerTabId)
-                .concat(cancelQueuedOwnerActions(ownerTabId, 'nuke'))
-            return Promise.resolve({
-                canceledUrls
+            return timeContentRequest('cancel-queued-owner-nukes', () => {
+                const ownerTabId = sender.tab?.id || null
+                const canceledUrls = consumeCanceledOwnerUrls(ownerTabId)
+                    .concat(cancelQueuedOwnerActions(ownerTabId, 'nuke'))
+                return {
+                    canceledUrls
+                }
             })
         }
         else if(request.action === 'pause-owner-nukes') {
@@ -833,9 +1025,9 @@ function registerServiceWorkerListeners(deps = {}) {
             return Promise.resolve({closed: false})
         }
         else if(request.action === 'record-job-milestone') {
-            return recordJobProgressFromRequest(request, sender, {
+            return timeContentRequest('record-job-milestone', () => recordJobProgressFromRequest(request, sender, {
                 expectTerminal: false
-            })
+            }))
         }
         else if(request.action === 'record-job-terminal') {
             return recordJobProgressFromRequest(request, sender, {
@@ -914,7 +1106,7 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'sweep-service-worker-blocked-profile-tabs') {
             return sweepServiceWorkerBlockedProfileTabs()
         }
-    })
+    }
     browser.webRequest.onCompleted.addListener(details => {
         if(details.url.match(/TribePeopleModalQuery/i)) {
             sendTabMessage(details.tabId, {status: 'space-people-modal-loaded'})

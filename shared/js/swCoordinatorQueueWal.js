@@ -2,7 +2,6 @@ const {
     appendWalRecordsToGeneration,
     buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
-    getWalRecordsForGeneration,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     isSegmentedWalStorageMeta,
@@ -55,9 +54,12 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
             COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS.has(normalizeQueueWriteOperationName(operationKind || ''))
     }
 
+    // A valid store is returned as it is, not copied. The callers only read it: the two queue appends (the single and the
+    // batch path, which pass it to appendWalRecordsToGeneration, and that never writes into its input), and the monolith
+    // fallback in swQueueWalStore.js, which passes a fresh storage read. Callers must not write into the returned store.
     function normalizeCoordinatorQueueWalStore(value = null, snapshotQueue = {}) {
         if(value && typeof value === 'object' && value.meta && value.checkpoints && value.wal) {
-            return cloneCoordinatorAuthorityValue(value)
+            return value
         }
         return makeCoordinatorQueueWalCheckpoint(snapshotQueue)
     }
@@ -126,7 +128,17 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         const residentSegments = getSegmentedWalCommittedSegmentCount(residentMeta, activeCheckpoint)
         if(residentSegments < requiredSegments) return false
 
-        return getWalRecordsForGeneration(residentStore, activeCheckpoint).length >= 0
+        // Every check above has passed. This used to end with getWalRecordsForGeneration(...).length >= 0, a full pass over
+        // the active records that re-normalized every record and added nothing to the result. Its one effect was a throw on
+        // a malformed active generation. The cheap part of that check stays: a generation whose segments are not an array
+        // of objects is not usable, and the caller falls back to storage. Record shape is not re-checked here, because
+        // resident records are normalized when they are written.
+        const activeGeneration = residentStore.wal[activeCheckpoint]
+        if(activeGeneration && (!Array.isArray(activeGeneration.segments) ||
+            activeGeneration.segments.some(segment => !segment || typeof segment !== 'object'))) {
+            return false
+        }
+        return true
     }
 
     function getCoordinatorQueueWalPhysicalPayload(store = {}, options = {}) {
@@ -345,33 +357,48 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
     }
 
     // Incremental verification (2026-10-09, option (b) of the codex take-2 review). Applies the appended
-    // records to the authority's own pre-append queue with the same reducer recovery uses, instead of
+    // records to the authority's own pre-append state with the same reducer recovery uses, instead of
     // recovering the whole WAL after every append. It fails closed the same way: any record the reducer
     // ignores fails the append. It returns null, and the caller falls back to full recovery, whenever it
-    // cannot establish the base: no base queue, a record outside the queue area (completed-history
-    // archives), or appended seqs that are not the contiguous tail ending at nextSeq - 1.
+    // cannot establish the base: no base queue; no base completed map (options.baseCompleted, null when the
+    // caller's resident map is not loaded); a record outside the queue and completed areas; appended seqs that
+    // are not the contiguous tail ending at nextSeq - 1; or a base whose nextSeq is not the append's first seq.
+    // The completed area (archived rows, and the removals that pull them back out) is applied to a copy of
+    // baseCompleted, made once, as the queue is copied, and only when the append touches that area, so the
+    // caller's maps are never written. When it did, authoritativeProjectionCompleted is the copy, which equals
+    // the completed map full recovery returns. When it did not, the field is null: no caller reads it, and
+    // copying every completed row for each queue-only append would cost more than the check it serves.
     // Full recovery still runs at hydrate and at every checkpoint switch. Those bound how long any drift
     // between the in-memory base and storage can last.
     function verifyAppendedIncrementally(append = {}, options = {}) {
         const baseQueue = options.baseQueue || null
         if(!baseQueue || typeof baseQueue !== 'object' || Array.isArray(baseQueue)) return null
+        const baseCompleted = options.baseCompleted || null
+        if(!baseCompleted || typeof baseCompleted !== 'object' || Array.isArray(baseCompleted)) return null
         const records = (append.records || []).map(makeWalRecord)
         if(!records.length) return null
-        if(records.some(record => record.area !== 'queue')) return null
+        if(records.some(record => record.area !== 'queue' && record.area !== 'completed')) return null
+        const touchesCompleted = records.some(record => record.area === 'completed')
         const nextSeq = Number.parseInt(append.store?.meta?.nextSeq, 10) || 0
         const firstSeq = nextSeq - records.length
         const seqs = records.map(record => record.seq).sort((left, right) => left - right)
         if(seqs.some((seq, index) => seq !== firstSeq + index)) return null
-        // The base must be the state the append was prepared against. A base that predates a later write
-        // would start one seq early or late, so only an exact match with the pre-append nextSeq is trusted.
+        // The base must be the state the append was prepared against. Callers build the append on the same stored WAL
+        // they take the base from, so this match holds by construction. It rejects a base whose nextSeq disagrees with
+        // the store's own seq numbering. It cannot tell a stale base from a current one: the caller's resident maps
+        // must move only together with the stored WAL, and that is what keeps the base current.
         const baseNextSeq = Number.parseInt(options.baseNextSeq, 10)
         if(!Number.isFinite(baseNextSeq) || baseNextSeq !== firstSeq) return null
 
         const ordered = records.slice().sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
-        // The base is copied once. The reducer then writes into that copy, and never into the caller's map.
+        // Each base is copied once, as a whole map. The reducer then writes into those copies, and never into the caller's maps.
         let state = {queue: {...baseQueue}}
         const appliedIds = new Set()
         const ownedAreas = new Set(['queue'])
+        if(touchesCompleted) {
+            state.completed = {...baseCompleted}
+            ownedAreas.add('completed')
+        }
         const ignored = []
         for(const record of ordered) {
             const result = applyWalRecord(state, record, {snapshotSeq: 0, appliedIds, ownedAreas})
@@ -383,7 +410,7 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
             recoveredAfterAppend: null,
             ignoredAppendedRecords: ignored,
             authoritativeProjectionQueue: state.queue,
-            authoritativeProjectionCompleted: null,
+            authoritativeProjectionCompleted: touchesCompleted ? state.completed : null,
             reason: ignored[0]?.reason || '',
             incremental: true
         }

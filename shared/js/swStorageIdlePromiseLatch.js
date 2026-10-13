@@ -60,6 +60,8 @@
 // under `state`, matching the convention already used by
 // swQueueWakeupMetricsShape.js.
 
+const {NO_DURABLE_WORK_REASON_LIMIT} = require('./tunables')
+
 function createStorageIdlePromiseLatch(deps = {}) {
     const {
         now: getNow = () => Date.now()
@@ -216,6 +218,18 @@ function createStorageIdlePromiseLatch(deps = {}) {
         return 'timeout.unknown'
     }
 
+    // Distinct reasons that already have a no-work counter. Past NO_DURABLE_WORK_REASON_LIMIT, new reasons count as "other".
+    const noDurableWorkReasonKeys = new Set()
+    function getNoDurableWorkReasonKey(reason = '') {
+        const normalized = `${reason || 'none'}`.trim().slice(0, 60).replace(/\s+/g, '-') || 'none'
+        if(noDurableWorkReasonKeys.has(normalized)) return normalized
+        if(noDurableWorkReasonKeys.size < NO_DURABLE_WORK_REASON_LIMIT) {
+            noDurableWorkReasonKeys.add(normalized)
+            return normalized
+        }
+        return 'other'
+    }
+
     function recordStorageIdleChurnCounters(context = {}) {
         const runtimeCounts = queueRuntime.getRuntimeCounts()
         const runtimeHasWork = runtimeCounts.activeQueuedTabs > 0 ||
@@ -229,7 +243,10 @@ function createStorageIdlePromiseLatch(deps = {}) {
             !context.queueWriteOperation
 
         if(!runtimeHasWork) incrementQueueWakeupMetric('storageUpdate.noRuntimeWork')
-        if(!durableHasWork) incrementQueueWakeupMetric('storageUpdate.noDurableWork')
+        if(!durableHasWork) {
+            incrementQueueWakeupMetric('storageUpdate.noDurableWork')
+            incrementQueueWakeupMetric(`storageUpdate.noDurableWork.reason.${getNoDurableWorkReasonKey(context.reason)}`)
+        }
         if(durableHasWork &&
             !runtimeHasWork &&
             context.paused !== true &&

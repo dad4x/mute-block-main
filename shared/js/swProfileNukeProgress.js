@@ -3,9 +3,11 @@
 // shape/summarization layer plus its sharded storage view: the record
 // summarizer, the compact progress view builder, the shard index/key
 // helpers, the shard-defaults builders, the projection-defaults builder,
-// the shard payload builder, the nonterminal-authority predicate used to
-// filter progress out of the content-page projection, the view/shard
-// record update and removal helpers, the shard-records normalizer, the
+// the shard payload builder, the content-page projection filter (a queued
+// profile or a terminal record keeps its progress), the stored-projection
+// content comparison the door's progress repair uses to write only the keys
+// that changed, the view/shard record update and removal helpers, the
+// shard-records normalizer, the
 // records-from-projection getter, and the content-page-state projection
 // payload assembler (which composes this module's own state with
 // swCoordinatorQueueView.js's and swCoordinatorContentQueueIndex.js's
@@ -68,6 +70,7 @@ function createProfileNukeProgress(deps = {}) {
         getNormalizedProfileHrefList,
         makeProjectionShardDefaults,
         isTerminalCoordinatorStatus,
+        isTerminalProfileNukeRecord,
         getCoordinatorItemHref,
         normalizeProfileNukeProgressView,
         normalizeCoordinatorMap,
@@ -95,6 +98,7 @@ function createProfileNukeProgress(deps = {}) {
         if(!href) return null
 
         const source = record && typeof record === 'object' ? record : {}
+        const generation = Number.parseInt(source.generation, 10) || 0
         return {
             profileHref: href,
             status: source.status || '',
@@ -150,7 +154,11 @@ function createProfileNukeProgress(deps = {}) {
             // dropped here, or the guard loses its stored basis for
             // comparison across a service-worker restart.
             clearedAt: Number.parseInt(source.clearedAt, 10) || 0,
-            directProgressClientUpdatedAt: Number.parseInt(source.directProgressClientUpdatedAt, 10) || 0
+            directProgressClientUpdatedAt: Number.parseInt(source.directProgressClientUpdatedAt, 10) || 0,
+            // Set by the write door on every upsert (sw.js applyCoordinatorProgressDeltas). Kept in both the view
+            // entry and the shard entry. Records written before generations existed have none, so the key is left
+            // out rather than written as 0.
+            ...(generation > 0 ? {generation} : {})
         }
     }
 
@@ -259,14 +267,59 @@ function createProfileNukeProgress(deps = {}) {
         })
     }
 
+    // A record is kept when its profile is queued (hasNonterminalCoordinatorAuthorityForProfile: a nonterminal queue row)
+    // or when the record itself is terminal (isTerminalProfileNukeRecord, the record-level predicate). Any other record,
+    // for example an in-flight action for a profile that is not queued, is dropped.
     function filterProfileNukeProgressForContentProjection(progress = {}, queue = {}) {
         const normalized = normalizeStoredProfileNukeProgress(progress || {})
         const filtered = {}
         for(const [profileHref, record] of Object.entries(normalized)) {
-            if(hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref)) continue
+            if(!hasNonterminalCoordinatorAuthorityForProfile(queue, profileHref) &&
+                !isTerminalProfileNukeRecord(record)) continue
             filtered[profileHref] = record
         }
         return filtered
+    }
+
+    // Canonical JSON for comparing projection values: object keys sorted at every depth, undefined members left out, so
+    // two values with the same content give the same string whatever their key order.
+    function stableProfileNukeProgressProjectionJson(value) {
+        if(Array.isArray(value)) return `[${value.map(stableProfileNukeProgressProjectionJson).join(',')}]`
+        if(value && typeof value === 'object') {
+            return `{${Object.keys(value)
+                .filter(key => value[key] !== undefined)
+                .sort()
+                .map(key => `${JSON.stringify(key)}:${stableProfileNukeProgressProjectionJson(value[key])}`)
+                .join(',')}}`
+        }
+        return JSON.stringify(value === undefined ? null : value)
+    }
+
+    // The content of a progress view or shard: its own updatedAt and each record's updatedAt are left out. A timestamp is
+    // not content. normalizeStoredProfileNukeProgress (swProfileProgressMerge.js) sets every record's updatedAt to now(),
+    // so a derived value always carries new timestamps and could never equal the stored one.
+    function getProfileNukeProgressProjectionContent(value) {
+        if(!value || typeof value !== 'object' || Array.isArray(value)) return value
+        const content = {...value}
+        delete content.updatedAt
+        if(content.records && typeof content.records === 'object' && !Array.isArray(content.records)) {
+            content.records = Object.fromEntries(Object.entries(content.records).map(([profileHref, record]) => {
+                if(!record || typeof record !== 'object' || Array.isArray(record)) return [profileHref, record]
+                const recordContent = {...record}
+                delete recordContent.updatedAt
+                return [profileHref, recordContent]
+            }))
+        }
+        return content
+    }
+
+    // The keys of derived (a progress view and the shard payload, as buildProfileNukeProgressView and
+    // buildProfileNukeProgressShardPayload build them) whose content differs from stored[key]. A missing stored value
+    // differs from every derived value. Timestamps are ignored (getProfileNukeProgressProjectionContent).
+    function getChangedProfileNukeProgressProjectionKeys(stored = {}, derived = {}) {
+        return Object.keys(derived || {}).filter(key =>
+            stableProfileNukeProgressProjectionJson(getProfileNukeProgressProjectionContent(stored?.[key])) !==
+            stableProfileNukeProgressProjectionJson(getProfileNukeProgressProjectionContent(derived[key])))
     }
 
     function updateProfileNukeProgressViewRecords(view = null, progressRecords = {}, nowMs = now()) {
@@ -446,6 +499,7 @@ function createProfileNukeProgress(deps = {}) {
         buildProfileNukeProgressShardPayload,
         hasNonterminalCoordinatorAuthorityForProfile,
         filterProfileNukeProgressForContentProjection,
+        getChangedProfileNukeProgressProjectionKeys,
         updateProfileNukeProgressViewRecords,
         updateProfileNukeProgressShardRecord,
         removeProfileNukeProgressViewRecords,

@@ -78,7 +78,7 @@ async function init() {
     spaceSortBy.value = popupState.sortBy
 
     if(!haveSameNukedPostKeys(settings[SPACE_NUKED_POSTS_KEY] || {}, popupState.nukedPosts)) {
-        await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: popupState.nukedPosts})
+        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
     }
 
     form.addEventListener('submit', async event => {
@@ -104,15 +104,14 @@ async function init() {
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
         maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
 
-        await browser.storage.local.set({
-            ...nextSettings,
-            [SPACE_NUKED_POSTS_KEY]: popupState.nukedPosts
-        })
+        // The worker owns every write. Settings and nuked posts both go through it.
+        await browser.runtime.sendMessage({action: 'set-extension-settings', settings: nextSettings})
+        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
         showStatus(status, 'Settings saved.')
     })
 
     form.addEventListener('reset', async () => {
-        await browser.storage.local.set(defaults)
+        await browser.runtime.sendMessage({action: 'set-extension-settings', settings: defaults})
 
         fopDelay.value = defaults.fopDelay
         flipToAnswers.checked = defaults.flipToAnswers
@@ -128,7 +127,7 @@ async function init() {
             retentionDays: popupState.nukedPostRetentionDays,
             maxEntries: popupState.maxRememberedNukedPosts
         })
-        await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: popupState.nukedPosts})
+        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
 
         showStatus(status, 'Settings reset.')
     })
@@ -136,7 +135,7 @@ async function init() {
     spaceSortBy.addEventListener('change', async () => {
         popupState.sortBy = spaceSortBy.value === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME
         renderSpaceList(spaceList)
-        await browser.storage.local.set({[SPACE_SORT_KEY]: popupState.sortBy})
+        await browser.runtime.sendMessage({action: 'set-space-sort', sortBy: popupState.sortBy})
     })
 
     spaceList.addEventListener('click', event => {
@@ -228,7 +227,7 @@ async function updateSpaceCategory(spaceKey, category, container) {
     }
 
     renderSpaceList(container)
-    await browser.storage.local.set({[SPACE_REGISTRY_KEY]: popupState.spaceRegistry})
+    await browser.runtime.sendMessage({action: 'set-space-registry', spaceRegistry: popupState.spaceRegistry})
 }
 
 function renderSpaceList(container) {
