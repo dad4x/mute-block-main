@@ -458,7 +458,13 @@ function createProfileProgressMerge(deps = {}) {
 
     function ensureProfileNukeProgressReady() {
         if(!profileNukeProgressReady) {
-            profileNukeProgressReady = loadProfileNukeProgress()
+            const pending = loadProfileNukeProgress()
+            profileNukeProgressReady = pending
+            // A failed load (an authority that cannot be loaded, P4) must not stay latched. The next caller loads again. The
+            // callers await the load itself, so this handler adds no tick to a successful load.
+            pending.catch(() => {
+                if(profileNukeProgressReady === pending) profileNukeProgressReady = null
+            })
         }
         return profileNukeProgressReady
     }

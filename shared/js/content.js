@@ -14,6 +14,7 @@ catch {}
 
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const { BRAND_RED } = require('./colorTokens')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -348,6 +349,11 @@ async function init() {
     if(initialPage === 'profile') {
         ensureProfileButtons()
         scheduleProfileButtonsFollowUps()
+        installProfilePageEventListeners()
+        // The observer re-inserts the buttons when Quora renders its menu. It used to start only after the
+        // two worker round trips below (up to 7 s under load), so buttons were late exactly when the worker
+        // was busy. It depends only on this page's DOM, so it can start here.
+        startObserver()
     }
 
     settings = await safeStorageGet(defaults)
@@ -357,7 +363,8 @@ async function init() {
     spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
     await refreshCoordinatorQueueFromRuntime({force: true})
     if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
-        await safeStorageSet({[SPACE_NUKED_POSTS_KEY]: spaceNukedPosts})
+        // The worker owns the space nuked-post keys (set-space-nuked-posts). Bounded, so the wait cannot stall init.
+        await safeSendRuntimeMessageWithTimeout({action: 'set-space-nuked-posts', nukedPosts: spaceNukedPosts}, null)
     }
     setStorageChangeListenerEnabled(true)
     installNavigationHooks()
@@ -709,19 +716,6 @@ async function sendQueuedProfileResolutionMessageWithRetry(message) {
     }
 
     return result
-}
-
-async function safeStorageSet(value) {
-    const storageArea = getStorageArea()
-    if(!storageArea?.set) return
-
-    try {
-        await storageArea.set(value)
-    }
-    catch(error) {
-        if(isExtensionContextInvalidatedError(error)) return
-        throw error
-    }
 }
 
 async function reconcileReloadCanceledNukes() {
@@ -1342,6 +1336,39 @@ function reportInitialBlockedStateIfQueued(blocked) {
 // "recorded once, first report wins" race to whichever observation reached
 // the service worker first *after* activeQueuedAttemptId was finally set --
 // misclassifying a genuine live block as already-blocked.
+// Diagnostic events for the flight recorder: what the user did on the page and when the page's blocked
+// state changed. Stamped with this page's clock so they line up with the worker's own events.
+function reportPageEvent(event, detail = '') {
+    void safeSendRuntimeMessage({
+        action: 'record-page-event',
+        event,
+        detail: `${detail || ''}`.slice(0, 80),
+        clientAt: Date.now()
+    }).catch(() => null)
+}
+
+let lastReportedProfileBlocked = null
+
+function reportProfileBlockedTransition() {
+    if(getPageType() !== 'profile') return
+    const blocked = !!isProfileBlocked()
+    if(blocked === lastReportedProfileBlocked) return
+    lastReportedProfileBlocked = blocked
+    reportPageEvent('profile-blocked-state', blocked ? 'blocked' : 'not-blocked')
+}
+
+function installProfilePageEventListeners() {
+    for(const type of ['pointerdown', 'click']) {
+        document.addEventListener(type, event => {
+            if(getPageType() !== 'profile') return
+            const target = event.target?.closest?.('button, a, [role="menuitem"], [role="menu"] *') || event.target
+            const label = `${target?.textContent || target?.getAttribute?.('aria-label') || ''}`.replace(/\s+/g, ' ').trim()
+            if(!/mute|block|unmute|unblock|confirm|yes/i.test(label)) return
+            reportPageEvent(`user-${type}`, label)
+        }, true)
+    }
+}
+
 function reportInitialBlockedStateUnconditionally(blocked) {
     void safeSendRuntimeMessageWithTimeout({
         action: 'record-initial-blocked-state',
@@ -1777,7 +1804,12 @@ async function waitForOwnedNukeTabsToDrain(button, timeoutMs = WAIT_FOR_OWNED_NU
     return false
 }
 
+let observerStarted = false
+
 function startObserver() {
+    if(observerStarted) return
+    observerStarted = true
+
     new MutationObserver(async mutations => {
         if(location.href !== currentUrl) {
             const previousProfileKey = getProfileKey(currentUrl)
@@ -1805,7 +1837,13 @@ function startObserver() {
 
         const page = getPageType()
 
+        if(page === 'profile') reportProfileBlockedTransition()
         if(page === 'profile' && shouldRefreshProfileButtons(mutations)) {
+            scheduleProfileButtonsRefresh()
+        }
+        // The buttons wait for Quora's menu button, which may appear without the menu nodes checked above.
+        if(page === 'profile' && !isProfileBlocked() &&
+            !document.querySelector('.mb-ext_mute-block-btn') && getProfileMenuButton()) {
             scheduleProfileButtonsRefresh()
         }
 
@@ -2233,6 +2271,11 @@ function onMessage(request, sender, sendResponse) {
             }
         }
 
+        // A redirected profile (for example /profile/<slug> redirected to /<slug>) lands on Quora's
+        // not-found page. That page is not a profile page, so it reaches this fall-through instead.
+        if(isQuoraNotFoundPage()) {
+            return Promise.resolve({willClose: false, reason: 'page-not-found', pageUnavailable: true, unavailableReason: 'Page Not Found', lastUrl: location.href})
+        }
         return Promise.resolve({willClose: false, armed: false})
     }
 
@@ -3041,6 +3084,11 @@ function getProfileUnavailableReason() {
     return ''
 }
 
+function isQuoraNotFoundPage() {
+    const bodyText = (document.body?.innerText || '').replace(/s+/g, ' ').trim().toLowerCase()
+    return /page not found/.test(bodyText) && /couldn'?t find the page you were looking for/.test(bodyText)
+}
+
 function getQuestionLogHref() {
     return location.origin + location.pathname.replace(/\/$/, '') + '/log'
 }
@@ -3761,7 +3809,7 @@ function getOrCreateContentProgressBar() {
     fill.className = `${CONTENT_PROGRESS_BAR_ID}-fill`
     fill.style.height = '100%'
     fill.style.width = '0%'
-    fill.style.background = '#b92b27'
+    fill.style.background = BRAND_RED
     fill.style.transition = 'width 200ms ease'
     track.appendChild(fill)
 
@@ -5027,6 +5075,11 @@ function toggleMuteBlockBtn() {
         existingBtn?.remove()
     }
     else {
+        // Not inserted until Quora's own profile menu exists: a press before that fails at once.
+        if(!getProfileMenuButton()) {
+            existingBtn?.remove()
+            return
+        }
         let target = getProfileButtonInsertionTarget()
         if(!target) return
 
@@ -5073,6 +5126,10 @@ function toggleMuteBlockCloseBtn() {
         existingBtn?.remove()
     }
     else {
+        if(!getProfileMenuButton()) {
+            existingBtn?.remove()
+            return
+        }
         let target = getProfileButtonInsertionTarget()
         if(!target) return
 
@@ -6767,7 +6824,7 @@ async function setCurrentSpaceCategory(space, category) {
 
     syncSpaceClassificationControls()
     scheduleSpaceAssetNukeControls(0)
-    await safeStorageSet({[SPACE_REGISTRY_KEY]: spaceRegistry})
+    await safeSendRuntimeMessage({action: 'set-space-registry', spaceRegistry}, null)
 }
 
 function getClosestCommonAncestor(nodes) {
@@ -9084,7 +9141,8 @@ async function registerPendingSpaceFeedEntries(space, entries) {
     if(!changed) return
 
     spacePendingNukedPosts = nextRecords
-    await safeStorageSet({[SPACE_PENDING_NUKED_POSTS_KEY]: nextRecords})
+    // The worker owns the pending nuked-post key (set-space-pending-nuked-posts).
+    await safeSendRuntimeMessage({action: 'set-space-pending-nuked-posts', pendingNukedPosts: nextRecords}, null)
 }
 
 async function removePendingSpaceFeedUrls(urls) {
@@ -13264,13 +13322,17 @@ async function muteProfile(options = {}) {
     // persisted record's actionKind blank forever: harmless behaviorally
     // (nothing branches on it for the mute-block path), but useless for the
     // recorded history this exists to support.
-    await recordCurrentProfileNukeProgress({
+    // Sent now but not awaited. It used to hold up the menu until the worker
+    // had written it through the storage queue, which under load was seconds.
+    // The message is still sent first, so the write stays ahead of the later
+    // milestones; a failure is caught below and does not stop the flow.
+    void recordCurrentProfileNukeProgress({
         actionKind: 'mute-block',
         status: 'muting',
         muteAttempted: true,
         muteAttemptedAt: Date.now(),
         event: 'Mute flow started'
-    })
+    }).catch(() => null)
 
     const menuOpened = await ensureProfileMenuOpen(2500, silent, allowForegroundFallback)
     if(!menuOpened) {
@@ -13282,7 +13344,7 @@ async function muteProfile(options = {}) {
         return allowBlockFallback ? blockProfile({silent, allowForegroundFallback}) : false
     }
 
-    await sleep(500)
+    // No fixed sleep here: the menu-state wait below polls until the items render.
 
     const muteState = await waitForMenuStateWithForegroundFallback(isMuteActionLabel, isUnmuteActionLabel, {
         timeoutMs: 5000,

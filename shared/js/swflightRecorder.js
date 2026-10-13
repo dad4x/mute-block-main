@@ -26,79 +26,9 @@ const {
     normalizeTabTargetUrl
 } = require('./subject')
 
-const FLIGHT_RECORDER_CAPACITY = 20000 // 2026-09-13: temporarily 10x'd to survive multiple reloads while chasing WAL segment-gap corruption
+const {FLIGHT_RECORDER_CAPACITY} = require('./tunables')
 const FLIGHT_RECORDER_STRING_MAX = 240
 const FLIGHT_RECORDER_URL_MAX = 500
-const FLIGHT_RECORDER_KINDS = new Set([
-    "start-resume",
-    "activation-guard-claim",
-    "activation-guard-release",
-    "activation-guard-hit",
-    "activation-guard-prune",
-    "fill-decision",
-    "fill-recovery",
-    "executor-classification",
-    "queue-drained",
-    "authority-mutation",
-    "compact-view-materialized",
-    "dashboard-refresh",
-    "window-focus-request",
-    "tab-open-request",
-    "tab-open-result",
-    "queued-tab-open-decision",
-    "queued-tab-action-pruned",
-    "queued-tab-pre-open-recovery",
-    "queued-tab-final-open-recovery",
-    "queued-attempt-identity-materialization",
-    "active-transition",
-    "queued-tab-runtime-missing",
-    "actorless-requeue",
-    "retry-budget-terminalization",
-    "retry-budget-recovery",
-    "enqueue-failure-terminalization-skip",
-    "enqueue-failure-requeue",
-    "enqueue-failure-terminalization",
-    "already-blocked-observation",
-    "blocked-sweep-terminal-result",
-    "blocked-live-tab-terminal-result",
-    "closed-before-terminal-requeue",
-    "tab-action-claim",
-    "tab-action-release",
-    "close-if-blocked-sent",
-    "close-if-blocked-response",
-    "cloudflare-challenge-detected",
-    "queue-wal-checkpoint-switch-start",
-    "queue-wal-checkpoint-switch-result",
-    "queue-wal-auto-recovery",
-    // 2026-09-29 tracing addition (project_open_issues_2026_09_27.md issue
-    // 2/classification): item.initialBlockedState (mutateCoordinatorInitialBlockedState,
-    // sw.js) decides reallyBlocked vs alreadyBlocked for the entire life of a
-    // row and is captured exactly once, first-report-wins -- but had no
-    // tracing at all, so a misclassification (confirmed live: FPT-Camera-3
-    // landed alreadyBlocked despite ~23s of active in-session polling that
-    // looks like a genuine live block, not a pre-existing one) couldn't be
-    // traced back to which report won the race, or why the early
-    // not-blocked observations apparently lost it.
-    "initial-blocked-state-record",
-    // 2026-09-29: Zoe-Lyta orphaned-tab incident -- terminalizeActiveCoordinatorItemFromBlockedLiveTab
-    // archived the row as succeeded and reported terminalized:true, but the
-    // live browser tab stayed open (found later with no mbCoordinatorQueue
-    // record at all). browser.tabs.remove() was wrapped in .catch(() => {})
-    // with no trace of the outcome, so a failed/no-op removal was
-    // indistinguishable from a successful one after the fact.
-    "terminal-tab-close-result",
-    // 2026-09-30: splits a handoff gap (activationHandoffTiming's single
-    // terminal->nextActive number) into its three stages -- previous row's
-    // profile-action-finalized -> this row's tab-open-request is our own
-    // scheduling overhead; tab-open-request -> tab-page-load-complete is
-    // the browser's page load, not ours; tab-page-load-complete -> this
-    // row's own profile-action-finalized is our block-and-finalize
-    // processing. Correlated across the three by targetUrl (and rowKey/
-    // runId where available), not a dedicated id, since they're emitted
-    // from three independent call sites that don't share one.
-    "tab-page-load-complete",
-    "profile-action-finalized"
-])
 
 let flightRecorderSeq = 0
 let flightRecorderDroppedCount = 0
@@ -117,86 +47,45 @@ function sanitizeFlightRecorderInteger(value = null) {
     return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function sanitizeFlightRecorderBoolean(value = null) {
-    return typeof value === "boolean" ? value : undefined
-}
-
 function sanitizeFlightRecorderUrl(value = "") {
     const text = sanitizeFlightRecorderString(value, FLIGHT_RECORDER_URL_MAX)
     if(!text) return ""
     return normalizeQuoraProfileUrl(text) || normalizeTabTargetUrl(text) || text
 }
 
+// Every event is kept, and every field is saved. Text is capped and whitespace collapsed; target URLs
+// are normalized; numbers and booleans are kept; objects are saved as capped JSON. Only an entry that
+// is not an object, or has no kind, is dropped.
+function sanitizeFlightRecorderValue(field = "", value) {
+    if(value === null || value === undefined) return undefined
+    if(typeof value === "number") return Number.isFinite(value) ? value : undefined
+    if(typeof value === "boolean") return value
+    if(typeof value === "string") {
+        return field === "targetUrl" ? sanitizeFlightRecorderUrl(value) : sanitizeFlightRecorderString(value)
+    }
+    try {
+        return sanitizeFlightRecorderString(JSON.stringify(value), FLIGHT_RECORDER_STRING_MAX)
+    }
+    catch {
+        return undefined
+    }
+}
+
 function sanitizeFlightRecorderEntry(entry = {}) {
-    const kind = sanitizeFlightRecorderString(entry?.kind || "")
-    if(!FLIGHT_RECORDER_KINDS.has(kind)) return null
+    if(!entry || typeof entry !== "object") return null
+    const kind = sanitizeFlightRecorderString(entry.kind || "")
+    if(!kind) return null
 
     const sanitized = {
-        at: sanitizeFlightRecorderInteger(entry?.at) || Date.now(),
+        at: sanitizeFlightRecorderInteger(entry.at) || Date.now(),
         seq: 0,
         kind
     }
-    const stringFields = [
-        "source",
-        "operationKind",
-        "rowKey",
-        "attemptId",
-        "runId",
-        "statusBefore",
-        "statusAfter",
-        "reason",
-        "terminalizationPolicy",
-        "enqueueResultReason",
-        "fillResultReason",
-        "fillError",
-        "error",
-        "generationId"
-    ]
-    for(const field of stringFields) {
-        const value = sanitizeFlightRecorderString(entry?.[field] || "")
-        if(value) sanitized[field] = value
+    for(const [field, value] of Object.entries(entry)) {
+        if(field === "kind" || field === "at" || field === "seq") continue
+        const copied = sanitizeFlightRecorderValue(field, value)
+        if(copied !== undefined) sanitized[field] = copied
     }
-    const targetUrl = sanitizeFlightRecorderUrl(entry?.targetUrl || "")
-    if(targetUrl) sanitized.targetUrl = targetUrl
-
-    for(const field of [
-        "attemptNumber",
-        "tabId",
-        "windowId",
-        "elapsedMs",
-        "enqueueQueued",
-        "enqueueQueuedKeysCount",
-        "enqueueTerminalizedExhausted",
-        "enqueueTerminalizedExhaustedKeysCount",
-        "fillOpenedTabs",
-        "fillActive",
-        "fillSchedulerBlockingActive",
-        "fillRemainingActions",
-        "queuedTabActionsCount",
-        "activeQueuedTabsCount",
-        "pendingTabActionsCount",
-        "durablyActiveQueuedTabsCount",
-        "durableActiveRows",
-        "durableQueuedRows",
-        "durableTerminalRows",
-        "snapshotSeq",
-        "checkpointedRecords",
-        "committedSegmentsA",
-        "committedSegmentsB",
-        "retiredKeys",
-        "viewItemCount",
-        "rebuiltRowCount",
-        "durationMs",
-        "activeAt"
-    ]) {
-        const value = sanitizeFlightRecorderInteger(entry?.[field])
-        if(value !== undefined) sanitized[field] = value
-    }
-    for(const field of ["accepted", "durable", "changed", "fillTimedOut", "runtimeSurfaceBefore", "blocked"]) {
-        const value = sanitizeFlightRecorderBoolean(entry?.[field])
-        if(value !== undefined) sanitized[field] = value
-    }
-
     return sanitized
 }
 
@@ -286,8 +175,9 @@ function __testResetFlightRecorder() {
 // Everything this instance would need to reconstruct its buffer elsewhere
 // (or in a fresh instance after this one is evicted) -- the full resident
 // window, not just whatever a caller's own `limit` asked for.
-function getFlightRecorderPersistableSnapshot() {
-    return getFlightRecorderSnapshot({limit: FLIGHT_RECORDER_CAPACITY})
+// The session copy is capped (see FLIGHT_RECORDER_SESSION_SNAPSHOT_LIMIT in sw.js) so it fits the session quota.
+function getFlightRecorderPersistableSnapshot(limit = FLIGHT_RECORDER_CAPACITY) {
+    return getFlightRecorderSnapshot({limit})
 }
 
 // Repopulates the buffer from a previously-persisted snapshot (see
@@ -322,7 +212,6 @@ function seedFlightRecorderFromPersisted(persisted = null) {
 
 module.exports = {
     FLIGHT_RECORDER_CAPACITY,
-    FLIGHT_RECORDER_KINDS,
     __testResetFlightRecorder,
     getFlightRecorder,
     getFlightRecorderSnapshot,

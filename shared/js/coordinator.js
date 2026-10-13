@@ -55,15 +55,9 @@ const SPACE_REGISTRY_KEY = 'mbSpaceRegistry'
 const HIDDEN_RUNS_KEY = 'mbCoordinatorHiddenRunIds'
 const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
 const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
-// Per-viewer UI preference only (like a collapsed panel), not durable
-// coordinator state -- localStorage is the right home for it, same
-// reasoning as dismissedOutlierKeys/eventHistogramClearedAtMs below, except
-// this one is meant to survive a reload.
-const DEV_MODE_STORAGE_KEY = 'mbDashboardDevMode'
-// chrome.storage mirror of the above, readable by the service worker (see
-// setDevModeStoredEnabled) -- must match sw.js's DEV_MODE_SYNC_STORAGE_KEY.
+// The service worker writes the dev-mode flag into chrome.storage (see setDevModeStoredEnabled). Must match sw.js's
+// DEV_MODE_SYNC_STORAGE_KEY.
 const DEV_MODE_SYNC_STORAGE_KEY = 'mbDashboardDevModeEnabled'
-const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
 const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#progress'
 const COORDINATOR_HISTORY_HASH = '#history'
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
@@ -208,7 +202,7 @@ async function renderHistoryList() {
 
 async function clearHistory() {
     if(!window.confirm('Clear all Recent History?')) return
-    await browser.storage.local.set({[SPACE_NUKED_POSTS_KEY]: {}})
+    await sendRuntimeMessageWithTimeout({action: 'set-space-nuked-posts', nukedPosts: {}}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     await renderHistoryList()
 }
 
@@ -337,6 +331,9 @@ async function init() {
     document.getElementById('pauseCurrentWorkButton')?.addEventListener('click', () => {
         void toggleCurrentWorkPause()
     })
+    document.getElementById('saveFlightRecorderButton')?.addEventListener('click', () => {
+        void saveFlightRecorder()
+    })
     document.getElementById('cancelCurrentWorkButton')?.addEventListener('click', () => {
         void cancelCurrentWork()
     })
@@ -355,6 +352,7 @@ async function init() {
     installPanelToggleListeners()
     installPanelWheelScrollListeners()
     installDashboardRuntimeRefreshListener()
+    await loadDevModeStoredEnabled()
     installDevModeToggle()
 
     installCompactStorageRefreshPolling()
@@ -391,27 +389,9 @@ async function registerQueuedWorkerActionSurfacePage() {
         document.title = 'Progress'
     }
 
-    const currentTab = await browser.tabs?.getCurrent?.().catch(() => null)
-    const currentWindow = !currentTab?.windowId && browser.windows?.getCurrent
-        ? await browser.windows.getCurrent({populate: true}).catch(() => null)
-        : null
-    const windowId = Number.parseInt(currentTab?.windowId || currentWindow?.id, 10) || 0
-    const anchorTabId = Number.parseInt(currentTab?.id, 10) ||
-        (Array.isArray(currentWindow?.tabs)
-            ? Number.parseInt(currentWindow.tabs.find(tab => tab?.active)?.id || currentWindow.tabs.find(tab => tab?.id)?.id, 10) || 0
-            : 0)
-    if(!windowId || !browser.storage?.session?.set) return false
-
-    await browser.storage.session.set({
-        [QUEUED_ACTION_SURFACE_STATE_KEY]: {
-            windowId,
-            anchorTabId: anchorTabId || null,
-            url: browser.runtime.getURL(`coordinator.html${QUEUED_ACTION_SURFACE_COORDINATOR_HASH}`),
-            reason: 'coordinator-worker-window-load',
-            updatedAt: Date.now()
-        }
-    }).catch(() => null)
-    return true
+    // The worker takes the window and tab from this page's sender, so the page only asks.
+    const result = await sendRuntimeMessageWithTimeout({action: 'register-queued-worker-action-surface'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    return result?.registered === true
 }
 
 // 2026-09-27: this periodic poll used to run unconditionally every
@@ -522,6 +502,10 @@ function applyCoordinatorDashboardStateFromMessage(incomingState = {}) {
         retryFailedActive = incomingState[COORDINATOR_RETRY_FAILED_ENABLED_KEY] === true
         applied = true
     }
+    if(Object.prototype.hasOwnProperty.call(incomingState, DEV_MODE_SYNC_STORAGE_KEY)) {
+        applyDevModeEnabled(incomingState[DEV_MODE_SYNC_STORAGE_KEY] === true)
+        applied = true
+    }
     if(applied) render()
     return applied
 }
@@ -529,10 +513,21 @@ function applyCoordinatorDashboardStateFromMessage(incomingState = {}) {
 function installDashboardRuntimeRefreshListener() {
     if(!browser.runtime?.onMessage?.addListener) return
     browser.runtime.onMessage.addListener(message => {
+        if(`${message?.action || ''}` === 'debug-run-limit-reached') {
+            // Every open dashboard page gets this broadcast. The worker lets only the first page claim the run id, and that page saves.
+            void claimDebugRunAutosave(`${message?.limitId || ''}`)
+            return
+        }
         if(`${message?.action || ''}` !== 'coordinator-dashboard-state-changed') return
         if(applyCoordinatorDashboardStateFromMessage(message?.state || {})) return
         scheduleDashboardCompactRefresh(DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS)
     })
+}
+
+async function claimDebugRunAutosave(limitId) {
+    const claim = await sendRuntimeMessageWithTimeout({action: 'claim-debug-run-autosave', limitId}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(claim?.claimed === false) return
+    void saveFlightRecorder()
 }
 
 function scheduleDashboardCompactRefresh(delay = 0) {
@@ -576,27 +571,30 @@ async function sendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs
     return result === timeoutMarker ? fallback : result
 }
 
+// The service worker stores the flag in chrome.storage. This page keeps a copy that the synchronous readers use, loaded at
+// init. A change made in another open dashboard page applies on that page's next load.
+let devModeStoredEnabled = false
+
 function isDevModeStoredEnabled() {
-    try {
-        return localStorage.getItem(DEV_MODE_STORAGE_KEY) === '1'
-    }
-    catch {
-        return false
-    }
+    return devModeStoredEnabled
+}
+
+async function loadDevModeStoredEnabled() {
+    const stored = await browser.storage.local.get({[DEV_MODE_SYNC_STORAGE_KEY]: false}).catch(() => ({}))
+    devModeStoredEnabled = stored[DEV_MODE_SYNC_STORAGE_KEY] === true
 }
 
 function setDevModeStoredEnabled(enabled) {
-    try {
-        localStorage.setItem(DEV_MODE_STORAGE_KEY, enabled ? '1' : '0')
-    }
-    catch {}
-    // localStorage is dashboard-page-local -- the service worker (which is
-    // what actually decides whether to write the pause diagnostic snapshot)
-    // can't read it, so mirror the flag into chrome.storage as well.
-    try {
-        browser.storage.local.set({[DEV_MODE_SYNC_STORAGE_KEY]: !!enabled}).catch(() => {})
-    }
-    catch {}
+    devModeStoredEnabled = enabled === true
+    void sendRuntimeMessageWithTimeout({action: 'set-dev-mode-enabled', enabled: devModeStoredEnabled}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+}
+
+// Applies a flag the worker pushed from a dashboard toggle. Pages without the toggle or the panels skip those steps.
+function applyDevModeEnabled(enabled) {
+    devModeStoredEnabled = enabled
+    const toggle = document.getElementById('devModeToggle')
+    if(toggle) toggle.checked = enabled
+    applyDevModeVisibility(enabled)
 }
 
 // Diagnostic panels (Metrics, Scan cost, Recent event counts, Outliers,
@@ -610,18 +608,33 @@ function applyDevModeVisibility(enabled) {
     })
 }
 
+// Countdown for a dev-mode run limit. Only asks the worker while dev mode is on.
+function formatRunCountdown(totalSeconds) {
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+async function refreshDebugRunStatus() {
+    const timeEl = document.getElementById('debugRunTimeLeft')
+    const targetsEl = document.getElementById('debugRunTargetsLeft')
+    if(!timeEl || !targetsEl || !isDevModeStoredEnabled()) return
+    const status = await sendRuntimeMessageWithTimeout({action: 'get-debug-resume-limit-status'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(!status?.active) {
+        timeEl.textContent = ''
+        targetsEl.textContent = ''
+        return
+    }
+    timeEl.textContent = status.secondsLeft !== null ? `${formatRunCountdown(status.secondsLeft)} left` : ''
+    targetsEl.textContent = status.targetLimit > 0 ? `${status.targetsLeft} of ${status.targetLimit} left` : ''
+}
+
 function installDevModeToggle() {
     const toggle = document.getElementById('devModeToggle')
     const enabled = isDevModeStoredEnabled()
     if(toggle) toggle.checked = enabled
     applyDevModeVisibility(enabled)
-    // Self-heals the chrome.storage mirror the service worker reads (e.g.
-    // this build's first run, or if chrome.storage was cleared) even when
-    // the user never touches the toggle this session.
-    try {
-        browser.storage.local.set({[DEV_MODE_SYNC_STORAGE_KEY]: enabled}).catch(() => {})
-    }
-    catch {}
+    setInterval(() => { void refreshDebugRunStatus() }, 1000)
     toggle?.addEventListener('change', () => {
         setDevModeStoredEnabled(toggle.checked)
         applyDevModeVisibility(toggle.checked)
@@ -671,7 +684,7 @@ function installPanelWheelScrollListeners() {
 }
 
 async function openPreferences() {
-    const url = browser.runtime.getURL('popup.html')
+    const url = browser.runtime.getURL('preferences.html')
     await browser.tabs.create({url, active: true}).catch(() => {
         window.open(url, '_blank', 'noopener')
     })
@@ -765,6 +778,13 @@ async function loadState() {
         [LAST_ENQUEUE_SUMMARY_KEY]: null
     })
 
+    // The paused flag is already in hand, so show it now. It used to wait for
+    // the service worker's view (about a second on an idle queue, more under
+    // load), and the button read "Pause" over a paused queue for that whole
+    // time, so a click in that window sent the wrong action.
+    state.paused = !!stored[COORDINATOR_PAUSED_KEY]
+    render()
+
     // Always ask the service worker to build the queue view fresh, rather
     // than trusting whatever's sitting in storage.mbCoordinatorQueueView --
     // that storage copy exists for other consumers (the SW's own cheap
@@ -817,6 +837,11 @@ async function refreshCompactDashboardViews() {
     const queueRefreshed = hasCoordinatorQueueView(result?.view)
     if(queueRefreshed) {
         applyCoordinatorQueueView(result.view)
+    }
+    else if(result?.error) {
+        // The service worker could not load the coordinator authority (its refresh answers with an explicit error, never an
+        // empty view). Keep the last good view rather than replacing it with a blank one, and report the failure.
+        console.error('Coordinator dashboard refresh failed:', result.error, result.detail || '')
     }
     else {
         // mbCoordinatorQueueView is no longer persisted to disk (see sw.js's
@@ -1242,7 +1267,7 @@ function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
 }
 
 async function clearEvents() {
-    await browser.storage.local.set({[COORDINATOR_EVENTS_KEY]: []})
+    await sendRuntimeMessageWithTimeout({action: 'clear-coordinator-events'}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     state.events = []
     render()
 }
@@ -1259,7 +1284,7 @@ async function clearCompletedRuns() {
     }
 
     state.hiddenRunIds = Array.from(nextHiddenRunIds)
-    await browser.storage.local.set({[HIDDEN_RUNS_KEY]: state.hiddenRunIds})
+    await sendRuntimeMessageWithTimeout({action: 'set-hidden-run-ids', runIds: state.hiddenRunIds}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     render()
 }
 
@@ -1507,6 +1532,7 @@ function syncCurrentWorkPauseControls(queueItems = []) {
                 : state.paused ? 'Paused' : 'Running'
         pauseState.classList.toggle('pause-state--paused', state.paused && !pausePending && !resumePending)
         pauseState.classList.toggle('pause-state--pending', pausePending || resumePending)
+        pauseState.classList.toggle('pause-state--running', !state.paused && !pausePending && !resumePending)
     }
 
     if(cancelButton) {
@@ -1542,8 +1568,10 @@ async function toggleCurrentWorkPause() {
     const wasPaused = state.paused
     currentWorkPausePending = wasPaused ? 'resume' : 'pause'
     render()
-    const action = state.paused ? 'resume-paused-coordinator-nukes' : 'pause-coordinator-nukes'
-    const result = await sendRuntimeMessageWithTimeout({action}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
+    const request = state.paused
+        ? {action: 'resume-paused-coordinator-nukes', debugLimit: readDebugResumeLimitFromControls()}
+        : {action: 'pause-coordinator-nukes'}
+    const result = await sendRuntimeMessageWithTimeout(request, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
         error: error?.message || `${error || ''}`
     }))
     retryFailedLastResult = {
@@ -1554,6 +1582,41 @@ async function toggleCurrentWorkPause() {
     currentWorkPausePending = ''
     await loadState()
     render()
+}
+
+// Dev-mode only: the Resume-for / Until dropdowns. Outside dev mode they are hidden and ignored.
+function readDebugResumeLimitFromControls() {
+    if(!isDevModeStoredEnabled()) return null
+    const minutes = Number.parseInt(document.getElementById('debugResumeMinutesSelect')?.value, 10) || 0
+    const targets = Number.parseInt(document.getElementById('debugResumeTargetsSelect')?.value, 10) || 0
+    if(minutes <= 0 && targets <= 0) return null
+    return {minutes, targets}
+}
+
+// Dev-mode only: downloads the service worker's flight recorder as JSON.
+async function saveFlightRecorder() {
+    const button = document.getElementById('saveFlightRecorderButton')
+    flashButton(button)
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'get-flight-recorder',
+        limit: 20000
+    }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+    if(result?.error || !Array.isArray(result?.entries)) {
+        retryFailedLastResult = {reason: 'flight-recorder-save-failed'}
+        render()
+        return
+    }
+    const blob = new Blob([JSON.stringify(result, null, 2)], {type: 'application/json'})
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `flight-recorder-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 async function cancelCurrentWork() {
@@ -1625,7 +1688,7 @@ async function toggleRetryFailed() {
     retryFailedActive = true
     retryFailedLastResult = {reason: 'starting'}
     render()
-    await browser.storage.local.set({[COORDINATOR_RETRY_FAILED_ENABLED_KEY]: true})
+    await sendRuntimeMessageWithTimeout({action: 'set-coordinator-retry-failed-enabled', enabled: true}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
     retryFailedLastResult = {reason: 'service-worker-scheduled'}
     render()
 }
@@ -1635,7 +1698,7 @@ function stopRetryFailed(reason = 'idle', {persist = true} = {}) {
     retryFailedLastResult = {reason}
     render()
     if(persist) {
-        void browser.storage.local.set({[COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false})
+        void sendRuntimeMessageWithTimeout({action: 'set-coordinator-retry-failed-enabled', enabled: false}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(() => null)
     }
 }
 
@@ -2297,17 +2360,6 @@ function renderWakeupMetrics(queueItems = []) {
                 : 'No challenge interstitials seen yet', {
                 alert: cloudflareChallenges > 1,
                 title: 'Profile loads that hit a Cloudflare bot-challenge interstitial instead of the real page. Concerning at any sustained rate above isolated one-offs -- each one also trips the queue-load throttle, so a rising count here explains a queue that keeps backing off.'
-            }),
-            buildMetricCard('Queue -> tab', formatPhaseAverage(phases.durableQueueToTabOpen), formatPhaseDetail(phases.durableQueueToTabOpen), {
-                // Half of the tighter of the two staleness windows this
-                // phase approaches (QUEUED_TAB_CREATE_TIMEOUT_MS 10s).
-                alert: getPhaseAverageMs(phases.durableQueueToTabOpen) >= 5000,
-                title: 'Time from a row becoming durably queued to its tab actually opening. Concerning if the average approaches this project\'s queued-tab-open staleness windows (STALE_BACKGROUND_OPENING_QUEUED_TAB_MS 20s, QUEUED_TAB_CREATE_TIMEOUT_MS 10s) -- rows that slow to open that tab are the ones that end up reclaimed as stale.'
-            }),
-            buildMetricCard('Tab -> claim', formatPhaseAverage(phases.tabOpenToClaimAccepted), formatPhaseDetail(phases.tabOpenToClaimAccepted), {
-                // Half of QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS / QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS (both 15s).
-                alert: getPhaseAverageMs(phases.tabOpenToClaimAccepted) >= 7500,
-                title: 'Time from tab open to the content script\'s action claim being accepted. Concerning if the average approaches QUEUED_TAB_CONTENT_ACTOR_READINESS_WINDOW_MS (15s) or QUEUED_TAB_DURABLE_CLAIM_TIMEOUT_MS (15s) -- both are staleness/timeout windows keyed to roughly this transition.'
             }),
             buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart), {
                 // Half of STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s).

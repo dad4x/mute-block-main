@@ -604,6 +604,20 @@ function getQueueMirrorKeys(meta = null, options = {}) {
     return keys
 }
 
+// The non-WAL keys of the queue namespace that the session mirror also holds
+// (docs/queue-storage-layering.md, section 6): the runs key, then every key of the progress projection.
+// progressDefaults is getProfileNukeProgressProjectionDefaults([]), which is the progress view plus every
+// shard; progress is hashed per href into a fixed shard count, so the full list is the complete progress
+// layout, not one shard per href. Pure: the caller supplies the key names and the progress defaults.
+function queueNamespaceMirrorKeys(options = {}) {
+    const progressKeys = Object.keys(options.progressDefaults || {})
+    const keys = options.runsKey ? [options.runsKey] : []
+    for(const key of progressKeys) {
+        if(!keys.includes(key)) keys.push(key)
+    }
+    return keys
+}
+
 // The part of a storage payload (or stored snapshot) that the mirror holds, as an object.
 function selectQueueMirrorRecords(stored = {}, meta = null, options = {}) {
     const mirror = {}
@@ -622,6 +636,16 @@ function isQueueMirrorFresh(mirrorMeta = null, diskMeta = null, options = {}) {
     return normalizeCheckpointId(mirrorMeta.activeCheckpoint) === active &&
         getSegmentedWalCommittedSegmentCount(mirrorMeta, active) === getSegmentedWalCommittedSegmentCount(diskMeta, active) &&
         normalizeSeq(mirrorMeta.nextSeq) === normalizeSeq(diskMeta.nextSeq)
+}
+
+// Rule 6 of docs/queue-storage-layering.md: a sequence marker, not disk meta, decides whether
+// a mirror read is fresh. The fingerprint is the three fields isQueueMirrorFresh compares
+// (active slot, committed segment count, next sequence), as one string. Returns null for
+// anything that is not segmented WAL meta, so a missing meta never matches a marker.
+function getQueueWalSeqFingerprint(meta = null) {
+    if(!isSegmentedWalStorageMeta(meta)) return null
+    const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
+    return `${activeCheckpoint}:${normalizeSeq(meta.nextSeq)}:${getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)}`
 }
 
 // The records one acknowledged append adds to a mirror that already holds the previous
@@ -811,6 +835,12 @@ function setWalGenerationMeta(store, generationId, generation) {
     }
 }
 
+// Every segment makeWalSegment returns is registered here. A registered segment is a fixed point of makeWalSegment: its
+// records are already normalized and sorted, and its id, seqs and sealed flag follow from them, so rebuilding it gives an
+// equal object. makeWalGeneration shares a registered segment instead of rebuilding it, so an append does not normalize
+// every record of the active generation again. Nothing writes into a segment after it is made.
+const normalizedWalSegments = new WeakSet()
+
 function makeWalSegment(records = [], options = {}) {
     const normalizedRecords = (records || [])
         .map(makeWalRecord)
@@ -822,19 +852,23 @@ function makeWalSegment(records = [], options = {}) {
         ? normalizedRecords[normalizedRecords.length - 1].seq
         : normalizeSeq(options.toSeq, fromSeq)
 
-    return {
+    const segment = {
         id: `${options.id || `wal-${fromSeq}-${toSeq}`}`,
         fromSeq,
         toSeq,
         sealed: options.sealed !== false,
         records: normalizedRecords
     }
+    normalizedWalSegments.add(segment)
+    return segment
 }
 
 function makeWalGeneration(options = {}) {
     return {
         snapshotSeq: normalizeSeq(options.snapshotSeq),
-        segments: (options.segments || []).map(segment => makeWalSegment(segment.records || [], segment))
+        segments: (options.segments || []).map(segment => normalizedWalSegments.has(segment)
+            ? segment
+            : makeWalSegment(segment.records || [], segment))
     }
 }
 
@@ -1055,23 +1089,30 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
     return {ok: true, reason: '', store, meta}
 }
 
+// Appends records to one generation and returns the next store. The input store is never written to. The next store is
+// a new top-level object with a new meta and a new wal map. The checkpoints and every generation except the target are
+// shared with the input, and so are the target's segment objects (makeWalSegment registers them, makeWalGeneration shares
+// them). The target's segments array is new, so the new segment goes onto that copy. Records are normalized as before:
+// each one is cloned and passed through makeWalRecord. Sharing returns the same store the old full clone did as long as
+// the store is JSON-clean, which holds for every store this module builds or reads back from storage. A rejected append
+// still returns a full clone.
 function appendWalRecordsToGeneration(store = {}, records = [], options = {}) {
-    const nextStore = cloneJson(store)
-    const generationId = normalizeCheckpointId(options.generationId, nextStore?.meta?.activeCheckpoint || CHECKPOINT_A)
-    const activeGenerationId = normalizeCheckpointId(nextStore?.meta?.activeCheckpoint || CHECKPOINT_A)
+    const generationId = normalizeCheckpointId(options.generationId, store?.meta?.activeCheckpoint || CHECKPOINT_A)
+    const activeGenerationId = normalizeCheckpointId(store?.meta?.activeCheckpoint || CHECKPOINT_A)
     if(generationId !== activeGenerationId && options.allowInactiveAppend !== true) {
+        const rejectedStore = cloneJson(store)
         return {
-            store: nextStore,
+            store: rejectedStore,
             generationId,
             records: [],
-            generation: getWalGeneration(nextStore, generationId),
+            generation: getWalGeneration(rejectedStore, generationId),
             rejected: true,
             reason: 'inactive-generation-append'
         }
     }
-    const generation = getWalGeneration(nextStore, generationId)
+    const generation = getWalGeneration(store, generationId)
     let nextSeq = Math.max(
-        normalizeSeq(nextStore?.meta?.nextSeq, normalizeSeq(generation.snapshotSeq) + 1),
+        normalizeSeq(store?.meta?.nextSeq, normalizeSeq(generation.snapshotSeq) + 1),
         normalizeSeq(generation.snapshotSeq) + 1
     )
     const normalizedRecords = []
@@ -1092,8 +1133,10 @@ function appendWalRecordsToGeneration(store = {}, records = [], options = {}) {
         }))
     }
 
+    const nextStore = {...store}
+    nextStore.meta = cloneJson(store?.meta)
     nextStore.wal = {
-        ...(nextStore.wal || {}),
+        ...(store?.wal || {}),
         [generationId]: generation
     }
     nextStore.meta.nextSeq = Math.max(normalizeSeq(nextStore.meta.nextSeq), nextSeq)
@@ -1436,7 +1479,40 @@ function estimateStateBytes(state = {}, options = {}) {
     }
 }
 
+// The keys one keyed row read needs: the meta key, any extra defaults the caller asked for, and the
+// row's keys for the meta's active slot. Pure, so the caller does the storage read and only that.
+function planKeyedRowReads(meta = null, wanted = [], options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const metaKey = options.metaKey || getSegmentedWalMetaKey(baseKey)
+    const readKeys = {[metaKey]: null, ...(options.extraDefaults || {})}
+    for(const key of wanted) {
+        for(const readKey of getKeyedRowReadKeys(meta, key, {baseKey})) {
+            readKeys[readKey] = null
+        }
+    }
+    return readKeys
+}
+
+// Projects each wanted row out of a stored snapshot. Stops at the first row that cannot be projected and
+// returns its reason, so the caller can decide whether a retry is worth it. Pure.
+function projectKeyedRows(stored = {}, wanted = [], options = {}) {
+    const rows = {}
+    for(const key of wanted) {
+        const projected = projectKeyedRowFromStored(stored, {
+            baseKey: options.baseKey,
+            area: 'queue',
+            key,
+            ...(options.codecOptions || {})
+        })
+        if(!projected.ok) return {ok: false, reason: projected.reason, rows: {}}
+        if(projected.found) rows[key] = projected.value
+    }
+    return {ok: true, reason: '', rows}
+}
+
 module.exports = {
+    planKeyedRowReads,
+    projectKeyedRows,
     CHECKPOINT_A,
     CHECKPOINT_B,
     CHECKPOINT_SHARD_DEFAULT_COUNT,
@@ -1453,8 +1529,10 @@ module.exports = {
     readStoredCheckpoint,
     getKeyedRowReadKeys,
     getQueueMirrorKeys,
+    queueNamespaceMirrorKeys,
     selectQueueMirrorRecords,
     isQueueMirrorFresh,
+    getQueueWalSeqFingerprint,
     planQueueMirrorAppend,
     planQueueMirrorRebuild,
     projectKeyedRowFromStored,
