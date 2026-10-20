@@ -90,6 +90,10 @@ test('after the migration, a write that changes one nuked post sends one bucket 
     assert.equal(keys.includes(NUKED), false, 'the whole nuked map is not written')
     assert.equal(keys.includes(PENDING), false, 'the pending map is not written by a nuked write')
     assert.equal(m.readSpaceMapFromStored(browser.__storage, NUKED)[changedKey].updatedAt, NOW, 'the change is on disk')
+    // The flight recorder reports the bytes this write put on disk, not the size of the whole-map payload it came from.
+    const recorded = sw.getFlightRecorderSnapshot({kind: 'storage-write', limit: 200}).entries.filter(entry => /test\.spaceMap/.test(entry.label || ''))
+    assert.equal(recorded.length, 1, 'one recorded write for the settlement-style write')
+    assert.ok(recorded[0].bytes > 0 && recorded[0].bytes < recorded[0].logicalBytes, `disk bytes ${recorded[0].bytes} are below the logical payload ${recorded[0].logicalBytes}`)
 })
 
 test('a restart with the bucketed layout reads the same maps back', async () => {

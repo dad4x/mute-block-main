@@ -2568,6 +2568,13 @@ function getSpaceMapDiskWrite(payload = {}, options = {}) {
     return {disk, hashes, migrated: migrating}
 }
 
+// The bytes a translated write puts on disk (the JSON of each value), for the flight recorder. The logical payload is larger.
+function measureDiskWriteBytes(disk = {}) {
+    let total = 0
+    for(const value of Object.values(disk)) total += JSON.stringify(value ?? null).length
+    return total
+}
+
 // Called only after the disk write succeeded. A failed write leaves the hashes as they were, so the next write sends the same buckets again.
 function commitSpaceMapDiskWrite(write = {}) {
     if(!write.hashes) return
@@ -2613,12 +2620,15 @@ async function metricStorageSet(payload = {}, options = {}) {
     const startedAt = Date.now()
     let result = null
     let writeOutcome = 'error'
+    // Bytes actually written to disk, set only when the write was turned into space map buckets (the logical payload is larger).
+    let diskWriteBytes = null
     try {
         if(isProfileProgressProjectionWrite) profileNukeProgressProjectionWriteDepth += 1
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
         const spaceMapWrite = getSpaceMapDiskWrite(payload, options)
         const diskPayload = options.namespaceStamps ? {...spaceMapWrite.disk, ...options.namespaceStamps} : spaceMapWrite.disk
+        if(spaceMapWrite.hashes) diskWriteBytes = measureDiskWriteBytes(diskPayload)
         result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
             ? coordinatorStorageAdapter.set(diskPayload)
             : true))
@@ -2645,7 +2655,8 @@ async function metricStorageSet(payload = {}, options = {}) {
             kind: 'storage-write',
             source: 'metricStorageSet',
             label: pathName,
-            bytes: payloadSummary?.bytes || 0,
+            bytes: diskWriteBytes ?? (payloadSummary?.bytes || 0),
+            logicalBytes: payloadSummary?.bytes || 0,
             rows: payloadSummary?.rows || 0,
             keys: (payloadSummary?.keys || keys).slice(0, 12).join(','),
             elapsedMs: writeElapsedMs,

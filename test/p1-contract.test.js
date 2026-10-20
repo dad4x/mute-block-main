@@ -5235,7 +5235,9 @@ test('every storage write is labelled, sized and recorded once (owner 18 Oct)', 
 
     assert.notEqual(eventIndex, -1)
     assert.match(writeBody.slice(eventIndex, eventIndex + 400), /label: pathName/)
-    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /bytes: payloadSummary\?\.bytes/)
+    // bytes is what reached disk (the logical payload when nothing was translated); logicalBytes is the payload before translation.
+    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /bytes: diskWriteBytes \?\? \(payloadSummary\?\.bytes \|\| 0\)/)
+    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /logicalBytes: payloadSummary\?\.bytes/)
     assert.match(writeBody, /storagePayload\.write\.unlabelled/)
     // The coordinator door labels a stored write from its progress metric path or its operation kind, never the phase fallback.
     const coordinatorSource = sw
