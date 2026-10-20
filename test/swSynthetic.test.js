@@ -1834,6 +1834,30 @@ test('a queue-only executor pass reads the live progress, not the copy the autho
     assert.equal(moduleCopy[startHref]?.status, 'succeeded', 'and keeps the record from startup')
 })
 
+test('the startup clean-up drops unfinished progress that no queue row can finish (20 Oct review)', async () => {
+    const orphanHref = 'https://www.quora.com/profile/Synthetic-Progress-Startup-Orphan'
+    // The harness leaves the startup chain off unless a test asks for it; this test is about the startup chain, so it asks.
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 5000,
+        runStartupWork: true,
+        storage: makeProgressProjectionSeed(orphanHref, {status: 'queued', actionKind: 'mute-block', updatedAt: 4000})
+    })
+    await sw.coordinatorAuthority.hydrate()
+    for(let tick = 0; tick < 500; tick += 1) await Promise.resolve()
+    assert.equal(getProgressShardRecord(browser.__sessionStorage, orphanHref), null, 'the unfinished record with no queue row is gone after the startup clean-up')
+})
+
+test('the clean-up keeps finished progress that has no queue row, because content still reads it (20 Oct review)', async () => {
+    const finishedHref = 'https://www.quora.com/profile/Synthetic-Progress-Cleanup-Finished'
+    const {browser, sw} = loadServiceWorkerHarness({now: 5000})
+    await sw.coordinatorAuthority.persistCoordinator({
+        progressDeltas: [{profileHref: finishedHref, record: {profileHref: finishedHref, status: 'blocked', blockSucceeded: true, actionKind: 'mute-block', updatedAt: 4500, terminalAt: 4500}}],
+        progressMetricPath: 'test.cleanupFinished'
+    }, {storageOptions: {metricPath: 'test.cleanupFinished.save'}})
+    await sw.coordinatorAuthority.repairProfileProgressProjection({metricPath: 'test.cleanupFinished.repair'})
+    assert.equal(getProgressShardRecord(browser.__sessionStorage, finishedHref)?.status, 'blocked', 'a finished record with no queue row is kept')
+})
+
 test('a repair that drops an unfinished record with no queue row is not shown by the tool read (decision 32; 20 Oct review)', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Repair-Tool-Read'
     const {browser, sw, storage} = loadServiceWorkerHarness({

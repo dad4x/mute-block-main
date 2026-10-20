@@ -30278,7 +30278,9 @@ async function sweepProfileTabsWithoutActiveQueueAuthority(options = {}) {
             metricPath: options.metricPath || 'profileTabsWithoutActiveAuthority.load'
         }).catch(() => null)
     const queue = currentAuthorityState?.queue || {}
-    const currentProgress = currentAuthorityState?.progress || {}
+    // The sweep reads the live progress, not the copy the authority took at startup, which never updates (20 Oct review; the same fix
+    // as the queue-only pass). Its reclaim decisions depend on this progress.
+    const currentProgress = getLiveResidentProfileNukeProgressRecords(currentAuthorityState?.progress || {})
     const progress = Object.keys(currentProgress).length ? currentProgress : profileNukeProgress || {}
     if(!Object.keys(queue).length) return {candidates: 0, closed: 0, terminalized: 0, authorityState: currentAuthorityState}
 
@@ -36215,6 +36217,10 @@ function scheduleStoredWorkRearmAfterStartupHydrate() {
             void loadCoordinatorOutliersRecord().catch(() => null)
             // The legacy disk copies are removed after the authority load, not at module load (legacy-index-cleanup-design.md, section 5).
             void retireLegacyContentIndexKeys().catch(() => null)
+            // Profile progress that no queue row can finish is dropped here, by the repair's own rule (an unfinished record with no queue
+            // row; see filterProfileNukeProgressForContentProjection). Finished records are kept, because content still reads them to
+            // know a profile is done. A steady state writes nothing, so this runs at every start without cost (20 Oct review).
+            void coordinatorAuthority.repairProfileProgressProjection({metricPath: 'progress.startupCleanup'}).catch(() => null)
         })
         .then(() => scheduleStoredWorkRearmAfterServiceWorkerReload())
 }

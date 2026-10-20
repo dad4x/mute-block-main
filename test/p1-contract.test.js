@@ -6262,6 +6262,13 @@ test('dashboard run badge relabels a fully-terminal run as done, not the raw emp
     assert.match(source, /buildBadge\(getRunStatusLabel\(run\)\)/)
 })
 
+test('the orphan-tab sweep reads the live progress, not the copy the authority took at startup (20 Oct review)', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const sweepBody = extractFunction(source, 'async function sweepProfileTabsWithoutActiveQueueAuthority(options = {})')
+    assert.match(sweepBody, /const currentProgress = getLiveResidentProfileNukeProgressRecords\(currentAuthorityState\?\.progress \|\| \{\}\)/)
+    assert.doesNotMatch(sweepBody, /const currentProgress = currentAuthorityState\?\.progress \|\| \{\}/)
+})
+
 test('Clear All Stats zeroes Terminal and wipes the Events backing store, not just their display', () => {
     const source = readRepoFile('shared/js/coordinator.js')
     const clearAllStatsBody = extractFunction(source, 'async function clearAllStats()')
