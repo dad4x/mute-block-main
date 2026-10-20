@@ -9,6 +9,7 @@ const {
     normalizeMaxRememberedNukedPosts,
     normalizeRetentionDays
 } = require('./nukedPosts')
+const {isSpaceMapStorageKey, readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const {
     SPACE_CATEGORIES,
     SPACE_REGISTRY_KEY,
@@ -36,8 +37,9 @@ async function init() {
         ...defaults,
         [SPACE_REGISTRY_KEY]: {},
         [SPACE_SORT_KEY]: SPACE_SORT_NAME,
-        [SPACE_NUKED_POSTS_KEY]: {}
+        ...spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])
     })
+    const storedNukedPosts = readSpaceMapFromStored(settings, SPACE_NUKED_POSTS_KEY)
 
     document.getElementById('appName').textContent = manifest.name
     document.getElementById('appVersion').textContent = `v${manifest.version}`
@@ -70,14 +72,14 @@ async function init() {
     nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
     maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
     popupState.spaceRegistry = settings[SPACE_REGISTRY_KEY] || {}
-    popupState.nukedPosts = getPrunedNukedPosts(settings[SPACE_NUKED_POSTS_KEY] || {}, {
+    popupState.nukedPosts = getPrunedNukedPosts(storedNukedPosts, {
         retentionDays: popupState.nukedPostRetentionDays,
         maxEntries: popupState.maxRememberedNukedPosts
     })
     popupState.sortBy = settings[SPACE_SORT_KEY] === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME
     spaceSortBy.value = popupState.sortBy
 
-    if(!haveSameNukedPostKeys(settings[SPACE_NUKED_POSTS_KEY] || {}, popupState.nukedPosts)) {
+    if(!haveSameNukedPostKeys(storedNukedPosts, popupState.nukedPosts)) {
         await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
     }
 
@@ -189,8 +191,10 @@ async function init() {
             renderSpaceList(spaceList)
         }
 
-        if(changes[SPACE_NUKED_POSTS_KEY]) {
-            popupState.nukedPosts = changes[SPACE_NUKED_POSTS_KEY].newValue || {}
+        if(Object.keys(changes).some(key => isSpaceMapStorageKey(key, [SPACE_NUKED_POSTS_KEY]))) {
+            void browser.storage.local.get(spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])).then(stored => {
+                popupState.nukedPosts = readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY)
+            })
         }
 
         if(changes[NUKED_POST_RETENTION_DAYS_KEY]) {

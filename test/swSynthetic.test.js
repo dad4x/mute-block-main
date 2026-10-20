@@ -1520,10 +1520,10 @@ test('a mirrored runs copy with the disk stamp is served at restart, and hydrate
             'mbCoordinatorNamespaceSeq.mbCoordinatorRuns',
             'mbCoordinatorPauseGeneration',
             'mbCoordinatorPaused',
-            'mbSpaceNukedPosts',
-            'mbSpacePendingNukedPosts'
+            // The space post maps are read in their layout keys: the legacy key, the 32 bucket keys of each map and the layout marker (spaceMapStorage.js).
+            ...require('../shared/js/spaceMapStorage').spaceMapStorageKeys(['mbSpaceNukedPosts', 'mbSpacePendingNukedPosts'])
         ].sort(),
-        'the hydrate read names the same keys as before, plus the runs stamp'
+        'the hydrate read names the same keys as before, plus the runs stamp and the space map layout keys'
     )
     assert.equal(sessionReads.filter(keys => keys.includes(NAMESPACE_RUNS_STAMP_KEY)).length, 1, 'the namespace session read carries the runs stamp')
     assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.status, 'running', 'the restart serves the mirrored runs')
@@ -44534,7 +44534,7 @@ function loadListPageHarness() {
                     windows: {getCurrent: async () => null}
                 }
             }
-            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys'].includes(name)) {
+            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './spaceMapStorage'].includes(name)) {
                 return sharedModule(name.slice(2))
             }
             throw new Error(`unexpected require in coordinator.js: ${name}`)

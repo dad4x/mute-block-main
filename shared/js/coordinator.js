@@ -18,6 +18,7 @@ const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     getPrunedNukedPosts
 } = require('./nukedPosts')
+const {readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const defaults = require('./defaults')
 const {SOFT_FAIL_RETRY_LIMIT} = require('./tunables')
 const {
@@ -136,11 +137,11 @@ async function openCoordinatorViewFromHere(action = 'open-coordinator') {
 
 async function loadHistoryEntries() {
     const stored = await browser.storage.local.get({
-        [SPACE_NUKED_POSTS_KEY]: {},
+        ...spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY]),
         [NUKED_POST_RETENTION_DAYS_KEY]: defaults[NUKED_POST_RETENTION_DAYS_KEY],
         [MAX_REMEMBERED_NUKED_POSTS_KEY]: defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
     })
-    return getPrunedNukedPosts(stored[SPACE_NUKED_POSTS_KEY] || {}, {
+    return getPrunedNukedPosts(readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY), {
         retentionDays: stored[NUKED_POST_RETENTION_DAYS_KEY],
         maxEntries: stored[MAX_REMEMBERED_NUKED_POSTS_KEY]
     })

@@ -2,6 +2,15 @@ const browser = require('webextension-polyfill')
 const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
 const {
+    SPACE_MAP_LAYOUT_KEY,
+    SPACE_MAP_LAYOUT_BUCKETED,
+    spaceMapStorageKeys,
+    splitSpaceMapIntoBuckets,
+    readSpaceMapFromStored,
+    hashSpaceMapBuckets,
+    changedSpaceMapBuckets
+} = require('./spaceMapStorage')
+const {
     SPACE_NUKED_POSTS_KEY,
     getPrunedNukedPosts
 } = require('./nukedPosts')
@@ -2511,6 +2520,61 @@ async function metricStorageGet(defaults = {}, options = {}) {
     return result
 }
 
+// The space post maps on disk (spaceMapStorage.js). spaceMapLayout.bucketed is true once the disk holds the bucketed layout.
+// hashes are the bucket hashes last written or loaded for each map, so a write sends only the buckets that changed. Before the
+// layout is bucketed, the legacy whole-map keys are written as before, so nothing changes until the migration has run.
+const spaceMapLayout = {
+    bucketed: false,
+    hashes: {[SPACE_NUKED_POSTS_KEY]: null, [SPACE_PENDING_NUKED_POSTS_KEY]: null}
+}
+const SPACE_MAP_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
+
+function getSpaceMapStoredReadDefaults() {
+    return Object.fromEntries(spaceMapStorageKeys(SPACE_MAP_KEYS).map(key => [key, key === SPACE_MAP_LAYOUT_KEY ? null : {}]))
+}
+
+// Reads the layout from a hydrate read: the maps become whole maps in stored (as before), and the layout and bucket keys are removed.
+function applySpaceMapStoredLayout(stored = {}) {
+    const bucketed = stored[SPACE_MAP_LAYOUT_KEY] === SPACE_MAP_LAYOUT_BUCKETED
+    const maps = {}
+    for(const key of SPACE_MAP_KEYS) maps[key] = readSpaceMapFromStored(stored, key)
+    for(const key of spaceMapStorageKeys(SPACE_MAP_KEYS)) delete stored[key]
+    Object.assign(stored, maps)
+    spaceMapLayout.bucketed = bucketed
+    spaceMapLayout.hashes = {}
+    for(const key of SPACE_MAP_KEYS) {
+        spaceMapLayout.hashes[key] = bucketed ? hashSpaceMapBuckets(splitSpaceMapIntoBuckets(key, maps[key])) : null
+    }
+}
+
+// The write a payload turns into on disk. A migration writes both maps as buckets, with the layout marker, and ignores the
+// last hashes. An ordinary write of a bucketed layout writes only the changed buckets. Anything else is written as it came.
+function getSpaceMapDiskWrite(payload = {}, options = {}) {
+    const migrating = options.spaceMapMigrate === true
+    const mapKeys = SPACE_MAP_KEYS.filter(key => Object.prototype.hasOwnProperty.call(payload, key))
+    if(!mapKeys.length) return {disk: payload, hashes: null, migrated: false}
+    if(migrating && mapKeys.length !== SPACE_MAP_KEYS.length) return {disk: payload, hashes: null, migrated: false}
+    if(!migrating && !spaceMapLayout.bucketed) return {disk: payload, hashes: null, migrated: false}
+    const disk = {...payload}
+    const hashes = {}
+    for(const key of mapKeys) delete disk[key]
+    for(const key of mapKeys) {
+        const previous = migrating ? null : spaceMapLayout.hashes[key]
+        const next = changedSpaceMapBuckets(key, payload[key], previous)
+        Object.assign(disk, next.changed)
+        hashes[key] = next.hashes
+    }
+    if(migrating) disk[SPACE_MAP_LAYOUT_KEY] = SPACE_MAP_LAYOUT_BUCKETED
+    return {disk, hashes, migrated: migrating}
+}
+
+// Called only after the disk write succeeded. A failed write leaves the hashes as they were, so the next write sends the same buckets again.
+function commitSpaceMapDiskWrite(write = {}) {
+    if(!write.hashes) return
+    for(const key of Object.keys(write.hashes)) spaceMapLayout.hashes[key] = write.hashes[key]
+    if(write.migrated) spaceMapLayout.bucketed = true
+}
+
 async function metricStorageSet(payload = {}, options = {}) {
     const storageContext = getActiveStorageContext()
     if(payload &&
@@ -2553,8 +2617,12 @@ async function metricStorageSet(payload = {}, options = {}) {
         if(isProfileProgressProjectionWrite) profileNukeProgressProjectionWriteDepth += 1
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
-        const diskPayload = options.namespaceStamps ? {...payload, ...options.namespaceStamps} : payload
-        result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => coordinatorStorageAdapter.set(diskPayload))
+        const spaceMapWrite = getSpaceMapDiskWrite(payload, options)
+        const diskPayload = options.namespaceStamps ? {...spaceMapWrite.disk, ...options.namespaceStamps} : spaceMapWrite.disk
+        result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
+            ? coordinatorStorageAdapter.set(diskPayload)
+            : true))
+        if(result !== false) commitSpaceMapDiskWrite(spaceMapWrite)
         writeOutcome = 'saved'
     }
     finally {
@@ -10122,6 +10190,24 @@ function createCoordinatorAuthority() {
         })
     }
 
+    // One-time move of the space post maps to the bucketed layout (spaceMapStorage.js). Runs through the door, so the maps are the
+    // resident ones and no settlement write can interleave. A no-op once the layout is bucketed. A failed write leaves the legacy
+    // layout in place, and the next startup tries again.
+    function migrateSpaceMapLayout(options = {}) {
+        return runExclusiveOnApplyTail(async () => {
+            if(!hydrated) await hydrate()
+            if(spaceMapLayout.bucketed) return {migrated: false, reason: 'already-bucketed'}
+            const stored = residentStoredFor({[SPACE_NUKED_POSTS_KEY]: {}, [SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+            await persistCoordinatorStoredChange({
+                storageOptions: {metricPath: options.metricPath || 'spaceMap.migrate', spaceMapMigrate: true}
+            }, {
+                [SPACE_NUKED_POSTS_KEY]: stored[SPACE_NUKED_POSTS_KEY],
+                [SPACE_PENDING_NUKED_POSTS_KEY]: stored[SPACE_PENDING_NUKED_POSTS_KEY]
+            })
+            return {migrated: spaceMapLayout.bucketed === true, reason: spaceMapLayout.bucketed ? 'migrated' : 'write-not-saved'}
+        })
+    }
+
     // The whole-state form of the write door, kept for startup and explicit
     // resync only. It takes a full next state and replaces the resident
     // projection's queue and stored state with the caller's snapshot. Normal
@@ -10563,6 +10649,7 @@ function createCoordinatorAuthority() {
         runExclusiveOnApplyTail,
         persistCoordinator,
         repairProfileProgressProjection,
+        migrateSpaceMapLayout,
         persistCoordinatorWholeState,
         applyWithinStorageUpdate,
         residentCompleted,
@@ -10653,8 +10740,7 @@ async function loadCoordinatorCurrentAuthorityState() {
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
             [COORDINATOR_EVENTS_KEY]: [],
-            [SPACE_PENDING_NUKED_POSTS_KEY]: {},
-            [SPACE_NUKED_POSTS_KEY]: {}
+            ...getSpaceMapStoredReadDefaults()
         }, {
             metricPath: 'authority.hydrate'
         })
@@ -10684,6 +10770,8 @@ async function loadCoordinatorCurrentAuthorityState() {
         // starts at its empty default.
         const progressDefaults = getProfileNukeProgressProjectionDefaults([])
         for(const key of PROFILE_NUKE_PROGRESS_STORAGE_KEYS) stored[key] = hydrateSession.progress[key] ?? progressDefaults[key]
+        // The space post maps: whole maps again, from whichever layout the disk holds (spaceMapStorage.js).
+        applySpaceMapStoredLayout(stored)
         const queueSnapshot = {}
         const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: 'authority.hydrate.segments'
@@ -36221,6 +36309,8 @@ function scheduleStoredWorkRearmAfterStartupHydrate() {
             // row; see filterProfileNukeProgressForContentProjection). Finished records are kept, because content still reads them to
             // know a profile is done. A steady state writes nothing, so this runs at every start without cost (20 Oct review).
             void coordinatorAuthority.repairProfileProgressProjection({metricPath: 'progress.startupCleanup'}).catch(() => null)
+            // The space post maps move to the bucketed layout once (spaceMapStorage.js). Not awaited by the load, so it adds no await to hydrate.
+            void coordinatorAuthority.migrateSpaceMapLayout({metricPath: 'spaceMap.migrate'}).catch(() => null)
         })
         .then(() => scheduleStoredWorkRearmAfterServiceWorkerReload())
 }

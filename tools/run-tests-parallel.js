@@ -59,7 +59,9 @@ const lanes = [
       ['node', 'test/swQueueBarSummary.test.js'],
       ['node', 'test/candidateListEvidence.test.js'],
       ['node', 'test/swResumeExemption.test.js'],
-      ['node', 'test/swProfileNukeProgressPush.test.js']
+      ['node', 'test/swProfileNukeProgressPush.test.js'],
+      ['node', 'test/spaceMapStorage.test.js'],
+      ['node', 'test/spaceMapBuckets.test.js']
     ]
   },
   {

@@ -152,6 +152,7 @@ function loadDashboardHarness() {
             if(name === './defaults') return require(path.join(__dirname, '..', 'shared/js/defaults'))
             if(name === './tunables') return require(path.join(__dirname, '..', 'shared/js/tunables'))
             if(name === './storageKeys') return require(path.join(__dirname, '..', 'shared/js/storageKeys'))
+            if(name === './spaceMapStorage') return require(path.join(__dirname, '..', 'shared/js/spaceMapStorage'))
             throw new Error(`unexpected require: ${name}`)
         },
         addEventListener() {},

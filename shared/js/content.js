@@ -25,6 +25,11 @@ const {
     haveSameNukedPostKeys
 } = require('./nukedPosts')
 const {
+    isSpaceMapStorageKey,
+    readSpaceMapFromStored,
+    spaceMapStorageReadDefaults
+} = require('./spaceMapStorage')
+const {
     SPACE_CATEGORIES,
     SPACE_REGISTRY_KEY,
     buildSpaceRecord,
@@ -54,6 +59,8 @@ const {
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES} = require('./tunables')
+// The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
+const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
@@ -424,9 +431,10 @@ async function init() {
 
     settings = await safeStorageGet(defaults)
     spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
-    const storedSpaceNukedPosts = (await safeStorageGet({[SPACE_NUKED_POSTS_KEY]: {}}))[SPACE_NUKED_POSTS_KEY] || {}
+    const storedSpaceMaps = await safeStorageGet(spaceMapStorageReadDefaults(SPACE_MAP_BASE_KEYS))
+    const storedSpaceNukedPosts = readSpaceMapFromStored(storedSpaceMaps, SPACE_NUKED_POSTS_KEY)
     spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
-    spacePendingNukedPosts = (await safeStorageGet({[SPACE_PENDING_NUKED_POSTS_KEY]: {}}))[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    spacePendingNukedPosts = readSpaceMapFromStored(storedSpaceMaps, SPACE_PENDING_NUKED_POSTS_KEY)
     await refreshCoordinatorQueueFromRuntime({force: true})
     if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
         // The worker owns the space nuked-post keys (set-space-nuked-posts). Bounded, so the wait cannot stall init.
@@ -630,6 +638,7 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
 function onStorageChanged(changes, areaName) {
     if(areaName !== 'local') return
 
+    let spaceMapsChanged = false
     for(const [key, change] of Object.entries(changes)) {
         if(Object.prototype.hasOwnProperty.call(defaults, key)) {
             settings[key] = change.newValue
@@ -641,18 +650,21 @@ function onStorageChanged(changes, areaName) {
                 scheduleSpaceAssetNukeControls(0)
             }
         }
-        else if(key === SPACE_NUKED_POSTS_KEY) {
-            spaceNukedPosts = change.newValue || {}
-            if(getPageType() === 'space') {
-                scheduleSpaceFeedProgressDrivenRefresh()
-            }
+        else if(isSpaceMapStorageKey(key, SPACE_MAP_BASE_KEYS)) {
+            spaceMapsChanged = true
         }
-        else if(key === SPACE_PENDING_NUKED_POSTS_KEY) {
-            spacePendingNukedPosts = change.newValue || {}
-            if(getPageType() === 'space') {
-                scheduleSpaceFeedProgressDrivenRefresh()
-            }
-        }
+    }
+    if(spaceMapsChanged) void refreshSpaceMapsFromStorage()
+}
+
+// A change to any layout key of the space post maps (the whole-map keys, the bucket keys or the layout marker) re-reads both
+// maps, so one event with several bucket keys costs one read.
+async function refreshSpaceMapsFromStorage() {
+    const stored = await safeStorageGet(spaceMapStorageReadDefaults(SPACE_MAP_BASE_KEYS))
+    spaceNukedPosts = readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY)
+    spacePendingNukedPosts = readSpaceMapFromStored(stored, SPACE_PENDING_NUKED_POSTS_KEY)
+    if(getPageType() === 'space') {
+        scheduleSpaceFeedProgressDrivenRefresh()
     }
 }
 
