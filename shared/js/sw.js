@@ -4,6 +4,7 @@ const defaults = require('./defaults')
 const {
     SPACE_MAP_LAYOUT_KEY,
     SPACE_MAP_LAYOUT_BUCKETED,
+    spaceMapBucketKeys,
     spaceMapStorageKeys,
     splitSpaceMapIntoBuckets,
     readSpaceMapFromStored,
@@ -2582,6 +2583,49 @@ function commitSpaceMapDiskWrite(write = {}) {
     if(write.migrated) spaceMapLayout.bucketed = true
 }
 
+// The run list (COORDINATOR_RUNS_KEY) on disk. Same scheme as the space maps, with its own layout marker, so the two can be
+// migrated separately. The session mirror of the run list stays whole. Its disk copy is the buckets once runsLayout.bucketed.
+const COORDINATOR_RUNS_LAYOUT_KEY = 'mbCoordinatorRunsLayoutVersion'
+const runsLayout = {bucketed: false, hash: null}
+
+function getRunsStoredReadDefaults() {
+    return {[COORDINATOR_RUNS_LAYOUT_KEY]: null, [COORDINATOR_RUNS_KEY]: {}, ...Object.fromEntries(spaceMapBucketKeys(COORDINATOR_RUNS_KEY).map(key => [key, {}]))}
+}
+
+// The layout keys only: used when the run list comes from the session mirror, so the legacy key is not read from disk.
+function getRunsLayoutStoredReadDefaults() {
+    return {[COORDINATOR_RUNS_LAYOUT_KEY]: null, ...Object.fromEntries(spaceMapBucketKeys(COORDINATOR_RUNS_KEY).map(key => [key, {}]))}
+}
+
+// From a hydrate read. fromMirror: the run list is the session copy, already in stored, and only the layout is read from disk.
+function applyRunsStoredLayout(stored = {}, options = {}) {
+    const bucketed = stored[COORDINATOR_RUNS_LAYOUT_KEY] === SPACE_MAP_LAYOUT_BUCKETED
+    const runs = options.fromMirror === true ? (stored[COORDINATOR_RUNS_KEY] || {}) : readSpaceMapFromStored(stored, COORDINATOR_RUNS_KEY)
+    for (const key of [COORDINATOR_RUNS_LAYOUT_KEY, ...spaceMapBucketKeys(COORDINATOR_RUNS_KEY)]) delete stored[key]
+    stored[COORDINATOR_RUNS_KEY] = runs
+    runsLayout.bucketed = bucketed
+    runsLayout.hash = bucketed ? hashSpaceMapBuckets(splitSpaceMapIntoBuckets(COORDINATOR_RUNS_KEY, runs)) : null
+}
+
+// The disk write of the run list. Once bucketed, a write sends only the changed buckets; a migration writes all of them with the marker.
+function getRunsDiskWrite(payload = {}, options = {}) {
+    if (!Object.prototype.hasOwnProperty.call(payload, COORDINATOR_RUNS_KEY)) return {disk: payload, hashes: null, migrated: false}
+    const migrating = options.runsMigrate === true
+    if (!migrating && !runsLayout.bucketed) return {disk: payload, hashes: null, migrated: false}
+    const disk = {...payload}
+    delete disk[COORDINATOR_RUNS_KEY]
+    const next = changedSpaceMapBuckets(COORDINATOR_RUNS_KEY, payload[COORDINATOR_RUNS_KEY], migrating ? null : runsLayout.hash)
+    Object.assign(disk, next.changed)
+    if (migrating) disk[COORDINATOR_RUNS_LAYOUT_KEY] = SPACE_MAP_LAYOUT_BUCKETED
+    return {disk, hashes: next.hashes, migrated: migrating}
+}
+
+function commitRunsDiskWrite(write = {}) {
+    if (!write.hashes) return
+    runsLayout.hash = write.hashes
+    if (write.migrated) runsLayout.bucketed = true
+}
+
 async function metricStorageSet(payload = {}, options = {}) {
     const storageContext = getActiveStorageContext()
     if(payload &&
@@ -2627,12 +2671,16 @@ async function metricStorageSet(payload = {}, options = {}) {
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
         const spaceMapWrite = getSpaceMapDiskWrite(payload, options)
-        const diskPayload = options.namespaceStamps ? {...spaceMapWrite.disk, ...options.namespaceStamps} : spaceMapWrite.disk
-        if(spaceMapWrite.hashes) diskWriteBytes = measureDiskWriteBytes(diskPayload)
+        const runsWrite = getRunsDiskWrite(spaceMapWrite.disk, options)
+        const diskPayload = options.namespaceStamps ? {...runsWrite.disk, ...options.namespaceStamps} : runsWrite.disk
+        if(spaceMapWrite.hashes || runsWrite.hashes) diskWriteBytes = measureDiskWriteBytes(diskPayload)
         result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
             ? coordinatorStorageAdapter.set(diskPayload)
             : true))
-        if(result !== false) commitSpaceMapDiskWrite(spaceMapWrite)
+        if(result !== false) {
+            commitSpaceMapDiskWrite(spaceMapWrite)
+            commitRunsDiskWrite(runsWrite)
+        }
         writeOutcome = 'saved'
     }
     finally {
@@ -10207,15 +10255,25 @@ function createCoordinatorAuthority() {
     function migrateSpaceMapLayout(options = {}) {
         return runExclusiveOnApplyTail(async () => {
             if(!hydrated) await hydrate()
-            if(spaceMapLayout.bucketed) return {migrated: false, reason: 'already-bucketed'}
-            const stored = residentStoredFor({[SPACE_NUKED_POSTS_KEY]: {}, [SPACE_PENDING_NUKED_POSTS_KEY]: {}})
-            await persistCoordinatorStoredChange({
-                storageOptions: {metricPath: options.metricPath || 'spaceMap.migrate', spaceMapMigrate: true}
-            }, {
-                [SPACE_NUKED_POSTS_KEY]: stored[SPACE_NUKED_POSTS_KEY],
-                [SPACE_PENDING_NUKED_POSTS_KEY]: stored[SPACE_PENDING_NUKED_POSTS_KEY]
-            })
-            return {migrated: spaceMapLayout.bucketed === true, reason: spaceMapLayout.bucketed ? 'migrated' : 'write-not-saved'}
+            if(spaceMapLayout.bucketed && runsLayout.bucketed) return {migrated: false, reason: 'already-bucketed'}
+            // Each map is migrated on its own marker. Both writes go through the door, so no settlement write can interleave.
+            if(!spaceMapLayout.bucketed) {
+                const stored = residentStoredFor({[SPACE_NUKED_POSTS_KEY]: {}, [SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+                await persistCoordinatorStoredChange({
+                    storageOptions: {metricPath: options.metricPath || 'spaceMap.migrate', spaceMapMigrate: true}
+                }, {
+                    [SPACE_NUKED_POSTS_KEY]: stored[SPACE_NUKED_POSTS_KEY],
+                    [SPACE_PENDING_NUKED_POSTS_KEY]: stored[SPACE_PENDING_NUKED_POSTS_KEY]
+                })
+            }
+            if(!runsLayout.bucketed) {
+                const stored = residentStoredFor({[COORDINATOR_RUNS_KEY]: {}})
+                await persistCoordinatorStoredChange({
+                    storageOptions: {metricPath: 'runs.migrate', runsMigrate: true}
+                }, {[COORDINATOR_RUNS_KEY]: stored[COORDINATOR_RUNS_KEY]})
+            }
+            const migrated = spaceMapLayout.bucketed && runsLayout.bucketed
+            return {migrated, reason: migrated ? 'migrated' : 'write-not-saved'}
         })
     }
 
@@ -10746,7 +10804,7 @@ async function loadCoordinatorCurrentAuthorityState() {
         const runsFromMirror = mirroredNamespace[COORDINATOR_RUNS_KEY] !== undefined
         const stored = await metricStorageGet({
             ...(mirror ? {} : getCoordinatorQueueWalStorageDefaults()),
-            ...(runsFromMirror ? {} : {[COORDINATOR_RUNS_KEY]: {}}),
+            ...(runsFromMirror ? getRunsLayoutStoredReadDefaults() : getRunsStoredReadDefaults()),
             ...Object.fromEntries(candidateKeys.map(key => [getCoordinatorNamespaceStampKey(key), null])),
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
@@ -10763,16 +10821,18 @@ async function loadCoordinatorCurrentAuthorityState() {
             if(mirroredStamps[key] === stored[stampKey]) confirmed.add(key)
             delete stored[stampKey]
         }
+        let runsFromMirrorConfirmed = false
         if(mirror) {
             Object.assign(stored, mirror.wal)
             const runsConfirmed = runsFromMirror && confirmed.has(COORDINATOR_RUNS_KEY)
+            runsFromMirrorConfirmed = runsConfirmed
             if(runsConfirmed) {
                 stored[COORDINATOR_RUNS_KEY] = mirroredNamespace[COORDINATOR_RUNS_KEY]
                 incrementQueueWakeupMetric('queueNamespace.hydrateRunsFromMirror')
             }
             const rejectedCount = candidateKeys.length - confirmed.size
             if(rejectedCount > 0) incrementQueueWakeupMetric('queueNamespace.hydrateStampRejected', rejectedCount)
-            const readFromDisk = runsFromMirror && !runsConfirmed ? {[COORDINATOR_RUNS_KEY]: {}} : {}
+            const readFromDisk = runsFromMirror && !runsConfirmed ? getRunsStoredReadDefaults() : {}
             if(Object.keys(readFromDisk).length) {
                 Object.assign(stored, await metricStorageGet(readFromDisk, {metricPath: 'authority.hydrate.namespace'}))
             }
@@ -10783,6 +10843,7 @@ async function loadCoordinatorCurrentAuthorityState() {
         for(const key of PROFILE_NUKE_PROGRESS_STORAGE_KEYS) stored[key] = hydrateSession.progress[key] ?? progressDefaults[key]
         // The space post maps: whole maps again, from whichever layout the disk holds (spaceMapStorage.js).
         applySpaceMapStoredLayout(stored)
+        applyRunsStoredLayout(stored, {fromMirror: runsFromMirrorConfirmed})
         const queueSnapshot = {}
         const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: 'authority.hydrate.segments'
@@ -28899,6 +28960,23 @@ async function probeQueuedTabContentScript(tabId) {
     }
 }
 
+// The content-script step of a queued tab open, timed for the flight recorder: one queued-tab-content-ensure event per open.
+// The caller's timeout still applies around the promise it wraps (QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS).
+function withQueuedTabContentEnsureRecord(ensurePromise) {
+    const startedAt = Date.now()
+    return ensurePromise.then(result => {
+        recordFlightRecorderEvent({
+            kind: 'queued-tab-content-ensure',
+            source: 'ensureQueuedTabContentScript',
+            elapsedMs: Date.now() - startedAt,
+            accepted: result?.ensured === true,
+            changed: false,
+            reason: `${result?.reason || (result?.ensured === true ? 'ensured' : 'not-ensured')}`.slice(0, 80)
+        })
+        return result
+    })
+}
+
 async function ensureQueuedTabContentScript(tabId, reason = '') {
     const normalizedTabId = normalizeTabId(tabId)
     const metadata = getQueuedTabMetadata(normalizedTabId)
@@ -35631,7 +35709,7 @@ async function fillQueuedTabsOnce(options = {}) {
             applyQueuedTabOpenRuntimeEffect(openPlan)
             const earlyContentEnsurePromise = options.returnAfterDurableActive === true
                 ? promiseWithTimeout(
-                    ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
+                    withQueuedTabContentEnsureRecord(ensureQueuedTabContentScript(tab.id, 'queued-tab-opened')),
                     QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
                     'queued tab content script ensure'
                 ).catch(error => ({
@@ -35707,7 +35785,7 @@ async function fillQueuedTabsOnce(options = {}) {
                 })
             }
             const contentEnsurePromise = earlyContentEnsurePromise || promiseWithTimeout(
-                ensureQueuedTabContentScript(tab.id, 'queued-tab-opened'),
+                withQueuedTabContentEnsureRecord(ensureQueuedTabContentScript(tab.id, 'queued-tab-opened')),
                 QUEUED_TAB_CONTENT_SCRIPT_ENSURE_TIMEOUT_MS,
                 'queued tab content script ensure'
             ).catch(error => ({

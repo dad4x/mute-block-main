@@ -1521,7 +1521,10 @@ test('a mirrored runs copy with the disk stamp is served at restart, and hydrate
             'mbCoordinatorPauseGeneration',
             'mbCoordinatorPaused',
             // The space post maps are read in their layout keys: the legacy key, the 32 bucket keys of each map and the layout marker (spaceMapStorage.js).
-            ...require('../shared/js/spaceMapStorage').spaceMapStorageKeys(['mbSpaceNukedPosts', 'mbSpacePendingNukedPosts'])
+            ...require('../shared/js/spaceMapStorage').spaceMapStorageKeys(['mbSpaceNukedPosts', 'mbSpacePendingNukedPosts']),
+            // The run list's layout marker and bucket keys (its legacy key is not read when the mirror confirms it).
+            'mbCoordinatorRunsLayoutVersion',
+            ...require('../shared/js/spaceMapStorage').spaceMapBucketKeys('mbCoordinatorRuns')
         ].sort(),
         'the hydrate read names the same keys as before, plus the runs stamp and the space map layout keys'
     )

@@ -110,6 +110,31 @@ test('a restart with the bucketed layout reads the same maps back', async () => 
     assert.deepEqual(stored[PENDING], pending)
 })
 
+test('the run list moves to buckets at startup, and a change writes one run bucket and no whole-list key', async () => {
+    const RUNS = 'mbCoordinatorRuns'
+    const RUNS_LAYOUT = 'mbCoordinatorRunsLayoutVersion'
+    const runs = {}
+    for (let i = 0; i < 30; i += 1) runs[`run-${i}`] = {runId: `run-${i}`, status: 'succeeded', updatedAt: NOW - i}
+    const {browser, sw} = loadServiceWorkerHarness({now: NOW, runStartupWork: true, storage: {[RUNS]: runs}})
+    await sw.coordinatorAuthority.hydrate()
+    await settle()
+    assert.equal(browser.__storage[RUNS_LAYOUT], m.SPACE_MAP_LAYOUT_BUCKETED, 'the run list layout marker is written')
+    assert.deepEqual(m.readSpaceMapFromStored(browser.__storage, RUNS), runs, 'the run buckets hold every run')
+    assert.deepEqual(browser.__storage[RUNS], runs, 'the legacy run list key is kept for a rollback')
+    const current = JSON.parse(JSON.stringify(sw.coordinatorAuthority.current().stored[RUNS]))
+    const changedRunId = 'run-7'
+    const next = {...current, [changedRunId]: {...current[changedRunId], status: 'blocked', updatedAt: NOW}}
+    const keys = await recordSetKeys(browser, async () => {
+        await sw.coordinatorAuthority.persistCoordinator({stored: {[RUNS]: next}}, {
+            storageOptions: {metricPath: 'test.runs.write', snapshotWriteReason: 'ordinaryMutation'}
+        })
+    })
+    const bucket = m.spaceMapBucketKey(RUNS, m.spaceMapBucketIndex(changedRunId))
+    assert.deepEqual(keys.filter(key => key.startsWith(`${RUNS}.b`)), [bucket], 'only the bucket of the changed run is written')
+    assert.equal(keys.includes(RUNS), false, 'the whole run list key is not written')
+    assert.equal(m.readSpaceMapFromStored(browser.__storage, RUNS)[changedRunId].status, 'blocked', 'the change is on disk')
+})
+
 ;(async () => {
     for (const [name, fn] of cases) await run(name, fn)
 })().catch(() => {
