@@ -105,9 +105,13 @@ async function init() {
         maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
 
         // The worker owns every write. Settings and nuked posts both go through it.
-        await browser.runtime.sendMessage({action: 'set-extension-settings', settings: nextSettings})
+        const settingsResult = await browser.runtime.sendMessage({action: 'set-extension-settings', settings: nextSettings})
         await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
-        showStatus(status, 'Settings saved.')
+        // review-3 R3-2: an empty number field arrives as NaN, which the worker does not save. Say so instead of "saved".
+        const rejectedSettings = Array.isArray(settingsResult?.rejected) ? settingsResult.rejected : []
+        showStatus(status, rejectedSettings.length
+            ? `Settings saved, except ${rejectedSettings.join(', ')} (empty or invalid).`
+            : 'Settings saved.')
     })
 
     form.addEventListener('reset', async () => {

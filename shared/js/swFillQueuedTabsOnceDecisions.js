@@ -552,7 +552,9 @@ function createFillQueuedTabsOnceDecisions(deps = {}) {
         }))
         void contentEnsurePromise.then(result =>
             handleQueuedTabContentScriptEnsureResult(tab.id, result, 'queued-tab-opened-return-after-durable-active')
-        )
+        ).catch(error => {
+            recordCoordinatorDiagnosticEvent('queued-tab-content-ensure-failed', error?.message || 'Queued tab content script ensure result failed')
+        })
         scheduleOwnedBlockedProfileSweep(next.ownerTabId, 750)
         void sweepOwnedBlockedProfileTabs(next.ownerTabId)
         scheduleCoordinatorQueueResume(1000, 'queued-tab-opened-return-after-durable-active', {

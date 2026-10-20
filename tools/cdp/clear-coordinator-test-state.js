@@ -3,6 +3,7 @@
 const {
     DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
+    clearProfileNukeProgressThroughWorker,
     evaluate,
     getJson,
     getOption,
@@ -72,8 +73,9 @@ runMain(async () => {
         })
     })`, 20000)
 
+    const progressClear = await clearProfileNukeProgressThroughWorker(config)
     console.log(JSON.stringify({
-        ok: result?.ok === true,
+        ok: result?.ok === true && progressClear.saved !== false,
         extensionId: config.extensionId,
         extensionPath: config.extensionPath,
         target: {
@@ -82,7 +84,9 @@ runMain(async () => {
         },
         removedCount: result?.removedCount || 0,
         removedKeys: result?.removedKeys || [],
-        error: result?.error || ''
+        error: result?.error || '',
+        progressCleared: progressClear.cleared || 0,
+        progressReason: progressClear.reason || ''
     }, null, 2))
-    if(result?.ok !== true) process.exitCode = 1
+    if(result?.ok !== true || progressClear.saved === false) process.exitCode = 1
 })

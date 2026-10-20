@@ -5,6 +5,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
@@ -26,15 +27,14 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function inspectQueueItem(needle, limit) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function inspectQueueItem(needle, limit, progress) {
         const storage = await chrome.storage.local.get({
             mbCoordinatorPaused: false,
             mbCoordinatorQueue: {},
-            mbCoordinatorRetryFailedEnabled: false,
-            mbProfileNukeProgressView: {}
+            mbCoordinatorRetryFailedEnabled: false
         })
         const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgressView?.records || {}
         const tabs = await chrome.tabs.query({})
         const normalize = value => {
             try {
@@ -141,7 +141,7 @@ runMain(async () => {
                     : []
             }
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)} )`, 30000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)}, ${JSON.stringify(progressRecords)} )`, 30000)
 
     console.log(JSON.stringify(result, null, 2))
 })

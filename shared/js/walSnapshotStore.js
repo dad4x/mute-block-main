@@ -379,6 +379,10 @@ function getKeyedRowReadKeys(meta = null, key = '', options = {}) {
     return keys
 }
 
+// The reason a manifest and the metadata disagree on the active slot. Named once: the checkpoint recovery in swQueueWalStore.js
+// matches on it, so a second copy of the literal could drift from the one that is returned here.
+const CHECKPOINT_MANIFEST_META_MISMATCH = 'checkpoint-manifest-meta-mismatch'
+
 // A keyed read may only use a manifest whose identity is the active metadata's. A stale or mixed
 // manifest with a matching shard would otherwise project a row from an older base.
 function checkpointManifestMatchesMeta(manifest = {}, metaCheckpoint = {}, activeId = '') {
@@ -388,6 +392,48 @@ function checkpointManifestMatchesMeta(manifest = {}, metaCheckpoint = {}, activ
         normalizeSeq(manifest.createdAt) === normalizeSeq(metaCheckpoint.createdAt) &&
         manifest.stateHash === metaCheckpoint.stateHash &&
         normalizeCheckpointShardCount(manifest.shardCount) === normalizeCheckpointShardCount(metaCheckpoint.shardCount)
+}
+
+// The identity that checkpointManifestMatchesMeta compares, as one string, for the checkpoint diagnostics. It lists the same
+// fields, so a diagnostic can show the metadata's checkpoint and the disk manifest side by side. The decision stays with the check.
+// A manifest's id is passed as the slot, because the check compares it too; the metadata's record has no id of its own.
+function getCheckpointFingerprint(record = {}, checkpointId = CHECKPOINT_A) {
+    return [
+        normalizeCheckpointId(checkpointId),
+        normalizeSeq(record?.snapshotSeq),
+        normalizeSeq(record?.snapshotEpoch),
+        normalizeSeq(record?.createdAt),
+        `${record?.stateHash}`,
+        normalizeCheckpointShardCount(record?.shardCount)
+    ].join(':')
+}
+
+// The checkpoint manifests a session mirror rebuild would copy that disagree with the disk meta, one entry per slot (hole 1,
+// docs/queue-storage-layering.md, section 6). The rule is the loader's, so a manifest the loader would refuse is never written over a
+// good session copy. A manifest with a metadata entry must pass checkpointManifestMatchesMeta. A sharded manifest with no entry
+// disagrees, as hydrate refuses it. A monolithic manifest with no entry predates fingerprints and is not checked. A missing manifest
+// is never copied. Only the slots the records hold are looked at. Each entry names its slot and both fingerprints.
+function findCheckpointManifestDisagreements(records = {}, meta = null, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    const disagreements = []
+    if(!isSegmentedWalStorageMeta(meta)) return disagreements
+    for(const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+        const key = getSegmentedWalCheckpointKey(baseKey, checkpointId)
+        if(!Object.prototype.hasOwnProperty.call(records || {}, key)) continue
+        const manifest = records[key]
+        const isRecord = manifest !== null && typeof manifest === 'object'
+        const metaCheckpoint = meta.checkpoints?.[checkpointId] || null
+        if(isRecord && !metaCheckpoint && manifest.format !== CHECKPOINT_SHARD_FORMAT) continue
+        if(isRecord && metaCheckpoint && checkpointManifestMatchesMeta(manifest, metaCheckpoint, checkpointId)) continue
+        disagreements.push({
+            checkpointId,
+            metaFingerprint: getCheckpointFingerprint(metaCheckpoint || {}, checkpointId),
+            manifestFingerprint: isRecord
+                ? getCheckpointFingerprint(manifest, normalizeCheckpointId(manifest.id))
+                : getCheckpointFingerprint({}, checkpointId)
+        })
+    }
+    return disagreements
 }
 
 function projectKeyedRowFromStored(stored = {}, options = {}) {
@@ -406,7 +452,7 @@ function projectKeyedRowFromStored(stored = {}, options = {}) {
     const metaCheckpoint = meta.checkpoints?.[active] || null
     if(!metaCheckpoint) return {ok: false, reason: 'checkpoint-meta-missing'}
     if(!checkpointManifestMatchesMeta(manifest, metaCheckpoint, active)) {
-        return {ok: false, reason: 'checkpoint-manifest-meta-mismatch'}
+        return {ok: false, reason: CHECKPOINT_MANIFEST_META_MISMATCH}
     }
 
     const shardCount = normalizeCheckpointShardCount(manifest.shardCount)
@@ -551,7 +597,7 @@ function projectKeyedRowFromResidentStore(resident = null, diskMeta = null, opti
     const metaCheckpoint = diskMeta.checkpoints?.[active] || null
     if(!metaCheckpoint) return {ok: false, reason: 'checkpoint-meta-missing'}
     if(!checkpointManifestMatchesMeta(manifest, metaCheckpoint, active)) {
-        return {ok: false, reason: 'checkpoint-manifest-meta-mismatch'}
+        return {ok: false, reason: CHECKPOINT_MANIFEST_META_MISMATCH}
     }
 
     const shardCount = normalizeCheckpointShardCount(manifest.shardCount)
@@ -605,17 +651,32 @@ function getQueueMirrorKeys(meta = null, options = {}) {
 }
 
 // The non-WAL keys of the queue namespace that the session mirror also holds
-// (docs/queue-storage-layering.md, section 6): the runs key, then every key of the progress projection.
+// (docs/queue-storage-layering.md, section 6): the runs key, the dashboard outlier list key (outliersKey), then every key of the progress projection.
 // progressDefaults is getProfileNukeProgressProjectionDefaults([]), which is the progress view plus every
 // shard; progress is hashed per href into a fixed shard count, so the full list is the complete progress
 // layout, not one shard per href. Pure: the caller supplies the key names and the progress defaults.
 function queueNamespaceMirrorKeys(options = {}) {
     const progressKeys = Object.keys(options.progressDefaults || {})
     const keys = options.runsKey ? [options.runsKey] : []
+    if(options.outliersKey && !keys.includes(options.outliersKey)) keys.push(options.outliersKey)
     for(const key of progressKeys) {
         if(!keys.includes(key)) keys.push(key)
     }
     return keys
+}
+
+// The stamp key of one namespace key (docs/queue-storage-layering.md, section 6, rule 7). Each namespace key has its own
+// stamp key: the namespace write that last wrote the key stores a token under it, on disk and, when that write is mirrored,
+// in the session mirror. A session copy of a key is used only when its stamp is the disk stamp of that key. Per key, not
+// per namespace: a mirrored write of one key must not vouch for another key whose disk copy an unmirrored write changed.
+// Pure: the caller supplies the prefix.
+function queueNamespaceStampKey(prefix = '', key = '') {
+    return `${prefix}${key}`
+}
+
+// The stamp keys of a list of namespace keys, in the same order.
+function queueNamespaceStampKeys(keys = [], prefix = '') {
+    return keys.map(key => queueNamespaceStampKey(prefix, key))
 }
 
 // The part of a storage payload (or stored snapshot) that the mirror holds, as an object.
@@ -648,6 +709,13 @@ function getQueueWalSeqFingerprint(meta = null) {
     return `${activeCheckpoint}:${normalizeSeq(meta.nextSeq)}:${getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)}`
 }
 
+// True when a storage payload carries a checkpoint manifest or shard key. Only a write that rewrites a checkpoint does: a checkpoint
+// switch, or a full append that cannot be incremental. The mirror append planner and the mirror gate in sw.js both use it.
+function payloadHasCheckpointKeys(payload = {}, options = {}) {
+    const checkpointPrefix = `${options.baseKey || 'wal'}.checkpoint.`
+    return Object.keys(payload || {}).some(key => key.startsWith(checkpointPrefix))
+}
+
 // The records one acknowledged append adds to a mirror that already holds the previous
 // state. Returns null when the mirror cannot be advanced this way: the active slot changed,
 // a checkpoint was written, or the committed count does not line up. Callers then rebuild.
@@ -657,8 +725,7 @@ function planQueueMirrorAppend(mirrorMeta = null, payload = {}, options = {}) {
     if(!isSegmentedWalStorageMeta(meta) || !isSegmentedWalStorageMeta(mirrorMeta)) return null
     const active = normalizeCheckpointId(meta.activeCheckpoint)
     if(normalizeCheckpointId(mirrorMeta.activeCheckpoint) !== active) return null
-    const checkpointPrefix = `${baseKey}.checkpoint.`
-    if(Object.keys(payload).some(key => key.startsWith(checkpointPrefix))) return null
+    if(payloadHasCheckpointKeys(payload, {baseKey})) return null
 
     const committedBefore = getSegmentedWalCommittedSegmentCount(mirrorMeta, active)
     const committedNow = getSegmentedWalCommittedSegmentCount(meta, active)
@@ -1041,6 +1108,25 @@ function hydrateSegmentedWalStore(stored = {}, options = {}) {
     const checkpoint = activeRead.checkpoint
     if(!activeRead.ok || !checkpoint) {
         return {ok: false, reason: activeRead.reason || 'missing-checkpoint', missingKey: activeRead.missingKey, store: null, meta}
+    }
+    // The active manifest must be the one the metadata describes, the same binding the keyed read enforces
+    // (checkpointManifestMatchesMeta). A manifest and a fingerprint from different writes fail closed, and no state is
+    // rebuilt from either of them. A monolithic slot with no fingerprint predates fingerprints and has nothing to bind to,
+    // so it loads as before. A sharded slot is always written with its fingerprint, so a missing one is refused.
+    const metaCheckpoint = meta.checkpoints?.[activeCheckpoint] || null
+    if(metaCheckpoint || checkpoint.format === CHECKPOINT_SHARD_FORMAT) {
+        if(!metaCheckpoint) {
+            return {ok: false, reason: 'checkpoint-meta-missing', store: null, meta}
+        }
+        if(!checkpointManifestMatchesMeta(checkpoint, metaCheckpoint, activeCheckpoint)) {
+            return {
+                ok: false,
+                reason: CHECKPOINT_MANIFEST_META_MISMATCH,
+                missingKey: getSegmentedWalCheckpointKey(baseKey, activeCheckpoint),
+                store: null,
+                meta
+            }
+        }
     }
 
     const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
@@ -1511,6 +1597,11 @@ function projectKeyedRows(stored = {}, wanted = [], options = {}) {
 }
 
 module.exports = {
+    CHECKPOINT_MANIFEST_META_MISMATCH,
+    checkpointManifestMatchesMeta,
+    findCheckpointManifestDisagreements,
+    getCheckpointFingerprint,
+    payloadHasCheckpointKeys,
     planKeyedRowReads,
     projectKeyedRows,
     CHECKPOINT_A,
@@ -1530,6 +1621,8 @@ module.exports = {
     getKeyedRowReadKeys,
     getQueueMirrorKeys,
     queueNamespaceMirrorKeys,
+    queueNamespaceStampKey,
+    queueNamespaceStampKeys,
     selectQueueMirrorRecords,
     isQueueMirrorFresh,
     getQueueWalSeqFingerprint,

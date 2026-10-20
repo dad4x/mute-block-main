@@ -77,7 +77,8 @@ function createCoordinatorRowEventMetrics(deps = {}) {
                 profileHref,
                 coordinatorKey: profileHref,
                 patch,
-                senderTabId: options.senderTabId || null
+                // Each pending record carries its own authenticated sender (review-2 S4-1); a call-wide sender is the fallback.
+                senderTabId: options.senderTabIdsByHref?.[profileHref] || options.senderTabId || null
             }))
             .filter(Boolean)
     }

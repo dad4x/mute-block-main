@@ -5,6 +5,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
@@ -20,15 +21,14 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectQueue(needle) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectQueue(needle, progressRecords) {
         const storage = await chrome.storage.local.get({
             mbCoordinatorQueue: {},
-            mbCoordinatorRuns: {},
-            mbProfileNukeProgressView: {}
+            mbCoordinatorRuns: {}
         })
         const queue = storage.mbCoordinatorQueue || {}
         const runs = storage.mbCoordinatorRuns || {}
-        const progressRecords = storage.mbProfileNukeProgressView?.records || {}
         const tabs = await chrome.tabs.query({})
         const profileTabs = tabs.filter(tab => /^https:\/\/www\.quora\.com\/profile\//i.test(tab.url || ''))
         const runtimeQueuedActions = typeof queuedTabActions !== 'undefined'
@@ -117,7 +117,7 @@ runMain(async () => {
             runs: runRows.slice(0, 20),
             totalQueue: Object.keys(queue).length,
             totalRuns: Object.keys(runs).length,
-            totalProgress: Number.parseInt(storage.mbProfileNukeProgressView?.total, 10) || Object.keys(progressRecords).length,
+            totalProgress: Object.keys(progressRecords).length,
             runtime: {
                 queuedActions: runtimeQueuedActions.length,
                 queuedActionSamples: runtimeQueuedActions.slice(0, 20),
@@ -132,7 +132,7 @@ runMain(async () => {
             })).slice(0, 60),
             profileTabCount: profileTabs.length
         }
-    }})( ${JSON.stringify(needle)} )`, 30000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)} )`, 30000)
 
     console.log(JSON.stringify(result, null, 2))
 })

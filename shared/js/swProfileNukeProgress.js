@@ -75,10 +75,7 @@ function createProfileNukeProgress(deps = {}) {
         normalizeProfileNukeProgressView,
         normalizeCoordinatorMap,
         makeCoordinatorQueueWalCheckpoint,
-        buildCoordinatorQueueView,
-        buildCoordinatorContentQueueIndex,
-        buildCoordinatorContentQueueIndexShardPayload,
-        buildCoordinatorContentSourceIndexShardPayload
+        buildCoordinatorQueueView
     } = deps.handlers || {}
     const {
         MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS,
@@ -87,10 +84,7 @@ function createProfileNukeProgress(deps = {}) {
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
         COORDINATOR_QUEUE_KEY,
         COORDINATOR_QUEUE_WAL_KEY,
-        COORDINATOR_QUEUE_VIEW_KEY,
-        COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
-        COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
-        COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX
+        COORDINATOR_QUEUE_VIEW_KEY
     } = deps.constants || {}
 
     function summarizeProfileNukeProgressRecord(profileHref = '', record = {}) {
@@ -474,15 +468,8 @@ function createProfileNukeProgress(deps = {}) {
             // moved on. Confirmed live: reappearing rows and up to 3
             // concurrently active tabs right after a
             // coordinator-authority-queue-wal-auto-recovered-from-view event.
-            if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_CONTENT_QUEUE_INDEX_KEY)) {
-                next[COORDINATOR_CONTENT_QUEUE_INDEX_KEY] = buildCoordinatorContentQueueIndex(queue, nowMs)
-            }
-            if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX))) {
-                Object.assign(next, buildCoordinatorContentQueueIndexShardPayload(queue, nowMs))
-            }
-            if(!Object.keys(next).some(key => `${key || ''}`.startsWith(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX))) {
-                Object.assign(next, buildCoordinatorContentSourceIndexShardPayload(queue, nowMs))
-            }
+            // Owner 601f 1a: the content queue index and its shards are no longer added to a full-queue write. They are derived
+            // from the resident queue on read (readResidentDerivedQueueIndex in sw.js), so nothing stores them.
         }
         return next
     }

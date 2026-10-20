@@ -5,6 +5,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -81,7 +82,8 @@ runMain(async () => {
         }
     }})()`, 15000)
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${function enqueueVisibleProfileSearch(visible, limit, maxConcurrent, noForegroundFallback) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${function enqueueVisibleProfileSearch(visible, limit, maxConcurrent, noForegroundFallback, progress) {
         const sendMessage = message => new Promise(resolve => {
             let settled = false
             const finish = value => {
@@ -104,9 +106,8 @@ runMain(async () => {
             sourceLabel: visible?.sourceLabel || visible?.title || ''
         }
 
-        return chrome.storage.local.get({mbCoordinatorQueue: {}, mbProfileNukeProgressView: {}}).then(async stored => {
+        return chrome.storage.local.get({mbCoordinatorQueue: {}}).then(async stored => {
             const queue = stored.mbCoordinatorQueue || {}
-            const progress = stored.mbProfileNukeProgressView?.records || {}
             const selected = unique.filter(href => {
                 const row = queue[href]
                 const record = progress[href]
@@ -157,7 +158,7 @@ runMain(async () => {
                 response
             }
         })
-    }})( ${JSON.stringify(visible)}, ${JSON.stringify(limit)}, ${JSON.stringify(maxConcurrent)}, ${JSON.stringify(noForegroundFallback)} )`, 30000)
+    }})( ${JSON.stringify(visible)}, ${JSON.stringify(limit)}, ${JSON.stringify(maxConcurrent)}, ${JSON.stringify(noForegroundFallback)}, ${JSON.stringify(progressRecords)} )`, 30000)
 
     console.log(JSON.stringify({
         target: target ? {id: target.id, title: target.title || '', url: target.url || ''} : null,

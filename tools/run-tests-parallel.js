@@ -26,9 +26,15 @@ const lanes = [
       ['node', 'test/contentSourcePostResolution.test.js'],
       ['node', 'test/contentEnqueueChunkRetry.test.js'],
       ['node', 'test/contentInlineResolution.test.js'],
+      ['node', 'test/contentQueuedClaimHold.test.js'],
+      ['node', 'test/acceptedReviewChanges.test.js'],
       ['node', 'test/cdpClickProfileExtensionAction.test.js'],
       ['node', 'test/requeueFailures.test.js'],
-      ['node', 'test/swStorageMetrics.test.js']
+      ['node', 'test/swStorageMetrics.test.js'],
+      ['node', 'test/swQueueWal.test.js'],
+      ['node', 'test/swQueueWalRecovery.test.js'],
+      ['node', 'test/swQueueWalStore.test.js'],
+      ['node', 'test/swQueueWalDurableReads.test.js']
     ]
   },
   {
@@ -47,7 +53,13 @@ const lanes = [
     commandTimeoutMs: 30000,
     commands: [
       ['node', 'test/p1-contract.test.js'],
-      ['node', 'test/terminalOwnedTabScope.test.js']
+      ['node', 'test/colorTokens.test.js'],
+      ['node', 'test/terminalOwnedTabScope.test.js'],
+      ['node', 'test/swStorageLane.test.js'],
+      ['node', 'test/swQueueBarSummary.test.js'],
+      ['node', 'test/candidateListEvidence.test.js'],
+      ['node', 'test/swResumeExemption.test.js'],
+      ['node', 'test/swProfileNukeProgressPush.test.js']
     ]
   },
   {

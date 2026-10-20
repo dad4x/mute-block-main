@@ -150,6 +150,8 @@ function loadDashboardHarness() {
             if(name === './timeouts') return require(path.join(__dirname, '..', 'shared/js/timeouts'))
             if(name === './nukedPosts') return require(path.join(__dirname, '..', 'shared/js/nukedPosts'))
             if(name === './defaults') return require(path.join(__dirname, '..', 'shared/js/defaults'))
+            if(name === './tunables') return require(path.join(__dirname, '..', 'shared/js/tunables'))
+            if(name === './storageKeys') return require(path.join(__dirname, '..', 'shared/js/storageKeys'))
             throw new Error(`unexpected require: ${name}`)
         },
         addEventListener() {},
@@ -209,7 +211,8 @@ function loadQueuedPageResolutionHarness() {
     vm.createContext(context)
     vm.runInContext([
         extractFunction(source, "function isSourcePostResolutionReason(reason = '')"),
-        extractFunction(source, 'function getQueuedPageResolvedProfileHref(claimedAction = {})')
+        extractFunction(source, 'function noteQueuedResolution(sink, source, href)'),
+        extractFunction(source, 'function getQueuedPageResolvedProfileHref(claimedAction = {}, sink = null)')
     ].join('\n\n'), context, {filename: 'queued-page-resolution-harness.js'})
 
     return {
@@ -281,7 +284,14 @@ test('forbidden legacy progress and repair surfaces stay out of live source', ()
     const failures = []
 
     for(const file of files) {
+        // D3: the 1.5 cleanup list names the retired progress blob key on purpose (sw.js VERSION_15_RETIRED_STORAGE_KEYS), and
+        // the upgrade-cleanup test seeds that key. Those are the only allowed occurrences; every other mention is still forbidden.
         const source = readRepoFile(file)
+            .replace(/const VERSION_15_RETIRED_STORAGE_KEYS = \[[^\]]*\]/, '')
+            // The same retired list in the minified build output (chrome/ and firefox/ carry it as a bare array literal).
+            // The bundler picks the quote style; accept either, but only for this exact retired list.
+            .replace(/\[(["'])mbCoordinatorQueue\1,\1mbProfileNukeProgress\1\]/g, '')
+            .replace(/test\('upgrade from 1\.5 removes only the 1\.5 storage residue this worker does not use'[\s\S]*?\n\}\)\n/, '')
         for(const entry of forbidden) {
             const match = source.match(entry.pattern)
             if(match) failures.push(`${file}: ${entry.name}: ${match[0]}`)
@@ -298,7 +308,8 @@ test('forbidden legacy storage keys are absent from source text and runtime acti
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const runtimeActions = getRuntimeRequestActionNames(bootstrap)
 
-    assert.doesNotMatch(source, /mbProfileNukeProgress(?!View|Shard)/)
+    // D3: the only allowed mention of the 1.5 blob key is the retired-keys declaration that the upgrade cleanup removes.
+    assert.doesNotMatch(source.replace(/const VERSION_15_RETIRED_STORAGE_KEYS = \[[^\]]*\]/, ''), /mbProfileNukeProgress(?!View|Shard)/)
     assert.doesNotMatch(source, /PROFILE_NUKE_PROGRESS_KEY/)
     assert.doesNotMatch(content, /mbProfileNukeProgress(?!View|Shard)|PROFILE_NUKE_PROGRESS_KEY/)
     assert.doesNotMatch(coordinator, /mbProfileNukeProgress(?!View|Shard)|PROFILE_NUKE_PROGRESS_KEY/)
@@ -329,6 +340,30 @@ test('current storage write payloads cannot include the full legacy progress key
     assert.match(metricStorageSetBody, /PROFILE_NUKE_PROGRESS_SHARD_PREFIX/)
 })
 
+test('the dashboard no longer computes outliers: the worker serves the list and the page renders it', () => {
+    const source = readRepoFile('shared/js/coordinator.js')
+    for(const removed of [
+        'function checkCoordinatorOutliers',
+        'function getCoordinatorActiveDurationBaseline',
+        'function getCoordinatorOutlierRowKey',
+        'function fetchFlightRecorderForOutlier',
+        'dismissedOutlierKeys',
+        'COORDINATOR_OUTLIER_',
+        'flightRecorderEntries'
+    ]) {
+        assert.equal(source.includes(removed), false, `coordinator.js no longer contains ${removed}`)
+    }
+    const renderBody = extractFunction(source, 'function render()')
+    assert.doesNotMatch(renderBody, /checkCoordinatorOutliers/)
+    assert.match(renderBody, /renderOutliers\(\)/)
+    const refreshBody = extractFunction(source, 'async function refreshCompactDashboardViews()')
+    assert.match(refreshBody, /Array\.isArray\(result\?\.outliers\)/)
+    const clearOutliersBody = extractFunction(source, 'async function clearOutliers()')
+    assert.match(clearOutliersBody, /sendRuntimeMessageWithTimeout\(\{action: 'clear-coordinator-outliers'\}/)
+    const clearAllStatsBody = extractFunction(source, 'async function clearAllStats()')
+    assert.doesNotMatch(clearAllStatsBody, /clearOutliers\(\)/)
+})
+
 test('runtime action contract enumerates current accepted actions and rejects old aliases', () => {
     const source = readRepoFile('shared/js/swBootstrap.js')
     const runtimeActions = getRuntimeRequestActionNames(source)
@@ -338,14 +373,19 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'cancel-coordinator-current-work',
         'cancel-coordinator-current-work-item',
         'cancel-queued-owner-nukes',
+        'claim-debug-run-autosave',
         'claim-tab-action',
         'cleanup-owned-nuke-status',
         'clear-coordinator-current-work',
+        'clear-coordinator-events',
+        'clear-coordinator-outliers',
         'clear-coordinator-terminal-stats',
         'clear-profile-nuke-state',
         'close-tab',
         'cloudflare-challenge-detected',
         'confirm-space-feed-profiles-blocked',
+        'content-claim-retry-hit',
+        'content-live-check',
         'coordinator-page-ready',
         'create-tab',
         'enqueue-coordinator-items',
@@ -353,6 +393,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'get-coordinator-queue-accounting',
         'get-coordinator-queue-runtime-state',
         'get-flight-recorder',
+        'get-debug-resume-limit-status',
         'get-coordinator-why-not-running',
         'get-owned-nuke-status',
         'heartbeat-action-lease',
@@ -364,12 +405,14 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'reconcile-coordinator-storage',
         'record-direct-profile-progress',
         'record-initial-blocked-state',
+        'record-page-event',
         'record-job-milestone',
         'record-job-terminal',
         'refresh-coordinator-dashboard-views',
         'refresh-coordinator-queue-view',
         'refresh-coordinator-runs-view',
         'refresh-queue-wakeup-metrics-view',
+        'register-queued-worker-action-surface',
         'release-action-lease',
         'release-job-tab',
         'remove-pending-space-feed-entries',
@@ -382,6 +425,14 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'resume-coordinator-queue',
         'resume-paused-coordinator-nukes',
         'retry-coordinator-failed',
+        'set-coordinator-retry-failed-enabled',
+        'set-dev-mode-enabled',
+        'set-extension-settings',
+        'set-hidden-run-ids',
+        'set-space-nuked-posts',
+        'set-space-registry',
+        'set-space-sort',
+        'set-space-pending-nuked-posts',
         'settle-terminal-coordinator-items',
         'sweep-owned-blocked-profile-tabs',
         'sweep-service-worker-blocked-profile-tabs'
@@ -502,9 +553,11 @@ test('missing dashboard queue view is regenerated by service worker', () => {
     assert.match(refreshBody, /action: 'refresh-coordinator-dashboard-views'/)
     assert.match(refreshBody, /applyCoordinatorQueueView\(result\.view\)/)
     assert.doesNotMatch(refreshBody, /COORDINATOR_QUEUE_KEY/)
-    // One WAL read and projection feeds both queue and completed history (no second replay).
-    assert.match(loaderBody, /loadCoordinatorQueueWalProjection\(walStored/)
-    assert.match(loaderBody, /recoverProjectedState\(walStore/)
+    // One resident read feeds both queue and completed history (P2). The loader replays nothing and reads no storage (P3).
+    assert.match(loaderBody, /getResidentCompletedForReads\(\)/)
+    assert.match(loaderBody, /buildCoordinatorDashboardAuthoritySnapshotFromResident\(/)
+    assert.doesNotMatch(loaderBody, /loadCoordinatorQueueWalProjection\(/)
+    assert.doesNotMatch(loaderBody, /recoverProjectedState\(/)
     assert.doesNotMatch(loaderBody, /getRecentCompletedWorkRows\(/)
     assert.match(queueViewBuilderBody, /buildCoordinatorQueueView\(queue, Date\.now\(\), \{runs: snapshot\.runs, statsClearedAt: coordinatorStatsClearedAtResident\}\)/)
     assert.match(bootstrap, /request\.action === 'refresh-coordinator-dashboard-views'/)
@@ -513,9 +566,13 @@ test('missing dashboard queue view is regenerated by service worker', () => {
 test('dashboard refresh reads authority once and derives both views from that snapshot', () => {
     const sw = readRepoFile('shared/js/sw.js')
     const combinedBody = extractFunction(sw, "async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-refresh')")
-    const loaderCalls = combinedBody.match(/loadCoordinatorDashboardAuthoritySnapshot\(/g) || []
+    const readerBody = extractFunction(sw, "async function readDashboardSnapshotOrUnavailable(reason = '', metricLabel = 'dashboard')")
+    const loaderCalls = combinedBody.match(/readDashboardSnapshotOrUnavailable\(/g) || []
 
     assert.equal(loaderCalls.length, 1)
+    assert.equal((readerBody.match(/getResidentCompletedForReads\(\)/g) || []).length, 1)
+    assert.equal((readerBody.match(/buildCoordinatorDashboardAuthoritySnapshotFromResident\(/g) || []).length, 1)
+    assert.doesNotMatch(readerBody, /loadCoordinatorDashboardAuthoritySnapshot\(/)
     assert.match(combinedBody, /buildCoordinatorQueueViewFromDashboardSnapshot\(snapshot\)/)
     assert.match(combinedBody, /buildCoordinatorRunsSummaryFromDashboardSnapshot\(snapshot\)/)
 })
@@ -533,21 +590,18 @@ test('raw queue snapshot saves are rejected without a physical write branch', ()
     assert.doesNotMatch(body, /buildCoordinatorQueueView\(queue\)/)
 })
 
-test('resident authority observer ignores raw queue snapshots', () => {
-    const source = readRepoFile('shared/js/sw.js')
-    const storageMetrics = readRepoFile('shared/js/swStorageMetrics.js')
-    const notifyBody = extractFunction(storageMetrics, 'function notifyCoordinatorAuthorityPersistedSnapshot(payload = {})')
-    const absorbBody = extractFunction(source, 'function absorbPersistedSnapshot(payload = {}, options = {})')
-    const refreshBody = extractFunction(source, "function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')")
+test('resident authority is updated only by the door: no snapshot observer, absorb, or refresh', () => {
+    // No writes happen outside the worker, so nothing absorbs a stored snapshot into the resident authority. Each resident
+    // update is the door's own, made after its write is acknowledged. Comment lines are not code, so they are not matched.
+    const codeOf = text => text.split('\n').filter(line => !/^\s*(\/\/|\*|\/\*)/.test(line)).join('\n')
+    const source = codeOf(readRepoFile('shared/js/sw.js'))
+    const storageMetrics = codeOf(readRepoFile('shared/js/swStorageMetrics.js'))
 
-    assert.match(notifyBody, /hasOwnProperty\.call\(payload, COORDINATOR_QUEUE_KEY\)/)
-    assert.match(notifyBody, /coordinatorAuthority\.rawQueueSnapshotObserverIgnored/)
-    assert.match(notifyBody, /return/)
-    assert.match(absorbBody, /options\.allowRecoveredAuthorityQueueSeed === true[\s\S]*COORDINATOR_QUEUE_KEY/)
-    assert.match(refreshBody, /hasWalPayload/)
-    assert.match(refreshBody, /allowRecoveredAuthorityQueueSeed: !hasWalPayload/)
-    assert.doesNotMatch(source, /allowRawQueueSeed/)
-    assert.doesNotMatch(source, /coordinatorAuthoritySnapshotObserver = payload => coordinatorAuthority\.absorbPersistedSnapshot\(payload, \{[\s\S]*allowRecoveredAuthorityQueueSeed/)
+    assert.doesNotMatch(source, /absorbPersistedSnapshot|coordinatorAuthoritySnapshotObserver|refreshResidentCoordinatorAuthorityState|notifyCoordinatorAuthorityPersistedSnapshot/)
+    assert.doesNotMatch(storageMetrics, /notifyCoordinatorAuthorityPersistedSnapshot|getSnapshotObserver|rawQueueSnapshotObserverIgnored/)
+    // The raw legacy queue key stays unwritable through metricStorageSet, so no outside or stale seed can reach the queue.
+    const setBody = extractFunction(readRepoFile('shared/js/sw.js'), 'async function metricStorageSet(payload = {}, options = {})')
+    assert.match(setBody, /COORDINATOR_QUEUE_KEY/)
 })
 
 test('service worker pushes compact dashboard refresh after compact state writes', () => {
@@ -683,7 +737,7 @@ test('current terminal/direct progress ignores the full legacy progress blob', (
     assert.doesNotMatch(body, /ensureProfileNukeProgressReady\(\)/)
     assert.doesNotMatch(body, /profileNukeProgress\?\.\[normalizedHref\]/)
     assert.doesNotMatch(body, /mergeStoredProfileProgressRecord\(/)
-    assert.match(rowEventBody, /loadCoordinatorQueueRunsScopedProgressProjectionForMutation\(\{[\s\S]*metricPath: `\$\{metricPath\}\.load`/)
+    assert.match(rowEventBody, /coordinatorQueueReader\.runsScopedProgressForMutation\(\{[\s\S]*metricPath: `\$\{metricPath\}\.load`/)
     assert.match(rowEventBody, /residentMetricPath: `\$\{metricPath\}\.usedResidentAuthority`/)
     assert.match(rowEventBody, /profileHrefs: normalizedEvents\.map\(event => event\.profileHref\)/)
     assert.match(rowEventBody, /const progress = \{\.\.\.\(state\.progress \|\| \{\}\)\}/)
@@ -733,7 +787,8 @@ test('metadata-only progress does not drive Current Work status transitions', ()
         'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})'
     )
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
-    const tabUpdatedIndex = bootstrap.indexOf('browser.tabs.onUpdated.addListener')
+    // D4: the tabs.onUpdated handler body is now a named function (the listener only gates and dispatches to it).
+    const tabUpdatedIndex = bootstrap.indexOf('function handleTabUpdated(')
     const tabUpdatedBody = bootstrap.slice(tabUpdatedIndex, tabUpdatedIndex + 2600)
 
     // progressPatchHasExplicitStatus/shouldApplyExplicitProgressStatusToCoordinatorItem
@@ -968,7 +1023,7 @@ test('reconcile returns after saving stale-active cleanup', () => {
     assert.notEqual(saveIndex, -1)
     assert.notEqual(settleIndex, -1)
     assert.ok(saveIndex < settleIndex)
-    assert.match(source, /async function loadCoordinatorReconcileAuthorityPhase\(options = \{\}\)[\s\S]*loadCoordinatorReconcileProjection\(\{[\s\S]*metricPath: 'reconcile\.load'/)
+    assert.match(source, /async function loadCoordinatorReconcileAuthorityPhase\(options = \{\}\)[\s\S]*coordinatorQueueReader\.reconcile\(\{[\s\S]*metricPath: 'reconcile\.load'/)
     assert.doesNotMatch(lockedBody, /loadCoordinatorState\(/)
     assert.match(body, /saveProfileNukeProgressRowProjection\(changedProgressRecords/)
     assert.match(body, /deleteProfileNukeProgressRowProjection\(deletedProgressHrefs/)
@@ -1099,7 +1154,9 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(wakeupMetricsShape, /epoch\.counters\['serviceWorker\.started'\] = 1/)
     assert.match(worker, /summarizeQueueWakeupMetricEpoch/)
     assert.match(worker, /MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY/)
-    assert.match(bootstrap, /browser\.runtime\.onStartup\.addListener\(\(\) => \{[\s\S]*handleCoordinatorBrowserStartup\(\)/)
+    // D4: the startup handler is a named function, and its listener goes through the coordinator-authority gate.
+    assert.match(bootstrap, /function handleRuntimeStartup\(\) \{[\s\S]*return handleCoordinatorBrowserStartup\(\)/)
+    assert.match(bootstrap, /browser\.runtime\.onStartup\.addListener\(\(\) => runAfterCoordinatorAuthorityReady\(\(\) => handleRuntimeStartup\(\)\)\)/)
 
     assert.match(html, /resetMetricsButton/)
     assert.match(dashboard, /reset-queue-wakeup-metrics/)
@@ -1107,9 +1164,9 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(dashboard, /refresh-queue-wakeup-metrics-view/)
     assert.match(dashboard, /formatPreviousEpochSummary/)
     assert.match(dashboard, /Current epoch/)
-    assert.match(dashboard, /getSecondsPerActualBlock\(queueItems, getCurrentMetricsEpochStartedAt\(\)\)/)
+    assert.match(dashboard, /getSecondsPerActualBlock\(getCurrentMetricsEpochStartedAt\(\)\)/)
     assert.match(dashboard, /function getCurrentMetricsEpochStartedAt\(\)/)
-    assert.match(dashboard, /milestones\.blockAttemptedAt/)
+    assert.match(readRepoFile('shared/js/swCoordinatorQueueView.js'), /milestones\.blockAttemptedAt/)
     // 2026-09-27: floored by epochStartedAt again (reversing the 2026-09-25
     // change above) -- per explicit user request, reloading the extension
     // or clicking "Reset metrics" should visibly reset this card instead of
@@ -1117,7 +1174,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     // matching comment on summarizeCoordinatorActualBlockTiming in
     // swCoordinatorQueueView.js for why this floor only ever excludes rows
     // from a genuine reset, not a routine same-version restart.
-    assert.match(dashboard, /terminalAt >= minimumTerminalAt/)
+    assert.match(readRepoFile('shared/js/swCoordinatorQueueView.js'), /terminalAt >= minimumTerminalAt/)
     assert.match(dashboard, /Storage deadlines/)
     assert.match(dashboard, /Timeout buckets/)
     assert.match(dashboard, /No-work writes/)
@@ -1144,8 +1201,7 @@ test('secs / block is relabeled secs / real block alongside a new secs / already
     assert.match(html, /id="secondsPerAlreadyBlocked"/)
     assert.doesNotMatch(html, />secs \/ block</)
 
-    assert.match(dashboard, /function isAlreadyBlockedSuccess\(item = \{\}\)/)
-    assert.match(dashboard, /function getSecondsPerAlreadyBlocked\(queueItems = \[\], epochStartedAt = 0\)/)
+    assert.match(dashboard, /function getSecondsPerAlreadyBlocked\(epochStartedAt = 0\)/)
     assert.match(dashboard, /setText\('secondsPerAlreadyBlocked', formatSecondsPerBlock\(secondsPerAlreadyBlocked\)\)/)
 
     assert.match(queueView, /function isCoordinatorAlreadyBlockedSuccess\(item = \{\}\)/)
@@ -1255,6 +1311,45 @@ test('dashboard waiting banner clears from current-epoch activation evidence', (
     assert.equal(activationMetricClears, false)
 })
 
+test('dashboard waiting banner clears from finished work the list no longer holds', () => {
+    // The list holds the live rows only, so a finished row is not in state.queue. The gate reads the worker's count over the full
+    // compact population (view.finishedWork), and the newest activity time among the finished rows must be from the current epoch.
+    const evaluate = loadDashboardHarness()
+
+    const finishedInEpochClears = evaluate(`
+        setQuoraVisitRequirement(true)
+        state.requiresQuoraVisitAt = 1000
+        state.metrics = {currentEpoch: {startedAt: 1000, counters: {}, journal: []}}
+        state.queueView = {version: 1, items: [], finishedWork: {count: 1, latestActivityAt: 1200}}
+        state.queue = {}
+        refreshQuoraVisitRequirement(getDisplayQueueItems())
+        state.requiresQuoraVisit
+    `)
+    assert.equal(finishedInEpochClears, false)
+
+    const finishedBeforeEpochStillWaits = evaluate(`
+        setQuoraVisitRequirement(true)
+        state.requiresQuoraVisitAt = 1000
+        state.metrics = {currentEpoch: {startedAt: 1000, counters: {}, journal: []}}
+        state.queueView = {version: 1, items: [], finishedWork: {count: 2, latestActivityAt: 900}}
+        state.queue = {}
+        refreshQuoraVisitRequirement(getDisplayQueueItems())
+        state.requiresQuoraVisit
+    `)
+    assert.equal(finishedBeforeEpochStillWaits, true)
+
+    const noFinishedStillWaits = evaluate(`
+        setQuoraVisitRequirement(true)
+        state.requiresQuoraVisitAt = 1000
+        state.metrics = {currentEpoch: {startedAt: 1000, counters: {}, journal: []}}
+        state.queueView = {version: 1, items: [], finishedWork: {count: 0, latestActivityAt: 0}}
+        state.queue = {}
+        refreshQuoraVisitRequirement(getDisplayQueueItems())
+        state.requiresQuoraVisit
+    `)
+    assert.equal(noFinishedStillWaits, true)
+})
+
 test('dashboard secs per block uses compact queue-view aggregate when terminal rows are truncated', () => {
     const evaluate = loadDashboardHarness()
     const result = evaluate(`(() => {
@@ -1274,10 +1369,10 @@ test('dashboard secs per block uses compact queue-view aggregate when terminal r
             'queued-' + index,
             {status: 'queued', queuedAt: 1100 + index, updatedAt: 1100 + index}
         ]))
-        const aggregateResult = getSecondsPerActualBlock(getDisplayQueueItems(), getCurrentMetricsEpochStartedAt())
+        const aggregateResult = getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt())
 
         state.queueView.actualBlockTiming.epochStartedAt = 900
-        var mismatchedEpochResult = getSecondsPerActualBlock(getDisplayQueueItems(), getCurrentMetricsEpochStartedAt());
+        var mismatchedEpochResult = getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt());
 
         return {
             aggregateText: formatSecondsPerBlock(aggregateResult),
@@ -1291,20 +1386,48 @@ test('dashboard secs per block uses compact queue-view aggregate when terminal r
     assert.equal(result.staleText, '--')
 })
 
-test('dashboard secs per block excludes already-blocked terminal successes', () => {
+test('dashboard timing tiles read the worker summaries only, never the list rows', () => {
+    // The worker computes these averages over the full compact population, finished rows included. The page's list holds the live rows
+    // only, so the tiles must not recompute from it: with no worker summary they show "--", whatever the list holds.
     const evaluate = loadDashboardHarness()
     const result = evaluate(`(() => {
-        const sample = [{
-            status: 'succeeded',
-            outcome: 'already-blocked',
-            actionKind: 'mute-block',
-            activeAt: 1000,
-            terminalAt: 5000
-        }]
-        return formatSecondsPerBlock(getSecondsPerActualBlock(sample, 0))
+        state.metrics = {currentEpoch: {startedAt: 1000, counters: {}, journal: []}}
+        state.queueView = {version: 1, items: [], total: 0}
+        state.queue = {
+            done: {status: 'succeeded', outcome: 'blocked', runId: 'run-timing', activeAt: 1100, terminalAt: 5100, updatedAt: 5100},
+            next: {status: 'active', runId: 'run-timing', activeAt: 5600, updatedAt: 5600}
+        }
+        return {
+            secondsPerBlock: formatSecondsPerBlock(getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt())),
+            handoff: formatSecondsPerBlock(getActivationHandoffSeconds(getCurrentMetricsEpochStartedAt()))
+        }
     })()`)
 
-    assert.equal(result, '--')
+    assert.equal(result.secondsPerBlock, '--')
+    assert.equal(result.handoff, '--')
+})
+
+test('dashboard secs per block tiles split already-blocked from real blocks using the worker summaries', () => {
+    // The worker partitions completed rows between the two tiles (summarizeCoordinatorAlreadyBlockedTiming and
+    // summarizeCoordinatorActualBlockTiming in swCoordinatorQueueView.js). The page shows each summary on its own tile.
+    const evaluate = loadDashboardHarness()
+    const result = evaluate(`(() => {
+        state.metrics = {currentEpoch: {startedAt: 1000, counters: {}, journal: []}}
+        state.queueView = {
+            version: 1,
+            items: [],
+            total: 0,
+            actualBlockTiming: {epochStartedAt: 1000, blocks: 0, elapsedMs: 0, seconds: 0},
+            alreadyBlockedTiming: {epochStartedAt: 1000, blocks: 1, elapsedMs: 4000, seconds: 4}
+        }
+        return {
+            realBlock: formatSecondsPerBlock(getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt())),
+            alreadyBlocked: formatSecondsPerBlock(getSecondsPerAlreadyBlocked(getCurrentMetricsEpochStartedAt()))
+        }
+    })()`)
+
+    assert.equal(result.realBlock, '--')
+    assert.equal(result.alreadyBlocked, '4.00')
 })
 
 test('service worker secs per block aggregate can use progress milestone timing', () => {
@@ -1370,7 +1493,7 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.match(dashboard, /const succeededCount = getQueueStatusCount\('succeeded', queueItems\)/)
     assert.match(dashboard, /const hardFailedCount = Math\.max\(0, failedCount - retryableFailedCount\)/)
     assert.match(dashboard, /setText\('currentWorkReadyCount', getCurrentWorkSummaryText\(queueItems, \{[\s\S]*queuedCount,[\s\S]*succeededCount,[\s\S]*retryableFailedCount,[\s\S]*hardFailedCount/)
-    assert.match(dashboard, /Showing \$\{shownCount\} of \$\{totalCount\}/)
+    assert.match(dashboard, /Showing \$\{listedCount\} of \$\{totalCount\}/)
     assert.match(dashboard, /button\.textContent = retryFailedActive \? 'Disable Retry Soft-Fails' : 'Enable Retry Soft-Fails'/)
     assert.doesNotMatch(dashboard, /eligible \/ \$\{failedCount\} failed/)
     assert.doesNotMatch(dashboard, /button\.textContent = 'Idle Retry'/)
@@ -1569,15 +1692,18 @@ test('dev mode toggle hides the internal-audience panels by default and persists
     // never be gated behind dev mode.
     assert.doesNotMatch(html, /data-panel-scroll-target="queueList"[^>]*data-dev-mode-panel/)
 
-    assert.match(dashboard, /const DEV_MODE_STORAGE_KEY = 'mbDashboardDevMode'/)
+    // The worker owns the flag (no writes outside the worker). The page reads a copy loaded from chrome.storage at init, and
+    // a toggle asks the worker to write it.
+    assert.match(readRepoFile('shared/js/storageKeys.js'), /DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled'/)
+    assert.match(dashboard, /DEV_MODE_SYNC_STORAGE_KEY[\s\S]*?\} = require\('\.\/storageKeys'\)/)
+    assert.doesNotMatch(dashboard, /localStorage/)
     const isEnabledBody = extractFunction(dashboard, 'function isDevModeStoredEnabled()')
-    assert.match(isEnabledBody, /localStorage\.getItem\(DEV_MODE_STORAGE_KEY\)/)
+    assert.match(isEnabledBody, /return devModeStoredEnabled/)
+    const loadEnabledBody = extractFunction(dashboard, 'async function loadDevModeStoredEnabled()')
+    assert.match(loadEnabledBody, /browser\.storage\.local\.get\(\{\[DEV_MODE_SYNC_STORAGE_KEY\]: false\}\)/)
     const setEnabledBody = extractFunction(dashboard, 'function setDevModeStoredEnabled(enabled)')
-    assert.match(setEnabledBody, /localStorage\.setItem\(DEV_MODE_STORAGE_KEY,/)
-    // localStorage access is wrapped -- a private window, cleared site data,
-    // or a blocked storage API must not throw and break the dashboard.
-    assert.match(isEnabledBody, /catch \{[\s\S]*return false/)
-    assert.match(setEnabledBody, /catch \{\}/)
+    assert.match(setEnabledBody, /action: 'set-dev-mode-enabled'/)
+    assert.doesNotMatch(setEnabledBody, /browser\.storage/)
 
     const applyVisibilityBody = extractFunction(dashboard, 'function applyDevModeVisibility(enabled)')
     assert.match(applyVisibilityBody, /querySelectorAll\('\[data-dev-mode-panel\]'\)/)
@@ -1712,7 +1838,7 @@ test('dashboard queued rows expose per-item cancel before status', () => {
     assert.match(handlerBody, /\[QUEUE_MACHINE_EVENT_TYPES\.CANCEL_STORED_WORK_ITEM\]/)
     assert.match(handlerBody, /\[QUEUE_MACHINE_EVENT_TYPES\.CANCEL_STORED_WORK\]/)
     assert.match(cancelItemMutationBody, /operationKind: 'current-work-item-cancel'/)
-    assert.match(cancelItemMutationBody, /loadCoordinatorQueueRunsEventsProjection\(\{[\s\S]*metricPath: 'currentWork\.itemCancel\.load'/)
+    assert.match(cancelItemMutationBody, /coordinatorQueueReader\.runsEvents\(\{[\s\S]*metricPath: 'currentWork\.itemCancel\.load'/)
     assert.doesNotMatch(cancelItemMutationBody, /loadCoordinatorState\(/)
     assert.doesNotMatch(cancelItemMutationBody, /PROFILE_NUKE_PROGRESS_KEY|profileNukeProgress|makeTerminalProgressRecordFromCoordinatorItem/)
     assert.match(cancelItemMutationBody, /coordinatorAuthority\.applyWithinStorageUpdate/)
@@ -1898,7 +2024,10 @@ test('profile-search content uses scoped runtime state instead of full storage c
     assert.match(swScopedBody, /getCoordinatorContentQueueIndexShardDefaults\(profileHrefs\)/)
     assert.match(swScopedBody, /normalizeCoordinatorContentQueueIndexShardRecords\(/)
     assert.match(swScopedBody, /hasMissingRequestedCoordinatorQueueIndexShard\(queueShardDefaults, stored\)/)
-    assert.match(swScopedBody, /metricStorageGet\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null/)
+    // Owner 601f 1a: the index shards come from the derived cache, not storage, and the progress view from the resident copy.
+    assert.match(swScopedBody, /readResidentDerivedQueueIndex\(\{/)
+    assert.doesNotMatch(swScopedBody, /metricStorageGet\(\{\s*\.\.\.sourceShardDefaults/)
+    assert.match(swScopedBody, /readResidentCoordinatorStored\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null/)
     assert.doesNotMatch(swScopedBody, /\[COORDINATOR_QUEUE_KEY\]: \{\}/)
     assert.doesNotMatch(swScopedBody, /\[PROFILE_NUKE_PROGRESS_KEY\]: \{\}/)
     assert.match(swScopedBody, /getCoordinatorContentSourceIndexShardDefaults\(request\)/)
@@ -1935,11 +2064,13 @@ test('content-page scoped state projections are maintained beside full queue and
     const contentPageStateProjectionSource = readRepoFile('shared/js/swContentPageStateProjection.js')
     const missingBody = extractFunction(contentPageStateProjectionSource, 'function isContentPageStateProjectionMissing(queueIndex = null, progressView = null, shardDefaults = {}, stored = {}, sourceShardDefaults = {})')
     const rebuildBody = extractFunction(sw, "async function rebuildContentPageStateProjectionFromCurrentState(reason = 'missing')")
+    const repairBody = extractFunction(sw, 'function repairProfileProgressProjection(options = {})')
 
     assert.match(sw, /COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'/)
     assert.match(sw, /COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex\.'/)
-    assert.match(sw, /PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'/)
-    assert.match(sw, /PROFILE_NUKE_PROGRESS_SHARD_PREFIX = 'mbProfileNukeProgressShard\.'/)
+    assert.match(readRepoFile('shared/js/storageKeys.js'), /PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView'/)
+    assert.match(readRepoFile('shared/js/storageKeys.js'), /PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard\.'/)
+    assert.doesNotMatch(sw, /const PROFILE_NUKE_PROGRESS_SHARD_PREFIX =/)
     assert.match(metricSetBody, /payload = addContentPageStateProjectionPayload\(payload\)/)
     // 2026-10-02: this used to also assert buildCoordinatorQueueView( here --
     // that call site unconditionally re-populated the on-disk
@@ -1950,9 +2081,14 @@ test('content-page scoped state projections are maintained beside full queue and
     // row states over a live WAL that had moved on (confirmed live:
     // reappearing queue rows and up to 3 concurrently active tabs).
     assert.doesNotMatch(projectionBody, /buildCoordinatorQueueView\(/)
-    assert.match(projectionBody, /buildCoordinatorContentQueueIndex\(/)
-    assert.match(projectionBody, /buildCoordinatorContentQueueIndexShardPayload\(/)
-    assert.match(projectionBody, /buildCoordinatorContentSourceIndexShardPayload\(/)
+    // 601f 1a: a full-queue write no longer adds the content index or its shards. They are derived on read.
+    assert.doesNotMatch(projectionBody, /buildCoordinatorContentQueueIndex\(/)
+    assert.doesNotMatch(projectionBody, /buildCoordinatorContentQueueIndexShardPayload\(/)
+    assert.doesNotMatch(projectionBody, /buildCoordinatorContentSourceIndexShardPayload\(/)
+    assert.match(sw, /function readResidentDerivedQueueIndex\(defaults = \{\}\) \{/)
+    assert.match(sw, /function getResidentDerivedQueueIndexPayload\(\) \{[\s\S]*residentDerivedQueueIndex\.queue !== queue/)
+    assert.doesNotMatch(rebuildBody, /metricStorageSet\(\{\s*\[COORDINATOR_CONTENT_QUEUE_INDEX_KEY\]/)
+    assert.doesNotMatch(sw, /scheduleDeferredCoordinatorContentIndexRebuild|runDeferredCoordinatorContentIndexRebuild/)
     assert.doesNotMatch(projectionBody, /PROFILE_NUKE_PROGRESS_KEY|buildProfileNukeProgressView|buildProfileNukeProgressShardPayload/)
     assert.match(sourceIndexBody, /getCoordinatorContentSourceKeysForItem\(item\)/)
     assert.match(queueViewBody, /authoritativeCounts/)
@@ -1965,14 +2101,21 @@ test('content-page scoped state projections are maintained beside full queue and
     assert.match(progressSummaryBody, /blockAttemptedAt/)
     assert.match(progressSummaryBody, /muteAttemptedAt/)
     assert.match(progressFilterBody, /hasNonterminalCoordinatorAuthorityForProfile\(queue, profileHref\)/)
+    assert.match(progressFilterBody, /isTerminalProfileNukeRecord\(record\)/)
     assert.match(missingBody, /hasMissingRequestedCoordinatorSourceShard\(queueIndex, sourceShardDefaults, stored\)/)
     assert.match(missingBody, /hasMissingRequestedProfileProgressShard\(progressView, shardDefaults, stored\)/)
     assert.match(rebuildBody, /coordinatorQueueReader\.full\(\{[\s\S]*contentPageState\.rebuild/)
     assert.doesNotMatch(rebuildBody, /\[COORDINATOR_QUEUE_KEY\]: \{\}/)
-    assert.match(rebuildBody, /\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null/)
-    assert.match(rebuildBody, /getAllProfileNukeProgressShardDefaults\(\)/)
-    assert.match(rebuildBody, /getProfileNukeProgressRecordsFromProjection\(stored\)/)
-    assert.match(rebuildBody, /filterProfileNukeProgressForContentProjection\(getProfileNukeProgressRecordsFromProjection\(stored\), queue\)/)
+    // The progress keys belong to the door: the rebuild only calls repairProfileProgressProjection, which reads the view
+    // and every shard, filters them against the resident queue, and writes only the keys whose content changed.
+    assert.doesNotMatch(rebuildBody, /PROFILE_NUKE_PROGRESS_VIEW_KEY|getProfileNukeProgressRecordsFromProjection|filterProfileNukeProgressForContentProjection|persistCoordinator\(/)
+    assert.match(rebuildBody, /coordinatorAuthority\.repairProfileProgressProjection\(\{/)
+    assert.match(repairBody, /\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null/)
+    assert.match(repairBody, /getAllProfileNukeProgressShardDefaults\(\)/)
+    assert.match(repairBody, /filterProfileNukeProgressForContentProjection\(\s*getProfileNukeProgressRecordsFromProjection\(stored\),\s*projection\.queue\s*\)/)
+    assert.match(repairBody, /getChangedProfileNukeProgressProjectionKeys\(stored, derived\)/)
+    assert.match(repairBody, /runExclusiveOnApplyTail\(/)
+    assert.doesNotMatch(repairBody, /coordinatorQueueReader\.full/)
     assert.doesNotMatch(rebuildBody, /PROFILE_NUKE_PROGRESS_KEY|normalizeStoredProfileNukeProgress/)
     assert.match(rebuildBody, /sourceShards/)
     assert.match(rebuildBody, /progressShards/)
@@ -2047,7 +2190,7 @@ test('service worker local storage goes through production adapter seam', () => 
     assert.match(suppressBody, /storageUpdate\.lateWriteSuppressed/)
     assert.match(metricGetBody, /coordinatorStorageAdapter\.get\(defaults\)/)
     assert.doesNotMatch(metricGetBody, /suppressAbandonedStorageOperation\('storageGet-/)
-    assert.match(metricSetBody, /coordinatorStorageAdapter\.set\(payload\)/)
+    assert.match(metricSetBody, /coordinatorStorageAdapter\.set\(diskPayload\)/)
     assert.match(metricSetBody, /suppressAbandonedStorageOperation\('storageSet'\)/)
     assert.doesNotMatch(nonAdapterSource, /browser\.storage\.local/)
 })
@@ -2279,16 +2422,16 @@ test('mbCoordinatorQueueView is never persisted to disk and has no storage-chang
     assert.doesNotMatch(bootstrap, /'storage-queue-view-changed'/)
 })
 
-test('storage change progress trigger uses compact progress view instead of full progress blob', () => {
+test('storage change listener does not read the progress view or the full progress blob (decision 2; 20 Oct review)', () => {
     const source = readRepoFile('shared/js/sw.js')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
-    const listenerStart = bootstrap.indexOf('browser.storage.onChanged.addListener((changes, areaName) => {')
+    // D4: the storage.onChanged body is a named function (the listener only gates and dispatches to it).
+    const listenerStart = bootstrap.indexOf('function handleStorageChanged(changes, areaName) {')
     const listenerEnd = bootstrap.indexOf('browser.runtime.onMessage.addListener', listenerStart)
     const listenerBody = bootstrap.slice(listenerStart, listenerEnd)
     const scopedBody = extractFunction(source, 'async function getContentPageCoordinatorState(request = {}, sender = {})')
 
-    assert.match(listenerBody, /changes\?\.\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]/)
-    assert.match(listenerBody, /normalizeProfileNukeProgressView\(changes\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]\.oldValue/)
+    assert.doesNotMatch(listenerBody, /PROFILE_NUKE_PROGRESS_VIEW_KEY/)
     assert.doesNotMatch(listenerBody, /normalizeStoredProfileNukeProgress\(changes\[PROFILE_NUKE_PROGRESS_KEY\]/)
     assert.doesNotMatch(listenerBody, /enqueueCoordinatorProgressSync\(changedProgress\)/)
     assert.match(scopedBody, /getProfileNukeProgressShardDefaults\(profileHrefs\)/)
@@ -2306,7 +2449,7 @@ test('active queued jobs have a wall-clock cap', () => {
 
     assert.match(source, /COORDINATOR_ACTIVE_JOB_MAX_MS = 45000/)
     assert.match(source, /COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS = 60000/)
-    assert.match(source, /STALE_QUEUED_TAB_MAX_RETRIES = 1/)
+    assert.match(readRepoFile('shared/js/tunables.js'), /STALE_QUEUED_TAB_MAX_RETRIES: 1,/)
     assert.match(contentSource, /ACTION_LEASE_WAIT_MS = 45000/)
     const activeQueuedTabStalenessSource = readRepoFile('shared/js/swActiveQueuedTabStaleness.js')
     assert.match(activeQueuedTabStalenessSource, /function getActiveQueuedTabStartedAt/)
@@ -2812,7 +2955,8 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.match(helperBody, /resolverPending: false/)
 
     assert.match(unresolvedBody, /coordinatorQueueReader\.runs\(\{[\s\S]*metricPath: 'resolver\.unresolved\.load'/)
-    assert.match(unresolvedBody, /metricStorageGet\(\{[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
+    assert.match(unresolvedBody, /readResidentCoordinatorStored\(\{[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
+    assert.doesNotMatch(unresolvedBody, /metricStorageGet\(/)
     assert.match(unresolvedBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'resolver-unresolved'/)
     assert.match(unresolvedBody, /expectedAttemptId: currentAttemptId \? incomingAttemptId : ''/)
     assert.match(unresolvedBody, /missing-attempt-identity/)
@@ -2875,16 +3019,16 @@ test('manual failed requeue requests reconcile after durable storage', () => {
     assert.notEqual(reconcileIndex, -1)
     assert.match(retryBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'RETRY_FAILED_ITEMS'/)
     assert.match(requeueBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'REQUEUE_FAILED_ITEMS'/)
-    assert.match(retryMutationBody, /loadCoordinatorQueueRunsEventsProgressProjection\(\{[\s\S]*metricPath: 'failedRetry\.load'/)
+    assert.match(retryMutationBody, /coordinatorQueueReader\.runsEventsProgress\(\{[\s\S]*metricPath: 'failedRetry\.load'/)
     assert.doesNotMatch(retryMutationBody, /loadCoordinatorState\(/)
-    assert.match(requeueMutationBody, /loadCoordinatorQueueRunsEventsProgressProjection\(\{[\s\S]*metricPath: 'failedRequeue\.load'/)
+    assert.match(requeueMutationBody, /coordinatorQueueReader\.runsEventsProgress\(\{[\s\S]*metricPath: 'failedRequeue\.load'/)
     assert.doesNotMatch(requeueMutationBody, /loadCoordinatorState\(/)
-    assert.match(retryMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
+    assert.match(retryMutationBody, /coordinatorAuthority\.persistCoordinator\(/)
     assert.match(retryMutationBody, /operationKind: 'retry'/)
     assert.match(retryMutationBody, /removedRows/)
     assert.match(retryMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
     assert.match(retryMutationBody, /queueOperation: 'retry-derived'/)
-    assert.match(requeueMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
+    assert.match(requeueMutationBody, /coordinatorAuthority\.persistCoordinator\(/)
     assert.match(requeueMutationBody, /operationKind: 'requeue'/)
     assert.match(requeueMutationBody, /removedRows/)
     assert.match(requeueMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
@@ -2943,6 +3087,38 @@ test('profile search buttons keep live commands dark and disabled commands grey'
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn:disabled,\s*\n\.mb-ext_profile-search-action-host \.mb-ext_nuke-profiles-btn:disabled\s*\{[\s\S]*background-color:\s*#f3f4f6[\s\S]*color:\s*#7b8494/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn--working,[\s\S]*background-color:\s*#fff7ed[\s\S]*color:\s*#7c2d12/)
     assert.match(css, /\.mb-ext_profile-search-toolbar \.mb-ext_nuke-profiles-btn--done,[\s\S]*background-color:\s*#eefdf3[\s\S]*color:\s*#166534/)
+})
+
+test('every injection of content.css loads tokens.css first', () => {
+    // content.css reads --mb-* custom properties that only shared/css/tokens.css defines, and tokens.css defines them on :root.
+    // A Quora page gets content.css from the manifest's content_scripts or from a programmatic insertCSS (sw.js, and the CDP
+    // helpers that copy it). Every one of those lists must include tokens.css, and list it before content.css.
+    const tokensBeforeContent = files => files.indexOf('css/tokens.css') !== -1 &&
+        files.indexOf('css/tokens.css') < files.indexOf('css/content.css')
+
+    assert.match(readRepoFile('shared/css/tokens.css'), /:root\s*\{[^}]*--mb-brand-red:\s*#b92b27/)
+    const mix = readRepoFile('webpack.mix.js')
+    assert.match(mix, /\.copy\('\.\/shared\/css', 'chrome\/css'\)/)
+    assert.match(mix, /\.copy\('\.\/shared\/css', 'firefox\/css'\)/)
+
+    for(const manifestPath of ['manifests/chrome.json', 'manifests/firefox.json']) {
+        const scripts = JSON.parse(readRepoFile(manifestPath)).content_scripts || []
+        const injecting = scripts.filter(entry => (entry.css || []).includes('css/content.css'))
+        assert.ok(injecting.length > 0, `${manifestPath} injects content.css as a content script`)
+        for(const entry of injecting) {
+            assert.ok(tokensBeforeContent(entry.css), `${manifestPath} lists ${entry.css.join(', ')}; tokens.css must come first`)
+        }
+    }
+
+    for(const sourcePath of ['shared/js/sw.js', 'tools/cdp/inject-content-script.js', 'tools/cdp/upgrade-regression/run.js']) {
+        const lists = [...readRepoFile(sourcePath).matchAll(/files:\s*\[([^\]]*)\]/g)]
+            .map(match => [...match[1].matchAll(/'([^']+)'/g)].map(name => name[1]))
+            .filter(files => files.includes('css/content.css'))
+        assert.ok(lists.length > 0, `${sourcePath} injects content.css programmatically`)
+        for(const files of lists) {
+            assert.ok(tokensBeforeContent(files), `${sourcePath} injects ${files.join(', ')}; tokens.css must come first`)
+        }
+    }
 })
 
 test('profile search controls only collect Follow-button profile rows', () => {
@@ -3056,9 +3232,9 @@ test('incoming coordinator executor concurrency can lower stale persisted rows',
     assert.match(body, /executorMaxConcurrent: executorMaxConcurrent \|\| existing\?\.executorMaxConcurrent \|\| null/)
     assert.match(body, /executorOwner: hasExecuteInput \? 'service-worker' : existing\?\.executorOwner \|\| ''/)
     assert.match(body, /serviceWorkerOwned: hasExecuteInput \? true : existing\?\.serviceWorkerOwned === true/)
-    assert.match(body, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
+    assert.match(body, /coordinatorAuthority\.persistCoordinator\(/)
     assert.match(body, /operationKind: 'enqueue'/)
-    assert.match(body, /loadCoordinatorQueueRunsEventsProgressProjection\(\{[\s\S]*metricPath: 'enqueue\.load'/)
+    assert.match(body, /coordinatorQueueReader\.runsEventsProgress\(\{[\s\S]*metricPath: 'enqueue\.load'/)
     assert.doesNotMatch(body, /loadCoordinatorState\(/)
     assert.match(body, /saveProfileNukeProgressRowProjection\(progressResetRecords/)
     assert.match(body, /queueOperation: 'enqueue-derived'/)
@@ -3144,7 +3320,7 @@ test('coordinator reconcile loop is split into ordered authority phases', () => 
         previousIndex = index
     }
 
-    assert.match(loadBody, /loadCoordinatorReconcileProjection\(\{[\s\S]*metricPath: 'reconcile\.load'/)
+    assert.match(loadBody, /coordinatorQueueReader\.reconcile\(\{[\s\S]*metricPath: 'reconcile\.load'/)
     assert.match(materializeBody, /materializeRemovedProfileDerivedStateFromAuthority\(ctx\.state\)/)
     assert.match(runtimeBody, /ctx\.liveProfileTabsByHref = await getLiveProfileTabsByHref\(\)/)
     assert.match(authorityBody, /applyProgressRecordCoordinatorReconcileActionLocked/)
@@ -3297,7 +3473,7 @@ test('queued-tab concurrency is forced to 1 for worker-window/foreground work', 
 test('queued tab opens wait for target URL before active transition', () => {
     const source = readRepoFile('shared/js/sw.js')
     const executorSource = readRepoFile('shared/js/swexecutor.js')
-    const createBody = extractFunction(source, 'async function createOwnedTab(action = {})')
+    const createBody = extractFunction(source, 'async function createOwnedTab(action = {}, attempt = {})')
     const ensureBody = extractFunction(source, 'async function ensureCreatedQueuedTabCommittedToExpectedUrl(tab = null, action = {}, options = {})')
     const executorEnsureBody = extractFunction(executorSource, 'async function ensureCreatedQueuedTabCommittedToExpectedUrl(tab = null, action = {}, options = {})')
     const executorWaitBody = extractFunction(executorSource, 'async function waitForQueuedTabExpectedOpenUrl(tabId = null, expectedUrl = \'\', timeoutMs = openUrlCommitTimeoutMs)')
@@ -3378,14 +3554,17 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.match(transitionBody, /metricPath: 'activeTransition\.save'/)
     assert.match(transitionBody, /projectionPayload: 'queueViewOnly'/)
     assert.match(transitionBody, /const rawProvidedAuthorityState = details\.useCurrentAuthorityState === true[\s\S]*details\.currentAuthorityState \|\| details\.authorityState/)
-    assert.match(transitionBody, /const forceFreshActiveTransitionAuthority =[\s\S]*rawProvidedAuthorityState\?\.rawQueueFallback === true[\s\S]*currentAuthorityState\?\.rawQueueFallback === true/)
-    assert.match(transitionBody, /forceFreshAuthorityState: forceFreshActiveTransitionAuthority/)
+    // D1: the raw-fallback force flag is retired; the transition reads the resident authority with no forced fresh read.
+    assert.doesNotMatch(transitionBody, /rawQueueFallback|forceFreshActiveTransitionAuthority|forceFreshAuthorityState/)
     assert.doesNotMatch(transitionBody, /deferProjectionSave: true/)
     assert.doesNotMatch(transitionBody, /projectionReconcileDelayMs: 30000/)
     assert.match(transitionBody, /if\(runsChanged\) \{[\s\S]*saveCoordinatorState\(\{[\s\S]*runs: nextRuns[\s\S]*\}, \{[\s\S]*queue: false,[\s\S]*runs: true,[\s\S]*reason: 'ordinaryMutation',[\s\S]*queueOperation: 'active-transition-derived'/)
     assert.doesNotMatch(transitionBody, /saveCoordinatorQueueRunsProjection\(/)
     assert.match(transitionBody, /return true/)
-    assert.match(confirmBody, /await coordinatorQueueReader\.full\(\{[\s\S]*metricPath: 'pendingTabAction\.confirm\.load'[\s\S]*\}\)\.catch\(\(\) => null\) \|\|[\s\S]*getHydratedCoordinatorAuthorityState\('pendingTabAction\.confirm\.residentAuthorityFallback'\)/)
+    assert.match(confirmBody, /await coordinatorQueueReader\.full\(\{[\s\S]*metricPath: 'pendingTabAction\.confirm\.load'[\s\S]*\}\)/)
+    // P4: a failed load rejects the confirm. It is never swallowed and read as "no row".
+    assert.doesNotMatch(confirmBody, /\.catch\(\(\) => null\)/)
+    assert.doesNotMatch(confirmBody, /pendingTabAction\.confirm\.residentAuthorityFallback/)
     assert.doesNotMatch(confirmBody, /loadCoordinatorState\(/)
     assert.match(rollbackBody, /coordinatorQueueReader\.runs\(\{[\s\S]*metricPath: 'rollbackActiveTransition\.load'/)
     assert.doesNotMatch(rollbackBody, /metricStorageGet\(/)
@@ -3420,7 +3599,8 @@ test('background tab opening updates authoritative Current Work', () => {
     assert.match(activeEffectBody.slice(failedTransitionIndex), /active-transition-failed/)
     assert.match(activeEffectBody.slice(failedTransitionIndex), /rollbackFailedQueuedTabOpen\(action, tab/)
     assert.match(activeEffectBody.slice(failedTransitionIndex), /detachQueuedTabRuntimeState\(tab\.id, 'active-transition-failed'\)/)
-    assert.match(activeEffectBody.slice(failedTransitionIndex), /void releaseQueuedTab\(tab\.id, \{[\s\S]*runtimeDetached: true/)
+    // review-2 S5-3: the fire-and-forget release goes through releaseQueuedTabInBackground, which records a failure.
+    assert.match(activeEffectBody.slice(failedTransitionIndex), /void releaseQueuedTabInBackground\(tab\.id, \{[\s\S]*runtimeDetached: true/)
     assert.doesNotMatch(body.slice(progressIndex, progressIndex + 900), /recordProfileNukeProgress\(openPlan\.profileHref/)
 })
 
@@ -3517,9 +3697,10 @@ test('queued progress keeps sender tab id in persisted records', () => {
     const deferredBody = extractFunction(source, 'async function recordDeferredCoordinatorJobMilestone(profileHref = \'\', patch = {}, options = {})')
     const requestBody = extractFunction(source, 'async function recordJobProgressFromRequest(request = {}, sender = {}, options = {})')
 
-    assert.match(helperBody, /normalizeTabId\(patch\?\.tabId \|\| senderTabId\)/)
+    // review-2 S4-1: the authenticated sender is read first; the body's patch.tabId only when no sender was passed.
+    assert.match(helperBody, /normalizeTabId\(senderTabId \|\| patch\?\.tabId\)/)
     assert.match(batchBody, /addSenderTabIdToProgressPatch\(patch, options\.senderTabId\)/)
-    assert.match(batchBody, /loadCoordinatorQueueRunsScopedProgressProjectionForMutation\(\{[\s\S]*metricPath: options\.expectTerminal === true \? 'terminalProgress\.load' : 'directProgress\.load'/)
+    assert.match(batchBody, /coordinatorQueueReader\.runsScopedProgressForMutation\(\{[\s\S]*metricPath: options\.expectTerminal === true \? 'terminalProgress\.load' : 'directProgress\.load'/)
     assert.match(batchBody, /residentMetricPath: options\.expectTerminal === true[\s\S]*'terminalProgress\.usedResidentAuthority'[\s\S]*'directProgress\.usedResidentAuthority'/)
     assert.doesNotMatch(batchBody, /loadCoordinatorState\(/)
     assert.match(batchBody, /saveProfileNukeProgressRowProjection\([\s\S]*inlineProgressProjectionRecords/)
@@ -3558,12 +3739,14 @@ test('terminal/direct progress can mutate from resident authority without storag
     const helperBody = extractFunction(source, 'async function loadCoordinatorQueueRunsScopedProgressProjectionForMutation(options = {})')
     const batchBody = extractFunction(source, 'async function recordCoordinatorJobProgressRecords(progressRecords = {}, options = {})')
 
-    assert.match(helperBody, /getHydratedCoordinatorAuthorityState\(options\.residentMetricPath \|\| ''\)/)
-    assert.match(helperBody, /if\(residentAuthority\) \{/)
-    assert.match(helperBody, /getProfileNukeProgressRecordsFromProjection\([\s\S]*residentAuthority\.stored \|\| \{\}/)
+    // The mutation's progress base is the resident copy, read after the gate (P2). There is no storage read and no fallback.
+    assert.match(helperBody, /await awaitResidentCoordinatorState\(\)/)
+    assert.match(helperBody, /getResidentCoordinatorCopies\(\)/)
+    assert.match(helperBody, /getResidentProgressRecords\(stored, progressProfileHrefs, \{includeView: false\}\)/)
     assert.match(helperBody, /residentAuthority: true/)
-    assert.match(helperBody, /return loadCoordinatorQueueRunsScopedProgressProjection\(options\)/)
-    assert.match(batchBody, /loadCoordinatorQueueRunsScopedProgressProjectionForMutation/)
+    assert.doesNotMatch(helperBody, /metricStorageGet\(/)
+    assert.doesNotMatch(helperBody, /getHydratedCoordinatorAuthorityState\(/)
+    assert.match(batchBody, /coordinatorQueueReader\.runsScopedProgressForMutation/)
     assert.doesNotMatch(batchBody, /await loadCoordinatorQueueRunsScopedProgressProjection\(/)
 })
 
@@ -3597,9 +3780,8 @@ test('dashboard resume polls are alarm-backed but user starts run direct authori
     assert.match(bootstrap, /return runScheduledCoordinatorQueueResume\('resume-alarm', \{allowBeforeQuora\}\)/)
     assert.match(source, /async function runScheduledCoordinatorQueueResume\(reason = '', options = \{\}\)/)
     const scheduledResumeBody = extractFunction(source, "async function runScheduledCoordinatorQueueResume(reason = '', options = {})")
-    assert.match(scheduledResumeBody, /const scheduledRawQueueCounts = getCoordinatorQueueWorkCounts\(scheduledRawQueue\)/)
-    assert.match(scheduledResumeBody, /Object\.keys\(scheduledRawQueue\)\.length && scheduledRawQueueCounts\.durableActiveRows <= 0/)
-    assert.match(scheduledResumeBody, /pump\.scheduledResume\.rawQueuePreload\.skippedActiveRows/)
+    // D1: the raw legacy queue preload is retired; the scheduled resume reads only the WAL-backed resident queue.
+    assert.doesNotMatch(scheduledResumeBody, /scheduledRawQueue|rawQueue|COORDINATOR_QUEUE_KEY/)
     assert.match(source, /runCoordinatorQueueExecutorFastPath\(resumeReason/)
     assert.match(source, /continueAfterAuthorityPreflight: true/)
     assert.match(source, /forceDurableQueueReload: true/)
@@ -3648,7 +3830,7 @@ test('queued background tabs have a content-script injection fallback', () => {
     assert.match(ensureBody, /content-script-version-mismatch/)
     assert.match(ensureBody, /versionMismatch: true/)
     assert.match(ensureBody, /files: \['js\/content\.js'\]/)
-    assert.match(ensureBody, /files: \['css\/content\.css'\]/)
+    assert.match(ensureBody, /files: \['css\/tokens\.css', 'css\/content\.css'\]/)
     assert.match(ensureBody, /contentScriptInjectedAt/)
     assert.match(ensureBody, /metadata\.contentScriptPresentAt \|\| metadata\.contentScriptInjectedAt/)
     assert.doesNotMatch(ensureBody, /metadata\.contentScriptEnsureFailedAt/)
@@ -3684,7 +3866,7 @@ test('queued tab fill bounds stale open-decision reads', () => {
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
     const enqueueBody = extractFunction(source, 'async function enqueueExistingExecutorForCoordinatorOnce(items = [], coordinator = {}, options = {})')
     const finalCheckIndex = fillBody.indexOf('validateQueuedTabOpenAgainstCurrentAuthority(next')
-    const createIndex = fillBody.indexOf('createOwnedTab(next)')
+    const createIndex = fillBody.indexOf('createOwnedTab(next, createAttempt)')
     const boundedCreateIndex = fillBody.indexOf("'queued owned tab create'")
 
     assert.match(planBody, /promiseWithTimeout\(\s*shouldOpenQueuedTabAction\(action, \{[\s\S]*currentAuthorityState: options\.currentAuthorityState \|\| options\.authorityState \|\| null[\s\S]*\}\),\s*QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS,\s*'queued tab open decision'/)
@@ -3998,6 +4180,7 @@ test('queued tab content ensure nudges the profile page to claim its action', ()
     const fillBody = extractFunction(swSource, 'async function fillQueuedTabsOnce(options = {})')
     const adoptBody = extractFunction(swSource, 'async function adoptLiveCoordinatorQueuedTab(item = null, itemKey = \'\', tab = null, ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID, options = {})')
     const messageBody = extractFunction(contentSource, 'function onMessage(request, sender, sendResponse)')
+    const claimHelperBody = extractFunction(contentSource, 'async function acceptQueuedProfileActionClaim(request = {})')
 
     assert.match(swSource, /QUEUED_TAB_ACTION_CLAIM_NUDGE_TIMEOUT_MS/)
     assert.match(nudgeBody, /makeClaimableQueuedTabAction/)
@@ -4037,12 +4220,12 @@ test('queued tab content ensure nudges the profile page to claim its action', ()
     assert.match(adoptBody, /nudgeQueuedTabActionClaimWithRetries\(tabId, 'resume-live-active-tab'\)/)
     assert.match(adoptBody, /scheduleOwnedBlockedProfileSweep\(ownerTabId, 4000\)/)
     assert.match(messageBody, /request\.action === 'claim-current-profile-tab-action'/)
-    assert.match(messageBody, /return \(async \(\) => \{/)
-    assert.match(messageBody, /await refreshCoordinatorQueueFromRuntime\(\)\.catch\(\(\) => null\)/)
-    assert.match(messageBody, /return \{accepted: true/)
-    assert.match(messageBody, /request\.queuedAction && typeof request\.queuedAction === 'object'/)
-    assert.match(messageBody, /maybeRecordAlreadyBlockedCoordinatorProfile\(\)/)
-    assert.match(messageBody, /void maybeRunAutoProfileAction\(\)/)
+    assert.match(messageBody, /return acceptQueuedProfileActionClaim\(request\)/)
+    assert.match(claimHelperBody, /await refreshCoordinatorQueueFromRuntime\(\)\.catch\(\(\) => null\)/)
+    assert.match(claimHelperBody, /return \{accepted: true/)
+    assert.match(claimHelperBody, /request\.queuedAction && typeof request\.queuedAction === 'object'/)
+    assert.match(claimHelperBody, /maybeRecordAlreadyBlockedCoordinatorProfile\(\)/)
+    assert.match(claimHelperBody, /void maybeRunAutoProfileAction\(\)/)
 })
 
 test('content script exposes a DOM marker for injection probes', () => {
@@ -4137,6 +4320,39 @@ test('queued profile action claim is bounded and retried for stored work', () =>
     assert.match(body, /autoProfileAction = undefined[\s\S]*QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS/)
 })
 
+test('profile progress lives in session storage and reaches content tabs by a worker push (decision 31, D13 b)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const content = readRepoFile('shared/js/content.js')
+    const push = readRepoFile('shared/js/swProfileNukeProgressPush.js')
+    const storedBody = extractFunction(sw, 'async function persistCoordinatorStoredChange(change = {}, stored = {}, options = {})')
+    const hydrateBody = extractFunction(sw, 'async function loadCoordinatorCurrentAuthorityState()')
+    const mirrorBody = extractFunction(sw, 'async function readValidCoordinatorQueueMirrorFromSession(session, sessionRead)')
+    const scopedBody = extractFunction(sw, 'async function getContentPageCoordinatorState(request = {}, sender = {})')
+    const storageListenerBody = extractFunction(bootstrap, 'function handleStorageChanged(changes, areaName)')
+    const onMessageBody = extractFunction(content, 'function onMessage(request, sender, sendResponse)')
+
+    // Disk never gets a progress key: the stored part splits them off, and only the session copy is written.
+    assert.match(storedBody, /omitProfileNukeProgressKeys\(payload\)/)
+    assert.match(storedBody, /pickProfileNukeProgressKeys\(payload\)/)
+    assert.match(storedBody, /writeProfileNukeProgressSession\(progressPayload\)/)
+    assert.match(storedBody, /profileNukeProgressPush\.push\(\)/)
+    // Hydrate reads progress from the session copy only, whatever the disk mirror holds. The progress keys ride in the first
+    // session read, the one that reads the mirror's marker, so hydrate adds no await for them.
+    const sessionReadBody = extractFunction(sw, 'async function readCoordinatorSessionForHydrate()')
+    assert.match(hydrateBody, /readCoordinatorSessionForHydrate\(\)/)
+    assert.match(sessionReadBody, /\.\.\.Object\.fromEntries\(PROFILE_NUKE_PROGRESS_STORAGE_KEYS\.map/)
+    assert.doesNotMatch(hydrateBody, /progressFromMirror|progressConfirmed|progressComplete|hydrateProgressFromMirror/)
+    assert.doesNotMatch(mirrorBody, /PROFILE_NUKE_PROGRESS|progressComplete/)
+    // The asking tab is subscribed, so it is pushed to when progress changes.
+    assert.match(scopedBody, /profileNukeProgressPush\.subscribe\(sender\?\.tab\?\.id\)/)
+    // The content tab refreshes on the push. The worker's storage listener no longer reads the progress view: nothing writes it to disk now.
+    assert.match(onMessageBody, /case PROFILE_NUKE_PROGRESS_PUSH_ACTION:[\s\S]{0,300}?scheduleContentPageStateProjectionRefresh\(\)/)
+    assert.doesNotMatch(storageListenerBody, /PROFILE_NUKE_PROGRESS_VIEW_KEY/)
+    assert.match(push, /PROFILE_NUKE_PROGRESS_PUSH_ACTION = 'profile-nuke-progress-changed'/)
+    assert.match(bootstrap, /request\.action === PROFILE_NUKE_PROGRESS_GET_ACTION/)
+})
+
 test('pending profile queued actions schedule a periodic claim rescue', () => {
     const source = readRepoFile('shared/js/content.js')
     const initBody = extractFunction(source, 'async function init()')
@@ -4155,8 +4371,9 @@ test('pending profile queued actions schedule a periodic claim rescue', () => {
     assert.match(nudgeBody, /void maybeRunAutoProfileAction\(\)/)
     assert.match(nudgeBody, /scheduleCurrentProfilePendingClaimRescue\(\)/)
     assert.ok(initBody.indexOf('await refreshCoordinatorQueueFromRuntime') < initBody.indexOf('nudgeCurrentProfilePendingClaim()'))
-    assert.match(storageBody, /key === PROFILE_NUKE_PROGRESS_VIEW_KEY \|\| key === COORDINATOR_QUEUE_VIEW_KEY/)
-    assert.match(storageBody, /scheduleContentPageStateProjectionRefresh\(\)/)
+    // Decision 17 (18 Oct) removed the queue-view branch of the content storage handler. Decision 31 (D13 b) removes the progress-view
+    // branch too: progress is in session storage, so the worker pushes a change instead (see the push test below).
+    assert.doesNotMatch(storageBody, /COORDINATOR_QUEUE_VIEW_KEY|PROFILE_NUKE_PROGRESS_VIEW_KEY/)
     assert.match(syncBody, /nudgeCurrentProfilePendingClaim\(\)/)
     assert.match(followUpBody, /nudgeCurrentProfilePendingClaim\(\)/)
     assert.match(followUpBody, /if\(!profileActionInProgress\)/)
@@ -4327,17 +4544,17 @@ test('dashboard exposes read-only why-not-running coordinator diagnostics', () =
 
 test('preferences expose browser-start auto-start as opt-in', () => {
     const defaults = readRepoFile('shared/js/defaults.js')
-    const popup = readRepoFile('shared/popup.html')
-    const popupJs = readRepoFile('shared/js/popup.js')
+    const preferences = readRepoFile('shared/preferences.html')
+    const preferencesJs = readRepoFile('shared/js/preferences.js')
     const prefs = readRepoFile('shared/js/swprefs.js')
     const worker = readRepoFile('shared/js/sw.js')
 
     assert.match(defaults, /coordinatorAutoStartOnBrowserStart: false/)
-    assert.match(popup, /id="coordinatorAutoStartOnBrowserStart"/)
-    assert.match(popup, /Auto-Start Current Work/)
-    assert.match(popup, /When on, resume work on browser start\. When off, do nothing until you navigate to a Quora page\./)
-    assert.match(popupJs, /coordinatorAutoStartOnBrowserStart\.checked = settings\.coordinatorAutoStartOnBrowserStart === true/)
-    assert.match(popupJs, /coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart\.checked/)
+    assert.match(preferences, /id="coordinatorAutoStartOnBrowserStart"/)
+    assert.match(preferences, /Auto-Start Current Work/)
+    assert.match(preferences, /When on, resume work on browser start\. When off, do nothing until you navigate to a Quora page\./)
+    assert.match(preferencesJs, /coordinatorAutoStartOnBrowserStart\.checked = settings\.coordinatorAutoStartOnBrowserStart === true/)
+    assert.match(preferencesJs, /coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart\.checked/)
     assert.match(prefs, /COORDINATOR_AUTO_START_ON_BROWSER_START_KEY = 'coordinatorAutoStartOnBrowserStart'/)
     assert.match(worker, /COORDINATOR_AUTO_START_ON_BROWSER_START_KEY/)
     assert.match(worker, /handleCoordinatorBrowserStartup\(\)/)
@@ -4351,8 +4568,9 @@ test('extension update rearms stored work from the durable queue', () => {
     const serviceWorkerReloadBody = extractFunction(worker, 'async function rearmStoredWorkAfterServiceWorkerReload(reason = \'service-worker-reload\')')
     const scheduleBody = extractFunction(browserSessionRuntime, 'function scheduleStoredWorkRearmAfterExtensionReload(reason = \'extension-updated\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
-    const installedIndex = bootstrap.indexOf('browser.runtime.onInstalled.addListener')
-    const installedBody = bootstrap.slice(installedIndex, bootstrap.indexOf('browser.runtime.onStartup.addListener', installedIndex))
+    // D4: the installed handler is a named function (its listener only gates and dispatches to it).
+    const installedIndex = bootstrap.indexOf('function handleRuntimeInstalled(details) {')
+    const installedBody = bootstrap.slice(installedIndex, bootstrap.indexOf('function handleRuntimeStartup() {', installedIndex))
 
     const storedReasonIndex = rearmBody.indexOf("const storedWorkReason = `${reason || 'extension-updated'}-stored-work`")
     const durableQueueIndex = rearmBody.indexOf('hasUnpausedStoredCoordinatorWorkInDurableQueue(storedWorkReason)', storedReasonIndex)
@@ -4416,7 +4634,7 @@ test('asset-space source-post resolver rows do not use the visible post author',
     const source = readRepoFile('shared/js/content.js')
     const subject = readRepoFile('shared/js/subject.js')
     const entriesBody = extractFunction(source, 'function getSpaceFeedPostEntries()')
-    const body = extractFunction(source, 'function getQueuedPageResolvedProfileHref(claimedAction = {})')
+    const body = extractFunction(source, 'function getQueuedPageResolvedProfileHref(claimedAction = {}, sink = null)')
     const singleBody = extractFunction(source, 'function getSingleSpacePostResolutionProfileHref(options = {})')
     const textUrlBody = extractFunction(source, 'function getProfileUrlsFromText(text)')
     const postArtifactBody = extractFunction(source, 'function getProfileUrlCandidatesFromSpacePostHref(href)')
@@ -4436,7 +4654,7 @@ test('asset-space source-post resolver rows do not use the visible post author',
     assert.doesNotMatch(entriesBody, /resolveProfileFromPage: isAssetSpacePage\(\) && !!postUrl && \(!candidateUrls\.length \|\| needsSourceResolution\)/)
     assert.match(body, /resolutionReason === 'low-confidence-profile-artifact'/)
     assert.match(reasonBody, /source-post-needs-profile-resolution/)
-    assert.match(body, /if\(isAssetSpacePage\(\)\) return explicitProfileHref/)
+    assert.match(body, /if\(isAssetSpacePage\(\)\) return noteQueuedResolution\(sink, 'explicit', explicitProfileHref\)/)
     assert.match(singleBody, /candidate\.source === 'listed-profile-link'/)
     assert.match(textUrlBody, /isLikelyExplicitProfileTargetHref\(href\)/)
     assert.match(postArtifactBody, /isLikelyExplicitProfileTargetSlug\(cleanSlug\)/)
@@ -4485,16 +4703,16 @@ test('asset-space source-post scan only creates resolver rows for explicit sourc
 
 test('source-post resolver waits for durable remap before navigating', () => {
     const source = readRepoFile('shared/js/content.js')
-    const messageBody = extractFunction(source, 'function onMessage(request, sender, sendResponse)')
+    const claimHelperBody = extractFunction(source, 'async function acceptQueuedProfileActionClaim(request = {})')
     const retryBody = extractFunction(source, 'async function sendQueuedProfileResolutionMessageWithRetry(message)')
     const actionBody = extractFunction(source, 'async function maybeRunAutoProfileAction()')
 
     assert.match(source, /QUEUED_PROFILE_RESOLUTION_MESSAGE_ATTEMPTS = 3/)
-    assert.match(messageBody, /canResolveQueuedProfileFromCurrentPage\(nextProfileAction \|\| \{\}\)/)
-    assert.match(messageBody, /return \{accepted: false, reason: 'not-profile'\}/)
+    assert.match(claimHelperBody, /canResolveQueuedProfileFromCurrentPage\(nextProfileAction \|\| \{\}\)/)
+    assert.match(claimHelperBody, /return \{accepted: false, reason: 'not-profile'\}/)
     assert.ok(
-        messageBody.indexOf('const nextProfileAction') <
-        messageBody.indexOf('canResolveQueuedProfileFromCurrentPage(nextProfileAction || {})')
+        claimHelperBody.indexOf('const nextProfileAction') <
+        claimHelperBody.indexOf('canResolveQueuedProfileFromCurrentPage(nextProfileAction || {})')
     )
     assert.match(retryBody, /QUEUED_PROFILE_RESOLUTION_MESSAGE_TIMEOUT_MS/)
     assert.match(retryBody, /result\?\.resolved === true/)
@@ -4526,13 +4744,13 @@ test('resolved profile handoff remaps queued tab metadata and pending action', (
     assert.match(resolveBody, /result\?\.resolved === true[\s\S]*remapQueuedTabToResolvedProfile\(/)
     assert.match(resolveMutationBody, /delete nextQueue\[itemKey\]/)
     assert.match(resolveMutationBody, /\[resolvedHref\]: nextItem/)
-    assert.match(resolveMutationBody, /loadCoordinatorQueueRunsPendingProjection\(\{[\s\S]*metricPath: 'resolver\.resolve\.load'/)
+    assert.match(resolveMutationBody, /coordinatorQueueReader\.runsPending\(\{[\s\S]*metricPath: 'resolver\.resolve\.load'/)
     assert.doesNotMatch(resolveMutationBody, /loadCoordinatorState\(/)
     assert.match(resolveMutationBody, /terminal-coordinator-item/)
     assert.match(resolveMutationBody, /not-profile-resolution-item/)
     assert.match(resolveMutationBody, /inactive-coordinator-item/)
     assert.match(resolveMutationBody, /missing-attempt-identity/)
-    assert.match(resolveMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
+    assert.match(resolveMutationBody, /coordinatorAuthority\.persistCoordinator\(/)
     assert.match(resolveMutationBody, /operationKind: 'resolver-remap'/)
     assert.match(resolveMutationBody, /removedRows/)
     assert.match(resolveMutationBody, /queue: false/)
@@ -4585,7 +4803,7 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     const cancelBody = extractFunction(sw, 'async function cancelCoordinatorCurrentWork()')
     const cancelStoredBody = extractFunction(sw, 'async function cancelStoredCoordinatorWork(options = {})')
     const cancelStoredMutationBody = extractFunction(sw, 'async function mutateCoordinatorStoredWorkCancel(operation = {})')
-    const resumePausedBody = extractFunction(sw, 'async function resumePausedCoordinatorNukes()')
+    const resumePausedBody = extractFunction(sw, 'async function resumePausedCoordinatorNukes(options = {})')
     const resumeBody = extractFunction(sw, 'async function resumeCoordinatorQueueExecutionOnce(coordinator = {}, options = {})')
     // the stored-pause-state guard was extracted to
     // decideResumeCoordinatorStoredPausedOutcome in decomposition Slice P2-19,
@@ -4647,7 +4865,7 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(cancelStoredBody, /type: hasTarget \? 'CANCEL_STORED_WORK_ITEM' : 'CANCEL_STORED_WORK'/)
     assert.match(cancelStoredMutationBody, /status: 'canceled'/)
     assert.match(cancelStoredMutationBody, /operationKind: 'stored-work-cancel'/)
-    assert.match(cancelStoredMutationBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(/)
+    assert.match(cancelStoredMutationBody, /persistCoordinatorWithFinishedOutliers\(/)
     assert.match(cancelStoredMutationBody, /queueOperation: 'stored-work-cancel-derived'/)
     assert.match(cancelBody, /coordinatorPauseRequested = true/)
     assert.match(cancelBody, /setCoordinatorPauseControlState\(true, pauseGeneration, 'ordinaryMutation'\)/)
@@ -4994,6 +5212,122 @@ test('fresh queued tab progress clears stale close fields', () => {
     assert.match(swBody.slice(reattachIndex, reattachIndex + 500), /slotReleasedAt: 0/)
 })
 
+test('terminal row slot release is sampled at the release, from the terminal record', () => {
+    // Owner, 17 Oct: the terminal phase sample runs before the release, and a closing tab never writes slotReleasedAt, so the
+    // terminal-to-slot-released sample has to come from the release itself.
+    const sw = readRepoFile('shared/js/sw.js')
+    const releaseBody = extractFunction(sw, 'async function releaseQueuedTab(tabId, options = {})')
+    const sampleIndex = releaseBody.indexOf("recordQueueWakeupPhase('terminalToSlotRelease'")
+    const slotWriteIndex = releaseBody.indexOf('slotReleasedAt: Date.now()')
+
+    assert.notEqual(sampleIndex, -1)
+    assert.notEqual(slotWriteIndex, -1)
+    assert.ok(sampleIndex < slotWriteIndex)
+    assert.match(releaseBody.slice(sampleIndex - 400, sampleIndex), /isTerminalProfileNukeRecord\(progressRecord\)/)
+    assert.match(releaseBody.slice(sampleIndex - 400, sampleIndex), /progressRecord\.terminalAt > 0/)
+})
+
+test('every storage write is labelled, sized and recorded once (owner 18 Oct)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const writeBody = extractFunction(sw, 'async function metricStorageSet(payload = {}, options = {})')
+    const eventIndex = writeBody.indexOf("kind: 'storage-write'")
+
+    assert.notEqual(eventIndex, -1)
+    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /label: pathName/)
+    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /bytes: payloadSummary\?\.bytes/)
+    assert.match(writeBody, /storagePayload\.write\.unlabelled/)
+    // The coordinator door labels a stored write from its progress metric path or its operation kind, never the phase fallback.
+    const coordinatorSource = sw
+    assert.match(coordinatorSource, /coordinatorStored\.\$\{options\.operationKind \|\| 'unlabelled'\}/)
+    const metricsSource = readRepoFile('shared/js/swStorageMetrics.js')
+    assert.match(metricsSource, /function recordStoragePayloadMetrics\(payload = \{\}, pathName = ''\) \{[\s\S]*?return \{bytes: totalBytes, rows: totalRows, keys: keyNames\}/)
+})
+
+test('archive writes record their outcome, so a skip carries its reason (owner 18 Oct)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const archiveBody = extractFunction(sw, 'async function archiveTerminalCoordinatorRow(rowKey = \'\', terminalRow = null, options = {})')
+    for (const outcome of ['skipped', 'failed', 'saved']) {
+        assert.match(archiveBody, new RegExp(`recordTerminalWriteOutcome\\('archiveTerminalCoordinatorRow', rowKey, '${outcome}'`))
+    }
+    assert.match(sw, /kind: 'terminal-write-outcome'/)
+})
+
+test('a removed tab runs the fill at once, and a busy window skips the whole-browser scans before them (owner 18 Oct)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    assert.match(bootstrap, /\n        requestQueuedTabRemovalRefill\(\)\n/)
+    assert.match(sw, /function requestQueuedTabRemovalRefill\(\) \{[\s\S]*?void fillQueuedTabs\(\{reason: QUEUED_TAB_REMOVED_REFILL_REASON\}\)/)
+
+    const fillBody = extractFunction(sw, 'async function fillQueuedTabsOnce(options = {})')
+    const busyIndex = fillBody.indexOf('const surfaceOccupiedBeforeScans')
+    const scanIndex = fillBody.indexOf('const finalOpenDecision = await validateQueuedTabOpenAgainstCurrentAuthority')
+    assert.notEqual(busyIndex, -1)
+    assert.notEqual(scanIndex, -1)
+    assert.ok(busyIndex < scanIndex)
+    assert.match(fillBody.slice(busyIndex, scanIndex), /isQueuedWorkerActionSurfaceOccupiedForOpen\(next\)/)
+    // One whole-browser scan per pass: each cache is reused only while no tab has been opened or removed.
+    assert.match(fillBody, /passProfileTabsGeneration !== tabsChangedGeneration/)
+    assert.match(fillBody, /passAllTabsGeneration !== tabsChangedGeneration/)
+})
+
+test('non-authority writes leave the lane, skipped rows carry an outcome, and every state write is labelled (owner 18 Oct)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    // The tab id is written only when it changes, and the caller is not held on the write.
+    assert.match(sw, /if\(coordinatorTabIdSavedToStorage === normalizedTabId\) return/)
+    // The diagnostic flush is coalesced inside its interval, unless the pending list is nearly full.
+    assert.match(sw, /incrementQueueWakeupMetric\('diagnosticEvent\.flushCoalesced'\)/)
+    // Every authority-mutation entry carries the outcome, status and error of the row written.
+    assert.match(sw, /outcome: result\.nextRow\?\.outcome \|\| record\.outcome/)
+    assert.match(sw, /outcome: record\.value\?\.outcome \|\| record\.outcome/)
+    // Every caller of the state writer names its write, so none falls back to reason.ordinaryMutation.
+    const writerCalls = sw.split('saveCoordinatorState(').length - 2
+    const labelled = (sw.match(/saveCoordinatorState\([^)]*metricPath|metricPath: '(?:authority|reconcile|activeTransition|retry|requeue|enqueue|storedWorkClear|queuedProfileTargetResolve|queuedProfileResolutionUnresolved|progress)\./g) || []).length
+    assert.ok(writerCalls > 0)
+    assert.ok(labelled > 0)
+})
+
+test('owned-tab map is written only when its serialized value changes (owner 18 Oct)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const body = extractFunction(sw, 'async function persistOwnedTabIdsByParent()')
+    // The skip compares the serialized JSON with the last value saved, and runs before the write.
+    const compareIndex = body.indexOf('if(serializedJson === ownedTabIdsByParentSavedJson)')
+    const writeIndex = body.indexOf('metricStorageSet({[OWNED_TAB_STATE_KEY]: serialized}')
+    assert.notEqual(compareIndex, -1)
+    assert.ok(writeIndex > compareIndex)
+    // The saved value is recorded only after the write succeeds, so a failed write is retried on the next call.
+    assert.match(body, /if\(saved !== false\) ownedTabIdsByParentSavedJson = serializedJson/)
+    // The cache is declared before the function that reads it, so it is never in its temporal dead zone.
+    assert.ok(sw.indexOf('let ownedTabIdsByParentSavedJson') < sw.indexOf('async function persistOwnedTabIdsByParent'))
+    assert.equal(sw.split('let ownedTabIdsByParentSavedJson').length - 1, 1)
+    // Nothing else writes the owned-tab key, so the cached value cannot go stale behind the skip. (The load path reads it.)
+    assert.equal((sw.match(/\bset\(\{\[OWNED_TAB_STATE_KEY\]|Set\(\{\[OWNED_TAB_STATE_KEY\]/g) || []).length, 1)
+})
+
+test('a removal refill that lands on an in-flight fill pass runs one more pass when it ends (601f 3a)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    // The removal reason has one constant, shared by the refill request and the coalescing check in fillQueuedTabs.
+    assert.match(sw, /const QUEUED_TAB_REMOVED_REFILL_REASON = 'queued-tab-removed-refill'/)
+    assert.match(sw, /void fillQueuedTabs\(\{reason: QUEUED_TAB_REMOVED_REFILL_REASON\}\)/)
+    // The in-flight branch marks the rerun for a removal only, and counts it.
+    assert.match(sw, /if\(options\.reason === QUEUED_TAB_REMOVED_REFILL_REASON\) \{\s*queuedTabRemovalRerunRequested = true\s*incrementQueueWakeupMetric\('pump\.queuedTabRemovalRefill\.coalescedIntoRerun'\)/)
+    // The owning pass runs the rerun once when it ends, and not while a pause is in effect.
+    assert.match(sw, /const ownsPromise = queuedTabFillPromise === trackedPromise/)
+    assert.match(sw, /if\(ownsPromise && queuedTabRemovalRerunRequested\) \{\s*queuedTabRemovalRerunRequested = false\s*if\(!isCoordinatorPauseRequestedLocally\(\) && quoraRuntimeActivated\)/)
+    // The flag is a boolean, so a removal during a rerun asks for one more pass and does not stack passes.
+    assert.match(sw, /let queuedTabRemovalRerunRequested = false/)
+})
+
+test('pause-effective is recorded by the first paused fill pass, not by the request (601f 4a)', () => {
+    const sw = readRepoFile('shared/js/sw.js')
+    const pauseBody = extractFunction(sw, 'async function pauseCoordinatorNukes()')
+    assert.doesNotMatch(pauseBody, /kind: 'pause-effective'/)
+    assert.match(pauseBody, /pauseRequestedAtMs = Date\.now\(\)/)
+    assert.match(sw, /function recordPauseEffectiveOnFirstPausedFillPass\(\)/)
+    assert.match(sw, /if\(pausedGateResult\) \{\s*recordPauseEffectiveOnFirstPausedFillPass\(\)/)
+    // The gate reads the in-memory request as well as the stored flag, so a pass during a pause request stops at once.
+    assert.match(sw, /\[COORDINATOR_PAUSED_KEY\]: pausedState\?\.\[COORDINATOR_PAUSED_KEY\] === true \|\| coordinatorPauseRequested === true/)
+})
+
 test('queued retry progress clears stale terminal attempt fields', () => {
     // normalizeProgressPatch moved to swProfileProgressMerge.js in
     // decomposition Slice 30.
@@ -5309,13 +5643,15 @@ test('legacy profile progress writes are deleted from service-worker progress pa
     assert.doesNotMatch(source, /request\.action === 'record-nuke-progress'/)
     assert.doesNotMatch(source, /request\.action === 'record-nuke-progress-batch'/)
     assert.doesNotMatch(source, /PROFILE_NUKE_PROGRESS_KEY/)
-    assert.doesNotMatch(source, /['"]mbProfileNukeProgress['"]/)
+    // D3: the retired-keys declaration is the one allowed mention (see the upgrade cleanup in sw.js).
+    assert.doesNotMatch(source.replace(/const VERSION_15_RETIRED_STORAGE_KEYS = \[[^\]]*\]/, ''), /['"]mbProfileNukeProgress['"]/)
     assert.doesNotMatch(source, /legacy-progress-message-disabled/)
     assert.doesNotMatch(source, /legacyMessageDisabled/)
     assert.doesNotMatch(source, /async function normalizeProfileNukeProgressStorage/)
     assert.doesNotMatch(source, /payload\[PROFILE_NUKE_PROGRESS_KEY\] = pruneProfileNukeProgress/)
     assert.doesNotMatch(source, /progress\.storageWrites|progress\.flushPerformed/)
-    assert.match(loadBody, /metricStorageGet\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null,[\s\S]*getAllProfileNukeProgressShardDefaults\(\)[\s\S]*\}/)
+    assert.match(loadBody, /readResidentCoordinatorStored\(\{[\s\S]*\[PROFILE_NUKE_PROGRESS_VIEW_KEY\]: null,[\s\S]*getAllProfileNukeProgressShardDefaults\(\)[\s\S]*\}/)
+    assert.doesNotMatch(loadBody, /metricStorageGet\(/)
     assert.match(loadBody, /getProfileNukeProgressRecordsFromProjection\(stored\)/)
     assert.doesNotMatch(loadBody, /PROFILE_NUKE_PROGRESS_KEY|normalizeStoredProfileNukeProgress/)
     assert.doesNotMatch(loadBody, /saveCoordinatorState\(/)
@@ -5337,11 +5673,15 @@ test('terminal settlement separates authority stamping from derived materializat
     // the mutation and its guard checks are inline in the loop below.
     assert.doesNotMatch(source, /async function applyTerminalCoordinatorAuthoritySettlementLocked/)
     assert.match(settlementBody, /const settlementResults = \[\]/)
-    assert.match(settlementBody, /const nextQueueForSettlement = \{\.\.\.queue\}/)
+    // The settlement writes a change (the staged results), not a copy of the whole queue. The copy is gone (see
+    // the change-only door in persistCoordinator).
+    assert.doesNotMatch(settlementBody, /const nextQueueForSettlement = \{\.\.\.queue\}/)
     assert.match(settlementBody, /makeCoordinatorAuthorityApplyResult\(\{[\s\S]*operationKind: 'terminal-settlement',[\s\S]*rowKey: itemKey/)
-    assert.match(settlementBody, /persistCoordinatorAuthorityQueueWalBatchMutation\(\s*settlementResults,\s*nextProjection/)
+    assert.match(settlementBody, /coordinatorAuthority\.persistCoordinator\(\s*\{results: settlementResults\}/)
     assert.match(settlementBody, /buildTerminalCoordinatorSettlementDerivedPayload\(stored, progress, \{[\s\S]*confirmedHrefs,[\s\S]*clearedHrefs,[\s\S]*progressChanged/)
-    assert.match(settlementBody, /getProfileNukeProgressProjectionDefaults\(requestedHrefs\)/)
+    // The progress base is the resident stored copy (P2), not a storage read with projection defaults.
+    assert.match(settlementBody, /coordinatorAuthority\.residentStored\(\)/)
+    assert.doesNotMatch(settlementBody, /metricStorageGet\(|getProfileNukeProgressProjectionDefaults\(/)
     assert.match(settlementBody, /getProfileNukeProgressRecordsFromProjection\(stored, requestedHrefs\)/)
     assert.doesNotMatch(settlementBody, /PROFILE_NUKE_PROGRESS_KEY|getProfileNukeProgressRecordsFromStorage/)
     assert.match(derivedBody, /SPACE_PENDING_NUKED_POSTS_KEY/)
@@ -5462,15 +5802,15 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     const releaseBody = extractFunction(source, 'async function releaseQueuedTab(tabId, options = {})')
     const releaseReconcileBody = extractFunction(source, 'function scheduleQueuedTabReleaseReconcile(reason = \'queued-tab-slot-release\', options = {})')
     const fillBody = extractFunction(source, 'async function fillQueuedTabsOnce(options = {})')
-    const createOwnedTabBody = extractFunction(source, 'async function createOwnedTab(action = {})')
+    const createOwnedTabBody = extractFunction(source, 'async function createOwnedTab(action = {}, attempt = {})')
     const restoreFocusBody = extractFunction(source, 'async function restoreBackgroundQueuedTabFocus(tab = null, previousActiveTab = null, action = {})')
     const durableIndex = releaseBody.indexOf('await Promise.all(durableWrites')
     const terminalIndex = releaseBody.indexOf('if(progressRecord && isTerminalProfileNukeRecord(progressRecord)')
     const terminalScheduleIndex = releaseBody.indexOf('scheduleReleaseContinuation()', terminalIndex)
     const rollbackIndex = releaseBody.indexOf('durableWrites.push(rollbackFailedQueuedTabOpen')
     const finalScheduleIndex = releaseBody.indexOf('scheduleReleaseContinuation()', durableIndex)
-    const pausedGateIndex = fillBody.indexOf('decidePausedStateGate({pausedState, cycle})')
-    const createIndex = fillBody.indexOf('createOwnedTab(next)')
+    const pausedGateIndex = fillBody.indexOf('const pausedGateResult = decidePausedStateGate({')
+    const createIndex = fillBody.indexOf('createOwnedTab(next, createAttempt)')
     const boundedCreateIndex = fillBody.indexOf("'queued owned tab create'")
     const openFailureIndex = fillBody.indexOf('openFailureCount')
 
@@ -5509,7 +5849,7 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     // swFillQueuedTabsOnceDecisions.js in decomposition Slice P2.5-4.
     const pausedGateBody = extractFunction(readRepoFile('shared/js/swFillQueuedTabsOnceDecisions.js'), 'function decidePausedStateGate(params = {})')
     assert.match(pausedGateBody, /pausedState\?\.\[COORDINATOR_PAUSED_KEY\] !== true/)
-    assert.match(fillBody, /decidePausedStateGate\(\{pausedState, cycle\}\)/)
+    assert.match(fillBody, /const pausedGateResult = decidePausedStateGate\(\{/)
     // The activation-guard-claim and profile-open-reservation-claim guard
     // pairs inside the fill loop were extracted to decideActivationGuardClaim
     // and decideProfileOpenReservationClaim in the same slice, then moved to
@@ -5527,7 +5867,8 @@ test('queued tab lifecycle recovery is durable before refilling slots', () => {
     // well before the durable write) used to have no way to stop it
     // before the loop ran out of capacity or activation intents on its
     // own. Live evidence: rows still going active seconds after Pause.
-    assert.match(fillBody, /while\(!coordinatorPauseRequested && getCapacityUsed\(\) < getEffectiveQueuedTabOpenConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
+    // review-2 S5-1 adds the fill's own cancel token to the same condition: a timed-out fill claims nothing more.
+    assert.match(fillBody, /while\(!coordinatorPauseRequested && options\.cancelToken\?\.cancelled !== true && getCapacityUsed\(\) < getEffectiveQueuedTabOpenConcurrency\(\) && queueRuntime\.getActivationIntentCount\(\)\)/)
     // The post-open-failure recovery decision (after the `postOpenRecovery`
     // await inside the tab-create catch's genuine-failure branch, including
     // the loop's last remaining inline `queueRuntime.requeueActivationIntent`
@@ -5646,19 +5987,18 @@ test('coordinator status predicates delegate to swCoordinatorStatusRules instead
 // exists and is not itself `async`/promise-returning, and each site calls
 // it rather than re-declaring `recoverCoordinatorQueueFromWal(...).queue`
 // inline.
-test('coordinator queue-projection loaders delegate the WAL-to-queue recovery step to a plain (non-async) helper', () => {
+test('queue-projection loaders answer from the resident state and never replay the WAL (P2, P3)', () => {
     const source = readRepoFile('shared/js/sw.js')
 
-    const helperBody = extractFunction(source, 'function recoverQueueFromWalStore(queueSnapshot, walStore)')
+    // The plain WAL-to-queue helper is gone. Hydrate is the only decode of the WAL (P3).
+    assert.doesNotMatch(source, /function recoverQueueFromWalStore/)
     assert.doesNotMatch(source, /async function recoverQueueFromWalStore/)
-    assert.match(helperBody, /recoverCoordinatorQueueFromWal\(/)
 
     const loaderNames = [
         'loadCoordinatorQueueProjection',
         'loadCoordinatorQueueRunsProjection',
         'loadCoordinatorQueueRunsProgressProjection',
         'loadCoordinatorQueueRunsScopedProgressProjection',
-        'loadCoordinatorCurrentAuthorityState',
         'loadCoordinatorQueueRunsEventsProjection',
         'loadCoordinatorQueueRunsEventsProgressProjection',
         'loadCoordinatorReconcileProjection',
@@ -5666,13 +6006,14 @@ test('coordinator queue-projection loaders delegate the WAL-to-queue recovery st
         'loadCoordinatorQueueRunsProgressPendingNukedProjection'
     ]
     for(const name of loaderNames) {
-        const signature = name === 'loadCoordinatorCurrentAuthorityState'
-            ? `async function ${name}(defaults = {}, options = {})`
-            : `async function ${name}(options = {})`
-        const body = extractFunction(source, signature)
-        assert.match(body, /const queue = recoverQueueFromWalStore\(queueSnapshot, walStore\)/, `${name} should delegate to recoverQueueFromWalStore`)
-        assert.doesNotMatch(body, /recoverCoordinatorQueueFromWal\(/, `${name} should not re-declare the WAL recovery call inline`)
+        const body = extractFunction(source, `async function ${name}(options = {})`)
+        assert.match(body, /await awaitResidentCoordinatorState\(\)/, `${name} should read the resident state after the gate`)
+        assert.doesNotMatch(body, /recoverCoordinatorQueueFromWal\(|loadCoordinatorQueueWalProjection\(|metricStorageGet\(/, `${name} should not replay the WAL or read storage`)
     }
+
+    const hydrateBody = extractFunction(source, 'async function loadCoordinatorCurrentAuthorityState()')
+    assert.match(hydrateBody, /loadCoordinatorQueueWalProjection\(/)
+    assert.match(hydrateBody, /recoverCoordinatorQueueFromWal\(/)
 })
 
 // Queue processing order (2026-09-11/12, see entropy-reduction-action-plan-
@@ -5711,15 +6052,16 @@ test('coordinator queue processing order comes from an explicit queueSequence in
     assert.match(queueRuntimeSource, /function getOrderedQueueKeys\(\)/)
     assert.match(queueRuntimeSource, /function getOrderedQueueItems\(queue = \{\}\)/)
 
-    const refreshBody = extractFunction(swSource, "function refreshResidentCoordinatorAuthorityState(state = null, metricName = '')")
-    assert.match(refreshBody, /queueRuntime\.rebuildQueueOrder\(/)
+    const orderSyncBody = extractFunction(swSource, 'function syncResidentQueueOrder(previousQueue = {})')
+    assert.match(orderSyncBody, /queueRuntime\.rebuildQueueOrder\(/)
     // 2026-09-26: rebuildQueueOrder's full O(n log n) sort now only runs the
-    // first time (index not yet seeded) -- every subsequent refresh diffs
-    // against the previously-resident queue with the O(1)-per-key
-    // incremental primitives instead, avoiding a full sort on every single
-    // coordinator queue mutation.
-    assert.match(refreshBody, /queueRuntime\.getOrderedQueueKeyCount\(\) > 0/)
-    assert.match(refreshBody, /queueRuntime\.syncOrderedQueueKeysFromQueueDiff\(previousQueue, nextQueue\)/)
+    // first time (index not yet seeded) -- every later change diffs against
+    // the previously-resident queue with the O(1)-per-key incremental
+    // primitives instead, avoiding a full sort on every queue mutation. The
+    // refresh path is gone, so hydrate, seed, and the door's writes call this helper.
+    assert.match(orderSyncBody, /queueRuntime\.getOrderedQueueKeyCount\(\) > 0/)
+    assert.match(orderSyncBody, /queueRuntime\.syncOrderedQueueKeysFromQueueDiff\(previousQueue, nextQueue\)/)
+    assert.ok((swSource.match(/syncResidentQueueOrder\(/g) || []).length >= 6, 'hydrate, seed, and each door write sync the order index')
     const syncDiffBody = extractFunction(queueRuntimeSource, 'function syncOrderedQueueKeysFromQueueDiff(previousQueue = {}, nextQueue = {})')
     assert.match(syncDiffBody, /noteOrderedQueueKeyAbsent\(key\)/)
     assert.match(syncDiffBody, /noteOrderedQueueKeyPresent\(key\)/)
@@ -5809,12 +6151,13 @@ test('no SCREAMING_SNAKE_CASE string constant is independently declared as a lit
     // a one-line import swap -- left as a documented follow-up in
     // entropy-reduction-action-plan-2026-09-09.md rather than guessed at
     // here. Allowlisted by value so this test still catches any *new*
-    // duplicate going forward.
+    // duplicate going forward. The two storage-key values that were
+    // allowlisted here (mbSpacePendingNukedPosts, mbProfileNukeProgressView)
+    // moved to shared/js/storageKeys.js on 2026-10-14 (14-oct-review-1.md
+    // finding 8), so they are no longer duplicated and no longer allowlisted.
     const knownPreexistingDuplicateValues = new Set([
         'service-worker-queue-owner',
-        'author-profile',
-        'mbSpacePendingNukedPosts',
-        'mbProfileNukeProgressView'
+        'author-profile'
     ])
 
     const files = ['shared/js/content.js', 'shared/js/sw.js', 'shared/js/jobState.js']
@@ -5839,6 +6182,67 @@ test('no SCREAMING_SNAKE_CASE string constant is independently declared as a lit
         .map(([value, locations]) => `'${value}' declared independently at: ${locations.join(', ')}`)
 
     assert.deepEqual(duplicated, [])
+})
+
+// 14-oct-review-1.md finding 8 (Pattern 6, duplicated constants): these storage key names and limits were each declared with a
+// literal in two or three shared/js modules, and nothing checked that the copies agreed. Each is now declared once: keys in
+// shared/js/storageKeys.js, limits in shared/js/tunables.js. Every other module imports the name. This test fails if one of these
+// names is declared again (const/let/var NAME =) in another shared/js module, and checks that each value is still the literal it
+// had in the source before the move. A destructured import (const {NAME} = require(...)) is not a declaration and does not trip it.
+test('storage key names and tunable limits are declared once, in storageKeys.js or tunables.js', () => {
+    // The values these names had in the source before the move.
+    const expectedKeyValues = {
+        COORDINATOR_QUEUE_VIEW_KEY: 'mbCoordinatorQueueView',
+        COORDINATOR_PAUSED_KEY: 'mbCoordinatorPaused',
+        COORDINATOR_RETRY_FAILED_ENABLED_KEY: 'mbCoordinatorRetryFailedEnabled',
+        COORDINATOR_RUNS_KEY: 'mbCoordinatorRuns',
+        COORDINATOR_EVENTS_KEY: 'mbCoordinatorEvents',
+        COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY: 'mbCoordinatorLastEnqueueSummary',
+        HIDDEN_RUNS_KEY: 'mbCoordinatorHiddenRunIds',
+        QUEUE_WAKEUP_METRICS_VIEW_KEY: 'mbQueueWakeupMetricsView',
+        PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView',
+        PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard.',
+        SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
+        SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
+        DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled'
+    }
+    const expectedLimitValues = {
+        MAX_PROFILE_NUKE_PROGRESS_ENTRIES: 1000,
+        STALE_QUEUED_TAB_MAX_RETRIES: 1,
+        EXHAUSTED_ROLLBACK_RECOVERY_LIMIT: 3,
+        QUEUE_LOAD_THROTTLE_MAX_MS: 120000
+    }
+    // Local names these values were declared under before the move. Retired, so none may come back as a declaration.
+    const retiredLocalNames = [
+        'LAST_ENQUEUE_SUMMARY_KEY',
+        'DEFAULT_QUEUED_TAB_MAX_RETRIES',
+        'QUEUE_LOAD_PRESSURE_RECOVERY_WINDOW_MS',
+        'COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT'
+    ]
+    const consolidatedNames = [...Object.keys(expectedKeyValues), ...Object.keys(expectedLimitValues)]
+    const declarationPattern = new RegExp(`\\b(?:const|let|var)\\s+(${[...consolidatedNames, ...retiredLocalNames].join('|')})\\s*=`)
+    const owningModules = new Set(['shared/js/storageKeys.js', 'shared/js/tunables.js'])
+    const sharedJsDir = path.join(__dirname, '..', 'shared/js')
+    const redeclared = []
+    for(const fileName of fs.readdirSync(sharedJsDir).filter(name => name.endsWith('.js')).sort()) {
+        const relativePath = `shared/js/${fileName}`
+        if(owningModules.has(relativePath)) continue
+        readRepoFile(relativePath).split('\n').forEach((line, index) => {
+            if(/^\s*(?:\/\/|\*)/.test(line)) return
+            const match = line.match(declarationPattern)
+            if(match) redeclared.push(`${relativePath}:${index + 1} (${match[1]})`)
+        })
+    }
+    assert.deepEqual(redeclared, [])
+
+    const storageKeys = require(path.join(__dirname, '..', 'shared/js/storageKeys'))
+    const tunables = require(path.join(__dirname, '..', 'shared/js/tunables'))
+    for(const [name, value] of Object.entries(expectedKeyValues)) {
+        assert.equal(storageKeys[name], value, `storageKeys.${name}`)
+    }
+    for(const [name, value] of Object.entries(expectedLimitValues)) {
+        assert.equal(tunables[name], value, `tunables.${name}`)
+    }
 })
 
 test('dashboard run badge relabels a fully-terminal run as done, not the raw empty status', () => {
@@ -5884,4 +6288,37 @@ test('Clear All Stats zeroes Terminal and wipes the Events backing store, not ju
     const queueViewSource = readRepoFile('shared/js/swCoordinatorQueueView.js')
     const filterBody = extractFunction(queueViewSource, 'function filterCoordinatorQueueForCompactView(queue = {}, runs = {}, statsClearedAt = 0)')
     assert.match(filterBody, /terminalAt <= clearedAt/)
+})
+
+// Rule 2 of docs/queue-storage-layering.md section 6: the dashboard asks the worker to write the queue events and
+// the retry-failed flag, and does not write those keys itself.
+test('dashboard clear-events and retry-failed controls send worker messages instead of writing storage', () => {
+    const source = readRepoFile('shared/js/coordinator.js')
+    assert.doesNotMatch(source, /storage\.local\.set\(\{\[COORDINATOR_EVENTS_KEY\]/)
+    assert.doesNotMatch(source, /storage\.local\.set\(\{\[COORDINATOR_RETRY_FAILED_ENABLED_KEY\]/)
+    assert.match(source, /action: 'clear-coordinator-events'/)
+    assert.match(source, /action: 'set-coordinator-retry-failed-enabled'/)
+})
+
+test('a queue bar request on a cold worker waits for the authority, and the bar summary is held in memory only (decision 2, 18 Oct)', () => {
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const bar = readRepoFile('shared/js/swQueueBarSummary.js')
+    // The get action is in the authority-gated set, so a cold request is answered after startup.
+    assert.match(bootstrap, /RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY = new Set\(\[\s*(?:\/\/[^\n]*\n\s*)?QUEUE_BAR_GET_ACTION,/)
+    // The cold path builds the first view and records its summary. A failed build answers null.
+    assert.match(bootstrap, /refreshCoordinatorQueueViewForDashboard\('queue-bar-first-build'\)/)
+    assert.match(bootstrap, /\.catch\(\(\) => \(\{summary: null\}\)\)/)
+    // Nothing in the bar module touches storage: the summary is held in memory only.
+    assert.doesNotMatch(bar, /storage\.(local|session)|setAccessLevel/)
+})
+
+test('a run\'s source page comes from the run record only; the event log is not read for it (decision 26, 18 Oct)', () => {
+    const provenance = readRepoFile('shared/js/swCoordinatorSourceProvenance.js')
+    const sw = readRepoFile('shared/js/sw.js')
+    const body = extractFunction(provenance, 'function makeCoordinatorSourceFromRunMetadata(runId = \'\', run = {})')
+    assert.match(body, /run\.sourcePages\.find\(Boolean\)/)
+    assert.doesNotMatch(body, /events/)
+    assert.doesNotMatch(provenance, /getCoordinatorRunSourcePageFromEvents/)
+    assert.doesNotMatch(sw, /getCoordinatorRunSourcePageFromEvents/)
+    assert.match(sw, /makeCoordinatorSourceFromRunMetadata\(item\.runId \|\| '', ctx\.runs\[item\.runId\] \|\| \{\}\)/)
 })

@@ -1,6 +1,6 @@
 /* mute block button */
 .mb-ext_mute-block-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -11,7 +11,7 @@
     margin-left: 5px;
 }
 .mb-ext_mute-block-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_mute-block-close-btn {
@@ -46,7 +46,7 @@
 
 /* find original poster button */
 .mb-ext_find-op-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -63,7 +63,7 @@
 }
 
 .mb-ext_find-op-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_question-center-slot {
@@ -75,7 +75,7 @@
 
 /* find original poster log page button */
 .mb-ext_find-op-log-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -86,7 +86,7 @@
 }
 
 .mb-ext_find-op-log-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 /* close tab button */
@@ -109,7 +109,7 @@
 
 /* open profiles button */
 .mb-ext_open-profiles-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     color: #fff;
     border: none;
     border-radius: 999px;
@@ -121,7 +121,7 @@
     gap: 4px;
 }
 .mb-ext_open-profiles-btn:hover {
-    background-color: rgb(168, 39, 35);
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_view-contributors-btn {
@@ -419,7 +419,7 @@
 }
 
 .mb-ext_space-category-btn--active[data-category="target"] {
-    background: #b92b27;
+    background: var(--mb-brand-red);
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.24);
     color: #fff;
 }
@@ -448,12 +448,12 @@
 }
 
 .mb-ext_space-feed-post-single-nuke-btn {
-    background-color: #b92b27;
+    background-color: var(--mb-brand-red);
     margin-left: 0;
 }
 
 .mb-ext_space-feed-post-single-nuke-btn:hover {
-    background-color: #a82723;
+    background-color: var(--mb-brand-red-dark);
 }
 
 .mb-ext_space-feed-post-single-nuke-btn.mb-ext_space-feed-post-single-nuke-btn--neutral,

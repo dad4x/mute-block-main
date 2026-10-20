@@ -29,6 +29,7 @@ function createStorageMetrics(deps = {}) {
         QUEUE_WAKEUP_METRICS_VIEW_KEY,
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
+        COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX,
         SPACE_PENDING_NUKED_POSTS_KEY,
         SPACE_NUKED_POSTS_KEY,
         OWNED_TAB_STATE_KEY,
@@ -66,6 +67,7 @@ function createStorageMetrics(deps = {}) {
         if(key === QUEUE_WAKEUP_METRICS_VIEW_KEY) return 'metricsView'
         if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY) return 'progressView'
         if(`${key || ''}`.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) return 'progressShard'
+        if(`${key || ''}`.startsWith(COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX)) return 'namespaceStamp'
         if(key === SPACE_PENDING_NUKED_POSTS_KEY) return 'pendingPosts'
         if(key === SPACE_NUKED_POSTS_KEY) return 'rememberedNukes'
         if(key === OWNED_TAB_STATE_KEY) return 'ownedTabs'
@@ -259,9 +261,10 @@ function createStorageMetrics(deps = {}) {
         incrementActiveStorageMetricDetail('queueWriteChangedRows', changedRows)
     }
 
+    // Returns the bytes, rows and key names it counted, so the write path can log the same numbers per write (owner 18 Oct).
     function recordStoragePayloadMetrics(payload = {}, pathName = '') {
         const entries = Object.entries(payload && typeof payload === 'object' ? payload : {})
-        if(!entries.length) return
+        if(!entries.length) return {bytes: 0, rows: 0, keys: []}
 
         let totalBytes = 0
         let totalRows = 0
@@ -281,7 +284,7 @@ function createStorageMetrics(deps = {}) {
             recordQueueWakeupMetricMax(`storagePayload.write.${metricKey}.maxRows`, rows)
         }
 
-        if(!totalBytes) return
+        if(!totalBytes) return {bytes: 0, rows: totalRows, keys: keyNames}
         incrementQueueWakeupMetric('storagePayload.write.total.bytes', totalBytes)
         incrementQueueWakeupMetric('storagePayload.write.total.calls')
         incrementQueueWakeupMetric('storagePayload.write.total.rows', totalRows)
@@ -290,6 +293,7 @@ function createStorageMetrics(deps = {}) {
         incrementActiveStorageMetricDetail('payloadBytes', totalBytes)
         setActiveStorageMetricDetail('payloadKeys', keyNames.slice(0, 12).join(','))
         setActiveStorageMetricDetail('payloadPath', normalizeStorageMetricPathName(pathName))
+        return {bytes: totalBytes, rows: totalRows, keys: keyNames}
     }
 
     function recordStorageReadPayloadMetrics(payload = {}, pathName = '') {

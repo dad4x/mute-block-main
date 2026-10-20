@@ -19,6 +19,19 @@ const {
     getPrunedNukedPosts
 } = require('./nukedPosts')
 const defaults = require('./defaults')
+const {SOFT_FAIL_RETRY_LIMIT} = require('./tunables')
+const {
+    COORDINATOR_EVENTS_KEY,
+    COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_VIEW_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY,
+    COORDINATOR_RUNS_KEY,
+    DEV_MODE_SYNC_STORAGE_KEY,
+    HIDDEN_RUNS_KEY,
+    QUEUE_WAKEUP_METRICS_VIEW_KEY,
+    SPACE_REGISTRY_KEY
+} = require('./storageKeys')
 
 // coordinatorStatusRules is the same factory sw.js uses, so
 // isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
@@ -45,44 +58,14 @@ const {
     isRetryableCoordinatorFailure
 } = coordinatorStatusRules
 
-const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
-const COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns'
-const COORDINATOR_EVENTS_KEY = 'mbCoordinatorEvents'
-const QUEUE_WAKEUP_METRICS_VIEW_KEY = 'mbQueueWakeupMetricsView'
-const LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
 const LAST_ENQUEUE_SUMMARY_MAX_AGE_MS = 30 * 60 * 1000
-const SPACE_REGISTRY_KEY = 'mbSpaceRegistry'
-const HIDDEN_RUNS_KEY = 'mbCoordinatorHiddenRunIds'
-const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
-const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
-// The service worker writes the dev-mode flag into chrome.storage (see setDevModeStoredEnabled). Must match sw.js's
-// DEV_MODE_SYNC_STORAGE_KEY.
-const DEV_MODE_SYNC_STORAGE_KEY = 'mbDashboardDevModeEnabled'
 const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#progress'
 const COORDINATOR_HISTORY_HASH = '#history'
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
-const RETRY_FAILED_LIMIT = 2
-const SECONDS_PER_BLOCK_SAMPLE_LIMIT = 100
-// Mirrors swCoordinatorQueueView.js's COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS
-// -- this client-side computation only runs when the SW-provided view value
-// is missing, but should apply the same outlier protection when it does.
-const TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
+const RETRY_FAILED_LIMIT = SOFT_FAIL_RETRY_LIMIT
 const CURRENT_WORK_MUTATION_TIMEOUT_MS = 70000
-// Outlier detection: a row's active-duration (queue -> tab -> block, live
-// for rows still running) is flagged if it exceeds a flat floor OR is a
-// genuine statistical outlier for this session (mean + N standard
-// deviations over already-terminal rows) -- the floor alone would miss a
-// session that's uniformly slow in a way still worth flagging relative to
-// itself, and the stddev alone would never fire early before enough
-// terminal samples exist. Checked on every render pass against every row
-// (active or terminal), not just at completion, so a row that's stuck and
-// never finishes still gets caught. Deliberately not persisted anywhere --
-// in-memory dashboard state only, reset on page reload, manually clearable.
-const COORDINATOR_OUTLIER_ABSOLUTE_THRESHOLD_MS = 45000
-const COORDINATOR_OUTLIER_STDDEV_MULTIPLIER = 2.5
-const COORDINATOR_OUTLIER_MIN_SAMPLES_FOR_STDDEV = 5
-const COORDINATOR_OUTLIER_MAX_ENTRIES = 50
+// The dashboard's outlier list is computed by the worker (swCoordinatorOutliers.js) and served with each dashboard refresh.
 
 const state = {
     queue: {},
@@ -105,19 +88,12 @@ const state = {
     outliers: [],
     lastEnqueueSummary: null
 }
-// Keyed by rowKey+attemptId, separate from state.outliers: a terminal row's
-// duration never changes, so without this a manually-cleared outlier would
-// simply get re-detected and reappear on the very next refresh pass. Clearing
-// dismisses that specific attempt permanently for this dashboard session
-// (not persisted, same as everything else here) -- a new attempt (retry) or
-// a different row is unaffected.
-const dismissedOutlierKeys = new Set()
 // Recent event counts (renderEventHistogram) re-fetches and re-tallies the
 // flight recorder's full retained window on every render, so a client-only
 // "clear" can't remove entries -- they'd just reappear on the next refresh.
 // Instead this records when Clear was pressed and every render only tallies
 // entries recorded after it, the same "not persisted, this tab only" scope
-// as dismissedOutlierKeys above. The flight recorder itself is a read-only
+// as the outlier list had before the worker took it over. The flight recorder itself is a read-only
 // diagnostic journal (swflightRecorder.js) with no production reset action,
 // and this doesn't add one.
 let eventHistogramClearedAtMs = 0
@@ -302,7 +278,7 @@ async function init() {
         void clearCompletedRuns()
     })
     document.getElementById('clearOutliersButton')?.addEventListener('click', () => {
-        clearOutliers()
+        void clearOutliers()
     })
     document.getElementById('clearScanCostButton')?.addEventListener('click', () => {
         void resetMetrics()
@@ -574,6 +550,8 @@ async function sendRuntimeMessageWithTimeout(message, fallback = null, timeoutMs
 // The service worker stores the flag in chrome.storage. This page keeps a copy that the synchronous readers use, loaded at
 // init. A change made in another open dashboard page applies on that page's next load.
 let devModeStoredEnabled = false
+// The run-status poll's timer, or null while dev mode is off. Started and stopped by syncDebugRunStatusTimer (review-3 R3-4).
+let debugRunStatusTimer = null
 
 function isDevModeStoredEnabled() {
     return devModeStoredEnabled
@@ -606,6 +584,19 @@ function applyDevModeVisibility(enabled) {
     document.querySelectorAll('[data-dev-mode-panel]').forEach(panel => {
         panel.hidden = !enabled
     })
+    syncDebugRunStatusTimer(enabled)
+}
+
+// The run-status poll asks the worker every second, so it runs only while dev mode is on. Every dev-mode change reaches
+// applyDevModeVisibility (init, the toggle, and a push from the worker), which starts or stops it. review-3 R3-4.
+function syncDebugRunStatusTimer(enabled) {
+    if(enabled && debugRunStatusTimer === null) {
+        debugRunStatusTimer = setInterval(() => { void refreshDebugRunStatus() }, 1000)
+    }
+    else if(!enabled && debugRunStatusTimer !== null) {
+        clearInterval(debugRunStatusTimer)
+        debugRunStatusTimer = null
+    }
 }
 
 // Countdown for a dev-mode run limit. Only asks the worker while dev mode is on.
@@ -634,7 +625,6 @@ function installDevModeToggle() {
     const enabled = isDevModeStoredEnabled()
     if(toggle) toggle.checked = enabled
     applyDevModeVisibility(enabled)
-    setInterval(() => { void refreshDebugRunStatus() }, 1000)
     toggle?.addEventListener('change', () => {
         setDevModeStoredEnabled(toggle.checked)
         applyDevModeVisibility(toggle.checked)
@@ -749,10 +739,11 @@ async function clearCoordinatorTerminalStats() {
 // (Metrics, Scan cost, Authority state reads, Recent event counts,
 // Outliers) plus the Current Work summary row's Terminal/Events tiles --
 // resetMetrics covers the first three (all backed by the same
-// queue-wakeup-metrics storage), clearEventHistogram/clearOutliers are
-// tab-local only, clearCoordinatorTerminalStats stamps the dashboard-side
+// queue-wakeup-metrics storage), clearEventHistogram is tab-local only,
+// clearCoordinatorTerminalStats (the worker) stamps the dashboard-side
 // cutoff Terminal reads against (see COORDINATOR_STATS_CLEARED_AT_KEY in
-// sw.js -- nothing is deleted, queued/active rows are never affected), and
+// sw.js -- nothing is deleted, queued/active rows are never affected) and
+// resets the worker's outlier list, and
 // clearEvents wipes the durable mbCoordinatorEvents log itself, not just its
 // display, so "Clear All Stats" is an unambiguous zeroing of everything
 // shown in that row.
@@ -760,7 +751,6 @@ async function clearAllStats() {
     await resetMetrics()
     await clearCoordinatorTerminalStats()
     clearEventHistogram()
-    clearOutliers()
     await clearEvents()
     await loadState()
     render()
@@ -775,7 +765,7 @@ async function loadState() {
         [HIDDEN_RUNS_KEY]: [],
         [COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false,
         [COORDINATOR_PAUSED_KEY]: false,
-        [LAST_ENQUEUE_SUMMARY_KEY]: null
+        [COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: null
     })
 
     // The paused flag is already in hand, so show it now. It used to wait for
@@ -822,7 +812,7 @@ async function loadState() {
     state.hiddenRunIds = normalizeStringList(stored[HIDDEN_RUNS_KEY])
     retryFailedActive = !!stored[COORDINATOR_RETRY_FAILED_ENABLED_KEY]
     state.paused = !!stored[COORDINATOR_PAUSED_KEY]
-    state.lastEnqueueSummary = stored[LAST_ENQUEUE_SUMMARY_KEY] || null
+    state.lastEnqueueSummary = stored[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY] || null
 }
 
 // One round trip for both dashboard views. The service worker reads authority
@@ -860,6 +850,7 @@ async function refreshCompactDashboardViews() {
 
     const runsRefreshed = !!result?.runs && typeof result.runs === 'object' && !Array.isArray(result.runs)
     if(runsRefreshed) state.runs = result.runs
+    if(Array.isArray(result?.outliers)) state.outliers = result.outliers
     return {queueRefreshed, runsRefreshed}
 }
 
@@ -1126,15 +1117,13 @@ function render() {
         getQueueStatusCount('acting', queueItems) +
         getQueueStatusCount('settling', queueItems)
     const terminalCount = getQueueTerminalCount(queueItems)
-    const secondsPerBlock = getSecondsPerActualBlock(queueItems, getCurrentMetricsEpochStartedAt())
-    const secondsPerAlreadyBlocked = getSecondsPerAlreadyBlocked(queueItems, getCurrentMetricsEpochStartedAt())
-    const activationHandoff = getActivationHandoffSeconds(queueItems, getCurrentMetricsEpochStartedAt())
+    const secondsPerBlock = getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt())
+    const secondsPerAlreadyBlocked = getSecondsPerAlreadyBlocked(getCurrentMetricsEpochStartedAt())
+    const activationHandoff = getActivationHandoffSeconds(getCurrentMetricsEpochStartedAt())
     const failedCount = getQueueStatusCount('failed', queueItems)
     const canceledCount = getQueueStatusCount('canceled', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
-    const retryableFailureShapeCount = queueItems.filter(isRetryableFailedQueueItem).length
-    const retryableFailedCount = queueItems.filter(isEligibleRetryFailedQueueItem).length
-    const exhaustedRetryableFailedCount = Math.max(0, retryableFailureShapeCount - retryableFailedCount)
+    const {eligible: retryableFailedCount, exhausted: exhaustedRetryableFailedCount} = getSoftFailRetryCounts(queueItems)
     const hardFailedCount = Math.max(0, failedCount - retryableFailedCount)
 
     setText('queuedCount', queuedCount)
@@ -1178,7 +1167,6 @@ function render() {
     renderEventHistogram()
     renderPhaseTimingHistogram()
     renderQueue(queueItems)
-    checkCoordinatorOutliers(queueItems)
     renderOutliers()
     renderDashboardBottomBar(queueItems)
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
@@ -1253,11 +1241,13 @@ function syncLastEnqueueSummary() {
 }
 
 function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
+    // The list holds the live rows only (buildCoordinatorQueueViewFromDashboardSnapshot in sw.js), so the header counts the listed rows.
+    // The view total also counts finished rows, which are not listed; it is shown only in the truncated form.
     const totalCount = getQueueTotalCount(queueItems)
-    const shownCount = state.queueTruncated ? queueItems.length : totalCount
+    const listedCount = queueItems.length
     const showingText = state.queueTruncated
-        ? `Showing ${shownCount} of ${totalCount}`
-        : `Showing ${totalCount}`
+        ? `Showing ${listedCount} of ${totalCount}`
+        : `Showing ${listedCount}`
     const queuedCount = Number.parseInt(counts.queuedCount, 10) || 0
     const succeededCount = Number.parseInt(counts.succeededCount, 10) || 0
     const softFailedCount = Number.parseInt(counts.retryableFailedCount, 10) || 0
@@ -1338,6 +1328,21 @@ function getRetryFailedCount(item = null) {
 
 function isEligibleRetryFailedQueueItem(item = null) {
     return isRetryableFailedQueueItem(item) && getRetryFailedCount(item) < RETRY_FAILED_LIMIT
+}
+
+// The worker counts the soft-fail retry figures over every compact row (view.softFailRetry): a finished soft-fail at the retry limit is
+// not in the list, so counting the list would drop the "retry limit reached" figure. Without a view, the list is counted, as before.
+function getSoftFailRetryCounts(queueItems = []) {
+    const fromView = hasCoordinatorQueueView() ? state.queueView?.softFailRetry : null
+    if(fromView && typeof fromView === 'object') {
+        return {
+            eligible: Number.parseInt(fromView.eligible, 10) || 0,
+            exhausted: Number.parseInt(fromView.exhausted, 10) || 0
+        }
+    }
+    const eligible = queueItems.filter(isEligibleRetryFailedQueueItem).length
+    const shape = queueItems.filter(isRetryableFailedQueueItem).length
+    return {eligible, exhausted: Math.max(0, shape - eligible)}
 }
 
 function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exhaustedRetryableFailedCount = 0) {
@@ -1544,7 +1549,8 @@ function syncCurrentWorkPauseControls(queueItems = []) {
 
     const clearButton = document.getElementById('clearCurrentWorkButton')
     if(clearButton) {
-        const totalCount = queueItems.length
+        // Clear removes finished rows too (mutateCoordinatorStoredWorkClear in sw.js), so the view total decides, not the listed rows.
+        const totalCount = getQueueTotalCount(queueItems)
         clearButton.disabled = totalCount <= 0
         clearButton.title = totalCount > 0
             ? `Cancel and remove all ${totalCount} Current Work row${totalCount === 1 ? '' : 's'}`
@@ -1652,7 +1658,8 @@ async function cancelCurrentWork() {
 // the service worker to remove every Current Work row entirely, live or
 // completed, so the list actually empties.
 async function clearCurrentWork() {
-    const totalRowCount = getDisplayQueueItems().length
+    // The view total, not the listed rows: Clear removes finished rows too (see syncCurrentWorkPauseControls).
+    const totalRowCount = getQueueTotalCount(getDisplayQueueItems())
     if(totalRowCount <= 0) {
         retryFailedLastResult = {reason: 'no-current-work-to-clear'}
         render()
@@ -1804,22 +1811,6 @@ function isActiveQueueItem(item = {}) {
     return isActiveCoordinatorStatus(item?.status)
 }
 
-function isActualBlockSuccess(item = {}) {
-    if(`${item?.status || ''}` !== 'succeeded') return false
-    if(`${item?.outcome || ''}` === 'already-blocked') return false
-    if(`${item?.outcome || ''}` === 'blocked') return true
-
-    const milestones = item?.milestones || {}
-    return Number.parseInt(item?.blockAttemptedAt || milestones.blockAttemptedAt, 10) > 0
-}
-
-// The exact complement of isActualBlockSuccess's already-blocked exclusion
-// -- see the matching pair in swCoordinatorQueueView.js.
-function isAlreadyBlockedSuccess(item = {}) {
-    if(`${item?.status || ''}` !== 'succeeded') return false
-    return `${item?.outcome || ''}` === 'already-blocked'
-}
-
 function getCurrentMetricsEpochStartedAt() {
     const metrics = state.metrics || {}
     const currentEpoch = metrics.currentEpoch || metrics
@@ -1899,8 +1890,15 @@ function hasFreshActiveQueueWork(queueItems = []) {
     })
 }
 
+// The finished rows are not in the list (view.items holds the live rows only), so the gate reads the worker's count over the full compact
+// population (view.finishedWork), as getSoftFailRetryCounts reads view.softFailRetry. Without that summary the list is read, as before.
 function hasFreshTerminalQueueWork(queueItems = []) {
     const epochStartedAt = getCurrentMetricsEpochStartedAt()
+    const finishedWork = hasCoordinatorQueueView() ? state.queueView?.finishedWork : null
+    if(finishedWork && typeof finishedWork === 'object') {
+        const latestActivityAt = Number.parseInt(finishedWork.latestActivityAt, 10) || 0
+        return (Number.parseInt(finishedWork.count, 10) || 0) > 0 && (!epochStartedAt || latestActivityAt >= epochStartedAt)
+    }
     return queueItems.some(item => {
         if(!isTerminalQueueItem(item)) return false
         const activityAt = getQueueItemActivityTime(item)
@@ -1925,53 +1923,15 @@ function refreshQuoraVisitRequirement(queueItems = []) {
     }
 }
 
-// Shared by getSecondsPerActualBlock ("secs / real block") and
-// getSecondsPerAlreadyBlocked ("secs / already blocked") -- same
-// sampling/outlier/epoch-floor fallback logic (used only when the
-// service-worker-provided queueView summary is unavailable), differing
-// only in which predicate selects the completed rows.
-function getSecondsPerBlockLike(queueItems = [], epochStartedAt = 0, matchesSuccess = () => false) {
-    // 2026-09-27: floored by epochStartedAt again -- see the matching
-    // comment on summarizeCoordinatorActualBlockTiming in
-    // swCoordinatorQueueView.js for why (epochStartedAt only moves on a
-    // deliberate reset, and this card should read "fresh" right after one).
-    const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
-    const completed = queueItems
-        .filter(item => {
-            if(!matchesSuccess(item)) return false
-            const terminalAt = getQueueItemTerminalTime(item)
-            return terminalAt > 0 && terminalAt >= minimumTerminalAt
-        })
-        .sort((left, right) => getQueueItemTerminalTime(right) - getQueueItemTerminalTime(left))
-        .slice(0, SECONDS_PER_BLOCK_SAMPLE_LIMIT)
-    if(!completed.length) return null
-
-    const durations = completed
-        .map(getQueueItemActiveDurationMs)
-        .filter(duration => duration > 0 && duration <= TIMING_SAMPLE_MAX_PLAUSIBLE_MS)
-    if(!durations.length) return null
-
-    const totalDurationMs = durations.reduce((total, duration) => total + duration, 0)
-
-    return {
-        seconds: (totalDurationMs / 1000) / durations.length,
-        blocks: durations.length,
-        elapsedMs: totalDurationMs
-    }
+// The timing tiles show the worker's summaries only (view.actualBlockTiming, view.alreadyBlockedTiming, view.activationHandoffTiming).
+// The worker computes them over the full compact population, finished rows included. The list holds the live rows only, so the page
+// cannot recompute these averages from it. With no usable summary a tile shows "--".
+function getSecondsPerActualBlock(epochStartedAt = 0) {
+    return getQueueViewSecondsPerActualBlock(epochStartedAt)
 }
 
-function getSecondsPerActualBlock(queueItems = [], epochStartedAt = 0) {
-    const viewResult = getQueueViewSecondsPerActualBlock(epochStartedAt)
-    if(viewResult) return viewResult
-
-    return getSecondsPerBlockLike(queueItems, epochStartedAt, isActualBlockSuccess)
-}
-
-function getSecondsPerAlreadyBlocked(queueItems = [], epochStartedAt = 0) {
-    const viewResult = getQueueViewSecondsPerAlreadyBlocked(epochStartedAt)
-    if(viewResult) return viewResult
-
-    return getSecondsPerBlockLike(queueItems, epochStartedAt, isAlreadyBlockedSuccess)
+function getSecondsPerAlreadyBlocked(epochStartedAt = 0) {
+    return getQueueViewSecondsPerAlreadyBlocked(epochStartedAt)
 }
 
 // Shared by the queueView-summary readers below (real block, already
@@ -2005,72 +1965,12 @@ function getQueueViewSecondsPerAlreadyBlocked(epochStartedAt = 0) {
     return getQueueViewTimingSummarySeconds(state.queueView?.alreadyBlockedTiming, epochStartedAt, 'blocks')
 }
 
-function getActivationHandoffSeconds(queueItems = [], epochStartedAt = 0) {
-    const viewResult = getQueueViewActivationHandoffSeconds(epochStartedAt)
-    if(viewResult) return viewResult
-
-    const minimumTerminalAt = Number.parseInt(epochStartedAt, 10) || 0
-    const activations = queueItems
-        .map(item => ({
-            item,
-            key: item?.storageKey || item?.targetProfileHref || item?.requestedUrl || '',
-            runId: `${item?.runId || ''}`.trim(),
-            activeAt: Number.parseInt(item?.activeAt, 10) || 0
-        }))
-        .filter(sample => sample.activeAt > 0 && sample.runId)
-        .sort((left, right) => left.activeAt - right.activeAt)
-    const terminals = queueItems
-        .map(item => ({
-            item,
-            key: item?.storageKey || item?.targetProfileHref || item?.requestedUrl || '',
-            runId: `${item?.runId || ''}`.trim(),
-            terminalAt: getQueueItemTerminalTime(item)
-        }))
-        .filter(sample => {
-            if(!isTerminalQueueItem(sample.item)) return false
-            // Floored by epochStartedAt again -- see getSecondsPerActualBlock above.
-            return sample.runId && sample.terminalAt > 0 && sample.terminalAt >= minimumTerminalAt
-        })
-        .sort((left, right) => left.terminalAt - right.terminalAt)
-    const gaps = []
-    for(const terminal of terminals) {
-        const nextActivation = activations.find(candidate =>
-            candidate.key !== terminal.key &&
-            candidate.runId === terminal.runId &&
-            candidate.activeAt > terminal.terminalAt
-        )
-        if(nextActivation) {
-            const gapMs = nextActivation.activeAt - terminal.terminalAt
-            if(gapMs > 0 && gapMs <= TIMING_SAMPLE_MAX_PLAUSIBLE_MS) gaps.push(gapMs)
-        }
-        if(gaps.length >= SECONDS_PER_BLOCK_SAMPLE_LIMIT) break
-    }
-    if(!gaps.length) return null
-
-    const elapsedMs = gaps.reduce((total, gap) => total + gap, 0)
-    return {
-        seconds: (elapsedMs / 1000) / gaps.length,
-        blocks: gaps.length,
-        elapsedMs
-    }
+function getActivationHandoffSeconds(epochStartedAt = 0) {
+    return getQueueViewActivationHandoffSeconds(epochStartedAt)
 }
 
 function getQueueViewActivationHandoffSeconds(epochStartedAt = 0) {
     return getQueueViewTimingSummarySeconds(state.queueView?.activationHandoffTiming, epochStartedAt, 'handoffs')
-}
-
-function getQueueItemActiveStartTime(item = {}) {
-    return Number.parseInt(item?.activeAt, 10) || 0
-}
-
-function getQueueItemTerminalTime(item = {}) {
-    return Number.parseInt(item?.terminalAt || item?.blockedAt || item?.updatedAt || item?.createdAt, 10) || 0
-}
-
-function getQueueItemActiveDurationMs(item = {}) {
-    const startedAt = getQueueItemActiveStartTime(item)
-    const endedAt = getQueueItemTerminalTime(item)
-    return startedAt > 0 && endedAt > startedAt ? endedAt - startedAt : 0
 }
 
 function formatSecondsPerBlock(result = null) {
@@ -2361,6 +2261,7 @@ function renderWakeupMetrics(queueItems = []) {
                 alert: cloudflareChallenges > 1,
                 title: 'Profile loads that hit a Cloudflare bot-challenge interstitial instead of the real page. Concerning at any sustained rate above isolated one-offs -- each one also trips the queue-load throttle, so a rising count here explains a queue that keeps backing off.'
             }),
+            buildLiveChecksCard(counters),
             buildMetricCard('Claim -> action', formatPhaseAverage(phases.claimAcceptedToActionStart), formatPhaseDetail(phases.claimAcceptedToActionStart), {
                 // Half of STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s).
                 alert: getPhaseAverageMs(phases.claimAcceptedToActionStart) >= 15000,
@@ -2494,6 +2395,34 @@ function renderWakeupMetrics(queueItems = []) {
             return row
         }), state.loading ? 'Loading history...' : 'No metrics journal entries yet.')
     }
+}
+
+// Live-run checks (owner, 15 Oct), counted since the last metrics reset. The value is how many resolutions the keyword scan of a
+// page decided, out of all resolutions. The scan is the one resolver step that guesses from the page, so any count needs a look.
+function buildLiveChecksCard(counters = {}) {
+    const resolvedBy = {
+        header: getMetricCounter(counters, 'liveCheck.resolvedBy.header'),
+        inline: getMetricCounter(counters, 'liveCheck.resolvedBy.inline'),
+        scored: getMetricCounter(counters, 'liveCheck.resolvedBy.scored'),
+        explicit: getMetricCounter(counters, 'liveCheck.resolvedBy.explicit'),
+        listed: getMetricCounter(counters, 'liveCheck.resolvedBy.listed'),
+        url: getMetricCounter(counters, 'liveCheck.resolvedBy.url')
+    }
+    const resolved = sumMetricCounters(counters, 'liveCheck.resolvedBy.')
+    const didNotLand = getMetricCounter(counters, 'liveCheck.didNotLand')
+    const redirectMismatch = getMetricCounter(counters, 'job.profileRedirectMismatch')
+    const shadowChanged = getMetricCounter(counters, 'suffixShadow.changed')
+    const supersessions = sumMetricCounters(counters, 'pump.executorStartSuperseded.')
+    const claimRetries = sumMetricCounters(counters, 'contentClaimRetry.')
+    const detail = [
+        `resolved: header ${resolvedBy.header}, inline ${resolvedBy.inline}, explicit ${resolvedBy.explicit}, listed ${resolvedBy.listed}, url ${resolvedBy.url}`,
+        `did not land ${didNotLand}, redirect mismatch ${redirectMismatch}`,
+        `suffix shadow ${shadowChanged}, supersessions ${supersessions}, claim retries ${claimRetries}`
+    ].join(' • ')
+    return buildMetricCard('Live checks', `${resolvedBy.scored} of ${resolved}`, detail, {
+        alert: resolvedBy.scored > 0,
+        title: 'Live-run checks since the last metrics reset. The value is resolutions decided by the keyword scan of a page ("scored") out of all resolutions. The scan is the only resolver step that guesses from the page, so any count needs a look. Did not land: a queued tab that never reached a profile page (not retried). Redirect mismatch: a queued link that landed on another profile and was ended. Suffix shadow: links the old suffix rule would have cut (counted, not changed). Supersessions: executor starts superseded by a newer one. Claim retries: content claim loops that reached their threshold.'
+    })
 }
 
 function buildMetricCard(label = '', value = '', detail = '', options = {}) {
@@ -2733,119 +2662,21 @@ function getQueueItemTitleLabel(item = {}, profileLabel = '') {
     return item.targetProfileHref || item.requestedUrl || item.id || 'Current work item'
 }
 
-function getCoordinatorActiveDurationBaseline(queueItems = []) {
-    const durations = []
-    for(const item of queueItems) {
-        const activeAt = Number.parseInt(item?.activeAt, 10) || 0
-        const terminalAt = Number.parseInt(item?.terminalAt, 10) || 0
-        if(activeAt > 0 && terminalAt > activeAt) durations.push(terminalAt - activeAt)
-    }
-    if(!durations.length) return {mean: 0, stdDev: 0, count: 0}
-
-    const mean = durations.reduce((sum, value) => sum + value, 0) / durations.length
-    const variance = durations.length > 1
-        ? durations.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (durations.length - 1)
-        : 0
-    return {mean, stdDev: Math.sqrt(variance), count: durations.length}
-}
-
-function getCoordinatorOutlierRowKey(item = {}) {
-    return `${item?.storageKey || item?.dedupeKey || item?.targetProfileHref || item?.requestedUrl || ''}`.trim()
-}
-
-// Checked against every row on every render pass (active or terminal), not
-// just at completion, so a row that's stuck and never reaches terminal
-// still gets caught -- the same activeAt/terminalAt fields buildQueueTimingCell
-// already uses to show "running Xs" per row. The stddev baseline is
-// recomputed fresh each pass from already-terminal rows, so a currently
-// slow, still-active row can't inflate the bar it's being measured against.
-function checkCoordinatorOutliers(queueItems = []) {
-    const baseline = getCoordinatorActiveDurationBaseline(queueItems)
-    const stdDevThreshold = baseline.count >= COORDINATOR_OUTLIER_MIN_SAMPLES_FOR_STDDEV
-        ? baseline.mean + COORDINATOR_OUTLIER_STDDEV_MULTIPLIER * baseline.stdDev
-        : Infinity
-
-    for(const item of queueItems) {
-        const activeAt = Number.parseInt(item?.activeAt, 10) || 0
-        if(activeAt <= 0) continue
-        const terminalAt = Number.parseInt(item?.terminalAt, 10) || 0
-        const durationMs = (terminalAt || (isActiveQueueItem(item) ? Date.now() : 0)) - activeAt
-        if(durationMs <= 0) continue
-
-        const exceedsAbsolute = durationMs >= COORDINATOR_OUTLIER_ABSOLUTE_THRESHOLD_MS
-        const exceedsStdDev = durationMs >= stdDevThreshold
-        if(!exceedsAbsolute && !exceedsStdDev) continue
-
-        const rowKey = getCoordinatorOutlierRowKey(item)
-        if(!rowKey) continue
-        const attemptId = `${item?.attemptId || ''}`.trim()
-        const dismissalKey = `${rowKey}|${attemptId}`
-        if(dismissedOutlierKeys.has(dismissalKey)) continue
-        const existing = state.outliers.find(entry => entry.rowKey === rowKey && entry.attemptId === attemptId)
-        const record = {
-            rowKey,
-            targetUrl: item.targetProfileHref || item.requestedUrl || rowKey,
-            runId: item.runId || '',
-            attemptId,
-            attemptNumber: Number.parseInt(item.attemptNumber, 10) || 0,
-            actionKind: item.actionKind || '',
-            status: item.status || '',
-            outcome: item.outcome || item.error || '',
-            activeAt,
-            terminalAt,
-            durationMs,
-            final: terminalAt > 0,
-            thresholdReason: exceedsAbsolute && exceedsStdDev ? 'both' : exceedsAbsolute ? 'absolute' : 'stddev',
-            meanDurationMsAtCapture: Math.round(baseline.mean),
-            stdDevMsAtCapture: Math.round(baseline.stdDev)
-        }
-
-        if(existing) {
-            Object.assign(existing, record)
-        }
-        else {
-            state.outliers.push({...record, capturedAt: Date.now(), flightRecorderEntries: null})
-            void fetchFlightRecorderForOutlier(rowKey, attemptId)
-        }
-    }
-
-    if(state.outliers.length > COORDINATOR_OUTLIER_MAX_ENTRIES) {
-        state.outliers = state.outliers.slice(-COORDINATOR_OUTLIER_MAX_ENTRIES)
-    }
-}
-
-// Flight recorder is a fixed-size ring buffer on the service worker side --
-// fetched once, right when a row first crosses the outlier threshold, so
-// its history is pulled out before a long batch rolls it out of the buffer.
-// Not re-fetched on later passes for the same row/attempt (only the timing
-// fields above get refreshed while it's still active).
-async function fetchFlightRecorderForOutlier(rowKey = '', attemptId = '') {
-    try {
-        const result = await sendRuntimeMessageWithTimeout({
-            action: 'get-flight-recorder',
-            rowKey,
-            limit: 50
-        }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
-        const entry = state.outliers.find(item => item.rowKey === rowKey && item.attemptId === attemptId)
-        if(entry) entry.flightRecorderEntries = Array.isArray(result?.entries) ? result.entries : []
-    }
-    catch {
-        const entry = state.outliers.find(item => item.rowKey === rowKey && item.attemptId === attemptId)
-        if(entry) entry.flightRecorderEntries = []
-    }
-    renderOutliers()
-}
-
 function clearEventHistogram() {
     eventHistogramClearedAtMs = Date.now()
     renderEventHistogram()
 }
 
-function clearOutliers() {
-    for(const outlier of state.outliers) {
-        dismissedOutlierKeys.add(`${outlier.rowKey}|${outlier.attemptId}`)
+// The worker owns the list (sw.js, resetCoordinatorOutliers). Clear dismisses every listed attempt there, so the list does not come back
+// on the next refresh or after a reload.
+async function clearOutliers() {
+    try {
+        const result = await sendRuntimeMessageWithTimeout({action: 'clear-coordinator-outliers'}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
+        if(Array.isArray(result?.outliers)) state.outliers = result.outliers
     }
-    state.outliers = []
+    catch(error) {
+        console.warn('Failed to clear outliers', error)
+    }
     renderOutliers()
 }
 
@@ -2864,8 +2695,7 @@ function renderOutliers() {
         row.className = 'row row--event'
         row.append(
             buildTitleCell(profileLabel || outlier.rowKey, outlier.runId, {
-                titleHref: normalizeExternalHref(outlier.targetUrl),
-                title: JSON.stringify(outlier.flightRecorderEntries || [])
+                titleHref: normalizeExternalHref(outlier.targetUrl)
             }),
             buildBadge(outlier.final ? (outlier.status || 'unknown') : 'active'),
             buildTextCell(
@@ -2875,7 +2705,7 @@ function renderOutliers() {
             buildTextCell(formatDateTime(outlier.capturedAt))
         )
         return row
-    }), 'No outliers this session.')
+    }), 'No outliers.')
 }
 
 function buildQueueTimingCell(item = {}) {

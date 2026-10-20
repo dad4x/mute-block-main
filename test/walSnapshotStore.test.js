@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict')
+const {createHash} = require('node:crypto')
+const zlib = require('node:zlib')
 const {
     CHECKPOINT_A,
     CHECKPOINT_B,
@@ -7,10 +9,14 @@ const {
     appendWalRecordsToGeneration,
     buildSegmentedWalStorageDefaults,
     buildSegmentedWalStoragePayload,
+    checkpointManifestMatchesMeta,
     decodeCheckpointSnapshot,
     encodeCheckpointSnapshot,
     estimateStateBytes,
+    findCheckpointManifestDisagreements,
     getActiveCheckpoint,
+    getCheckpointFingerprint,
+    getSegmentedWalCheckpointKey,
     getSegmentedWalMetaKey,
     getSegmentedWalSegmentKey,
     getWalRecordsForGeneration,
@@ -24,6 +30,7 @@ const {
     verifyCheckpoint,
     writeInactiveCheckpoint
 } = require('../shared/js/walSnapshotStore')
+const {createCoordinatorQueueWalStore} = require('../shared/js/swCoordinatorQueueWal')
 
 const fakeZstdCodec = {
     name: 'fake-zstd',
@@ -136,6 +143,54 @@ test('projectSnapshot does not attach a stateHash (unused, expensive full-state 
 
     const recovered = recoverProjectedState(makePairedCheckpointStore(baseState(), {snapshotSeq: 10}), [])
     assert.equal('stateHash' in recovered.projected, false)
+})
+
+test('an append leaves its input store unchanged and stores the same output as before structural sharing', () => {
+    // Regression for the per-write copy cost (take-8 review, P2): appendWalRecordsToGeneration used to deep-copy the whole
+    // store (checkpoints and every segment) and rebuild the active generation on every append. It now shares the parts the
+    // append does not change. The digest pins the stored output of this fixed sequence as the implementation before that
+    // change wrote it, so a difference in the stored form fails here, without a live run.
+    const codec = {
+        name: 'gzip',
+        compress: bytes => zlib.gzipSync(bytes),
+        decompress: bytes => zlib.gunzipSync(bytes)
+    }
+    const rowA = 'https://www.quora.com/profile/Golden-Row-A'
+    const rowB = 'https://www.quora.com/profile/Golden-Row-B'
+    const rowC = 'https://www.quora.com/profile/Golden-Row-C'
+    const written = writeInactiveCheckpoint(makePairedCheckpointStore({}, {snapshotSeq: 0, codec}), {
+        queue: {
+            [rowA]: {status: 'queued', attemptId: 'attempt-a', attemptNumber: 1, updatedAt: 1},
+            [rowB]: {status: 'queued', attemptId: 'attempt-b', attemptNumber: 1, updatedAt: 2}
+        },
+        completed: {},
+        runs: {},
+        progress: {},
+        events: []
+    }, {snapshotSeq: 4, snapshotEpoch: 1, createdAt: 10, codec, codecName: codec.name, shardCount: 3})
+    const store0 = activateCheckpoint(written.store, written.checkpointId, {codec}).store
+    const store0Json = JSON.stringify(store0)
+    const first = appendWalRecordsToGeneration(store0, [
+        {kind: 'map.set', area: 'queue', key: rowC, value: {status: 'queued', attemptId: 'attempt-c', attemptNumber: 1, updatedAt: 5}, attemptId: 'attempt-c', attemptNumber: 1, status: 'queued'},
+        {kind: 'map.patch', area: 'queue', key: rowA, patch: {status: 'blocked', updatedAt: 6}, attemptId: 'attempt-a', attemptNumber: 1, status: 'blocked'}
+    ], {segmentId: 'golden-first'})
+    const firstJson = JSON.stringify(first.store)
+    const second = appendWalRecordsToGeneration(first.store, [
+        {seq: 20, kind: 'map.remove', area: 'queue', key: rowB, removed: true, attemptId: 'attempt-b', attemptNumber: 1, status: 'queued'},
+        {kind: 'map.set', area: 'completed', key: rowB, value: {status: 'succeeded', attemptId: 'attempt-b', attemptNumber: 1, terminalAt: 7}, attemptId: 'attempt-b', attemptNumber: 1, status: 'succeeded', terminal: true}
+    ], {segmentId: 'golden-second', sealed: false})
+
+    assert.equal(JSON.stringify(store0), store0Json, 'the first append leaves its input store unchanged')
+    assert.equal(JSON.stringify(first.store), firstJson, 'the second append leaves its input store unchanged')
+    assert.equal(
+        createHash('sha256').update(JSON.stringify(second.store)).digest('hex'),
+        'bb3b4c176319381682a25bfdcba6923e7e6cfb324a2994bd323e992c36662868',
+        'the stored output matches the digest pinned from the pre-sharing implementation'
+    )
+    const decoded = recoverProjectedState(second.store, [], {codec})
+    assert.deepEqual(Object.keys(decoded.projected.state.queue).sort(), [rowA, rowC].sort())
+    assert.equal(decoded.projected.state.queue[rowA].status, 'blocked')
+    assert.deepEqual(Object.keys(decoded.projected.state.completed).sort(), [rowB])
 })
 
 test('applyWalRecord shallow-copies state instead of deep-cloning untouched rows and areas', () => {
@@ -680,6 +735,213 @@ test('segmented WAL storage detects manifest advanced past missing segment', () 
     assert.equal(hydrated.reason, 'missing-segment')
 })
 
+function monolithicAndShardedStores() {
+    const monolithic = makePairedCheckpointStore(baseState(), {
+        activeCheckpoint: CHECKPOINT_A,
+        snapshotSeq: 10,
+        nextSeq: 11
+    })
+    const written = writeInactiveCheckpoint(monolithic, baseState(), {
+        snapshotSeq: 12,
+        snapshotEpoch: 1,
+        createdAt: 1,
+        shardCount: 10
+    })
+    const activated = activateCheckpoint(written.store, written.checkpointId, {})
+    assert.equal(activated.activated, true, activated.reason)
+    return {monolithic, sharded: activated.store}
+}
+
+test('segmented WAL storage rejects a checkpoint manifest that does not match the active metadata', () => {
+    // A manifest and the metadata's fingerprint for one active slot can name different checkpoints when they come from
+    // different writes. The keyed read already refuses that mix (checkpoint-manifest-meta-mismatch), and hydrate must
+    // refuse it too rather than rebuild state from the manifest. Each case hydrates the untouched payload first, so a
+    // failure can only come from the one metadata field it tampers with.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const {monolithic, sharded} = monolithicAndShardedStores()
+    const cases = [
+        {label: 'monolithic active slot', store: monolithic, activeId: CHECKPOINT_A, field: 'snapshotSeq', value: 11},
+        {label: 'sharded active slot', store: sharded, activeId: CHECKPOINT_B, field: 'stateHash', value: 'not-the-manifest-hash'}
+    ]
+    for(const {label, store, activeId, field, value} of cases) {
+        const payload = buildSegmentedWalStoragePayload(store, {baseKey, writeCheckpoints: true})
+        assert.equal(hydrateSegmentedWalStore(payload, {baseKey}).ok, true, `${label}: the untouched payload hydrates`)
+
+        const meta = payload[metaKey]
+        const mixed = {
+            ...payload,
+            [metaKey]: {
+                ...meta,
+                checkpoints: {
+                    ...meta.checkpoints,
+                    [activeId]: {...meta.checkpoints[activeId], [field]: value}
+                }
+            }
+        }
+        const hydrated = hydrateSegmentedWalStore(mixed, {baseKey})
+        assert.equal(hydrated.ok, false, `${label}: a manifest that disagrees with the metadata must not hydrate`)
+        assert.equal(hydrated.reason, 'checkpoint-manifest-meta-mismatch', label)
+        assert.equal(hydrated.store, null, label)
+    }
+})
+
+test('checkpoint fingerprint names the fields the manifest check compares, the same way for the metadata and the manifest', () => {
+    // The recovery diagnostics name a checkpoint by its fingerprint, so the fingerprint must agree with the check it explains.
+    // Equal manifest and metadata give equal fingerprints. A difference in any field the check compares must show in the
+    // fingerprint. The slot id is part of it, because a manifest's own id is one of the things the check compares.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const {sharded} = monolithicAndShardedStores()
+    const payload = buildSegmentedWalStoragePayload(sharded, {baseKey, writeCheckpoints: true})
+    const metaCheckpoint = payload[metaKey].checkpoints[CHECKPOINT_B]
+    const manifest = payload[getSegmentedWalCheckpointKey(baseKey, CHECKPOINT_B)]
+    assert.equal(checkpointManifestMatchesMeta(manifest, metaCheckpoint, CHECKPOINT_B), true)
+
+    const fingerprint = getCheckpointFingerprint(manifest, CHECKPOINT_B)
+    assert.equal(getCheckpointFingerprint(metaCheckpoint, CHECKPOINT_B), fingerprint)
+    const changed = [
+        {field: 'stateHash', value: 'not-the-manifest-hash'},
+        {field: 'snapshotSeq', value: metaCheckpoint.snapshotSeq + 1},
+        {field: 'snapshotEpoch', value: metaCheckpoint.snapshotEpoch + 1},
+        {field: 'createdAt', value: metaCheckpoint.createdAt + 1},
+        {field: 'shardCount', value: metaCheckpoint.shardCount + 1}
+    ]
+    for(const {field, value} of changed) {
+        const record = {...metaCheckpoint, [field]: value}
+        assert.equal(checkpointManifestMatchesMeta(manifest, record, CHECKPOINT_B), false, field)
+        assert.notEqual(getCheckpointFingerprint(record, CHECKPOINT_B), fingerprint, field)
+    }
+    assert.notEqual(getCheckpointFingerprint(manifest, CHECKPOINT_A), fingerprint, 'the slot id is part of the fingerprint')
+})
+
+test('a mirror rebuild copies a checkpoint manifest only when the loader rule accepts it against the disk meta', () => {
+    // Hole 1 (docs/queue-storage-layering.md, section 6). The mirror rebuild names every manifest it would copy that disagrees with
+    // the disk meta, so it can keep the session copy instead. The rule is the loader's: a sharded manifest needs a metadata entry and
+    // an identity match (checkpointManifestMatchesMeta); a monolithic one is checked only when its entry exists; a missing manifest is
+    // never copied. Only the slots the records hold are looked at.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const {sharded, monolithic} = monolithicAndShardedStores()
+    const payload = buildSegmentedWalStoragePayload(sharded, {baseKey, writeCheckpoints: true})
+    const meta = payload[metaKey]
+    const active = meta.activeCheckpoint
+    const manifestKey = getSegmentedWalCheckpointKey(baseKey, active)
+    const manifest = payload[manifestKey]
+
+    assert.deepEqual(findCheckpointManifestDisagreements({[manifestKey]: manifest}, meta, {baseKey}), [], 'a manifest that agrees is copied')
+    assert.deepEqual(findCheckpointManifestDisagreements({}, meta, {baseKey}), [], 'no manifest in the records, nothing to check')
+
+    const torn = {...manifest, stateHash: 'not-the-manifest-hash'}
+    const found = findCheckpointManifestDisagreements({[manifestKey]: torn}, meta, {baseKey})
+    assert.equal(found.length, 1)
+    assert.equal(found[0].checkpointId, active)
+    assert.equal(found[0].metaFingerprint, getCheckpointFingerprint(meta.checkpoints[active], active))
+    assert.equal(found[0].manifestFingerprint, getCheckpointFingerprint(torn, active))
+
+    assert.equal(findCheckpointManifestDisagreements({[manifestKey]: null}, meta, {baseKey}).length, 1, 'a missing manifest is never copied')
+
+    const withoutEntry = {...meta, checkpoints: {}}
+    assert.equal(findCheckpointManifestDisagreements({[manifestKey]: manifest}, withoutEntry, {baseKey}).length, 1, 'a sharded manifest with no metadata entry disagrees')
+
+    const monolithicPayload = buildSegmentedWalStoragePayload(monolithic, {baseKey, writeCheckpoints: true})
+    const monolithicMeta = {...monolithicPayload[metaKey]}
+    delete monolithicMeta.checkpoints
+    const monolithicKey = getSegmentedWalCheckpointKey(baseKey, monolithicMeta.activeCheckpoint)
+    assert.deepEqual(
+        findCheckpointManifestDisagreements({[monolithicKey]: monolithicPayload[monolithicKey]}, monolithicMeta, {baseKey}),
+        [],
+        'a monolithic manifest with no metadata entry predates fingerprints, and is copied as before'
+    )
+})
+
+test('segmented WAL storage rejects a sharded active slot whose metadata has no fingerprint', () => {
+    // Sharded manifests are only written together with their fingerprint, so a missing one means corruption, not an old layout.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const {sharded} = monolithicAndShardedStores()
+    const payload = buildSegmentedWalStoragePayload(sharded, {baseKey, writeCheckpoints: true})
+    const meta = {...payload[metaKey], checkpoints: {[CHECKPOINT_A]: payload[metaKey].checkpoints[CHECKPOINT_A]}}
+    const hydrated = hydrateSegmentedWalStore({...payload, [metaKey]: meta}, {baseKey})
+    assert.equal(hydrated.ok, false)
+    assert.equal(hydrated.reason, 'checkpoint-meta-missing')
+})
+
+test('segmented WAL storage still hydrates a monolithic slot whose metadata predates the fingerprint', () => {
+    // Stores written before the metadata recorded a fingerprint per slot have nothing to bind a manifest to, so the binding
+    // check cannot apply to them. A monolithic slot with no fingerprint hydrates as it always did.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const {monolithic} = monolithicAndShardedStores()
+    const payload = buildSegmentedWalStoragePayload(monolithic, {baseKey, writeCheckpoints: true})
+    const meta = {...payload[metaKey]}
+    delete meta.checkpoints
+    const hydrated = hydrateSegmentedWalStore({...payload, [metaKey]: meta}, {baseKey})
+    assert.equal(hydrated.ok, true, hydrated.reason)
+    assert.equal(recoverProjectedState(hydrated.store).projected.state.queue['https://www.quora.com/profile/A'].status, 'queued')
+})
+
+test('one incremental append over a legacy seed keeps the metadata fingerprint and the stored manifest in agreement', () => {
+    // The worker's own append (prepareCoordinatorQueueWalAppend, swCoordinatorQueueWal.js) over a monolithic seed, the shape
+    // the synthetic legacy-queue fixtures start from. An incremental append writes the metadata and the new segment, not the
+    // manifest. So after it, the active slot's fingerprint in the metadata must equal the stored manifest's stateHash, and
+    // hydrate must accept what was written. Nothing else writes storage between the seed and the append.
+    const baseKey = 'mbCoordinatorQueueWal'
+    const metaKey = getSegmentedWalMetaKey(baseKey)
+    const href = 'https://www.quora.com/profile/A'
+    const seed = makePairedCheckpointStore({queue: {[href]: {status: 'queued', attemptId: 'attempt-1', attemptNumber: 1}}}, {
+        createdAt: 1000,
+        nextSeq: 1
+    })
+    const storage = buildSegmentedWalStoragePayload(seed, {baseKey, writeCheckpoints: true})
+    const seeded = hydrateSegmentedWalStore(storage, {baseKey})
+    assert.equal(seeded.ok, true, seeded.reason)
+
+    const worker = createCoordinatorQueueWalStore({
+        constants: {
+            COORDINATOR_QUEUE_WAL_KEY: baseKey,
+            COORDINATOR_QUEUE_WAL_META_KEY: metaKey,
+            COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT: 128,
+            COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT: 1024,
+            COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS: []
+        },
+        metrics: {
+            incrementQueueWakeupMetric: () => {},
+            recordQueueWakeupMetricMax: () => {},
+            getJsonByteSize: value => JSON.stringify(value || null).length
+        },
+        authority: {
+            cloneCoordinatorAuthorityValue: value => JSON.parse(JSON.stringify(value ?? null)),
+            normalizeCoordinatorAuthorityRowKey: key => `${key || ''}`,
+            normalizeSnapshotWriteReason: reason => `${reason || 'ordinaryMutation'}`,
+            normalizeQueueWriteOperationName: name => `${name || 'write'}`,
+            getAttemptIdFromValue: value => `${value?.attemptId || ''}`,
+            getAttemptNumberFromValue: value => Number.parseInt(value?.attemptNumber, 10) || 0,
+            makeCoordinatorQueueWalCheckpoint: state => makePairedCheckpointStore(state, {})
+        },
+        runtime: {Date}
+    })
+    const prepared = worker.prepareCoordinatorQueueWalAppend(seeded.store, [{
+        kind: 'map.patch',
+        area: 'queue',
+        key: href,
+        patch: {status: 'opening'},
+        operationKind: 'synthetic-open',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        at: 1001
+    }], {segmentId: 'synthetic-open-1', previousMeta: storage[metaKey], previousStored: storage})
+    assert.equal(prepared.ok, true, prepared.reason)
+    assert.equal(prepared.physicalWal.payload[getSegmentedWalCheckpointKey(baseKey, CHECKPOINT_A)], undefined, 'the append is incremental: no manifest is rewritten')
+    Object.assign(storage, prepared.physicalWal.payload)
+
+    const active = storage[metaKey].activeCheckpoint
+    assert.equal(storage[metaKey].checkpoints[active].stateHash, storage[getSegmentedWalCheckpointKey(baseKey, active)].stateHash)
+    const hydrated = hydrateSegmentedWalStore(storage, {baseKey})
+    assert.equal(hydrated.ok, true, hydrated.reason)
+    assert.equal(recoverProjectedState(hydrated.store).projected.state.queue[href].status, 'opening')
+})
+
 test('activating checkpoint switches recovery to that generation WAL', () => {
     const store = makePairedCheckpointStore(baseState(), {
         activeCheckpoint: CHECKPOINT_A,
@@ -925,6 +1187,19 @@ test('corrupted compressed inactive checkpoint does not flip active pointer', ()
     const activated = activateCheckpoint(prepared, checkpointId, {codec: fakeZstdCodec})
     assert.equal(activated.activated, false)
     assert.equal(activated.store.meta.activeCheckpoint, CHECKPOINT_A)
+})
+
+test('the queue namespace mirror keys include the outlier list key, after the runs key and before the progress keys', () => {
+    const {queueNamespaceMirrorKeys} = require('../shared/js/walSnapshotStore')
+    assert.deepEqual(
+        queueNamespaceMirrorKeys({runsKey: 'runs', outliersKey: 'outliers', progressDefaults: {progressView: null, progressShard0: null}}),
+        ['runs', 'outliers', 'progressView', 'progressShard0']
+    )
+    assert.deepEqual(
+        queueNamespaceMirrorKeys({runsKey: 'runs', progressDefaults: {progressView: null}}),
+        ['runs', 'progressView'],
+        'the outlier key is optional'
+    )
 })
 
 test('raw and compressed checkpoint modes project to identical state', () => {

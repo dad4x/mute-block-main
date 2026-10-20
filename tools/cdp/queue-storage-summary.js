@@ -5,6 +5,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -27,10 +28,10 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function inspectStorageQueue(needle, includeFullRead) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function inspectStorageQueue(needle, includeFullRead, progressRecords) {
         const defaults = {
             mbCoordinatorQueueView: {},
-            mbProfileNukeProgressView: {},
             mbCoordinatorRuns: {},
             mbCoordinatorPaused: false,
             mbCoordinatorIdleRetryEnabled: false
@@ -43,9 +44,6 @@ runMain(async () => {
             ? storage.mbCoordinatorQueueView
             : {}
         const items = Array.isArray(view.items) ? view.items : []
-        const progressView = storage.mbProfileNukeProgressView && typeof storage.mbProfileNukeProgressView === 'object'
-            ? storage.mbProfileNukeProgressView
-            : {}
         const queue = includeFullRead ? storage.mbCoordinatorQueue || {} : null
         const runs = storage.mbCoordinatorRuns || {}
         const matchesNeedle = item => {
@@ -133,13 +131,13 @@ runMain(async () => {
             runs: runRows.slice(0, 40),
             totalQueue: includeFullRead ? Object.keys(queue).length : Number.parseInt(view.total, 10) || items.length,
             totalRuns: Object.keys(runs).length,
-            totalProgress: Number.parseInt(progressView.total, 10) || Object.keys(progressView.records || {}).length,
+            totalProgress: Object.keys(progressRecords).length,
             truncated: view.truncated === true,
             fullStorageRead: includeFullRead,
             paused: storage.mbCoordinatorPaused === true,
             idleRetryEnabled: storage.mbCoordinatorIdleRetryEnabled === true
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(includeFull)} )`, includeFull ? 30000 : 20000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(includeFull)}, ${JSON.stringify(progressRecords)} )`, includeFull ? 30000 : 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

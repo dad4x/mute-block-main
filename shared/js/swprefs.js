@@ -6,8 +6,10 @@
  * storage subsystem's WAL-backed state.
  */
 
-const COORDINATOR_RETRY_FAILED_ENABLED_KEY = 'mbCoordinatorRetryFailedEnabled'
-const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
+const {
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY
+} = require('./storageKeys')
 const COORDINATOR_PAUSE_GENERATION_KEY = 'mbCoordinatorPauseGeneration'
 const COORDINATOR_AUTO_START_ON_BROWSER_START_KEY = 'coordinatorAutoStartOnBrowserStart'
 const TARGET_QUEUED_TAB_CONCURRENCY_KEY = 'targetQueuedTabConcurrency'

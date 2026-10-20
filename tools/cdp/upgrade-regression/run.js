@@ -8,8 +8,10 @@ const {
     cdpCommand,
     DEFAULT_CHROME_DEV_PATH,
     evaluate,
+    getCdpConfig,
     getJson,
     getTargets,
+    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     runMain,
     sleep
@@ -923,7 +925,16 @@ async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
     }
 }
 
+// The storage snapshot of a target, with the progress the worker holds. Disk holds no progress now (20 Oct review), so the progress
+// comes from the worker's message, sent from an extension page (decision 32). A target outside the extension gets no worker progress.
 async function readStorage(target) {
+    const snapshot = await readDiskStorage(target)
+    const extensionId = (target?.url || '').match(/^chrome-extension:\/\/([^/]+)\//)?.[1] || ''
+    const workerProgress = extensionId ? await readProfileNukeProgressFromWorker({...getCdpConfig(), extensionId}) : null
+    return {...snapshot, workerProgress}
+}
+
+async function readDiskStorage(target) {
     return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
             let settled = false
@@ -1219,7 +1230,9 @@ function summarizeAuthorityState(storage) {
         walKeyDigest: stableDigest(walKeys),
         walSignature: stableDigest(Object.fromEntries(walKeys.map(key => [key, data[key]]))),
         walKeys: walKeys.slice(-8),
-        progressViewRecords: countRecordMap(data.mbProfileNukeProgressView),
+        progressViewRecords: storage?.workerProgress
+            ? Object.keys(storage.workerProgress).length
+            : countRecordMap(data.mbProfileNukeProgressView),
         progressShardRecords,
         pendingSpacePostRecords: countRecordMap(data.mbSpacePendingNukedPosts),
         nukedSpacePostRecords: countRecordMap(data.mbSpaceNukedPosts),
@@ -1232,15 +1245,21 @@ function getSelectedProgressRecords(storage, targetProfileHrefs = [], selectedSu
     const targets = Array.from(new Set((targetProfileHrefs || [])
         .map(target => normalizeComparableUrl(target || ''))
         .filter(Boolean)))
-    const viewRecords = data.mbProfileNukeProgressView?.records &&
-        typeof data.mbProfileNukeProgressView.records === 'object'
-        ? data.mbProfileNukeProgressView.records
-        : {}
-    const shardRecords = Object.entries(data)
-        .filter(([key, value]) => key.startsWith('mbProfileNukeProgressShard.') &&
-            value?.records && typeof value.records === 'object')
-        .flatMap(([key, value]) => Object.entries(value.records)
-            .map(([profileHref, record]) => ({key, profileHref, record})))
+    // The worker's progress (every record, from the stored copy) when the snapshot carries it. Disk holds no progress now (20 Oct
+    // review), so the disk view and shards are read only for a snapshot without the worker's copy.
+    const viewRecords = storage?.workerProgress
+        ? storage.workerProgress
+        : data.mbProfileNukeProgressView?.records &&
+            typeof data.mbProfileNukeProgressView.records === 'object'
+            ? data.mbProfileNukeProgressView.records
+            : {}
+    const shardRecords = storage?.workerProgress
+        ? []
+        : Object.entries(data)
+            .filter(([key, value]) => key.startsWith('mbProfileNukeProgressShard.') &&
+                value?.records && typeof value.records === 'object')
+            .flatMap(([key, value]) => Object.entries(value.records)
+                .map(([profileHref, record]) => ({key, profileHref, record})))
     const authorityByTarget = new Map((selectedSummary?.selected || [])
         .map(item => [
             normalizeComparableUrl(item?.targetProfileHref || ''),
@@ -3306,7 +3325,7 @@ async function injectContentScriptForPage(context, pageUrl) {
             try {
                 await chrome.scripting.insertCSS({
                     target: {tabId: tab.id},
-                    files: ['css/content.css']
+                    files: ['css/tokens.css', 'css/content.css']
                 }).catch(error => ({
                     ignored: true,
                     error: error?.message || `${error || ''}`

@@ -186,6 +186,11 @@ function createCoordinatorJobEnvelope(deps = {}) {
     }
 
     function getFailedItemProfileResolutionRetryUrl(item = {}, fallbackKey = '') {
+        // Review 5 (R5-4), owner rule: a row that is not a resolution and has its own link is never retried as a resolution from
+        // its source post, because the post would choose the profile. A "did not land" error carries the post URL, so without this
+        // a canonical row could block a profile picked from its post.
+        if(!isProfileResolutionItem(item) && getCoordinatorItemHref(item)) return ''
+
         const fallbackResolutionUrl = getFailedItemQuestionResolutionUrl(item)
         if(fallbackResolutionUrl) return fallbackResolutionUrl
 

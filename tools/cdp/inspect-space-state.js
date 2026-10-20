@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const {evaluate, getCdpConfig, getOption, getTargets, runMain} = require('./lib/cdp')
+const {evaluate, getCdpConfig, getOption, getTargets, readProfileNukeProgressFromWorker, runMain} = require('./lib/cdp')
 
 runMain(async () => {
     const config = getCdpConfig()
@@ -39,17 +39,16 @@ runMain(async () => {
 
     let workerResult = null
     if(serviceWorker) {
-        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle) {
+        const progressRecords = await readProfileNukeProgressFromWorker(config)
+        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, progress) {
             const storage = await chrome.storage.local.get({
                 mbSpacePendingNukedPosts: {},
                 mbCoordinatorQueue: {},
-                mbCoordinatorRuns: {},
-                mbProfileNukeProgressView: {}
+                mbCoordinatorRuns: {}
             })
             const pending = storage.mbSpacePendingNukedPosts || {}
             const queue = storage.mbCoordinatorQueue || {}
             const runs = storage.mbCoordinatorRuns || {}
-            const progress = storage.mbProfileNukeProgressView?.records || {}
             const tabs = await chrome.tabs.query({})
             const spaceTabs = tabs
                 .filter(tab => `${tab.url || ''}\n${tab.title || ''}`.toLowerCase().includes(needle))
@@ -115,7 +114,7 @@ runMain(async () => {
                     runs: Object.keys(runs).length
                 }
             }
-        }})( ${JSON.stringify(needle)} )`)
+        }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)} )`)
     }
 
     console.log(JSON.stringify({needle, pageCount: pages.length, pageResults, workerResult}, null, 2))

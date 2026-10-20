@@ -16,6 +16,9 @@
 // accessors rather than snapshotted values, so a listener registered once
 // at startup still observes current state whenever it fires later.
 
+const {QUEUE_BAR_GET_ACTION, getQueueBarSummary, summarizeQueueBarView, recordQueueBarSummary, subscribeQueueBarTab, pushQueueBarSummary} = require('./swQueueBarSummary')
+const {PROFILE_NUKE_PROGRESS_CLEAR_ACTION, PROFILE_NUKE_PROGRESS_GET_ACTION} = require('./swProfileNukeProgressPush')
+
 function registerServiceWorkerListeners(deps = {}) {
     const {
         browser
@@ -50,6 +53,11 @@ function registerServiceWorkerListeners(deps = {}) {
     // record-page-event) and any action no handler matches, which gets no response as before. An
     // action added to the dispatch chain without an entry here runs ungated, so a read of an unloaded authority fails loudly.
     const RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY = new Set([
+        // The queue bar's summary is answered after startup, so a request made on a cold worker waits for the authority (18 Oct).
+        QUEUE_BAR_GET_ACTION,
+        // A tool's read of the progress waits for the authority too, so it never reads an unloaded copy (decision 32).
+        PROFILE_NUKE_PROGRESS_GET_ACTION,
+        PROFILE_NUKE_PROGRESS_CLEAR_ACTION,
         'cloudflare-challenge-detected',
         'create-tab',
         'enqueue-coordinator-items',
@@ -58,6 +66,7 @@ function registerServiceWorkerListeners(deps = {}) {
         'coordinator-page-ready',
         'pause-coordinator-nukes',
         'clear-coordinator-events',
+        'clear-coordinator-outliers',
         'set-space-nuked-posts',
         'set-space-pending-nuked-posts',
         'set-coordinator-retry-failed-enabled',
@@ -122,7 +131,6 @@ function registerServiceWorkerListeners(deps = {}) {
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
-        PROFILE_NUKE_PROGRESS_VIEW_KEY,
         TARGET_QUEUED_TAB_CONCURRENCY_KEY
     } = deps.constants || {}
     const {
@@ -133,9 +141,7 @@ function registerServiceWorkerListeners(deps = {}) {
         getCoordinatorTabId,
         getQueuedActionSurfaceAnchorTabId,
         getQueuedActionSurfaceWindowId,
-        getProfileNukeProgressProjectionWriteDepth,
-        getProfileNukeProgress,
-        setProfileNukeProgress
+        getProfileNukeProgress
     } = deps.state || {}
     const {
         activateConfirmationElementInPageWorld,
@@ -164,7 +170,6 @@ function registerServiceWorkerListeners(deps = {}) {
         forgetRemovedCoordinatorTabId,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
-        getChangedProfileProgressRecords,
         getContentPageCoordinatorState,
         getCoordinatorQueueAccounting,
         getCoordinatorQueueRuntimeState,
@@ -177,6 +182,8 @@ function registerServiceWorkerListeners(deps = {}) {
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
         recordInitialBlockedStateFromRequest,
+        requestProfileBlockedPageEventCheck,
+        requestQueuedTabRemovalRefill,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
         isBrowserTabId,
@@ -194,9 +201,7 @@ function registerServiceWorkerListeners(deps = {}) {
         markQueuedTabClosing,
         markQuoraRuntimeActivated,
         markQuoraRuntimeActivatedFromRequest,
-        mergeStoredProfileProgressRecord,
         metricStorageSet,
-        normalizeProfileNukeProgressView,
         normalizeQuoraProfileUrl,
         normalizeRuntimeMessageAction,
         normalizeTabId,
@@ -205,6 +210,7 @@ function registerServiceWorkerListeners(deps = {}) {
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
         clearCoordinatorEventsRequested,
+        clearCoordinatorOutliersRequested,
         setSpaceNukedPostsRequested,
         setSpacePendingNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
@@ -262,6 +268,8 @@ function registerServiceWorkerListeners(deps = {}) {
         terminalizeQueuedTabProfileRedirectMismatchFromMetadata,
         validateQueuedTabAttempt,
         ensureCoordinatorAuthorityHydrated,
+        readProfileNukeProgressForTools,
+        clearProfileNukeProgressForTools,
         retireUnusedVersion15StorageKeys
     } = deps.handlers || {}
 
@@ -358,7 +366,11 @@ function registerServiceWorkerListeners(deps = {}) {
         }
     
         const detached = detachQueuedTabRuntimeState(tabId, 'tab-removed')
-    
+        // Any tab removal may free the worker-window slot, so the fill runs again now (owner 18 Oct). Most removals are tabs the
+        // worker closed itself, and their queued-tab metadata is already gone, so the refill is not gated on it. Coalesced, and
+        // a no-op while paused.
+        requestQueuedTabRemovalRefill()
+
         void ownedTabIdsReady.then(async () => {
             const metadata = detached.metadata
             const isOwnerTab = detached.wasOwnerTab
@@ -481,7 +493,7 @@ function registerServiceWorkerListeners(deps = {}) {
                 metadata,
                 wasActive: detached.wasActive,
                 foregroundLeaseReleased: detached.foregroundLeaseReleased
-            }).catch(() => null)
+            }).catch(() => incrementQueueWakeupMetric('queuedTab.releaseFailed'))
             if(metadata?.profileHref || metadata?.coordinatorKey || isOwnerTab || wasOwnedChild) {
                 scheduleCoordinatorQueueResume(1000, 'tab-removed', {
                     allowBeforeQuora: true
@@ -540,7 +552,7 @@ function registerServiceWorkerListeners(deps = {}) {
     
                 if(errorPageUrl && /^(?:chrome|edge|about|moz-extension|chrome-error):/i.test(errorPageUrl)) {
                     const closeRequestedAt = markQueuedTabClosing(tabId, 'browser-error-page')
-                    void releaseQueuedTab(tabId)
+                    void releaseQueuedTab(tabId).catch(() => incrementQueueWakeupMetric('queuedTab.releaseFailed'))
                     void recordCoordinatorJobProgressViaQueueMachine(metadata.profileHref, {
                         status: 'error-page',
                         finalError: 'Queued tab navigated to a browser error page',
@@ -596,34 +608,8 @@ function registerServiceWorkerListeners(deps = {}) {
         if(changes?.[TARGET_QUEUED_TAB_CONCURRENCY_KEY]) {
             setTargetQueuedTabConcurrency(changes[TARGET_QUEUED_TAB_CONCURRENCY_KEY].newValue)
         }
-        if(!changes?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]) return
-        if(getProfileNukeProgressProjectionWriteDepth() > 0) return
-    
-        const oldProgress = normalizeProfileNukeProgressView(changes[PROFILE_NUKE_PROGRESS_VIEW_KEY].oldValue || null).records
-        const nextProgress = normalizeProfileNukeProgressView(changes[PROFILE_NUKE_PROGRESS_VIEW_KEY].newValue || null).records
-        const changedProgress = getChangedProfileProgressRecords(oldProgress, nextProgress)
-        if(Object.keys(nextProgress).length) {
-            const mergedProgress = {
-                ...getProfileNukeProgress()
-            }
-            for(const [profileHref, record] of Object.entries(nextProgress)) {
-                mergedProgress[profileHref] = mergeStoredProfileProgressRecord(
-                    mergedProgress[profileHref] || null,
-                    record,
-                    profileHref
-                )
-            }
-            setProfileNukeProgress(mergedProgress)
-        }
-        const terminalChangedProgress = Object.fromEntries(
-            Object.entries(changedProgress)
-                .filter(([, record]) => isTerminalProfileNukeRecord(record))
-        )
-        if(Object.keys(terminalChangedProgress).length) {
-            scheduleCoordinatorQueueResume(1000, 'terminal-progress', {
-                allowBeforeQuora: true
-            })
-        }
+        // Progress lives in session storage (decision 31), and nothing writes its view to disk now, so no progress key is read here.
+        // A change to the old disk key is not handled (20 Oct review, decision 2).
     }
     browser.storage.onChanged.addListener((changes, areaName) => areaName === 'local'
         ? runAfterCoordinatorAuthorityReady(() => handleStorageChanged(changes, areaName))
@@ -694,6 +680,9 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'clear-coordinator-events') {
             return clearCoordinatorEventsRequested()
         }
+        else if(request.action === 'clear-coordinator-outliers') {
+            return clearCoordinatorOutliersRequested()
+        }
         else if(request.action === 'set-space-nuked-posts') {
             return setSpaceNukedPostsRequested(request.nukedPosts)
         }
@@ -733,8 +722,40 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'cancel-coordinator-current-work-item') {
             return cancelCoordinatorCurrentWorkItem(request)
         }
+        else if(request.action === QUEUE_BAR_GET_ACTION) {
+            // The queue bar's summary, as the worker holds it (decisions 9 and 11). Null until a queue view has been recorded. The asking
+            // tab is subscribed, so it receives later pushes (decision 15).
+            subscribeQueueBarTab(sender?.tab?.id)
+            if(getQueueBarSummary()) return Promise.resolve({summary: getQueueBarSummary()})
+            // A cold worker has recorded no summary yet. The first view after startup is built here, its summary recorded and pushed
+            // (decision 2, 18 Oct). A failed build answers null, which hides the bar.
+            return refreshCoordinatorQueueViewForDashboard('queue-bar-first-build').then(result => {
+                if(result?.view) {
+                    const {summary, changed} = recordQueueBarSummary(summarizeQueueBarView(result.view, Date.now()))
+                    if(changed) void pushQueueBarSummary(browser, summary)
+                }
+                return {summary: getQueueBarSummary()}
+            }).catch(() => ({summary: null}))
+        }
+        else if(request.action === PROFILE_NUKE_PROGRESS_GET_ACTION) {
+            // Tools read the whole progress through the worker (decision 32): the stored copy, as the content page reads it (20 Oct review).
+            return Promise.resolve(readProfileNukeProgressForTools()).then(profileNukeProgress => ({profileNukeProgress}))
+        }
+        else if(request.action === PROFILE_NUKE_PROGRESS_CLEAR_ACTION) {
+            // The dev tools' clear (20 Oct review). Only an extension page may clear progress: a message from a tab is refused.
+            if(sender?.tab) return Promise.resolve({cleared: 0, saved: false, reason: 'extension-pages-only'})
+            return clearProfileNukeProgressForTools()
+        }
         else if(request.action === 'clear-coordinator-current-work') {
-            return clearCoordinatorCurrentWork()
+            return clearCoordinatorCurrentWork().then(result => {
+                // Owner decision 11 (18 Oct): a successful clear writes an explicit zero summary. A failed clear returns a reason and
+                // leaves the summary as it was.
+                if(!result?.reason) {
+                    const {summary} = recordQueueBarSummary({total: 0, pending: 0, updatedAt: Date.now()})
+                    void pushQueueBarSummary(browser, summary)
+                }
+                return result
+            })
         }
         else if(request.action === 'reconcile-coordinator-storage') {
             if(request.userInitiated !== true) {
@@ -867,6 +888,26 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'claim-tab-action') {
             return claimPendingTabAction(sender)
         }
+        else if(request.action === 'content-claim-retry-hit') {
+            // Measurement only (review-2 C-3): a claim retry loop in content.js reports once, when it reaches its pass threshold.
+            // Nothing here reads coordinator state, so the action is not in RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.
+            const loop = /^[a-z-]{1,40}$/.test(`${request.loop || ''}`) ? request.loop : 'unknown'
+            incrementQueueWakeupMetric(`contentClaimRetry.${loop}`)
+            recordFlightRecorderEvent({
+                kind: 'content-claim-retry-hit',
+                source: 'content-script',
+                targetUrl: `${request.href || ''}`,
+                tabId: sender.tab?.id || null,
+                accepted: true,
+                reason: loop,
+                passes: Number.isFinite(request.passes) ? request.passes : 0
+            })
+        }
+        else if(request.action === 'content-live-check') {
+            // Measurement only (owner, 15 Oct): the live-check card counts these. Nothing here reads coordinator state, so the
+            // action is not in RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.
+            if(request.check === 'did-not-land') incrementQueueWakeupMetric('liveCheck.didNotLand')
+        }
         else if(request.action === 'cloudflare-challenge-detected') {
             incrementQueueWakeupMetric('cloudflareChallenge.detected')
             recordFlightRecorderEvent({
@@ -942,6 +983,11 @@ function registerServiceWorkerListeners(deps = {}) {
                 accepted: true,
                 changed: false
             })
+            // A profile page that turned blocked is checked now, not at the next reconcile tick (owner 17 Oct). Not awaited: the
+            // page gets its answer at once, and the check reports through the flight recorder and the row's own terminal write.
+            if(request.event === 'profile-blocked-state' && request.detail === 'blocked' && sender.tab?.id) {
+                void requestProfileBlockedPageEventCheck(sender.tab.id, 'profile-blocked-page-event').catch(() => null)
+            }
             return Promise.resolve({recorded: true})
         }
         else if(request.action === 'record-initial-blocked-state') {

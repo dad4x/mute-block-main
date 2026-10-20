@@ -62,13 +62,11 @@
 // needed this exact pattern yet, so this is a new but directly analogous
 // extension of the established `now` convention.
 //
-// State note: `profileNukeProgress` (the module-level mutable progress-by-
-// href map, still owned by sw.js -- far too widely used to move as part of
-// this slice) is read by normalizeProgressPatch as a fallback when no
-// `existing` record is passed in. Threaded through as
-// `state.getProfileNukeProgress: () => profileNukeProgress`, matching the
-// precedent already used for coordinatorReconcileLockedMaterialization's
-// identical getter. `profileNukeProgressReady` (the memoized load-promise
+// State note: normalizeProgressPatch reads a fallback base when no `existing`
+// record is passed in. That base is the stored progress record, read through
+// `state.getStoredProfileNukeProgressRecord` (20 Oct review). It used to be
+// the module-level progress map in sw.js, which some writers do not keep in
+// step with the stored copy. `profileNukeProgressReady` (the memoized load-promise
 // latch used only by ensureProfileNukeProgressReady) is *not* shared with
 // any other code, so it's relocated into this module's own closure state
 // instead of staying a bare sw.js `let` -- it's re-initialized fresh each
@@ -127,7 +125,11 @@ function createProfileProgressMerge(deps = {}) {
     const {
         UNBLOCK_UNMUTE_ACTION_KIND
     } = deps.constants || {}
-    const {getProfileNukeProgress} = deps.state || {}
+    const {getStoredProfileNukeProgressRecord} = deps.state || {}
+    // The stored record of one profile, or null. Without the dependency (a caller that builds this module alone), there is no base.
+    const readStoredProfileProgressRecord = typeof getStoredProfileNukeProgressRecord === 'function'
+        ? getStoredProfileNukeProgressRecord
+        : () => null
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const nowIso = typeof deps.nowIso === 'function' ? deps.nowIso : () => new Date().toISOString()
 
@@ -321,7 +323,7 @@ function createProfileProgressMerge(deps = {}) {
         }
         delete cleanPatch.replaceProgressRecord
 
-        const previous = replaceProgressRecord ? {} : existing || getProfileNukeProgress()?.[normalizedHref] || {}
+        const previous = replaceProgressRecord ? {} : existing || readStoredProfileProgressRecord(normalizedHref) || {}
         const preserveTerminal = !replaceProgressRecord && shouldPreserveTerminalProfileProgress(previous, cleanPatch)
         const next = {
             ...previous,
@@ -447,7 +449,8 @@ function createProfileProgressMerge(deps = {}) {
     }
 
     function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null) {
-        const normalizedTabId = normalizeTabId(patch?.tabId || senderTabId)
+        // The authenticated sender wins over a tab id in the patch body (review-2 S4-1).
+        const normalizedTabId = normalizeTabId(senderTabId || patch?.tabId)
         if(!normalizedTabId) return patch
 
         return {

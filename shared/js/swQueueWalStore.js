@@ -12,13 +12,29 @@
 const {
     CHECKPOINT_A,
     CHECKPOINT_B,
+    CHECKPOINT_MANIFEST_META_MISMATCH,
+    checkpointManifestMatchesMeta,
+    getCheckpointFingerprint,
     getSegmentedWalCheckpointKey,
     getSegmentedWalCheckpointShardKeys,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     isSegmentedWalStorageMeta,
-    hydrateSegmentedWalStore
+    normalizeCheckpointId,
+    normalizeCheckpointShardCount,
+    hydrateSegmentedWalStore,
+    verifyCheckpoint
 } = require('./walSnapshotStore')
+
+// The diagnostic and flight recorder kinds of the checkpoint binding (loadStoreFromStorage below), named once.
+const CHECKPOINT_MISMATCH_EVENT = 'coordinator-authority-queue-wal-checkpoint-mismatch'
+const CHECKPOINT_RECOVERED_EVENT = 'coordinator-authority-queue-wal-checkpoint-recovered-from-mirror'
+const CHECKPOINT_MISMATCH_FLIGHT_KIND = 'queue-wal-checkpoint-mismatch'
+const CHECKPOINT_RECOVERED_FLIGHT_KIND = 'queue-wal-checkpoint-recovered-from-mirror'
+// The record of a mirror rebuild that keeps its session copy instead of copying a manifest that disagrees with the disk meta
+// (rebuildCoordinatorQueueMirrorFromDisk in sw.js). It names the same kinds of fact as the mismatch event.
+const MIRROR_REBUILD_SKIPPED_EVENT = 'coordinator-authority-queue-wal-mirror-rebuild-skipped'
+const MIRROR_REBUILD_SKIPPED_FLIGHT_KIND = 'queue-wal-mirror-rebuild-skipped'
 
 function createQueueWalStore(deps = {}) {
     const {
@@ -26,6 +42,7 @@ function createQueueWalStore(deps = {}) {
         metrics = {},
         diagnostics = {},
         storage = {},
+        mirror = {},
         checkpoints = {},
         authority = {}
     } = deps
@@ -36,15 +53,18 @@ function createQueueWalStore(deps = {}) {
         COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT,
         COORDINATOR_QUEUE_WAL_ATOMIC_READ_SEGMENT_SUPERSET,
         COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT,
-        COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT
+        COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT,
+        // The codec the snapshots are written with. Without it a codec-encoded copy cannot be decoded, so it is refused.
+        COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {}
     } = constants
     const {
         incrementQueueWakeupMetric,
         recordQueueWakeupMetricMax,
         runQueueWakeupMetricPhase
     } = metrics
-    const {recordCoordinatorDiagnosticEvent} = diagnostics
+    const {recordCoordinatorDiagnosticEvent, recordFlightRecorderEvent} = diagnostics
     const {metricStorageGet} = storage
+    const {readCheckpointKeys: readMirrorCheckpointKeys} = mirror
     const {
         scheduleSwitch: scheduleCoordinatorQueueWalCheckpointSwitch,
         checkQuotaHealth: maybeCheckCoordinatorStorageQuotaHealth
@@ -60,6 +80,8 @@ function createQueueWalStore(deps = {}) {
         recordQueueWakeupMetricMax,
         runQueueWakeupMetricPhase,
         recordCoordinatorDiagnosticEvent,
+        recordFlightRecorderEvent,
+        readMirrorCheckpointKeys,
         metricStorageGet,
         scheduleCoordinatorQueueWalCheckpointSwitch,
         maybeCheckCoordinatorStorageQuotaHealth,
@@ -129,6 +151,65 @@ function createQueueWalStore(deps = {}) {
         clear() {
             residentStore = null
         }
+    }
+
+    // Recovery A of the checkpoint binding (docs/queue-storage-layering.md, section 6). The session mirror holds the worker's own
+    // copy of the active checkpoint: its manifest and shard records, written with the mirror. The copy is a candidate, and it is
+    // never trusted by itself. It is used only when checkpointManifestMatchesMeta holds for it against the disk meta, which is the
+    // check the disk manifest failed. Then hydrate runs on a store built from it, and that checks each shard's identity against the
+    // copy's manifest. A copy that fails either check is not used. Returns hydrated (ok only when the copy was used), copy (the keys
+    // to put into stored, when it was used), and mismatch (the facts the diagnostics record, and what happened to the copy).
+    async function recoverCheckpointFromMirror(stored, meta) {
+        const active = normalizeCheckpointId(meta.activeCheckpoint)
+        const metaCheckpoint = meta.checkpoints?.[active] || null
+        const manifestKey = getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, active)
+        const shardKeys = getSegmentedWalCheckpointShardKeys(
+            COORDINATOR_QUEUE_WAL_KEY,
+            active,
+            normalizeCheckpointShardCount(metaCheckpoint?.shardCount)
+        )
+        const diskManifest = stored?.[manifestKey] || {}
+        const mismatch = {
+            checkpointId: active,
+            metaFingerprint: getCheckpointFingerprint(metaCheckpoint || {}, active),
+            manifestFingerprint: getCheckpointFingerprint(diskManifest, normalizeCheckpointId(diskManifest.id)),
+            mirror: 'none',
+            copyFingerprint: ''
+        }
+        const keys = [manifestKey, ...shardKeys]
+        const copy = await readMirrorCheckpointKeys(keys)
+        const copyManifest = copy?.[manifestKey] || null
+        if(!copyManifest || typeof copyManifest !== 'object') return {hydrated: null, copy: null, mismatch}
+
+        const copyFingerprint = getCheckpointFingerprint(copyManifest, normalizeCheckpointId(copyManifest.id))
+        if(!metaCheckpoint || !checkpointManifestMatchesMeta(copyManifest, metaCheckpoint, active)) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointMirrorCopyRejected')
+            mismatch.mirror = `rejected (fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+
+        const copyKeys = Object.fromEntries(keys.map(key => [key, copy[key] ?? null]))
+        const hydrated = runQueueWakeupMetricPhase('queueWalHydrate', () => hydrateSegmentedWalStore({...stored, ...copyKeys}, {
+            baseKey: COORDINATOR_QUEUE_WAL_KEY,
+            fallbackStore: stored[COORDINATOR_QUEUE_WAL_KEY] || null
+        }))
+        if(hydrated?.ok !== true || !hydrated.store) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointMirrorCopyRejected')
+            mismatch.mirror = `unusable (${hydrated?.reason || 'hydrate-failed'}, fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+        // The state hash check (hole 2). The copy's shards must decode and each match its own hash, and the merged state must hash to
+        // the manifest's stateHash. This is the check recovery applies to the store later (recoverProjectedState), so a copy that fails
+        // it is refused here, and the recovery is recorded only for a copy that passes.
+        const verification = verifyCheckpoint(hydrated.store.checkpoints?.[active], COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
+        if(!verification.ok) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointMirrorCopyRejected')
+            mismatch.mirror = `unusable (${verification.reason}, fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+        mismatch.mirror = 'used'
+        mismatch.copyFingerprint = copyFingerprint
+        return {hydrated, copy: copyKeys, mismatch}
     }
 
     async function loadStoreFromStorage(stored = {}, snapshotQueue = {}, options = {}) {
@@ -222,6 +303,13 @@ function createQueueWalStore(deps = {}) {
                 for(let segmentNo = 0; segmentNo < guessedSegmentCount; segmentNo += 1) {
                     atomicReadKeys[getSegmentedWalSegmentKey(COORDINATOR_QUEUE_WAL_KEY, guessedActiveCheckpoint, segmentNo)] = null
                 }
+                // This read is the disk re-read of a load: the meta, both checkpoint manifests and their shards, and the committed
+                // segments (the fallback read below fetches any segment the first read missed). Object.assign puts these disk values
+                // over the mirror copies of the same keys, and a key absent on disk comes back as null, so it replaces the copy too.
+                // A restart takes this path, since the resident copy is empty then. So a stale mirror copy (after a lost pending
+                // marker and a lost mirror write) cannot reach hydrate unchecked, which is why a marker-only freshness check is
+                // acceptable at restart. A future path that uses the mirror without this re-read must first compare the disk meta
+                // fingerprint with the marker's committed value, and must still check the segment keys as hydrate does.
                 const atomicRead = await metricStorageGet(atomicReadKeys, {
                     metricPath: attempt > 1
                         ? `${options.metricPath || 'coordinatorQueueWal.segmented.load'}.tornWriteRetry`
@@ -271,8 +359,42 @@ function createQueueWalStore(deps = {}) {
                     incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrateTornWriteRetried')
                 }
             }
+            // The checkpoint binding (docs/queue-storage-layering.md, section 6). A manifest that still disagrees with the disk meta
+            // after the single re-read is recovered from the session mirror's copy when that copy agrees with the meta. Otherwise the
+            // load fails closed, below, and the mismatch is recorded with both fingerprints.
+            let checkpointMismatch = null
+            let recoveredFromMirror = null
+            if(hydrated?.reason === CHECKPOINT_MANIFEST_META_MISMATCH) {
+                incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointMismatch')
+                const recovery = await recoverCheckpointFromMirror(stored, meta)
+                checkpointMismatch = recovery.mismatch
+                if(recovery.hydrated) {
+                    Object.assign(stored, recovery.copy)
+                    hydrated = recovery.hydrated
+                    recoveredFromMirror = recovery.mismatch
+                }
+            }
             if(hydrated?.ok === true && hydrated.store) {
                 incrementQueueWakeupMetric('coordinatorAuthority.queueWal.segmentedHydrated')
+                if(recoveredFromMirror) {
+                    // Recorded here, once the store is accepted. The copy has passed every check the loader applies to it (identity,
+                    // hydrate and the state hash), and a copy refused at any of them is never reported as recovered.
+                    const facts = recoveredFromMirror
+                    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointRecoveredFromMirror')
+                    recordCoordinatorDiagnosticEvent(
+                        CHECKPOINT_RECOVERED_EVENT,
+                        `Active checkpoint ${facts.checkpointId} recovered from the session mirror: the disk manifest (fingerprint ${facts.manifestFingerprint}) disagreed with the metadata (fingerprint ${facts.metaFingerprint}); the mirror copy (fingerprint ${facts.copyFingerprint}) agrees with the metadata and was used.`,
+                        {...facts}
+                    )
+                    recordFlightRecorderEvent({
+                        kind: CHECKPOINT_RECOVERED_FLIGHT_KIND,
+                        source: 'loadStoreFromStorage',
+                        checkpointId: facts.checkpointId,
+                        metaFingerprint: facts.metaFingerprint,
+                        manifestFingerprint: facts.manifestFingerprint,
+                        copyFingerprint: facts.copyFingerprint
+                    })
+                }
                 const activeSegmentCount = getSegmentedWalCommittedSegmentCount(
                     meta,
                     hydrated.store?.meta?.activeCheckpoint || ''
@@ -293,6 +415,23 @@ function createQueueWalStore(deps = {}) {
                 'coordinator-authority-queue-wal-segmented-hydrate-failed',
                 hydrated?.reason || 'Coordinator authority queue WAL segmented hydrate failed'
             )
+            if(checkpointMismatch) {
+                // Fail closed, and say which checkpoint disagrees and how. The throw below keeps the authority unavailable.
+                const facts = checkpointMismatch
+                recordCoordinatorDiagnosticEvent(
+                    CHECKPOINT_MISMATCH_EVENT,
+                    `Active checkpoint ${facts.checkpointId}: the metadata fingerprint ${facts.metaFingerprint} does not match the disk manifest fingerprint ${facts.manifestFingerprint}; session mirror copy: ${facts.mirror}. Failing closed: the queue authority is unavailable.`,
+                    {...facts}
+                )
+                recordFlightRecorderEvent({
+                    kind: CHECKPOINT_MISMATCH_FLIGHT_KIND,
+                    source: 'loadStoreFromStorage',
+                    checkpointId: facts.checkpointId,
+                    metaFingerprint: facts.metaFingerprint,
+                    manifestFingerprint: facts.manifestFingerprint,
+                    mirror: facts.mirror
+                })
+            }
             // 2026-09-15: auto-recover instead of leaving the coordinator dead in
             // the water -- this used to require someone running a CDP helper by
             // hand after every "missing-segment" incident (both the helper and the
@@ -359,4 +498,8 @@ function createQueueWalStore(deps = {}) {
     }
 }
 
-module.exports = {createQueueWalStore}
+module.exports = {
+    createQueueWalStore,
+    MIRROR_REBUILD_SKIPPED_EVENT,
+    MIRROR_REBUILD_SKIPPED_FLIGHT_KIND
+}

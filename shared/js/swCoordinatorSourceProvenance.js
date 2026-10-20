@@ -58,7 +58,6 @@ function createCoordinatorSourceProvenance(deps = {}) {
     } = deps.constants || {}
     const {
         normalizeQuoraProfileUrl,
-        normalizeCoordinatorEvents,
         getCoordinatorItemHref,
         getWalRecordsForGeneration,
         normalizeQueueWriteOperationName,
@@ -104,16 +103,6 @@ function createCoordinatorSourceProvenance(deps = {}) {
         return match?.[1] || ''
     }
 
-    function getCoordinatorRunSourcePageFromEvents(events = [], runId = '') {
-        for(const event of [...normalizeCoordinatorEvents(events)].reverse()) {
-            if(`${event?.runId || ''}` !== `${runId || ''}`) continue
-            const sourcePageUrl = `${event?.details?.sourcePageUrl || ''}`.trim()
-            if(sourcePageUrl) return sourcePageUrl
-        }
-
-        return ''
-    }
-
     function getProfileSearchQueryFromPageUrl(pageUrl = '') {
         try {
             return new URL(pageUrl).searchParams.get('q') || ''
@@ -123,11 +112,10 @@ function createCoordinatorSourceProvenance(deps = {}) {
         }
     }
 
-    function makeCoordinatorSourceFromRunMetadata(runId = '', run = {}, events = []) {
+    function makeCoordinatorSourceFromRunMetadata(runId = '', run = {}) {
         const sourceType = run.sourceType || inferSourceTypeFromRunId(runId) || 'profile-list'
-        const sourcePageUrl = (Array.isArray(run.sourcePages) && run.sourcePages.find(Boolean)) ||
-            getCoordinatorRunSourcePageFromEvents(events, runId) ||
-            ''
+        // Decision 26 (18 Oct): the run's own source pages are the only source. The event log is not read.
+        const sourcePageUrl = (Array.isArray(run.sourcePages) && run.sourcePages.find(Boolean)) || ''
         const source = {
             type: sourceType,
             pageUrl: sourcePageUrl
@@ -350,7 +338,6 @@ function createCoordinatorSourceProvenance(deps = {}) {
         getChangedProfileProgressRecords,
         getCoordinatorProgressRecordForItem,
         inferSourceTypeFromRunId,
-        getCoordinatorRunSourcePageFromEvents,
         getProfileSearchQueryFromPageUrl,
         makeCoordinatorSourceFromRunMetadata,
         mergeCoordinatorSourceMetadata,

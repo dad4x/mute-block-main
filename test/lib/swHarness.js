@@ -93,9 +93,53 @@ function makeEvent() {
     }
 }
 
-function createFakeBrowser(initialStorage = {}) {
+const {PROFILE_NUKE_PROGRESS_SHARD_PREFIX, PROFILE_NUKE_PROGRESS_VIEW_KEY} = require('../../shared/js/storageKeys')
+
+// Decision 31: profile progress (the view and the shards) is held in session storage, never on disk. A progress key in a seed goes to
+// the session copy, unless options.progressOnDisk is set (the legacy-copy cleanup test seeds the old disk copy that way).
+function isProfileProgressStorageKey(key = '') {
+    return key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)
+}
+
+// The storage a test reads for the worker: disk keys from the local copy, progress keys from the session copy. Reads, writes and
+// deletes of a progress key go to the session copy. Everything else is the local copy, as before.
+function makeWorkerStorageView(localStorage, sessionStorage) {
+    const isProgressKey = key => typeof key === 'string' && isProfileProgressStorageKey(key)
+    return new Proxy(localStorage, {
+        get: (target, key) => isProgressKey(key) ? sessionStorage[key] : target[key],
+        set(target, key, value) {
+            if(isProgressKey(key)) sessionStorage[key] = value
+            else target[key] = value
+            return true
+        },
+        has: (target, key) => isProgressKey(key) ? key in sessionStorage : key in target,
+        deleteProperty(target, key) {
+            if(isProgressKey(key)) delete sessionStorage[key]
+            else delete target[key]
+            return true
+        },
+        ownKeys: target => [
+            ...Reflect.ownKeys(target).filter(key => !isProgressKey(key)),
+            ...Object.keys(sessionStorage).filter(isProfileProgressStorageKey)
+        ],
+        getOwnPropertyDescriptor(target, key) {
+            if(!isProgressKey(key)) return Object.getOwnPropertyDescriptor(target, key)
+            const descriptor = Object.getOwnPropertyDescriptor(sessionStorage, key)
+            return descriptor ? {...descriptor, configurable: true} : undefined
+        }
+    })
+}
+
+function createFakeBrowser(initialStorage = {}, options = {}) {
     const storage = clone(initialStorage) || {}
     const sessionStorage = {}
+    if(options.progressOnDisk !== true) {
+        for(const key of Object.keys(storage)) {
+            if(!isProfileProgressStorageKey(key)) continue
+            sessionStorage[key] = storage[key]
+            delete storage[key]
+        }
+    }
     const runtimeOnMessage = makeEvent()
     const storageOnChanged = makeEvent()
     const alarmsOnAlarm = makeEvent()
@@ -463,14 +507,14 @@ function loadServiceWorkerHarness(options = {}) {
     const repoRoot = path.resolve(__dirname, '..', '..')
     const swPath = path.join(repoRoot, 'shared/js/sw.js')
     const timers = options.timers || createFakeTimers(options.now || 0)
-    const browser = options.browser || createFakeBrowser(options.storage || {})
+    const browser = options.browser || createFakeBrowser(options.storage || {}, {progressOnDisk: options.progressOnDisk})
     const baseRequire = createRequire(swPath)
-    let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\n${fs.readFileSync(swPath, 'utf8')}`
+    let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\nlet __testCoordinatorExecutorStartResult = null;\n${fs.readFileSync(swPath, 'utf8')}`
 
     if(!options.runStartupWork) {
         source = source
             .replace(/\nvoid startQueueWakeupMetricsBackedStartupWork\(\)/, '\n')
-            .replace(/\nscheduleStoredWorkRearmAfterServiceWorkerReload\(\)/, '\n')
+            .replace(/\nvoid scheduleStoredWorkRearmAfterStartupHydrate\(\)/, '\n')
     }
     if(options.disableQueueWakeupMetricsFlush === true) {
         source = source.replace(
@@ -509,7 +553,7 @@ function loadServiceWorkerHarness(options = {}) {
     }
     source = source.replace(
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    clearStaleCoordinatorExecutorStartPromise',
-        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    clearStaleCoordinatorExecutorStartPromise'
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    if(__testCoordinatorExecutorStartResult) {\n        const result = __testCoordinatorExecutorStartResult\n        __testCoordinatorExecutorStartResult = null\n        return result\n    }\n    clearStaleCoordinatorExecutorStartPromise'
     )
     source = source.replace(
         'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
@@ -523,21 +567,20 @@ function loadServiceWorkerHarness(options = {}) {
         'async function metricStorageRemove(keys = [], options = {}) {\n    const normalizedKeys',
         'async function metricStorageRemove(keys = [], options = {}) {\n    if(__testHarnessDeactivated) return false\n    const normalizedKeys'
     )
-    source = source.replace(
-        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot',
-        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot'
-    )
-    source = source.replace(
-        '    if(!walStore || typeof walStore !== \'object\') {\n        return {',
-        '    if(__testHarnessDeactivated) {\n        return {\n            queue: normalizedSnapshot,\n            recovered: false,\n            reason: \'test-harness-deactivated\'\n        }\n    }\n\n    if(!walStore || typeof walStore !== \'object\') {\n        return {'
-    )
     source += `
 
 module.exports.__test = {
     archiveTerminalCoordinatorRow,
+    startDebugResumeLimit,
+    enforceDebugResumeLimit,
+    handleDebugResumeLimitAlarm,
+    getDebugResumeLimitStatus,
+    orderQueuedItemsForDrain,
+    noteDebugResumeTargetFinished,
     applyCoordinatorRowEvent,
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
+    buildCoordinatorQueueViewFromDashboardSnapshot,
     mergeCoordinatorQueueViewTimingCache,
     setCoordinatorQueueWalResidentStoreCache,
     getResidentCoordinatorQueueWalPhysicalStoredSupplement,
@@ -550,6 +593,23 @@ module.exports.__test = {
     coordinatorAuthority,
     enqueueSpaceFeedStorageUpdate,
     enqueueExistingExecutorForCoordinator,
+    enqueueExistingExecutorForCoordinatorOnce,
+    fillQueuedTabsOnce,
+    readResidentDerivedQueueIndex,
+    getLegacyContentIndexCleanupNames,
+    retireLegacyContentIndexKeys,
+    getContentPageCoordinatorState,
+    recordDirectProfileProgressFromRequest,
+    cancelCoordinatorCurrentWork,
+    pauseCoordinatorNukes,
+    // Test-only hooks for the executor-start token and the pause guard (review-2 S2-1, S2-2, S3-1). Getters read the live binding.
+    resetCoordinatorExecutorStartPromiseAfterTimeout: reason => persistentRetryExecutorTimers.resetCoordinatorExecutorStartPromiseAfterTimeout(reason),
+    getCoordinatorExecutorStartTokenForTest: () => coordinatorExecutorStartToken,
+    getQueuedTabConcurrencyForTest: () => queuedTabConcurrency,
+    getCoordinatorPauseRequestedForTest: () => coordinatorPauseRequested,
+    getCoordinatorQueueViewTimingCacheForTest: () => coordinatorQueueViewTimingCache,
+    clearCoordinatorTerminalStats,
+    runCoordinatorExecutorApplyPhase,
     buildQueuedTabOpenEffectPlan,
     applyQueuedTabOpenRuntimeEffect,
     confirmQueuedTabOpenDurableActiveEffect,
@@ -563,6 +623,9 @@ module.exports.__test = {
     nudgeQueuedTabActionClaim,
     nudgeQueuedTabActionClaimWithRetries,
     ensureProfileNukeProgressReady,
+    saveProfileNukeProgressRowProjection,
+    rebuildContentPageStateProjectionFromCurrentState,
+    deleteProfileNukeProgressRowProjection,
     reconcileCoordinatorStorage,
     recordCoordinatorJobProgress,
     recordCoordinatorJobProgressRecords,
@@ -571,7 +634,6 @@ module.exports.__test = {
     getFlightRecorderSnapshot,
     createOwnedTabInQueuedWorkerActionSurface,
     getOrCreateQueuedWorkerActionSurface,
-    restoreFocusIfQueuedWorkerActionSurfaceIdle,
     getCoordinatorWhyNotRunning,
     getStorageUpdateQueueSnapshot,
     getRuntimeSurfaceForCoordinatorItem,
@@ -599,6 +661,8 @@ module.exports.__test = {
     refreshCoordinatorQueueViewForDashboard,
     refreshCoordinatorRunsViewForDashboard,
     refreshCoordinatorDashboardViewsForDashboard,
+    loadCoordinatorOutliersRecord,
+    loadCoordinatorDashboardAuthoritySnapshot,
     loadCoordinatorQueueRowFromStorage,
     loadCoordinatorQueueRowsFromStorage,
     rebuildCoordinatorQueueMirrorFromDisk,
@@ -734,6 +798,9 @@ module.exports.__test = {
     __testSetCoordinatorExecutorStartThrow(error) {
         __testCoordinatorExecutorStartThrow = error
     },
+    __testSetCoordinatorExecutorStartResult(result) {
+        __testCoordinatorExecutorStartResult = result
+    },
     __testSetCoordinatorReconcilePromise(promise, startedAt = Date.now()) {
         coordinatorReconcilePromise = promise
         coordinatorReconcilePromiseStartedAt = Number.parseInt(startedAt, 10) || Date.now()
@@ -758,7 +825,8 @@ module.exports.__test = {
             profileNukeProgress: {...profileNukeProgress},
             coordinatorAuthorityShadowWalStore: JSON.parse(JSON.stringify(coordinatorAuthorityShadowWalStore)),
             progressShadowWalStore: JSON.parse(JSON.stringify(progressShadowWalStore)),
-            coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.current().stored?.mbCoordinatorQueueWal || null)),
+            // The resident stored copy, not current(): a counters snapshot must still read after a failed hydrate (D4 guard).
+            coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.residentStored()?.mbCoordinatorQueueWal || null)),
             spaceFeedStorageUpdateDepth: storageUpdateState.getDepth(),
             abandonedSpaceFeedStorageUpdates: storageUpdateState.getAbandonedCount(),
             queuedTabFillPromise: hasVisibleQueuedTabFillPromise(),
@@ -862,7 +930,7 @@ module.exports.__test = {
         browser,
         timers,
         sw: module.exports.__test,
-        storage: browser.__storage
+        storage: makeWorkerStorageView(browser.__storage, browser.__sessionStorage)
     }
 }
 

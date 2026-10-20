@@ -265,7 +265,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers">v</button>
-                        <h2 title="Rows whose active duration exceeded 45s or 2.5 standard deviations above this session's average active duration, captured with their flight-recorder history for inspection. Checked continuously, not just at completion, so a still-running stuck row shows up too. Not persisted -- lives only in this dashboard tab, cleared on reload or manually.">Outliers</h2>
+                        <h2 title="Rows whose active duration exceeded 45s or 2.5 standard deviations above the average active duration of terminal rows. Checked continuously, so a still-running stuck row shows up too. Kept by the worker across reloads until Clear here or Clear All Stats.">Outliers</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="outlierCount">0 outliers</span>

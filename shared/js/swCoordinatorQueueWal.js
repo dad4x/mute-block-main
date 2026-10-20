@@ -57,6 +57,7 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
     // A valid store is returned as it is, not copied. The callers only read it: the two queue appends (the single and the
     // batch path, which pass it to appendWalRecordsToGeneration, and that never writes into its input), and the monolith
     // fallback in swQueueWalStore.js, which passes a fresh storage read. Callers must not write into the returned store.
+    // The returned store is shared with the caller's resident state, so callers must not write into it in place. Clone it before mutating.
     function normalizeCoordinatorQueueWalStore(value = null, snapshotQueue = {}) {
         if(value && typeof value === 'object' && value.meta && value.checkpoints && value.wal) {
             return value

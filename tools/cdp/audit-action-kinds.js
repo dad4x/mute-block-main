@@ -4,6 +4,7 @@ const {
     evaluate,
     getCdpConfig,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -20,14 +21,13 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function auditActionKinds() {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function auditActionKinds(progress) {
         const storage = await chrome.storage.local.get({
             mbCoordinatorQueue: {},
-            mbProfileNukeProgressView: {},
             mbCoordinatorRuns: {}
         })
         const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgressView?.records || {}
         const runs = storage.mbCoordinatorRuns || {}
         const countBy = (values, selector) => values.reduce((counts, value) => {
             const key = selector(value) || '(empty)'
@@ -90,7 +90,7 @@ runMain(async () => {
             unblockConfirmEventCount: unblockConfirmEvents.length,
             unblockConfirmEvents: unblockConfirmEvents.slice(-25)
         }
-    }})()`, 20000)
+    }})(${JSON.stringify(progressRecords)})`, 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

@@ -158,5 +158,18 @@ module.exports = {
     // fillQueuedTabsOnce) so a genuinely stuck occupant still fails here,
     // with the accurate "worker-action-surface-busy" reason, rather than
     // in the outer wrapper with a less specific "tab create timed out".
-    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS: 8000
+    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS: 8000,
+    // Gap between blocked-tab re-checks after a profile-blocked-state page event (sw.js, owner 17 Oct). A fixed schedule, not a
+    // back-off: a re-check that finds the tab not yet blocked waits this long, and the schedule ends when the tab is blocked or the
+    // attempt ends. The reconcile interval is deliberately not used, so a stalled reconcile cannot delay the check.
+    PROFILE_BLOCKED_PAGE_EVENT_RECHECK_INTERVAL_MS: 1000,
+    // Delay before the fill runs again after a queued tab is removed (sw.js, owner 18 Oct). Set at the scheduler's minimum, so a
+    // freed slot is filled at once, instead of waiting for the one-second resume timers the fill otherwise uses.
+    QUEUED_TAB_REMOVAL_REFILL_DELAY_MS: 100,
+    // Shortest gap between two diagnostic-event flushes that write to storage (sw.js, owner 18 Oct). A flush inside the gap waits
+    // for the next idle moment, unless the pending list is more than half full. Coalesces the flushes; the events are kept.
+    DIAGNOSTIC_EVENT_FLUSH_MIN_INTERVAL_MS: 5000,
+    // The one read of the legacy-cleanup names, once per browser session (sw.js, owner 20 Oct; the cleanup has no budget of its own,
+    // so it used the space-feed storage budget). Same value as that budget: 15 seconds.
+    LEGACY_CONTENT_INDEX_CLEANUP_READ_TIMEOUT_MS: 15000
 }

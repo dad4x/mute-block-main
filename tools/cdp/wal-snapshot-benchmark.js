@@ -6,6 +6,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 const {
@@ -137,11 +138,11 @@ async function readLiveStorage(config) {
     }
 }
 
-function buildDatasets(storage = {}) {
+function buildDatasets(storage = {}, progressRecords = {}) {
     const recoveryCritical = {
         queue: storage.mbCoordinatorQueue || {},
         runs: storage.mbCoordinatorRuns || {},
-        progressView: storage.mbProfileNukeProgressView || {},
+        progressView: {records: progressRecords, total: Object.keys(progressRecords).length},
         events: storage.mbCoordinatorEvents || []
     }
     const userMemory = {
@@ -165,7 +166,8 @@ runMain(async () => {
         .filter(Number.isFinite)
     const codecs = codecNames.flatMap(codecName => levels.map(level => makeCodec(codecName, level)))
     const live = await readLiveStorage(config)
-    const datasets = buildDatasets(live.storage)
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const datasets = buildDatasets(live.storage, progressRecords)
 
     const results = datasets.map(dataset => ({
         name: dataset.name,

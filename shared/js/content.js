@@ -15,6 +15,8 @@ catch {}
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
 const { BRAND_RED } = require('./colorTokens')
+const { QUEUE_BAR_GET_ACTION, QUEUE_BAR_PUSH_ACTION, getQueueBarDisplay } = require('./swQueueBarSummary')
+const { PROFILE_NUKE_PROGRESS_PUSH_ACTION } = require('./swProfileNukeProgressPush')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -45,6 +47,13 @@ const {
     TRANSIENT_PROGRESS_STATUSES,
     UNBLOCK_UNMUTE_ACTION_KIND
 } = require('./jobState')
+const {
+    COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_VIEW_KEY,
+    SPACE_PENDING_NUKED_POSTS_KEY
+} = require('./storageKeys')
+const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES} = require('./tunables')
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
@@ -147,6 +156,69 @@ let activeQueuedAttemptNumber = 0
 let activeQueuedAttemptProfileHref = ''
 let activeQueuedNoForegroundFallback = false
 let activeQueuedActionSurfaceMode = ''
+
+// Hold for a claim pushed while work is busy (review-2 C-2, owner decision 2026-10-14: hold on the content side). The push is
+// held here, not run on top of that work, and runs when that work ends. Rules:
+//   - a repeat of the attempt already running is answered accepted, with nothing held;
+//   - a push while this tab is finishing is declined, so the worker retries it and a retry after this work ends is accepted;
+//   - a held push is dropped if the tab is finishing when the work ends; the worker's stale-claim check then requeues the row
+//     (QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS);
+//   - a second push while busy replaces the first held one. The worker already counted the first as accepted, so the stale-claim
+//     check recovers it;
+//   - the tab's own claim answering with an action supersedes a push held during that claim.
+let heldQueuedClaim = null
+// Set when this tab's queued work is finishing: a close was requested, or the tab is kept open to retry a terminal record.
+// Reset when the next action starts. It only blocks a claim that arrives while busy, so a tab whose close failed still takes
+// new work once its current action ends.
+let queuedTabFinishing = false
+
+function markQueuedTabFinishing() {
+    queuedTabFinishing = true
+}
+
+// Answers a claim pushed by the worker (claim-current-profile-tab-action). Busy means an action is running or this tab is
+// waiting for its own claim.
+async function acceptQueuedProfileActionClaim(request = {}) {
+    if(!request.queuedAction) {
+        await refreshCoordinatorQueueFromRuntime().catch(() => null)
+    }
+    const nextProfileAction = request.queuedAction && typeof request.queuedAction === 'object'
+        ? request.queuedAction
+        : undefined
+    if(getPageType() !== 'profile' && !canResolveQueuedProfileFromCurrentPage(nextProfileAction || {})) {
+        return {accepted: false, reason: 'not-profile'}
+    }
+    if(autoProfileActionPending || autoProfileActionClaimPending) {
+        const requestedAttemptId = `${nextProfileAction?.attemptId || ''}`.trim()
+        if(requestedAttemptId && requestedAttemptId === activeQueuedAttemptId) {
+            return {accepted: true, reason: 'already-running'}
+        }
+        if(queuedTabFinishing) return {accepted: false, reason: 'tab-finishing'}
+        heldQueuedClaim = {action: nextProfileAction}
+        return {accepted: true, reason: 'held-while-busy'}
+    }
+    autoProfileAction = nextProfileAction
+    autoProfileActionAttempts = 0
+    void maybeRecordAlreadyBlockedCoordinatorProfile()
+    void maybeRunAutoProfileAction()
+    scheduleCurrentProfilePendingClaimRescue(500)
+    return {accepted: true, reason: request.reason || ''}
+}
+
+// Runs the claim held while work ran, if this tab is still open and not finishing. Returns true when it took over the tab.
+function releaseHeldQueuedProfileActionClaim() {
+    const held = heldQueuedClaim
+    heldQueuedClaim = null
+    if(!held) return false
+    if(queuedTabFinishing) {
+        console.info('Held queued claim dropped: this tab is finishing')
+        return false
+    }
+    autoProfileAction = held.action
+    autoProfileActionAttempts = 0
+    void maybeRunAutoProfileAction()
+    return true
+}
 let profileBlockMutationCount = 0
 let profileBlockHintKey = null
 let profileBlockHintAt = 0
@@ -235,14 +307,8 @@ const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const SPACE_FEED_CANDIDATE_CONFIDENCE_HIGH = 'high'
 const SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM = 'medium'
 const SPACE_FEED_CANDIDATE_CONFIDENCE_LOW = 'low'
-const SPACE_PENDING_NUKED_POSTS_KEY = 'mbSpacePendingNukedPosts'
-const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
-const COORDINATOR_QUEUE_VIEW_KEY = 'mbCoordinatorQueueView'
-const COORDINATOR_PAUSED_KEY = 'mbCoordinatorPaused'
-const COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY = 'mbCoordinatorLastEnqueueSummary'
 const CONTENT_PROGRESS_BAR_ID = 'mb-ext_progress-bar'
 const PENDING_COORDINATOR_STATUSES = new Set(['queued', 'opening', 'active', 'acting', 'settling'])
-const MAX_PROFILE_NUKE_PROGRESS_ENTRIES = 1000
 const STALE_PROFILE_NUKE_PROGRESS_MS = 12000
 const SPACE_FEED_SCROLL_IDLE_MS = 450
 const SPACE_FEED_SCROLL_REFRESH_GRACE_MS = 120
@@ -586,9 +652,6 @@ function onStorageChanged(changes, areaName) {
             if(getPageType() === 'space') {
                 scheduleSpaceFeedProgressDrivenRefresh()
             }
-        }
-        else if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key === COORDINATOR_QUEUE_VIEW_KEY) {
-            scheduleContentPageStateProjectionRefresh()
         }
     }
 }
@@ -2262,6 +2325,9 @@ function onMessage(request, sender, sendResponse) {
                 // already blocked" without waiting on that slower,
                 // sometimes-backed-up channel (classifyBlockConfirmationFromItem,
                 // sw.js).
+                // The worker usually closes a tab that answers willClose, so a claim held for it must not run here. If the
+                // worker declines to close it, the held claim is dropped and the worker's stale-claim check requeues the row.
+                markQueuedTabFinishing()
                 return Promise.resolve({
                     willClose: true,
                     resolvedProfileHref,
@@ -2280,23 +2346,7 @@ function onMessage(request, sender, sendResponse) {
     }
 
     if(request.action === 'claim-current-profile-tab-action') {
-        return (async () => {
-            if(!request.queuedAction) {
-                await refreshCoordinatorQueueFromRuntime().catch(() => null)
-            }
-            const nextProfileAction = request.queuedAction && typeof request.queuedAction === 'object'
-                ? request.queuedAction
-                : undefined
-            if(getPageType() !== 'profile' && !canResolveQueuedProfileFromCurrentPage(nextProfileAction || {})) {
-                return {accepted: false, reason: 'not-profile'}
-            }
-            autoProfileAction = nextProfileAction
-            autoProfileActionAttempts = 0
-            void maybeRecordAlreadyBlockedCoordinatorProfile()
-            void maybeRunAutoProfileAction()
-            scheduleCurrentProfilePendingClaimRescue(500)
-            return {accepted: true, reason: request.reason || ''}
-        })()
+        return acceptQueuedProfileActionClaim(request)
     }
 
     if(request.action === 'get-profile-action-surface-state') {
@@ -2368,9 +2418,28 @@ function onMessage(request, sender, sendResponse) {
         case 'question-log-loaded':
             scheduleOriginalPosterRedirect()
             break
+        case QUEUE_BAR_PUSH_ACTION:
+            void refreshContentProgressBar(request.summary ?? null)
+            break
+        case PROFILE_NUKE_PROGRESS_PUSH_ACTION:
+            // The worker pushes this when progress changed (decision 31). The page asks for its scoped state again, the same request it makes on load.
+            scheduleContentPageStateProjectionRefresh()
+            break
         default:
+            reportUnhandledContentMessage(request, sender)
             break
     }
+}
+
+// review-2 C-7: a message that matches no handler was dropped without a trace. This reports the ones this extension sent with an
+// action or status that nothing here handles. Messages from other senders are not reported.
+function reportUnhandledContentMessage(request = {}, sender = {}) {
+    const action = `${request?.action || ''}`.trim()
+    const status = `${request?.status || ''}`.trim()
+    if(!action && !status) return false
+    if(!sender || sender.id !== browser.runtime?.id) return false
+    console.info(`Unhandled content-script message: action=${action || '-'}, status=${status || '-'}`)
+    return true
 }
 
 function ensureQuestionPageFOPBtn() {
@@ -3828,28 +3897,25 @@ function removeContentProgressBar() {
     contentProgressBarEl = null
 }
 
-async function refreshContentProgressBar() {
+// The queue bar (coder-instructions-2026-10-18.md, section 4 item 2). The summary comes from the worker by runtime message on load,
+// or as the summary the worker pushed (QUEUE_BAR_PUSH_ACTION). Nothing is read from storage for it, and a failed request shows no
+// bar. The paused flag is still read from storage.local.
+async function refreshContentProgressBar(pushedSummary = undefined) {
     if(!document.body) return
 
-    const stored = await safeStorageGet({
-        [COORDINATOR_QUEUE_VIEW_KEY]: null,
-        [COORDINATOR_PAUSED_KEY]: false
-    }).catch(() => null)
-    const view = stored?.[COORDINATOR_QUEUE_VIEW_KEY]
+    const [stored, reply] = await Promise.all([
+        safeStorageGet({[COORDINATOR_PAUSED_KEY]: false}).catch(() => null),
+        pushedSummary !== undefined
+            ? Promise.resolve({summary: pushedSummary})
+            : Promise.resolve().then(() => browser.runtime.sendMessage({action: QUEUE_BAR_GET_ACTION})).catch(() => null)
+    ])
     const paused = !!stored?.[COORDINATOR_PAUSED_KEY]
-    const hasView = !!view && typeof view === 'object' && Array.isArray(view.items)
-    const total = hasView ? (Number.parseInt(view.total, 10) || 0) : 0
-    const counts = hasView && view.counts && typeof view.counts === 'object' ? view.counts : {}
-    const pending = [...PENDING_COORDINATOR_STATUSES].reduce(
-        (sum, status) => sum + (Number.parseInt(counts[status], 10) || 0),
-        0
-    )
-    const terminal = Math.max(0, total - pending)
+    const display = getQueueBarDisplay(reply?.summary || null, paused)
 
     // Vanish when there's nothing queued, the batch is fully done, or the
     // queue is paused -- this is meant to be an ambient signal that work is
     // actively happening, not a persistent fixture.
-    if(!hasView || total <= 0 || paused || terminal >= total) {
+    if(!display.visible) {
         removeContentProgressBar()
         return
     }
@@ -3857,8 +3923,8 @@ async function refreshContentProgressBar() {
     const bar = getOrCreateContentProgressBar()
     const fill = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-fill`)
     const count = bar.querySelector(`.${CONTENT_PROGRESS_BAR_ID}-count`)
-    if(fill) fill.style.width = `${Math.min(100, Math.round((terminal / total) * 100))}%`
-    if(count) count.textContent = `${terminal} / ${total}`
+    if(fill) fill.style.width = `${display.percent}%`
+    if(count) count.textContent = `${display.terminal} / ${display.total}`
 }
 
 function installContentProgressBarStorageListener() {
@@ -3872,7 +3938,8 @@ function installContentProgressBarStorageListener() {
     // of that page-type-specific gating.
     source.addListener((changes, areaName) => {
         if(areaName !== 'local') return
-        if(changes[COORDINATOR_QUEUE_VIEW_KEY] || changes[COORDINATOR_PAUSED_KEY]) {
+        // The queue view is no longer stored, so only the paused flag changes the bar from storage. The summary arrives by message.
+        if(changes[COORDINATOR_PAUSED_KEY]) {
             void refreshContentProgressBar()
         }
     })
@@ -4284,20 +4351,6 @@ function isProfileActionMenuOpen() {
     })
 }
 
-function getDialogAction(regex) {
-    const dialogRoots = getDialogRoots()
-
-    const match = findOverlayAction(regex, dialogRoots)
-    if(match) return match
-
-    if(dialogRoots.length) {
-        const primary = getDialogPrimaryAction(dialogRoots, regex)
-        if(primary) return primary
-    }
-
-    return getGlobalPrimaryAction(regex)
-}
-
 function getVisibleActionButtons(root) {
     return Array.from(root.querySelectorAll('button, [role="button"], a')).filter(button => {
         return !shouldIgnoreActionCandidate(button) && isVisible(button)
@@ -4573,7 +4626,9 @@ function scoreActionCandidate(candidate, preferredRegex = null, rootText = '') {
     return score
 }
 
-function getGlobalPrimaryAction(preferredRegex = null) {
+function getGlobalPrimaryAction(preferredRegex) {
+    // Only ever called with a label regex (review-2 C-4). Without one there is no action, so the unscoped search is gone.
+    if(!(preferredRegex instanceof RegExp)) return null
     // This scans the WHOLE document, not just a dialog -- unlike
     // getDialogPrimaryAction, there's no overlay root to scope the search to.
     // scoreActionCandidate's styling/position heuristics (e.g. +80 for a
@@ -4586,7 +4641,6 @@ function getGlobalPrimaryAction(preferredRegex = null) {
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(candidate => !shouldIgnoreActionCandidate(candidate) && isVisible(candidate))
         .filter(candidate => {
-            if(!preferredRegex) return true
             const label = `${candidate.getAttribute('aria-label') || ''} ${getElementText(candidate)}`.trim()
             return preferredRegex.test(label)
         })
@@ -4823,25 +4877,23 @@ function isProfileBlockedFromInlineState() {
         return false
     }
 
-    const lowerProfilePath = profilePath.toLowerCase()
-
+    // Case-sensitive, like every profile comparison (owner, 14 Oct): a script that mentions a case variant of this path is not this profile.
     for(const script of Array.from(document.scripts || [])) {
         const text = script.textContent || ''
-        const lowerText = text.toLowerCase()
-        if(!text || !lowerText.includes(lowerProfilePath)) continue
+        if(!text || !text.includes(profilePath)) continue
 
         let searchFrom = 0
         let matchesScanned = 0
 
         while(matchesScanned < 10) {
-            const index = lowerText.indexOf(lowerProfilePath, searchFrom)
+            const index = text.indexOf(profilePath, searchFrom)
             if(index < 0) break
 
             const contextStart = Math.max(0, index - 4000)
             const contextEnd = Math.min(text.length, index + profilePath.length + 4000)
             if(hasInlineBlockedStateMarker(text.slice(contextStart, contextEnd))) return true
 
-            searchFrom = index + lowerProfilePath.length
+            searchFrom = index + profilePath.length
             matchesScanned += 1
         }
     }
@@ -4964,6 +5016,7 @@ function scheduleCloseTabFollowUps(delays = [500, 1500, 4000, 10000, 30000, 6000
 }
 
 async function requestCloseTab(attempts = 3, delayMs = 150, scheduleFollowUps = true) {
+    markQueuedTabFinishing()
     if(scheduleFollowUps) scheduleCloseTabFollowUps()
 
     for(let attempt = 0; attempt < attempts; attempt++) {
@@ -5493,7 +5546,8 @@ function getQuoraProfileSlugData(href) {
         const url = new URL(normalizedHref)
         const slug = url.pathname.replace(/^\/profile\//i, '')
         const decodedSlug = decodeURIComponent(slug)
-        const normalizedSlug = decodedSlug.normalize('NFKC')
+        // NFC, not NFKC, as in sanitizeProfileHrefSlug: a fullwidth lookalike is not folded onto the real profile (review 4, R4-1).
+        const normalizedSlug = decodedSlug.normalize('NFC')
         if(!normalizedSlug) return null
 
         return {
@@ -5511,7 +5565,8 @@ function getNormalizedProfileIdentityKey(href) {
     const slugData = getQuoraProfileSlugData(href)
     if(!slugData) return ''
 
-    return slugData.normalizedSlug.toLocaleLowerCase()
+    // Owner, 14 Oct: case-sensitive, so a case variant is a different identity and is not merged with the real profile.
+    return slugData.normalizedSlug
 }
 
 function getNormalizedProfileHrefList(urls) {
@@ -5530,37 +5585,8 @@ function getNormalizedProfileHrefList(urls) {
         })
     }
 
-    return normalizedEntries
-        .filter((entry, _, entries) => !isLikelyTruncatedProfileIdentityKey(entry.identityKey, entries))
-        .map(entry => entry.href)
-}
-
-function isLikelyTruncatedProfileIdentityKey(identityKey, entries) {
-    const value = `${identityKey || ''}`
-
-    return entries.some(entry => {
-        const other = `${entry?.identityKey || ''}`
-        if(other === value || !other.startsWith(value) || other.length < value.length + 2) {
-            return false
-        }
-
-        if(/^[a-z]{1,3}$/i.test(value) && other.length >= value.length + 3) {
-            return true
-        }
-
-        const remainder = other.slice(value.length)
-        if(/^-\d+(?:-|$)/i.test(remainder)) {
-            return true
-        }
-
-        const tokens = value.split('-').filter(Boolean)
-        const lastToken = `${tokens[tokens.length - 1] || ''}`
-        if(lastToken.length >= 1 && lastToken.length <= 3 && /^[a-z0-9]+(?:-|$)/i.test(remainder)) {
-            return true
-        }
-
-        return false
-    })
+    // Owner, 15 Oct: no candidate is dropped for being a prefix of a longer identity, so Jane and Jane-7 are two profiles.
+    return normalizedEntries.map(entry => entry.href)
 }
 
 function normalizeQuoraPostHref(href) {
@@ -5773,32 +5799,6 @@ function rememberVisibleProfileDisplayNames(root) {
     }
 }
 
-function getTrailingTitleNameCandidate(text) {
-    const normalized = `${text || ''}`.replace(/\s+/g, ' ').trim()
-    if(!normalized) return ''
-
-    const patterns = [
-        /[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})$/,
-        /[.?!]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})$/
-    ]
-
-    for(const pattern of patterns) {
-        const match = normalized.match(pattern)
-        if(match?.[1]) return match[1].trim()
-    }
-
-    return ''
-}
-
-function getProfileSlugText(href) {
-    const slugData = getQuoraProfileSlugData(href)
-    if(!slugData) return ''
-
-    const cleanSlug = sanitizeProfileDisplaySlug(slugData.normalizedSlug)
-
-    return cleanSlug.replace(/-/g, ' ').toLocaleLowerCase()
-}
-
 function getProfileDisplayName(href) {
     const normalizedHref = normalizeQuoraProfileHref(href)
     const cachedName = normalizedHref ? profileDisplayNamesByHref[normalizedHref] : ''
@@ -5812,12 +5812,9 @@ function getProfileDisplayName(href) {
     return cleanSlug
 }
 
+// Owner, 15 Oct: no suffix is stripped for display either, until a live example proves one must go.
 function sanitizeProfileDisplaySlug(slug) {
-    return sanitizeProfileHrefSlug(
-        `${slug || ''}`
-            .replace(/(?:^|[-_\s])(?:ch|oid|share|srid|target_type)=.*$/i, '')
-            .replace(/(?:[-_\s])(?:https?|amp|ch|oid|share|srid|target|target_type|type)(?:[-_\s].*)?$/i, '')
-    )
+    return sanitizeProfileHrefSlug(slug)
 }
 
 function buildNukeTargetsHelpText(baseText, urls) {
@@ -5841,45 +5838,6 @@ function buildNukeTargetsHelpText(baseText, urls) {
         'Will nuke:',
         ...previewEntries
     ].join('\n')
-}
-
-function getNearbyProfileUrlsForName(postRoot, nameCandidate, excludedHref = '') {
-    if(!postRoot || !nameCandidate) return []
-
-    const candidate = nameCandidate.toLowerCase()
-    const scopes = []
-
-    for(const nextScope of [
-        postRoot.parentElement,
-        postRoot.closest('.dom_annotate_multifeed_bundle_TribeContentBundle'),
-        postRoot.closest('.dom_annotate_multifeed_tribe_top_items'),
-        getSpaceFeedContentRoot()
-    ]) {
-        if(nextScope && !scopes.includes(nextScope)) {
-            scopes.push(nextScope)
-        }
-    }
-
-    for(const scope of scopes) {
-        const matches = []
-        const seen = new Set()
-
-        for(const link of getQuoraProfileLinks(scope)) {
-            const href = normalizeQuoraProfileHref(link.href)
-            if(!href || href === excludedHref || seen.has(href)) continue
-
-            const linkText = getElementText(link).toLowerCase()
-            const slugText = getProfileSlugText(href)
-            if(!linkText.includes(candidate) && !slugText.includes(candidate)) continue
-
-            seen.add(href)
-            matches.push(href)
-        }
-
-        if(matches.length === 1) return matches
-    }
-
-    return []
 }
 
 function getOriginalPosterProfileHrefFromInlineData() {
@@ -5959,9 +5917,14 @@ function getOriginalPosterProfileHrefFromInlinePayloads() {
     return null
 }
 
-function getOriginalPosterProfileHref() {
+// The sink, when given, records which step found the profile: 'inline' (the page's own data) or 'scored' (the keyword scan of
+// visible links). The scan is the only resolver step that guesses from the page, so the live-check card counts it (owner, 15 Oct).
+function getOriginalPosterProfileHref(sink = null) {
     const inlineProfileHref = getOriginalPosterProfileHrefFromInlineData()
-    if(inlineProfileHref) return inlineProfileHref
+    if(inlineProfileHref) {
+        if(sink) sink.source = 'inline'
+        return inlineProfileHref
+    }
 
     const main = document.querySelector('#mainContent, main, [role="main"]') || document.body
     if(!main) return null
@@ -5972,7 +5935,9 @@ function getOriginalPosterProfileHref() {
         .filter(entry => entry.score > 0)
 
     profileLinks.sort((left, right) => right.score - left.score)
-    return normalizeQuoraProfileHref(profileLinks[0]?.link.href) || null
+    const scoredProfileHref = normalizeQuoraProfileHref(profileLinks[0]?.link.href) || null
+    if(scoredProfileHref && sink) sink.source = 'scored'
+    return scoredProfileHref
 }
 
 function scoreOriginalPosterLink(link) {
@@ -6677,7 +6642,8 @@ function getStoredSpaceRecord(space) {
     if(exactRecord) return exactRecord
 
     const targetUrl = normalizeSpaceUrl(space.url || '')
-    const targetSlug = `${space.slug || extractSpaceSlug(targetUrl) || ''}`.trim().toLowerCase()
+    // Case-sensitive, like every identity comparison (owner, 14 Oct).
+    const targetSlug = `${space.slug || extractSpaceSlug(targetUrl) || ''}`.trim()
 
     for(const record of Object.values(spaceRegistry)) {
         if(!record || typeof record !== 'object') continue
@@ -6687,7 +6653,7 @@ function getStoredSpaceRecord(space) {
             return record
         }
 
-        const recordSlug = `${record.slug || extractSpaceSlug(recordUrl) || ''}`.trim().toLowerCase()
+        const recordSlug = `${record.slug || extractSpaceSlug(recordUrl) || ''}`.trim()
         if(targetSlug && recordSlug && recordSlug === targetSlug) {
             return record
         }
@@ -7232,7 +7198,8 @@ function getSpaceFeedPostKey(postRoot, timestamp) {
     const snippet = getElementText(postRoot).replace(/\s+/g, ' ').trim().slice(0, 120)
     if(!snippet) return ''
 
-    return `space-post-text:${snippet.toLowerCase()}`
+    // Exact text, not lower-cased (owner, 14 Oct): two posts whose text differs only in case are different posts.
+    return `space-post-text:${snippet}`
 }
 
 function getSpaceFeedProfileLinkCardRoot(link) {
@@ -7543,15 +7510,8 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
         }
     }
 
-    if(!urls.length) {
-        const titleAnchor = postRoot.querySelector('.qu-fontWeight--bold a[href], a.post_timestamp')
-        const titleNameCandidate = getTrailingTitleNameCandidate(getElementText(titleAnchor) || getElementText(postRoot))
-
-        for(const href of getNearbyProfileUrlsForName(postRoot, titleNameCandidate, headerProfileHref)) {
-            addUrl(href, makeSpaceFeedCandidateEvidence('nearby-profile-name', SPACE_FEED_CANDIDATE_CONFIDENCE_MEDIUM))
-        }
-    }
-
+    // A post with no profile link is not matched to a profile by a name in its title (review 4, R4-2). A name match queued and
+    // nuked profiles that only contained the name, so the page resolver reads the profile from the post instead.
     return attachSpaceFeedCandidateMetadata(urls, candidateEvidenceByHref, needsSourceResolution)
 }
 
@@ -9226,9 +9186,16 @@ function isSourcePostResolutionReason(reason = '') {
     ].includes(`${reason || ''}`.trim())
 }
 
-function getQueuedPageResolvedProfileHref(claimedAction = {}) {
+// Records in the sink which step gave the resolved profile: header, inline, scored, explicit, listed or url. The href is the same
+// with or without a sink (owner, 15 Oct: the live-check card counts the steps).
+function noteQueuedResolution(sink, source, href) {
+    if(sink) sink.source = href ? source : ''
+    return href
+}
+
+function getQueuedPageResolvedProfileHref(claimedAction = {}, sink = null) {
     const pageType = getPageType()
-    if(pageType === 'profile') return normalizeQuoraProfileHref(location.href)
+    if(pageType === 'profile') return noteQueuedResolution(sink, 'url', normalizeQuoraProfileHref(location.href))
     if(pageType === 'space-post') {
         const resolutionReason = `${claimedAction?.resolutionReason || ''}`.trim()
         const explicitProfileHref = getSingleSpacePostResolutionProfileHref({explicitOnly: true})
@@ -9236,24 +9203,32 @@ function getQueuedPageResolvedProfileHref(claimedAction = {}) {
             `${claimedAction?.resolutionMode || ''}`.trim() === QUEUED_PROFILE_RESOLUTION_MODE ||
             isSourcePostResolutionReason(resolutionReason)
         if(resolutionReason === 'low-confidence-profile-artifact') {
-            return explicitProfileHref
+            return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
         }
         if(isQueuedResolution) {
-            if(isAssetSpacePage()) return explicitProfileHref
+            if(isAssetSpacePage()) return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
 
-            return getSpacePostHeaderProfileHref() ||
-                getOriginalPosterProfileHref() ||
-                explicitProfileHref
+            const queuedHeaderHref = getSpacePostHeaderProfileHref()
+            if(queuedHeaderHref) return noteQueuedResolution(sink, 'header', queuedHeaderHref)
+
+            const queuedOriginalPosterSink = {}
+            const queuedOriginalPosterHref = getOriginalPosterProfileHref(queuedOriginalPosterSink)
+            if(queuedOriginalPosterHref) {
+                return noteQueuedResolution(sink, queuedOriginalPosterSink.source || 'scored', queuedOriginalPosterHref)
+            }
+
+            return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
         }
         const listedProfileLinks = getSpacePostListedProfileLinks()
-        if(listedProfileLinks.length === 1) return listedProfileLinks[0]
+        if(listedProfileLinks.length === 1) return noteQueuedResolution(sink, 'listed', listedProfileLinks[0])
 
-        return getSpacePostHeaderProfileHref() ||
-            getOriginalPosterProfileHref() ||
-            null
+        const headerProfileHref = getSpacePostHeaderProfileHref()
+        if(headerProfileHref) return noteQueuedResolution(sink, 'header', headerProfileHref)
+
+        return getOriginalPosterProfileHref(sink)
     }
     if(pageType === 'question' || pageType === 'question-log') {
-        return getOriginalPosterProfileHref()
+        return getOriginalPosterProfileHref(sink)
     }
 
     return null
@@ -9538,6 +9513,8 @@ function getSpaceFeedProfilePostAssociations(entries) {
         const postKey = entry?.postKey || ''
         const postUrl = entry?.postUrl || ''
         const candidateEvidenceByHref = entry?.candidateEvidenceByHref || {}
+        // Decision 12 (18 Oct): the post's full candidate list, normalized, goes on each evidence record written at enqueue.
+        const postCandidateUrls = [...new Set((entry.candidateUrls || []).map(url => normalizeQuoraProfileHref(url)).filter(Boolean))]
 
         for(const url of entry.candidateUrls || []) {
             const normalized = normalizeQuoraProfileHref(url)
@@ -9574,7 +9551,8 @@ function getSpaceFeedProfilePostAssociations(entries) {
                     confidence: candidateEvidence.confidence || '',
                     source: candidateEvidence.source || '',
                     rawSlug: candidateEvidence.rawSlug || '',
-                    sourcePageUrl: location.href
+                    sourcePageUrl: location.href,
+                    ...(postCandidateUrls.length ? {candidateUrls: postCandidateUrls} : {})
                 })
             }
         }
@@ -11448,6 +11426,30 @@ async function nukeModalProfiles() {
     }
 }
 
+// Measurement only (review-2 C-3). Each claim retry loop reports to the worker once, the first time it reaches
+// CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES passes on this page. No loop stops at that count, so it sets no ceiling.
+const claimRetryPassCounts = {}
+// Measurement only (owner, 15 Oct): the live-check card counts these in the worker. Nothing is decided from them here.
+function noteLiveCheck(check) {
+    void safeSendRuntimeMessage({
+        action: 'content-live-check',
+        check
+    }).catch(() => null)
+}
+
+function noteClaimRetryPass(loop) {
+    const passes = (claimRetryPassCounts[loop] || 0) + 1
+    claimRetryPassCounts[loop] = passes
+    if(passes !== CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES) return
+
+    void safeSendRuntimeMessage({
+        action: 'content-claim-retry-hit',
+        loop,
+        passes,
+        href: location.href
+    }).catch(() => null)
+}
+
 async function maybeRunAutoProfileAction() {
     if(autoProfileActionPending || autoProfileActionClaimPending) return
 
@@ -11469,6 +11471,7 @@ async function maybeRunAutoProfileAction() {
             // transient SW hiccup a chance to self-heal instead of stranding
             // the tab for its full retry-budget lifetime.
             void refreshContentPageCoordinatorStateFromRuntime()
+            noteClaimRetryPass('queue-not-loaded')
             setTimeout(() => void maybeRunAutoProfileAction(), QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS)
             return
         }
@@ -11487,17 +11490,22 @@ async function maybeRunAutoProfileAction() {
 
         if(!autoProfileAction) {
             autoProfileAction = undefined
+            // The claim found no action, so a push held during the claim has nothing else to run it: take it.
+            if(releaseHeldQueuedProfileActionClaim()) return
             const shouldKeepRetrying = autoProfileActionAttempts < QUEUED_ACTION_CLAIM_FAST_ATTEMPTS ||
                 hasCurrentProfilePendingCoordinatorQueueItem()
             if(shouldKeepRetrying) {
                 const retryDelay = autoProfileActionAttempts < QUEUED_ACTION_CLAIM_FAST_ATTEMPTS
                     ? QUEUED_ACTION_CLAIM_FAST_RETRY_DELAY_MS
                     : QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS
+                noteClaimRetryPass('claim-retry')
                 setTimeout(() => void maybeRunAutoProfileAction(), retryDelay)
                 scheduleCurrentProfilePendingClaimRescue(retryDelay)
             }
             return
         }
+        // The tab's own claim answered with an action: that is the worker's current assignment, so a push held during the claim is superseded.
+        heldQueuedClaim = null
     }
 
     const claimedAction = typeof autoProfileAction === 'string'
@@ -11507,6 +11515,7 @@ async function maybeRunAutoProfileAction() {
     if(claimedAction?.action !== 'nuke' && claimedAction?.action !== UNBLOCK_UNMUTE_ACTION_KIND) {
         autoProfileAction = undefined
         if(hasCurrentProfilePendingCoordinatorQueueItem()) {
+            noteClaimRetryPass('pending-item-retry')
             setTimeout(() => void maybeRunAutoProfileAction(), QUEUED_ACTION_CLAIM_SLOW_RETRY_DELAY_MS)
             scheduleCurrentProfilePendingClaimRescue()
         }
@@ -11519,6 +11528,7 @@ async function maybeRunAutoProfileAction() {
         : 'mute-block'
 
     autoProfileActionPending = true
+    queuedTabFinishing = false
     autoProfileAction = null
     autoProfileActionAttempts = 0
 
@@ -11595,6 +11605,7 @@ async function maybeRunAutoProfileAction() {
                 ...patch
             })
             if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+                markQueuedTabFinishing()
                 console.info('Queued terminal success was not recorded; leaving tab open for retry')
                 setTimeout(() => {
                     void sweepServiceWorkerBlockedProfileTabs()
@@ -11642,6 +11653,7 @@ async function maybeRunAutoProfileAction() {
         }
         const abandonQueuedTab = async (message, extraPatch = {}) => {
             console.info(message)
+            if(/\bdid not land on a profile page\b/.test(`${message || ''}`)) noteLiveCheck('did-not-land')
             await recordQueuedProfileProgress({
                 status: 'error',
                 openedViablePage: false,
@@ -11673,8 +11685,11 @@ async function maybeRunAutoProfileAction() {
             if(!canResolveQueuedProfileFromCurrentPage(claimedAction)) return false
 
             let resolvedProfileHref = ''
+            let resolvedSource = ''
             for(let attempt = 0; attempt < 10; attempt += 1) {
-                resolvedProfileHref = normalizeQuoraProfileHref(getQueuedPageResolvedProfileHref(claimedAction) || '') || ''
+                const resolution = {}
+                resolvedProfileHref = normalizeQuoraProfileHref(getQueuedPageResolvedProfileHref(claimedAction, resolution) || '') || ''
+                resolvedSource = resolution.source || ''
                 if(resolvedProfileHref) break
                 await sleep(350 + attempt * 100)
             }
@@ -11686,6 +11701,7 @@ async function maybeRunAutoProfileAction() {
                 coordinatorKey: claimedAction?.coordinatorKey || '',
                 requestedUrl: claimedAction?.requestedUrl || location.href,
                 profileHref: resolvedProfileHref,
+                resolutionSource: resolvedSource,
                 attemptId: activeQueuedAttemptId || '',
                 attemptNumber: activeQueuedAttemptNumber || 0
             })
@@ -12048,6 +12064,16 @@ async function maybeRunAutoProfileAction() {
                 return
             }
 
+            // review-2 C-1, same defect on the unblock path: the page resolved to another profile, so nothing here may be
+            // unblocked or unmuted, or recorded as the queued profile's success.
+            const remappedUnblockProfileHref = getQueuedProfileRemapTarget(queuedProfileHref)
+            if(remappedUnblockProfileHref) {
+                await recordQueuedProfileProgress({
+                    event: `Profile remapped to ${remappedUnblockProfileHref}`
+                })
+                return
+            }
+
             const initialReadyTimeoutMs = document.visibilityState === 'visible'
                 ? VISIBLE_PROFILE_READY_MS
                 : allowForegroundFallback
@@ -12131,6 +12157,7 @@ async function maybeRunAutoProfileAction() {
                     event: wasBlocked ? 'Queued Unblock Unmute completed' : 'Queued profile was already unblocked'
                 })
                 if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
+                    markQueuedTabFinishing()
                     console.info('Queued terminal unblock/unmute success was not recorded; leaving tab open for retry')
                     return
                 }
@@ -12176,11 +12203,14 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
+        // review-2 C-1: the page resolved to another profile than the one this action was claimed for. Nothing on it may be
+        // blocked, muted or marked blocked for the queued profile. The worker's redirect check ends the row and closes the tab.
         const remappedProfileHref = getQueuedProfileRemapTarget(queuedProfileHref)
         if(remappedProfileHref) {
             await recordQueuedProfileProgress({
                 event: `Profile remapped to ${remappedProfileHref}`
             })
+            return
         }
 
         if(isProfileBlocked()) {
@@ -12356,6 +12386,7 @@ async function maybeRunAutoProfileAction() {
         activeQueuedAttemptProfileHref = ''
         activeQueuedNoForegroundFallback = false
         activeQueuedActionSurfaceMode = ''
+        releaseHeldQueuedProfileActionClaim()
     }
 }
 

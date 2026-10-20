@@ -339,11 +339,35 @@ function createQueuedTabActionAuthorityMatching(deps = {}) {
         return true
     }
 
+    // The startup grace: a tab whose startup anchor is younger than QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS is not
+    // checked against authority yet. Written as the negated >= test so that a NaN clock keeps the answer the check gave
+    // before this grace was shared.
+    function isQueuedTabStartupGraceActive(metadata = null, nowMs = now()) {
+        const startupAnchor = getFreshQueuedTabRuntimeStartupAnchor(metadata)
+        return !!startupAnchor && !(nowMs - startupAnchor >= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS)
+    }
+
     function shouldCheckQueuedTabRuntimeAuthority(metadata = null, nowMs = now()) {
         if(metadata?.closeRequestedAt || metadata?.closeReason) return false
+        return !isQueuedTabStartupGraceActive(metadata, nowMs)
+    }
 
-        const startupAnchor = getFreshQueuedTabRuntimeStartupAnchor(metadata)
-        return !startupAnchor || nowMs - startupAnchor >= QUEUED_TAB_UNCONFIRMED_ACTIVE_RECONCILE_MS
+    // The pending-action test the stale sweep applies before it closes an active tab (sweepStaleQueuedTabs in sw.js). A
+    // pending action holds the tab only when it belongs to the same attempt as the tab's metadata.
+    function hasPendingActionForQueuedTabAttempt(tabId = null, metadata = null) {
+        const pendingAction = queueRuntime.getPendingTabAction(tabId)
+        if(!pendingAction) return false
+        return (!getAttemptIdFromValue(metadata) || getAttemptIdFromValue(pendingAction) === getAttemptIdFromValue(metadata)) &&
+            (!getAttemptNumberFromValue(metadata) || getAttemptNumberFromValue(pendingAction) === getAttemptNumberFromValue(metadata))
+    }
+
+    // When a stale queue-opened tab may close: not inside the startup grace, and not while an action is pending for it.
+    // The caller decides that the tab is stale (the attempt-mismatch test) before asking. The sweep's stale-timeout path
+    // applies the pending half, and so does the sweep's attempt-mismatch release (releaseQueuedTabRuntimeIfAuthorityNotActive,
+    // when called with deferForPendingAction). The unconfirmed-transition release (releaseUnconfirmedQueuedTabIfAuthorityNotActive)
+    // and the other callers of the authority release apply only the grace half.
+    function shouldDeferStaleQueuedTabClose(tabId = null, metadata = null, nowMs = now()) {
+        return isQueuedTabStartupGraceActive(metadata, nowMs) || hasPendingActionForQueuedTabAttempt(tabId, metadata)
     }
 
     return {
@@ -361,7 +385,9 @@ function createQueuedTabActionAuthorityMatching(deps = {}) {
         getQueuedTabUnconfirmedActiveTransitionAt,
         coordinatorItemMatchesQueuedTabRuntime,
         coordinatorQueuedItemMatchesRuntimeCandidate,
-        shouldCheckQueuedTabRuntimeAuthority
+        shouldCheckQueuedTabRuntimeAuthority,
+        hasPendingActionForQueuedTabAttempt,
+        shouldDeferStaleQueuedTabClose
     }
 }
 
