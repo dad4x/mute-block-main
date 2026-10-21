@@ -2628,6 +2628,23 @@ function commitRunsDiskWrite(write = {}) {
     if (write.migrated) runsLayout.bucketed = true
 }
 
+// Diagnostic only (B15a): compares the resident run list with the buckets last written or loaded, and records a gap
+// when they differ. Writes nothing. Compares against the disk baseline, so a run changed in memory with no write shows here.
+function recordRunsResidentDiskGap(residentRuns = {}, source = '') {
+    if (!runsLayout.bucketed || !runsLayout.hash) return
+    const runs = residentRuns || {}
+    const gap = changedSpaceMapBuckets(COORDINATOR_RUNS_KEY, runs, runsLayout.hash)
+    const gapBuckets = Object.keys(gap.changed)
+    if (!gapBuckets.length) return
+    recordFlightRecorderEvent({
+        kind: 'runs-disk-gap',
+        source,
+        residentRunCount: Object.keys(runs).length,
+        gapBucketCount: gapBuckets.length,
+        gapBuckets: gapBuckets.slice(0, 8).join(',')
+    })
+}
+
 async function metricStorageSet(payload = {}, options = {}) {
     const storageContext = getActiveStorageContext()
     if(payload &&
@@ -11925,6 +11942,7 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
         })
         if(stateSaved === false) saved = false
     }
+    recordRunsResidentDiskGap(nextRuns, 'reconcile-tail')
     if(ctx.terminalSettlementHrefs.size) {
         const terminalSettlementHrefs = Array.from(ctx.terminalSettlementHrefs)
         const terminalSettlementHrefsThisPass = terminalSettlementHrefs.slice(0, COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE)
