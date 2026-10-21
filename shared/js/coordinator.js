@@ -22,7 +22,6 @@ const {readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMa
 const defaults = require('./defaults')
 const {SOFT_FAIL_RETRY_LIMIT} = require('./tunables')
 const {
-    COORDINATOR_EVENTS_KEY,
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     COORDINATOR_PAUSED_KEY,
     COORDINATOR_QUEUE_VIEW_KEY,
@@ -757,10 +756,40 @@ async function clearAllStats() {
     render()
 }
 
+// Events come from the flight recorder's event channel (events-to-flight-recorder design, B7a and B11b): the newest
+// MAX_DASHBOARD_EVENTS, shaped as the event list has always been shaped. Nothing is read from storage for them.
+const MAX_DASHBOARD_EVENTS = 500
+const FLIGHT_RECORDER_EVENT_RESERVED_FIELDS = new Set(['kind', 'channel', 'at', 'seq', 'message', 'runId', 'rowKey'])
+
+function flightRecorderEntryToEvent(entry = {}) {
+    const details = {}
+    for(const [field, value] of Object.entries(entry || {})) {
+        if(!FLIGHT_RECORDER_EVENT_RESERVED_FIELDS.has(field)) details[field] = value
+    }
+    return {
+        id: `fr-${entry?.seq || 0}`,
+        type: `${entry?.kind || ''}`,
+        message: `${entry?.message || ''}`,
+        at: Number(entry?.at) || 0,
+        runId: `${entry?.runId || ''}`,
+        itemId: `${entry?.rowKey || ''}`,
+        details
+    }
+}
+
+async function loadEventsFromFlightRecorder() {
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'get-flight-recorder',
+        channel: 'event',
+        limit: MAX_DASHBOARD_EVENTS
+    }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(!result || !Array.isArray(result.entries)) return []
+    return result.entries.map(flightRecorderEntryToEvent).slice(-MAX_DASHBOARD_EVENTS)
+}
+
 async function loadState() {
     const stored = await browser.storage.local.get({
         [COORDINATOR_RUNS_KEY]: {},
-        [COORDINATOR_EVENTS_KEY]: [],
         [QUEUE_WAKEUP_METRICS_VIEW_KEY]: {},
         [SPACE_REGISTRY_KEY]: {},
         [HIDDEN_RUNS_KEY]: [],
@@ -802,7 +831,7 @@ async function loadState() {
     if(!refreshed.runsRefreshed) {
         state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
     }
-    state.events = normalizeEvents(stored[COORDINATOR_EVENTS_KEY])
+    state.events = await loadEventsFromFlightRecorder()
     if(hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
         state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])
     }

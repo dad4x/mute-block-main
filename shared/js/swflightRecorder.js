@@ -133,11 +133,13 @@ function getFlightRecorderSnapshot(request = {}) {
         ))
         const sinceSeq = Math.max(0, Number.parseInt(request?.sinceSeq, 10) || 0)
         const kind = sanitizeFlightRecorderString(request?.kind || "")
+        const channel = sanitizeFlightRecorderString(request?.channel || "")
         const rowKey = sanitizeFlightRecorderString(request?.rowKey || "")
         const targetUrl = sanitizeFlightRecorderUrl(request?.targetUrl || "")
         let entries = getFlightRecorderEntriesOrdered()
             .filter(entry => entry.seq > sinceSeq)
         if(kind) entries = entries.filter(entry => entry.kind === kind)
+        if(channel) entries = entries.filter(entry => entry.channel === channel)
         if(rowKey) entries = entries.filter(entry => entry.rowKey === rowKey)
         if(targetUrl) entries = entries.filter(entry => entry.targetUrl === targetUrl)
         entries = entries.slice(Math.max(0, entries.length - limit))
@@ -164,6 +166,11 @@ function getFlightRecorderSnapshot(request = {}) {
 
 function getFlightRecorder(request = {}) {
     return Promise.resolve(getFlightRecorderSnapshot(request))
+}
+
+// Clears the ring (the dashboard's Clear Events). The sequence keeps counting, and empty slots are skipped by the reader.
+function clearFlightRecorderEntries() {
+    flightRecorderEntries.fill(undefined)
 }
 
 function __testResetFlightRecorder() {
@@ -213,6 +220,7 @@ function seedFlightRecorderFromPersisted(persisted = null) {
 module.exports = {
     FLIGHT_RECORDER_CAPACITY,
     __testResetFlightRecorder,
+    clearFlightRecorderEntries,
     getFlightRecorder,
     getFlightRecorderSnapshot,
     getFlightRecorderPersistableSnapshot,

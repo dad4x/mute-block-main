@@ -47,6 +47,8 @@
 // through as get/set state accessors here, matching the
 // swQueueWakeupMetricsShape.js convention, rather than moved.
 
+const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
+
 function createCoordinatorJobEnvelope(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const {
@@ -75,6 +77,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
         getAttemptNumberFromValue,
         incrementQueueWakeupMetric,
         recordQueueWakeupMetricMax,
+        recordFlightRecorderEvent,
         getStorageUpdateDepth,
         getQueueRuntimeCounts
     } = deps.handlers || {}
@@ -325,10 +328,9 @@ function createCoordinatorJobEnvelope(deps = {}) {
 
     function recordCoordinatorDiagnosticEvent(type = 'coordinator-diagnostic', message = '', details = {}) {
         const event = {
-            id: makeId('event'),
+            type: `${type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic',
             runId: details?.runId || '',
             itemId: details?.itemId || '',
-            type: `${type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic',
             message: `${message || 'Coordinator diagnostic event'}`.slice(0, 500),
             at: now(),
             details: details && typeof details === 'object'
@@ -336,17 +338,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
                 : {}
         }
         incrementQueueWakeupMetric('diagnosticEvent.received')
-        let pending = getPendingCoordinatorDiagnosticEvents()
-        pending.push(event)
-        if(pending.length > MAX_COORDINATOR_EVENTS) {
-            pending = pending.slice(-MAX_COORDINATOR_EVENTS)
-            setPendingCoordinatorDiagnosticEvents(pending)
-            incrementQueueWakeupMetric('diagnosticEvent.pendingPruned')
-        }
-        recordQueueWakeupMetricMax('diagnosticEvent.pendingMax', pending.length)
-        if(getStorageUpdateDepth() <= 0 && getCoordinatorDiagnosticBatchDepth() <= 0) {
-            incrementQueueWakeupMetric('diagnosticEvent.persistDeferred')
-        }
+        recordFlightRecorderEvent(coordinatorEventToFlightRecorderEntry(event))
         return true
     }
 

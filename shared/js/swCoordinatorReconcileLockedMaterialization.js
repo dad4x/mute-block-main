@@ -123,6 +123,7 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         normalizeCoordinatorEvents,
         getCoordinatorItemHref,
         makeId,
+        emitCoordinatorEvent,
         isProfileResolutionItem,
         normalizeQuoraProfileUrl,
         normalizeCoordinatorRequestedUrl,
@@ -355,30 +356,23 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         return {results, removedRows}
     }
 
-    function hasTerminalKeyOnlyCoordinatorEvent(events = [], itemKey = '', item = {}) {
-        const runId = `${item?.runId || ''}`.trim()
-        const status = `${item?.status || ''}`.trim()
-        const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey)
-
-        return normalizeCoordinatorEvents(events).some(event => {
-            if(`${event?.itemId || ''}` !== `${itemKey || ''}`) return false
-            if(runId && `${event?.runId || ''}` !== runId) return false
-            if(status && `${event?.type || ''}` !== status) return false
-            if(coordinatorKey && `${event?.details?.coordinatorKey || ''}` && `${event.details.coordinatorKey}` !== coordinatorKey) return false
-            return true
-        })
+    // R1 (events-to-flight-recorder design, B3): a terminal key-only row gets one diagnostic per session. The diagnostic goes to the
+    // flight recorder, and no row or run field depends on it, so a session-scoped set is enough. No stored event is read.
+    const terminalKeyOnlyDiagnosed = new Set()
+    function terminalKeyOnlyDiagnosticKey(itemKey = '', item = {}) {
+        return `${itemKey || ''}|${`${item?.status || ''}`.trim()}|${`${item?.runId || ''}`.trim()}|${getCoordinatorItemQueueKey(item, itemKey)}`
     }
 
     function materializeTerminalKeyOnlyDerivedStateLocked(state = {}, itemKey = '', item = {}, nowMs = now()) {
         if(!item || typeof item !== 'object') return {changed: false}
         if(getCoordinatorItemHref(item) || !isTerminalCoordinatorStatus(item.status)) return {changed: false}
 
-        const events = state.events || []
         const affectedRunIds = []
         const runId = `${item.runId || ''}`.trim()
         if(runId) affectedRunIds.push(runId)
 
-        if(hasTerminalKeyOnlyCoordinatorEvent(events, itemKey, item)) {
+        const diagnosticKey = terminalKeyOnlyDiagnosticKey(itemKey, item)
+        if(terminalKeyOnlyDiagnosed.has(diagnosticKey)) {
             return {
                 changed: false,
                 affectedRunIds
@@ -386,7 +380,8 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         }
 
         const eventAt = Number.parseInt(item.terminalAt || item.updatedAt, 10) || nowMs
-        events.push({
+        terminalKeyOnlyDiagnosed.add(diagnosticKey)
+        emitCoordinatorEvent({
             id: makeId('event'),
             runId,
             itemId: itemKey,
@@ -400,8 +395,8 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         })
 
         return {
-            changed: true,
-            eventsChanged: true,
+            changed: false,
+            eventsChanged: false,
             affectedRunIds,
             materialized: 1
         }
@@ -474,7 +469,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         if(!runId) return {changed: false}
 
         const runs = state.runs || {}
-        const events = state.events || []
         const progress = state.progress || {}
         const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
         const coordinatorKey = getCoordinatorItemQueueKey(item, itemKey) || href || itemKey
@@ -551,12 +545,8 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
             }
         }
 
-        if((runsChanged || progressChanged) && !events.some(event =>
-            `${event?.runId || ''}` === runId &&
-            `${event?.type || ''}` === 'materialize' &&
-            `${event?.details?.reason || ''}` === 'enqueue-derived-materialization'
-        )) {
-            events.push({
+        if(runsChanged || progressChanged) {
+            emitCoordinatorEvent({
                 id: makeId('event'),
                 runId,
                 itemId: coordinatorKey || itemKey,
@@ -570,7 +560,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
                     sourcePageUrl
                 }
             })
-            eventsChanged = true
         }
 
         return {
@@ -619,7 +608,7 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         applyStaleProfileResolutionTabReconcileActionLocked,
         applyProgressRecordCoordinatorReconcileActionLocked,
         buildCoordinatorReconcileQueueAuthorityDiff,
-        hasTerminalKeyOnlyCoordinatorEvent,
+        terminalKeyOnlyDiagnosticKey,
         materializeTerminalKeyOnlyDerivedStateLocked,
         settleTerminalResolverPendingSourceRecordsLocked,
         settleResolvedResolverPendingSourceRecordsLocked,

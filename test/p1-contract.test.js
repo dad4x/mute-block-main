@@ -2257,26 +2257,12 @@ test('fill loop obtains activation intent through queue-machine slot event', () 
     assert.match(slotPlannerBody, /hasQueuedActivationGuard\(next\)/)
 })
 
-test('stale-attempt diagnostics are serialized with coordinator updates', () => {
+test('stale-attempt diagnostics go straight to the flight recorder, not the persisted queue (events design, B9a)', () => {
     const source = readRepoFile('shared/js/sw.js')
-    // shouldFlushPendingCoordinatorDiagnosticEventsNow moved to
-    // swCoordinatorJobEnvelope.js in decomposition Slice 11; its internal
-    // queueRuntime.getRuntimeCounts() call became a threaded
-    // getQueueRuntimeCounts() dep call in the move.
-    const jobEnvelopeSource = readRepoFile('shared/js/swCoordinatorJobEnvelope.js')
     const diagnosticBody = extractFunction(source, 'async function recordStaleAttemptDiagnostic(details = {})')
-    const saveBody = extractFunction(source, 'async function saveCoordinatorState(state = {}, changes = {})')
-
-    assert.match(source, /pendingCoordinatorDiagnosticEvents/)
-    assert.match(diagnosticBody, /pendingCoordinatorDiagnosticEvents\.push\(event\)/)
-    assert.match(diagnosticBody, /diagnosticEvent\.persistDeferred/)
+    assert.match(diagnosticBody, /recordFlightRecorderEvent\(coordinatorEventToFlightRecorderEntry\(event\)\)/)
+    assert.doesNotMatch(diagnosticBody, /pendingCoordinatorDiagnosticEvents/)
     assert.doesNotMatch(diagnosticBody, /enqueueSpaceFeedStorageUpdate\(async \(\) =>/)
-    assert.match(jobEnvelopeSource, /function shouldFlushPendingCoordinatorDiagnosticEventsNow\(context = \{\}\) \{[\s\S]*const runtimeCounts = getQueueRuntimeCounts\(\)[\s\S]*runtimeCounts\.activeQueuedTabs <= 0[\s\S]*runtimeCounts\.queuedTabActions <= 0[\s\S]*runtimeCounts\.pendingTabActions <= 0[\s\S]*durableActiveRows <= 0[\s\S]*durableQueuedRows <= 0/)
-    assert.match(source, /function flushPendingCoordinatorDiagnosticEventsIfIdle\(context = \{\}\) \{[\s\S]*diagnosticEvent\.flushDeferredForQueueWork/)
-    assert.match(saveBody, /drainPendingCoordinatorDiagnosticEvents\(\)/)
-    assert.match(saveBody, /concat\(diagnosticEvents\)/)
-    assert.match(source, /onIdle: async context => \{[\s\S]*flushPendingCoordinatorDiagnosticEventsIfIdle\(context\)/)
-    assert.match(source, /flushPendingCoordinatorDiagnosticEventsIfIdle\(getCoordinatorQueueWorkCounts\(ctx\.queue \|\| \{\}\)\)/)
 })
 
 test('progress repair is explicit, not a hot runtime path', () => {
@@ -2956,7 +2942,8 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.match(helperBody, /resolverPending: false/)
 
     assert.match(unresolvedBody, /coordinatorQueueReader\.runs\(\{[\s\S]*metricPath: 'resolver\.unresolved\.load'/)
-    assert.match(unresolvedBody, /readResidentCoordinatorStored\(\{[\s\S]*\[COORDINATOR_EVENTS_KEY\]: \[\],[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
+    assert.match(unresolvedBody, /readResidentCoordinatorStored\(\{[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
+    assert.doesNotMatch(unresolvedBody, /COORDINATOR_EVENTS_KEY/)
     assert.doesNotMatch(unresolvedBody, /metricStorageGet\(/)
     assert.match(unresolvedBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'resolver-unresolved'/)
     assert.match(unresolvedBody, /expectedAttemptId: currentAttemptId \? incomingAttemptId : ''/)

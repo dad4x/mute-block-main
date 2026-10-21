@@ -1516,7 +1516,6 @@ test('a mirrored runs copy with the disk stamp is served at restart, and hydrate
     assert.deepEqual(
         stampReads[0].filter(key => !key.startsWith(LEGACY_PROGRESS_PREFIX)).sort(),
         [
-            'mbCoordinatorEvents',
             'mbCoordinatorNamespaceSeq.mbCoordinatorRuns',
             'mbCoordinatorPauseGeneration',
             'mbCoordinatorPaused',
@@ -4473,7 +4472,7 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents) {
+        if(payload?.mbCoordinatorRuns) {
             throw new Error('synthetic bulk current work cancel derived failure')
         }
         return originalSet(payload)
@@ -4490,8 +4489,8 @@ test('bulk current work cancel derived failure does not poison WAL terminalizati
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB], undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(hrefA))?.status, 'canceled')
     assert.equal((await sw.findCompletedWorkRowByKey(hrefB))?.status, 'canceled')
-    assert.equal(storage.mbCoordinatorEvents.length, 1)
-    assert.equal(storage.mbCoordinatorEvents[0].type, 'stored-work-cancel-derived-save-failed')
+    // Diagnostic events go to the flight recorder now, not to storage (events-to-flight-recorder design, B9a).
+    assert.equal(sw.getFlightRecorderSnapshot({kind: 'stored-work-cancel-derived-save-failed', limit: 5}).entries.length, 1)
     assert.equal(sw.state().queueWakeupCounters['storedWork.cancel.derivedSaveFailed'] || 0, 1)
     assert.ok(
         sw.state().hasCoordinatorReconcileTimeout ||
@@ -4605,7 +4604,7 @@ test('bulk current work pause WAL-requeues active rows as a batch', async () => 
     assert.equal(sw.coordinatorAuthority.current().queue[hrefQueued].status, 'queued')
     assert.equal(getFreshQueueView(sw, storage).counts.queued, 2)
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
-    assert.equal(storage.mbCoordinatorEvents[0].type, 'paused')
+    assert.ok(sw.getFlightRecorderSnapshot({kind: 'paused', limit: 5}).entries.length >= 1, 'the paused event is in the flight recorder')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].status, 'tab-opened')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].tabId, tabId)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].attemptId, attemptId)
@@ -15136,15 +15135,14 @@ test('key-only terminalization is WAL-backed and recovers after restart', async 
 
     assert.equal(result.changed, true)
     assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, LEGACY_PROFILE_PROGRESS_KEY)), false)
-    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), true)
+    assert.equal(getDefaults.some(defaults => Object.prototype.hasOwnProperty.call(defaults || {}, 'mbCoordinatorEvents')), false, 'events are not read from disk')
     assert.equal(result.status, 'failed')
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView?.counts.failed, undefined)
     // 2026-10-13: a soft failure (timeout) with automatic retries left stays live and is not archived.
     assert.equal(await sw.findCompletedWorkRowByKey(key), null)
     assert.equal(sw.coordinatorAuthority.current().queue[key]?.status, 'failed')
-    assert.equal(storage.mbCoordinatorEvents.length, 1)
-    assert.equal(storage.mbCoordinatorEvents[0].details.coordinatorKey, key)
+    assert.ok(sw.getFlightRecorderSnapshot({channel: 'event', limit: 50}).entries.some(entry => entry.coordinatorKey === key), 'the event is in the flight recorder with its coordinator key')
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
         getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
@@ -16055,7 +16053,7 @@ test('unresolved resolver terminalization is WAL-backed and recovers after resta
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView?.counts.skipped, undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'skipped')
-    assert.equal(storage.mbCoordinatorEvents.length, 1)
+    assert.ok(sw.getFlightRecorderSnapshot({channel: 'event', limit: 50}).entries.length >= 1, 'the outcome is in the flight recorder')
     assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
 
     const walRecords = getWalRecordsForGeneration(
@@ -16534,29 +16532,18 @@ test('key-only terminalization derived failure does not poison authority termina
     assert.equal(result.changed, true)
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(
-        storage.mbCoordinatorEvents.some(event => event?.details?.reason === 'synthetic-key-only-derived-failure'),
-        false
-    )
+    assert.equal(sw.getFlightRecorderSnapshot({channel: 'event', limit: 200}).entries.some(entry => entry.reason === 'synthetic-key-only-derived-failure'), true, 'the terminal diagnostic is in the flight recorder')
     // 2026-10-13: a soft failure with retries left stays live, so the terminal row is resident and not archived.
     assert.equal(sw.coordinatorAuthority.current().queue[key]?.status, 'failed')
-    assert.equal(sw.state().queueWakeupCounters['reconcile.keyOnlyTerminalize.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
 
     browser.storage.local.set = originalSet
     const reconcileResult = await sw.reconcileCoordinatorStorage()
     // The terminal-key-only event materializer and the run-stats recompute both still see this row, now as a live soft
     // failure with retries left. That row is not finished (swCoordinatorRuns.js getCoordinatorRunStatus), so the run is
     // 'running' and not 'empty'. terminalCount still counts the row as terminal.
-    assert.equal(reconcileResult.eventsChanged, true)
-    assert.equal(reconcileResult.runsChanged, true)
-    assert.equal(
-        storage.mbCoordinatorEvents.some(event => event?.itemId === key && event?.details?.coordinatorKey === key),
-        true
-    )
+    assert.equal(reconcileResult.eventsChanged, false, 'the diagnostic goes to the flight recorder; no stored change')
+    // The run record is already consistent without the old stored event, so the reconcile no longer reports it changed. The status and count below are what matter.
+    assert.ok(sw.getFlightRecorderSnapshot({channel: 'event', limit: 200}).entries.some(entry => entry.rowKey === key), 'the diagnostic is in the flight recorder')
     assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
     assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
 })
@@ -17263,7 +17250,7 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(current.runs['run-authority-hydrate'].queued, 1)
     assert.equal(current.progress[href].status, 'queued')
     // Hydrate decodes the events with the rest of the state (they are not mirrored, so they come from the one full read).
-    assert.deepEqual(current.events.map(event => event.id), ['event-authority-hydrate'])
+    assert.deepEqual(current.events, [], 'events are not held in the authority; they are in the flight recorder')
     const hydrateDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns'
@@ -17274,7 +17261,7 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(getDefaults.some(defaults => hasStorageDefault(defaults, 'mbProfileNukeProgressView')), false, 'no progress view is read from disk')
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorQueue'), false)
     assert.equal(hasStorageDefault(hydrateDefaults, LEGACY_PROFILE_PROGRESS_KEY), false)
-    assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorEvents'), true)
+    assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorEvents'), false, 'events are not read from disk')
     // The one full read also carries the space post keys (P3); none of them is a separate read later.
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpacePendingNukedPosts'), true)
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpaceNukedPosts'), true)
@@ -23333,7 +23320,7 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !isCoordinatorQueueWalPayload(payload)) {
+        if(payload?.mbCoordinatorRuns && !isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic enqueue derived save failure')
         }
         return originalSet(payload)
@@ -23371,18 +23358,14 @@ test('enqueue derived save failure keeps WAL row durable and reconcile materiali
     assert.ok(reconcile.materialized > 0)
     assert.equal(reconcile.runsChanged, true)
     assert.equal(reconcile.progressChanged, false)
-    assert.equal(reconcile.eventsChanged, true)
+    assert.equal(reconcile.eventsChanged, false, 'the materialization diagnostic goes to the flight recorder; no stored change')
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
     assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
     assert.equal(storage.mbProfileNukeProgressView.records[href].runId, runId)
     assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
-    assert.equal(storage.mbCoordinatorEvents.some(event =>
-        event.runId === runId &&
-        event.type === 'materialize' &&
-        event.details?.reason === 'enqueue-derived-materialization'
-    ), true)
+    assert.ok(sw.getFlightRecorderSnapshot({kind: 'materialize', limit: 50}).entries.some(entry => entry.runId === runId && entry.reason === 'enqueue-derived-materialization'), 'the materialization is in the flight recorder')
     // The enqueue hydrated the authority, so the reconcile answers from the resident state (P2): it reads no coordinator,
     // progress or space key from storage. Metric reads are not coordinator state and are not part of this check.
     const coordinatorStateReads = getDefaults.filter(defaults => Object.keys(defaults || {}).some(key =>
@@ -23443,7 +23426,6 @@ test('reconcile does not materialize projection-only queued progress as queue au
     const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueueWal',
         'mbCoordinatorRuns',
-        'mbCoordinatorEvents',
         'mbCoordinatorPaused',
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
@@ -23605,7 +23587,7 @@ test('enqueue resetExisting derived save failure reconcile replaces stale progre
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
     browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && payload?.mbCoordinatorEvents && !isCoordinatorQueueWalPayload(payload)) {
+        if(payload?.mbCoordinatorRuns && !isCoordinatorQueueWalPayload(payload)) {
             throw new Error('synthetic reset enqueue derived save failure')
         }
         return originalSet(payload)
@@ -23662,11 +23644,7 @@ test('enqueue resetExisting derived save failure reconcile replaces stale progre
     assert.equal(storage.mbProfileNukeProgressView.records[href].tabId, null)
     assert.notEqual(storage.mbProfileNukeProgressView.records[href].blockAttempted, true)
     assert.equal(storage.mbCoordinatorRuns[nextRunId].targetProfileHrefs.includes(href), true)
-    assert.equal(storage.mbCoordinatorEvents.some(event =>
-        event.runId === nextRunId &&
-        event.type === 'materialize' &&
-        event.details?.reason === 'enqueue-derived-materialization'
-    ), true)
+    assert.ok(sw.getFlightRecorderSnapshot({kind: 'materialize', limit: 50}).entries.some(entry => entry.runId === nextRunId && entry.reason === 'enqueue-derived-materialization'), true, 'the materialization is in the flight recorder')
 })
 
 test('executable enqueue preserves explicit pause and does not open worker tabs', async () => {

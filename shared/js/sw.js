@@ -1,6 +1,7 @@
 const browser = require('webextension-polyfill')
 const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
+const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
 const {
     SPACE_MAP_LAYOUT_KEY,
     SPACE_MAP_LAYOUT_BUCKETED,
@@ -174,6 +175,7 @@ const {
     getFlightRecorder,
     getFlightRecorderSnapshot,
     getFlightRecorderPersistableSnapshot,
+    clearFlightRecorderEntries,
     recordFlightRecorderEvent,
     seedFlightRecorderFromPersisted
 } = require('./swflightRecorder')
@@ -2856,6 +2858,7 @@ const coordinatorJobEnvelope = createCoordinatorJobEnvelope({
         getAttemptNumberFromValue,
         incrementQueueWakeupMetric,
         recordQueueWakeupMetricMax,
+        recordFlightRecorderEvent,
         getStorageUpdateDepth: () => storageUpdateState.getDepth(),
         getQueueRuntimeCounts: () => queueRuntime.getRuntimeCounts()
     },
@@ -5834,20 +5837,14 @@ async function refreshQueueWakeupMetricsViewForDashboard(reason = 'dashboard-ref
 }
 
 async function flushPendingCoordinatorDiagnosticEvents() {
+    // Diagnostic events are recorded in the flight recorder when they happen (events-to-flight-recorder design, B9a). Anything still
+    // in the pending queue is handed to the recorder here. Nothing is written to storage.
     return runQueueWakeupMetricPhase('flushDiagnosticEvents', async () => {
         const pending = drainPendingCoordinatorDiagnosticEvents()
         if(!pending.length) return false
-
+        for(const event of pending) emitCoordinatorEvent(event)
         incrementQueueWakeupMetric('diagnosticEvent.flushPerformed')
         incrementQueueWakeupMetric('diagnosticEvent.eventsPerFlush', pending.length)
-        const stored = await readResidentCoordinatorStored({[COORDINATOR_EVENTS_KEY]: []})
-        const events = normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY])
-        await coordinatorAuthority.persistCoordinator({
-            stored: {[COORDINATOR_EVENTS_KEY]: events.concat(pending).slice(-MAX_COORDINATOR_EVENTS)}
-        }, {
-            storageOptions: {metricPath: 'diagnosticEvent.flush', snapshotWriteReason: 'reconcile'}
-        })
-        incrementQueueWakeupMetric('diagnosticEvent.storageWrites')
         return true
     })
 }
@@ -5868,18 +5865,16 @@ async function flushPendingCoordinatorDiagnosticEventsIfIdle(context = {}) {
     return flushPendingCoordinatorDiagnosticEvents()
 }
 
+// A durable coordinator event goes to the flight recorder (events-to-flight-recorder design, B9a). It is not stored.
+function emitCoordinatorEvent(event = {}) {
+    if(!event || typeof event !== 'object') return false
+    return recordFlightRecorderEvent(coordinatorEventToFlightRecorderEntry(event))
+}
+
 async function recordStaleAttemptDiagnostic(details = {}) {
     const event = makeStaleAttemptDiagnosticEvent(details)
     incrementQueueWakeupMetric('diagnosticEvent.received')
-    pendingCoordinatorDiagnosticEvents.push(event)
-    if(pendingCoordinatorDiagnosticEvents.length > MAX_COORDINATOR_EVENTS) {
-        pendingCoordinatorDiagnosticEvents = pendingCoordinatorDiagnosticEvents.slice(-MAX_COORDINATOR_EVENTS)
-        incrementQueueWakeupMetric('diagnosticEvent.pendingPruned')
-    }
-    recordQueueWakeupMetricMax('diagnosticEvent.pendingMax', pendingCoordinatorDiagnosticEvents.length)
-    if(storageUpdateState.getDepth() <= 0 && coordinatorDiagnosticBatchDepth <= 0) {
-        incrementQueueWakeupMetric('diagnosticEvent.persistDeferred')
-    }
+    recordFlightRecorderEvent(coordinatorEventToFlightRecorderEntry(event))
     return true
 }
 
@@ -10204,13 +10199,12 @@ function createCoordinatorAuthority() {
     // absorbPersistedSnapshot does, so the resident queue (and everything else) is not rebuilt or re-cloned here.
     function applyStoredChangeToProjection(stored = {}) {
         const hasRuns = Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY)
-        const hasEvents = Object.prototype.hasOwnProperty.call(stored, COORDINATOR_EVENTS_KEY)
         const cloned = cloneCoordinatorAuthorityValue(stored)
         projection = {
             ...projection,
             stored: {...(projection.stored || {}), ...cloned},
             runs: hasRuns ? normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(cloned[COORDINATOR_RUNS_KEY] || {})) : projection.runs,
-            events: hasEvents ? normalizeCoordinatorEvents(cloneCoordinatorAuthorityValue(cloned[COORDINATOR_EVENTS_KEY] || [])) : projection.events
+            events: projection.events || []
         }
     }
 
@@ -10808,7 +10802,6 @@ async function loadCoordinatorCurrentAuthorityState() {
             ...Object.fromEntries(candidateKeys.map(key => [getCoordinatorNamespaceStampKey(key), null])),
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
-            [COORDINATOR_EVENTS_KEY]: [],
             ...getSpaceMapStoredReadDefaults()
         }, {
             metricPath: 'authority.hydrate'
@@ -10868,7 +10861,7 @@ async function loadCoordinatorCurrentAuthorityState() {
             stored,
             queue,
             runs: runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY])),
-            events: runQueueWakeupMetricPhase('normalizeEvents', () => normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY])),
+            events: [],
             progress: runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, [])),
             completed,
             decode: {
@@ -11123,11 +11116,6 @@ async function saveCoordinatorState(state = {}, changes = {}) {
         if(changes.runs) payload[COORDINATOR_RUNS_KEY] = state.runs || {}
         if(changes.pendingPosts) payload[SPACE_PENDING_NUKED_POSTS_KEY] = state.pendingPosts || {}
         if(changes.nukedPosts) payload[SPACE_NUKED_POSTS_KEY] = state.nukedPosts || {}
-        if(changes.events) {
-            payload[COORDINATOR_EVENTS_KEY] = normalizeCoordinatorEvents(state.events || [])
-                .concat(diagnosticEvents)
-                .slice(-MAX_COORDINATOR_EVENTS)
-        }
         if(Object.keys(payload).length) {
             if(isStorageUpdateAbandoned(updateToken)) {
                 incrementQueueWakeupMetric('storageUpdate.lateWriteSuppressed')
@@ -11192,16 +11180,17 @@ async function applyCoordinatorRunsUpdate(queue = {}, affectedRunIds = null, opt
 }
 
 async function coordinatorRunsUpdateLockedUpdate(queue = {}, affectedRunIds = null, options = {}) {
+    // Events are recorded in the flight recorder and not stored (events-to-flight-recorder design, B9a). Nothing here reads or writes the stored list.
     const newEvents = Array.isArray(options.events) ? options.events.filter(Boolean) : []
-    const eventsChanged = newEvents.length > 0
+    newEvents.forEach(emitCoordinatorEvent)
+    const eventsChanged = false
     // Only read mbCoordinatorEvents when there's actually something to
     // append to it -- several callers of this helper are WAL-backed paths
     // with their own test coverage asserting they never touch
     // mbCoordinatorEvents at all (see e.g. "non-profile landing
     // terminalization is WAL-backed and recovers after restart").
     const stored = await readResidentCoordinatorStored({
-        [COORDINATOR_RUNS_KEY]: {},
-        ...(eventsChanged ? {[COORDINATOR_EVENTS_KEY]: []} : {})
+        [COORDINATOR_RUNS_KEY]: {}
     }, {metricPath: options.metricPath ? `${options.metricPath}.runsLock.load` : 'coordinatorRuns.lock.load'})
     const freshRuns = normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY] || {})
     // A caller that needs to stamp run-level metadata (e.g. paused/status)
@@ -11312,6 +11301,7 @@ const coordinatorReconcileLockedMaterialization = createCoordinatorReconcileLock
         JOB_EVENT_TERMINAL
     },
     handlers: {
+        emitCoordinatorEvent,
         normalizeTabId,
         getPersistedQueuedTabId,
         normalizeAttemptId,
@@ -11914,20 +11904,17 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
     }
     const queueAuthoritySaved = !ctx.changed || queueAuthorityPersistence?.saved === true
     if(queueAuthoritySaved && runsChanged) storagePatch[COORDINATOR_RUNS_KEY] = nextRuns
-    if(queueAuthoritySaved && ctx.eventsChanged) storagePatch[COORDINATOR_EVENTS_KEY] = ctx.events
     if(queueAuthoritySaved && ctx.pendingPostsChanged) storagePatch[SPACE_PENDING_NUKED_POSTS_KEY] = ctx.pendingPosts
     if(queueAuthoritySaved && ctx.nukedPostsChanged) storagePatch[SPACE_NUKED_POSTS_KEY] = ctx.nukedPosts
 
     if(Object.keys(storagePatch).length) {
         const stateSaved = await saveCoordinatorState({
             runs: storagePatch[COORDINATOR_RUNS_KEY],
-            events: storagePatch[COORDINATOR_EVENTS_KEY],
             pendingPosts: storagePatch[SPACE_PENDING_NUKED_POSTS_KEY],
             nukedPosts: storagePatch[SPACE_NUKED_POSTS_KEY]
         }, { metricPath: 'reconcile.authorityTransitionPhase',
             queue: false,
             runs: runsChanged,
-            events: ctx.eventsChanged,
             progress: false,
             pendingPosts: ctx.pendingPostsChanged,
             nukedPosts: ctx.nukedPostsChanged,
@@ -21927,9 +21914,8 @@ function noteDebugResumeTargetFinished(rowKey = '') {
 // worker writes, through its own storage door, so the resident authority sees the change the same way it
 // sees every other write.
 async function clearCoordinatorEventsRequested() {
-    await coordinatorAuthority.persistCoordinator({stored: {[COORDINATOR_EVENTS_KEY]: []}}, {
-        storageOptions: {metricPath: 'dashboardRequest.clearEvents'}
-    })
+    // Events live in the flight recorder now (events-to-flight-recorder design, B12a). The stored list is left as it is (B13a).
+    clearFlightRecorderEntries()
     return {ok: true}
 }
 
@@ -23704,7 +23690,6 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
-    const events = normalizeCoordinatorEvents(state.events)
     const progress = state.progress
 
     profileNukeProgress = progress
@@ -23817,7 +23802,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     }
     Object.assign(nextRuns, recomputeCoordinatorRuns(nextQueue, nextRuns, new Set([runId])))
 
-    events.push({
+    emitCoordinatorEvent({
         id: makeId('event'),
         runId,
         itemId: '',
@@ -23901,12 +23886,10 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
     }
     try {
         derivedSaved = await saveCoordinatorState({
-            runs: nextRuns,
-            events
+            runs: nextRuns
         }, { metricPath: 'retry.derived',
             queue: false,
             runs: true,
-            events: true,
             progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'retry-derived',
@@ -24038,7 +24021,6 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
     const queue = currentAuthorityState.queue
     const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
-    const events = normalizeCoordinatorEvents(state.events)
     const now = Date.now()
     const runId = makeId('requeue-failed')
     const selectedItems = []
@@ -24181,7 +24163,7 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     }
     Object.assign(nextRuns, recomputeCoordinatorRuns(nextQueue, nextRuns, new Set([runId])))
 
-    events.push({
+    emitCoordinatorEvent({
         id: makeId('event'),
         runId,
         itemId: '',
@@ -24261,12 +24243,10 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
     }
     try {
         derivedSaved = await saveCoordinatorState({
-            runs: nextRuns,
-            events
+            runs: nextRuns
         }, { metricPath: 'requeue.derived',
             queue: false,
             runs: true,
-            events: true,
             progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'requeue-derived',
@@ -24590,7 +24570,6 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     const queue = state.queue
     const nextQueue = {...queue}
     const runs = normalizeCoordinatorMap(state.runs)
-    const events = normalizeCoordinatorEvents(state.events)
     const progress = state.progress
     // A candidate whose row already terminalized settles out of the live
     // queue (archiveTerminalCoordinatorRow) -- without this, a profile
@@ -24874,7 +24853,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     }
     Object.assign(runs, recomputeCoordinatorRuns(nextQueue, runs, affectedRunIds))
 
-    events.push({
+    emitCoordinatorEvent({
         id: makeId('event'),
         runId,
         itemId: '',
@@ -24964,10 +24943,9 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         derivedSaved = false
     }
     try {
-        derivedSaved = await saveCoordinatorState({runs, events}, { metricPath: 'enqueue.derived',
+        derivedSaved = await saveCoordinatorState({runs}, { metricPath: 'enqueue.derived',
             queue: false,
             runs: true,
-            events: true,
             progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'enqueue-derived',
@@ -26474,9 +26452,8 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
         }
     }
 
-    const events = normalizeCoordinatorEvents(state.events)
     const totalCleared = clearedUrls.length + clearedWorkKeys.length
-    events.push({
+    emitCoordinatorEvent({
         id: makeId('event'),
         runId: '',
         itemId: '',
@@ -26492,12 +26469,9 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
 
     let derivedSaved = true
     try {
-        derivedSaved = await saveCoordinatorState({
-            events
-        }, { metricPath: 'storedWorkClear.derived',
+        derivedSaved = await saveCoordinatorState({}, { metricPath: 'storedWorkClear.derived',
             queue: false,
             runs: false,
-            events: true,
             progress: false,
             reason: 'ordinaryMutation',
             queueOperation: 'stored-work-clear-derived',
@@ -33221,7 +33195,6 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
             metricPath: 'resolver.unresolved.load'
         })
         const stored = await readResidentCoordinatorStored({
-            [COORDINATOR_EVENTS_KEY]: [],
             [SPACE_PENDING_NUKED_POSTS_KEY]: {}
         }, {
             metricPath: 'resolver.unresolved.derived.load'
@@ -33340,8 +33313,7 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
             evidence: request.evidence || []
         })
 
-        const events = normalizeCoordinatorEvents(stored[COORDINATOR_EVENTS_KEY] || [])
-        events.push({
+        emitCoordinatorEvent({
             id: makeId('event'),
             runId: nextItem.runId || '',
             itemId: nextItem.id || itemKey,
@@ -33359,12 +33331,10 @@ async function markQueuedProfileResolutionUnresolved(request = {}, sender = {}) 
         try {
             derivedSaved = await saveCoordinatorState({
                 runs: runsChanged ? nextRuns : undefined,
-                events,
                 pendingPosts: pendingResult.pendingPosts
             }, { metricPath: 'queuedProfileResolutionUnresolved.derived',
                 queue: false,
                 runs: runsChanged,
-                events: true,
                 pendingPosts: pendingResult.changed,
                 reason: 'ordinaryMutation',
                 queueOperation: 'resolver-unresolved-derived',
