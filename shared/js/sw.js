@@ -28485,13 +28485,65 @@ function requestQueuedTabRemovalRefill() {
 // Farjana-Akter-MONI-2 held 15.9 s, then got worker-action-surface-busy with no create issued).
 // This is a cheap pre-check so the fill loop backs off before claiming anything. It is advisory:
 // createOwnedTabInQueuedWorkerActionSurface's lock and live re-query remain the ground truth.
+// A profile tab left in the worker window after its profile finished keeps the surface busy for every later open. Its runtime is
+// released and its row is terminal or gone, so nothing else closes it. This closes such tabs: a Quora profile tab that no active
+// queued runtime tracks and whose row is not active. A tab is closed only after it has looked orphaned for the grace period, so a
+// tab that is still being activated is never taken. The anchor tab is never closed. Returns the window's tabs after any close.
+const ORPHAN_SURFACE_TAB_GRACE_MS = 10000
+const orphanSurfaceTabFirstSeenAt = new Map()
+
+async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
+    const anchorTabId = normalizeTabId(surface?.anchorTabId)
+    const state = getHydratedCoordinatorAuthorityState('surfaceOrphanReap.usedResidentAuthority')
+    if(!state) return tabs
+    const queue = state.queue || {}
+    const reaped = []
+    for(const tab of tabs) {
+        const tabId = normalizeTabId(tab?.id)
+        if(!tabId || tabId === anchorTabId) continue
+        const href = normalizeQuoraProfileUrl(tab?.url || '')
+        const entry = href ? (findCoordinatorQueueEntryForHref(queue, href) || (queue[href] ? {item: queue[href]} : null)) : null
+        const orphaned = !!href && !queueRuntime.hasActiveQueuedTab(tabId) && !(entry?.item && isActiveCoordinatorStatus(entry.item.status))
+        if(!orphaned) {
+            orphanSurfaceTabFirstSeenAt.delete(tabId)
+            continue
+        }
+        const firstSeenAt = orphanSurfaceTabFirstSeenAt.get(tabId)
+        if(firstSeenAt === undefined) {
+            orphanSurfaceTabFirstSeenAt.set(tabId, Date.now())
+            continue
+        }
+        if(Date.now() - firstSeenAt < ORPHAN_SURFACE_TAB_GRACE_MS) continue
+        orphanSurfaceTabFirstSeenAt.delete(tabId)
+        markQueuedTabClosing(tabId, 'orphaned-surface-tab')
+        await browser.tabs.remove(tabId).catch(() => {})
+        cleanupQueuedTabMetadataOnly(tabId)
+        reaped.push(tabId)
+        recordFlightRecorderEvent({
+            kind: 'orphaned-surface-tab-closed',
+            source: 'reapOrphanedWorkerSurfaceTabs',
+            rowKey: href,
+            targetUrl: href,
+            tabId,
+            accepted: true,
+            changed: true,
+            reason: entry?.item ? 'row-not-active' : 'no-row'
+        })
+    }
+    if(!reaped.length) return tabs
+    return browser.tabs.query({windowId: surface.windowId}).catch(() => [])
+}
+
 async function isQueuedWorkerActionSurfaceOccupiedForOpen(action = {}) {
     if(!shouldUseQueuedWorkerActionSurface(action)) return false
     if(queuedWorkerActionSurfaceOpensInFlight > 0) return true
     const surface = await getLiveQueuedWorkerActionSurface().catch(() => null)
     if(!surface?.windowId) return false
-    const surfaceTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
+    let surfaceTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
     const anchorTabId = normalizeTabId(surface.anchorTabId)
+    if(surfaceTabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)) {
+        surfaceTabs = await reapOrphanedWorkerSurfaceTabs(surface, surfaceTabs)
+    }
     return surfaceTabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)
 }
 
@@ -28564,6 +28616,7 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         const isSurfaceBusy = tabs => tabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)
 
         let surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
+        if(isSurfaceBusy(surfaceWindowTabs)) surfaceWindowTabs = await reapOrphanedWorkerSurfaceTabs(surface, surfaceWindowTabs)
         if(isSurfaceBusy(surfaceWindowTabs)) {
             // Rather than bail out immediately and leave the next attempt to
             // whatever generic reconcile/resume tick happens to fire next

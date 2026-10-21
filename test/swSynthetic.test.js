@@ -21647,6 +21647,40 @@ test('createOwnedTabInQueuedWorkerActionSurface proceeds as soon as the occupyin
     assert.notEqual(second.id, first.id)
 })
 
+test('a profile tab left in the worker window after its profile finished is closed, so the next open can use the window', async () => {
+    // 20 Oct: a blocked profile tab finished, was released from the runtime, and stayed open in the worker window. The surface stayed
+    // busy for every later open. An orphaned profile tab is closed once it has looked orphaned for the grace period.
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000})
+    const makeAction = href => ({
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    })
+    const orphanHref = 'https://www.quora.com/profile/Synthetic-Worker-Orphan-First'
+    const orphan = await sw.createOwnedTabInQueuedWorkerActionSurface(makeAction(orphanHref), {url: orphanHref})
+    assert.ok(orphan?.id)
+    // The first look only starts the grace period, so an open right away still waits and gives up.
+    await settleWithFakeTimersInSmallSteps(
+        sw.createOwnedTabInQueuedWorkerActionSurface(makeAction('https://www.quora.com/profile/Synthetic-Worker-Orphan-Early'), {url: 'https://www.quora.com/profile/Synthetic-Worker-Orphan-Early'}),
+        timers
+    ).catch(() => null)
+    assert.equal(browser.__tabs.has(orphan.id), true, 'the orphan is not taken on its first look')
+    // Past the grace period, the next open closes the orphan and takes the window.
+    await timers.tick(11000)
+    const next = await settleWithFakeTimersInSmallSteps(
+        sw.createOwnedTabInQueuedWorkerActionSurface(makeAction('https://www.quora.com/profile/Synthetic-Worker-Orphan-Next'), {url: 'https://www.quora.com/profile/Synthetic-Worker-Orphan-Next'}),
+        timers
+    )
+    assert.ok(next?.id)
+    assert.equal(browser.__tabs.has(orphan.id), false, 'the orphaned profile tab was closed')
+    assert.ok(sw.getFlightRecorderSnapshot({kind: 'orphaned-surface-tab-closed', limit: 5}).entries.length >= 1, 'the close is recorded')
+})
+
 test('createOwnedTabInQueuedWorkerActionSurface keeps waiting past an unrelated tab removal instead of failing on the first spurious wakeup', async () => {
     // notifyQueuedWorkerActionSurfaceSlotMaybeFreed (sw.js) fires on *any*
     // tab removal, not just the worker-window occupant's -- there's no
