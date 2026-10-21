@@ -261,6 +261,28 @@ function createStorageMetrics(deps = {}) {
         incrementActiveStorageMetricDetail('queueWriteChangedRows', changedRows)
     }
 
+    // The physical write: the bytes that reached storage after any bucket split, so the write card and the histogram show disk
+    // size, not the whole-map payload the caller built. One count per successful write, in the bucket its size falls in.
+    const PHYSICAL_WRITE_SIZE_BUCKETS = [
+        [1024, 'lt1k'],
+        [4096, '1k_4k'],
+        [16384, '4k_16k'],
+        [65536, '16k_64k'],
+        [262144, '64k_256k'],
+        [1048576, '256k_1m'],
+        [4194304, '1m_4m'],
+        [Infinity, 'ge4m']
+    ]
+    function recordPhysicalWriteMetrics(bytes = 0) {
+        const size = Math.max(0, Number(bytes) || 0)
+        if(!size) return
+        incrementQueueWakeupMetric('storagePhysical.write.total.bytes', size)
+        incrementQueueWakeupMetric('storagePhysical.write.total.calls')
+        recordQueueWakeupMetricMax('storagePhysical.write.total.maxBytes', size)
+        const [, bucketName] = PHYSICAL_WRITE_SIZE_BUCKETS.find(([limit]) => size < limit)
+        incrementQueueWakeupMetric(`storagePhysical.write.size.${bucketName}`)
+    }
+
     // Returns the bytes, rows and key names it counted, so the write path can log the same numbers per write (owner 18 Oct).
     function recordStoragePayloadMetrics(payload = {}, pathName = '') {
         const entries = Object.entries(payload && typeof payload === 'object' ? payload : {})
@@ -345,7 +367,8 @@ function createStorageMetrics(deps = {}) {
         recordQueueWriteOperationMetricValue,
         recordQueueWriteOperationMetrics,
         recordStoragePayloadMetrics,
-        recordStorageReadPayloadMetrics
+        recordStorageReadPayloadMetrics,
+        recordPhysicalWriteMetrics
     }
 }
 

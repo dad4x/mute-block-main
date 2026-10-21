@@ -1196,6 +1196,7 @@ function render() {
     renderAuthorityLoadHistogram()
     renderEventHistogram()
     renderPhaseTimingHistogram()
+    renderWriteSizeHistogram()
     renderQueue(queueItems)
     renderOutliers()
     renderDashboardBottomBar(queueItems)
@@ -2168,6 +2169,10 @@ function renderWakeupMetrics(queueItems = []) {
     const payloadProgressBytes = getMetricCounter(counters, 'storagePayload.write.progress.bytes')
     const payloadQueueViewBytes = getMetricCounter(counters, 'storagePayload.write.queueView.bytes')
     const payloadMaxBytes = getMetricCounter(counters, 'storagePayload.write.total.maxBytes')
+    // Physical writes: the bytes that reached storage after the bucket split. The card below reads these; the logical counters above are kept for comparison.
+    const physicalBytes = getMetricCounter(counters, 'storagePhysical.write.total.bytes')
+    const physicalCalls = getMetricCounter(counters, 'storagePhysical.write.total.calls')
+    const physicalMaxBytes = getMetricCounter(counters, 'storagePhysical.write.total.maxBytes')
     const queueViewWriteCalls = getMetricCounter(counters, 'storagePayload.write.queueView.latencyCalls')
     const queueViewWriteLatencyMsSum = getMetricCounter(counters, 'storagePayload.write.queueView.latencyMsSum')
     const queueViewWriteMaxLatencyMs = getMetricCounter(counters, 'storagePayload.write.queueView.maxLatencyMs')
@@ -2389,8 +2394,8 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Read hot path', topReadPath.path || '--', formatStoragePayloadPathDetail(topReadPath), {
                 title: 'Which named code path (metricPath, e.g. "reconcile.load") is responsible for the most read bytes this epoch. Concerning if a path you would not expect to read often (anything outside startup/reconcile) shows up here with a high call count -- that usually means a cache that should be short-circuiting it is not.'
             }),
-            buildMetricCard('Write payload avg', payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--', `${formatBytes(payloadBytes)} total; max ${formatBytes(payloadMaxBytes)}`, {
-                title: 'Average and largest single-write payload size across all storage writes this epoch (the write-side counterpart to Read payload avg above). Concerning if this trends upward over a long session -- larger writes mean longer Storage set latency and a bigger blast radius if one gets interrupted mid-write.'
+            buildMetricCard('Write payload avg', physicalCalls ? formatBytes(physicalBytes / physicalCalls) : '--', `${formatBytes(physicalBytes)} on disk over ${physicalCalls} writes; max ${formatBytes(physicalMaxBytes)}. Logical payload avg ${payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--'} (${formatBytes(payloadBytes)} before the bucket split)`, {
+                title: 'Average and largest size of each write that reached storage this epoch, after the bucket split. The logical figure is what the callers built before the split (a whole map), kept for comparison. Concerning if the physical average trends upward over a long session.'
             }),
             buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), `queue ${formatBytes(payloadQueueBytes)}, view ${formatBytes(payloadQueueViewBytes)}, runs ${formatBytes(payloadRunsBytes)}, progress ${formatBytes(payloadProgressBytes)}`, {
                 title: 'Write bytes broken down by which storage key they went to. Not concerning by itself -- "queue" naturally dominates on a large batch -- but useful alongside Write hot path to see which code path is driving that volume.'
@@ -3342,6 +3347,27 @@ function renderPhaseTimingHistogram() {
         }
     }).filter(row => row.value > 0)
 
+    renderHorizontalHistogram(container, data)
+}
+
+// Physical write sizes, smallest band first. The worker counts each successful write in one of these bands (swStorageMetrics).
+const PHYSICAL_SIZE_BANDS = [
+    ['lt1k', 'under 1 KB'], ['1k_4k', '1-4 KB'], ['4k_16k', '4-16 KB'], ['16k_64k', '16-64 KB'],
+    ['64k_256k', '64-256 KB'], ['256k_1m', '256 KB-1 MB'], ['1m_4m', '1-4 MB'], ['ge4m', '4 MB and over']
+]
+
+function renderWriteSizeHistogram() {
+    const container = document.getElementById('writeSizeHistogram')
+    if(!container) return
+
+    const metricsDocument = state.metrics || {}
+    const counters = (metricsDocument.currentEpoch || metricsDocument).counters || {}
+
+    // Not sorted: the bands are already in size order, and the bars show how the writes spread across them.
+    const data = PHYSICAL_SIZE_BANDS.map(([band, label]) => {
+        const count = getMetricCounter(counters, `storagePhysical.write.size.${band}`)
+        return {label, value: count, detail: `${count} writes`}
+    }).filter(item => item.value > 0)
     renderHorizontalHistogram(container, data)
 }
 

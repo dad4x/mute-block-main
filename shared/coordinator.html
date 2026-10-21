@@ -235,6 +235,16 @@
                 <div class="histogram-container" id="authorityLoadHistogram"></div>
             </section>
 
+            <section class="panel" data-panel-scroll-target="writeSizeHistogram" data-dev-mode-panel hidden>
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="writeSizeHistogram" aria-expanded="true" aria-controls="writeSizeHistogram" aria-label="Collapse Write sizes">v</button>
+                        <h2 title="How many storage writes that reached disk fell in each size band this epoch, after the bucket split. Same counters as Reset metrics, so a metrics reset clears it too.">Write sizes (physical)</h2>
+                    </div>
+                </div>
+                <div class="histogram-container" id="writeSizeHistogram"></div>
+            </section>
+
             <section class="panel" data-panel-scroll-target="eventHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">

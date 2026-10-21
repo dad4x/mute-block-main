@@ -724,7 +724,8 @@ const {
     QUEUE_LOAD_THROTTLE_MAX_MS,
     STORED_WORK_CLEAR_REREAD_ATTEMPTS,
     PROFILE_BLOCKED_PAGE_EVENT_RECHECK_MAX_ATTEMPTS,
-    FILL_PRE_SCAN_BUSY_SKIP_ENABLED
+    FILL_PRE_SCAN_BUSY_SKIP_ENABLED,
+    RUNS_GAP_WATCH_INTERVAL_MS
 } = require('./tunables')
 // The dashboard's outlier list (swCoordinatorOutliers.js): a running baseline, pushed by each finished row at its archive.
 const {
@@ -2367,7 +2368,8 @@ const {
     recordQueueWriteOperationMetricValue,
     recordQueueWriteOperationMetrics,
     recordStoragePayloadMetrics,
-    recordStorageReadPayloadMetrics
+    recordStorageReadPayloadMetrics,
+    recordPhysicalWriteMetrics
 } = storageMetrics
 
 const coordinatorStorageAdapter = createChromeLocalStorageAdapter(() => browser.storage.local)
@@ -2630,19 +2632,43 @@ function commitRunsDiskWrite(write = {}) {
 
 // Diagnostic only (B15a): compares the resident run list with the buckets last written or loaded, and records a gap
 // when they differ. Writes nothing. Compares against the disk baseline, so a run changed in memory with no write shows here.
+// Every call records one runs-gap-check entry, so a zero-gap pass is visible in the recorder too. A gap also records runs-disk-gap.
 function recordRunsResidentDiskGap(residentRuns = {}, source = '') {
-    if (!runsLayout.bucketed || !runsLayout.hash) return
     const runs = residentRuns || {}
+    const residentRunCount = Object.keys(runs).length
+    if (!runsLayout.bucketed || !runsLayout.hash) {
+        recordFlightRecorderEvent({kind: 'runs-gap-check', source, residentRunCount, gapBucketCount: 0, reason: 'no-bucketed-layout'})
+        return
+    }
     const gap = changedSpaceMapBuckets(COORDINATOR_RUNS_KEY, runs, runsLayout.hash)
     const gapBuckets = Object.keys(gap.changed)
+    recordFlightRecorderEvent({kind: 'runs-gap-check', source, residentRunCount, gapBucketCount: gapBuckets.length})
     if (!gapBuckets.length) return
     recordFlightRecorderEvent({
         kind: 'runs-disk-gap',
         source,
-        residentRunCount: Object.keys(runs).length,
+        residentRunCount,
         gapBucketCount: gapBuckets.length,
         gapBuckets: gapBuckets.slice(0, 8).join(',')
     })
+}
+
+// The timer that makes the gap check regular: a reconcile pass runs only when one is scheduled, so it can go quiet for a whole run.
+// Skips until the authority is hydrated, so it never compares against an empty resident copy.
+// Started by a timed run (startDebugResumeLimit) and stopped when that run's limit clears, so it runs for the length of the run.
+let runsGapWatchTimer = null
+function startRunsGapWatch() {
+    if (runsGapWatchTimer !== null) return
+    const tick = () => {
+        runsGapWatchTimer = null
+        if (!debugResumeLimit) return
+        if (coordinatorAuthority.isHydrated()) {
+            const runs = coordinatorAuthority.residentStoredFor({[COORDINATOR_RUNS_KEY]: {}})[COORDINATOR_RUNS_KEY]
+            recordRunsResidentDiskGap(runs, 'timer')
+        }
+        runsGapWatchTimer = setTimeout(tick, RUNS_GAP_WATCH_INTERVAL_MS)
+    }
+    runsGapWatchTimer = setTimeout(tick, RUNS_GAP_WATCH_INTERVAL_MS)
 }
 
 async function metricStorageSet(payload = {}, options = {}) {
@@ -2699,6 +2725,8 @@ async function metricStorageSet(payload = {}, options = {}) {
         if(result !== false) {
             commitSpaceMapDiskWrite(spaceMapWrite)
             commitRunsDiskWrite(runsWrite)
+            // The bytes that reached storage: the bucket-split size when the write was translated, else the payload itself.
+            recordPhysicalWriteMetrics(diskWriteBytes ?? payloadSummary.bytes)
         }
         writeOutcome = 'saved'
     }
@@ -21878,6 +21906,7 @@ function startDebugResumeLimit(limit = null) {
     }
     if(untilAt) {
         void Promise.resolve(browser.alarms?.create?.(DEBUG_RESUME_LIMIT_ALARM_NAME, {when: untilAt})).catch(() => null)
+        startRunsGapWatch()
     }
     recordFlightRecorderEvent({
         kind: 'debug-resume-limit-set',
