@@ -17346,6 +17346,15 @@ async function requestProfileBlockedPageEventCheck(tabId, reason = 'profile-bloc
     }
 }
 
+// Coarse, non-identifying label for a tab's URL, used only on no-response close probes.
+function classifyNoResponseTabUrl(url = '') {
+    const text = `${url || ''}`
+    if(!text) return 'none'
+    if(text.startsWith('about:') || text.startsWith('chrome:') || text.startsWith('moz-extension:')) return 'internal'
+    if(/^https:\/\/([a-z0-9-]+\.)*quora\.com\//i.test(text)) return normalizeQuoraProfileUrl(text) ? 'quora-profile' : 'quora-other'
+    return 'other'
+}
+
 async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', expectedItem = null, expectedRecord = null, liveProfileTabsByHref = new Map(), reason = 'active-blocked-live-tab') {
     if(!expectedItem || typeof expectedItem !== 'object') return {changed: false, reason: 'invalid-item'}
     if(!isActiveCoordinatorStatus(expectedItem.status)) return {changed: false, reason: 'inactive-item'}
@@ -17414,6 +17423,9 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
                 attemptNumber: pollAttemptNumber
             }).catch(() => null)
             closeIfBlockedLastProbeCompletedAtByTabId.set(tabId, Date.now())
+            // A missing reply is recorded with what the tab looked like at that moment, so a
+            // no-response can be told apart: gone, still loading, or alive with no content script.
+            const noResponseTab = response ? null : await browser.tabs.get(tabId).catch(() => null)
             recordFlightRecorderEvent({
                 kind: 'close-if-blocked-response',
                 source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
@@ -17424,7 +17436,12 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
                 attemptNumber: pollAttemptNumber,
                 elapsedMs: Date.now() - sentAt,
                 accepted: response?.willClose === true,
-                reason: response ? (response.reason || (response.willClose ? 'will-close' : 'not-blocked')) : 'no-response'
+                reason: response ? (response.reason || (response.willClose ? 'will-close' : 'not-blocked')) : 'no-response',
+                ...(response ? {} : {
+                    tabPresent: Boolean(noResponseTab),
+                    tabStatus: noResponseTab?.status || '',
+                    tabUrlCategory: classifyNoResponseTabUrl(noResponseTab?.url || '')
+                })
             })
             return response
         })()
