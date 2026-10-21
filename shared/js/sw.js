@@ -17187,8 +17187,9 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
     if(!recorded?.terminal) return false
 
     markQueuedTabClosing(normalizedTabId, reason)
-    await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
+    // Removed before the release, for the same reason as the sweep above.
     await browser.tabs.remove(normalizedTabId).catch(() => {})
+    await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
     return true
     }) === true
 }
@@ -29890,8 +29891,10 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
 
                 signaled += 1
                 markQueuedTabClosing(tabId, 'background-blocked-sweep')
-                await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})
+                // The tab is removed before the release. The release waits for the next fill, and that fill waits for this tab's
+                // worker surface, so releasing first kept the tab open for good (flight recorder, 20 Oct: 751 surface-busy decisions).
                 await browser.tabs.remove(tabId).catch(() => {})
+                await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})
             }
         }
         catch {}
@@ -30707,11 +30710,12 @@ async function closeTerminalOwnedProfileTabsBody(profileHrefs = [], options = {}
                 if(normalizeQuoraProfileUrl(tab?.url || '') !== href) continue
 
                 markQueuedTabClosing(normalizedTabId, 'terminal-coordinator-tab-id')
-                await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
+                // Removed before the release, for the same reason as the sweep (the release waits for a fill that needs this tab's surface).
                 try {
                     await browser.tabs.remove(normalizedTabId)
                 }
                 catch {}
+                await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
                 closedTabIds.add(normalizedTabId)
                 closed += 1
             } else {

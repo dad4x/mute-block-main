@@ -6332,3 +6332,12 @@ test('a run\'s source page comes from the run record only; the event log is not 
     assert.doesNotMatch(sw, /getCoordinatorRunSourcePageFromEvents/)
     assert.match(sw, /makeCoordinatorSourceFromRunMetadata\(item\.runId \|\| '', ctx\.runs\[item\.runId\] \|\| \{\}\)/)
 })
+
+test('a blocked worker tab is removed before its release waits for the next fill (20 Oct stall)', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const sweepBody = extractFunction(source, 'async function sweepOwnedBlockedProfileTabs(parentTabId)')
+    assert.ok(sweepBody.indexOf('await browser.tabs.remove(tabId)') !== -1)
+    assert.ok(sweepBody.indexOf('await browser.tabs.remove(tabId)') < sweepBody.indexOf('await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})'))
+    assert.match(source, /await browser\.tabs\.remove\(normalizedTabId\)\.catch\(\(\) => \{\}\)\n    await releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: true\}\)/)
+    assert.match(source, /await browser\.tabs\.remove\(normalizedTabId\)\n                \}\n                catch \{\}\n                await releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: true\}\)/)
+})

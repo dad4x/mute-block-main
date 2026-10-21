@@ -125,7 +125,8 @@ test('completion for href A closes A\'s own owned tab and walks no other owned t
     assert.equal(result.ownedClosed, 1, 'A\'s owned tab is closed')
     assert.equal(browser.__tabs.has(tabA), false, 'A\'s owned tab is removed')
     assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsWalked'), 0, 'A\'s tab was closed in the row pass, so the owned walk fetches nothing')
-    assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsSkipped'), 1, 'B\'s owned tab is skipped without a fetch')
+    // A's tab is removed before its release now, so the owned walk also finds it gone and skips it (no fetch). B's tab is skipped too.
+    assert.equal(counterDelta(before, after, 'terminalOwnedTabClose.ownedTabsSkipped'), 2, 'A\'s and B\'s owned tabs are both skipped without a fetch')
 })
 
 test('orphan sweep closes a live tab that has no owner', async () => {
