@@ -309,7 +309,7 @@ register('the three claim retry loops each report through noteClaimRetryPass, an
     for(const loop of ['queue-not-loaded', 'claim-retry', 'pending-item-retry']) {
         assert.equal(body.split(`noteClaimRetryPass('${loop}')`).length - 1, 1, `${loop} reports once from the claim loop`)
     }
-    assert.match(contentSource, /const \{MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_SCHEDULE_MS\} = require\('\.\/tunables'\)/)
+    assert.match(contentSource, /const \{MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS\} = require\('\.\/tunables'\)/)
     const {CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES} = require('../shared/js/tunables')
     assert.ok(Number.isInteger(CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES) && CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES > 0)
 })

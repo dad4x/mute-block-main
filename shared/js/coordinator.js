@@ -1150,9 +1150,10 @@ function render() {
         getQueueStatusCount('acting', queueItems) +
         getQueueStatusCount('settling', queueItems)
     const terminalCount = getQueueTerminalCount(queueItems)
-    const secondsPerBlock = getSecondsPerActualBlock(getCurrentMetricsEpochStartedAt())
-    const secondsPerAlreadyBlocked = getSecondsPerAlreadyBlocked(getCurrentMetricsEpochStartedAt())
-    const activationHandoff = getActivationHandoffSeconds(getCurrentMetricsEpochStartedAt())
+    const timingEpochStartedAt = getCurrentMetricsEpochStartedAt()
+    const secondsPerBlock = rememberTimingTile('secondsPerBlock', timingEpochStartedAt, getSecondsPerActualBlock(timingEpochStartedAt))
+    const secondsPerAlreadyBlocked = rememberTimingTile('secondsPerAlreadyBlocked', timingEpochStartedAt, getSecondsPerAlreadyBlocked(timingEpochStartedAt))
+    const activationHandoff = rememberTimingTile('activationHandoff', timingEpochStartedAt, getActivationHandoffSeconds(timingEpochStartedAt))
     const failedCount = getQueueStatusCount('failed', queueItems)
     const canceledCount = getQueueStatusCount('canceled', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
@@ -1960,6 +1961,20 @@ function refreshQuoraVisitRequirement(queueItems = []) {
 // The timing tiles show the worker's summaries only (view.actualBlockTiming, view.alreadyBlockedTiming, view.activationHandoffTiming).
 // The worker computes them over the full compact population, finished rows included. The list holds the live rows only, so the page
 // cannot recompute these averages from it. With no usable summary a tile shows "--".
+// The timing tiles keep the last value shown in the current metrics epoch, so an empty summary (a cancel, or a queue with no rows)
+// shows the last value rather than a blank (owner, 22 Oct). A new epoch (a metrics reset) starts them empty again.
+const lastTimingTiles = {epochStartedAt: 0, secondsPerBlock: null, secondsPerAlreadyBlocked: null, activationHandoff: null}
+function rememberTimingTile(key = '', epochStartedAt = 0, value = null) {
+    if (lastTimingTiles.epochStartedAt !== epochStartedAt) {
+        lastTimingTiles.epochStartedAt = epochStartedAt
+        lastTimingTiles.secondsPerBlock = null
+        lastTimingTiles.secondsPerAlreadyBlocked = null
+        lastTimingTiles.activationHandoff = null
+    }
+    if (value) lastTimingTiles[key] = value
+    return lastTimingTiles[key]
+}
+
 function getSecondsPerActualBlock(epochStartedAt = 0) {
     return getQueueViewSecondsPerActualBlock(epochStartedAt)
 }

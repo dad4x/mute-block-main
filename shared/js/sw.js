@@ -379,6 +379,24 @@ const {
     createFillQueuedTabsOnceDecisions
 } = require('./swFillQueuedTabsOnceDecisions')
 const queueRuntime = createQueueRuntimeState()
+// Executor input generation (22 Oct). Every write that can change how queued rows classify bumps it. The apply pass reuses its
+// last classification only while the counter has not moved and the classification is younger than the backstop interval, so a
+// missed trigger costs at most the backstop, not a stall.
+const EXECUTOR_CLASSIFY_BACKSTOP_MS = 30000
+let lastApplyExecutorClassification = null
+let executorInputGeneration = 0
+function bumpExecutorInputGeneration() {
+    executorInputGeneration += 1
+}
+const EXECUTOR_RUNTIME_WRITE_PATTERN = /^(add|clear|consume|delete|drop|enqueue|mark|map|note|patch|pause|prune|rebuild|remember|remove|replace|requeue|resume|restore|set|sync)/
+for (const runtimeMethodName of Object.keys(queueRuntime)) {
+    if (!EXECUTOR_RUNTIME_WRITE_PATTERN.test(runtimeMethodName) || typeof queueRuntime[runtimeMethodName] !== 'function') continue
+    const runtimeMethod = queueRuntime[runtimeMethodName]
+    queueRuntime[runtimeMethodName] = (...args) => {
+        bumpExecutorInputGeneration()
+        return runtimeMethod(...args)
+    }
+}
 // coordinatorStatusRules is constructed here, immediately after the
 // requires, rather than in place like prior slices: three already-
 // extracted modules -- coordinatorAttemptIdentity, coordinatorJobEnvelope,
@@ -3216,6 +3234,7 @@ const {
 
 const activationGuardRuntime = createActivationGuardRuntime({
     now: () => Date.now(),
+    bumpExecutorInputGeneration,
     constants: {
         QUEUED_PROFILE_OPEN_RESERVATION_TTL_MS,
         QUEUED_ACTIVATION_GUARD_TTL_MS,
@@ -6197,6 +6216,7 @@ function getCoordinatorNamespaceStampKey(key = '') {
 async function saveProfileNukeProgressRowProjection(progressRecords = {}, options = {}) {
     const normalizedRecords = normalizeStoredProfileNukeProgress(progressRecords || {})
     noteTerminalProgressForSettlement(normalizedRecords)
+    bumpExecutorInputGeneration()
     const hrefs = Object.keys(normalizedRecords)
     if(!hrefs.length) return false
 
@@ -7302,6 +7322,7 @@ function omitProfileNukeProgressKeys(payload = {}) {
 // area refuses the write (it answers false), which the caller reports as not saved. A write that throws is rethrown, as a disk write
 // is, so the caller's storage-error path handles it. Nothing is written to disk.
 async function writeProfileNukeProgressSession(payload = {}) {
+    bumpExecutorInputGeneration()
     const session = getCoordinatorQueueMirrorSessionArea()
     if(!session) {
         incrementQueueWakeupMetric('progress.sessionWriteUnavailable')
@@ -9839,6 +9860,7 @@ function createCoordinatorAuthority() {
     // The queue order index in queueRuntime follows the resident queue. Only the authority replaces that queue (hydrate, seed,
     // and the door's writes), and each of those calls this with the queue it replaced. The first call seeds the index.
     function syncResidentQueueOrder(previousQueue = {}) {
+        bumpExecutorInputGeneration()
         const nextQueue = projection.queue || {}
         updateDeepPendingShadowRows(previousQueue, nextQueue)
         if(queueRuntime.getOrderedQueueKeyCount() > 0) queueRuntime.syncOrderedQueueKeysFromQueueDiff(previousQueue, nextQueue)
@@ -16281,6 +16303,8 @@ async function classifyCoordinatorExecutorState(options = {}) {
         ? Infinity
         : Math.max(1, getEffectiveQueuedTabOpenConcurrency() * 2)
     let queuedRowsFullyClassified = 0
+    // The deep queued rows classify decided on, from the same view the apply walk starts with (22 Oct, shadow check).
+    const deepPendingKeys = new Set()
     // Built once per call instead of letting getRuntimeSurfaceForCoordinatorItem
     // re-scan the full runtime state (activeQueuedTabs + pendingTabActions +
     // queuedTabActions) on every one of the (up to hundreds of) queue rows
@@ -16417,6 +16441,7 @@ async function classifyCoordinatorExecutorState(options = {}) {
                     record: effectiveRecord,
                     reason: 'queued-authority-needs-executor-intent-scan-bounded'
                 })
+                deepPendingKeys.add(itemKey)
                 cases.push(classified)
                 internalRows.push({contract: classified, itemKey, item, record: effectiveRecord, liveTab: null})
                 continue
@@ -16534,7 +16559,8 @@ async function classifyCoordinatorExecutorState(options = {}) {
         executorClassificationId,
         generatedAt,
         cases,
-        internalRows
+        internalRows,
+        deepPendingKeys
     }
 }
 
@@ -17363,7 +17389,21 @@ async function runProfileBlockedPageEventCheck(tabId, reason = 'profile-blocked-
     let result = {changed: false, reason: 'not-checked'}
     for(let attempt = 1; attempt <= PROFILE_BLOCKED_PAGE_EVENT_RECHECK_MAX_ATTEMPTS; attempt += 1) {
         const target = resolveActiveQueuedActionForBlockedPageEvent(tabId)
-        if(!target) return {changed: false, reason: 'no-active-queued-action', attempts: attempt}
+        if(!target) {
+            // A pause returns an active row to queued while its tab is still open, so the blocked state is handled on the tab directly
+            // (22 Oct). Without this the event was dropped, and the close waited for the next scheduled reconcile.
+            const handled = await terminalizeAlreadyBlockedQueuedTab(tabId, 'profile-blocked-page-event-no-active')
+            recordFlightRecorderEvent({
+                kind: 'profile-blocked-page-event-check',
+                source: 'runProfileBlockedPageEventCheck',
+                tabId,
+                accepted: handled === true,
+                reason: handled === true ? 'queued-already-blocked-terminalized' : 'no-active-queued-action',
+                attemptNumber: attempt
+            })
+            if(handled === true) return {changed: true, reason: 'queued-already-blocked-terminalized', attempts: attempt}
+            return {changed: false, reason: 'no-active-queued-action', attempts: attempt}
+        }
         const tab = await browser.tabs.get(tabId).catch(() => null)
         if(!tab?.id) return {changed: false, reason: 'tab-gone', attempts: attempt}
 
@@ -18566,7 +18606,7 @@ function updateDeepPendingShadowRows(previousQueue = {}, nextQueue = {}) {
     }
 }
 // The expected deep set, taken before the walk changes anything, from the same state the walk starts with. Measurement only.
-function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), preRecoveredCount = 0) {
+function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), preRecoveredCount = 0, skipFreshPreflight = false, candidateKeys = null) {
     if(!deepPendingShadowReady) return null
     const limit = Math.max(1, getEffectiveQueuedTabOpenConcurrency() * 2)
     // The apply pass examines only the first COORDINATOR_RECONCILE_ACTION_BUDGET queued rows in order (its own budget), so the expected
@@ -18581,9 +18621,8 @@ function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), p
         applyWindowKeys.add(key)
         if(headKeys.size < limit) headKeys.add(key)
     }
-    const runtimeSurfaceIndex = buildRuntimeSurfaceIndex(queueRuntime.listRuntimeSurfaceEntries())
     const expected = new Set()
-    for(const key of deepPendingShadowRows) {
+    for(const key of (candidateKeys || deepPendingShadowRows)) {
         if(headKeys.has(key) || !applyWindowKeys.has(key)) continue
         const item = queue?.[key]
         if(!isDeepPendingShadowCandidate(key, item)) continue
@@ -18591,10 +18630,12 @@ function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), p
         const coordinatorKey = getCoordinatorItemQueueKey(item, key)
         if(preRecoveredKeys.has(key) || preRecoveredKeys.has(href) || preRecoveredKeys.has(coordinatorKey)) continue
         if(preRecoveredCount > 0 && `${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered') continue
-        if(getRuntimeSurfaceForCoordinatorItem(item, key, {runtimeSurfaceIndex}).hasSurface) continue
+        // The walk skips these rows when the pass was asked to skip fresh preflight rows (see the same test in the walk).
+        if(skipFreshPreflight && (`${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered' ||
+            /fast-executor-preflight$/.test(`${item?.actionLeaseReleaseReason || ''}`))) continue
         expected.add(key)
     }
-    return {expected, headSize: headKeys.size, candidates: deepPendingShadowRows.size}
+    return {expected, headSize: headKeys.size, candidates: (candidateKeys || deepPendingShadowRows).size}
 }
 // Compares the snapshot with the deep rows the walk pushed. Measurement only.
 function compareDeepPendingShadow(snapshot = null, walkDeepKeys = new Set()) {
@@ -18774,13 +18815,28 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         incrementQueueWakeupMetric('progress.scopedGlobalWrite')
     }
     profileNukeProgress = progress
-    const executorClassification = await classifyCoordinatorExecutorState({
+    const classifyGenerationBefore = executorInputGeneration
+    const reusableClassification = lastApplyExecutorClassification &&
+        lastApplyExecutorClassification.generation === executorInputGeneration &&
+        Date.now() - lastApplyExecutorClassification.at < EXECUTOR_CLASSIFY_BACKSTOP_MS &&
+        !options.forceFreshExecutorClassification
+        ? lastApplyExecutorClassification.result
+        : null
+    const executorClassification = reusableClassification || await classifyCoordinatorExecutorState({
         currentAuthorityState,
         liveProfileTabsByHref,
         progress,
         paused: false
     })
+    if(!reusableClassification) {
+        lastApplyExecutorClassification = {generation: classifyGenerationBefore, at: Date.now(), result: executorClassification}
+        incrementQueueWakeupMetric('pump.executorClassification.fullPass')
+    }
+    else {
+        incrementQueueWakeupMetric('pump.executorClassification.reused')
+    }
     const executorClassificationId = executorClassification.executorClassificationId || ''
+    const classifyDeepPendingKeys = executorClassification.deepPendingKeys || new Set()
     const classificationGeneratedAt = executorClassification.generatedAt || 0
     const primaryExecutorCase = executorClassification.cases.find(item => item.case !== 'idle-no-work') ||
         executorClassification.cases[0] ||
@@ -19063,7 +19119,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         queue = currentAuthorityState.queue
     }
 
-    const deepPendingSnapshot = snapshotDeepPendingExpected(queue, preRecoveredExhaustedKeys, preRecoveredExhausted)
+    const deepPendingSnapshot = snapshotDeepPendingExpected(queue, preRecoveredExhaustedKeys, preRecoveredExhausted, options.skipFreshPreflightRequeuedRows === true, classifyDeepPendingKeys)
     const shadowDeepPushedKeys = new Set()
     for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue)) {
         if(preprocessedActiveMissingKeys.has(itemKey)) continue
@@ -36320,6 +36376,7 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
 
 registerServiceWorkerListeners({
     browser,
+    bumpExecutorInputGeneration,
     constants: {
         defaults,
         COORDINATOR_RESUME_ALARM_NAME,

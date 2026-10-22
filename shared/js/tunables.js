@@ -71,8 +71,8 @@ module.exports = {
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED: true,
     // Cadence of the run-list gap check (B15a diagnostic): how often the resident run list is compared with the run buckets on disk.
     RUNS_GAP_WATCH_INTERVAL_MS: 30000,
-    // Waits between reads of the profile menu for its block or unblock item, in ms (the page script). The first read is at once, then
-    // each wait is the next value, and the last value repeats until the 5 s limit. A fast menu is caught early; a slow one is caught later.
-    PROFILE_MENU_POLL_SCHEDULE_MS: [100, 200, 200, 500]
+    // Wait between reads of the profile menu for its block or unblock item, in ms (the page script). The first read is at once. A fixed
+    // 500 ms was measured against an escalating schedule (22 Oct): no difference in blocks, handoff or gaps, so the simpler fixed wait stays.
+    PROFILE_MENU_POLL_INTERVAL_MS: 500
 }
 

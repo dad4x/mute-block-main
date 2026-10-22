@@ -58,7 +58,7 @@ const {
     COORDINATOR_QUEUE_VIEW_KEY,
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
-const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_SCHEDULE_MS} = require('./tunables')
+const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
 const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
@@ -411,7 +411,7 @@ async function init() {
     // fetched below. Firing it here, before that slower sequential chain,
     // means the button can appear as soon as Quora's own profile menu
     // renders instead of being needlessly gated behind a coordinator-queue
-    // round trip and reconcileReloadCanceledNukes -- a live trace found
+    // round trip -- a live trace found
     // these two steps alone routinely add several seconds before the first
     // insertion attempt even happens, on a page where Quora's own DOM was
     // already ready (see entropy-reduction-action-plan-2026-09-09.md,
@@ -444,7 +444,6 @@ async function init() {
     }
     setStorageChangeListenerEnabled(true)
     installNavigationHooks()
-    await reconcileReloadCanceledNukes()
 
     const page = initialPage
 
@@ -793,23 +792,6 @@ async function sendQueuedProfileResolutionMessageWithRetry(message) {
     }
 
     return result
-}
-
-async function reconcileReloadCanceledNukes() {
-    // This runs unconditionally during init(), for every page type, before
-    // either the profile page's mute-block button or the space page's
-    // asset/neutral/target buttons get created -- so an unbounded message
-    // wait here stalls button injection on every page, not just this one
-    // cleanup step. safeSendRuntimeMessage has no timeout at all; use the
-    // same bounded pattern as the sibling coordinator-state refresh call in
-    // refreshContentPageCoordinatorStateFromRuntime instead, so a
-    // slow/asleep service worker degrades to "skip this cleanup cycle"
-    // rather than blocking page setup indefinitely.
-    const result = await safeSendRuntimeMessageWithTimeout({action: 'cancel-queued-owner-nukes'}, {canceledUrls: []}, 4000)
-    const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
-    if(!canceledUrls.length) return
-
-    await removePendingSpaceFeedUrls(canceledUrls)
 }
 
 function isTransientProfileNukeStatus(status) {
@@ -4667,15 +4649,11 @@ function getGlobalPrimaryAction(preferredRegex) {
 
 async function waitForAction(getAction, timeoutMs = WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
-    // An array is an escalating schedule: each wait is the next value, and the last value repeats (the first check is at once).
-    const schedule = Array.isArray(intervalMs) ? intervalMs : null
-    let step = 0
-
     while(Date.now() - startedAt < timeoutMs) {
         const action = getAction()
         if(action) return action
 
-        await sleep(schedule ? schedule[Math.min(step++, schedule.length - 1)] : intervalMs)
+        await sleep(intervalMs)
     }
 
     return null
@@ -10716,7 +10694,9 @@ function getProfileSearchRows(options = {}) {
         const row = getProfileSearchRowForFollowButton(followButton)
         if(!row) continue
 
-        const rect = row.getBoundingClientRect()
+        // Layout is read only for the viewport pass, which is the only caller that uses the position (owner, 22 Oct). A full-page read
+        // of every row's layout and text forced a layout per row on every sync, so it cost more as the page grew.
+        const rect = fromCurrentViewport ? row.getBoundingClientRect() : null
         if(fromCurrentViewport && rect.bottom < -80) continue
 
         const href = getProfileSearchPrimaryHref(row)
@@ -10727,9 +10707,8 @@ function getProfileSearchRows(options = {}) {
             href,
             row,
             followButton,
-            rowText: getElementText(row),
-            viewportTop: rect.top,
-            viewportBottom: rect.bottom
+            viewportTop: rect ? rect.top : null,
+            viewportBottom: rect ? rect.bottom : null
         })
     }
 
@@ -13585,7 +13564,7 @@ async function blockProfile(options = {}) {
 
     let blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
         timeoutMs: 5000,
-        intervalMs: PROFILE_MENU_POLL_SCHEDULE_MS,
+        intervalMs: PROFILE_MENU_POLL_INTERVAL_MS,
         promotionReason: 'block-option-not-found',
         silent,
         allowForegroundFallback

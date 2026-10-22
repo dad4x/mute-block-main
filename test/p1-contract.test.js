@@ -1165,7 +1165,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     assert.match(dashboard, /refresh-queue-wakeup-metrics-view/)
     assert.match(dashboard, /formatPreviousEpochSummary/)
     assert.match(dashboard, /Current epoch/)
-    assert.match(dashboard, /getSecondsPerActualBlock\(getCurrentMetricsEpochStartedAt\(\)\)/)
+    assert.match(dashboard, /rememberTimingTile\('secondsPerBlock', timingEpochStartedAt, getSecondsPerActualBlock\(timingEpochStartedAt\)\)/)
     assert.match(dashboard, /function getCurrentMetricsEpochStartedAt\(\)/)
     assert.match(readRepoFile('shared/js/swCoordinatorQueueView.js'), /milestones\.blockAttemptedAt/)
     // 2026-09-27: floored by epochStartedAt again (reversing the 2026-09-25
@@ -3925,12 +3925,12 @@ test('executor apply classifies before reducer decisions instead of pre-filling 
     assert.doesNotMatch(body, /pre-fill-durable-resume/)
     assert.doesNotMatch(body, /const queuedActionsBeforeFill = queuedTabActions\.length/)
     assert.doesNotMatch(body, /const fillResult = await fillQueuedTabs\(/)
-    assert.match(body, /const executorClassification = await classifyCoordinatorExecutorState\(\{[\s\S]*currentAuthorityState,[\s\S]*liveProfileTabsByHref,[\s\S]*progress,[\s\S]*paused: false[\s\S]*\}\)/)
+    assert.match(body, /const executorClassification = reusableClassification \|\| await classifyCoordinatorExecutorState\(\{[\s\S]*currentAuthorityState,[\s\S]*liveProfileTabsByHref,[\s\S]*progress,[\s\S]*paused: false[\s\S]*\}\)/)
     assert.match(body, /const requeueMissingActiveTabs = options\.requeueMissingActiveTabs !== false/)
     assert.match(body, /const executorClassificationId = executorClassification\.executorClassificationId \|\| ''/)
     assert.match(body, /classificationGeneratedAt/)
     assert.ok(
-        body.indexOf('const executorClassification = await classifyCoordinatorExecutorState') <
+        body.indexOf('const executorClassification = reusableClassification || await classifyCoordinatorExecutorState') <
         body.indexOf('for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue))')
     )
     assert.match(body, /let requeued = 0/)

@@ -23,6 +23,8 @@ function registerServiceWorkerListeners(deps = {}) {
     const {
         browser
     } = deps
+    // A tab event can change how queued rows classify (a tab opened, closed or updated), so it bumps the executor input generation.
+    const bumpExecutorInput = typeof deps.bumpExecutorInputGeneration === 'function' ? deps.bumpExecutorInputGeneration : () => {}
 
     // Times a request a content script awaits before it acts (profile pages wait on these), so a slow
     // worker shows up in the flight recorder as a content-request event. Diagnostic only.
@@ -501,7 +503,10 @@ function registerServiceWorkerListeners(deps = {}) {
             }
         })
     }
-    browser.tabs.onRemoved.addListener(tabId => runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId)))
+    browser.tabs.onRemoved.addListener(tabId => {
+        bumpExecutorInput()
+        return runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId))
+    })
     function handleTabUpdated(tabId, changeInfo, tab) {
         const observedUrl = `${changeInfo.url || tab?.url || ''}`.trim()
         if(isQuoraRuntimeUrl(observedUrl)) {
@@ -595,7 +600,10 @@ function registerServiceWorkerListeners(deps = {}) {
         const canceledUrls = cancelQueuedOwnerActions(tabId, 'nuke')
         rememberCanceledOwnerUrls(tabId, canceledUrls)
     }
-    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => runAfterCoordinatorAuthorityReady(() => handleTabUpdated(tabId, changeInfo, tab)))
+    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+        bumpExecutorInput()
+        return runAfterCoordinatorAuthorityReady(() => handleTabUpdated(tabId, changeInfo, tab))
+    })
     function handleStorageChanged(changes, areaName) {
         if(areaName !== 'local') return
     
