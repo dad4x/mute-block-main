@@ -70,6 +70,9 @@ module.exports = {
     // handoff summary worse with a wait; this is a skip, not a wait, and needs its own measurement run.
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED: true,
     // Cadence of the run-list gap check (B15a diagnostic): how often the resident run list is compared with the run buckets on disk.
-    RUNS_GAP_WATCH_INTERVAL_MS: 30000
+    RUNS_GAP_WATCH_INTERVAL_MS: 30000,
+    // Pause after the profile menu opens, before the block option is first read (the page script). The read then polls every 250 ms,
+    // so a shorter pause only moves the first read earlier; a late menu is still caught by the poll.
+    PROFILE_MENU_SETTLE_MS: 500
 }
 

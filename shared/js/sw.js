@@ -15389,19 +15389,8 @@ async function transitionCoordinatorItemForQueuedTab(action = {}, tab = {}, deta
         incrementQueueWakeupMetric('activeTransition.coalesced')
         return queuedTabActiveTransitionPromises.get(inFlightKey)
     }
-    recordFlightRecorderEvent({
-        kind: 'active-transition',
-        source: 'transitionCoordinatorItemForQueuedTab',
-        rowKey: coordinatorKey || href,
-        targetUrl: href || action?.requestedUrl || action?.url || '',
-        attemptId: getAttemptIdFromValue(details) || getAttemptIdFromValue(action),
-        attemptNumber: getAttemptNumberFromValue(details) || getAttemptNumberFromValue(action),
-        runId: action?.runId || '',
-        tabId: tab?.id || null,
-        accepted: true,
-        reason: 'attempt'
-    })
-
+    // One record per activation (owner 21 Oct): the outcome is recorded once, by the locked transition, with the start time.
+    const attemptStartedAt = Date.now()
     const transitionPromise = (getActiveStorageContext()
         ? Promise.resolve().then(() => {
             incrementQueueWakeupMetric('activeTransition.usedCurrentStorageUpdate')
@@ -15412,7 +15401,7 @@ async function transitionCoordinatorItemForQueuedTab(action = {}, tab = {}, deta
                 coordinatorKey,
                 action,
                 tab,
-                details
+                details: {...details, attemptStartedAt}
             }, {
                 reason: 'ordinaryMutation'
             })
@@ -15425,7 +15414,7 @@ async function transitionCoordinatorItemForQueuedTab(action = {}, tab = {}, deta
                 coordinatorKey,
                 action,
                 tab,
-                details
+                details: {...details, attemptStartedAt}
             }, {
                 reason: 'ordinaryMutation'
             })
@@ -15931,6 +15920,7 @@ async function transitionCoordinatorItemForQueuedTabLocked(action = {}, tab = {}
         changed: authorityResult?.changed === true,
         statusBefore: item?.status || '',
         statusAfter: authorityResult?.nextRow?.status || '',
+        attemptStartedAt: Number.parseInt(details?.attemptStartedAt, 10) || 0,
         reason: authorityResult?.reason || 'authority-result'
     })
     if(authorityResult?.accepted !== true || authorityResult?.durable !== true) return false

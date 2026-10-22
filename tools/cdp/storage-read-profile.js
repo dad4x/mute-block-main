@@ -13,7 +13,6 @@ const DEFAULT_KEYS = [
     'mbCoordinatorQueue',
     'mbProfileNukeProgressView',
     'mbCoordinatorRuns',
-    'mbCoordinatorEvents',
     'mbQueueWakeupMetrics',
     'mbSpaceRegistry',
     'mbSpacePendingNukedPosts',
@@ -76,6 +75,23 @@ runMain(async () => {
             return {label, value, durationMs}
         }
 
+        // Space maps and the run list are stored in 32 buckets each once their layout marker is 2 (1437+). Rebuild the whole map.
+        const BUCKETED_MAP_LAYOUT = {
+            mbSpacePendingNukedPosts: 'mbSpaceMapLayoutVersion',
+            mbSpaceNukedPosts: 'mbSpaceMapLayoutVersion',
+            mbCoordinatorRuns: 'mbCoordinatorRunsLayoutVersion'
+        }
+        async function readLogical(key) {
+            const layoutKey = BUCKETED_MAP_LAYOUT[key]
+            if (!layoutKey) return (await chrome.storage.local.get(key))[key]
+            const bucketKeys = Array.from({length: 32}, (_, i) => `${key}.b${i.toString(16).padStart(2, '0')}`)
+            const stored = await chrome.storage.local.get([layoutKey, key, ...bucketKeys])
+            if (stored[layoutKey] !== 2) return stored[key]
+            const merged = {}
+            for (const bucketKey of bucketKeys) Object.assign(merged, stored[bucketKey] || {})
+            return merged
+        }
+
         const bytesInUse = {}
         if(chrome.storage.local.getBytesInUse) {
             for(const key of keysToRead) {
@@ -89,8 +105,8 @@ runMain(async () => {
 
         const reads = []
         for(const key of keysToRead) {
-            const measured = await timed(key, () => chrome.storage.local.get(key))
-            const value = measured.value ? measured.value[key] : undefined
+            const measured = await timed(key, () => readLogical(key))
+            const value = measured.value
             reads.push({
                 key,
                 present: value !== undefined,

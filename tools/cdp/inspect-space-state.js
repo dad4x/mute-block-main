@@ -41,14 +41,17 @@ runMain(async () => {
     if(serviceWorker) {
         const progressRecords = await readProfileNukeProgressFromWorker(config)
         workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, progress) {
-            const storage = await chrome.storage.local.get({
-                mbSpacePendingNukedPosts: {},
-                mbCoordinatorQueue: {},
-                mbCoordinatorRuns: {}
-            })
-            const pending = storage.mbSpacePendingNukedPosts || {}
+            const storage = await chrome.storage.local.get(null)
+            // Space maps and the run list are kept in 32 buckets each once their layout marker is 2 (1437+). Rebuild each whole map.
+            const readBucketed = (base, layoutKey) => {
+                if (storage[layoutKey] !== 2) return storage[base] || {}
+                const merged = {}
+                for (let i = 0; i < 32; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
+                return merged
+            }
+            const pending = readBucketed('mbSpacePendingNukedPosts', 'mbSpaceMapLayoutVersion')
             const queue = storage.mbCoordinatorQueue || {}
-            const runs = storage.mbCoordinatorRuns || {}
+            const runs = readBucketed('mbCoordinatorRuns', 'mbCoordinatorRunsLayoutVersion')
             const tabs = await chrome.tabs.query({})
             const spaceTabs = tabs
                 .filter(tab => `${tab.url || ''}\n${tab.title || ''}`.toLowerCase().includes(needle))

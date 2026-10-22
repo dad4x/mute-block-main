@@ -58,7 +58,7 @@ const {
     COORDINATOR_QUEUE_VIEW_KEY,
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
-const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES} = require('./tunables')
+const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_SETTLE_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
 const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
@@ -13572,7 +13572,7 @@ async function blockProfile(options = {}) {
     noteCurrentProfileNukeProgress({
         event: 'Block profile menu opened'
     })
-    await sleep(500)
+    await sleep(PROFILE_MENU_SETTLE_MS)
 
     let blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
         timeoutMs: 5000,

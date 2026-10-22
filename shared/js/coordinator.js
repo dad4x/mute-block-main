@@ -286,6 +286,9 @@ async function init() {
     document.getElementById('clearAuthorityLoadHistogramButton')?.addEventListener('click', () => {
         void resetMetrics()
     })
+    document.getElementById('clearWriteSizeHistogramButton')?.addEventListener('click', () => {
+        void resetMetrics()
+    })
     document.getElementById('resetPhaseTimingButton')?.addEventListener('click', () => {
         void resetMetrics()
     })

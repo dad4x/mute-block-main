@@ -138,15 +138,24 @@ async function readLiveStorage(config) {
     }
 }
 
+// Space maps and the run list are stored in 32 buckets each once their layout marker is 2 (1437+). Rebuild the whole map.
+function readBucketedMap(storage = {}, baseKey = '', layoutKey = '') {
+    if (storage[layoutKey] !== 2) return storage[baseKey] || {}
+    const merged = {}
+    for (let i = 0; i < 32; i += 1) Object.assign(merged, storage[`${baseKey}.b${i.toString(16).padStart(2, '0')}`] || {})
+    return merged
+}
+
 function buildDatasets(storage = {}, progressRecords = {}) {
     const recoveryCritical = {
         queue: storage.mbCoordinatorQueue || {},
-        runs: storage.mbCoordinatorRuns || {},
+        runs: readBucketedMap(storage, 'mbCoordinatorRuns', 'mbCoordinatorRunsLayoutVersion'),
         progressView: {records: progressRecords, total: Object.keys(progressRecords).length},
-        events: storage.mbCoordinatorEvents || []
+        // Coordinator events are no longer stored (1442); they live in the flight recorder, so this set is empty.
+        events: []
     }
     const userMemory = {
-        mbSpaceNukedPosts: storage.mbSpaceNukedPosts || {}
+        mbSpaceNukedPosts: readBucketedMap(storage, 'mbSpaceNukedPosts', 'mbSpaceMapLayoutVersion')
     }
     const full = storage
 
