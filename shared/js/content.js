@@ -58,7 +58,7 @@ const {
     COORDINATOR_QUEUE_VIEW_KEY,
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
-const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_SETTLE_MS} = require('./tunables')
+const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_SCHEDULE_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
 const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
@@ -248,6 +248,8 @@ let profileSearchCollectionKey = ''
 let profileSearchStagedHrefs = []
 let profileSearchStagedHrefSet = new Set()
 let profileSearchCollectCursorScrollY = 0
+// Follow buttons a collect pass has already handled. A later pass skips them before any layout read, so a pass costs the new tail of the page, not all of it (owner, 21 Oct).
+let profileSearchProcessedFollowButtons = new WeakSet()
 let profileSearchCollectCursorHref = ''
 let profileSearchFollowUpTimeouts = []
 let profileSearchPendingRefreshTimeout = null
@@ -4665,12 +4667,15 @@ function getGlobalPrimaryAction(preferredRegex) {
 
 async function waitForAction(getAction, timeoutMs = WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS) {
     const startedAt = Date.now()
+    // An array is an escalating schedule: each wait is the next value, and the last value repeats (the first check is at once).
+    const schedule = Array.isArray(intervalMs) ? intervalMs : null
+    let step = 0
 
     while(Date.now() - startedAt < timeoutMs) {
         const action = getAction()
         if(action) return action
 
-        await sleep(intervalMs)
+        await sleep(schedule ? schedule[Math.min(step++, schedule.length - 1)] : intervalMs)
     }
 
     return null
@@ -10595,7 +10600,7 @@ function stageProfileSearchHrefs(hrefs = []) {
     return added
 }
 
-function hasUnstagedProfileSearchQueueableRow(rows = getProfileSearchRows({fromCurrentViewport: true})) {
+function hasUnstagedProfileSearchQueueableRow(rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})) {
     ensureProfileSearchCollectionStateForCurrentSearch()
     getProfileSearchStagedHrefs()
 
@@ -10700,12 +10705,14 @@ function getProfileSearchRows(options = {}) {
     if(getPageType() !== 'profile-search') return []
 
     const fromCurrentViewport = !!options.fromCurrentViewport
+    const skipProcessed = !!options.skipProcessed
     const rows = []
     const seen = new Set()
     const followButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
         .filter(isProfileSearchFollowButton)
 
     for(const followButton of followButtons) {
+        if(skipProcessed && profileSearchProcessedFollowButtons.has(followButton)) continue
         const row = getProfileSearchRowForFollowButton(followButton)
         if(!row) continue
 
@@ -10923,9 +10930,10 @@ function syncProfileSearchControls() {
         buttons.batch.disabled = !batchHrefs.length
     }
     else if(pendingSearchCount > 0) {
-        setNukeButtonWorking(buttons.collect, `Nuking ${pendingSearchCount} left`)
-        buttons.collect.disabled = true
-        buttons.batch.disabled = true
+        // Collecting more does not wait for the nukes in progress, so the button is always offered (owner, 21 Oct).
+        setNukeButtonIdle(buttons.collect, `Collect ${limit} More`)
+        buttons.collect.disabled = false
+        buttons.batch.disabled = !batchHrefs.length
         scheduleProfileSearchPendingRefresh()
     }
     else {
@@ -11015,6 +11023,7 @@ async function collectMoreProfileSearchResults(button) {
     let stalledStartedAt = 0
     let scrollPasses = 0
 
+    profileSearchProcessedFollowButtons = new WeakSet()
     await animateNukeButtonPress(button)
     await restoreProfileSearchCollectCursor()
 
@@ -11025,12 +11034,13 @@ async function collectMoreProfileSearchResults(button) {
             const beforeCount = collectedCount
             const beforeY = getProfileSearchScrollY()
             const beforeHeight = getProfileSearchScrollHeight()
-            const rows = getProfileSearchRows({fromCurrentViewport: true})
+            const rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})
             for(const row of getProfileSearchQueueableRows(rows, {allowRetry: false})) {
                 if(collectedCount >= limit) break
                 collectedCount += stageProfileSearchHrefs([row.href])
             }
 
+            for(const row of rows) profileSearchProcessedFollowButtons.add(row.followButton)
             saveProfileSearchCollectCursor(rows)
             setNukeButtonWorking(button, `Collecting ${getProfileSearchStagedHrefs().length} / ${targetStagedCount}`)
             syncProfileSearchControls()
@@ -13572,11 +13582,10 @@ async function blockProfile(options = {}) {
     noteCurrentProfileNukeProgress({
         event: 'Block profile menu opened'
     })
-    await sleep(PROFILE_MENU_SETTLE_MS)
 
     let blockState = await waitForMenuStateWithForegroundFallback(isBlockActionLabel, isUnblockActionLabel, {
         timeoutMs: 5000,
-        intervalMs: 250,
+        intervalMs: PROFILE_MENU_POLL_SCHEDULE_MS,
         promotionReason: 'block-option-not-found',
         silent,
         allowForegroundFallback

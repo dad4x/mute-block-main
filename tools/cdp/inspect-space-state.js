@@ -41,7 +41,9 @@ runMain(async () => {
     if(serviceWorker) {
         const progressRecords = await readProfileNukeProgressFromWorker(config)
         workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, progress) {
-            const storage = await chrome.storage.local.get(null)
+            const keys = ['mbSpaceMapLayoutVersion', 'mbCoordinatorRunsLayoutVersion', 'mbCoordinatorQueue', 'mbSpacePendingNukedPosts', 'mbCoordinatorRuns']
+            for (let i = 0; i < 32; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
+            const storage = await chrome.storage.local.get(keys)
             // Space maps and the run list are kept in 32 buckets each once their layout marker is 2 (1437+). Rebuild each whole map.
             const readBucketed = (base, layoutKey) => {
                 if (storage[layoutKey] !== 2) return storage[base] || {}

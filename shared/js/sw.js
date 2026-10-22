@@ -2655,16 +2655,37 @@ function recordRunsResidentDiskGap(residentRuns = {}, source = '') {
 
 // The timer that makes the gap check regular: a reconcile pass runs only when one is scheduled, so it can go quiet for a whole run.
 // Skips until the authority is hydrated, so it never compares against an empty resident copy.
+// Diagnostic only (21 Oct): a time series of the store's size and the queue's counts, sampled on the same timer as the gap check.
+// It shows whether storage writes slow as the store grows, or as more work is queued. Writes nothing.
+async function recordStoreSizeSample() {
+    let bytesInUse = -1
+    try {
+        bytesInUse = await coordinatorStorageAdapter.getBytesInUse(null)
+    }
+    catch {}
+    const queue = (coordinatorAuthority.isHydrated() ? coordinatorAuthority.current()?.queue : null) || {}
+    const counts = getCoordinatorQueueWorkCounts(queue)
+    recordFlightRecorderEvent({
+        kind: 'store-size',
+        source: 'runsGapWatch',
+        bytesInUse: Number.isFinite(bytesInUse) ? bytesInUse : -1,
+        queueRows: Object.keys(queue).length,
+        queued: counts.durableQueuedRows || 0,
+        active: counts.durableActiveRows || 0
+    })
+}
+
 // Started by a timed run (startDebugResumeLimit) and stopped when that run's limit clears, so it runs for the length of the run.
 let runsGapWatchTimer = null
 function startRunsGapWatch() {
     if (runsGapWatchTimer !== null) return
-    const tick = () => {
+    const tick = async () => {
         runsGapWatchTimer = null
         if (!debugResumeLimit) return
         if (coordinatorAuthority.isHydrated()) {
             const runs = coordinatorAuthority.residentStoredFor({[COORDINATOR_RUNS_KEY]: {}})[COORDINATOR_RUNS_KEY]
             recordRunsResidentDiskGap(runs, 'timer')
+            await recordStoreSizeSample()
         }
         runsGapWatchTimer = setTimeout(tick, RUNS_GAP_WATCH_INTERVAL_MS)
     }
@@ -6175,6 +6196,7 @@ function getCoordinatorNamespaceStampKey(key = '') {
 
 async function saveProfileNukeProgressRowProjection(progressRecords = {}, options = {}) {
     const normalizedRecords = normalizeStoredProfileNukeProgress(progressRecords || {})
+    noteTerminalProgressForSettlement(normalizedRecords)
     const hrefs = Object.keys(normalizedRecords)
     if(!hrefs.length) return false
 
@@ -6970,9 +6992,15 @@ function cloneCoordinatorAuthorityValue(value) {
 // that key, and nothing on the resident path edits a stored value or a WAL object in place, so the values can be shared
 // between consecutive resident projections. Every other caller gets the full copy, as before. The queue, runs, events and
 // progress are copied either way. swSynthetic pins the no-in-place-write rule for the door and for applyLocked.
+// options.sharedQueue (21 Oct) is for the resident mutation path. The queue map is copied one level down and its rows are shared, not
+// cloned: rows are never edited in place (current() already shares them under the same rule), so a full clone of every row on every
+// mutation was pure cost, and it grew with the queue. Only the map itself is new per projection.
 function makeCoordinatorAuthorityProjection(state = {}, options = {}) {
-    recordScanCost('makeCoordinatorAuthorityProjection', Object.keys(state.queue || {}).length)
-    const clonedQueue = cloneCoordinatorAuthorityValue(state.queue || {})
+    const sharedQueue = options.sharedQueue === true
+    recordScanCost('makeCoordinatorAuthorityProjection', sharedQueue ? 0 : Object.keys(state.queue || {}).length)
+    const clonedQueue = sharedQueue
+        ? {...(state.queue || {})}
+        : cloneCoordinatorAuthorityValue(state.queue || {})
     return {
         stored: options.sharedStored === true
             ? {...(state.stored || {})}
@@ -9812,6 +9840,7 @@ function createCoordinatorAuthority() {
     // and the door's writes), and each of those calls this with the queue it replaced. The first call seeds the index.
     function syncResidentQueueOrder(previousQueue = {}) {
         const nextQueue = projection.queue || {}
+        updateDeepPendingShadowRows(previousQueue, nextQueue)
         if(queueRuntime.getOrderedQueueKeyCount() > 0) queueRuntime.syncOrderedQueueKeysFromQueueDiff(previousQueue, nextQueue)
         else queueRuntime.rebuildQueueOrder(nextQueue)
     }
@@ -10376,7 +10405,7 @@ function createCoordinatorAuthority() {
             ? null
             : callerAuthorityState
         const residentAuthorityRows = !providedAuthorityState
-            ? makeCoordinatorAuthorityProjection(projection, {sharedStored: true})
+            ? makeCoordinatorAuthorityProjection(projection, {sharedStored: true, sharedQueue: true})
             : null
         const freshAuthorityRows = providedAuthorityState || residentAuthorityRows
         if(residentAuthorityRows) {
@@ -10397,7 +10426,7 @@ function createCoordinatorAuthority() {
             },
             queue: freshAuthorityRows.queue,
             runs: freshAuthorityRows.runs
-        }, {sharedStored: true})
+        }, {sharedStored: true, sharedQueue: true})
         syncResidentQueueOrder(queueBeforeLocked)
         // 2026-10-06: recordActiveStorageWorkSnapshot used to only get
         // called from inside the ~10 "load" functions (loadCoordinatorCurrentAuthorityState
@@ -13436,8 +13465,11 @@ const {
     getCoordinatorExecutorPlanBatchLimit
 } = queuedActivationSubjectKeys
 
-async function reprimeFreshQueuedTabActionsForCurrentPendingItems(pendingItems = [], ownerTabId = null, ownerWindowId = null, options = {}) {
-    if(!pendingItems.length) return {reprimed: 0, reason: 'no-pending-items'}
+async function reprimeFreshQueuedTabActionsForCurrentPendingItems(allPendingItems = [], ownerTabId = null, ownerWindowId = null, options = {}) {
+    if(!allPendingItems.length) return {reprimed: 0, reason: 'no-pending-items'}
+    // Head only (owner, 22 Oct): only the front of the pending list can be dispatched next, so reprime reads and re-primes that window,
+    // not every pending row. Rows past the window are not touched here; they are picked up when they reach the head.
+    const pendingItems = allPendingItems.slice(0, COORDINATOR_RECONCILE_ACTION_BUDGET)
 
     // 2026-10-03: see reprimeFreshQueuedTabActionsForPrunedStaleAttempts's
     // identical note -- this function's own body, refreshResidentCoordinatorAuthorityState,
@@ -18469,6 +18501,125 @@ async function requeueStalledActivePendingAction(classified = null, itemKey = ''
     }
 }
 
+// Terminal progress that may still settle a queued row (22 Oct). A progress write notes its terminal profiles here, and the apply
+// pass settles only those (see the keyed pass in runCoordinatorExecutorApplyPhase). A full re-seed from the progress runs at startup
+// and every TERMINAL_PROGRESS_SETTLE_RESEED_MS, as the safety net for a write the hook did not see.
+const TERMINAL_PROGRESS_SETTLE_RESEED_MS = 10 * 60 * 1000
+const terminalProgressSettleHrefs = new Set()
+let terminalProgressSettleSeededAt = 0
+function noteTerminalProgressForSettlement(records = {}) {
+    for(const [href, record] of Object.entries(records || {})) {
+        if(record && typeof record === 'object' && isTerminalProfileNukeRecord(record)) terminalProgressSettleHrefs.add(href)
+    }
+}
+
+// The settlement conditions the apply walk used for one queued row, unchanged: the record must be terminal, not retryable, applicable
+// to the row, not mismatched to it, and not older than the row. A progress record that mismatches the row counts only when it is the
+// recoverable lost-attempt case.
+function getTerminalSettlementRecordForQueuedRow(item = {}, itemKey = '', progress = {}) {
+    if(`${item?.status || ''}`.trim() !== 'queued') return null
+    const progressRecord = getCoordinatorProgressRecordForItem(itemKey, item, progress)
+    const progressAttemptMismatched = progressRecord && hasMismatchedCoordinatorAttempt(item, progressRecord)
+    const recoverableQueuedAuthorityLostAttemptRecord = progressAttemptMismatched &&
+        !getAttemptIdFromValue(item) &&
+        !getAttemptNumberFromValue(item) &&
+        getAttemptNumberFromValue(progressRecord) > 0 &&
+        (!item.runId || !progressRecord.runId || item.runId === progressRecord.runId)
+    const record = progressAttemptMismatched ? (recoverableQueuedAuthorityLostAttemptRecord ? progressRecord : null) : progressRecord
+    const settles = !!record &&
+        isTerminalProfileNukeRecord(record) &&
+        !isRetryableTerminalProfileNukeRecord(record) &&
+        shouldApplyProgressToCoordinatorItem(item, record) &&
+        !hasMismatchedCoordinatorAttempt(item, record) &&
+        ((Number.parseInt(record.updatedAt || record.terminalAt || record.completedAt, 10) || 0) >=
+            (Number.parseInt(item.updatedAt || item.queuedAt || item.createdAt, 10) || 0))
+    return settles ? record : null
+}
+
+// Shadow count of the deep pending rows (22 Oct, measurement only). The apply pass pushes a queued row past the head window with no
+// runtime surface as a pending item. This set tracks those candidate rows by key, updated at each queue replacement, so the pass can
+// be checked against it. Nothing dispatches from it.
+const DEEP_PENDING_REASON = 'queued-authority-needs-executor-intent-scan-bounded'
+const deepPendingShadowRows = new Set()
+let deepPendingShadowReady = false
+function isDeepPendingShadowCandidate(key = '', item = null) {
+    if(!item || typeof item !== 'object') return false
+    if(`${item.status || ''}`.trim() !== 'queued') return false
+    return !!(getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key) || getCoordinatorItemQueueKey(item, key))
+}
+function updateDeepPendingShadowRows(previousQueue = {}, nextQueue = {}) {
+    if(!deepPendingShadowReady) {
+        deepPendingShadowRows.clear()
+        for(const [key, item] of Object.entries(nextQueue || {})) {
+            if(isDeepPendingShadowCandidate(key, item)) deepPendingShadowRows.add(key)
+        }
+        deepPendingShadowReady = true
+        return
+    }
+    const keys = new Set([...Object.keys(previousQueue || {}), ...Object.keys(nextQueue || {})])
+    for(const key of keys) {
+        const previousItem = previousQueue?.[key]
+        const nextItem = nextQueue?.[key]
+        if(previousItem === nextItem) continue
+        if(isDeepPendingShadowCandidate(key, nextItem)) deepPendingShadowRows.add(key)
+        else deepPendingShadowRows.delete(key)
+    }
+}
+// The expected deep set, taken before the walk changes anything, from the same state the walk starts with. Measurement only.
+function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), preRecoveredCount = 0) {
+    if(!deepPendingShadowReady) return null
+    const limit = Math.max(1, getEffectiveQueuedTabOpenConcurrency() * 2)
+    // The apply pass examines only the first COORDINATOR_RECONCILE_ACTION_BUDGET queued rows in order (its own budget), so the expected
+    // deep rows are the candidates inside that window, less the classify head window.
+    const headKeys = new Set()
+    const applyWindowKeys = new Set()
+    let queuedSeen = 0
+    for(const [key, item] of queueRuntime.getOrderedQueueItems(queue)) {
+        if(`${item?.status || ''}`.trim() !== 'queued') continue
+        if(queuedSeen >= COORDINATOR_RECONCILE_ACTION_BUDGET) break
+        queuedSeen += 1
+        applyWindowKeys.add(key)
+        if(headKeys.size < limit) headKeys.add(key)
+    }
+    const runtimeSurfaceIndex = buildRuntimeSurfaceIndex(queueRuntime.listRuntimeSurfaceEntries())
+    const expected = new Set()
+    for(const key of deepPendingShadowRows) {
+        if(headKeys.has(key) || !applyWindowKeys.has(key)) continue
+        const item = queue?.[key]
+        if(!isDeepPendingShadowCandidate(key, item)) continue
+        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
+        const coordinatorKey = getCoordinatorItemQueueKey(item, key)
+        if(preRecoveredKeys.has(key) || preRecoveredKeys.has(href) || preRecoveredKeys.has(coordinatorKey)) continue
+        if(preRecoveredCount > 0 && `${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered') continue
+        if(getRuntimeSurfaceForCoordinatorItem(item, key, {runtimeSurfaceIndex}).hasSurface) continue
+        expected.add(key)
+    }
+    return {expected, headSize: headKeys.size, candidates: deepPendingShadowRows.size}
+}
+// Compares the snapshot with the deep rows the walk pushed. Measurement only.
+function compareDeepPendingShadow(snapshot = null, walkDeepKeys = new Set()) {
+    if(!snapshot) return
+    incrementQueueWakeupMetric('pendingShadow.checked')
+    const {expected} = snapshot
+    const onlyExpected = [...expected].filter(key => !walkDeepKeys.has(key))
+    const onlyWalk = [...walkDeepKeys].filter(key => !expected.has(key))
+    if(onlyExpected.length || onlyWalk.length) {
+        incrementQueueWakeupMetric('pendingShadow.mismatch')
+        recordFlightRecorderEvent({
+            kind: 'pending-shadow-mismatch',
+            source: 'runCoordinatorExecutorApplyPhase',
+            expected: expected.size,
+            walk: walkDeepKeys.size,
+            candidates: snapshot.candidates,
+            headRows: snapshot.headSize,
+            onlyExpected: onlyExpected.length,
+            onlyWalk: onlyWalk.length,
+            sampleOnlyExpected: onlyExpected.slice(0, 3).join(','),
+            sampleOnlyWalk: onlyWalk.slice(0, 3).join(',')
+        })
+    }
+}
+
 async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-apply', options = {}) {
     const serviceWorkerOwned = options.serviceWorkerOwned === true
     const ownerTabId = options.ownerTabId || (serviceWorkerOwned ? SERVICE_WORKER_QUEUE_OWNER_ID : null)
@@ -18587,7 +18738,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         currentAuthorityState = coordinatorAuthority.current()
         incrementMetric('changed.terminalizedExhaustedRolledBack', terminalizedExhausted)
     }
-    const queue = currentAuthorityState.queue
+    let queue = currentAuthorityState.queue
     // A queue-only pass reads the live progress, not currentAuthorityState.progress. That field is the copy the authority took at
     // startup and never updates, so the pass would decide on old progress and write it into the module-level copy (20 Oct review).
     const currentProgress = options.queueOnlyAuthority === true
@@ -18846,6 +18997,74 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         : Math.max(1, COORDINATOR_RECONCILE_ACTION_BUDGET)
     let executorApplyQueuedRowsExamined = 0
 
+    // Keyed settle pass (22 Oct). A queued row whose profile progress is terminal is settled from the profiles a progress write noted,
+    // not by visiting every queued row each pass. The set is re-seeded from the full progress at startup and every ten minutes, so a
+    // write the hook missed is still caught.
+    if(!terminalProgressSettleSeededAt || Date.now() - terminalProgressSettleSeededAt > TERMINAL_PROGRESS_SETTLE_RESEED_MS) {
+        for(const [href, record] of Object.entries(currentProgress || {})) {
+            if(record && typeof record === 'object' && isTerminalProfileNukeRecord(record)) terminalProgressSettleHrefs.add(href)
+        }
+        terminalProgressSettleSeededAt = Date.now()
+    }
+    let settledQueuedFromProgress = false
+    for(const href of Array.from(terminalProgressSettleHrefs)) {
+        const item = queue?.[href]
+        const record = item ? getTerminalSettlementRecordForQueuedRow(item, href, progress) : null
+        if(!record) {
+            terminalProgressSettleHrefs.delete(href)
+            continue
+        }
+        // The same settlement the walk used to run for this row, with the same guard and the same continuation.
+        incrementMetric('queuedTerminalProgressSettlement.matched')
+        const mapped = getCoordinatorStatusFromProgress(record)
+        const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
+            now: Date.now()
+        })
+        const terminalResult = isTerminalCoordinatorStatus(nextItem?.status)
+            ? await enqueueSpaceFeedStorageUpdate(() => {
+                return coordinatorAuthority.applyWithinStorageUpdate({
+                    operationKind: 'terminal-progress',
+                    rowKey: href,
+                    expectedAttemptId: getAttemptIdFromValue(item),
+                    expectedAttemptNumber: getAttemptNumberFromValue(item),
+                    reason: 'ordinaryMutation',
+                    metricPath: 'terminalProgress.queuedSettlement.save',
+                    projectionPayload: 'queueViewOnly',
+                    currentAuthorityState,
+                    mutate(currentItem, context) {
+                        if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
+                            return context.reject('row-changed-before-authority-apply')
+                        }
+                        return nextItem
+                    }
+                })
+            }, {
+                reason: 'terminal-progress',
+                timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
+            }).catch(error => ({
+                accepted: false,
+                durable: false,
+                reason: 'queued-terminal-progress-settlement-error',
+                error: error?.message || `${error || ''}`
+            }))
+            : {accepted: false, durable: false, reason: 'queued-terminal-progress-not-terminal'}
+        terminalProgressSettleHrefs.delete(href)
+        if(terminalResult?.accepted === true && terminalResult?.durable === true) {
+            incrementMetric('changed.terminalizedQueuedFromTerminalProgress')
+            settledQueuedFromProgress = true
+            scheduleTerminalProgressContinuation('queued-terminal-progress-authority-continuation', [href])
+            continue
+        }
+        incrementMetric(`noop.queuedTerminalProgress.${terminalResult?.reason || 'notTerminalized'}`)
+    }
+    if(settledQueuedFromProgress) {
+        // The walk below must see the rows as they are now, not the snapshot taken before these settlements.
+        currentAuthorityState = coordinatorAuthority.current()
+        queue = currentAuthorityState.queue
+    }
+
+    const deepPendingSnapshot = snapshotDeepPendingExpected(queue, preRecoveredExhaustedKeys, preRecoveredExhausted)
+    const shadowDeepPushedKeys = new Set()
     for(const [itemKey, item] of queueRuntime.getOrderedQueueItems(queue)) {
         if(preprocessedActiveMissingKeys.has(itemKey)) continue
         if(`${item?.status || ''}`.trim() === 'queued') {
@@ -18884,67 +19103,6 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             incrementMetric('ignored.mismatchedProgress')
         }
         const record = progressAttemptMismatched ? recoverableQueuedAuthorityLostAttemptRecord ? progressRecord : null : progressRecord
-        const terminalRecordSettlesQueuedAuthority = `${item?.status || ''}`.trim() === 'queued' &&
-            record &&
-            isTerminalProfileNukeRecord(record) &&
-            !isRetryableTerminalProfileNukeRecord(record) &&
-            shouldApplyProgressToCoordinatorItem(item, record) &&
-            !hasMismatchedCoordinatorAttempt(item, record) &&
-            ((Number.parseInt(record.updatedAt || record.terminalAt || record.completedAt, 10) || 0) >=
-                (Number.parseInt(item.updatedAt || item.queuedAt || item.createdAt, 10) || 0))
-        if(terminalRecordSettlesQueuedAuthority && href) {
-            // 2026-09-27: instrumentation only, no behavior change -- added
-            // to measure how often this self-healing repair (a queued row
-            // whose durable progress record already shows terminal) fires
-            // in practice, before deciding whether it's worth moving off
-            // this per-tick loop onto a slower periodic sweep. `record` is
-            // computed here for many other branches later in this same
-            // loop too, so extracting just this settlement isn't a free
-            // win the way removing classify's nested runtime-surface scan
-            // was -- this fires rarely enough that the hit rate itself
-            // should decide whether restructuring is worth it.
-            incrementMetric('queuedTerminalProgressSettlement.matched')
-            const mapped = getCoordinatorStatusFromProgress(record)
-            const nextItem = transitionCoordinatorItemFromProgress(item, record, mapped, {
-                now: Date.now()
-            })
-            const terminalResult = isTerminalCoordinatorStatus(nextItem?.status)
-                ? await enqueueSpaceFeedStorageUpdate(() => {
-                    return coordinatorAuthority.applyWithinStorageUpdate({
-                        operationKind: 'terminal-progress',
-                        rowKey: itemKey,
-                        expectedAttemptId: getAttemptIdFromValue(item),
-                        expectedAttemptNumber: getAttemptNumberFromValue(item),
-                        reason: 'ordinaryMutation',
-                        metricPath: 'terminalProgress.queuedSettlement.save',
-                        projectionPayload: 'queueViewOnly',
-                        currentAuthorityState,
-                        mutate(currentItem, context) {
-                            if(JSON.stringify(currentItem) !== JSON.stringify(item)) {
-                                return context.reject('row-changed-before-authority-apply')
-                            }
-                            return nextItem
-                        }
-                    })
-                }, {
-                    reason: 'terminal-progress',
-                    timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
-                }).catch(error => ({
-                    accepted: false,
-                    durable: false,
-                    reason: 'queued-terminal-progress-settlement-error',
-                    error: error?.message || `${error || ''}`
-                }))
-                : {accepted: false, durable: false, reason: 'queued-terminal-progress-not-terminal'}
-            if(terminalResult?.accepted === true && terminalResult?.durable === true) {
-                incrementMetric('changed.terminalizedQueuedFromTerminalProgress')
-                currentAuthorityState = coordinatorAuthority.current()
-                scheduleTerminalProgressContinuation('queued-terminal-progress-authority-continuation', [href])
-                continue
-            }
-            incrementMetric(`noop.queuedTerminalProgress.${terminalResult?.reason || 'notTerminalized'}`)
-        }
-
         const classified = executorClassifiedRows.get(itemKey) || null
         if(classified?.contract?.case === 'terminal-with-runtime-surface') {
             const terminalRuntimeResult = await resolveTerminalRuntimeExecutorCase(classified, {
@@ -19566,6 +19724,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
             continue
         }
 
+        if(classified?.contract?.reason === DEEP_PENDING_REASON) shadowDeepPushedKeys.add(itemKey)
         pendingItems.push({
             ...item,
             targetProfileHref: href || '',
@@ -19584,6 +19743,7 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
         }
     }
 
+    compareDeepPendingShadow(deepPendingSnapshot, shadowDeepPushedKeys)
     recordScanCost('runCoordinatorExecutorApplyPhase', Object.keys(queue).length)
 
     if(requeued > 0 &&
