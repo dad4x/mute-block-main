@@ -2,6 +2,7 @@ const browser = require('webextension-polyfill')
 const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
 const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
+const {runsChangeRecords, persistedRunFields} = require('./swRunsWal')
 const {
     SPACE_MAP_LAYOUT_KEY,
     SPACE_MAP_LAYOUT_BUCKETED,
@@ -184,6 +185,7 @@ const {
 } = require('./swSessionMemory')
 const {classifyStorageWriteForResume, applyResumeExemptionToUpdate, isProgressStorageKey} = require('./swResumeExemption')
 const {createProfileNukeProgressPush} = require('./swProfileNukeProgressPush')
+const {summarizeQueueBarView, recordQueueBarSummary, pushQueueBarSummary} = require('./swQueueBarSummary')
 const {
     createQueueRuntimeState
 } = require('./swqueueRuntime')
@@ -6587,12 +6589,33 @@ function summarizeSoftFailRetryCounts(items = []) {
 function summarizeFinishedWorkInPopulation(items = []) {
     let count = 0
     let latestActivityAt = 0
+    // Every finished row lands in exactly one outcome bucket, so the buckets add up to count.
+    const outcomes = {blocked: 0, alreadyBlocked: 0, skipped: {}, failed: 0, other: 0}
+    // Seconds per bucket: active to terminal, summed over the rows that have both times.
+    const durations = {blocked: {count: 0, totalMs: 0}, alreadyBlocked: {count: 0, totalMs: 0}, skipped: {count: 0, totalMs: 0}, failed: {count: 0, totalMs: 0}}
+    const addDuration = (bucket, item) => {
+        const activeAt = Number.parseInt(item.activeAt, 10) || 0
+        const terminalAt = Number.parseInt(item.terminalAt, 10) || 0
+        if(!activeAt || terminalAt < activeAt) return
+        durations[bucket].count += 1
+        durations[bucket].totalMs += terminalAt - activeAt
+    }
     for(const item of items) {
         if(!isTerminalCoordinatorStatus(item.status)) continue
         count += 1
         latestActivityAt = Math.max(latestActivityAt, item.updatedAt, item.activeAt, item.terminalAt, item.createdAt, item.queuedAt)
+        const outcome = `${item.outcome || ''}`.trim()
+        if(item.status === 'succeeded' && outcome === 'blocked') { outcomes.blocked += 1; addDuration('blocked', item) }
+        else if(item.status === 'succeeded' && outcome === 'already-blocked') { outcomes.alreadyBlocked += 1; addDuration('alreadyBlocked', item) }
+        else if(item.status === 'skipped') {
+            const key = outcome || 'unspecified'
+            outcomes.skipped[key] = (outcomes.skipped[key] || 0) + 1
+            addDuration('skipped', item)
+        }
+        else if(item.status === 'failed') { outcomes.failed += 1; addDuration('failed', item) }
+        else outcomes.other += 1
     }
-    return {count, latestActivityAt}
+    return {count, latestActivityAt, outcomes, durations}
 }
 
 // Returns {view, population}: the dashboard's queue view, and the population the view is built from.
@@ -6681,6 +6704,14 @@ async function refreshCoordinatorQueueViewForDashboard(reason = 'dashboard-refre
     if(unavailable) return unavailable
     const {view} = buildCoordinatorQueueViewFromDashboardSnapshot(snapshot)
     recordDashboardViewRowCounts('refreshCoordinatorQueueViewForDashboard', reason, snapshot, view)
+    // Owner, 23 Oct: the queue bar's numbers come from the view this refresh builds. The view is no longer stored, so nothing else
+    // records and pushes a change, and the bar on the Quora tabs stayed at its first reading.
+    const {summary, changed} = recordQueueBarSummary(summarizeQueueBarView(view, Date.now()))
+    if(changed) {
+        void pushQueueBarSummary(browser, summary)
+        // Owner, 23 Oct: a finished run changes progress the page reads. The page is told the same moment, so it asks for its state again.
+        profileNukeProgressPush.push()
+    }
     return {
         refreshed: true,
         reason,
@@ -6957,6 +6988,7 @@ async function refreshCoordinatorRunsViewForDashboard(reason = 'dashboard-refres
 // authority read, instead of two round trips that each replay the same WAL and
 // completed-work log.
 async function refreshCoordinatorDashboardViewsForDashboard(reason = 'dashboard-refresh') {
+    if(!pendingSpaceArchiveReconciled) void reconcilePendingSpaceFeedWithArchive().catch(() => null)
     recordFlightRecorderEvent({
         kind: 'dashboard-refresh',
         source: 'refreshCoordinatorDashboardViewsForDashboard',
@@ -7273,7 +7305,9 @@ const queueWalStore = createQueueWalStore({
     storage: {
         // A direct reference, not an arrow: metricStorageGet is a hoisted function declaration, and an extra
         // wrapper frame here pushes callers out of V8's default 10-frame stack capture.
-        metricStorageGet
+        metricStorageGet,
+        // Recovery B writes back the active slot's records through this, the same write every checkpoint uses.
+        metricStorageSet
     },
     checkpoints: {
         scheduleSwitch: (...args) => scheduleCoordinatorQueueWalCheckpointSwitch(...args),
@@ -8419,10 +8453,13 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
     // The completed-area records, in the order they are appended. The door applies these same records to the resident
     // completed map after the write is acknowledged (applyCompletedWalRecordsToResident), so both sides share one builder.
     const completedWalRecords = [...completedRecords, ...removedCompletedRecords]
+    // The runs records of this write (24 Oct, swRunsWal.js): one run write's records, in area 'runs', appended in the same batch.
+    const runWalRecords = (Array.isArray(options.runRecords) ? options.runRecords : []).map(record => cloneCoordinatorAuthorityValue(record))
     const records = [
         ...setRecords,
         ...removeRecords,
-        ...completedWalRecords
+        ...completedWalRecords,
+        ...runWalRecords
     ]
     if(!records.length) {
         return {
@@ -8521,7 +8558,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
 
     // See the matching comment in persistCoordinatorAuthorityQueueWalMutation
     // above for why this is delegated to verifyAppendedCoordinatorQueueWalReplay.
-    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, {...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS, baseQueue: options.previousProjectionQueue || null, baseCompleted: options.previousProjectionCompleted || null, baseNextSeq: storedWal?.meta?.nextSeq}))
+    const replayVerified = runQueueWakeupMetricPhase('queueWalReplayVerify', () => verifyAppendedCoordinatorQueueWalReplay(append, {...COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS, baseQueue: options.previousProjectionQueue || null, baseCompleted: options.previousProjectionCompleted || null, baseRuns: options.previousProjectionRuns || null, baseNextSeq: storedWal?.meta?.nextSeq}))
     const {ignoredAppendedRecords} = replayVerified
     if(!replayVerified.ok) {
         incrementQueueWakeupMetric(ignoredAppendedRecords.length
@@ -8605,8 +8642,34 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         snapshotSaved: false,
         walSaved: true,
         records,
-        completedWalRecords
+        completedWalRecords,
+        // The runs after this write, from the runs before it and this write's run records (24 Oct). Always computed here, so the
+        // in-memory runs match what a replay of the log gives.
+        authoritativeRuns: runWalRecords.length ? applyRunRecordsToRuns(options.previousProjectionRuns, runWalRecords) : null
     }
+}
+
+// The runs as the worker keeps them in memory (24 Oct, path A): each run's persisted fields, with its counts and status worked out from the
+// queue rows. A reload gives exactly this, since it starts from the same persisted fields and the same queue. Only runs with a persisted
+// record are worked out: a queue row whose run was pruned does not bring the run back (the completed-row filter reads the run set).
+function runsWithDerivedFields(queue = {}, runs = {}) {
+    const persisted = {}
+    for (const [runId, run] of Object.entries(runs || {})) {
+        persisted[runId] = persistedRunFields({...run, id: run?.id || runId})
+    }
+    return recomputeCoordinatorRuns(queue || {}, persisted)
+}
+
+// The runs map after one write's run records, applied in order with the log engine's reducer (24 Oct). Returns a new map.
+function applyRunRecordsToRuns(baseRuns = {}, records = []) {
+    const appliedIds = new Set()
+    const ownedAreas = new Set()
+    let state = {runs: {...(baseRuns || {})}}
+    records.forEach((record, index) => {
+        const result = applyWalRecord(state, {...record, seq: Number(record.seq) || index + 1}, {snapshotSeq: 0, appliedIds, ownedAreas})
+        if(result.applied) state = result.state
+    })
+    return state.runs || {}
 }
 
 // Extracted 2026-09-19 from switchCoordinatorAuthorityQueueWalCheckpoint so
@@ -9965,9 +10028,22 @@ function createCoordinatorAuthority() {
     // the checkpoint from nothing. Runs on the applyTail chain, so no two commits interleave.
     function persistCoordinator(change = {}, options = {}) {
         return runExclusiveOnApplyTail(async () => {
-            const stored = normalizeCoordinatorStoredChange(change.stored)
+            let stored = normalizeCoordinatorStoredChange(change.stored)
             if(change.progressDeltas !== undefined && !Array.isArray(change.progressDeltas)) {
                 throw new Error('persistCoordinator: change.progressDeltas must be an array')
+            }
+            // The runs part (24 Oct): the whole runs value under the runs key becomes this write's run records, written in the log, and is
+            // not written to disk as a value. The records are made against the resident runs, so the resident runs are loaded first.
+            if(stored && Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY) && !hydrated) await hydrate()
+            const runsPart = takeRunsPartFromChange(stored)
+            if(runsPart) {
+                change = {...change, runRecords: runsPart.records, runsAfter: runsPart.runsAfter}
+                stored = Object.keys(runsPart.storedWithoutRuns).length ? runsPart.storedWithoutRuns : null
+                if(!runsPart.records.length && !hasCoordinatorQueueChange(change) && change.progressDeltas === undefined && stored === null) {
+                    // Nothing about the runs changed, and nothing else was asked for: nothing is written.
+                    incrementQueueWakeupMetric('runs.writeUnchanged')
+                    return {saved: true, backend: 'coordinator-stored', reason: 'runs-unchanged'}
+                }
             }
             if(stored === null && change.progressDeltas === undefined) return persistCoordinatorQueueChange(change, options)
             if(!hasCoordinatorQueueChange(change)) {
@@ -9996,8 +10072,25 @@ function createCoordinatorAuthority() {
     }
 
     function hasCoordinatorQueueChange(change = {}) {
+        if(Array.isArray(change.runRecords) && change.runRecords.length > 0) return true
         return [change.results, change.removedRows, change.completedRows, change.removedCompletedRows]
             .some(rows => Array.isArray(rows) && rows.length > 0)
+    }
+
+    // The runs part of a change (24 Oct): the runs value a caller passes under the runs key is compared with the resident runs, and the
+    // difference is this write's run records (swRunsWal.js). Returns null when the change has no runs part; otherwise the records, the
+    // whole runs value the caller wrote (kept in memory, counts included), and the stored part without the runs key.
+    function takeRunsPartFromChange(stored = null) {
+        if(!stored || !Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY)) return null
+        const value = stored[COORDINATOR_RUNS_KEY]
+        const runsAfter = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+        const storedWithoutRuns = {...stored}
+        delete storedWithoutRuns[COORDINATOR_RUNS_KEY]
+        return {
+            records: runsChangeRecords(projection.runs || {}, runsAfter),
+            runsAfter,
+            storedWithoutRuns
+        }
     }
 
     // Returns the stored part of a change as a plain {key: value} object, or null when the change has no stored part.
@@ -10040,17 +10133,27 @@ function createCoordinatorAuthority() {
             completedRows: change.completedRows,
             removedCompletedRows: change.removedCompletedRows,
             previousProjectionQueue: base.queue,
-            previousProjectionCompleted: baseCompleted
+            previousProjectionCompleted: baseCompleted,
+            // The run records of this write, and the runs they apply to (24 Oct, see takeRunsPartFromChange).
+            runRecords: change.runRecords,
+            previousProjectionRuns: base.runs
         }))
         if(persistence?.saved === true) {
             const resident = projection
+            // Path A (24 Oct): the in-memory runs are worked out from the new queue after every write, as a reload works them out. The log
+            // holds the persisted fields; counts and status are never read back from it.
+            const nextQueue = applyCoordinatorQueueChange(resident.queue, {results, removedRows})
+            const nextRuns = runsWithDerivedFields(nextQueue, change.runsAfter ?? persistence.authoritativeRuns ?? resident.runs ?? {})
             projection = makeCoordinatorAuthorityProjection({
                 ...resident,
-                queue: applyCoordinatorQueueChange(resident.queue, {results, removedRows}),
+                queue: nextQueue,
+                runs: nextRuns,
                 stored: {
                     ...(resident.stored || {}),
                     ...(persistence.append?.store ? {[COORDINATOR_QUEUE_WAL_KEY]: persistence.append.store} : {}),
-                    ...(persistence.physicalWal?.payload || {})
+                    ...(persistence.physicalWal?.payload || {}),
+                    // The resident stored copy of the runs follows the runs, so a reader of the stored key sees this write (in memory only).
+                    [COORDINATOR_RUNS_KEY]: nextRuns
                 }
             }, {sharedStored: true})
             syncResidentQueueOrder(resident.queue)
@@ -10629,6 +10732,9 @@ function createCoordinatorAuthority() {
                         ...(persistenceResult.physicalWal?.payload || {})
                     }
                 }
+                // Path A (24 Oct): the runs are worked out from the queue after this write, as a reload works them out. Done after the
+                // save, as the door does (persistCoordinatorQueueChange), so the log check above still sees the base runs.
+                nextProjection.runs = runsWithDerivedFields(nextProjection.queue, nextProjection.runs)
                 projection = nextProjection
                 if(storageContext) {
                     storageContext.coordinatorAuthorityQueueMutationApplied = true
@@ -10670,6 +10776,12 @@ function createCoordinatorAuthority() {
             })
         }
         result.shadowWal = safeRecordCoordinatorAuthorityShadowWalProjection(result)
+        // A row that just finished leaves its space's pending list as well. The page used to be the only one to report it, so a finish the
+        // page did not see left the profile offered as still queueable (trollsgalore, 22 Oct: 16 finished profiles still listed).
+        if(result?.durable === true && isTerminalCoordinatorStatus(nextRow?.status) && !isTerminalCoordinatorStatus(previousRow?.status)) {
+            const finishedHref = normalizeQuoraProfileUrl(nextRow?.targetProfileHref || nextRow?.requestedUrl || nextRow?.coordinatorKey || '')
+            if(finishedHref && pendingSpaceFeedNamesHref(finishedHref)) void removePendingSpaceFeedUrls([finishedHref]).catch(() => null)
+        }
         // Archive gate (2026-10-13): a soft failure with automatic retries left stays in the live queue (isArchivableCoordinatorRow).
         if(result?.durable === true && isArchivableCoordinatorRow(nextRow)) {
             void archiveTerminalCoordinatorRow(rowKey, nextRow, {currentAuthorityState: projection}).catch(() => null)
@@ -10898,10 +11010,17 @@ async function loadCoordinatorCurrentAuthorityState() {
             ...Object.fromEntries(candidateKeys.map(key => [getCoordinatorNamespaceStampKey(key), null])),
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
+            // The erase marker rides in this read, so the common start adds no await (the hydrate tick counts depend on it).
+            [ERASE_BLOCK_HISTORY_PENDING_KEY]: false,
             ...getSpaceMapStoredReadDefaults()
         }, {
             metricPath: 'authority.hydrate'
         })
+        // A block-history erase owed by the last reload. Nothing read above is used: the erase runs, and the load starts again on empty storage.
+        if(stored[ERASE_BLOCK_HISTORY_PENDING_KEY] === true) {
+            await runPendingBlockHistoryErase()
+            return loadCoordinatorCurrentAuthorityState()
+        }
         // The stamps are not coordinator state, so they are removed from stored once read. A key is confirmed when its disk
         // stamp is the session stamp it was mirrored with.
         const confirmed = new Set()
@@ -10953,10 +11072,15 @@ async function loadCoordinatorCurrentAuthorityState() {
         // The arrays are only sized, never filled, so the summary holds no record.
         const appliedCount = Array.isArray(recovery.wal?.projected?.applied) ? recovery.wal.projected.applied.length : 0
         const ignoredCount = Array.isArray(recovery.wal?.projected?.ignored) ? recovery.wal.projected.ignored.length : 0
+        // The runs come from the log (24 Oct): the checkpoint and the records after it, replayed as the queue and completed rows are. Counts
+        // and status are worked out again from the queue rows here, as they are not stored.
+        const runsFromLog = runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(recovery.wal?.projected?.state?.runs || {}))
+        const runs = runsWithDerivedFields(queue, runsFromLog)
+        stored[COORDINATOR_RUNS_KEY] = runs
         return {
             stored,
             queue,
-            runs: runQueueWakeupMetricPhase('normalizeRuns', () => normalizeCoordinatorMap(stored[COORDINATOR_RUNS_KEY])),
+            runs,
             events: [],
             progress: runQueueWakeupMetricPhase('normalizeProgress', () => getProfileNukeProgressRecordsFromProjection(stored, [])),
             completed,
@@ -12143,7 +12267,9 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
     if(!terminalEntries.length && !terminalProgressSettlementHrefs.length &&
         !missingConfirmedHrefs.size && !missingClearedHrefs.size) {
         scheduleTerminalOwnedProfileTabCleanup(requestedHrefs)
-        return {settled: 0, confirmed: 0, cleared: 0, progressRestored: 0, pendingPosts: null, nukedPosts: null}
+        // Owner, 23 Oct: the worker's pending records are the authority. A reply with no change still returns them, so the page's copy
+        // is replaced rather than kept when it has gone stale.
+        return {settled: 0, confirmed: 0, cleared: 0, progressRestored: 0, pendingPosts: cloneCoordinatorAuthorityValue(stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}), nukedPosts: null}
     }
 
     const now = Date.now()
@@ -12342,7 +12468,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
 
     if(!confirmedHrefs.size && !clearedHrefs.size && !queueChanged && !progressChanged) {
         scheduleTerminalOwnedProfileTabCleanup(terminalEntries.map(entry => entry.href))
-        return {settled: 0, confirmed: 0, cleared: 0, progressRestored: 0, terminalProgressSettled, terminalProgressSettlementFailed, terminalProgressSettlementLastReason, pendingPosts: null, nukedPosts: null}
+        return {settled: 0, confirmed: 0, cleared: 0, progressRestored: 0, terminalProgressSettled, terminalProgressSettlementFailed, terminalProgressSettlementLastReason, pendingPosts: cloneCoordinatorAuthorityValue(stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}), nukedPosts: null}
     }
 
     const derivedSettlement = buildTerminalCoordinatorSettlementDerivedPayload(stored, progress, {
@@ -12413,7 +12539,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
         confirmed: confirmedHrefs.size,
         cleared: clearedHrefs.size,
         progressRestored,
-        pendingPosts: derivedSettlement.pendingPosts,
+        pendingPosts: derivedSettlement.pendingPosts || cloneCoordinatorAuthorityValue(stored[SPACE_PENDING_NUKED_POSTS_KEY] || {}),
         nukedPosts: derivedSettlement.nukedPosts
     }
 }
@@ -17271,6 +17397,8 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
     // Removed before the release, for the same reason as the sweep above.
     await browser.tabs.remove(normalizedTabId).catch(() => {})
     await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
+    // Finishing the row should not wait for the next scheduled pass (22 Oct): the terminal continuation runs now.
+    scheduleTerminalProgressContinuation('already-blocked-terminal-continuation', [metadata.profileHref])
     return true
     }) === true
 }
@@ -18606,8 +18734,8 @@ function updateDeepPendingShadowRows(previousQueue = {}, nextQueue = {}) {
     }
 }
 // The expected deep set, taken before the walk changes anything, from the same state the walk starts with. Measurement only.
-function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), preRecoveredCount = 0, skipFreshPreflight = false, candidateKeys = null) {
-    if(!deepPendingShadowReady) return null
+// Two sets are built with the same filters: one from classify's own deep rows (the walk's source) and one from the running set.
+function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), preRecoveredCount = 0, skipFreshPreflight = false, classifyKeys = null) {
     const limit = Math.max(1, getEffectiveQueuedTabOpenConcurrency() * 2)
     // The apply pass examines only the first COORDINATOR_RECONCILE_ACTION_BUDGET queued rows in order (its own budget), so the expected
     // deep rows are the candidates inside that window, less the classify head window.
@@ -18621,27 +18749,55 @@ function snapshotDeepPendingExpected(queue = {}, preRecoveredKeys = new Set(), p
         applyWindowKeys.add(key)
         if(headKeys.size < limit) headKeys.add(key)
     }
-    const expected = new Set()
-    for(const key of (candidateKeys || deepPendingShadowRows)) {
-        if(headKeys.has(key) || !applyWindowKeys.has(key)) continue
-        const item = queue?.[key]
-        if(!isDeepPendingShadowCandidate(key, item)) continue
-        const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
-        const coordinatorKey = getCoordinatorItemQueueKey(item, key)
-        if(preRecoveredKeys.has(key) || preRecoveredKeys.has(href) || preRecoveredKeys.has(coordinatorKey)) continue
-        if(preRecoveredCount > 0 && `${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered') continue
-        // The walk skips these rows when the pass was asked to skip fresh preflight rows (see the same test in the walk).
-        if(skipFreshPreflight && (`${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered' ||
-            /fast-executor-preflight$/.test(`${item?.actionLeaseReleaseReason || ''}`))) continue
-        expected.add(key)
+    const runtimeSurfaceIndex = buildRuntimeSurfaceIndex(queueRuntime.listRuntimeSurfaceEntries())
+    const keep = (candidates, checkSurface = false) => {
+        const expected = new Set()
+        for(const key of candidates) {
+            if(headKeys.has(key) || !applyWindowKeys.has(key)) continue
+            const item = queue?.[key]
+            if(!isDeepPendingShadowCandidate(key, item)) continue
+            const href = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(key)
+            const coordinatorKey = getCoordinatorItemQueueKey(item, key)
+            if(preRecoveredKeys.has(key) || preRecoveredKeys.has(href) || preRecoveredKeys.has(coordinatorKey)) continue
+            // A row with a runtime surface is not a deep pending row (classify decides that by the same test).
+            if(checkSurface && getRuntimeSurfaceForCoordinatorItem(item, key, {runtimeSurfaceIndex}).hasSurface) continue
+            if(preRecoveredCount > 0 && `${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered') continue
+            // The walk skips these rows when the pass was asked to skip fresh preflight rows (see the same test in the walk).
+            if(skipFreshPreflight && (`${item?.actionLeaseReleaseReason || ''}` === 'executor-plan-active-transition-retry-budget-recovered' ||
+                /fast-executor-preflight$/.test(`${item?.actionLeaseReleaseReason || ''}`))) continue
+            expected.add(key)
+        }
+        return expected
     }
-    return {expected, headSize: headKeys.size, candidates: (candidateKeys || deepPendingShadowRows).size}
+    return {
+        expected: keep(classifyKeys || deepPendingShadowRows),
+        runningExpected: keep(deepPendingShadowRows, true),
+        headSize: headKeys.size,
+        candidates: deepPendingShadowRows.size
+    }
 }
 // Compares the snapshot with the deep rows the walk pushed. Measurement only.
 function compareDeepPendingShadow(snapshot = null, walkDeepKeys = new Set()) {
     if(!snapshot) return
     incrementQueueWakeupMetric('pendingShadow.checked')
     const {expected} = snapshot
+    // The running set against the classify set, with the same filters (22 Oct). A difference means the running set is not yet exact.
+    const runningOnly = [...snapshot.runningExpected].filter(key => !expected.has(key))
+    const classifyOnly = [...expected].filter(key => !snapshot.runningExpected.has(key))
+    incrementQueueWakeupMetric('runningSet.checked')
+    if(runningOnly.length || classifyOnly.length) {
+        incrementQueueWakeupMetric('runningSet.mismatch')
+        recordFlightRecorderEvent({
+            kind: 'running-set-mismatch',
+            source: 'runCoordinatorExecutorApplyPhase',
+            running: snapshot.runningExpected.size,
+            classify: expected.size,
+            runningOnly: runningOnly.length,
+            classifyOnly: classifyOnly.length,
+            sampleRunningOnly: runningOnly.slice(0, 3).join(','),
+            sampleClassifyOnly: classifyOnly.slice(0, 3).join(',')
+        })
+    }
     const onlyExpected = [...expected].filter(key => !walkDeepKeys.has(key))
     const onlyWalk = [...walkDeepKeys].filter(key => !expected.has(key))
     if(onlyExpected.length || onlyWalk.length) {
@@ -22189,6 +22345,63 @@ async function clearCoordinatorEventsRequested() {
     return {ok: true}
 }
 
+// Erase everything (the last-gasp reset, owner decision 22 Oct, widened 22 Oct to a full clean slate). Removes every stored key, settings and
+// spaces included, then reloads the extension, which ends the service worker and its resident copies of the queue, the progress records and
+// the flight recorder, so none of them is written back over the erase. The erase pauses the queue first (owner, 24 Oct), and is refused if a row is
+// still active after that, so no tab is mid-action. Not for routine use: after it the queue has no record of any profile blocked, and will act on them again.
+const ERASE_BLOCK_HISTORY_CONFIRMATION = 'ERASE'
+const ERASE_BLOCK_HISTORY_PENDING_KEY = 'mbEraseBlockHistoryPending'
+const ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY = 'mbEraseBlockHistoryGeneration'
+// Nothing is kept: a clean slate. The marker is the one key the erase itself handles, and it is removed last.
+const ERASE_BLOCK_HISTORY_KEEP_KEYS = new Set()
+
+async function eraseBlockHistoryRequested(request = {}) {
+    if(request?.confirmation !== ERASE_BLOCK_HISTORY_CONFIRMATION) return {erased: false, reason: 'confirmation-mismatch'}
+    if(!getHydratedCoordinatorAuthorityState('eraseBlockHistory.usedResidentAuthority')) return {erased: false, reason: 'authority-not-loaded'}
+    // Owner, 24 Oct: the erase forces the pause itself. The pause stops new opens and requeues any row that was active, so the
+    // in-flight check below reads the queue after the pause.
+    const pausedStored = await coordinatorStorageAdapter.get({[COORDINATOR_PAUSED_KEY]: false})
+    if(pausedStored[COORDINATOR_PAUSED_KEY] !== true) await pauseCoordinatorNukes()
+    const authority = getHydratedCoordinatorAuthorityState('eraseBlockHistory.usedResidentAuthority')
+    if(!authority) return {erased: false, reason: 'authority-not-loaded'}
+    if(Object.values(authority.queue).some(item => isActiveCoordinatorStatus(item?.status))) {
+        return {erased: false, reason: 'queue-row-active'}
+    }
+    return enqueueSpaceFeedStorageUpdate(async () => {
+        // The marker goes first, so an erase cut short by the reload is finished at the next start (eraseBlockHistoryPending, below).
+        await coordinatorStorageAdapter.set({[ERASE_BLOCK_HISTORY_PENDING_KEY]: true})
+        // Everything is cleared here, then the extension reloads, so the new worker starts with no stored history for its modules to load
+        // and write back. Clearing at startup instead left the progress records in session storage: the modules had read them first.
+        const stored = await coordinatorStorageAdapter.get(null)
+        const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY)
+        if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
+        await browser.storage.session?.clear?.()
+        setTimeout(() => { browser.runtime.reload?.() }, 300)
+        return {scheduled: true, removedCount: removeKeys.length}
+    })
+}
+
+// Runs at the start of the authority's load, before anything is read back into memory. A marker left by eraseBlockHistoryRequested means the
+// erase is owed: every stored key outside the keep list goes, and the marker goes last, so an interrupted erase runs again at the next start.
+async function runPendingBlockHistoryErase() {
+    const marker = await coordinatorStorageAdapter.get({[ERASE_BLOCK_HISTORY_PENDING_KEY]: false})
+    if(marker[ERASE_BLOCK_HISTORY_PENDING_KEY] !== true) return {ran: false}
+    const stored = await coordinatorStorageAdapter.get(null)
+    const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY && !ERASE_BLOCK_HISTORY_KEEP_KEYS.has(key))
+    if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
+    await browser.storage.session?.clear?.()
+    // The erase generation lives in session storage, so the worker can say which erase it has finished.
+    const eraseGeneration = Date.now()
+    void browser.storage.session?.set?.({[ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY]: eraseGeneration}).catch(() => {})
+    // The open Quora tabs still hold the state they loaded with, and their content scripts were cut off by the reload. Reloading them
+    // starts fresh content scripts, which read the cleared storage and can ask this worker for the erase generation.
+    const quoraTabs = await browser.tabs.query({url: ['*://*.quora.com/*']}).catch(() => [])
+    for(const tab of quoraTabs) void browser.tabs.reload(tab.id).catch(() => null)
+    await coordinatorStorageAdapter.remove(ERASE_BLOCK_HISTORY_PENDING_KEY)
+    incrementQueueWakeupMetric('eraseBlockHistory.ran')
+    return {ran: true, removedCount: removeKeys.length, reloadedTabs: quoraTabs.length, eraseGeneration}
+}
+
 // Content-script and popup requests for the space nuked-post keys (docs/queue-storage-layering.md, section 6, rule 2).
 // These are non-queue keys, so the door writes only the stored part: no WAL write and no hydrate.
 async function setSpaceNukedPostsRequested(nukedPosts = {}) {
@@ -24768,6 +24981,7 @@ async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []
     const hasExecuteInput = request.execute && typeof request.execute === 'object'
     let queued = 0
     let merged = 0
+    const mergedHrefs = []
     let runId = runInput.id || ''
     let durable = false
     let storageTimedOut = false
@@ -24783,6 +24997,7 @@ async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []
         })
         queued += Number.parseInt(chunkResult?.queued, 10) || 0
         merged += Number.parseInt(chunkResult?.merged, 10) || 0
+        if(Array.isArray(chunkResult?.mergedHrefs)) mergedHrefs.push(...chunkResult.mergedHrefs)
         if(!runId && chunkResult?.runId) runId = chunkResult.runId
         if(Array.isArray(chunkResult?.resetCleanupTargets)) {
             resetCleanupTargets.push(...chunkResult.resetCleanupTargets)
@@ -24805,6 +25020,7 @@ async function enqueueCoordinatorItemsStorageChunked(request = {}, rawItems = []
     return {
         queued,
         merged,
+        mergedHrefs,
         executionQueued: 0,
         runId,
         coordinatorTabId: null,
@@ -24859,6 +25075,8 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     let nextQueueSequence = getNextCoordinatorQueueSequence(queue)
     let queued = 0
     let merged = 0
+    // Owner, 23 Oct: the profiles this batch merged into existing rows, so the page can clear its pending records for them.
+    const mergedHrefs = []
     let progressChanged = false
     const progressResetRecords = {}
     const authorityResults = []
@@ -24945,6 +25163,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
             // queue (which would just get archived out again next tick,
             // achieving nothing but churn), and don't open a tab for it.
             merged += 1
+            if(targetProfileHref) mergedHrefs.push(targetProfileHref)
             if(itemSource?.pageUrl) sourcePages.add(itemSource.pageUrl)
             continue
         }
@@ -25061,7 +25280,10 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
                 progressChanged = true
             }
         }
-        if(existing) merged += 1
+        if(existing) {
+            merged += 1
+            if(targetProfileHref) mergedHrefs.push(targetProfileHref)
+        }
         else queued += 1
 
         if(itemSource?.pageUrl) sourcePages.add(itemSource.pageUrl)
@@ -25146,6 +25368,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         return {
             queued,
             merged,
+            mergedHrefs,
             executionQueued: 0,
             runId,
             coordinatorTabId: null,
@@ -25246,6 +25469,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
     return {
         queued,
         merged,
+        mergedHrefs,
         executionQueued: 0,
         runId,
         coordinatorTabId: null,
@@ -25760,6 +25984,42 @@ async function removePendingSpaceFeedUrls(urls = []) {
 
         return {changed, pendingPosts: nextPending}
     }, {reason: 'remove-pending-space-feed-urls'})
+}
+
+// A synchronous look at the resident pending lists, so a finish that no pending record names costs no storage update.
+function pendingSpaceFeedNamesHref(href = '') {
+    const pending = coordinatorAuthority.residentStoredFor({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    return Object.values(pending).some(record => [
+        ...getStoredSpaceFeedRecordUrls(record, 'allUrls'),
+        ...getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+    ].some(url => normalizeQuoraProfileUrl(url) === href))
+}
+
+// Once per worker start: a space's pending list can still name profiles whose queue row finished and was archived before the fix above. Those
+// profiles are removed. A profile with a live row is still being worked, so it stays.
+let pendingSpaceArchiveReconciled = false
+async function reconcilePendingSpaceFeedWithArchive() {
+    if(pendingSpaceArchiveReconciled) return {changed: false, reason: 'already-run'}
+    pendingSpaceArchiveReconciled = true
+    const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+    const pending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+    const hrefs = new Set()
+    for(const record of Object.values(pending)) {
+        for(const url of getStoredSpaceFeedRecordUrls(record, 'remainingUrls')) {
+            const href = normalizeQuoraProfileUrl(url)
+            if(href) hrefs.add(href)
+        }
+    }
+    const liveQueue = coordinatorAuthority.current()?.queue || {}
+    const finished = []
+    for(const href of hrefs) {
+        if(findCoordinatorQueueEntryForHref(liveQueue, href)) continue
+        const archived = await coordinatorQueueReader.completedRow(href).catch(() => null)
+        if(archived && isTerminalCoordinatorStatus(archived.status)) finished.push(href)
+    }
+    if(!finished.length) return {changed: false, removed: 0}
+    const result = await removePendingSpaceFeedUrls(finished)
+    return {changed: result?.changed === true, removed: finished.length}
 }
 
 async function removePendingSpaceFeedEntries(postKeys = []) {
@@ -30674,6 +30934,13 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
     const result = await resultPromise
 
     if(result?.terminal) {
+        // The row reached its terminal state above, but the stored progress record for the profile stayed at its tab-opening write.
+        // This path saved only the row, so the progress was never brought to the same terminal state (1472 run: 40 blocks unrecorded).
+        // Saved here, after the row's storage update, because the progress write takes the same storage queue.
+        void recordCoordinatorJobProgressViaQueueMachine(normalizedProfileHref, result.record, {
+            expectTerminal: true,
+            senderTabId: normalizedTabId
+        }).catch(() => null)
         scheduleQueuedWorkContinuation('active-blocked-live-tab-terminal')
         scheduleCompletedJobOwnedTabCleanup([normalizedProfileHref])
     }
@@ -34555,6 +34822,9 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         const runsChanged = JSON.stringify(nextRuns) !== JSON.stringify(runs)
         if(runsChanged) runs = nextRuns
 
+        // 24 Oct: what each progress update changed, so the no-work writes can be split into pure no-ops and real progress saves.
+        incrementQueueWakeupMetric(`${options.expectTerminal === true ? 'terminalProgress' : 'directProgress'}.outcome.${runsChanged ? 'runs' : progressChanged ? 'progress' : 'none'}`)
+
         if(runsChanged || progressChanged) {
             const inlineQueueOperation = terminalProgressRows === progressChangedRows
                 ? 'terminal-progress'
@@ -36361,6 +36631,65 @@ async function getContentPageCoordinatorState(request = {}, sender = {}) {
         scopedProgress[profileHref] = record
     }
 
+    // The history the page filters candidates by is the archive as well as the progress record. A profile whose queue row finished as a
+    // block is settled on the page even when its progress record is missing or still shows tab-opening.
+    for(const profileHref of profileHrefs) {
+        // Owner, 23 Oct: a finished row still in the live queue is settled for the page the same way. A success is a block; any other
+        // finish is terminal and not blocked, so it is a Bad Link.
+        const liveItem = findCoordinatorQueueEntryForHref(scopedQueue, profileHref)?.item || null
+        if(liveItem && isTerminalCoordinatorStatus(liveItem.status) && !scopedProgress[profileHref]) {
+            scopedProgress[profileHref] = liveItem.status === 'succeeded'
+                ? {
+                    actionKind: 'mute-block',
+                    runId: liveItem.runId || '',
+                    status: 'blocked',
+                    blockSucceeded: true,
+                    terminalAt: Number.parseInt(liveItem.terminalAt, 10) || Date.now(),
+                    finalError: '',
+                    event: 'Settled from the live queue row'
+                }
+                : {
+                    actionKind: 'mute-block',
+                    runId: liveItem.runId || '',
+                    status: 'archived-terminal',
+                    blockSucceeded: false,
+                    terminalAt: Number.parseInt(liveItem.terminalAt, 10) || Date.now(),
+                    finalError: '',
+                    event: 'Settled from the live queue row'
+                }
+            continue
+        }
+        const archived = await coordinatorQueueReader.completedRow(profileHref).catch(() => null)
+        const outcome = `${archived?.outcome || ''}`.trim()
+        // Owner, 23 Oct: a finished archived row that is not a block is still settled. The worker merges a new candidate for it, so the page
+        // must not offer it again. It is not counted as nuked, and it is not retryable.
+        if(archived && isTerminalCoordinatorStatus(archived.status) && !scopedProgress[profileHref] && outcome !== 'blocked' && outcome !== 'already-blocked') {
+            scopedProgress[profileHref] = {
+                actionKind: 'mute-block',
+                runId: archived.runId || '',
+                status: 'archived-terminal',
+                blockSucceeded: false,
+                terminalAt: Number.parseInt(archived.terminalAt, 10) || Date.now(),
+                finalError: '',
+                event: 'Settled from the archived queue row'
+            }
+            continue
+        }
+        if(!archived || archived.status !== 'succeeded' || (outcome !== 'blocked' && outcome !== 'already-blocked')) continue
+        scopedProgress[profileHref] = {
+            ...(scopedProgress[profileHref] || {}),
+            actionKind: 'mute-block',
+            runId: archived.runId || scopedProgress[profileHref]?.runId || '',
+            status: outcome,
+            blockSucceeded: true,
+            foundBlockedBeforeQueue: outcome !== 'blocked',
+            blockedAt: Number.parseInt(archived.terminalAt, 10) || Date.now(),
+            terminalAt: Number.parseInt(archived.terminalAt, 10) || Date.now(),
+            finalError: '',
+            event: 'Settled from the archived queue row'
+        }
+    }
+
     return {
         scoped: true,
         pageType: request.pageType || '',
@@ -36421,6 +36750,9 @@ registerServiceWorkerListeners({
         forgetRemovedCoordinatorTabId,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
+        classifyCoordinatorExecutorState,
+        findCompletedWorkRowByKey,
+        getRecentCompletedWorkRows,
         getContentPageCoordinatorState,
         getCoordinatorQueueAccounting,
         getCoordinatorQueueRuntimeState,
@@ -36461,6 +36793,7 @@ registerServiceWorkerListeners({
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
         clearCoordinatorEventsRequested,
+        eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
         setSpaceNukedPostsRequested,
         setSpacePendingNukedPostsRequested,

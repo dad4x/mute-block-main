@@ -312,3 +312,35 @@ function renderSpaceList(container) {
 
     container.appendChild(fragment)
 }
+
+// Erase block history, the last-gasp reset. The worker pauses the queue, does the erase, refuses it while work is still running, and reloads the extension.
+const ERASE_BLOCK_HISTORY_PHRASE = 'ERASE'
+const ERASE_REFUSAL_MESSAGES = {
+    'confirmation-mismatch': `Type ${ERASE_BLOCK_HISTORY_PHRASE} exactly to erase.`,
+    'authority-not-loaded': 'The queue is still loading. Try again in a moment.',
+    'queue-row-active': 'A profile is still being processed after the pause. Wait a moment, then erase again.'
+}
+const eraseConfirmInput = document.getElementById('eraseConfirm')
+const eraseBlockHistoryButton = document.getElementById('eraseBlockHistoryButton')
+const eraseStatus = document.getElementById('eraseStatus')
+// Owner, 23 Oct: the button is never dimmed, so a click without the phrase puts the cursor into the confirmation box and says why.
+eraseBlockHistoryButton?.addEventListener('click', async () => {
+    if(eraseConfirmInput?.value !== ERASE_BLOCK_HISTORY_PHRASE) {
+        eraseConfirmInput?.focus()
+        if(eraseStatus) {
+            eraseStatus.hidden = false
+            eraseStatus.textContent = ERASE_REFUSAL_MESSAGES['confirmation-mismatch']
+        }
+        return
+    }
+    eraseBlockHistoryButton.disabled = true
+    const result = await browser.runtime.sendMessage({action: 'erase-block-history', confirmation: eraseConfirmInput.value})
+        .catch(error => ({erased: false, reason: 'message-failed', detail: error?.message || ''}))
+    if(eraseStatus) {
+        eraseStatus.hidden = false
+        eraseStatus.textContent = result?.scheduled
+            ? 'Erase scheduled. The extension is reloading, which stops its worker; the erase runs as it starts.'
+            : `Not erased. ${ERASE_REFUSAL_MESSAGES[result?.reason] || 'Something went wrong. Nothing was erased.'}`
+    }
+    if(!result?.scheduled) eraseBlockHistoryButton.disabled = false
+})

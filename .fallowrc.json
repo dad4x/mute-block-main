@@ -10,7 +10,7 @@
     "shared/js/sw.js",
     "shared/js/content.js",
     "shared/js/coordinator.js",
-    "shared/js/popup.js",
+    "shared/js/preferences.js",
     // tools/**/*.js are standalone CLI scripts invoked by hand
     // (`node tools/cdp/foo.js`) or from package.json scripts, not part of
     // an import graph -- each is its own entry, not "unused" just because

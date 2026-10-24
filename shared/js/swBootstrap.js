@@ -212,6 +212,7 @@ function registerServiceWorkerListeners(deps = {}) {
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
         clearCoordinatorEventsRequested,
+        eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
         setSpaceNukedPostsRequested,
         setSpacePendingNukedPostsRequested,
@@ -690,6 +691,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'clear-coordinator-outliers') {
             return clearCoordinatorOutliersRequested()
+        }
+        else if(request.action === 'erase-block-history') {
+            return eraseBlockHistoryRequested(request)
         }
         else if(request.action === 'set-space-nuked-posts') {
             return setSpaceNukedPostsRequested(request.nukedPosts)

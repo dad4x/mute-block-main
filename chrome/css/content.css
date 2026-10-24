@@ -475,6 +475,14 @@
     background-color: #6b7280;
 }
 
+/* Owner, 23 Oct: a post whose profiles ended in errors and none can be queued shows a white "Bad Links" button. */
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links,
+.mb-ext_space-feed-post-single-nuke-btn.mb-ext_nuke-profiles-btn--bad-links:hover {
+    background-color: #ffffff;
+    color: #111827;
+    box-shadow: inset 0 0 0 1px #9ca3af;
+}
+
 .mb-ext_space-feed-post-queue-btn {
     margin-left: 0;
     background-color: #111827;

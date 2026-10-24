@@ -317,6 +317,18 @@ function getCheckpointShardRecord(checkpoint = {}, shard = {}) {
     })
 }
 
+// The storage records of one sharded checkpoint slot, keyed as storage keys them: the manifest and one record per shard. The
+// inverse of readStoredCheckpoint. Recovery B rebuilds a torn slot from a checkpoint the worker already holds, so the records
+// must be exactly what the writer would store. A monolithic checkpoint has no such records, and returns null.
+function getCheckpointStorageRecords(checkpoint = null, baseKey = 'wal', checkpointId = CHECKPOINT_A) {
+    if(checkpoint?.format !== CHECKPOINT_SHARD_FORMAT) return null
+    const records = {[getSegmentedWalCheckpointKey(baseKey, checkpointId)]: getCheckpointManifest(checkpoint)}
+    for(const shard of checkpoint.shards || []) {
+        records[getSegmentedWalCheckpointShardKey(baseKey, checkpointId, shard.index)] = getCheckpointShardRecord(checkpoint, shard)
+    }
+    return records
+}
+
 // Reads one checkpoint slot from a stored snapshot. Monolithic (legacy) slots are
 // returned as they are. Sharded slots are reassembled from their shard records,
 // and each record must match the manifest's identity.
@@ -1341,6 +1353,12 @@ function validateWalRecord(record = {}) {
     else if(record.kind === 'list.append') {
         if(!record.area) return {ok: false, reason: 'missing-area'}
     }
+    else if(record.kind === 'map.appendUnique') {
+        if(!record.area) return {ok: false, reason: 'missing-area'}
+        if(!record.key) return {ok: false, reason: 'missing-key'}
+        if(!record.field) return {ok: false, reason: 'missing-field'}
+        if(!Array.isArray(record.values)) return {ok: false, reason: 'missing-values'}
+    }
     else {
         return {ok: false, reason: 'unknown-kind'}
     }
@@ -1470,6 +1488,26 @@ function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
         list.push(cloneJson(record.value))
         const maxEntries = normalizeSeq(record.maxEntries)
         nextState[area] = maxEntries > 0 ? list.slice(-maxEntries) : list
+    }
+    else if(record.kind === 'map.appendUnique') {
+        // Adds the values the list does not hold yet, in the order given. Replaying the same record again adds nothing, so it is
+        // idempotent. The record carries every value it adds, so the log alone rebuilds the list.
+        const map = takeAreaForWrite(nextState, area, context)
+        const previous = map[record.key] || {}
+        const current = Array.isArray(previous[record.field]) ? previous[record.field] : []
+        const seen = new Set(current)
+        const fresh = []
+        for (const value of record.values) {
+            if (typeof value !== 'string' || !value || seen.has(value)) continue
+            seen.add(value)
+            fresh.push(value)
+        }
+        if (!fresh.length) {
+            context.appliedIds?.add(record.id)
+            return {state, applied: false, reason: 'nothing-new', record}
+        }
+        map[record.key] = {...previous, [record.field]: [...current, ...fresh]}
+        nextState[area] = map
     }
 
     context.appliedIds?.add(record.id)
@@ -1612,6 +1650,7 @@ module.exports = {
     normalizeCheckpointShardCount,
     DEFAULT_RECOVERY_CRITICAL_AREAS,
     getCheckpointManifest,
+    getCheckpointStorageRecords,
     getSegmentedWalCheckpointShardKey,
     getSegmentedWalCheckpointShardKeys,
     makeShardedCheckpoint,

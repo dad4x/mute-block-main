@@ -162,12 +162,13 @@ test('after hydrate, a dashboard refresh is answered from the resident state: co
         storage: {
             mbCoordinatorPaused: false,
             ...makeCompletedWalStoragePayload({completed: {[hrefA]: rowA, [hrefB]: rowB}}),
-            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
     await sw.coordinatorAuthority.hydrate()
+    // The run is written through the door before the reads are measured, so its record is in the log, not on disk as a key.
+    await writeRunsThroughDoor(sw, {[runId]: makeCoordinatorRun({href: hrefA, runId})})
 
     const refreshed = await recordWalStorageReads(browser, () => sw.refreshCoordinatorDashboardViewsForDashboard('resident-check'))
     assert.equal(refreshed.result.refreshed, true)
@@ -307,7 +308,12 @@ test('a queue door write changes its row and the WAL keys only, and leaves the p
     assert.equal(after.queue[href].updatedAt, 102000, 'the written row is the resident row')
     assert.ok(after.stored['mbCoordinatorQueueWal.meta'].nextSeq > earlierWalMeta.nextSeq, 'the WAL meta moved to the new append')
     assert.equal(JSON.stringify(after.stored.mbProfileNukeProgressView), earlierProgressView, 'a queue write leaves the progress view as it was')
-    assert.equal(JSON.stringify(after.stored.mbCoordinatorRuns), earlierRuns, 'a queue write leaves the runs key as it was')
+    // The runs are worked out from the queue rows, as a reload works them out, so the write moves the run's derived fields to the
+    // written row. The earlier projection kept its own copy (checked above), and the stored copy follows the resident runs.
+    assert.equal(after.runs[runId].updatedAt, 102000, 'the run follows the written row')
+    assert.equal(after.runs[runId].itemCount, 1)
+    assert.equal(JSON.stringify(after.stored.mbCoordinatorRuns), JSON.stringify(after.runs), 'the stored runs copy matches the resident runs')
+    assert.notEqual(earlierRuns, JSON.stringify(after.runs), 'the runs value moved with the row')
 
     // The resident state agrees with a fresh decode of the WAL on disk.
     await sw.coordinatorAuthority.hydrate()
@@ -580,7 +586,9 @@ test('dashboard view counts finished work over the population, so the Quora-visi
     assert.equal(saved.saved, true, saved.reason)
     const view = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('finished-work-count'))
     assert.equal(view.view.items.some(item => item.attemptId === row.attemptId), false, 'the finished row is not in the list')
-    assert.deepEqual(view.view.finishedWork, {count: 1, latestActivityAt: 720000}, 'the view counts the finished row over the population')
+    assert.equal(view.view.finishedWork.count, 1, 'the view counts the finished row over the population')
+    assert.equal(view.view.finishedWork.latestActivityAt, 720000)
+    assert.equal(view.view.finishedWork.outcomes.blocked + view.view.finishedWork.outcomes.alreadyBlocked + Object.values(view.view.finishedWork.outcomes.skipped).reduce((n, v) => n + v, 0) + view.view.finishedWork.outcomes.failed + view.view.finishedWork.outcomes.other, 1, 'every finished row is in one outcome bucket')
 })
 
 test('terminal cleanup coalesces overlapping per-row calls into one trailing pass', async () => {
@@ -1222,7 +1230,7 @@ test('a verify-rejected append leaves the session mirror on the durable WAL, so 
     assert.equal(read.rows[hrefN]?.attemptId, 'attempt-verify-n', 'the mirror-backed read includes the good row')
 })
 
-test('a non-queue change through the door writes its dedicated keys, mirrors them under the WAL marker, and never touches the WAL', async () => {
+test('a non-queue change through the door writes its dedicated keys, mirrors them under the WAL marker, and carries its runs as log records', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Door-Stored-A'
     const runId = 'run-door-stored'
     const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-door-stored-a', now: 620000})
@@ -1250,7 +1258,6 @@ test('a non-queue change through the door writes its dedicated keys, mirrors the
         storage: {
             mbCoordinatorPaused: false,
             ...walPayload,
-            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
@@ -1258,13 +1265,10 @@ test('a non-queue change through the door writes its dedicated keys, mirrors the
     await sw.coordinatorAuthority.hydrate()
     assert.equal(await sw.rebuildCoordinatorQueueMirrorFromDisk(), true)
     const session = browser.__sessionStorage
-
-    const walKeys = () => Object.fromEntries(Object.entries(storage).filter(([key]) => key.startsWith(baseKey)))
-    const walBefore = JSON.stringify(walKeys())
     const appendedBefore = sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.appended'] || 0
 
     // A change with no queue part: a runs value, a pause flag and its generation. No results, no removed rows.
-    const runsAfter = {[runId]: {...makeCoordinatorRun({href: hrefA, runId}), status: 'completed'}}
+    const runsAfter = {[runId]: {...makeCoordinatorRun({href: hrefA, runId}), paused: true}}
     const persistence = await sw.coordinatorAuthority.persistCoordinator({
         stored: {
             mbCoordinatorRuns: runsAfter,
@@ -1274,14 +1278,13 @@ test('a non-queue change through the door writes its dedicated keys, mirrors the
         storageOptions: {metricPath: 'test.nonQueueDoor'}
     })
     assert.equal(persistence.saved, true, persistence.reason)
-    assert.equal(persistence.reason, 'stored-written')
 
-    // The dedicated keys hold the written values, and the session mirror holds the runs key under the same marker.
-    assert.deepEqual(storage.mbCoordinatorRuns, runsAfter, 'the runs value is on disk')
+    // The dedicated keys hold the written values, mirrored under the WAL marker. The runs value is not a key: it is log records.
     assert.equal(storage.mbCoordinatorPaused, true)
     assert.equal(storage.mbCoordinatorPauseGeneration, 7)
+    assert.equal(storage.mbCoordinatorRuns, undefined, 'no runs key is on disk')
+    assert.equal(session.mbCoordinatorRuns, undefined, 'no runs key is in the session')
     const {getQueueWalSeqFingerprint} = require('../shared/js/walSnapshotStore')
-    assert.deepEqual(session.mbCoordinatorRuns, runsAfter, 'the session mirror holds the runs value that was written')
     assert.equal(
         session.mbCoordinatorQueueWalSeq.committed,
         getQueueWalSeqFingerprint(session['mbCoordinatorQueueWal.meta']),
@@ -1289,17 +1292,16 @@ test('a non-queue change through the door writes its dedicated keys, mirrors the
     )
     assert.equal(session.mbCoordinatorQueueWalSeq.pending, session.mbCoordinatorQueueWalSeq.committed)
 
-    // The WAL was not touched: its keys are unchanged and no segment was appended.
-    assert.equal(JSON.stringify(walKeys()), walBefore, 'the WAL keys are unchanged')
-    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.appended'] || 0, appendedBefore)
+    // The runs change is one log append.
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.appended'] || 0, appendedBefore + 1, 'the runs change is one log append')
 
     // The resident projection took the change after the write.
-    assert.equal(sw.coordinatorAuthority.current().runs[runId]?.status, 'completed', 'the resident runs were updated')
+    assert.equal(sw.coordinatorAuthority.current().runs[runId]?.paused, true, 'the resident runs were updated')
     assert.equal(sw.coordinatorAuthority.current().stored.mbCoordinatorPaused, true)
 })
 
 
-test('a runs write goes through the namespace door: the session mirror holds the runs key, and hydrate reads it without disk', async () => {
+test('a runs write goes through the door as log records: no runs key is mirrored or written to disk, and a restart reads the runs from the log', async () => {
     const hrefA = 'https://www.quora.com/profile/Synthetic-Namespace-Runs-A'
     const runId = 'run-namespace-door'
     const rowA = makeQueuedCoordinatorRow({href: hrefA, runId, attemptId: 'attempt-namespace-a', now: 600000})
@@ -1315,8 +1317,6 @@ test('a runs write goes through the namespace door: the session mirror holds the
     })
     let activated = wal.activateCheckpoint(written.store, written.checkpointId, {codec: zlibCodec})
     assert.equal(activated.activated, true, activated.reason)
-    // One tail record, so the active generation has a committed segment and the resident WAL copy is set.
-    // Namespace writes stamp the mirror with that resident meta, so without it they are not mirrored.
     activated = {store: wal.appendWalRecordsToGeneration(activated.store, [{
         seq: 6, kind: 'map.patch', area: 'queue', key: hrefA, patch: {status: 'active', tabId: 883}
     }], {}).store}
@@ -1325,12 +1325,11 @@ test('a runs write goes through the namespace door: the session mirror holds the
         writeCheckpoints: true
     })
 
-    const {sw, browser} = loadServiceWorkerHarness({
+    const {sw, browser, storage} = loadServiceWorkerHarness({
         now: 600000,
         storage: {
             mbCoordinatorPaused: false,
             ...walPayload,
-            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: hrefA, runId})},
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
@@ -1339,32 +1338,22 @@ test('a runs write goes through the namespace door: the session mirror holds the
     assert.equal(await sw.rebuildCoordinatorQueueMirrorFromDisk(), true)
     const session = browser.__sessionStorage
 
-    // A runs write through saveCoordinatorState goes to disk and to the mirror in the same write.
+    // The runs write goes through the door. Its records go to the log; the runs key is neither mirrored nor written to disk.
     const runsAfterWrite = {[runId]: {...makeCoordinatorRun({href: hrefA, runId}), status: 'completed'}}
-    await sw.saveCoordinatorState({runs: runsAfterWrite}, {runs: true, reason: 'ordinaryMutation'})
-    const {getQueueWalSeqFingerprint} = require('../shared/js/walSnapshotStore')
-    assert.deepEqual(session.mbCoordinatorRuns, runsAfterWrite, 'the session mirror holds the runs value that was written')
-    assert.equal(session.mbCoordinatorQueueWalSeq.pending, session.mbCoordinatorQueueWalSeq.committed)
-    assert.equal(
-        session.mbCoordinatorQueueWalSeq.committed,
-        getQueueWalSeqFingerprint(session['mbCoordinatorQueueWal.meta']),
-        'the committed marker is the WAL meta fingerprint'
-    )
+    const saved = await sw.coordinatorAuthority.persistCoordinator({stored: {mbCoordinatorRuns: runsAfterWrite}}, {
+        operationKind: 'synthetic-namespace-runs', reason: 'ordinaryMutation', metricPath: 'test.namespace.runs'
+    })
+    assert.equal(saved.saved, true, saved.reason)
+    assert.equal(session.mbCoordinatorRuns, undefined, 'the runs are not mirrored as a key')
+    assert.equal(storage.mbCoordinatorRuns, undefined, 'no runs key is written to disk')
 
-    // Hydrate from the valid mirror: the runs key is not read from disk.
-    const runsDiskReads = []
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
-    browser.storage.local.get = defaults => {
-        runsDiskReads.push(...Object.keys(defaults || {}).filter(key => key === 'mbCoordinatorRuns'))
-        return originalGet(defaults)
-    }
-    try {
-        await sw.coordinatorAuthority.hydrate()
-    } finally {
-        browser.storage.local.get = originalGet
-    }
-    assert.deepEqual(runsDiskReads, [], 'a valid mirror serves the runs key without a disk read')
-    assert.equal(sw.coordinatorAuthority.current().runs[runId].status, 'completed')
+    // A restart rebuilds the runs from the log, with the targets the write carried.
+    const restarted = loadServiceWorkerHarness({now: 600010, storage})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(
+        restarted.sw.coordinatorAuthority.current().runs[runId]?.targetProfileHrefs,
+        runsAfterWrite[runId].targetProfileHrefs
+    )
 })
 
 // Namespace stamp (docs/queue-storage-layering.md, section 6, rule 7). A session copy of the runs key is used at restart only when
@@ -1401,7 +1390,6 @@ async function startNamespaceMirrorHarness(href, runId) {
         storage: {
             mbCoordinatorPaused: false,
             ...makeNamespaceMirrorWalPayload(href),
-            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href, runId})},
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
@@ -1415,31 +1403,39 @@ function makeNamespaceRuns(href, runId, status) {
     return {[runId]: {...makeCoordinatorRun({href, runId}), status}}
 }
 
+// A runs write as the worker makes it: the runs value goes through the write door, which turns it into log records.
+function writeRunsThroughDoor(sw, runs) {
+    return sw.coordinatorAuthority.persistCoordinator({stored: {mbCoordinatorRuns: runs}}, {
+        operationKind: 'synthetic-runs-write', reason: 'ordinaryMutation', metricPath: 'test.runsWrite'
+    })
+}
+
 // The stamp key of the runs key (sw.js COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX + COORDINATOR_RUNS_KEY).
 const NAMESPACE_RUNS_STAMP_KEY = 'mbCoordinatorNamespaceSeq.mbCoordinatorRuns'
 
-test('an unmirrored runs write after a checkpoint switch is what a restart shows, not the session copy it left behind', async () => {
+test('a runs write across a checkpoint switch is what a restart shows: the runs are log records, and no runs key is on disk or in the session', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Namespace-Unmirrored-Restart'
     const runId = 'run-namespace-unmirrored-restart'
     const {sw, browser, storage, session} = await startNamespaceMirrorHarness(href, runId)
+    const runWithPause = paused => ({[runId]: {...makeCoordinatorRun({href, runId}), paused}})
 
-    const runsMirrored = makeNamespaceRuns(href, runId, 'running')
-    await sw.saveCoordinatorState({runs: runsMirrored}, {runs: true, reason: 'ordinaryMutation'})
-    assert.deepEqual(session.mbCoordinatorRuns, runsMirrored, 'the mirrored write reaches the session copy')
+    const runsBeforeSwitch = await writeRunsThroughDoor(sw, runWithPause(false))
+    assert.equal(runsBeforeSwitch.saved, true, runsBeforeSwitch.reason)
+    assert.equal(storage.mbCoordinatorRuns, undefined, 'no runs key is on disk')
+    assert.equal(session.mbCoordinatorRuns, undefined, 'no runs key is in the session')
 
-    // The switch leaves the new generation with no committed segment, so the resident WAL meta is not set and the next
-    // namespace write is not mirrored.
     const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
     assert.equal(checkpointSwitch.checkpointSwitched, true, checkpointSwitch.reason)
 
-    const runsUnmirrored = makeNamespaceRuns(href, runId, 'completed')
-    await sw.saveCoordinatorState({runs: runsUnmirrored}, {runs: true, reason: 'ordinaryMutation'})
-    assert.deepEqual(storage.mbCoordinatorRuns, runsUnmirrored, 'the unmirrored write reaches disk')
-    assert.deepEqual(session.mbCoordinatorRuns, runsMirrored, 'the unmirrored write leaves the session copy behind')
+    // A write after the switch goes to the new generation's log. It is not a key, so the session holds no runs copy to go stale.
+    const runsAfterSwitch = await writeRunsThroughDoor(sw, runWithPause(true))
+    assert.equal(runsAfterSwitch.saved, true, runsAfterSwitch.reason)
+    assert.equal(storage.mbCoordinatorRuns, undefined, 'no runs key is on disk after the switch')
+    assert.equal(session.mbCoordinatorRuns, undefined, 'no runs key is in the session after the switch')
 
     const restarted = loadServiceWorkerHarness({now: 600010, browser})
     await restarted.sw.coordinatorAuthority.hydrate()
-    assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.status, 'completed', 'the restart shows the latest runs')
+    assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.paused, true, 'the restart shows the latest runs from the log')
 })
 
 test('a session runs copy whose namespace stamp is not the disk stamp is not used at restart', async () => {
@@ -1472,31 +1468,22 @@ test('a session runs copy with no namespace stamp (an existing install) is not u
     assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.status, 'running', 'the restart reads the disk runs')
 })
 
-test('a mirrored runs copy with the disk stamp is served at restart, and hydrate adds only the stamp to its disk read', async () => {
+test('a runs write is read back at restart from the log: no runs stamp is written or read, and the restart shows the runs', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Namespace-Stamp-Match'
     const runId = 'run-namespace-stamp-match'
     const {sw, browser, storage, session} = await startNamespaceMirrorHarness(href, runId)
-    const runsMirrored = makeNamespaceRuns(href, runId, 'running')
-    await sw.saveCoordinatorState({runs: runsMirrored}, {runs: true, reason: 'ordinaryMutation'})
-    assert.deepEqual(session.mbCoordinatorRuns, runsMirrored, 'the mirrored write reaches the session copy')
-    assert.equal(typeof storage[NAMESPACE_RUNS_STAMP_KEY], 'string', 'the disk write carries a stamp for the runs key')
-    assert.equal(session[NAMESPACE_RUNS_STAMP_KEY], storage[NAMESPACE_RUNS_STAMP_KEY], 'the session copy carries the same stamp')
+    const runsWritten = {[runId]: {...makeCoordinatorRun({href, runId}), paused: true}}
+    const saved = await writeRunsThroughDoor(sw, runsWritten)
+    assert.equal(saved.saved, true, saved.reason)
+    assert.equal(storage[NAMESPACE_RUNS_STAMP_KEY], undefined, 'no stamp is written for the runs: they are not a disk key')
+    assert.equal(session[NAMESPACE_RUNS_STAMP_KEY], undefined, 'no stamp is mirrored for the runs')
 
-    // Count every storage call the restart makes, module load and hydrate together. The counts are the ones this fixture makes
-    // before the stamp existed: five disk reads (three one-key startup reads, the hydrate read, and the WAL read that a restart
-    // still makes from disk) and four session reads. The stamp is one more key in the hydrate read and in the namespace session
-    // read; no call is added, and the runs key is not read from disk.
+    // Count the disk reads the restart makes, module load and hydrate together.
     const diskReads = []
-    const sessionReads = []
     const originalLocalGet = browser.storage.local.get.bind(browser.storage.local)
-    const originalSessionGet = browser.storage.session.get.bind(browser.storage.session)
     browser.storage.local.get = defaults => {
-        diskReads.push(Object.keys(defaults || {}))
+        diskReads.push(Array.isArray(defaults) ? defaults : Object.keys(defaults || {}))
         return originalLocalGet(defaults)
-    }
-    browser.storage.session.get = defaults => {
-        sessionReads.push(Array.isArray(defaults) ? defaults : Object.keys(defaults || {}))
-        return originalSessionGet(defaults)
     }
     let restarted = null
     try {
@@ -1505,30 +1492,10 @@ test('a mirrored runs copy with the disk stamp is served at restart, and hydrate
     }
     finally {
         browser.storage.local.get = originalLocalGet
-        browser.storage.session.get = originalSessionGet
     }
 
-    assert.equal(diskReads.length, 5, 'the restart makes the same five disk reads as before')
-    assert.equal(sessionReads.length, 4, 'the restart makes the same four session reads as before')
-    assert.equal(diskReads.some(keys => keys.includes('mbCoordinatorRuns')), false, 'the runs key is not read from disk')
-    const stampReads = diskReads.filter(keys => keys.includes(NAMESPACE_RUNS_STAMP_KEY))
-    assert.equal(stampReads.length, 1, 'the runs stamp is read once, in the hydrate read')
-    assert.deepEqual(
-        stampReads[0].filter(key => !key.startsWith(LEGACY_PROGRESS_PREFIX)).sort(),
-        [
-            'mbCoordinatorNamespaceSeq.mbCoordinatorRuns',
-            'mbCoordinatorPauseGeneration',
-            'mbCoordinatorPaused',
-            // The space post maps are read in their layout keys: the legacy key, the 32 bucket keys of each map and the layout marker (spaceMapStorage.js).
-            ...require('../shared/js/spaceMapStorage').spaceMapStorageKeys(['mbSpaceNukedPosts', 'mbSpacePendingNukedPosts']),
-            // The run list's layout marker and bucket keys (its legacy key is not read when the mirror confirms it).
-            'mbCoordinatorRunsLayoutVersion',
-            ...require('../shared/js/spaceMapStorage').spaceMapBucketKeys('mbCoordinatorRuns')
-        ].sort(),
-        'the hydrate read names the same keys as before, plus the runs stamp and the space map layout keys'
-    )
-    assert.equal(sessionReads.filter(keys => keys.includes(NAMESPACE_RUNS_STAMP_KEY)).length, 1, 'the namespace session read carries the runs stamp')
-    assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.status, 'running', 'the restart serves the mirrored runs')
+    assert.equal(diskReads.some(keys => keys.includes(NAMESPACE_RUNS_STAMP_KEY)), false, 'no runs stamp is read from disk')
+    assert.equal(restarted.sw.coordinatorAuthority.current().runs[runId]?.paused, true, 'the restart shows the runs from the log')
 })
 
 test('profile progress is held in session storage only, and a restart after a queue write serves its latest copy (decision 31)', async () => {
@@ -4429,83 +4396,6 @@ test('bulk current work cancel waits for storage tail before closing active owne
     assert.equal(browser.__tabs.has(tabId), false)
 })
 
-test('bulk current work cancel derived failure does not poison WAL terminalization', async () => {
-    const hrefA = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-A'
-    const hrefB = 'https://www.quora.com/profile/Synthetic-Bulk-Cancel-Derived-Failure-B'
-    const runId = 'run-bulk-cancel-derived-failure'
-    const makeRow = (href, attemptNumber = 1) => ({
-        runId,
-        status: 'queued',
-        actionKind: 'mute-block',
-        targetProfileHref: href,
-        requestedUrl: href,
-        dedupeKey: href,
-        coordinatorKey: href,
-        queuedAt: 502000,
-        activeAt: 0,
-        updatedAt: 502500,
-        tabId: null,
-        attemptId: `attempt-bulk-cancel-derived-failure-${attemptNumber}`,
-        attemptNumber,
-        milestones: {}
-    })
-    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
-        now: 503000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [hrefA]: makeRow(hrefA, 1),
-                [hrefB]: makeRow(hrefB, 2)
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'active',
-                    targetProfileHrefs: [hrefA, hrefB],
-                    targetWorkKeys: [hrefA, hrefB]
-                }
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {}
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns) {
-            throw new Error('synthetic bulk current work cancel derived failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
-        action: 'cancel-coordinator-current-work'
-    }), timers)
-
-    assert.equal(result.canceledUrls.length, 2)
-    assert.equal(storage.mbCoordinatorQueue[hrefA].status, 'queued')
-    assert.equal(storage.mbCoordinatorQueue[hrefB].status, 'queued')
-    assert.equal(sw.coordinatorAuthority.current().queue[hrefA], undefined)
-    assert.equal(sw.coordinatorAuthority.current().queue[hrefB], undefined)
-    assert.equal((await sw.findCompletedWorkRowByKey(hrefA))?.status, 'canceled')
-    assert.equal((await sw.findCompletedWorkRowByKey(hrefB))?.status, 'canceled')
-    // Diagnostic events go to the flight recorder now, not to storage (events-to-flight-recorder design, B9a).
-    assert.equal(sw.getFlightRecorderSnapshot({kind: 'stored-work-cancel-derived-save-failed', limit: 5}).entries.length, 1)
-    assert.equal(sw.state().queueWakeupCounters['storedWork.cancel.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-    const walRecords = getWalRecordsForGeneration(
-        getStoredCoordinatorQueueWal(storage),
-        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
-    )
-    // 2 canceled rows x 2 records each (map.remove on area:'queue' +
-    // map.set on area:'completed') = 4.
-    assert.equal(walRecords.length, 4)
-    assert.equal(walRecords.every(record => record.operationKind === 'stored-work-cancel'), true)
-})
-
 test('bulk current work pause writes no content-queue-index: the stored copy is left alone and the read is derived', async () => {
     // 601f 1a: the batch default writes no content-queue-index and schedules no rebuild. The stored copy (the sentinel) is never
     // rewritten, and the read is derived from the resident queue.
@@ -4544,80 +4434,6 @@ test('bulk current work pause writes no content-queue-index: the stored copy is 
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionDeferred'] || 0, 0)
     assert.deepEqual(storage.mbCoordinatorContentQueueIndex, sentinelContentQueueIndex)
     assert.notDeepEqual(derivedContentQueueIndex(sw), sentinelContentQueueIndex)
-})
-
-test('bulk current work pause WAL-requeues active rows as a batch', async () => {
-    const hrefActive = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Active'
-    const hrefQueued = 'https://www.quora.com/profile/Synthetic-Bulk-Pause-Queued'
-    const runId = 'run-bulk-pause'
-    const attemptId = 'attempt-bulk-pause-active'
-    const tabId = 703
-    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
-        now: 504000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [hrefActive]: makeActiveCoordinatorRow({href: hrefActive, runId, attemptId, tabId, now: 504000}),
-                [hrefQueued]: makeQueuedCoordinatorRow({href: hrefQueued, runId, attemptId: 'attempt-bulk-pause-queued', now: 504000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'active',
-                    targetProfileHrefs: [hrefActive, hrefQueued],
-                    targetWorkKeys: [hrefActive, hrefQueued]
-                }
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [hrefActive]: {
-                    profileHref: hrefActive,
-                    status: 'tab-opened',
-                    runId,
-                    tabId,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 503700
-                }
-            }
-        }
-    })
-    browser.__tabs.set(tabId, {
-        id: tabId,
-        windowId: 1,
-        url: hrefActive,
-        active: false
-    })
-
-    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
-        action: 'pause-coordinator-nukes'
-    }), timers)
-
-    assert.equal(result.paused, true)
-    assert.equal(result.pausedUrls.length, 2)
-    assert.equal(storage.mbCoordinatorPaused, true)
-    assert.equal(storage.mbCoordinatorQueue[hrefActive].status, 'active')
-    assert.equal(storage.mbCoordinatorQueue[hrefQueued].status, 'queued')
-    assert.equal(sw.coordinatorAuthority.current().queue[hrefActive].status, 'queued')
-    assert.equal(sw.coordinatorAuthority.current().queue[hrefQueued].status, 'queued')
-    assert.equal(getFreshQueueView(sw, storage).counts.queued, 2)
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
-    assert.ok(sw.getFlightRecorderSnapshot({kind: 'paused', limit: 5}).entries.length >= 1, 'the paused event is in the flight recorder')
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].status, 'tab-opened')
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].tabId, tabId)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefActive].attemptId, attemptId)
-    assert.equal(browser.__removedTabs.includes(tabId), true)
-    const walRecords = getWalRecordsForGeneration(
-        getStoredCoordinatorQueueWal(storage),
-        getStoredCoordinatorQueueWal(storage)?.meta?.activeCheckpoint
-    )
-    assert.equal(walRecords.length, 1)
-    assert.equal(walRecords[0].operationKind, 'stored-work-pause')
-    const recovered = recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue
-    assert.equal(recovered[hrefActive].status, 'queued')
-    assert.equal(recovered[hrefQueued].status, 'queued')
 })
 
 test('pause closes the live runtime tab even when the durable row tabId is stale', async () => {
@@ -4862,110 +4678,6 @@ test('bulk current work pause WAL append failure does not close active owned tab
     assert.equal(storage.mbCoordinatorEvents.length, 0)
     assert.equal(browser.__removedTabs.includes(tabId), false)
     assert.equal(browser.__tabs.has(tabId), true)
-})
-
-test('runs paused update uses queue-runs projection without loading progress', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Runs-Paused-Projection'
-    const runId = 'run-runs-paused-projection'
-    const attemptId = 'attempt-runs-paused-projection'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 505500,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 505500})
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'paused',
-                    paused: true,
-                    targetProfileHrefs: [href],
-                    targetWorkKeys: [href]
-                }
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'queued',
-                    runId,
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 505400
-                }
-            }
-        }
-    })
-    // Hydrate is the one full load (P3). The spy starts after it, so it records only what the runs update reads.
-    await sw.coordinatorAuthority.hydrate()
-    const getDefaults = []
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
-    browser.storage.local.get = async defaults => {
-        getDefaults.push(defaults)
-        return originalGet(defaults)
-    }
-
-    const result = await sw.setCoordinatorRunsPaused(false)
-
-    assert.equal(result.changed, true)
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
-    assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
-    // After hydrate, the paused update answers from the resident state (P2): it reads no coordinator, progress or space key.
-    assert.deepEqual(getDefaults.filter(defaults => Object.keys(defaults || {}).some(key => key.startsWith('mbCoordinator') || key.startsWith(LEGACY_PROGRESS_PREFIX) || key.startsWith('mbSpace'))), [])
-})
-
-test('runs paused update failure schedules reconcile without throwing', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Runs-Paused-Failure'
-    const runId = 'run-runs-paused-failure'
-    const attemptId = 'attempt-runs-paused-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 505800,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 505800})
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'paused',
-                    paused: true,
-                    targetProfileHrefs: [href],
-                    targetWorkKeys: [href]
-                }
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {}
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns) {
-            throw new Error('synthetic runs paused save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await sw.setCoordinatorRunsPaused(false)
-
-    assert.equal(result.changed === false || result.changed === undefined, true)
-    assert.equal(result.reason, 'runs-paused-save-failed')
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'paused')
-    assert.equal(sw.state().queueWakeupCounters['runsPaused.derivedSaveFailed'], 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-
-    browser.storage.local.set = originalSet
-    const reconcileResult = await sw.reconcileCoordinatorStorage()
-
-    assert.equal(reconcileResult.runsChanged, true)
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
-    assert.equal(storage.mbCoordinatorRuns[runId].paused, false)
 })
 
 test('a row that did not land on a profile page is not retried, and never becomes a resolution (owner, 15 Oct; review-5 R5-4)', async () => {
@@ -7569,76 +7281,6 @@ test('row event queue WAL projection failure does not poison durable acknowledge
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
     assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionFailed'] || 0, 0)
     // 601f 1a: no index write can fail, so no reconcile is scheduled for one.
-})
-
-test('row event derived runs failure does not poison durable queue WAL acknowledgement', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Row-Event-Runs-Failure'
-    const runId = 'run-row-event-runs-failure'
-    const attemptId = 'attempt-row-event-runs-failure'
-    const tabId = 528
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 153000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: {
-                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 153000}),
-                    status: 'queued',
-                    activeAt: 0,
-                    tabId: null
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'queued',
-                    runId,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 152500
-                }
-            }
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns) {
-            throw new Error('synthetic row-event runs failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await sw.applyCoordinatorRowEvent({
-        eventKind: 'queued-progress-milestone',
-        profileHref: href,
-        patch: {
-            status: 'page-ready',
-            actionReadyAt: 153010,
-            runId,
-            tabId,
-            actionKind: 'mute-block',
-            attemptId,
-            attemptNumber: 1
-        }
-    })
-
-    assert.equal(result.recorded, true)
-    assert.equal(result.terminal, false)
-    assert.equal(result.progressProjectionDurable, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(recoverProjectedState(getStoredCoordinatorQueueWal(storage)).projected.state.queue[href].status, 'active')
-    assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'active')
-    assert.equal(sw.state().queueWakeupCounters['rowEvent.queued-progress-milestone.derivedRunsSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
 })
 
 test('queued tab metadata milestones use row-event projection without full progress write', async () => {
@@ -12149,67 +11791,6 @@ test('concurrent terminal projection saves do not regress newer terminal progres
     assert.equal(getProgressShardRecord(storage, hrefB).attemptId, attemptIdB)
 })
 
-test('terminal progress projection save recomputes runs from WAL authority over stale raw queue', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Run-Authority'
-    const runId = 'run-terminal-run-authority'
-    const attemptId = 'attempt-terminal-run-authority'
-    const tabId = 516
-    const {storage, sw} = loadServiceWorkerHarness({
-        now: 257000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 257000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'blocking',
-                    runId,
-                    tabId,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 256500
-                }
-            }
-        }
-    })
-
-    const result = await sw.recordCoordinatorJobProgress(href, {
-        status: 'blocked',
-        blockSucceeded: true,
-        blockedAt: 257100,
-        terminalAt: 257100,
-        actionKind: 'mute-block',
-        runId,
-        tabId,
-        attemptId,
-        attemptNumber: 1
-    }, {
-        expectTerminal: true,
-        senderTabId: tabId
-    })
-
-    assert.equal(result.recorded, true)
-    assert.equal(result.terminal, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'succeeded')
-
-    await waitFor(
-        () => storage.mbCoordinatorRuns[runId]?.status === 'empty',
-        'terminal progress projection save did not recompute runs from WAL authority',
-        {attempts: 40}
-    )
-
-    assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
-    assert.equal(Number.parseInt(storage.mbCoordinatorRuns[runId].pendingCount, 10) || 0, 0)
-})
-
 test('terminal job progress acknowledges durable terminal queue before projection save timeout', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Compatibility-Timeout'
     const runId = 'run-terminal-compatibility-timeout'
@@ -12516,245 +12097,6 @@ test('profile-progress field allowlist round-trips every known field (schema tri
 
     assert.deepEqual(storage.mbProfileNukeProgressView.records[href], expected)
     assert.deepEqual(getProgressShardRecord(storage, href), expected)
-})
-
-test('clear profile state removes queue row through WAL authority and saves derived cleanup', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Wal'
-    const runId = 'run-clear-profile-wal'
-    const attemptId = 'attempt-clear-profile-wal'
-    const postKey = 'post-clear-profile-wal'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 278000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 278000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'queued',
-                    runId,
-                    tabId: null,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 278000
-                }
-            },
-            ...makeProgressProjectionSeed(href, {
-                status: 'queued',
-                runId,
-                tabId: null,
-                actionKind: 'mute-block',
-                attemptId,
-                attemptNumber: 1,
-                updatedAt: 278000
-            }),
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 278000
-                }
-            },
-            mbSpaceNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    urls: [href],
-                    updatedAt: 278000
-                }
-            }
-        }
-    })
-    // Hydrate is the one full load (P3). The spy starts after it, so it records only what the clear reads.
-    await sw.coordinatorAuthority.hydrate()
-    const getDefaults = []
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
-    browser.storage.local.get = async defaults => {
-        getDefaults.push(defaults)
-        return originalGet(defaults)
-    }
-
-    const result = await browser.runtime.sendMessage({
-        action: 'clear-profile-nuke-state',
-        profileHref: href,
-        reason: 'synthetic-clear'
-    }, {tab: {id: 12, windowId: 1}})
-
-    assert.equal(result.cleared, true)
-    assert.equal(result.queueChanged, true)
-    assert.equal(result.runsChanged, true)
-    assert.equal(result.progressChanged, true)
-    assert.equal(result.pendingChanged, true)
-    assert.equal(result.nukedChanged, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
-    assert.equal(sw.coordinatorAuthority.current().queue[href], undefined)
-    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
-    // clearProfileNukeState tombstones rather than deletes the row (a blank
-    // record with a fresh clearedAt/directProgressClientUpdatedAt), so the
-    // service worker's out-of-order-write guard has something durable to
-    // compare a straggling checkpoint write against -- see
-    // recordDirectProfileProgressFromRequest.
-    assert.ok(storage.mbProfileNukeProgressView.records[href])
-    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
-    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
-    const clearedShardRecord = getProgressShardRecord(storage, href)
-    assert.ok(clearedShardRecord)
-    assert.equal(clearedShardRecord.status, '')
-    assert.ok(clearedShardRecord.clearedAt > 0)
-    assert.ok(sw.state().profileNukeProgress[href])
-    assert.ok(sw.state().profileNukeProgress[href].clearedAt > 0)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
-    assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
-    assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
-    assert.equal(storage.mbCoordinatorQueueView?.counts.queued || 0, 0)
-    // After hydrate, the clear answers from the resident state (P2): it reads no coordinator, progress or space key from
-    // storage. Metric reads are not coordinator state and are not part of this check.
-    const coordinatorStateReads = getDefaults.filter(defaults => Object.keys(defaults || {}).some(key =>
-        key.startsWith('mbCoordinator') || key.startsWith(LEGACY_PROGRESS_PREFIX) || key.startsWith('mbSpace')
-    ))
-    assert.deepEqual(coordinatorStateReads, [])
-
-    const records = getWalRecordsForGeneration(
-        getStoredCoordinatorQueueWal(storage),
-        getStoredCoordinatorQueueWal(storage).meta.activeCheckpoint
-    )
-    assert.equal(records.length, 1)
-    assert.equal(records[0].operationKind, 'clear-profile')
-    assert.equal(records[0].removed, true)
-})
-
-test('clear profile state derived failure materializes cleanup without resurrecting queue row', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Clear-Profile-Derived-Failure'
-    const runId = 'run-clear-profile-derived-failure'
-    const attemptId = 'attempt-clear-profile-derived-failure'
-    const postKey = 'post-clear-profile-derived-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 278250,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 278250})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'queued',
-                    runId,
-                    tabId: null,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 278250
-                }
-            },
-            ...makeProgressProjectionSeed(href, {
-                status: 'queued',
-                runId,
-                tabId: null,
-                actionKind: 'mute-block',
-                attemptId,
-                attemptNumber: 1,
-                updatedAt: 278250
-            }),
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-derived-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 278250
-                }
-            },
-            mbSpaceNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-derived-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    urls: [href],
-                    updatedAt: 278250
-                }
-            }
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    let failedDerivedSave = false
-    browser.storage.local.set = async payload => {
-        if(!failedDerivedSave &&
-            payload?.mbCoordinatorRuns &&
-            payload?.mbSpacePendingNukedPosts &&
-            payload?.mbSpaceNukedPosts) {
-            failedDerivedSave = true
-            throw new Error('synthetic clear profile derived failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await browser.runtime.sendMessage({
-        action: 'clear-profile-nuke-state',
-        profileHref: href,
-        reason: 'synthetic-clear-derived-failure'
-    }, {tab: {id: 12, windowId: 1}})
-    browser.storage.local.set = originalSet
-
-    assert.equal(result.cleared, true)
-    assert.equal(result.queueChanged, true)
-    assert.equal(result.derivedSaved, false)
-    assert.equal(failedDerivedSave, true)
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
-    // The injected failure only targets the combined runs/pending/nuked
-    // "derived" payload -- the progress tombstone is a separate save
-    // (saveProfileNukeProgressRowProjection) that isn't part of that
-    // payload, so it still succeeds independently. See the sibling "clear
-    // profile state derived failure" comment above for why this is a
-    // tombstone rather than an absent record.
-    assert.ok(storage.mbProfileNukeProgressView.records[href])
-    assert.equal(storage.mbProfileNukeProgressView.records[href].status, '')
-    assert.ok(storage.mbProfileNukeProgressView.records[href].clearedAt > 0)
-    const derivedFailureShardRecord = getProgressShardRecord(storage, href)
-    assert.ok(derivedFailureShardRecord)
-    assert.equal(derivedFailureShardRecord.status, '')
-    assert.ok(derivedFailureShardRecord.clearedAt > 0)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
-    assert.ok(storage.mbSpacePendingNukedPosts[postKey])
-    assert.ok(storage.mbSpaceNukedPosts[postKey])
-    assert.equal(sw.state().queueWakeupCounters['clearProfile.derivedSaveFailed'], 1)
-
-    const reconcileResult = await sw.reconcileCoordinatorStorage()
-
-    assert.equal(reconcileResult.queueChanged, false)
-    assert.equal(reconcileResult.queueCount, 0)
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href], undefined)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
-    assert.ok(storage[LEGACY_PROFILE_PROGRESS_KEY][href])
-    assert.equal(storage.mbProfileNukeProgressView.records[href], undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), false)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), false)
-    assert.equal(storage.mbCoordinatorRuns[runId].itemCount, 0)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
-    assert.equal(storage.mbSpaceNukedPosts[postKey], undefined)
 })
 
 test('clear profile state WAL failure leaves raw and derived state intact', async () => {
@@ -15016,72 +14358,6 @@ test('non-profile landing projection failure does not poison WAL terminalization
     assert.equal((await restarted.sw.findCompletedWorkRowByKey(href))?.status, 'skipped')
 })
 
-test('non-profile landing derived failure does not poison authority terminalization', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Non-Profile-Derived-Failure'
-    const topicUrl = 'https://www.quora.com/topic/Synthetic-Non-Profile-Derived-Failure'
-    const runId = 'run-non-profile-derived-failure'
-    const attemptId = 'attempt-non-profile-derived-failure'
-    const tabId = 630
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 424000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 424000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'tab-opening',
-                    runId,
-                    tabId,
-                    tabOpenedAt: 423500,
-                    lastUrl: topicUrl,
-                    updatedAt: 423500,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1
-                }
-            }
-        }
-    })
-    let walSaved = false
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(isCoordinatorQueueWalPayload(payload)) {
-            walSaved = true
-        }
-        if(walSaved && !isCoordinatorQueueWalPayload(payload) && (payload?.mbCoordinatorRuns || payload?.[LEGACY_PROFILE_PROGRESS_KEY])) {
-            throw new Error('synthetic non-profile derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await sw.terminalizeActiveCoordinatorNonProfileLanding(href, topicUrl, {
-        reason: 'reconcile',
-        expectedAttemptId: attemptId,
-        expectedAttemptNumber: 1,
-        reconcileReason: 'synthetic-non-profile-derived-failure'
-    })
-
-    assert.equal(result.changed, true)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opening')
-    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'profile-unavailable')
-    assert.equal(getProgressShardRecord(storage, href).status, 'profile-unavailable')
-    assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'skipped')
-    assert.equal(sw.state().queueWakeupCounters['reconcile.nonProfileLanding.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-})
-
 test('key-only terminalization is WAL-backed and recovers after restart', async () => {
     const key = 'resolve-profile:https://www.quora.com/q/example/post-key-only-authority'
     const requestedUrl = 'https://www.quora.com/q/example/post-key-only-authority'
@@ -16472,82 +15748,6 @@ test('key-only terminalization projection failure does not poison WAL terminaliz
     assert.equal(await restarted.sw.findCompletedWorkRowByKey(key), null)
 })
 
-test('key-only terminalization derived failure does not poison authority terminalization', async () => {
-    const key = 'resolve-profile:https://www.quora.com/q/example/post-key-only-derived-failure'
-    const requestedUrl = 'https://www.quora.com/q/example/post-key-only-derived-failure'
-    const runId = 'run-key-only-derived-failure'
-    const attemptId = 'attempt-key-only-derived-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 429000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [key]: {
-                    runId,
-                    status: 'active',
-                    actionKind: 'mute-block',
-                    executorTabAction: 'resolve-profile',
-                    requestedUrl,
-                    dedupeKey: key,
-                    coordinatorKey: key,
-                    queuedAt: 428000,
-                    activeAt: 428500,
-                    updatedAt: 428500,
-                    attemptId,
-                    attemptNumber: 1,
-                    milestones: {}
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    ...makeCoordinatorRun({href: key, runId}),
-                    targetProfileHrefs: [],
-                    targetWorkKeys: [key]
-                }
-            },
-            mbCoordinatorEvents: []
-        }
-    })
-    let walSaved = false
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(isCoordinatorQueueWalPayload(payload)) {
-            walSaved = true
-        }
-        if(walSaved &&
-            !isCoordinatorQueueWalPayload(payload) &&
-            payload?.mbCoordinatorEvents?.some(event => event?.details?.reason === 'synthetic-key-only-derived-failure')) {
-            throw new Error('synthetic key-only derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await sw.terminalizeCoordinatorKeyOnlyItem(key, {
-        expectedAttemptId: attemptId,
-        expectedAttemptNumber: 1,
-        reason: 'synthetic-key-only-derived-failure',
-        now: 429000
-    })
-
-    assert.equal(result.changed, true)
-    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(sw.getFlightRecorderSnapshot({channel: 'event', limit: 200}).entries.some(entry => entry.reason === 'synthetic-key-only-derived-failure'), true, 'the terminal diagnostic is in the flight recorder')
-    // 2026-10-13: a soft failure with retries left stays live, so the terminal row is resident and not archived.
-    assert.equal(sw.coordinatorAuthority.current().queue[key]?.status, 'failed')
-
-    browser.storage.local.set = originalSet
-    const reconcileResult = await sw.reconcileCoordinatorStorage()
-    // The terminal-key-only event materializer and the run-stats recompute both still see this row, now as a live soft
-    // failure with retries left. That row is not finished (swCoordinatorRuns.js getCoordinatorRunStatus), so the run is
-    // 'running' and not 'empty'. terminalCount still counts the row as terminal.
-    assert.equal(reconcileResult.eventsChanged, false, 'the diagnostic goes to the flight recorder; no stored change')
-    // The run record is already consistent without the old stored event, so the reconcile no longer reports it changed. The status and count below are what matter.
-    assert.ok(sw.getFlightRecorderSnapshot({channel: 'event', limit: 200}).entries.some(entry => entry.rowKey === key), 'the diagnostic is in the flight recorder')
-    assert.equal(storage.mbCoordinatorRuns[runId].status, 'running')
-    assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, 1)
-})
-
 test('reconcile does not promote terminal error progress over active service-worker authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Error'
     const runId = 'run-terminal-error'
@@ -17198,12 +16398,6 @@ test('coordinator authority hydrates resident projection without storage writes'
                 rowKey: href,
                 createdAt: 3000
             }),
-            mbCoordinatorRuns: {
-                'run-authority-hydrate': {
-                    id: 'run-authority-hydrate',
-                    queued: 1
-                }
-            },
             mbCoordinatorEvents: [{
                 id: 'event-authority-hydrate',
                 type: 'synthetic',
@@ -17247,7 +16441,8 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(hydrated.queue[href].id, 'authority-hydrate-row')
     assert.equal(hydrated.queue[staleRawHref], undefined)
     assert.equal(current.queue[href].attemptId, 'attempt-hydrate')
-    assert.equal(current.runs['run-authority-hydrate'].queued, 1)
+    // The legacy runs key on disk is not used: the seeded run is not in the resident runs.
+    assert.equal(current.runs['run-authority-hydrate'], undefined, 'the legacy runs key is not used; the runs come from the log')
     assert.equal(current.progress[href].status, 'queued')
     // Hydrate decodes the events with the rest of the state (they are not mirrored, so they come from the one full read).
     assert.deepEqual(current.events, [], 'events are not held in the authority; they are in the flight recorder')
@@ -18740,52 +17935,47 @@ test('dashboard queue view refresh never writes mbCoordinatorQueueView to storag
     assert.equal(storage.mbCoordinatorQueueView, undefined)
 })
 
-test('dashboard queue view refresh omits terminal rows whose runs were already pruned', async () => {
+test('dashboard queue view refresh omits an archived terminal row whose run is no longer known', async () => {
+    // Runs are worked out from the queue rows, so a live row always has its run. The completed-work log keeps the rows that were
+    // archived, and the view keeps one of those only when its run is still known. This row's run is in neither the queue nor the runs.
     const staleHref = 'https://www.quora.com/profile/Synthetic-Compact-Stale-Run-Terminal'
     const liveHref = 'https://www.quora.com/profile/Synthetic-Compact-Live-Run-Terminal'
     const pendingHref = 'https://www.quora.com/profile/Synthetic-Compact-Missing-Run-Pending'
-    const liveRunId = 'run-compact-live-terminal'
     const staleRunId = 'run-compact-stale-terminal'
+    const liveRunId = 'run-compact-live-terminal'
     const pendingRunId = 'run-compact-missing-pending'
     const {sw, storage} = loadServiceWorkerHarness({
         now: 2000,
         storage: {
-            mbCoordinatorQueue: {
-                [staleHref]: {
-                    ...makeQueuedCoordinatorRow({
-                        href: staleHref,
-                        runId: staleRunId,
-                        attemptId: 'attempt-compact-stale-terminal',
-                        now: 1000
-                    }),
-                    status: 'succeeded',
-                    outcome: 'blocked',
-                    terminalAt: 1500,
-                    updatedAt: 1500
+            mbCoordinatorPaused: false,
+            ...makeCompletedWalStoragePayload({
+                queue: {
+                    [liveHref]: {
+                        ...makeQueuedCoordinatorRow({
+                            href: liveHref,
+                            runId: liveRunId,
+                            attemptId: 'attempt-compact-live-terminal',
+                            now: 1001
+                        }),
+                        status: 'failed',
+                        outcome: 'timeout',
+                        error: 'Queued tab active transition failed after exhausting retry budget',
+                        terminalAt: 1600,
+                        updatedAt: 1600
+                    },
+                    [pendingHref]: makeQueuedCoordinatorRow({
+                        href: pendingHref,
+                        runId: pendingRunId,
+                        attemptId: 'attempt-compact-missing-pending',
+                        now: 1002
+                    })
                 },
-                [liveHref]: {
-                    ...makeQueuedCoordinatorRow({
-                        href: liveHref,
-                        runId: liveRunId,
-                        attemptId: 'attempt-compact-live-terminal',
-                        now: 1001
-                    }),
-                    status: 'failed',
-                    outcome: 'timeout',
-                    error: 'Queued tab active transition failed after exhausting retry budget',
-                    terminalAt: 1600,
-                    updatedAt: 1600
-                },
-                [pendingHref]: makeQueuedCoordinatorRow({
-                    href: pendingHref,
-                    runId: pendingRunId,
-                    attemptId: 'attempt-compact-missing-pending',
-                    now: 1002
-                })
-            },
-            mbCoordinatorRuns: {
-                [liveRunId]: makeCoordinatorRun({href: liveHref, runId: liveRunId})
-            }
+                completed: {
+                    [staleHref]: makeArchivedCoordinatorRow({href: staleHref, runId: staleRunId, attemptId: 'attempt-compact-stale-terminal', terminalAt: 1500})
+                }
+            }),
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
         }
     })
 
@@ -23304,76 +22494,6 @@ test('enqueue WAL append failure does not reset active owned tab', async () => {
     assert.equal(storage.mbCoordinatorRuns[nextRunId], undefined)
 })
 
-test('enqueue derived save failure keeps WAL row durable and reconcile materializes derived state', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Derived-Failure'
-    const runId = 'run-enqueue-derived-failure'
-    const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, sw, storage, timers} = loadServiceWorkerHarness({
-        now: 3075,
-        storage: {
-            mbCoordinatorPaused: true,
-            mbCoordinatorQueue: {},
-            mbCoordinatorRuns: {},
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {}
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && !isCoordinatorQueueWalPayload(payload)) {
-            throw new Error('synthetic enqueue derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
-        href,
-        runId,
-        execute: {
-            tabAction: 'nuke',
-            maxConcurrent: 1,
-            noForegroundFallback: true
-        }
-    }), sourceSender)
-
-    assert.equal(enqueue.queued, 1)
-    assert.equal(enqueue.durable, true)
-    assert.equal(enqueue.derivedSaved, false)
-    assert.equal(storage.mbCoordinatorQueue?.[href], undefined)
-    assert.notEqual(getRecoveredCoordinatorQueue(storage)[href].status, 'active')
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href].runId, runId)
-    assert.equal(storage.mbCoordinatorRuns?.[runId], undefined)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
-    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
-    browser.storage.local.set = originalSet
-    const getDefaults = []
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
-    browser.storage.local.get = async defaults => {
-        getDefaults.push(defaults)
-        return originalGet(defaults)
-    }
-
-    const reconcile = await sw.reconcileCoordinatorStorage()
-
-    assert.ok(reconcile.materialized > 0)
-    assert.equal(reconcile.runsChanged, true)
-    assert.equal(reconcile.progressChanged, false)
-    assert.equal(reconcile.eventsChanged, false, 'the materialization diagnostic goes to the flight recorder; no stored change')
-    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
-    assert.equal(storage.mbCoordinatorRuns[runId].targetWorkKeys.includes(href), true)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgressView.records[href].runId, runId)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, getRecoveredCoordinatorQueue(storage)[href].attemptId)
-    assert.ok(sw.getFlightRecorderSnapshot({kind: 'materialize', limit: 50}).entries.some(entry => entry.runId === runId && entry.reason === 'enqueue-derived-materialization'), 'the materialization is in the flight recorder')
-    // The enqueue hydrated the authority, so the reconcile answers from the resident state (P2): it reads no coordinator,
-    // progress or space key from storage. Metric reads are not coordinator state and are not part of this check.
-    const coordinatorStateReads = getDefaults.filter(defaults => Object.keys(defaults || {}).some(key =>
-        key.startsWith('mbCoordinator') || key.startsWith(LEGACY_PROGRESS_PREFIX) || key.startsWith('mbSpace')
-    ))
-    assert.deepEqual(coordinatorStateReads, [])
-})
-
 test('reconcile does not materialize projection-only queued progress as queue authority', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Projection-Only-Queued-Materialize'
     const runId = 'run-projection-only-queued-materialize'
@@ -23506,145 +22626,6 @@ test('stored-work reconcile terminal raw row updates WAL authority', async () =>
         record.operationKind === 'reconcile-progress' &&
         record.status === 'failed'
     ), true)
-})
-
-test('enqueue progress projection failure does not poison durable WAL acknowledgement', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Projection-Failure'
-    const runId = 'run-enqueue-projection-failure'
-    const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, sw, storage} = loadServiceWorkerHarness({
-        now: 3080,
-        storage: {
-            mbCoordinatorPaused: true,
-            mbCoordinatorQueue: {},
-            mbCoordinatorRuns: {},
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {}
-        }
-    })
-    const originalSet = browser.storage.session.set.bind(browser.storage.session)
-    browser.storage.session.set = async payload => {
-        if(payload?.mbProfileNukeProgressView ||
-            Object.keys(payload || {}).some(key => key.startsWith('mbProfileNukeProgressShard.'))) {
-            throw new Error('synthetic enqueue projection failure')
-        }
-        return originalSet(payload)
-    }
-
-    const enqueue = await browser.runtime.sendMessage(makeCoordinatorEnqueue({
-        href,
-        runId,
-        execute: {
-            tabAction: 'nuke',
-            maxConcurrent: 1,
-            noForegroundFallback: true
-        }
-    }), sourceSender)
-
-    assert.equal(enqueue.queued, 1)
-    assert.equal(enqueue.durable, true)
-    assert.equal(enqueue.derivedSaved, false)
-    assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'queued')
-    assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY]?.[href], undefined)
-    assert.equal(storage.mbProfileNukeProgressView, undefined)
-    assert.equal(getProgressShardRecord(storage, href), null)
-    assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
-})
-
-test('enqueue resetExisting derived save failure reconcile replaces stale progress attempt', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Enqueue-Reset-Derived-Failure'
-    const oldRunId = 'run-enqueue-reset-derived-old'
-    const nextRunId = 'run-enqueue-reset-derived-next'
-    const oldAttemptId = 'attempt-enqueue-reset-derived-old'
-    const sourceSender = {tab: {id: 12, windowId: 1}}
-    const {browser, sw, storage} = loadServiceWorkerHarness({
-        now: 3090,
-        storage: {
-            mbCoordinatorPaused: true,
-            mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({href, runId: oldRunId, attemptId: oldAttemptId, tabId: 791, now: 3090})
-            },
-            mbCoordinatorRuns: {
-                [oldRunId]: makeCoordinatorRun({href, runId: oldRunId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'tab-opened',
-                    runId: oldRunId,
-                    tabId: 791,
-                    actionKind: 'mute-block',
-                    attemptId: oldAttemptId,
-                    attemptNumber: 1,
-                    blockAttempted: true,
-                    blockSucceeded: false,
-                    updatedAt: 3080
-                }
-            }
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbCoordinatorRuns && !isCoordinatorQueueWalPayload(payload)) {
-            throw new Error('synthetic reset enqueue derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const enqueue = await browser.runtime.sendMessage({
-        action: 'enqueue-coordinator-items',
-        run: {
-            id: nextRunId,
-            sourceType: 'space-feed',
-            resetExisting: true
-        },
-        source: {
-            type: 'space-feed',
-            pageUrl: 'https://www.quora.com/space/example'
-        },
-        execute: {
-            tabAction: 'nuke',
-            maxConcurrent: 1,
-            noForegroundFallback: true
-        },
-        items: [{
-            targetProfileHref: href,
-            requestedUrl: href,
-            dedupeKey: href,
-            resetExisting: true
-        }]
-    }, sourceSender)
-
-    assert.equal(enqueue.merged, 1)
-    assert.equal(enqueue.durable, true)
-    assert.equal(enqueue.derivedSaved, false)
-    const walRow = getRecoveredCoordinatorQueue(storage)[href]
-    assert.equal(walRow.status, 'queued')
-    assert.equal(walRow.runId, nextRunId)
-    assert.notEqual(walRow.attemptId, oldAttemptId)
-    assert.equal(walRow.attemptNumber, 2)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opened')
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].runId, oldRunId)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, oldAttemptId)
-    browser.storage.local.set = originalSet
-
-    const reconcile = await sw.reconcileCoordinatorStorage()
-
-    assert.ok(reconcile.materialized > 0)
-    assert.equal(reconcile.progressChanged, false)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'tab-opened')
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].runId, oldRunId)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].attemptId, oldAttemptId)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'queued')
-    assert.equal(storage.mbProfileNukeProgressView.records[href].runId, nextRunId)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptId, walRow.attemptId)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].attemptNumber, walRow.attemptNumber)
-    assert.equal(storage.mbProfileNukeProgressView.records[href].tabId, null)
-    assert.notEqual(storage.mbProfileNukeProgressView.records[href].blockAttempted, true)
-    assert.equal(storage.mbCoordinatorRuns[nextRunId].targetProfileHrefs.includes(href), true)
-    assert.ok(sw.getFlightRecorderSnapshot({kind: 'materialize', limit: 50}).entries.some(entry => entry.runId === nextRunId && entry.reason === 'enqueue-derived-materialization'), true, 'the materialization is in the flight recorder')
 })
 
 test('executable enqueue preserves explicit pause and does not open worker tabs', async () => {
@@ -40305,9 +39286,9 @@ test('change-only write keeps a runs change made during a slow WAL write', async
     await walWriteStarted.promise
 
     // A runs change made while the WAL write is still in flight goes through the door as well. It queues behind that write,
-    // and the change-only write does not carry runs, so the runs value must survive the write.
+    // and the change-only write does not carry runs, so the runs change must survive the write. paused is a persisted run field.
     const absorbedRuns = {
-        [runId]: {...makeCoordinatorRun({href: hrefA, runId}), absorbedDuringWrite: true}
+        [runId]: {...makeCoordinatorRun({href: hrefA, runId}), paused: true}
     }
     const runsWrite = sw.coordinatorAuthority.persistCoordinator({
         stored: {mbCoordinatorRuns: absorbedRuns}
@@ -40321,7 +39302,13 @@ test('change-only write keeps a runs change made during a slow WAL write', async
     browser.storage.local.set = originalSet
 
     assert.equal(persistence.saved, true, 'expected the change-only write to be saved')
-    assert.equal(JSON.stringify(sw.coordinatorAuthority.current().runs), JSON.stringify(absorbedRuns), 'expected the absorbed runs to survive the write')
+    // The runs are the persisted fields of the absorbed run, with counts and targets worked out from both queue rows.
+    const residentRuns = sw.coordinatorAuthority.current().runs
+    assert.equal(residentRuns[runId].paused, true, 'expected the absorbed runs change to survive the write')
+    assert.deepEqual([...residentRuns[runId].targetProfileHrefs].sort(), [hrefA, hrefB].sort(), 'expected the run to carry both rows')
+    const freshRuns = loadServiceWorkerHarness({now: 5000, storage: JSON.parse(JSON.stringify(storage))})
+    await freshRuns.sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(plainCopy(residentRuns), plainCopy(freshRuns.sw.coordinatorAuthority.current().runs), 'the resident runs equal a fresh decode')
     assert.equal(JSON.stringify(sw.coordinatorAuthority.current().queue[hrefB]), JSON.stringify(rowB), 'expected the changed row to be resident after the write')
     assert.ok(sw.coordinatorAuthority.current().queue[hrefA], 'expected the untouched row to stay resident')
     assert.equal(getRecoveredCoordinatorQueue(storage)[hrefB]?.status, 'queued', 'expected the changed row to be durable')
@@ -44458,7 +43445,8 @@ function buildListFixture() {
             activeAt: terminalAt - 25000, terminalAt
         }))
     }
-    // Finished rows of a run that is not in the runs map: a terminal row of an unknown run is dropped from the compact population.
+    // Finished rows of a run that is not in the runs map. A live queue row carries LIST_FIXTURE_UNKNOWN_RUN, so the run is known
+    // (runs are worked out from the queue rows) and these rows stay in the population (owner decision, 24 Oct: option 1).
     for(let index = 0; index < 10; index += 1) {
         addRow(completed, makeListFixtureRow({
             href: listFixtureHref('gone', index), runId: LIST_FIXTURE_UNKNOWN_RUN, status: 'succeeded', outcome: 'blocked',
@@ -44552,6 +43540,8 @@ function loadListPageHarness() {
             if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './spaceMapStorage'].includes(name)) {
                 return sharedModule(name.slice(2))
             }
+            // The dashboard's footer bar is built by this module; the list-page harness does not draw it.
+            if(name === './queueProgressBar') return {createQueueProgressBar: () => ({bar: {style: {}}, setProgress() {}})}
             throw new Error(`unexpected require in coordinator.js: ${name}`)
         },
         document: {
@@ -44583,8 +43573,8 @@ function loadListPageHarness() {
 
 // LIST_GOLDEN_BEGIN
 // Golden values captured from the tree before the list change, by the same helper block (scratchpad golden-list-before.json).
-const LIST_GOLDEN_TOTAL = 309
-const LIST_GOLDEN_COUNTS = {"active":10,"queued":76,"failed":90,"succeeded":113,"canceled":20}
+const LIST_GOLDEN_TOTAL = 319
+const LIST_GOLDEN_COUNTS = {"active":10,"queued":76,"failed":90,"succeeded":123,"canceled":20}
 const LIST_GOLDEN_AUTHORITATIVE_COUNTS = {"active":10,"queued":76}
 const LIST_GOLDEN_LIVE_KEYS = [
     "https://www.quora.com/profile/List-active-9",
@@ -45324,7 +44314,56 @@ test('a reset of a live executor-start head is counted at the phase its enqueue 
     assert.equal(delta('pump.executorStartSupersededFirstTab'), 0)
 })
 
-;(async () => {
+;// Erase block history (the last-gasp reset). The history goes; the preferences stay; the erase is refused unless the queue is paused,
+// and a wrong confirmation is refused before anything else is read.
+test('erase everything removes every stored key, preferences and spaces included, and needs the ERASE phrase', async () => {
+    const harness = loadServiceWorkerHarness({now: 600000, storage: {
+        mbCoordinatorPaused: true,
+        mbCoordinatorRuns: {'run-1': {id: 'run-1'}},
+        mbProfileNukeProgressView: {'https://www.quora.com/profile/A': {status: 'blocked'}},
+        nukedPostRetentionDays: 7,
+        mbSpaceRegistry: {'space-a': {name: 'A'}}
+    }})
+    await harness.sw.coordinatorAuthority.hydrate()
+    const send = request => harness.browser.runtime.sendMessage(request)
+    const mismatch = await send({action: 'erase-block-history', confirmation: 'yes'})
+    assert.equal(mismatch.erased, false)
+    assert.equal(mismatch.reason, 'confirmation-mismatch')
+    const scheduled = await send({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    // The erase runs at the next start, before the authority loads: a restart with the same storage does it.
+    const restarted = loadServiceWorkerHarness({now: 600010, storage: harness.storage})
+    const hydrating = restarted.sw.coordinatorAuthority.hydrate()
+    await restarted.timers.tick(1000)
+    await hydrating
+    assert.equal(restarted.storage.mbProfileNukeProgressView, undefined)
+    assert.equal(restarted.storage.mbCoordinatorRuns, undefined)
+    assert.equal(restarted.storage.mbCoordinatorPaused, undefined)
+    assert.equal(restarted.storage.mbEraseBlockHistoryPending, undefined, 'the marker is cleared last')
+    assert.equal(restarted.storage.nukedPostRetentionDays, undefined, 'the preferences are erased too')
+    assert.equal(restarted.storage.mbSpaceRegistry, undefined, 'the spaces are erased too')
+    assert.equal(restarted.storage.mbEraseBlockHistoryPending, undefined, 'the marker is cleared')
+})
+
+test('erase everything forces a pause first when the queue is running, then erases the stored history', async () => {
+    const harness = loadServiceWorkerHarness({now: 600000, storage: {
+        mbCoordinatorRuns: {'run-1': {id: 'run-1'}},
+        mbProfileNukeProgressView: {'https://www.quora.com/profile/A': {status: 'blocked'}}
+    }})
+    await harness.sw.coordinatorAuthority.hydrate()
+    // Owner, 24 Oct: the queue is not paused here. The erase pauses it itself and does not refuse.
+    const scheduled = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    const restarted = loadServiceWorkerHarness({now: 600010, storage: harness.storage})
+    const hydrating = restarted.sw.coordinatorAuthority.hydrate()
+    await restarted.timers.tick(1000)
+    await hydrating
+    assert.equal(restarted.storage.mbCoordinatorRuns, undefined)
+    assert.equal(restarted.storage.mbProfileNukeProgressView, undefined)
+    assert.equal(restarted.storage.mbEraseBlockHistoryPending, undefined, 'the marker is cleared last')
+})
+;
+(async () => {
     let failed = 0
     const listOnly = process.argv.includes('--list')
     if(listOnly) {

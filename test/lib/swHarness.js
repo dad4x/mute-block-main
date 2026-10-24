@@ -166,6 +166,8 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
     function makeStorageArea(targetStorage, areaName = 'local') {
         return {
             async get(defaults = {}) {
+                // get(null) reads every key, as chrome.storage does.
+                if(defaults === null) return clone(targetStorage)
                 if(typeof defaults === 'string') {
                     return {[defaults]: clone(targetStorage[defaults])}
                 }
@@ -189,6 +191,9 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
                     await storageOnChanged.emit(changes, areaName)
                 }
             },
+            async clear() {
+                for(const key of Object.keys(targetStorage)) delete targetStorage[key]
+            },
             async remove(keys) {
                 const list = Array.isArray(keys) ? keys : [keys]
                 const changes = {}
@@ -199,7 +204,8 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
                     }
                     delete targetStorage[key]
                 }
-                await storageOnChanged.emit(changes, areaName)
+                // As in the browser, a remove resolves without waiting for the change listeners.
+                void storageOnChanged.emit(changes, areaName)
             }
         }
     }

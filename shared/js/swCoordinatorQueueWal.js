@@ -378,7 +378,11 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         if(!baseCompleted || typeof baseCompleted !== 'object' || Array.isArray(baseCompleted)) return null
         const records = (append.records || []).map(makeWalRecord)
         if(!records.length) return null
-        if(records.some(record => record.area !== 'queue' && record.area !== 'completed')) return null
+        // Run records (area 'runs', 24 Oct) are checked here only when the caller gives the base runs; otherwise the full replay checks them.
+        const touchesRuns = records.some(record => record.area === 'runs')
+        const baseRuns = options.baseRuns || null
+        if(touchesRuns && (!baseRuns || typeof baseRuns !== 'object' || Array.isArray(baseRuns))) return null
+        if(records.some(record => record.area !== 'queue' && record.area !== 'completed' && record.area !== 'runs')) return null
         const touchesCompleted = records.some(record => record.area === 'completed')
         const nextSeq = Number.parseInt(append.store?.meta?.nextSeq, 10) || 0
         const firstSeq = nextSeq - records.length
@@ -400,6 +404,10 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
             state.completed = {...baseCompleted}
             ownedAreas.add('completed')
         }
+        if(touchesRuns) {
+            state.runs = {...baseRuns}
+            ownedAreas.add('runs')
+        }
         const ignored = []
         for(const record of ordered) {
             const result = applyWalRecord(state, record, {snapshotSeq: 0, appliedIds, ownedAreas})
@@ -412,6 +420,7 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
             ignoredAppendedRecords: ignored,
             authoritativeProjectionQueue: state.queue,
             authoritativeProjectionCompleted: touchesCompleted ? state.completed : null,
+            authoritativeProjectionRuns: touchesRuns ? state.runs : null,
             reason: ignored[0]?.reason || '',
             incremental: true
         }

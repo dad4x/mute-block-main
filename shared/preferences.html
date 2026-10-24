@@ -128,6 +128,22 @@
 
             <div class="space-list" id="spaceList"></div>
         </section>
+
+        <section class="section section-danger">
+            <div class="label">Erase Everything</div>
+            <div class="hint danger-warning">
+                This permanently deletes everything the extension has stored: the record of every profile blocked, the queue, the run history, the statistics, the outlier list, your preferences and your categorized spaces. The extension then starts as a fresh install, and it will act on every profile it has blocked before. Do not use this routinely. Use it only before a clean reinstall or to start over.
+            </div>
+            <div class="hint">Pause the Queue on the Dashboard first. The erase is refused while any work is running. The extension reloads, which stops its background worker, once the erase is scheduled.</div>
+            <div class="field">
+                <label class="label" for="eraseConfirm">Type ERASE to confirm</label>
+                <input class="input" id="eraseConfirm" type="text" autocomplete="off">
+            </div>
+            <div class="actions">
+                <button class="button button-danger" id="eraseBlockHistoryButton" type="button">Erase everything</button>
+            </div>
+            <div class="status" id="eraseStatus" hidden></div>
+        </section>
     </main>
 
     <script src="js/preferences.js"></script>

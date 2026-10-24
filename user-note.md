@@ -6,6 +6,41 @@ Canonical planning now starts at [planning.md](planning.md). Canonical
 architecture starts at [architecture.md](architecture.md). Move any planning
 implication from this note into `planning.md` before treating it as active work.
 
+Sections are dated where it matters. Older sections record intent at the time
+they were written and are not gospel. Where sections conflict, the newest one
+wins.
+
+## Profile Search While Work Is Pending (2026-10-10)
+
+Status: current intent. Not implemented. Supersedes the search-page parts of
+the older notes below.
+
+On a profile search page, work already queued for that search must not lock the
+page's own controls.
+
+- `Collect 100 More` stays visible and enabled while earlier profiles from the
+  same search are still pending. Its label does not change to
+  `Nuking N left`.
+- `Nuke 'Em N` stays enabled whenever there are new queueable profiles on the
+  page. It queues only profiles that are not already pending, so it never
+  double-queues.
+- Work already running is still shown, as a separate status such as
+  `67 working for "elon musk"`. It is not shown as the collect button's label
+  or as a disabled state.
+- Per-row Mute-Block buttons keep working alongside all of this, as they
+  already do.
+- Queueing more while earlier work runs is intended. A new batch joins the
+  same run. It does not replace or restart the run.
+
+**Why:** The pending gate treated "some work is running for this search" as
+"the toolbar is unsafe". The per-profile checks already prevent duplicates, so
+the gate blocked useful work without adding safety. Showing `Nuking N left` on
+the collect button kept progress visible but took the action away.
+
+**Decided (2026-10-11):** no Stop control on search pages. The pause behavior
+in the next section was written for the working Nuking button on other pages
+and does not apply here.
+
 ## Pause And Canceled Work
 
 In the Dashboard, `canceled` means the extension stopped queued work because

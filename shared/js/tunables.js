@@ -73,6 +73,34 @@ module.exports = {
     RUNS_GAP_WATCH_INTERVAL_MS: 30000,
     // Wait between reads of the profile menu for its block or unblock item, in ms (the page script). The first read is at once. A fixed
     // 500 ms was measured against an escalating schedule (22 Oct): no difference in blocks, handoff or gaps, so the simpler fixed wait stays.
-    PROFILE_MENU_POLL_INTERVAL_MS: 500
+    PROFILE_MENU_POLL_INTERVAL_MS: 500,
+    // Space page: how long to wait before asking the worker again for profiles it has not answered, after a reply timed out or failed.
+    SPACE_FEED_STATE_RETRY_MS: 1500,
+    // Polling: how often the Quora page asks the worker for the queue bar summary, and for the space page's state while a nuke is pending.
+    CONTENT_PROGRESS_BAR_POLL_MS: 3000,
+    SPACE_FEED_STATE_POLL_MS: 5000,
+    // Dashboard: how often the throttle note is redrawn while Quora throttles the queue.
+    DASHBOARD_THROTTLE_NOTE_REFRESH_MS: 1000,
+    // Dashboard flight recorder card (dev mode only): how often it asks the worker for new events while it is expanded, and how many rows it keeps.
+    FLIGHT_RECORDER_CARD_POLL_MS: 1000,
+    FLIGHT_RECORDER_CARD_ROW_LIMIT: 200,
+    // The owned nuke status is reused for this long before the page asks the worker again.
+    OWNED_NUKE_STATUS_TTL_MS: 2000,
+    // The space page's redraw waits at most this long for the owned status. A slower answer lands in the cache for the next redraw.
+    OWNED_NUKE_STATUS_WAIT_MS: 150,
+    // Space page renders: at least this long between renders driven by scrolling and page changes.
+    SPACE_FEED_RENDER_MIN_GAP_MS: 200,
+    // Space page: how long the profile-link card scan is reused, unless the page's structure changes first.
+    SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS: 1000,
+    // Space page: the whole feed is searched for profile links at most this often. Between searches the links are kept up to date from the page's added nodes.
+    SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS: 10000,
+    // Space page: how long the feed's content root is reused before it is worked out again.
+    SPACE_FEED_CONTENT_ROOT_MEMO_MS: 2000,
+    // Space page: a redraw reuses the last scan of the feed for at most this long, and while the view moves less than the band (down, up).
+    SPACE_FEED_SCAN_REUSE_MS: 10000,
+    SPACE_FEED_SCAN_BAND_DOWN_PX: 1000,
+    SPACE_FEED_SCAN_BAND_UP_PX: 200,
+    // Space page: how long the page-wide render model is reused while the same posts are on the page.
+    SPACE_FEED_RENDER_MODEL_MEMO_MS: 300
 }
 

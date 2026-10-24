@@ -20,7 +20,8 @@ const {
 } = require('./nukedPosts')
 const {readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT} = require('./tunables')
+const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     COORDINATOR_PAUSED_KEY,
@@ -188,11 +189,29 @@ async function clearHistory() {
 // sections stayed shown simultaneously regardless of hash. Confirmed live
 // 2026-09-29 (screenshot): the worker bar and the history header both
 // rendered stacked on top of the plain dashboard.
+// The dashboard's footer bar is built by the same function as the page's progress bar (queueProgressBar.js), so the two look the same.
+let dashboardBottomBarProgress = null
+
+function installDashboardBottomBar() {
+    if(dashboardBottomBarProgress) return
+    dashboardBottomBarProgress = createQueueProgressBar({
+        barId: 'dashboardBottomBar',
+        iconSrc: 'icons/32.png',
+        interactive: true,
+        logoTitle: 'Open dashboard',
+        onLogoClick: () => { void openDashboardFromBottomBar() }
+    })
+    // The bar sets its own display style, which would override the hidden attribute, so it is shown and hidden through that style.
+    dashboardBottomBarProgress.bar.style.display = 'none'
+    document.body.appendChild(dashboardBottomBarProgress.bar)
+}
+
 function applyCoordinatorViewMode() {
+    installDashboardBottomBar()
     const dashboardView = document.getElementById('dashboardView')
     const workerBarView = document.getElementById('workerBarView')
     const historyView = document.getElementById('historyView')
-    const dashboardBottomBar = document.getElementById('dashboardBottomBar')
+    const dashboardBottomBar = dashboardBottomBarProgress?.bar || null
     const isWorkerBar = isQueuedWorkerActionSurfacePage()
     const isHistory = isCoordinatorHistoryPage()
 
@@ -201,7 +220,7 @@ function applyCoordinatorViewMode() {
     if(historyView) historyView.hidden = !isHistory
     // Only the plain dashboard gets the footer bar -- the worker window has
     // its own equivalent (.worker-bar) and History is just a short list.
-    if(dashboardBottomBar) dashboardBottomBar.hidden = isWorkerBar || isHistory
+    if(dashboardBottomBar) dashboardBottomBar.style.display = isWorkerBar || isHistory ? 'none' : 'flex'
 }
 
 async function initHistoryPage() {
@@ -268,9 +287,6 @@ async function init() {
 
     const manifest = browser.runtime.getManifest()
     document.getElementById('appVersion').textContent = `v${manifest.version}`
-    document.getElementById('dashboardBottomBarLogo')?.addEventListener('click', () => {
-        void openDashboardFromBottomBar()
-    })
     document.getElementById('clearEventsButton')?.addEventListener('click', () => {
         void clearEvents()
     })
@@ -588,6 +604,7 @@ function applyDevModeVisibility(enabled) {
         panel.hidden = !enabled
     })
     syncDebugRunStatusTimer(enabled)
+    syncFlightRecorderPollTimer()
 }
 
 // The run-status poll asks the worker every second, so it runs only while dev mode is on. Every dev-mode change reaches
@@ -600,6 +617,75 @@ function syncDebugRunStatusTimer(enabled) {
         clearInterval(debugRunStatusTimer)
         debugRunStatusTimer = null
     }
+}
+
+// Flight recorder card (dev mode only, collapsed by default). While it is expanded it asks the worker for the events newer than the last one
+// shown, every FLIGHT_RECORDER_CARD_POLL_MS. Collapsing it or turning dev mode off stops the poll.
+let flightRecorderPollTimer = null
+let flightRecorderLastSeq = 0
+let flightRecorderRows = []
+let flightRecorderRenderedKey = ''
+
+function isFlightRecorderCardExpanded() {
+    const list = document.getElementById('flightRecorderList')
+    return !!list && !list.hidden
+}
+
+function syncFlightRecorderPollTimer() {
+    const shouldPoll = isDevModeStoredEnabled() && isFlightRecorderCardExpanded()
+    if(shouldPoll && flightRecorderPollTimer === null) {
+        flightRecorderPollTimer = setInterval(() => { void refreshFlightRecorderCard() }, FLIGHT_RECORDER_CARD_POLL_MS)
+        void refreshFlightRecorderCard()
+    }
+    else if(!shouldPoll && flightRecorderPollTimer !== null) {
+        clearInterval(flightRecorderPollTimer)
+        flightRecorderPollTimer = null
+    }
+}
+
+async function refreshFlightRecorderCard() {
+    if(!isDevModeStoredEnabled() || !isFlightRecorderCardExpanded()) return
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'get-flight-recorder',
+        limit: FLIGHT_RECORDER_CARD_ROW_LIMIT,
+        sinceSeq: flightRecorderLastSeq
+    }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(!result || !Array.isArray(result.entries)) return
+    // The worker's sequence starts again after a worker restart, so the rows shown before it no longer continue. The next poll starts from the beginning.
+    if((Number(result.newestSeq) || 0) < flightRecorderLastSeq) {
+        flightRecorderLastSeq = 0
+        flightRecorderRows = []
+        flightRecorderRenderedKey = ''
+        return
+    }
+    flightRecorderLastSeq = Number(result.newestSeq) || flightRecorderLastSeq
+    if(result.entries.length) {
+        flightRecorderRows = [...result.entries].reverse().concat(flightRecorderRows).slice(0, FLIGHT_RECORDER_CARD_ROW_LIMIT)
+    }
+    renderFlightRecorderCard()
+}
+
+function renderFlightRecorderCard() {
+    const countEl = document.getElementById('flightRecorderCount')
+    const container = document.getElementById('flightRecorderList')
+    if(!container) return
+    if(countEl) countEl.textContent = `${flightRecorderRows.length} events`
+    // Redrawn only when a new event arrived, so an idle recorder costs one small reply a second.
+    const key = `${flightRecorderLastSeq}|${flightRecorderRows.length}`
+    if(key === flightRecorderRenderedKey) return
+    flightRecorderRenderedKey = key
+    replaceChildren(container, flightRecorderRows.map(entry => {
+        const row = document.createElement('div')
+        row.className = 'row row--event'
+        const message = `${entry.message || ''}`
+        row.append(
+            buildTitleCell(message || `${entry.kind || 'event'}`, `${entry.channel || ''}`, {title: `${entry.rowKey || entry.runId || ''}`}),
+            buildBadge(`${entry.kind || 'event'}`),
+            buildTextCell(`#${entry.seq || 0}`),
+            buildTextCell(formatDateTime(entry.at))
+        )
+        return row
+    }), 'No flight recorder events yet.')
 }
 
 // Countdown for a dev-mode run limit. Only asks the worker while dev mode is on.
@@ -646,12 +732,15 @@ function installPanelToggleListeners() {
             const panel = target.closest('.panel')
             button.setAttribute('aria-expanded', nextExpanded ? 'true' : 'false')
             button.textContent = nextExpanded ? 'v' : '>'
-            const panelLabel = targetId === 'queueList' ? 'Current Work' : targetId.replace(/List$/, '')
+            const panelLabel = targetId === 'queueList' ? 'Current Work'
+                : targetId === 'flightRecorderList' ? 'Flight recorder'
+                : targetId.replace(/List$/, '')
             button.setAttribute('aria-label', `${nextExpanded ? 'Collapse' : 'Expand'} ${panelLabel}`)
             target.hidden = !nextExpanded
             if(panel) {
                 panel.classList.toggle('panel--collapsed', !nextExpanded)
             }
+            if(targetId === 'flightRecorderList') syncFlightRecorderPollTimer()
         })
     })
 }
@@ -1076,11 +1165,11 @@ function renderWorkerBar() {
 function renderDashboardBottomBar(queueItems = []) {
     const total = getQueueTotalCount(queueItems)
     const terminal = getQueueTerminalCount(queueItems)
-    const fill = document.getElementById('dashboardBottomBarFill')
-    const count = document.getElementById('dashboardBottomBarCount')
-
-    if(fill) fill.style.width = `${total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0}%`
-    if(count) count.textContent = `${terminal} / ${total}`
+    installDashboardBottomBar()
+    dashboardBottomBarProgress.setProgress(
+        total > 0 ? Math.min(100, Math.round((terminal / total) * 100)) : 0,
+        `${terminal} / ${total}`
+    )
 }
 
 // The bottom-bar logo is a "jump to the real dashboard" shortcut, meant to
@@ -1172,8 +1261,29 @@ function render() {
     setText('secondsPerAlreadyBlocked', formatSecondsPerBlock(secondsPerAlreadyBlocked))
     setText('activationHandoffSeconds', formatSecondsPerBlock(activationHandoff))
     const blockOutcomeCounts = getBlockOutcomeCounts()
-    setText('reallyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.reallyBlockedCount, blockOutcomeCounts.total))
-    setText('alreadyBlockedCount', formatBlockOutcomeCount(blockOutcomeCounts.alreadyBlockedCount, blockOutcomeCounts.total))
+    const finishedOutcomes = state.queueView?.finishedWork?.outcomes || null
+    // The blocked cards read the same finished rows as the skipped and failed cards, so the four add up to the terminal total.
+    // The epoch counters are used only when no finished rows have been summarised yet.
+    const reallyBlockedTotal = finishedOutcomes ? (Number.parseInt(finishedOutcomes.blocked, 10) || 0) : blockOutcomeCounts.reallyBlockedCount
+    const alreadyBlockedTotal = finishedOutcomes ? (Number.parseInt(finishedOutcomes.alreadyBlocked, 10) || 0) : blockOutcomeCounts.alreadyBlockedCount
+    const blockedAccounted = reallyBlockedTotal + alreadyBlockedTotal
+    setText('reallyBlockedCount', formatBlockOutcomeCount(reallyBlockedTotal, blockedAccounted))
+    setText('alreadyBlockedCount', formatBlockOutcomeCount(alreadyBlockedTotal, blockedAccounted))
+    const skippedByOutcome = finishedOutcomes?.skipped || {}
+    const skippedTotal = Object.values(skippedByOutcome).reduce((sum, n) => sum + (Number.parseInt(n, 10) || 0), 0)
+    setText('skippedCount', finishedOutcomes ? skippedTotal : '--')
+    setText('skippedDetail', finishedOutcomes
+        ? Object.entries(skippedByOutcome).map(([outcome, n]) => outcome + ' ' + n).join(', ') || 'none'
+        : 'no finished rows yet')
+    setText('failedCount', finishedOutcomes ? (Number.parseInt(finishedOutcomes.failed, 10) || 0) : '--')
+    const finishedDurations = state.queueView?.finishedWork?.durations || null
+    const averageSeconds = bucket => {
+        const count = Number.parseInt(bucket?.count, 10) || 0
+        return count ? formatSecondsPerBlock({seconds: ((Number.parseInt(bucket.totalMs, 10) || 0) / count) / 1000}) : '--'
+    }
+    const skippedDurationBucket = finishedDurations?.skipped || null
+    setText('secondsPerSkipped', averageSeconds(skippedDurationBucket))
+    setText('secondsPerError', averageSeconds(finishedDurations?.failed || null))
     setText('reallyBlockedDuration', formatBlockOutcomeDuration(
         blockOutcomeCounts.reallyBlockedDurationSampleCount,
         blockOutcomeCounts.reallyBlockedTotalDurationMs,
@@ -1192,6 +1302,8 @@ function render() {
     const queueTotalCount = getQueueTotalCount(queueItems)
     setText('queueCount', `${queueTotalCount} job${queueTotalCount === 1 ? '' : 's'}${state.queueTruncated ? ` (${queueItems.length} shown)` : ''}`)
     setText('refreshState', getRefreshStateText())
+    // Owner, 24 Oct: while Quora is throttling the queue, the note is shown as a warning.
+    document.getElementById('refreshState')?.classList.toggle('status-pill--warn', getCurrentQueueLoadThrottle().active === true)
 
     renderRuns(runItems)
     renderEvents()
@@ -1250,9 +1362,8 @@ function formatCoordinatorEnqueueBreakdown(summary = null) {
         if(preFilter.unqueueable) noticeParts.push(`${preFilter.unqueueable} unresolvable`)
     }
 
-    const fromPart = rawWorkItems > requested
-        ? `${rawWorkItems} candidates, ${duplicates} duplicates, ${requested} unique`
-        : `${requested} candidates`
+    // The page has already de-duplicated the profiles, so the summary shows the unique count only.
+    const fromPart = `${requested} unique`
     return noticeParts.length
         ? `${fromPart} -> ${queued} new (${noticeParts.join(', ')})`
         : `${fromPart} -> ${queued} new`
@@ -2056,6 +2167,21 @@ function getRefreshStateText() {
     }
     return `Updated ${formatTime(Date.now())}`
 }
+
+// Owner, 24 Oct: the throttle countdown is redrawn every second while Quora throttles the queue, instead of only when new data arrives.
+// It also clears the warning colour once the throttle has ended.
+function refreshThrottleNote() {
+    const el = document.getElementById('refreshState')
+    if(!el) return
+
+    const throttled = getCurrentQueueLoadThrottle().active === true
+    if(!throttled && !el.classList.contains('status-pill--warn')) return
+
+    setText('refreshState', getRefreshStateText())
+    el.classList.toggle('status-pill--warn', throttled)
+}
+
+setInterval(refreshThrottleNote, DASHBOARD_THROTTLE_NOTE_REFRESH_MS)
 
 function getCurrentQueueLoadThrottle() {
     const metrics = state.metrics || {}

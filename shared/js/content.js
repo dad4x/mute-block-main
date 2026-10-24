@@ -14,7 +14,7 @@ catch {}
 
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
-const { BRAND_RED } = require('./colorTokens')
+const { createQueueProgressBar } = require('./queueProgressBar')
 const { QUEUE_BAR_GET_ACTION, QUEUE_BAR_PUSH_ACTION, getQueueBarDisplay } = require('./swQueueBarSummary')
 const { PROFILE_NUKE_PROGRESS_PUSH_ACTION } = require('./swProfileNukeProgressPush')
 const {
@@ -58,7 +58,7 @@ const {
     COORDINATOR_QUEUE_VIEW_KEY,
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
-const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS} = require('./tunables')
+const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
 const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
@@ -522,7 +522,10 @@ function getCurrentPageStateProfileHrefs(options = {}) {
         }
     }
 
-    return getNormalizedProfileHrefList(hrefs).slice(0, 250)
+    const list = getNormalizedProfileHrefList(hrefs)
+    // Owner, 23 Oct: on the space page the profiles the worker has not answered for go first, so more than 250 are answered over rounds.
+    if(page === 'space') list.sort((left, right) => Number(isSpaceFeedProfileStateReady(left)) - Number(isSpaceFeedProfileStateReady(right)))
+    return list.slice(0, 250)
 }
 
 function getProfileHrefScopeSignature(profileHrefs = []) {
@@ -606,6 +609,7 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
     }
 
     const stateRequestStartedAt = Date.now()
+    countSpaceQueryEvent(`stateRequest.${page}`)
     contentPageStateRefreshPromise = safeSendRuntimeMessageWithTimeout(request, null, 3000)
         .then(result => {
             recordSpaceMarkPerf('stateRoundTrip', {
@@ -614,17 +618,40 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
                 hrefs: profileHrefs.length,
                 page
             })
-            if(!result || typeof result !== 'object') return false
+            if(!result || typeof result !== 'object') {
+                // A timed-out or failed reply leaves this page's copy of the queue and progress as it was. Ask again after a short wait.
+                spaceFeedStateRefreshStatus.outcome = 'no-reply'
+                spaceFeedStateRefreshStatus.finishedAt = Date.now()
+                if(page === 'space') retrySpaceFeedStateLater(SPACE_FEED_STATE_RETRY_MS)
+                return false
+            }
+            spaceFeedStateRefreshStatus.outcome = 'ok'
+            spaceFeedStateRefreshStatus.finishedAt = Date.now()
+            spaceFeedStateRefreshStatus.requested = profileHrefs.length
+            spaceFeedStateRefreshStatus.records = Object.keys(result.profileNukeProgress || {}).length
+            // Owner, 23 Oct: one reply covers only the profiles asked about this round, so it is merged into the copy, not used to replace it.
+            // Rows from earlier rounds stay; the queue rows are keyed by item and are added over the copy.
             if(result.coordinatorQueue && typeof result.coordinatorQueue === 'object') {
-                coordinatorQueue = normalizeCoordinatorQueue(result.coordinatorQueue)
+                coordinatorQueue = {...coordinatorQueue, ...normalizeCoordinatorQueue(result.coordinatorQueue)}
                 coordinatorQueueLoaded = true
             }
             if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
-                profileNukeProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
+                // Progress is keyed by profile: the profiles asked about this round take the reply's records, and a profile with no record in the reply has none.
+                const repliedProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
+                const keptProgress = {...profileNukeProgress}
+                for(const href of profileHrefs) delete keptProgress[href]
+                profileNukeProgress = {...keptProgress, ...repliedProgress}
             }
             contentPageStateRefreshAt = Date.now()
             if(page === 'space') {
+                // Owner, 23 Oct: the worker has answered for every profile asked about. One with no record is not nuked.
+                for(const href of profileHrefs) spaceFeedAnsweredProfileKeys.add(getSpaceFeedProfileStateKey(href))
                 spaceFeedScopedStateSignature = getProfileHrefScopeSignature(profileHrefs)
+                // More than 250 profiles: ask again for the rest until every scanned profile has an answer.
+                retrySpaceFeedUnansweredStateLater(0)
+                // Owner, 23 Oct: the count and buttons follow the worker's answer, whichever path asked for it. 24 Oct: asked for through the
+                // render timer, so a burst of answers is drawn once per render gap rather than once per answer.
+                scheduleSpaceAssetNukeControls(0)
             }
             return true
         })
@@ -634,6 +661,56 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
         })
 
     return contentPageStateRefreshPromise
+}
+
+// Owner, 23 Oct: after a timed-out or failed reply, the page asks the worker again after a short wait, so its copy of the queue and progress
+// catches up when the worker is free.
+function retrySpaceFeedStateLater(delayMs = 0) {
+    spaceFeedScopedStateSignature = ''
+    spaceFeedStateRefreshStatus.retriesWaiting += 1
+    setTimeout(() => {
+        spaceFeedStateRefreshStatus.retriesWaiting -= 1
+        scheduleSpaceFeedScopedStateRefresh(getLatestSpaceFeedEntries())
+    }, delayMs)
+}
+
+// Owner, 24 Oct: while a nuke is pending on the space page, its progress is asked for again every few seconds. The worker keeps the tabs to
+// push to in memory, so after a worker restart the page could stay on an old copy. Asking again keeps the copy current.
+// The page is redrawn only when the answer changed the progress or queue records, so an unchanged answer costs one message.
+let spaceFeedStatePollTimer = null
+
+function getSpaceFeedStateFingerprint() {
+    const progress = Object.values(profileNukeProgress || {})
+    return [
+        Object.keys(profileNukeProgress || {}).length,
+        progress.filter(record => isSuccessfulProfileNukeRecord(record)).length,
+        Object.keys(coordinatorQueue || {}).length
+    ].join('|')
+}
+
+async function pollSpaceFeedState() {
+    if(getPageType() !== 'space') return
+    if(Object.keys(spacePendingNukedPosts || {}).length === 0 && spaceFeedNukingPostKeys.size === 0) return
+
+    const before = getSpaceFeedStateFingerprint()
+    const refreshed = await refreshContentPageCoordinatorStateFromRuntime({force: true, entries: getLatestSpaceFeedEntries()})
+    if(refreshed && getSpaceFeedStateFingerprint() !== before) scheduleSpaceFeedProgressDrivenRefresh()
+}
+
+if(spaceFeedStatePollTimer === null) {
+    spaceFeedStatePollTimer = setInterval(() => {
+        void pollSpaceFeedState()
+    }, SPACE_FEED_STATE_POLL_MS)
+}
+
+// Owner, 23 Oct: a scanned profile the worker has not answered for is not counted. While any is unanswered, ask again after a short wait.
+function retrySpaceFeedUnansweredStateLater(delayMs = 0) {
+    const unanswered = getLatestSpaceFeedEntries().some(entry =>
+        getNormalizedProfileHrefList(entry?.candidateUrls || []).some(url => !isSpaceFeedProfileStateReady(url)))
+    if(!unanswered) return
+
+    spaceFeedScopedStateSignature = ''
+    setTimeout(() => scheduleSpaceFeedScopedStateRefresh(getLatestSpaceFeedEntries()), delayMs)
 }
 
 function onStorageChanged(changes, areaName) {
@@ -860,7 +937,7 @@ function getReconciledProfileRecordPatch(record) {
 async function reconcileStaleSpaceFeedProgress(entries = null) {
     if(getPageType() !== 'space') return false
 
-    updateOwnedNukeStatusCache(await getOwnedNukeStatus())
+    await refreshOwnedNukeStatusCacheIfStale()
     const pendingProfileHrefs = getNormalizedProfileHrefList(
         Object.values(spacePendingNukedPosts || {})
             .flatMap(record => getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
@@ -1715,8 +1792,11 @@ function normalizeOwnedNukeStatus(status = null) {
     return next
 }
 
+let ownedNukeStatusFetchedAt = 0
+
 function updateOwnedNukeStatusCache(status = null) {
     ownedNukeStatusCache = normalizeOwnedNukeStatus(status)
+    ownedNukeStatusFetchedAt = Date.now()
 
     return ownedNukeStatusCache
 }
@@ -1736,6 +1816,12 @@ async function promoteCurrentQueuedTab(reason = 'hidden-tab-stall', allowForegro
         promoted: response?.promoted === true,
         reason: response?.reason || (response?.promoted ? 'promoted' : 'promote-denied')
     }
+}
+
+// Owner, 24 Oct: the owned nuke status is asked of the worker at most once per OWNED_NUKE_STATUS_TTL_MS. Renders reuse the last answer.
+async function refreshOwnedNukeStatusCacheIfStale() {
+    if(Date.now() - ownedNukeStatusFetchedAt < OWNED_NUKE_STATUS_TTL_MS) return ownedNukeStatusCache
+    return refreshOwnedNukeStatusCache()
 }
 
 async function refreshOwnedNukeStatusCache() {
@@ -1936,7 +2022,9 @@ function startObserver() {
             scheduleProfileSearchControls(180)
         }
 
-        const activeModal = getProfilePeopleModal()
+        // 24 Oct: the dialog search runs only when a dialog may have opened or one is already open, not on every change on the page.
+        const dialogMayBeOpen = mutationsMayInvolveDialog(mutations) || !!activeProfileModal?.isConnected
+        const activeModal = dialogMayBeOpen ? getProfilePeopleModal() : null
         const activeModalButtons = getModalProfileActionButtons(activeModal)
         const needsLateModalActions = activeModal &&
             getProfileModalItems(activeModal).length &&
@@ -1946,7 +2034,7 @@ function startObserver() {
             injectModalOpenProfilesBtn()
         }
 
-        let modal = document.querySelector('[role="dialog"][aria-modal="true"]:not([data-mb-checked])')
+        let modal = dialogMayBeOpen ? document.querySelector('[role="dialog"][aria-modal="true"]:not([data-mb-checked])') : null
         if(!modal) return
 
         modal.dataset.mbChecked = true
@@ -2030,6 +2118,12 @@ function getSpaceFeedPostRootFromMutationNode(node) {
 }
 
 function invalidateSpaceFeedEntryCacheForMutations(mutations) {
+    // Owner, 24 Oct: a structural change ends the reuse of the profile-link card scan, so the next render reads the page again.
+    spaceFeedProfileLinkCardCache = null
+    spaceFeedRenderModelMemo = null
+    // Stage 1 (24 Oct): a structural change ends the reuse of the last feed scan.
+    spaceFeedStructureVersion += 1
+    noteSpaceFeedProfileLinkMutations(mutations)
     if(!spaceFeedEntryCache.size) return
 
     for(const mutation of mutations || []) {
@@ -2052,6 +2146,17 @@ function isSpaceFeedMutationSignalNode(node) {
 
     if(element.matches?.('a.post_timestamp, a[href*="/profile/"]')) return true
     return !!element.querySelector?.('a.post_timestamp, a[href*="/profile/"]')
+}
+
+// 24 Oct: a profile dialog can open only when a dialog element is added to the page.
+function mutationsMayInvolveDialog(mutations = []) {
+    for(const mutation of mutations || []) {
+        for(const node of Array.from(mutation.addedNodes || [])) {
+            if(!(node instanceof Element)) continue
+            if(node.matches?.('[role="dialog"], [aria-modal="true"]') || node.querySelector?.('[role="dialog"], [aria-modal="true"]')) return true
+        }
+    }
+    return false
 }
 
 function hasSpaceFeedStructuralMutations(mutations) {
@@ -2604,7 +2709,7 @@ function setNukeButtonIdle(button, label = `Nuke 'Em`) {
         return
     }
     button.dataset.mbNukeState = 'idle'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--bad-links')
     button.innerText = label
 }
 
@@ -2617,7 +2722,7 @@ function setNukeButtonWorking(button, label = 'Nuking...') {
         return
     }
     button.dataset.mbNukeState = 'working'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--done')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--done', 'mb-ext_nuke-profiles-btn--bad-links')
     button.classList.add('mb-ext_nuke-profiles-btn--working')
     button.innerText = label
 }
@@ -2632,8 +2737,17 @@ function setNukeButtonDone(button, label = 'Nuked') {
         return
     }
     button.dataset.mbNukeState = 'done'
-    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working')
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--bad-links')
     button.classList.add('mb-ext_nuke-profiles-btn--done')
+    button.innerText = label
+}
+
+// Owner, 23 Oct: errors on a post and nothing left to queue. The button is white and lists the profiles that failed on hover.
+function setNukeButtonBadLinks(button, label = 'Bad Links') {
+    if(!button) return
+    button.dataset.mbNukeState = 'bad-links'
+    button.classList.remove('mb-ext_nuke-profiles-btn--flash', 'mb-ext_nuke-profiles-btn--pressed', 'mb-ext_nuke-profiles-btn--working', 'mb-ext_nuke-profiles-btn--done')
+    button.classList.add('mb-ext_nuke-profiles-btn--bad-links')
     button.innerText = label
 }
 
@@ -2801,7 +2915,7 @@ function shouldRefreshSpaceAssetNukeControls(mutations = null) {
     const storedEntryCount = Number.parseInt(main?.dataset.mbSpaceFeedEntryCount || '-1', 10)
     const storedPostButtonCount = Number.parseInt(main?.dataset.mbSpaceFeedPostButtonCount || '-1', 10)
     const hasStatusButton = !!document.querySelector('.mb-ext_space-feed-status-btn')
-    const livePostButtonCount = document.querySelectorAll('.mb-ext_space-feed-post-nuke-host').length
+    const livePostButtonCount = getSpaceFeedPostHostsInDocument().length
 
     if(!hasStatusButton) return true
 
@@ -2835,8 +2949,12 @@ function getSpaceAssetNukeRefreshDelay(delay) {
     return Math.max(0, delay, scrollRemaining > 0 ? scrollRemaining + SPACE_FEED_SCROLL_REFRESH_GRACE_MS : 0)
 }
 
+// Owner, 24 Oct: renders driven by scrolling and page changes are kept at least SPACE_FEED_RENDER_MIN_GAP_MS apart.
+let lastSpaceAssetNukeRenderAt = 0
+
 function scheduleSpaceAssetNukeControls(delay = 180) {
-    const adjustedDelay = getSpaceAssetNukeRefreshDelay(delay)
+    const renderGapDelay = Math.max(0, lastSpaceAssetNukeRenderAt + SPACE_FEED_RENDER_MIN_GAP_MS - Date.now())
+    const adjustedDelay = Math.max(getSpaceAssetNukeRefreshDelay(delay), renderGapDelay)
     const scheduledAt = Date.now() + adjustedDelay
 
     if(spaceAssetNukePending && delay !== 0 && scheduledAt <= spaceAssetNukeScheduledAt + 40) return
@@ -2849,10 +2967,13 @@ function scheduleSpaceAssetNukeControls(delay = 180) {
             spaceAssetNukeTimeout = null
             spaceAssetNukePending = false
             spaceAssetNukeScheduledAt = 0
+            // 24 Oct: the owned status is waited for only briefly. A slow answer lands in the cache for the next redraw, and the redraw does not wait for it.
             if(getPageType() === 'space') {
-                await refreshOwnedNukeStatusCache()
+                const ownedStatusRefresh = refreshOwnedNukeStatusCacheIfStale().catch(() => null)
+                await Promise.race([ownedStatusRefresh, sleep(OWNED_NUKE_STATUS_WAIT_MS)])
             }
             suppressSpaceAssetNukeRefreshUntil = Date.now() + 250
+            lastSpaceAssetNukeRenderAt = Date.now()
             syncSpaceFeedNukeControls()
         })()
     }, adjustedDelay)
@@ -3818,71 +3939,12 @@ function getOrCreateContentProgressBar() {
     }
     if(contentProgressBarEl?.isConnected) return contentProgressBarEl
 
-    const darkMode = isPageInDarkMode()
-    const barBackground = darkMode ? 'rgba(32, 32, 35, 0.92)' : 'rgba(255, 255, 255, 0.92)'
-    const textColor = darkMode ? '#e8e8ea' : '#1c1c1e'
-    const trackBackground = darkMode ? 'rgba(255, 255, 255, 0.18)' : 'rgba(0, 0, 0, 0.12)'
-    const borderColor = darkMode ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)'
-
-    const bar = document.createElement('div')
-    bar.id = CONTENT_PROGRESS_BAR_ID
-    bar.style.position = 'fixed'
-    bar.style.left = '0'
-    bar.style.right = '0'
-    bar.style.bottom = '0'
-    bar.style.zIndex = '999999'
-    bar.style.display = 'flex'
-    bar.style.alignItems = 'center'
-    bar.style.gap = '10px'
-    bar.style.padding = '5px 12px'
-    bar.style.background = barBackground
-    bar.style.borderTop = `1px solid ${borderColor}`
-    bar.style.color = textColor
-    bar.style.fontSize = '12px'
-    bar.style.fontFamily = 'system-ui, -apple-system, sans-serif'
-    // Display-only -- never intercept clicks/scroll on the page beneath it.
-    bar.style.pointerEvents = 'none'
-
-    const brand = document.createElement('div')
-    brand.style.display = 'flex'
-    brand.style.alignItems = 'center'
-    brand.style.gap = '6px'
-    brand.style.flexShrink = '0'
-
-    const logo = document.createElement('img')
-    logo.src = browser.runtime.getURL('icons/32.png')
-    logo.alt = ''
-    logo.width = 16
-    logo.height = 16
-    logo.style.display = 'block'
-
-    const label = document.createElement('div')
-    label.textContent = 'Progress'
-    label.style.fontWeight = '600'
-    label.style.whiteSpace = 'nowrap'
-
-    brand.append(logo, label)
-
-    const track = document.createElement('div')
-    track.style.flex = '1'
-    track.style.height = '6px'
-    track.style.borderRadius = '3px'
-    track.style.background = trackBackground
-    track.style.overflow = 'hidden'
-
-    const fill = document.createElement('div')
-    fill.className = `${CONTENT_PROGRESS_BAR_ID}-fill`
-    fill.style.height = '100%'
-    fill.style.width = '0%'
-    fill.style.background = BRAND_RED
-    fill.style.transition = 'width 200ms ease'
-    track.appendChild(fill)
-
-    const count = document.createElement('div')
-    count.className = `${CONTENT_PROGRESS_BAR_ID}-count`
-    count.style.whiteSpace = 'nowrap'
-
-    bar.append(brand, track, count)
+    // Built by the same function as the dashboard's bar (queueProgressBar.js), so the two look the same. Display-only: it never takes clicks.
+    const { bar } = createQueueProgressBar({
+        barId: CONTENT_PROGRESS_BAR_ID,
+        darkMode: isPageInDarkMode(),
+        iconSrc: browser.runtime.getURL('icons/32.png')
+    })
     document.body.appendChild(bar)
     contentProgressBarEl = bar
     return bar
@@ -3941,9 +4003,16 @@ function installContentProgressBarStorageListener() {
     })
 }
 
+let contentProgressBarPollTimer = null
+
 function initContentProgressBar() {
     installContentProgressBarStorageListener()
     void refreshContentProgressBar()
+    if(contentProgressBarPollTimer === null) {
+        contentProgressBarPollTimer = setInterval(() => {
+            void refreshContentProgressBar()
+        }, CONTENT_PROGRESS_BAR_POLL_MS)
+    }
 }
 
 function reorderProfileButtonRail(rail) {
@@ -6916,7 +6985,20 @@ function syncSpaceFeedTopBarLayout() {
     return true
 }
 
+// 24 Oct: the feed's content root is worked out at most once per SPACE_FEED_CONTENT_ROOT_MEMO_MS. Working it out counts the posts in every
+// candidate, and it was asked for on almost every scan and redraw.
+let spaceFeedContentRootMemo = {root: null, at: 0}
+
 function getSpaceFeedContentRoot() {
+    const memo = spaceFeedContentRootMemo
+    if(memo.root?.isConnected && Date.now() - memo.at < SPACE_FEED_CONTENT_ROOT_MEMO_MS) return memo.root
+
+    const root = computeSpaceFeedContentRoot()
+    spaceFeedContentRootMemo = {root, at: Date.now()}
+    return root
+}
+
+function computeSpaceFeedContentRoot() {
     const candidates = Array.from(document.querySelectorAll('#mainContent, main, [role="main"]'))
         .filter(candidate => candidate instanceof Element)
     if(!candidates.length) return document.body
@@ -7040,8 +7122,12 @@ function getBoundedVisibleSpaceFeedTimestamps() {
     // measuring twice per node here was forcing a redundant layout reflow
     // for every post ever loaded into this (non-virtualized) feed on every
     // scan.
+    // Owner, 24 Oct: only the posts near the viewport are measured. Measuring every timestamp on each sync forced a layout read per post.
+    // Until the near-post observer has reported any post, the whole feed is measured once.
     const scanRoot = getSpaceFeedContentRoot() || document
-    const nodes = Array.from(scanRoot.querySelectorAll('a.post_timestamp'))
+    // 24 Oct: every post is measured. The near-post observer had posts on screen that it still reported as far away, so those posts were never
+    // scanned. The position test below (isSpaceFeedTimestampInScanWindow) is what decides, and it is the same test the button check uses.
+    const nodes = timedSpaceQuery('allTimestamps', () => Array.from(scanRoot.querySelectorAll('a.post_timestamp')))
     const timestamps = nodes
         .map((timestamp, index) => {
             const rect = timestamp?.getBoundingClientRect?.() || null
@@ -7098,7 +7184,9 @@ function mergeSpaceFeedTimestampScanResults(...groups) {
 }
 
 function getVisibleSpaceFeedTimestamps() {
-    const sampledTimestamps = getViewportSampledSpaceFeedTimestamps()
+    // Owner, 24 Oct: hit-testing the viewport on every sync was the largest cost while scrolling. Once the near-post observer has reported
+    // posts, those posts are used instead, and the sampling runs only before the observer has reported any.
+    const sampledTimestamps = getSpaceFeedNearObserver() ? [] : getViewportSampledSpaceFeedTimestamps()
     const boundedTimestamps = getBoundedVisibleSpaceFeedTimestamps()
     const timestamps = mergeSpaceFeedTimestampScanResults(sampledTimestamps, boundedTimestamps)
     if(timestamps.length) return timestamps
@@ -7107,11 +7195,49 @@ function getVisibleSpaceFeedTimestamps() {
     return []
 }
 
-function isSpaceFeedRootCandidate(node, timestamp) {
-    if(!node || node.nodeType !== Node.ELEMENT_NODE) return false
+// 24 Oct: 'candidate' when the node holds exactly this post's timestamp; 'crowded' when it holds more than one. No ancestor of a crowded node
+// can be a candidate, so the walk up from a post stops there.
+function getSpaceFeedRootCandidateState(node, timestamp) {
+    if(!node || node.nodeType !== Node.ELEMENT_NODE) return ''
 
-    const timestamps = Array.from(node.querySelectorAll('a.post_timestamp'))
-    return timestamps.length === 1 && timestamps[0] === timestamp
+    const timestamps = timedSpaceQuery('nodeTimestamps', () => Array.from(node.querySelectorAll('a.post_timestamp')))
+    if(timestamps.length > 1) return 'crowded'
+    return timestamps.length === 1 && timestamps[0] === timestamp ? 'candidate' : ''
+}
+
+function isSpaceFeedRootCandidate(node, timestamp) {
+    return getSpaceFeedRootCandidateState(node, timestamp) === 'candidate'
+}
+
+// The posts the page has marked with their key. Kept here so a redraw does not search the whole page for them.
+const spaceFeedMarkedRoots = new Set()
+
+function getSpaceFeedMarkedRoots() {
+    for(const root of Array.from(spaceFeedMarkedRoots)) {
+        if(!root.isConnected) spaceFeedMarkedRoots.delete(root)
+    }
+    return Array.from(spaceFeedMarkedRoots)
+}
+
+// The post buttons the page has drawn. Every host is made in getSpaceFeedPostButtonHost; a host Quora or the page removes drops out on read.
+const spaceFeedPostHostSet = new Set()
+
+// Page order, as a document query would give them.
+function getSpaceFeedPostHostsInDocument() {
+    for(const host of Array.from(spaceFeedPostHostSet)) {
+        if(!host.isConnected) spaceFeedPostHostSet.delete(host)
+    }
+    return Array.from(spaceFeedPostHostSet)
+        .sort((left, right) => (left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1)
+}
+
+function getSpaceFeedQueueingButtons() {
+    const buttons = []
+    for(const host of getSpaceFeedPostHostsInDocument()) {
+        buttons.push(...host.querySelectorAll('[data-mb-queueing="true"]'))
+    }
+    buttons.push(...timedSpaceQuery('queueingTopButton', () => Array.from(document.querySelectorAll('.mb-ext_space-feed-nuke-btn[data-mb-queueing="true"]'))))
+    return buttons
 }
 
 function getSpaceFeedPreferredRoot(timestamp) {
@@ -7155,7 +7281,9 @@ function getSpaceFeedCardRootForTimestamp(timestamp, root = getSpaceFeedContentR
     let node = timestamp.parentElement
 
     while(node && node !== root) {
-        if(isSpaceFeedRootCandidate(node, timestamp)) {
+        const state = getSpaceFeedRootCandidateState(node, timestamp)
+        if(state === 'crowded') break
+        if(state === 'candidate') {
             matched = node
         }
 
@@ -7197,7 +7325,23 @@ function getSpaceFeedPostKey(postRoot, timestamp) {
     return `space-post-text:${snippet}`
 }
 
+// Owner, 23 Oct: the card check reads layout and text for every profile link on the page, and the scan runs on every render. Its result is
+// kept per link element and reused while the link's href is the same, so a render only does this work for links it has not seen.
+const spaceFeedProfileLinkRootCache = new WeakMap()
+
 function getSpaceFeedProfileLinkCardRoot(link) {
+    if(!(link instanceof Element)) return null
+
+    const href = link.href || ''
+    const cached = spaceFeedProfileLinkRootCache.get(link)
+    if(cached && cached.href === href) return cached.root
+
+    const root = computeSpaceFeedProfileLinkCardRoot(link)
+    spaceFeedProfileLinkRootCache.set(link, {href, root})
+    return root
+}
+
+function computeSpaceFeedProfileLinkCardRoot(link) {
     if(!(link instanceof Element) || !isVisible(link)) return null
 
     const root = link.closest('a[href*="/profile/"]')
@@ -7216,7 +7360,7 @@ function getSpaceFeedProfileLinkCardRoot(link) {
     // byline rendered as this same card shape, and he was queued for
     // mute-block with no further scrutiny as a result.
     if(root.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return null
-    if(root.querySelector('a.post_timestamp, .post_timestamp')) return null
+    if(timedSpaceQuery('linkCardTimestamp', () => root.querySelector('a.post_timestamp, .post_timestamp'))) return null
     if(root.closest('.mb-ext_space-feed-post-nuke-host')) return null
     if(!root.classList.contains('q-box') && !root.classList.contains('puppeteer_test_link')) return null
 
@@ -7229,7 +7373,70 @@ function getSpaceFeedProfileLinkCardRoot(link) {
     return root
 }
 
+// The profile-link card scan is reused for a short time while the page's structure does not change (see invalidateSpaceFeedEntryCacheForMutations).
+let spaceFeedProfileLinkCardCache = null
+// Owner, 24 Oct: the profile links of the feed are kept as a set. The whole feed is searched at most every SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS;
+// between searches, links the page adds are put in the set as they arrive (see noteSpaceFeedProfileLinkMutations), and removed ones are
+// dropped when the set is read. A search runs at once for a new content root.
+const spaceFeedProfileLinkSet = new Set()
+let spaceFeedProfileLinkSetRoot = null
+let spaceFeedProfileLinkSetScannedAt = 0
+let spaceFeedProfileLinkSetDirty = true
+let spaceFeedProfileLinkOrder = []
+
+function noteSpaceFeedProfileLinkMutations(mutations = []) {
+    for(const mutation of mutations || []) {
+        for(const node of Array.from(mutation.addedNodes || [])) {
+            if(!(node instanceof Element)) continue
+            if(node.matches?.('a[href*="/profile/"]')) spaceFeedProfileLinkSet.add(node)
+            for(const link of timedSpaceQuery('linkMutationScan', () => Array.from(node.querySelectorAll?.('a[href*="/profile/"]') || []))) spaceFeedProfileLinkSet.add(link)
+            spaceFeedProfileLinkSetDirty = true
+        }
+        if(mutation.removedNodes?.length) spaceFeedProfileLinkSetDirty = true
+    }
+}
+
+function getSpaceFeedProfileLinksInDomOrder(contentRoot) {
+    const due = spaceFeedProfileLinkSetRoot !== contentRoot ||
+        Date.now() - spaceFeedProfileLinkSetScannedAt >= SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS
+    if(due) {
+        spaceFeedProfileLinkSet.clear()
+        for(const link of timedSpaceQuery('linkFullScan', () => Array.from(contentRoot.querySelectorAll('a[href*="/profile/"]')))) spaceFeedProfileLinkSet.add(link)
+        spaceFeedProfileLinkSetRoot = contentRoot
+        spaceFeedProfileLinkSetScannedAt = Date.now()
+        spaceFeedProfileLinkSetDirty = true
+    }
+
+    for(const link of Array.from(spaceFeedProfileLinkSet)) {
+        if(!link.isConnected || !contentRoot.contains(link)) {
+            spaceFeedProfileLinkSet.delete(link)
+            spaceFeedProfileLinkSetDirty = true
+        }
+    }
+
+    if(spaceFeedProfileLinkSetDirty) {
+        spaceFeedProfileLinkOrder = Array.from(spaceFeedProfileLinkSet)
+            .sort((left, right) => (left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1)
+        spaceFeedProfileLinkSetDirty = false
+    }
+    return spaceFeedProfileLinkOrder
+}
+
 function getSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
+    const cached = spaceFeedProfileLinkCardCache
+    if(cached && Date.now() - cached.at < SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS) {
+        for(const key of cached.keys) activeKeys.add(key)
+        return cached.entries
+    }
+
+    const keys = new Set()
+    const entries = computeSpaceFeedProfileLinkCardEntries(keys)
+    for(const key of keys) activeKeys.add(key)
+    spaceFeedProfileLinkCardCache = {at: Date.now(), keys: [...keys], entries}
+    return entries
+}
+
+function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
     if(!isAssetSpacePage()) return []
 
     const contentRoot = getSpaceFeedContentRoot()
@@ -7239,7 +7446,7 @@ function getSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
     const seenRoots = new Set()
     const seenHrefs = new Set()
 
-    for(const link of Array.from(contentRoot.querySelectorAll('a[href*="/profile/"]'))) {
+    for(const link of getSpaceFeedProfileLinksInDomOrder(contentRoot)) {
         const root = getSpaceFeedProfileLinkCardRoot(link)
         if(!root || seenRoots.has(root)) continue
 
@@ -7264,8 +7471,8 @@ function getSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
 function getSpaceFeedPostHeaderProfileHref(postRoot, timestamp) {
     if(!postRoot) return null
 
-    const timestampNode = timestamp || postRoot.querySelector('a.post_timestamp')
-    const profileLinks = getQuoraProfileLinks(postRoot).filter(isVisible)
+    const timestampNode = timestamp || timedSpaceQuery('headerTimestamp', () => postRoot.querySelector('a.post_timestamp'))
+    const profileLinks = timedSpaceQuery('headerProfileLinks', () => getQuoraProfileLinks(postRoot)).filter(isVisible)
 
     let headerProfileHref = null
 
@@ -7324,7 +7531,7 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
     // either branch sees the result. Skipping embedded timestamps here
     // fixes it at the source for both branches instead of re-patching each
     // caller.
-    for(const candidate of Array.from(postRoot.querySelectorAll('a.post_timestamp'))) {
+    for(const candidate of timedSpaceQuery('postTimestamps', () => Array.from(postRoot.querySelectorAll('a.post_timestamp')))) {
         const embedAncestor = candidate.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)
         if(embedAncestor instanceof Element && embedAncestor !== postRoot && postRoot.contains(embedAncestor)) continue
 
@@ -7373,19 +7580,8 @@ function getSpaceFeedPostContentScopes(postRoot) {
     const scopes = []
     const addScope = scope => {
         if(!scope || scopes.includes(scope)) return
-        // 2026-10-08 (Franklin Veaux pattern, third+fourth occurrence): a
-        // scope nested inside -- or itself matching -- an embedded/quoted
-        // sub-post marker is the embed's own content, not the actual
-        // poster's. Both consumers of this scope list (the dom-profile-link
-        // loop and the text-profile-url fallback, both in
-        // getSpaceFeedPostCandidateProfileUrls) have no embed-awareness of
-        // their own, so a link or plain-text URL inside an embed -- most
-        // commonly the embedded answer's own author byline -- was
-        // previously indistinguishable from something the actual poster
-        // deliberately wrote. Excluding these scopes entirely matches how
-        // getSpaceFeedPosterProfileUrls (2026-09-27) and
-        // getSpaceFeedProfileLinkCardRoot (2026-10-08) already handle this.
-        if(scope !== postRoot && scope.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return
+        // Owner, 23 Oct: embedded and quoted content is read like the rest of the post. A followed author is caught when the block is
+        // attempted (block-attempt-on-following), so it is not excluded here.
         scopes.push(scope)
     }
 
@@ -7420,7 +7616,9 @@ function isSpaceFeedCandidateProfileLink(link, postRoot) {
         return false
     }
 
-    const actionLabel = getPostActionLabel(link)
+    // Owner, 23 Oct: a profile link's own text is its URL, and a URL can carry words such as "share=" in its query. The action words are
+    // tested without URLs, so a profile link is not mistaken for a share or comment button.
+    const actionLabel = getPostActionLabel(link).replace(/https?:\/\/\S+/gi, ' ')
     if(/\b(comment|share|upvote|downvote|more)\b/i.test(actionLabel)) {
         return false
     }
@@ -7515,14 +7713,42 @@ function getRememberedSpaceFeedPostUrlSet(postKey) {
     return new Set(getStoredSpaceFeedRecordUrls(record, 'allUrls'))
 }
 
+// Owner, 23 Oct: a profile is counted only once the worker has answered for it. A profile found nuked is kept in a set for the life of
+// the page, so it is not asked about again and does not drop out when the worker's reply is replaced.
+const spaceFeedKnownNukedProfileKeys = new Set()
+const spaceFeedAnsweredProfileKeys = new Set()
+// Diagnostic, 23 Oct: the last progress refresh from the worker, shown in the MB Info report.
+const spaceFeedStateRefreshStatus = {outcome: 'none', finishedAt: 0, requested: 0, records: 0, retriesWaiting: 0}
+
+function getSpaceFeedProfileStateKey(href) {
+    const normalized = normalizeQuoraProfileHref(href)
+    if(!normalized) return ''
+
+    return getNormalizedProfileIdentityKey(normalized) || normalized
+}
+
+function isKnownNukedSpaceFeedProfile(href) {
+    const key = getSpaceFeedProfileStateKey(href)
+    if(!key) return false
+    if(spaceFeedKnownNukedProfileKeys.has(key)) return true
+    if(!isProfileNukeSucceeded(href)) return false
+
+    spaceFeedKnownNukedProfileKeys.add(key)
+    return true
+}
+
+function isSpaceFeedProfileStateReady(href) {
+    const key = getSpaceFeedProfileStateKey(href)
+    return !!key && spaceFeedAnsweredProfileKeys.has(key)
+}
+
 function isSpaceFeedPostNuked(postKey, candidateUrls = null) {
     const rememberedUrls = getRememberedSpaceFeedPostUrlSet(postKey)
-    if(!rememberedUrls.size) return false
-
     const urls = getNormalizedProfileHrefList(candidateUrls || [])
-    if(!urls.length) return true
+    if(!urls.length) return rememberedUrls.size > 0
 
-    return urls.every(url => rememberedUrls.has(url) || isProfileNukeSucceeded(url))
+    // Owner, 22 Oct: nuked is a fact about the profile, not the post. A post is nuked when each of its profiles is settled, for every report.
+    return urls.every(url => isKnownNukedSpaceFeedProfile(url))
 }
 
 function isSpaceFeedEntryNuked(entry) {
@@ -7563,7 +7789,7 @@ function hasActivePendingSpaceFeedWork(entries = null) {
 }
 
 function clearStaleLocalSpaceFeedBusyState() {
-    const queueingButtons = document.querySelectorAll('.mb-ext_space-feed-nuke-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-queue-btn[data-mb-queueing="true"], .mb-ext_space-feed-post-nuke-btn[data-mb-queueing="true"]')
+    const queueingButtons = getSpaceFeedQueueingButtons()
 
     if(!spaceFeedNukingPostKeys.size && !queueingButtons.length) return false
     if(hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
@@ -7879,6 +8105,7 @@ function isSettledProfileNukeRecord(record) {
 
     const status = `${record?.status || ''}`.trim()
     return status === 'profile-unavailable' ||
+        status === 'archived-terminal' ||
         status === 'error' ||
         status === 'error-page' ||
         status === 'interrupted'
@@ -7949,7 +8176,8 @@ function getQueueableSpaceFeedEntryUrls(entry) {
         .filter(url => !pendingUrls.has(url) &&
             !isPendingCoordinatorProfileHref(url) &&
             !isProfileNukeRetryBlocked(url) &&
-            !isRememberedSpaceFeedPostProfile(entry.postKey, url))
+            isSpaceFeedProfileStateReady(url) &&
+            !isKnownNukedSpaceFeedProfile(url))
 }
 
 function isQueueableSpaceFeedResolverEntry(entry) {
@@ -7964,16 +8192,20 @@ function isQueueableSpaceFeedResolverEntry(entry) {
 }
 
 function getSpaceFeedQueuedWorkCount(entries = []) {
-    let count = 0
+    // Distinct profiles, as the page de-duplicates them: a profile linked from several posts is one. A post whose profile is still to be read counts one.
+    const profiles = new Set()
+    let unresolved = 0
 
     for(const entry of Array.isArray(entries) ? entries : []) {
-        count += getNormalizedProfileHrefList(entry?.candidateUrls || []).length
+        for(const url of getNormalizedProfileHrefList(entry?.candidateUrls || [])) {
+            profiles.add(getNormalizedProfileIdentityKey(url) || url)
+        }
         if(isQueueableSpaceFeedResolverEntry(entry) || (isResolvableSpaceFeedEntry(entry) && spacePendingNukedPosts?.[entry.postKey]?.resolverPending)) {
-            count += 1
+            unresolved += 1
         }
     }
 
-    return count
+    return profiles.size + unresolved
 }
 
 function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
@@ -8029,12 +8261,11 @@ function isRememberedSpaceFeedPostProfileForRender(postKey = '', profileHref = '
 
 function isSpaceFeedPostNukedForRender(postKey = '', candidateUrls = null, context = null) {
     const rememberedUrls = getRememberedSpaceFeedPostUrlSetForRender(postKey, context)
-    if(!rememberedUrls.size) return false
-
     const urls = getNormalizedProfileHrefList(candidateUrls || [])
-    if(!urls.length) return true
+    if(!urls.length) return rememberedUrls.size > 0
 
-    return urls.every(url => rememberedUrls.has(url) || isProfileNukeSucceeded(url))
+    // Owner, 22 Oct: nuked is a fact about the profile, not the post. A post is nuked when each of its profiles is settled, for every report.
+    return urls.every(url => isKnownNukedSpaceFeedProfile(url))
 }
 
 function getActivePendingSpaceFeedUrlsForRender(postKey = '', context = null) {
@@ -8058,6 +8289,29 @@ function isSpaceFeedPostPendingForRender(postKey = '', context = null) {
     return getActivePendingSpaceFeedUrlsForRender(key, context).length > 0
 }
 
+// Diagnostic, 23 Oct: for one post, how many of its candidate profiles are answered, nuked, retry-blocked, pending, or queueable. Written to
+// the post's button as data-mb-diag, so the reason a post shows nothing can be read from the page.
+function getSpaceFeedPostCandidateDiagnostic(entry = null) {
+    const urls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+    const pendingUrls = new Set(entry?.activePendingUrls || [])
+    const counts = {
+        candidates: urls.length,
+        answered: 0,
+        nuked: 0,
+        retryBlocked: 0,
+        pending: 0,
+        queueable: entry?.queueableUrls?.length || 0,
+        resolver: entry?.hasResolver === true
+    }
+    for(const url of urls) {
+        if(isSpaceFeedProfileStateReady(url)) counts.answered += 1
+        if(isKnownNukedSpaceFeedProfile(url)) counts.nuked += 1
+        if(isProfileNukeRetryBlocked(url)) counts.retryBlocked += 1
+        if(pendingUrls.has(url) || isPendingCoordinatorProfileHref(url)) counts.pending += 1
+    }
+    return JSON.stringify(counts)
+}
+
 function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null) {
     if(!entry?.postKey) return []
 
@@ -8067,7 +8321,8 @@ function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null) {
         .filter(url => !pendingUrls.has(url) &&
             !pendingCoordinatorProfileHrefs.has(url) &&
             !isProfileNukeRetryBlocked(url) &&
-            !isRememberedSpaceFeedPostProfileForRender(entry.postKey, url, context))
+            isSpaceFeedProfileStateReady(url) &&
+            !isKnownNukedSpaceFeedProfile(url))
 }
 
 function isSpaceFeedEntryNukedForRender(entry = null, context = null) {
@@ -8151,12 +8406,54 @@ function makeSpaceFeedLiveEntry(entry = null) {
     return null
 }
 
-function getSpaceFeedRenderEntriesWorkCount(entries = []) {
-    return (Array.isArray(entries) ? entries : [])
-        .reduce((total, entry) => total + (Number.parseInt(entry?.workCount, 10) || 0), 0)
+
+
+// Owner, 23 Oct: the count is the number of unique profiles still to be queued. A red post says only that one of its profiles is in that
+// queue, so a profile linked from several posts counts once.
+// Owner, 23 Oct: the busy count is the distinct profiles on this space that are queued and not yet done. A profile linked from several posts
+// counts once, and profiles still to be queued are not in it. A post whose profile is still being read counts one.
+function getSpacePendingProfileCount(entries = [], pendingCoordinatorProfileHrefs = new Set()) {
+    const list = Array.isArray(entries) ? entries : []
+    const pendingKeys = new Set()
+    for(const entry of list) {
+        for(const url of entry?.activePendingUrls || []) pendingKeys.add(getSpaceFeedProfileStateKey(url))
+    }
+    const candidateKeys = new Set(list.flatMap(entry =>
+        getNormalizedProfileHrefList(entry?.candidateUrls || []).map(url => getSpaceFeedProfileStateKey(url))))
+    for(const url of pendingCoordinatorProfileHrefs || []) {
+        const key = getSpaceFeedProfileStateKey(url)
+        if(candidateKeys.has(key)) pendingKeys.add(key)
+    }
+    return pendingKeys.size + list.filter(entry => entry?.resolverPending).length
 }
 
+function getSpaceFeedUniqueQueueableProfileCount(queueableEntries = []) {
+    const keys = new Set()
+    for(const entry of Array.isArray(queueableEntries) ? queueableEntries : []) {
+        for(const url of getNormalizedProfileHrefList(entry?.candidateUrls || [])) keys.add(getSpaceFeedProfileStateKey(url))
+    }
+    return keys.size
+}
+
+// Owner, 24 Oct: the page-wide model is reused for a short time while the same posts are on the page, so scrolling does not rebuild it
+// for every post on each render. A structural page change clears the reuse (see invalidateSpaceFeedEntryCacheForMutations).
+let spaceFeedRenderModelMemo = null
+
 function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scannedEntries) {
+    const scanned = Array.isArray(scannedEntries) ? scannedEntries : []
+    const aggregate = Array.isArray(aggregateEntries) ? aggregateEntries : []
+    const signature = `${scanned.map(entry => entry?.postKey || '').join('|')}#${aggregate.map(entry => `${entry?.postKey || ''}:${(entry?.candidateUrls || []).length}`).join('|')}`
+    const now = Date.now()
+    if(spaceFeedRenderModelMemo && spaceFeedRenderModelMemo.signature === signature && now - spaceFeedRenderModelMemo.at < SPACE_FEED_RENDER_MODEL_MEMO_MS) {
+        return spaceFeedRenderModelMemo.model
+    }
+
+    const model = computeSpaceFeedRenderModel(scannedEntries, aggregateEntries)
+    spaceFeedRenderModelMemo = {signature, at: now, model}
+    return model
+}
+
+function computeSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scannedEntries) {
     const context = buildSpaceFeedRenderContext()
     const totalEntries = (Array.isArray(aggregateEntries) ? aggregateEntries : []).map(entry => buildSpaceFeedRenderEntry(entry, context))
     const visibleEntries = (Array.isArray(scannedEntries) ? scannedEntries : []).map(entry => buildSpaceFeedRenderEntry(entry, context))
@@ -8174,7 +8471,13 @@ function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scann
         .map(makeSpaceFeedQueueableEntry)
         .filter(Boolean)
         .map(entry => ({...entry, workCount: entry.queueableWorkCount || 0}))
-    const queueableCount = getSpaceFeedRenderEntriesWorkCount(queueableEntries)
+    const unresolvedCount = queueableEntries.reduce((total, entry) => {
+        return getNormalizedProfileHrefList(entry.candidateUrls || []).length
+            ? total
+            : total + (Number.parseInt(entry.workCount, 10) || 0)
+    }, 0)
+    // The count is the unique profiles still to be queued, plus one for each post whose profile is still to be read.
+    const queueableCount = getSpaceFeedUniqueQueueableProfileCount(queueableEntries) + unresolvedCount
     const busyEntries = actionableEntries.filter(entry => entry.postBusy)
     const hasNukedEntries = totalEntries.some(entry => entry.postNuked)
     const allActionableEntriesSettled = actionableEntries.length > 0 &&
@@ -8184,6 +8487,7 @@ function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scann
     const storedSpaceWorkCount = getStoredPendingSpaceFeedWorkCountForSpace(context.space)
     const activeSpaceWorkCount = getActivePendingSpaceFeedWorkCountForSpace(context.space)
     const displaySpaceWorkCount = Math.max(activeSpaceWorkCount, context.coordinatorSpaceWorkCount)
+    const pendingProfileCount = getSpacePendingProfileCount(totalEntries, context.pendingCoordinatorProfileHrefs)
     const hasActiveSpaceWork = displaySpaceWorkCount > 0
     const localBusy = !!(hasActiveSpaceWork || busyEntries.length || pendingEntries.length)
 
@@ -8208,6 +8512,7 @@ function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scann
         activeSpaceWorkCount,
         coordinatorSpaceWorkCount: context.coordinatorSpaceWorkCount,
         displaySpaceWorkCount,
+        pendingProfileCount,
         hasActiveSpaceWork,
         localBusy,
         batchNukeActive: isActiveSpaceFeedNukeMode('batch', localBusy, context.space),
@@ -8217,7 +8522,7 @@ function buildSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = scann
 }
 
 function getSpaceFeedActionElements(postRoot) {
-    const actions = Array.from(postRoot.querySelectorAll('button, a, [role="button"]'))
+    const actions = timedSpaceQuery('postActions', () => Array.from(postRoot.querySelectorAll('button, a, [role="button"]')))
         .filter(candidate => isSpaceFeedActionLabel(getPostActionLabel(candidate)))
 
     return actions
@@ -8267,11 +8572,11 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
     const parent = getSpaceFeedPostAnchorContainer(postRoot) || postRoot
     if(isSpaceFeedDocumentLevelElement(parent)) return null
 
-    let host = Array.from(parent.querySelectorAll(':scope > .mb-ext_space-feed-post-nuke-host'))
+    let host = timedSpaceQuery('postHostLookup', () => Array.from(parent.querySelectorAll(':scope > .mb-ext_space-feed-post-nuke-host')))
         .find(candidate => (candidate.dataset.mbPostHostKey || '') === postKey)
     if(host) return host
 
-    for(const strayHost of Array.from(postRoot.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
+    for(const strayHost of timedSpaceQuery('postHostStray', () => Array.from(postRoot.querySelectorAll('.mb-ext_space-feed-post-nuke-host')))) {
         if(strayHost.parentElement !== parent && (!postKey || strayHost.dataset.mbPostHostKey === postKey)) {
             strayHost.remove()
         }
@@ -8279,6 +8584,7 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
 
     host = document.createElement('div')
     host.className = 'mb-ext_space-feed-post-nuke-host mb-ext_post-nuke-slot'
+    spaceFeedPostHostSet.add(host)
     host.dataset.mbPostHostKey = postKey
     parent.classList.add('mb-ext_post-card')
 
@@ -8391,19 +8697,51 @@ function getSpaceFeedButtonEntries(button) {
     }
 }
 
+// Stage 1 (24 Oct, space-page-redraw-plan-2026-10-24.md): a redraw reuses the last scan of the feed unless the feed's structure changed, the
+// view moved past the band, the content root changed, or the scan is old. Scanning the feed is what made every redraw costly.
+let spaceFeedStructureVersion = 0
+let spaceFeedScanReuse = null
+
+function getSpaceFeedPostEntriesForRender() {
+    const contentRoot = getSpaceFeedContentRoot()
+    const scrollY = window.scrollY || 0
+    const reuse = spaceFeedScanReuse
+    if(reuse &&
+        reuse.root === contentRoot &&
+        reuse.version === spaceFeedStructureVersion &&
+        Date.now() - reuse.at < SPACE_FEED_SCAN_REUSE_MS &&
+        isSpaceFeedScrollWithinBand(scrollY - reuse.scrollY) &&
+        reuse.entries.every(entry => entry.postRoot?.isConnected !== false)) {
+        return reuse.entries
+    }
+
+    const entries = getSpaceFeedPostEntries()
+    spaceFeedScanReuse = {entries, root: contentRoot, version: spaceFeedStructureVersion, scrollY, at: Date.now()}
+    return entries
+}
+
+// The scan window reaches further below the view than above it, so a move down is allowed further than a move up.
+function isSpaceFeedScrollWithinBand(movedPx) {
+    return movedPx >= 0 ? movedPx < SPACE_FEED_SCAN_BAND_DOWN_PX : -movedPx < SPACE_FEED_SCAN_BAND_UP_PX
+}
+
 function getSpaceFeedPostEntries() {
     const entries = []
     const roots = getSpaceFeedCardRoots()
     const contentRoot = getSpaceFeedContentRoot()
     const activeKeys = new Set()
+    let newlyObservedRoots = 0
 
     for(const postRoot of roots) {
-        const timestamp = postRoot.querySelector('a.post_timestamp')
+        const timestamp = timedSpaceQuery('entryTimestamp', () => postRoot.querySelector('a.post_timestamp'))
         if(!timestamp) continue
 
         const postKey = getSpaceFeedPostKey(postRoot, timestamp)
         if(!postKey) continue
         activeKeys.add(postKey)
+        if(!spaceFeedObservedRoots.has(postRoot)) newlyObservedRoots += 1
+        getSpaceFeedNearObserver()?.observe(postRoot)
+        spaceFeedObservedRoots.add(postRoot)
 
         const postUrl = getSpaceFeedPostUrl(timestamp)
         const cached = spaceFeedEntryCache.get(postKey)
@@ -8423,7 +8761,9 @@ function getSpaceFeedPostEntries() {
             let node = postRoot.parentElement
 
             while(!candidateUrls.length && node && node !== contentRoot) {
-                if(isSpaceFeedRootCandidate(node, timestamp)) {
+                const rootState = getSpaceFeedRootCandidateState(node, timestamp)
+                if(rootState === 'crowded') break
+                if(rootState === 'candidate') {
                     candidateUrls = getSpaceFeedPostCandidateProfileUrls(node, timestamp)
                     candidateEvidenceByHref = mergeSpaceFeedCandidateEvidenceByHref(
                         candidateEvidenceByHref,
@@ -8446,6 +8786,11 @@ function getSpaceFeedPostEntries() {
             })
         }
 
+        // Diagnostic, 23 Oct: the candidate count and the post's timestamp, kept on the card so a post that shows nothing can be traced.
+        // Written only when the value changes, so it does not cause extra page updates.
+        const diagValue = `${candidateUrls.length}|${(timestamp?.getAttribute('href') || '').slice(0, 40)}`
+        if(postRoot.dataset.mbPostDiag !== diagValue) postRoot.dataset.mbPostDiag = diagValue
+
         entries.push({
             postKey,
             postRoot,
@@ -8462,8 +8807,16 @@ function getSpaceFeedPostEntries() {
     for(const [postKey, cached] of spaceFeedEntryCache) {
         if(!activeKeys.has(postKey) || !cached?.postRoot?.isConnected) {
             spaceFeedEntryCache.delete(postKey)
+            if(cached?.postRoot) {
+                spaceFeedNearObserver?.unobserve(cached.postRoot)
+                spaceFeedNearPostRoots.delete(cached.postRoot)
+            }
         }
     }
+
+    // 24 Oct: a post seen for the first time was read before the observer had reported where it is, so it was not drawn. One more redraw,
+    // after the observer has reported, draws it. A post is new only once, so this does not repeat.
+    if(newlyObservedRoots && getPageType() === 'space') scheduleSpaceAssetNukeControls(120)
 
     return entries
 }
@@ -8471,8 +8824,7 @@ function getSpaceFeedPostEntries() {
 function buildSpaceFeedEntrySnapshot(entry, previous = null) {
     const previousUrls = getNormalizedProfileHrefList(previous?.candidateUrls || [])
     const currentUrls = getNormalizedProfileHrefList(entry?.candidateUrls || [])
-    const rect = entry?.postRoot?.isConnected ? entry.postRoot.getBoundingClientRect() : null
-    const previousViewport = previous ? getUpdatedSpaceFeedEntryViewport(previous) : {}
+    const viewport = readSpaceFeedEntryViewport(entry?.postRoot, previous)
 
     return {
         postKey: entry?.postKey || previous?.postKey || '',
@@ -8489,8 +8841,8 @@ function buildSpaceFeedEntrySnapshot(entry, previous = null) {
             : previous?.postRoot?.isConnected
                 ? previous.postRoot
                 : null,
-        viewportTop: rect?.top ?? previousViewport.viewportTop ?? null,
-        viewportBottom: rect?.bottom ?? previousViewport.viewportBottom ?? null
+        viewportTop: viewport.viewportTop,
+        viewportBottom: viewport.viewportBottom
     }
 }
 
@@ -8519,9 +8871,15 @@ function getDiscoveredSpaceFeedEntries() {
 }
 
 function setLatestSpaceFeedEntries(entries) {
+    // 24 Oct: only a post in this scan can be near the viewport. Every other post keeps its last reading, so no position is read for it.
+    const scannedRoots = new Set((Array.isArray(entries) ? entries : []).map(entry => entry?.postRoot).filter(Boolean))
+    const priorByKey = new Map(latestSpaceFeedEntries.map(entry => [entry.postKey, entry]))
     rememberDiscoveredSpaceFeedEntries(entries)
     latestSpaceFeedEntries = getDiscoveredSpaceFeedEntries().map(entry => {
-        const rect = entry?.postRoot?.getBoundingClientRect?.() || null
+        const prior = priorByKey.get(entry?.postKey) || null
+        const viewport = scannedRoots.has(entry?.postRoot)
+            ? readSpaceFeedEntryViewport(entry?.postRoot, entry)
+            : {viewportTop: prior?.viewportTop ?? entry?.viewportTop ?? null, viewportBottom: prior?.viewportBottom ?? entry?.viewportBottom ?? null}
 
         return {
             postKey: entry?.postKey || '',
@@ -8530,8 +8888,8 @@ function setLatestSpaceFeedEntries(entries) {
             resolveProfileFromPage: !!entry?.resolveProfileFromPage,
             resolutionReason: entry?.resolutionReason || '',
             postRoot: entry?.postRoot || null,
-            viewportTop: rect?.top ?? null,
-            viewportBottom: rect?.bottom ?? null
+            viewportTop: viewport.viewportTop,
+            viewportBottom: viewport.viewportBottom
         }
     }).filter(entry => !!entry.postKey)
 }
@@ -8547,12 +8905,24 @@ function getLatestSpaceFeedEntries() {
     }))
 }
 
-function getUpdatedSpaceFeedEntryViewport(entry) {
-    const rect = entry?.postRoot?.isConnected ? entry.postRoot.getBoundingClientRect() : null
+// Owner, 24 Oct: a post's position is read from the layout only while it is near the viewport. Otherwise the last reading is kept, so a
+// render does not force a layout read for every post on the page.
+function readSpaceFeedEntryViewport(postRoot, previous = null) {
+    if(postRoot?.isConnected && isSpaceFeedPostRootNear(postRoot)) {
+        const rect = postRoot.getBoundingClientRect()
+        return {viewportTop: rect.top, viewportBottom: rect.bottom}
+    }
 
     return {
-        viewportTop: rect?.top ?? entry?.viewportTop ?? null,
-        viewportBottom: rect?.bottom ?? entry?.viewportBottom ?? null
+        viewportTop: previous?.viewportTop ?? null,
+        viewportBottom: previous?.viewportBottom ?? null
+    }
+}
+
+function getUpdatedSpaceFeedEntryViewport(entry) {
+    return {
+        viewportTop: entry?.viewportTop ?? null,
+        viewportBottom: entry?.viewportBottom ?? null
     }
 }
 
@@ -8593,7 +8963,13 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
         pending: pendingEntries.length,
         expectedPostButtons,
         topButton: !!document.querySelector('.mb-ext_space-feed-nuke-btn'),
-        postButtons: document.querySelectorAll('.mb-ext_space-feed-post-nuke-btn').length
+        postButtons: document.querySelectorAll('.mb-ext_space-feed-post-nuke-btn').length,
+        stateRefresh: {
+            ...spaceFeedStateRefreshStatus,
+            ageMs: spaceFeedStateRefreshStatus.finishedAt ? Date.now() - spaceFeedStateRefreshStatus.finishedAt : null,
+            knownNukedProfiles: spaceFeedKnownNukedProfileKeys.size,
+            answeredProfiles: spaceFeedAnsweredProfileKeys.size
+        }
     }
 }
 
@@ -8625,6 +9001,9 @@ function formatSpaceFeedStatusSummary(snapshot) {
         `actionable: ${snapshot.actionable}`,
         `actionable_candidates: ${snapshot.actionableCandidates}`,
         `stored_progress_records: ${snapshot.storedProgressRecords}`,
+        `state_refresh: outcome=${snapshot.stateRefresh.outcome} age=${formatDurationMs(snapshot.stateRefresh.ageMs)} requested=${snapshot.stateRefresh.requested} records=${snapshot.stateRefresh.records} retries_waiting=${snapshot.stateRefresh.retriesWaiting}`,
+        `known_nuked_profiles: ${snapshot.stateRefresh.knownNukedProfiles}`,
+        `answered_profiles: ${snapshot.stateRefresh.answeredProfiles}`,
         `tracked_candidates: ${snapshot.trackedCandidates}`,
         `pending: ${snapshot.pending}`,
         `expected_post_buttons: ${snapshot.expectedPostButtons}`,
@@ -8787,6 +9166,39 @@ function formatSpaceFeedTimingSummary(snapshot) {
     return lines.join('\n')
 }
 
+// Diagnostic, 23 Oct: what each button shows right now, read from the page, so the report matches what the owner sees.
+function describeSpaceFeedPostButtonState(button) {
+    if(!button) return 'no-button'
+    if(getComputedStyle(button).display === 'none') return 'hidden'
+
+    const text = (button.textContent || '').trim()
+    if(/^nuked$/i.test(text)) return 'nuked'
+    if(/^nuking/i.test(text)) return 'nuking'
+    if(/^mute-block$/i.test(text) && !button.disabled) return 'red'
+    return 'grey'
+}
+
+function formatSpaceFeedButtonStates() {
+    const globalButton = document.querySelector('.mb-ext_space-feed-nuke-btn')
+    const hosts = Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))
+    const tally = {}
+    const postLines = hosts.map((host, index) => {
+        const single = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
+        const queue = host.querySelector('.mb-ext_space-feed-post-queue-btn')
+        const state = describeSpaceFeedPostButtonState(single)
+        tally[state] = (tally[state] || 0) + 1
+        const queueShown = queue && getComputedStyle(queue).display !== 'none' ? (queue.textContent || '').trim() : 'hidden'
+        return `- post_${index + 1}: ${state} | queue: ${queueShown} | ${single?.dataset.mbDiag || 'no diagnostic'}`
+    })
+
+    return [
+        'button_states:',
+        `- global: ${globalButton ? `${(globalButton.textContent || '').trim()} disabled=${globalButton.disabled}` : 'none'}`,
+        `- post_hosts: ${hosts.length} ${Object.entries(tally).map(([state, count]) => `${state}=${count}`).join(' ')}`,
+        ...postLines
+    ].join('\n')
+}
+
 function formatSpaceFeedStatusDetails(snapshot) {
     const lines = [
         'report_format: detailed-v2',
@@ -8794,7 +9206,13 @@ function formatSpaceFeedStatusDetails(snapshot) {
         '',
         formatSpaceFeedStatusSummary(snapshot),
         '',
-        formatSpaceFeedTimingSummary(snapshot)
+        formatSpaceFeedButtonStates(),
+        '',
+        formatSpaceFeedTimingSummary(snapshot),
+        '',
+        formatSpaceFeedButtonTrace(),
+        '',
+        formatSpaceQueryStats()
     ]
 
     const actionableEntries = Array.isArray(snapshot?.actionableEntries) ? snapshot.actionableEntries : []
@@ -9246,9 +9664,10 @@ function removeSpaceFeedNukeButtons() {
         host.remove()
     }
 
-    for(const root of Array.from(document.querySelectorAll('[data-mb-space-feed-post-key]'))) {
+    for(const root of getSpaceFeedMarkedRoots()) {
         delete root.dataset.mbSpaceFeedPostKey
     }
+    spaceFeedMarkedRoots.clear()
 }
 
 function removeSpaceFeedNukeControls() {
@@ -9639,6 +10058,8 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
     let storageTimedOut = false
     let stopReason = ''
     const resetCleanupTargets = []
+    // Owner, 23 Oct: the profiles the worker merged into existing rows, so the page clears their pending records.
+    const mergedHrefs = []
 
     for(let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
         // A failed/timed-out attempt below has no partial-success state to
@@ -9693,6 +10114,7 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
             merged += Number.parseInt(settled.merged, 10) || 0
         }
         if(Array.isArray(settled.resetCleanupTargets)) resetCleanupTargets.push(...settled.resetCleanupTargets)
+        if(Array.isArray(settled.mergedHrefs)) mergedHrefs.push(...settled.mergedHrefs)
         if(settled.durable === true || settled.recoveredFromSummary) durable = true
         if(onProgress) onProgress(queued, merged, totalItems)
 
@@ -9710,6 +10132,7 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
     return {
         queued,
         merged,
+        mergedHrefs,
         executionQueued: 0,
         runId,
         durable,
@@ -9911,6 +10334,11 @@ async function nukeSpaceFeedEntries(button, entries) {
         })
         const enqueueQueuedCount = Number.parseInt(result?.queued, 10) || 0
         const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
+        // Owner, 23 Oct: a profile the worker merged was not queued, so its pending record is cleared rather than left as "left".
+        if(Array.isArray(result?.mergedHrefs) && result.mergedHrefs.length) {
+            await removePendingSpaceFeedUrls(result.mergedHrefs)
+            syncSpaceFeedNukeControls()
+        }
 
         if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
@@ -10043,7 +10471,6 @@ function syncSpaceFeedTopNukeButton(renderModel) {
     const busyEntries = model?.busyEntries || []
     const ownerRunningForThisSpace = model?.ownerRunning && (model.localBusy || button?.dataset?.mbQueueing === 'true')
     const displayEntries = model?.singleNukeActive ? queueableEntries : liveEntries
-    const displayEntryWorkCount = getSpaceFeedRenderEntriesWorkCount(displayEntries)
     const shouldPromptScroll = !ownerRunningForThisSpace &&
         !model?.ownerPaused &&
         !busyEntries.length &&
@@ -10059,11 +10486,19 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         setMuteBlockHelp(button, 'Queue detected profiles from visible posts in this space for mute and block')
         host.appendChild(button)
     }
-    button = ensureCurrentInstanceClickHandler(button, 'space-feed-top', event => {
+    button = ensureCurrentInstanceClickHandler(button, 'space-feed-top', async event => {
         const activeButton = event.currentTarget
         if(activeButton.dataset.mbNukeState === 'working') {
             return
         }
+
+        // Owner, 23 Oct: a collapsed post has no candidate until it is expanded, so a post that was not yet expanded was missing from the batch.
+        // Expand every rendered collapsed post first, then rescan, so the batch is built from what is on the page now.
+        const expandedNow = expandCollapsedSpaceFeedPosts(getSpaceFeedPostEntries(), {nearOnly: false, limit: 25})
+        if(expandedNow) await new Promise(resolve => setTimeout(resolve, 1500))
+        // The batch is read from the list stored on this button at the last render, so a render refreshes that list before the read.
+        // Without it, a post expanded by this click was counted in the label but left out of the batch.
+        syncSpaceFeedNukeControls()
 
         const currentEntries = getLatestSpaceFeedEntries()
         const entriesToNuke = getClickedSpaceFeedEntries(activeButton, currentEntries)
@@ -10103,9 +10538,7 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         setMuteBlockHelp(button, queueableEntries.length
             ? 'This space has active queued work. Use the black post buttons to add newly visible candidates.'
             : 'This space has active queued work.')
-        setNukeButtonWorking(button, model.displaySpaceWorkCount > 0
-            ? formatSpaceFeedGlobalWorkLabel(model.displaySpaceWorkCount)
-            : formatSpaceFeedGlobalWorkLabel(displayEntryWorkCount))
+        setNukeButtonWorking(button, formatSpaceFeedGlobalWorkLabel(model?.pendingProfileCount || 0))
         button.disabled = true
     }
     else if(model?.ownerPaused && ownerRunningForThisSpace && busyEntries.length) {
@@ -10145,29 +10578,203 @@ function syncSpaceFeedTopNukeButton(renderModel) {
     return true
 }
 
+// Posts near the viewport (one screen above and below). Only these get their per-post buttons written, so a change in the count does not
+// touch every post on the page. A post that scrolls near is brought up to date then. Without IntersectionObserver (tests, old browsers)
+// every post counts as near, as before.
+const spaceFeedNearPostRoots = new Set()
+// The post roots the near-post observer has been asked to watch. A post not in here has not been seen by the observer yet.
+const spaceFeedObservedRoots = new WeakSet()
+// Diagnostic (24 Oct): how often and how long each page search takes on the space page, by where it is made. Shown in the Info report.
+const spaceQueryStats = new Map()
+
+function timedSpaceQuery(label, run) {
+    const started = performance.now()
+    try {
+        return run()
+    }
+    finally {
+        const stat = spaceQueryStats.get(label) || {count: 0, ms: 0}
+        stat.count += 1
+        stat.ms += performance.now() - started
+        spaceQueryStats.set(label, stat)
+    }
+}
+
+// Counts an event that has no duration, such as a state request sent to the worker.
+function countSpaceQueryEvent(label) {
+    const stat = spaceQueryStats.get(label) || {count: 0, ms: 0}
+    stat.count += 1
+    spaceQueryStats.set(label, stat)
+}
+
+function formatSpaceQueryStats() {
+    const lines = ['space_query_stats:']
+    const rows = [...spaceQueryStats.entries()].sort((left, right) => right[1].ms - left[1].ms)
+    for(const [label, stat] of rows) {
+        lines.push(`- ${label}: count=${stat.count} ms=${Math.round(stat.ms)}`)
+    }
+    if(!rows.length) lines.push('- none yet')
+    return lines.join('\n')
+}
+
+// Diagnostic (24 Oct): the last button decision for each post that has candidates, and how many posts the last sync was given. Shown in the
+// Info report only. Kept in memory and bounded; never stored.
+const SPACE_FEED_BUTTON_TRACE_LIMIT = 40
+const spaceFeedButtonTrace = new Map()
+let spaceFeedButtonTraceRun = {visible: 0, at: 0}
+let spaceFeedNearObserver = null
+let lastSpaceFeedRenderModel = null
+
+function getSpaceFeedNearObserver() {
+    if(spaceFeedNearObserver || typeof IntersectionObserver !== 'function') return spaceFeedNearObserver
+    spaceFeedNearObserver = new IntersectionObserver(changes => {
+        let arrived = false
+        for(const change of changes) {
+            if(change.isIntersecting) {
+                spaceFeedNearPostRoots.add(change.target)
+                arrived = true
+            }
+            else spaceFeedNearPostRoots.delete(change.target)
+        }
+        if(arrived) scheduleSpaceFeedNearSync()
+    }, {rootMargin: '100% 0px 100% 0px'})
+    return spaceFeedNearObserver
+}
+
+// The place of each post in the feed, first post 1. Link-card entries are not posts and are not counted.
+function getSpaceFeedPostOrdinals() {
+    const ordinals = new Map()
+    let total = 0
+    for(const entry of getLatestSpaceFeedEntries()) {
+        if(`${entry?.postKey || ''}`.startsWith('space-profile-link:')) continue
+        total += 1
+        ordinals.set(entry.postKey, total)
+    }
+    return {ordinals, total}
+}
+
+function formatSpaceFeedPostOrdinalPrefix(postOrdinals, postKey = '') {
+    const ordinal = postOrdinals?.ordinals?.get(postKey)
+    return ordinal ? `Post ${ordinal} of ${postOrdinals.total}: ` : ''
+}
+
+function recordSpaceFeedButtonTrace(entry = {}, reason = '') {
+    if(!entry?.postKey) return
+    const urls = getNormalizedProfileHrefList(entry.candidateUrls || [])
+    if(!urls.length && entry.hasCandidates !== true) return
+    // Delete then set, so the Map keeps the newest decision last and the oldest is dropped first.
+    spaceFeedButtonTrace.delete(entry.postKey)
+    spaceFeedButtonTrace.set(entry.postKey, {
+        reason,
+        candidates: urls.length,
+        hasCandidates: entry.hasCandidates === true,
+        postNuked: entry.postNuked === true,
+        rootConnected: !!entry.postRoot?.isConnected
+    })
+    while(spaceFeedButtonTrace.size > SPACE_FEED_BUTTON_TRACE_LIMIT) {
+        spaceFeedButtonTrace.delete(spaceFeedButtonTrace.keys().next().value)
+    }
+}
+
+function formatSpaceFeedButtonTrace() {
+    // Cards are counted from the page itself, so a post the render never reached still shows up here.
+    const cards = Array.from(document.querySelectorAll('[data-mb-post-diag]'))
+    const withCandidates = cards.filter(card => (Number.parseInt(card.dataset.mbPostDiag, 10) || 0) > 0)
+    const withoutHost = withCandidates.filter(card => !card.querySelector('.mb-ext_space-feed-post-nuke-host'))
+    const lines = [
+        'button_trace:',
+        `- visible_entries_last_sync: ${spaceFeedButtonTraceRun.visible} at ${spaceFeedButtonTraceRun.at ? new Date(spaceFeedButtonTraceRun.at).toISOString() : 'never'}`,
+        `- cards_with_candidates: ${withCandidates.length}`,
+        `- cards_with_candidates_no_host: ${withoutHost.length}`
+    ]
+    let index = 0
+    for(const [key, record] of spaceFeedButtonTrace) {
+        index += 1
+        lines.push(`- trace_${index}: ${record.reason} | candidates=${record.candidates} hasCandidates=${record.hasCandidates} postNuked=${record.postNuked} rootConnected=${record.rootConnected} | ${key.slice(-70)}`)
+    }
+    for(const card of withoutHost.slice(0, 10)) {
+        lines.push(`- no_host_card: ${card.dataset.mbPostDiag}`)
+    }
+    return lines.join('\n')
+}
+
+// 24 Oct: near is the same position test the scan uses, read from the post itself, so an observer report that is behind cannot leave an
+// on-screen post without its button.
+function isSpaceFeedPostRootNear(postRoot) {
+    if(!getSpaceFeedNearObserver()) return true
+    const rect = postRoot?.getBoundingClientRect?.() || null
+    if(!rect) return false
+    return isSpaceFeedTimestampInScanWindow(null, rect)
+}
+
+// 24 Oct: a post that has come into view is drawn by a full redraw, not by the last list. The last list cannot contain a post that arrived after
+// it was built, so drawing from it left those posts blank until the page was scrolled away and back. The redraw timer keeps this to one redraw per gap.
+function scheduleSpaceFeedNearSync() {
+    if(getPageType() !== 'space') return
+    scheduleSpaceAssetNukeControls(0)
+}
+
 function syncSpaceFeedPostButtons(renderModel) {
     const model = Array.isArray(renderModel) ? buildSpaceFeedRenderModel(renderModel) : renderModel
     const activeKeys = new Set()
+    // Hosts already on the page, by post key. The lookup below can miss a host that exists (when Quora re-mounts part of a post), and then
+    // adds a second button set beside the first. Each post keeps the host it uses and drops any other host for the same key.
+    const hostsByKey = new Map()
+    for(const existing of getSpaceFeedPostHostsInDocument()) {
+        const key = existing.dataset.mbPostHostKey || ''
+        if(!hostsByKey.has(key)) hostsByKey.set(key, [])
+        hostsByKey.get(key).push(existing)
+    }
     const entries = model?.visibleEntries || []
     const aggregateUrls = model?.queueableUrls || []
     const aggregateCount = Number.parseInt(model?.queueableCount, 10) || 0
+    spaceFeedButtonTraceRun = {visible: entries.length, at: Date.now()}
+    // 24 Oct: the hover text names the post's place in the feed, counted over every post on the page, not only the ones on screen.
+    const postOrdinals = getSpaceFeedPostOrdinals()
 
     for(const entry of entries) {
+        // Owner, 24 Oct: buttons are for the main post card only. A profile link in a post's text is still counted in the queue, but gets no button,
+        // and it is not kept active here, so an old button on it is removed by the cleanup at the end of this sync.
+        if(`${entry.postKey || ''}`.startsWith('space-profile-link:')) {
+            recordSpaceFeedButtonTrace(entry, 'link-in-body')
+            continue
+        }
+        if(!isSpaceFeedPostRootNear(entry.postRoot)) {
+            activeKeys.add(entry.postKey)
+            recordSpaceFeedButtonTrace(entry, 'not-near')
+            continue
+        }
         const liveUrls = entry.liveUrls || []
+        const postLabel = formatSpaceFeedPostOrdinalPrefix(postOrdinals, entry.postKey)
         const hasResolver = entry.hasResolver === true
         const hasCandidates = entry.hasCandidates === true
         const postBusy = entry.postBusy === true
         const postNuked = entry.postNuked === true
-        const shouldShowControls = postNuked || aggregateCount > 0 || hasCandidates || postBusy
+        // Owner, 23 Oct: the profiles on this post that ended in errors and cannot be queued again. Named on the Bad Links button.
+        const badLinkNames = postNuked || hasCandidates ? [] : getNormalizedProfileHrefList(entry.candidateUrls || [])
+            .filter(url => isProfileNukeRetryBlocked(url) && !isKnownNukedSpaceFeedProfile(url))
+            .map(url => url.split('/profile/')[1] || url)
+        const hasBadLinks = badLinkNames.length > 0
+        const shouldShowControls = postNuked || aggregateCount > 0 || hasCandidates || postBusy || hasBadLinks
         if(!shouldShowControls) {
             delete entry.postRoot.dataset.mbSpaceFeedPostKey
+            spaceFeedMarkedRoots.delete(entry.postRoot)
+            recordSpaceFeedButtonTrace(entry, 'no-controls')
             continue
         }
 
         const host = getSpaceFeedPostButtonHost(entry.postRoot, entry.postKey)
-        if(!host) continue
+        if(!host) {
+            recordSpaceFeedButtonTrace(entry, 'no-host')
+            continue
+        }
+        recordSpaceFeedButtonTrace(entry, postNuked ? 'nuked' : hasCandidates ? 'red' : hasBadLinks ? 'bad-links' : 'other')
+        for(const stale of hostsByKey.get(entry.postKey) || []) {
+            if(stale !== host && stale.isConnected) stale.remove()
+        }
 
         entry.postRoot.dataset.mbSpaceFeedPostKey = entry.postKey
+        spaceFeedMarkedRoots.add(entry.postRoot)
         activeKeys.add(entry.postKey)
 
         if(postNuked) {
@@ -10184,9 +10791,11 @@ function syncSpaceFeedPostButtons(renderModel) {
             doneButton.dataset.mbPostUrl = entry.postUrl || ''
             setSpaceFeedButtonUrls(doneButton, liveUrls)
             doneButton.classList.remove('mb-ext_space-feed-post-single-nuke-btn--neutral')
-            setMuteBlockHelp(doneButton, 'This post has already been nuked')
+            setMuteBlockHelp(doneButton, `${postLabel}This post has already been nuked`)
             setNukeButtonDone(doneButton)
             doneButton.disabled = true
+            // 24 Oct: a button hidden while the post had nothing to show is shown again once the post is nuked.
+            doneButton.style.display = ''
             syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
             continue
         }
@@ -10252,9 +10861,9 @@ function syncSpaceFeedPostButtons(renderModel) {
 
         queueButton.dataset.mbPostKey = entry.postKey
         setSpaceFeedButtonSelection(queueButton, model?.queueableEntries || [])
-        setMuteBlockHelp(queueButton, aggregateCount > 0
-            ? buildNukeTargetsHelpText(`Queue ${aggregateCount} current target${aggregateCount === 1 ? '' : 's'} from visible posts in this space`, aggregateUrls)
-            : 'No currently detected targets are queueable from visible posts in this space')
+        setMuteBlockHelp(queueButton, postLabel + (aggregateCount > 0
+            ? `Queue ${aggregateCount} current target${aggregateCount === 1 ? '' : 's'} in this space (this post: ${(entry.queueableUrls || []).map(url => url.split('/profile/')[1] || url).join(', ') || 'none'})`
+            : 'No currently detected targets are queueable from visible posts in this space'))
 
         if(queueButton.dataset.mbQueueing === 'true') {
             setNukeButtonWorking(queueButton, `Nuking ${aggregateCount}`)
@@ -10264,36 +10873,51 @@ function syncSpaceFeedPostButtons(renderModel) {
             setNukeButtonIdle(queueButton, `Nuke 'Em ${aggregateCount}`)
             queueButton.disabled = aggregateCount < 1
         }
+        // Owner, 23 Oct: the black count button belongs with a red button, so it is hidden on a post that has none.
+        queueButton.style.display = hasCandidates ? '' : 'none'
 
         singleButton.dataset.mbPostKey = entry.postKey
         singleButton.dataset.mbPostUrl = entry.postUrl || ''
         setSpaceFeedButtonUrls(singleButton, liveUrls)
-        setMuteBlockHelp(singleButton, hasResolver
+        setMuteBlockHelp(singleButton, postLabel + (hasResolver
             ? 'Queue this post for author profile resolution and mute-block'
-            : buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton)))
+            : buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton))))
+        // Diagnostic, 23 Oct: shown on hover after the help text, and kept on the button as data-mb-diag.
+        const diagnostic = getSpaceFeedPostCandidateDiagnostic(entry)
+        singleButton.dataset.mbDiag = diagnostic
+        singleButton.title = `${singleButton.title} | diagnostic ${diagnostic}`
         singleButton.classList.remove('mb-ext_space-feed-post-single-nuke-btn--neutral')
 
+        // Owner, 23 Oct: red means the post has a profile that is in the queue to be nuked. A post whose profiles are all queued already
+        // shows Nuking.
         if(postNuked) {
             setNukeButtonDone(singleButton)
-            singleButton.disabled = true
-        }
-        else if(postBusy) {
-            setNukeButtonWorking(singleButton, formatSpaceFeedPostWorkLabel(entry.liveWorkCount || entry.queueableWorkCount || 0))
             singleButton.disabled = true
         }
         else if(hasCandidates) {
             setNukeButtonIdle(singleButton, 'Mute-Block')
             singleButton.disabled = false
         }
+        else if(postBusy) {
+            setNukeButtonWorking(singleButton, formatSpaceFeedPostWorkLabel(entry.liveWorkCount || entry.queueableWorkCount || 0))
+            singleButton.disabled = true
+        }
+        else if(hasBadLinks) {
+            setNukeButtonBadLinks(singleButton)
+            singleButton.disabled = true
+            setMuteBlockHelp(singleButton, `${postLabel}Bad Links: nothing here can be queued. Failed: ${badLinkNames.join(', ')}`)
+        }
         else {
             setNukeButtonIdle(singleButton, 'Mute-Block')
             singleButton.disabled = true
         }
+        // Owner, 23 Oct: the red button is there only while a profile in the post is in the queue, so a post with none gets no button.
+        singleButton.style.display = postNuked || hasCandidates || postBusy || hasBadLinks ? '' : 'none'
 
         syncSpaceFeedPostHeaderReservedSpace(entry.postRoot, host)
     }
 
-    for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
+    for(const host of getSpaceFeedPostHostsInDocument()) {
         const button = host.querySelector('.mb-ext_space-feed-post-nuke-btn')
         const postKey = button?.dataset.mbPostKey || host.dataset.mbPostHostKey || ''
         if(!button ||
@@ -10305,7 +10929,7 @@ function syncSpaceFeedPostButtons(renderModel) {
     }
 
     const seenHostKeys = new Set()
-    for(const host of Array.from(document.querySelectorAll('.mb-ext_space-feed-post-nuke-host'))) {
+    for(const host of getSpaceFeedPostHostsInDocument()) {
         const hostKey = host.dataset.mbPostHostKey || host.querySelector('.mb-ext_space-feed-post-nuke-btn')?.dataset.mbPostKey || ''
         if(!hostKey) continue
         if(seenHostKeys.has(hostKey)) {
@@ -10315,11 +10939,59 @@ function syncSpaceFeedPostButtons(renderModel) {
         seenHostKeys.add(hostKey)
     }
 
-    for(const root of Array.from(document.querySelectorAll('[data-mb-space-feed-post-key]'))) {
+    for(const root of getSpaceFeedMarkedRoots()) {
         if(isSpaceFeedDocumentLevelElement(root) || !activeKeys.has(root.dataset.mbSpaceFeedPostKey || '')) {
             delete root.dataset.mbSpaceFeedPostKey
+            spaceFeedMarkedRoots.delete(root)
         }
     }
+}
+
+// Owner, 23 Oct: a collapsed post shows no profile link, so its candidates cannot be read. Clicking the post body expands it, which shows the
+// link. Each post is clicked at most once, since a second click would collapse it again.
+const spaceFeedExpandedPostKeys = new Set()
+const SPACE_FEED_EXPAND_CLICKS_PER_PASS = 3
+
+// The post body, found by its position under the author header: the element at a point just below the header. Anything that is a link,
+// a button, part of the header, or the Follow control is not used, so a click cannot open a profile or follow someone.
+function findSpaceFeedPostBodyElement(postRoot) {
+    const header = postRoot.querySelector('a.post_timestamp')?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
+    if(!header) return null
+
+    const rect = postRoot.getBoundingClientRect()
+    const y = header.getBoundingClientRect().bottom + 12
+    if(y >= rect.bottom - 4) return null
+
+    const x = rect.left + Math.min(40, rect.width / 2)
+    const element = document.elementFromPoint(x, y)
+    if(!element || !postRoot.contains(element) || header.contains(element)) return null
+    if(element.closest('a, button, [role="button"], .mb-ext_space-feed-post-nuke-host')) return null
+    if(/\bfollow\b/i.test(element.textContent || '') && (element.textContent || '').trim().length < 40) return null
+
+    return element
+}
+
+function expandCollapsedSpaceFeedPosts(entries = [], options = {}) {
+    const nearOnly = options.nearOnly !== false
+    const limit = options.limit || SPACE_FEED_EXPAND_CLICKS_PER_PASS
+    let clicked = 0
+    for(const entry of Array.isArray(entries) ? entries : []) {
+        if(clicked >= limit) break
+        if(!entry?.postRoot || !entry.postKey || spaceFeedExpandedPostKeys.has(entry.postKey)) continue
+        if(getNormalizedProfileHrefList(entry.candidateUrls || []).length) continue
+        if(nearOnly && !isSpaceFeedPostRootNear(entry.postRoot)) continue
+
+        const target = findSpaceFeedPostBodyElement(entry.postRoot)
+        if(!target) continue
+
+        spaceFeedExpandedPostKeys.add(entry.postKey)
+        target.click()
+        // The post's cached candidate list was read while it was collapsed, so it is read again on the next scan.
+        spaceFeedEntryCache.delete(entry.postKey)
+        clicked += 1
+    }
+    if(clicked) setTimeout(() => syncSpaceFeedNukeControls(), 800)
+    return clicked
 }
 
 function syncSpaceFeedNukeControls() {
@@ -10327,16 +10999,19 @@ function syncSpaceFeedNukeControls() {
         removeSpaceFeedNukeControls()
         return false
     }
+    const renderStartedAt = Date.now()
 
-    const scannedEntries = getSpaceFeedPostEntries()
-    setLatestSpaceFeedEntries(scannedEntries)
-    const entries = getLatestSpaceFeedEntries()
-    scheduleSpaceFeedScopedStateRefresh(entries)
-    const renderModel = buildSpaceFeedRenderModel(scannedEntries, entries)
-    recordSpaceMarkPerf('render', {entries: entries.length, coordinatorReady: coordinatorQueueLoaded})
-    scheduleSpaceFeedProgressReconciliation(entries)
-    clearStaleLocalSpaceFeedBusyState()
-    clearInactiveSpaceFeedNukeMode()
+    // 24 Oct: each phase of the redraw is timed under phase.* in the Info report, to find the one whose cost grows with the feed.
+    const scannedEntries = timedSpaceQuery('phase.scan', () => getSpaceFeedPostEntriesForRender())
+    timedSpaceQuery('phase.expand', () => expandCollapsedSpaceFeedPosts(scannedEntries))
+    timedSpaceQuery('phase.latest', () => setLatestSpaceFeedEntries(scannedEntries))
+    const entries = timedSpaceQuery('phase.latestRead', () => getLatestSpaceFeedEntries())
+    timedSpaceQuery('phase.stateRefresh', () => scheduleSpaceFeedScopedStateRefresh(entries))
+    const renderModel = timedSpaceQuery('phase.model', () => buildSpaceFeedRenderModel(scannedEntries, entries))
+    recordSpaceMarkPerf('render', {entries: entries.length, coordinatorReady: coordinatorQueueLoaded, ms: Date.now() - renderStartedAt})
+    timedSpaceQuery('phase.progressReconcile', () => scheduleSpaceFeedProgressReconciliation(entries))
+    timedSpaceQuery('phase.busyState', () => clearStaleLocalSpaceFeedBusyState())
+    timedSpaceQuery('phase.nukeMode', () => clearInactiveSpaceFeedNukeMode())
     const main = getSpaceFeedContentRoot()
     if(main) {
         main.dataset.mbSpaceFeedTimestampCount = `${entries.length}`
@@ -10346,16 +11021,17 @@ function syncSpaceFeedNukeControls() {
         main.dataset.mbSpaceFeedPostButtonCount = `${getExpectedSpaceFeedPostButtonCount(scannedEntries)}`
     }
 
-    syncSpaceFeedStatusButton(entries)
+    timedSpaceQuery('phase.statusButton', () => syncSpaceFeedStatusButton(entries))
 
     if(!isNukableSpacePage()) {
         removeSpaceFeedNukeButtons()
         return true
     }
 
-    syncSpaceFeedTopNukeButton(renderModel)
+    timedSpaceQuery('phase.topButton', () => syncSpaceFeedTopNukeButton(renderModel))
     syncSpaceFeedTopBarLayout()
-    syncSpaceFeedPostButtons(renderModel)
+    lastSpaceFeedRenderModel = renderModel
+    timedSpaceQuery('phase.postButtons', () => syncSpaceFeedPostButtons(renderModel))
     if(getStoredPendingSpaceFeedWorkCountForSpace() > 0 || hasActivePendingSpaceFeedWork(entries)) {
         scheduleSpaceAssetNukeControls(1200)
     }
@@ -11613,8 +12289,11 @@ async function maybeRunAutoProfileAction() {
                 }, 1000)
                 return false
             }
-            await releaseQueuedTabSlot()
-            await requestCloseTab()
+            // Owner, 23 Oct: close first. The worker only accepts the close while this tab still owns the attempt, and releasing the slot
+            // first ended that ownership, so the close was refused and the tab waited for the orphan sweep. The worker's close also
+            // releases the slot, so the slot is released here only when the close did not happen.
+            const closed = await requestCloseTab()
+            if(!closed) await releaseQueuedTabSlot()
             return true
         }
         const skipQueuedUnavailableTab = async message => {

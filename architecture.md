@@ -237,6 +237,30 @@ brief programmatic focus/blur around the action is an acceptable tradeoff
 against the "don't steal user attention" goal this surface exists for) once
 the rest of the coordinator/queue work now in progress lands.
 
+## Platform Boundary: Desktop And iOS
+
+The queue, WAL/checkpoint, browser-tab executor, and dedicated worker-window
+architecture described above is the current desktop Chrome/Firefox lane. Its
+storage volume, background scheduling, and tab/window assumptions are not a
+portable contract for iPhone Safari. The separate
+[iPhone Safari plan](mute-block-ios-safari-plan.md) explicitly assumes no
+shared-code dependency on this desktop extension and limits the first mobile
+version to foreground, user-directed actions rather than unattended queued
+moderation.
+
+The iOS API restrictions in that plan are iOS-specific. They should not be
+inferred to apply to macOS Safari: macOS Safari is a distinct extension target
+and needs its own API/lifecycle evaluation. A Mac is also part of the planned
+iOS development toolchain because Xcode and Safari Web Inspector are needed;
+that prerequisite does not make the desktop queue architecture an iOS design.
+
+The October 2026 WAL/dashboard/tab-cleanup review findings concern the current
+desktop implementation and its completion-to-next-job costs. They are not a
+reason to add the desktop WAL, large completed-history snapshots, queue metrics,
+or background executor to the iPhone plan. Reuse only a specific component if a
+future platform design independently establishes that it fits the platform's
+lifecycle, storage, and foreground-action constraints.
+
 ## Scheduler Boundary
 
 Scheduler timers and browser alarms are non-persistent runtime effects. They
@@ -413,6 +437,24 @@ far" or "recompute onto a seed read moments ago" pattern touching a durable
 key deserves the same scrutiny, especially wherever the read and the eventual
 write are separated by an `await`.
 
+### Stored Work Clear (as built, 15 Oct 2026)
+
+`mutateCoordinatorStoredWorkClear` builds its plan with
+`buildStoredWorkClearPlan(state = {})`. The plan comes from a read, so it can be
+stale when it is saved. Before saving, the clear re-reads and checks each
+planned row's attempt against the fresh read. If any row moved, the plan is
+rebuilt from the fresh read. The loop is bounded by
+`STORED_WORK_CLEAR_REREAD_ATTEMPTS`, which is 2 ([tunables.js](shared/js/tunables.js)).
+
+A row that still moved after the last re-read is removed with the rest, not left
+behind (owner, 14 Oct). Its tab is in the plan's owned tabs, so the tab is
+closed. The completed-row read, `completedRecent(Number.MAX_SAFE_INTEGER)`, is
+not measured yet (open).
+
+Open: a late write from an attempt that moved after the last read. A write to a
+row that no longer exists is rejected on the milestone path
+(`missing-coordinator-item`). The other writers have not been checked.
+
 ## Module Extraction And The Test Harness Realm Boundary
 
 **Resolved 2026-09** (`test/lib/swHarness.js`, commits `db12da9`,
@@ -523,6 +565,120 @@ messages that carry attempt identity and are accepted or rejected by the service
 worker authority boundary. Non-queued local observations may update content-local
 UI state, but they do not persist service-worker queue/progress authority.
 
+## Profile Identity, Landing And Resolution
+
+Status: as built, 15 Oct 2026. The changes are in the working tree on
+`review/shared-wip` (HEAD `abc2307`) and are not committed. They close the
+owner rules from the 14 and 15 Oct reviews. The record is
+[14-oct-review-3-reply.md](14-oct-review-3-reply.md), sections 7 to 10. The
+reviewer responses are [14-oct-review-5.md](14-oct-review-5.md),
+[14-oct-review-5-response.md](14-oct-review-5-response.md) and
+[14-oct-review-5-response-2.md](14-oct-review-5-response-2.md).
+
+### Identity rule
+
+A profile is the slug exactly as written in its link.
+
+- The slug is case-sensitive. `Cesc-Fabregas-56` and `cesc-fabregas-56` are
+  different profiles.
+- The slug is composed with NFC, not NFKC. A fullwidth lookalike such as
+  `Ｃｅｓｃ-Fabregas-56` is a different profile.
+- No suffix is removed. `Cesc-Fabregas-share-56` is a different profile from
+  `Cesc-Fabregas`, and `Jane-Type-Smith-7` is different from `Jane`.
+- No trailing separator and no whitespace is trimmed.
+- The query and the fragment are dropped. Whether the query belongs in
+  identity is still open (see Loose Ends in [planning.md](planning.md)).
+- Percent-encoding is decoded for the key.
+
+Where the rule lives:
+
+- Worker and hrefs: `sanitizeProfileHrefSlug` and `normalizeQuoraProfileHref`
+  in [subject.js](shared/js/subject.js). No identity key calls the suffix
+  helpers. `legacyStrippedSuffix` and `shadowSuffixTokens` compute what the old
+  rule would have removed. They feed the shadow counter only.
+- Content: `getQuoraProfileSlugData`, `getNormalizedProfileIdentityKey` and
+  `getNormalizedProfileHrefList` in [content.js](shared/js/content.js). The
+  list keeps every case variant and every shorter identity. The only dedupe is
+  on the identity key.
+
+Removed, and not to be reintroduced without an owner decision: the
+identity-prefix truncation filter, the lower-casing of identity keys, the
+name-association candidate (a post's title no longer chooses a profile), and
+the suffix cut. The old concern that `Cesc-Fabregas-share-56` became
+`Cesc-Fabregas` no longer applies, because no key strips it.
+
+### Candidates from a space feed
+
+Candidates come from the post itself, in `content.js`:
+
+- profile links in the post's DOM are high confidence;
+- profile URLs in the post's text are medium;
+- on asset pages only, a slug taken from the post's own URL is medium when it
+  has two or more tokens, and low otherwise;
+- low-confidence candidates are not queued.
+
+Medium candidates are queued and nuked, with no per-candidate check (open). A
+text URL that is truncated (an ellipsis in its profile path) is dropped.
+
+### Landing check
+
+A queued tab must land on the queued profile. The comparison is exact after
+normalisation.
+
+- Content side: `getQueuedProfileRemapTarget` compares the normalised queued
+  href with the normalised `location.href`.
+- Worker side: the tab-update check in [swBootstrap.js](shared/js/swBootstrap.js)
+  ends a row that lands on a different profile
+  (`terminalizeQueuedTabProfileRedirectMismatchFromMetadata`).
+
+The check reads the URL only. It does not read the profile's own identity from
+the page, so a lookalike that Quora serves at its own URL can pass it. That gap
+is the reason for the dry-run mode, which is designed but not built. The worker
+check is skipped for resolver rows, which have no queued href.
+
+### Resolution
+
+A row with no queued href (`resolveProfileFromPage`) is resolved from its source
+post or page.
+
+- It is created only for asset-space posts with a low-confidence artifact (the
+  entry builder sets the flag as `isAssetSpacePage() && !!postUrl &&
+  needsSourceResolution`), and by retries of resolution rows.
+- The resolver picks the post header's profile link, the page's inline data, a
+  keyword-scored scan of its profile links, the single explicit profile link, or
+  the single listed link. The order differs by page type. Each choice is counted
+  (see Live-run checks under Metrics And Tests).
+- The worker accepts a resolved profile only for a resolution row.
+  `resolveQueuedProfileTarget` refuses any other row with
+  `not-profile-resolution-item`.
+- The keyword-scored scan still decides profiles for resolution rows on question
+  pages and space posts. Owner, 15 Oct: kept, and measured.
+- `maybeRedirectToOriginalPoster` navigates to a scored guess when the URL has
+  `mb_op=1`, which the original-poster link adds. Deferred.
+
+### Retry and "did not land"
+
+Owner, 15 Oct:
+
+- A row with its own queued link is never retried as a resolution from its
+  source post or question. `getFailedItemProfileResolutionRetryUrl` returns no
+  URL for such a row. A "did not land" error carries the post URL, so without
+  this guard a canonical row could block a profile picked from its post.
+- A queued tab that does not land on a profile page is not retried.
+  `isRetryableJobFailure` returns false for that error, so the automatic retry
+  skips it, and the row is archivable once it is terminal.
+- Manual requeue (`REQUEUE_FAILED_ITEMS`) does not filter by retryability. It
+  can requeue such a row on the same link. This is disclosed, not hidden.
+
+### Profile search
+
+The profile-search match is not covered by the identity rule.
+`isProfileSearchHrefMatchForCurrentQuery` folds case and NFKD, so a fullwidth or
+lower-case link matches the same query words. The batch button blocks every
+staged match, including the real profile if it is in the results. It is left as
+it is, to be tested in the live run, and it stays out of the first canonical
+run.
+
 ## Shared Moderation Boundary
 
 Imported moderation data is review and policy input, not a remote command
@@ -564,6 +720,28 @@ UI controls activated. The flight recorder is remotely probeable for failure
 analysis, but it is not persisted, not replay input, not authority, and not a
 trace file. See
 [flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md).
+
+### Live-run checks (as built, 15 Oct 2026)
+
+The dashboard's Metrics section has a "Live checks" card (`buildLiveChecksCard`
+in [coordinator.js](shared/js/coordinator.js)). Its value is the number of
+resolutions decided by the keyword scan of a page, out of all resolutions. It
+alerts when that count is above zero. The detail line and the counters behind
+it:
+
+- `liveCheck.resolvedBy.<source>`, for `header`, `inline`, `scored`,
+  `explicit`, `listed`, `url`, and `unknown` for any other value. The worker
+  counts a resolution only after `resolveQueuedProfileTarget` succeeds, so a
+  refused guess is not counted.
+- `liveCheck.didNotLand`, reported by the content script when a tab does not
+  land on a profile page (`content-live-check`).
+- `job.profileRedirectMismatch` (rows ended by the landing check),
+  `suffixShadow.changed` and `suffixShadow.token.*` (what the old suffix rule
+  would have cut; measurement only, no key uses it),
+  `pump.executorStartSuperseded.*`, and `contentClaimRetry.*`.
+
+The counts say how often the scan decided a profile. They do not say whether it
+decided rightly. That needs the rows.
 
 Tests should exercise state snapshots directly:
 

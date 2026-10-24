@@ -153,6 +153,8 @@ function loadDashboardHarness() {
             if(name === './tunables') return require(path.join(__dirname, '..', 'shared/js/tunables'))
             if(name === './storageKeys') return require(path.join(__dirname, '..', 'shared/js/storageKeys'))
             if(name === './spaceMapStorage') return require(path.join(__dirname, '..', 'shared/js/spaceMapStorage'))
+            // The dashboard's footer bar is built by this module; the contract tests do not draw it.
+            if(name === './queueProgressBar') return {createQueueProgressBar: () => ({bar: {style: {}}, setProgress() {}})}
             throw new Error(`unexpected require: ${name}`)
         },
         addEventListener() {},
@@ -390,6 +392,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'coordinator-page-ready',
         'create-tab',
         'enqueue-coordinator-items',
+        'erase-block-history',
         'get-content-page-coordinator-state',
         'get-coordinator-queue-accounting',
         'get-coordinator-queue-runtime-state',
@@ -1469,8 +1472,8 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.ok(currentWorkIndex >= 0)
     assert.ok(currentWorkIndex < summaryIndex)
     assert.ok(summaryIndex < runsIndex)
-    assert.ok(runsIndex < metricsIndex)
-    assert.ok(metricsIndex < eventsIndex)
+    assert.ok(metricsIndex < runsIndex, 'metrics sits above runs')
+    assert.ok(runsIndex < eventsIndex)
     assert.match(html, /Showing 0, 0 queued, 0 succeeded, 0 soft-fail, 0 hard-fail/)
     assert.match(html, /id="pauseCurrentWorkState">Running[\s\S]*id="currentWorkReadyCount"[\s\S]*id="startCoordinatorButton"[\s\S]*id="pauseCurrentWorkButton"[\s\S]*id="cancelCurrentWorkButton"[\s\S]*id="requeueFailedButton"[\s\S]*id="retryFailedButton"/)
     assert.match(html, />Queued<\/div>/)
@@ -2007,7 +2010,7 @@ test('profile-search content uses scoped runtime state instead of full storage c
     assert.match(pendingRefreshBody, /syncProfileSearchControls\(\)/)
     assert.match(syncBody, /pendingSearchCount > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
     assert.match(nukeBody, /queued > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
-    assert.match(spaceSyncBody, /const entries = getLatestSpaceFeedEntries\(\)[\s\S]*scheduleSpaceFeedScopedStateRefresh\(entries\)[\s\S]*buildSpaceFeedRenderModel/)
+    assert.match(spaceSyncBody, /const entries = timedSpaceQuery\('phase\.latestRead', \(\) => getLatestSpaceFeedEntries\(\)\)[\s\S]*scheduleSpaceFeedScopedStateRefresh\(entries\)[\s\S]*buildSpaceFeedRenderModel/)
     assert.match(spaceScopedRefreshBody, /refreshContentPageCoordinatorStateFromRuntime\(\{[\s\S]*force: true,[\s\S]*entries: scopedEntries/)
     assert.match(spaceScopedRefreshBody, /syncSpaceFeedNukeControls\(\)/)
     assert.match(listenerBody, /source\.addListener\(onStorageChanged\)/)
@@ -4586,7 +4589,8 @@ test('manifests allow service-worker content-script injection fallback', () => {
 
 test('space-feed scan root prefers the post-bearing main content node', () => {
     const source = readRepoFile('shared/js/content.js')
-    const rootBody = extractFunction(source, 'function getSpaceFeedContentRoot()')
+    // The root is worked out in computeSpaceFeedContentRoot and reused for a short time by getSpaceFeedContentRoot (24 Oct).
+    const rootBody = extractFunction(source, 'function computeSpaceFeedContentRoot()')
     const syncBody = extractFunction(source, 'function syncSpaceFeedNukeControls()')
 
     assert.match(rootBody, /querySelectorAll\('#mainContent, main, \[role="main"\]'\)/)
@@ -4880,7 +4884,7 @@ test('contributor modal rows are queueable without follow proxy controls', () =>
     assert.match(body, /isContributorProfileModal\(getProfileModalForItem\(item\)\)/)
     assert.match(body, /return true/)
     assert.match(body, /return hasVisibleFollowProxy\(item\)/)
-    assert.match(observer, /const activeModal = getProfilePeopleModal\(\)/)
+    assert.match(observer, /const activeModal = dialogMayBeOpen \? getProfilePeopleModal\(\) : null/)
     assert.match(observer, /needsLateModalActions/)
     assert.match(observer, /!activeModalButtons\.nuke/)
     assert.match(observer, /injectModalOpenProfilesBtn\(\)/)

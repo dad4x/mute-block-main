@@ -3,8 +3,10 @@ const {
     CHECKPOINT_A,
     CHECKPOINT_B,
     activateCheckpoint,
+    appendWalRecordsToGeneration,
     buildSegmentedWalStoragePayload,
     getSegmentedWalMetaKey,
+    hydrateSegmentedWalStore,
     makePairedCheckpointStore,
     recoverProjectedState,
     writeInactiveCheckpoint
@@ -39,6 +41,7 @@ function makeLayer(options = {}) {
     const diagnostics = []
     const flightEntries = []
     const mirrorReads = []
+    const writes = []
     const diskSnapshots = options.diskSnapshots || []
     let diskReadCount = 0
     const pick = (source, keys) => Object.fromEntries(keys.map(key => [key, source[key] ?? null]))
@@ -68,6 +71,10 @@ function makeLayer(options = {}) {
                 const snapshot = diskSnapshots[Math.min(diskReadCount, diskSnapshots.length - 1)]
                 diskReadCount += 1
                 return pick(snapshot, Object.keys(defaults))
+            },
+            metricStorageSet: async (payload = {}, writeOptions = {}) => {
+                if(options.writeFails) throw new Error("injected write failure")
+                writes.push({...payload})
             }
         },
         mirror: {
@@ -84,10 +91,10 @@ function makeLayer(options = {}) {
             normalizeMap: value => ({...(value || {})}),
             makeCheckpoint: queue => ({fromSnapshot: queue}),
             normalizeStore: (value, snapshotQueue) => value || {fromSnapshot: snapshotQueue},
-            canUseResidentForMeta: (store, meta) => Boolean(store) && store.meta?.activeCheckpoint === meta?.activeCheckpoint
+            canUseResidentForMeta: (store, meta) => options.residentUsable !== false && Boolean(store) && store.meta?.activeCheckpoint === meta?.activeCheckpoint
         }
     })
-    return {layer, metrics, reads, diagnostics, flightEntries, mirrorReads}
+    return {layer, metrics, reads, diagnostics, flightEntries, mirrorReads, writes}
 }
 
 // One sharded checkpoint in the active slot, with one queue row. Four shards, to match the layer's constants.
@@ -241,6 +248,72 @@ assert.throws(() => createQueueWalStore({}), /Missing queue WAL store dependency
         const mismatch = diagnostics.find(entry => entry.type === MISMATCH_EVENT)
         assert.ok(mismatch, 'the fail-closed path records the mismatch')
         assert.ok(mismatch.message.includes(disagreeingPayload[SLOT_MANIFEST_KEY].stateHash), 'the rejected copy is named')
+    })
+
+    // Recovery B, the worker's own copy (docs/queue-storage-layering.md, section 6). The resident store's active slot is the other
+    // one, so the load does not reuse it and reads the disk, where the slot is torn. Its checkpoint records are the copy.
+    // The worker keeps a store only when it has WAL segments on its active slot, so one real append stands in for live activity.
+    const residentWith = payload => {
+        const store = hydrateSegmentedWalStore(payload, {baseKey: BASE_KEY}).store
+        const appended = appendWalRecordsToGeneration(store, [{kind: 'map.set', area: 'queue', key: 'https://example.test/resident-tail', value: {status: 'queued', attemptId: 'attempt-tail', attemptNumber: 1, updatedAt: 9}, attemptId: 'attempt-tail', attemptNumber: 1, status: 'queued'}], {segmentId: 'resident-tail'}).store
+        // The meta a durable write of this store would carry, as the worker keeps it after a write.
+        return {...appended, meta: buildSegmentedWalStoragePayload(appended, {baseKey: BASE_KEY})[META_KEY]}
+    }
+
+    // (d) No mirror copy. The worker's copy agrees with the disk meta: the store is accepted, the torn slot is written back, and the
+    // disk meta is not written.
+    await scenario('a torn checkpoint manifest is recovered from the worker copy when no mirror copy exists, and the slot is written back', async () => {
+        const {layer, writes, metrics, diagnostics} = makeLayer({diskSnapshots: [tornDisk], mirrorCopy: null, residentUsable: false})
+        layer.resident.set(residentWith(currentPayload))
+        const stored = currentStored()
+        const result = await layer.loadStoreFromStorage(stored, {}, {})
+        assert.equal(recoverProjectedState(result).projected.state.queue[ROW_HREF].attemptId, 'attempt-current-slot')
+        assert.equal(stored[BASE_KEY], result)
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointRecoveredFromWorker'))
+        assert.equal(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointRecoveredFromMirror'), false)
+        const recovered = diagnostics.find(entry => entry.type === RECOVERED_EVENT)
+        assert.ok(recovered?.message.includes('recovered from the worker'), 'the worker is named as the source')
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointWorkerRepaired'), 'the slot is written back')
+        const written = Object.assign({}, ...writes)
+        assert.equal(written[SLOT_MANIFEST_KEY].stateHash, currentPayload[SLOT_MANIFEST_KEY].stateHash, 'the written manifest is the current one')
+        assert.ok(Object.keys(written).every(key => key !== META_KEY), 'the disk meta is never written')
+    })
+
+    // (e) The worker's copy disagrees with the disk meta: it is not used, nothing is written, and the refusal names it.
+    await scenario('a worker copy that disagrees with the disk meta is not used, and the refusal names it', async () => {
+        const {layer, writes, metrics, diagnostics} = makeLayer({diskSnapshots: [tornDisk], mirrorCopy: null, residentUsable: false})
+        layer.resident.set(residentWith(disagreeingPayload))
+        const stored = currentStored()
+        await assert.rejects(() => layer.loadStoreFromStorage(stored, {}, {}), error => error?.walDecodeFailed === true)
+        assert.equal(stored[BASE_KEY], undefined, 'no store is accepted')
+        assert.equal(writes.length, 0, 'nothing is written')
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointWorkerCopyRejected'))
+        const mismatch = diagnostics.find(entry => entry.type === MISMATCH_EVENT)
+        assert.ok(mismatch, 'the fail-closed path records the mismatch')
+        assert.ok(mismatch.message.includes('worker copy: rejected'), 'the worker copy is named as rejected')
+        assert.ok(mismatch.message.includes(disagreeingPayload[SLOT_MANIFEST_KEY].stateHash), 'the rejected copy is named by its fingerprint')
+    })
+
+    // (f) The session mirror's copy disagrees, the worker's agrees: the worker's copy is used.
+    await scenario('a worker copy is used when the session mirror copy disagrees with the disk meta', async () => {
+        const {layer, metrics, diagnostics} = makeLayer({diskSnapshots: [tornDisk], mirrorCopy: disagreeingPayload, residentUsable: false})
+        layer.resident.set(residentWith(currentPayload))
+        const stored = currentStored()
+        const result = await layer.loadStoreFromStorage(stored, {}, {})
+        assert.equal(recoverProjectedState(result).projected.state.queue[ROW_HREF].attemptId, 'attempt-current-slot')
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointMirrorCopyRejected'))
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointRecoveredFromWorker'))
+        assert.equal(diagnostics.find(entry => entry.type === RECOVERED_EVENT)?.message.includes('recovered from the worker'), true)
+    })
+
+    // (g) The write-back fails: the recovery stands, because the store is verified in memory, and the failure is counted.
+    await scenario('a failed write-back does not undo a worker recovery, and the failure is counted', async () => {
+        const {layer, metrics} = makeLayer({diskSnapshots: [tornDisk], mirrorCopy: null, writeFails: true, residentUsable: false})
+        layer.resident.set(residentWith(currentPayload))
+        const stored = currentStored()
+        const result = await layer.loadStoreFromStorage(stored, {}, {})
+        assert.equal(recoverProjectedState(result).projected.state.queue[ROW_HREF].attemptId, 'attempt-current-slot')
+        assert.ok(metrics.some(m => m.name === 'coordinatorAuthority.queueWal.checkpointWorkerRepairFailed'))
     })
 
     // (d) A torn read that the single re-read resolves is accepted from disk, and the mirror is not consulted.

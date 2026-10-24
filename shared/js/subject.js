@@ -188,7 +188,23 @@ function getDefaultBaseUrl() {
     return globalThis.location?.origin || 'https://www.quora.com'
 }
 
+// Owner, 24 Oct: the same profile address is normalised on every render. Results are remembered (bounded), since the function is pure for a given base.
+const normalizedProfileHrefMemo = new Map()
+const NORMALIZED_PROFILE_HREF_MEMO_LIMIT = 4000
+
 function normalizeQuoraProfileHref(href, baseUrl = getDefaultBaseUrl()) {
+    if(!href) return null
+
+    const key = `${href}\n${baseUrl}`
+    if(normalizedProfileHrefMemo.has(key)) return normalizedProfileHrefMemo.get(key)
+
+    const value = normalizeQuoraProfileHrefUncached(href, baseUrl)
+    if(normalizedProfileHrefMemo.size >= NORMALIZED_PROFILE_HREF_MEMO_LIMIT) normalizedProfileHrefMemo.clear()
+    normalizedProfileHrefMemo.set(key, value)
+    return value
+}
+
+function normalizeQuoraProfileHrefUncached(href, baseUrl = getDefaultBaseUrl()) {
     if(!href) return null
 
     try {

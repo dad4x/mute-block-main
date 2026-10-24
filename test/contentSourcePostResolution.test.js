@@ -107,7 +107,7 @@ test('space-feed profile-link-card scanner excludes embedded/quoted sub-post aut
     // a troll-patrol (asset) space's post, his byline rendered as this same
     // card shape, and he was queued for mute-block a third time as a result.
     const source = readRepoFile('shared/js/content.js')
-    const cardRootBody = extractFunction(source, 'function getSpaceFeedProfileLinkCardRoot(link)')
+    const cardRootBody = extractFunction(source, 'function computeSpaceFeedProfileLinkCardRoot(link)')
 
     assert.match(
         cardRootBody,
@@ -115,23 +115,12 @@ test('space-feed profile-link-card scanner excludes embedded/quoted sub-post aut
     )
 })
 
-test('space-feed post content scopes exclude embedded/quoted sub-post regions', () => {
-    // 2026-10-08: auditing the Franklin Veaux pattern turned up two more
-    // consumers of the same gap before either could actually be triggered
-    // live -- getSpaceFeedPostCandidateProfileUrls's main dom-profile-link
-    // loop and its text-profile-url fallback both iterate whatever scopes
-    // this function returns, and neither has any embed-awareness of its
-    // own. getSpaceFeedPostContentScopes used to deliberately include
-    // embed/quote marker elements (.standalone_featurable,
-    // [data-is-quora-embed="true"], [data-type="hyperlink_embed"]) as
-    // scopes to search *inside*, so an embedded/quoted sub-post's own
-    // author byline link (or its plain-text URL) was indistinguishable
-    // from something the actual poster deliberately wrote.
+test('space-feed post content scopes read embedded/quoted sub-post regions like the rest of the post', () => {
+    // Owner, 23 Oct: the embed exclusion is removed. A followed author who reposts a target is caught when the block is attempted
+    // (block-attempt-on-following), since the page cannot check who is followed cheaply. Embedded regions are therefore scopes too.
     const source = readRepoFile('shared/js/content.js')
     const scopesBody = extractFunction(source, 'function getSpaceFeedPostContentScopes(postRoot)')
 
-    assert.match(
-        scopesBody,
-        /if\(scope !== postRoot && scope\.closest\(SPACE_FEED_EMBED_SCOPE_SELECTOR\)\) return/
-    )
+    assert.doesNotMatch(scopesBody, /scope\.closest\(SPACE_FEED_EMBED_SCOPE_SELECTOR\)/)
+    assert.match(scopesBody, /\[data-type="hyperlink_embed"\]/)
 })

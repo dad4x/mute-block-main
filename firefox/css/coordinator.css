@@ -43,7 +43,7 @@ body {
 /* Room for the fixed dashboard-bottom-bar below so the last panel doesn't
    sit underneath it. */
 #dashboardView {
-    padding-bottom: 76px;
+    padding-bottom: 44px;
 }
 
 .coordinator-header {
@@ -104,6 +104,13 @@ h2 {
     font-size: 12px;
     font-weight: 700;
     padding: 6px 10px;
+}
+
+/* Owner, 24 Oct: the throttle note is a warning, shown in the same red as the alert metric cards. */
+.status-pill--warn {
+    background: var(--mb-red-50);
+    border: 1px solid var(--mb-red-200);
+    color: var(--mb-red-800);
 }
 
 .dev-mode-toggle {
@@ -923,62 +930,3 @@ a.row-subtitle:hover {
    showing it is already the plain dashboard (see the click handler in
    coordinator.js). Brand red (var(--mb-brand-red)), matching the extension's icon and
    popup/content accent color, rather than the worker-bar's neutral fill. */
-.dashboard-bottom-bar {
-    align-items: center;
-    background: var(--mb-white);
-    border-top: 1px solid var(--mb-grey-200);
-    bottom: 0;
-    box-shadow: 0 -2px 8px rgba(var(--mb-black-rgb), 0.06);
-    box-sizing: border-box;
-    display: flex;
-    gap: 12px;
-    left: 0;
-    padding: 10px 16px;
-    position: fixed;
-    right: 0;
-    width: 100%;
-    z-index: 10;
-}
-
-.dashboard-bottom-bar-logo {
-    background: none;
-    border: none;
-    cursor: pointer;
-    display: block;
-    flex: 0 0 auto;
-    line-height: 0;
-    padding: 0;
-}
-
-.dashboard-bottom-bar-logo img {
-    display: block;
-    height: 28px;
-    object-fit: contain;
-    width: 28px;
-}
-
-.dashboard-bottom-bar-progress {
-    background: var(--mb-grey-100);
-    border: 1px solid var(--mb-grey-200);
-    border-radius: 999px;
-    flex: 1 1 auto;
-    height: 12px;
-    overflow: hidden;
-    position: relative;
-}
-
-.dashboard-bottom-bar-fill {
-    background: var(--mb-brand-red);
-    height: 100%;
-    transition: width 0.3s ease;
-    width: 0%;
-}
-
-.dashboard-bottom-bar-count {
-    color: var(--mb-grey-800);
-    flex: 0 0 auto;
-    font-size: 13px;
-    font-variant-numeric: tabular-nums;
-    font-weight: 700;
-    white-space: nowrap;
-}

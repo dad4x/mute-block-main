@@ -15,6 +15,7 @@ const {
     CHECKPOINT_MANIFEST_META_MISMATCH,
     checkpointManifestMatchesMeta,
     getCheckpointFingerprint,
+    getCheckpointStorageRecords,
     getSegmentedWalCheckpointKey,
     getSegmentedWalCheckpointShardKeys,
     getSegmentedWalSegmentKey,
@@ -63,7 +64,7 @@ function createQueueWalStore(deps = {}) {
         runQueueWakeupMetricPhase
     } = metrics
     const {recordCoordinatorDiagnosticEvent, recordFlightRecorderEvent} = diagnostics
-    const {metricStorageGet} = storage
+    const {metricStorageGet, metricStorageSet} = storage
     const {readCheckpointKeys: readMirrorCheckpointKeys} = mirror
     const {
         scheduleSwitch: scheduleCoordinatorQueueWalCheckpointSwitch,
@@ -210,6 +211,46 @@ function createQueueWalStore(deps = {}) {
         mismatch.mirror = 'used'
         mismatch.copyFingerprint = copyFingerprint
         return {hydrated, copy: copyKeys, mismatch}
+    }
+
+    // Recovery B, the second source after the session mirror (docs/queue-storage-layering.md, section 6). The worker's resident
+    // store holds the active checkpoint as this worker decoded it. Its records are rebuilt into the storage keys the writer uses,
+    // and are used only when the manifest agrees with the disk meta, the copy hydrates, and its state hash verifies. The disk
+    // meta is never written. A copy exists only while this worker is alive, so after a restart a torn slot still fails closed.
+    async function recoverCheckpointFromWorker(stored, meta, mismatch) {
+        const active = normalizeCheckpointId(meta.activeCheckpoint)
+        const metaCheckpoint = meta.checkpoints?.[active] || null
+        const records = getCheckpointStorageRecords(resident.get()?.checkpoints?.[active] || null, COORDINATOR_QUEUE_WAL_KEY, active)
+        if(!metaCheckpoint || !records) {
+            mismatch.worker = 'none'
+            return {hydrated: null, copy: null, mismatch}
+        }
+        const manifestKey = getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, active)
+        const copyFingerprint = getCheckpointFingerprint(records[manifestKey], active)
+        if(!checkpointManifestMatchesMeta(records[manifestKey], metaCheckpoint, active)) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWorkerCopyRejected')
+            mismatch.worker = `rejected (fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+        const hydrated = runQueueWakeupMetricPhase('queueWalHydrate', () => hydrateSegmentedWalStore({...stored, ...records}, {
+            baseKey: COORDINATOR_QUEUE_WAL_KEY,
+            fallbackStore: stored[COORDINATOR_QUEUE_WAL_KEY] || null
+        }))
+        if(hydrated?.ok !== true || !hydrated.store) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWorkerCopyRejected')
+            mismatch.worker = `unusable (${hydrated?.reason || 'hydrate-failed'}, fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+        const verification = verifyCheckpoint(hydrated.store.checkpoints?.[active], COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
+        if(!verification.ok) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWorkerCopyRejected')
+            mismatch.worker = `unusable (${verification.reason}, fingerprint ${copyFingerprint})`
+            return {hydrated: null, copy: null, mismatch}
+        }
+        mismatch.source = 'worker'
+        mismatch.worker = 'used'
+        mismatch.copyFingerprint = copyFingerprint
+        return {hydrated, copy: records, mismatch}
     }
 
     async function loadStoreFromStorage(stored = {}, snapshotQueue = {}, options = {}) {
@@ -364,14 +405,21 @@ function createQueueWalStore(deps = {}) {
             // load fails closed, below, and the mismatch is recorded with both fingerprints.
             let checkpointMismatch = null
             let recoveredFromMirror = null
+            let recoveredCopy = null
             if(hydrated?.reason === CHECKPOINT_MANIFEST_META_MISMATCH) {
                 incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointMismatch')
                 const recovery = await recoverCheckpointFromMirror(stored, meta)
                 checkpointMismatch = recovery.mismatch
-                if(recovery.hydrated) {
-                    Object.assign(stored, recovery.copy)
-                    hydrated = recovery.hydrated
-                    recoveredFromMirror = recovery.mismatch
+                let usable = recovery
+                if(!recovery.hydrated) {
+                    // Recovery B: the worker's own copy, tried only after the session mirror's copy is refused.
+                    usable = await recoverCheckpointFromWorker(stored, meta, checkpointMismatch)
+                }
+                if(usable.hydrated) {
+                    Object.assign(stored, usable.copy)
+                    hydrated = usable.hydrated
+                    recoveredFromMirror = usable.mismatch
+                    recoveredCopy = usable.copy
                 }
             }
             if(hydrated?.ok === true && hydrated.store) {
@@ -380,12 +428,28 @@ function createQueueWalStore(deps = {}) {
                     // Recorded here, once the store is accepted. The copy has passed every check the loader applies to it (identity,
                     // hydrate and the state hash), and a copy refused at any of them is never reported as recovered.
                     const facts = recoveredFromMirror
-                    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointRecoveredFromMirror')
+                    const fromWorker = facts.source === 'worker'
+                    const sourceName = fromWorker ? 'worker' : 'session mirror'
+                    incrementQueueWakeupMetric(fromWorker
+                        ? 'coordinatorAuthority.queueWal.checkpointRecoveredFromWorker'
+                        : 'coordinatorAuthority.queueWal.checkpointRecoveredFromMirror')
                     recordCoordinatorDiagnosticEvent(
                         CHECKPOINT_RECOVERED_EVENT,
-                        `Active checkpoint ${facts.checkpointId} recovered from the session mirror: the disk manifest (fingerprint ${facts.manifestFingerprint}) disagreed with the metadata (fingerprint ${facts.metaFingerprint}); the mirror copy (fingerprint ${facts.copyFingerprint}) agrees with the metadata and was used.`,
+                        `Active checkpoint ${facts.checkpointId} recovered from the ${sourceName}: the disk manifest (fingerprint ${facts.manifestFingerprint}) disagreed with the metadata (fingerprint ${facts.metaFingerprint}); the ${sourceName} copy (fingerprint ${facts.copyFingerprint}) agrees with the metadata and was used.`,
                         {...facts}
                     )
+                    if(fromWorker && typeof metricStorageSet === 'function') {
+                        // Write back only the active slot's records, which the metadata vouches for by state hash. The meta is left as it
+                        // is. The await is in this recovery path only. A failed write does not undo the recovery: the store is verified in
+                        // memory, and the next restart fails closed until a later write repairs the slot.
+                        try {
+                            await metricStorageSet(recoveredCopy, {metricPath: 'coordinatorQueueWal.checkpointWorkerRepair'})
+                            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWorkerRepaired')
+                        }
+                        catch(error) {
+                            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointWorkerRepairFailed')
+                        }
+                    }
                     recordFlightRecorderEvent({
                         kind: CHECKPOINT_RECOVERED_FLIGHT_KIND,
                         source: 'loadStoreFromStorage',
@@ -420,7 +484,7 @@ function createQueueWalStore(deps = {}) {
                 const facts = checkpointMismatch
                 recordCoordinatorDiagnosticEvent(
                     CHECKPOINT_MISMATCH_EVENT,
-                    `Active checkpoint ${facts.checkpointId}: the metadata fingerprint ${facts.metaFingerprint} does not match the disk manifest fingerprint ${facts.manifestFingerprint}; session mirror copy: ${facts.mirror}. Failing closed: the queue authority is unavailable.`,
+                    `Active checkpoint ${facts.checkpointId}: the metadata fingerprint ${facts.metaFingerprint} does not match the disk manifest fingerprint ${facts.manifestFingerprint}; session mirror copy: ${facts.mirror}; worker copy: ${facts.worker || 'not tried'}. Failing closed: the queue authority is unavailable.`,
                     {...facts}
                 )
                 recordFlightRecorderEvent({

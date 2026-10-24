@@ -23,6 +23,7 @@ const lanes = [
       ['node', 'test/contentActionSelectors.test.js'],
       ['node', 'test/contentUnmuteVerification.test.js'],
       ['node', 'test/contentSpaceScopedState.test.js'],
+      ['node', 'test/contentSpaceProfileStateGate.test.js'],
       ['node', 'test/contentSourcePostResolution.test.js'],
       ['node', 'test/contentEnqueueChunkRetry.test.js'],
       ['node', 'test/contentInlineResolution.test.js'],
@@ -62,7 +63,10 @@ const lanes = [
       ['node', 'test/swProfileNukeProgressPush.test.js'],
       ['node', 'test/spaceMapStorage.test.js'],
       ['node', 'test/spaceMapBuckets.test.js'],
-      ['node', 'test/coordinatorEventRecord.test.js']
+      ['node', 'test/coordinatorEventRecord.test.js'],
+      ['node', 'test/runsWal.test.js'],
+      ['node', 'test/walUsersSynthetic.test.js'],
+      ['node', 'test/walAppendUnique.test.js']
     ]
   },
   {
