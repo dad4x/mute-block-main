@@ -39,7 +39,7 @@ runMain(async () => {
             activeCount: text('activeCount'),
             secondsPerBlock: text('secondsPerBlock'),
             terminalCount: text('terminalCount'),
-            eventCount: text('eventCount'),
+            avgPageLoad: text('avgPageLoadValue'),
             runCount: text('runCount'),
             queueCount: text('queueCount'),
             currentWorkReadyCount: text('currentWorkReadyCount'),

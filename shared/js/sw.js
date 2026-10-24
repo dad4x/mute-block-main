@@ -27,6 +27,12 @@ const {
     SPACE_PENDING_NUKED_POSTS_KEY,
     PROFILE_NUKE_PROGRESS_VIEW_KEY,
     PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
+    PROFILE_NUKE_PROGRESS_SHARD_COUNT,
+    LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT,
+    SPACE_MAP_BUCKET_COUNT,
+    CHECKPOINT_SHARD_DEFAULT_COUNT,
+    COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
+    COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
     DEV_MODE_SYNC_STORAGE_KEY,
     HIDDEN_RUNS_KEY
 } = require('./storageKeys')
@@ -96,7 +102,6 @@ const {
     buildSegmentedWalStoragePayload,
     CHECKPOINT_A,
     CHECKPOINT_B,
-    CHECKPOINT_SHARD_DEFAULT_COUNT,
     createChromeLocalStorageAdapter,
     normalizeCheckpointId,
     normalizeCheckpointShardCount,
@@ -384,7 +389,6 @@ const queueRuntime = createQueueRuntimeState()
 // Executor input generation (22 Oct). Every write that can change how queued rows classify bumps it. The apply pass reuses its
 // last classification only while the counter has not moved and the classification is younger than the backstop interval, so a
 // missed trigger costs at most the backstop, not a stall.
-const EXECUTOR_CLASSIFY_BACKSTOP_MS = 30000
 let lastApplyExecutorClassification = null
 let executorInputGeneration = 0
 function bumpExecutorInputGeneration() {
@@ -720,15 +724,12 @@ const SERVICE_WORKER_QUEUE_OWNER_ID = 'service-worker-queue-owner'
 const MAX_COORDINATOR_EVENTS = 500
 const MAX_COORDINATOR_CONTENT_QUEUE_INDEX_ITEMS = 1200
 const MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS = 1200
-const COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT = 32
-const PROFILE_NUKE_PROGRESS_SHARD_COUNT = 32
 // 2026-10-07: additive alongside COORDINATOR_CONTENT_QUEUE_INDEX_KEY, not a
 // replacement -- see buildCoordinatorContentQueueIndexShardPayload's own
 // comment for why the existing monolithic key's shape stays untouched
 // (many existing tests assert its exact fields) while getContentPageCoordinatorState
 // reads these shards instead of that key for its hot per-request lookup.
 const COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX = 'mbCoordinatorContentQueueIndexShard.'
-const COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT = 32
 const {
     MAX_QUEUE_WAKEUP_METRIC_JOURNAL,
     MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL,
@@ -745,7 +746,10 @@ const {
     STORED_WORK_CLEAR_REREAD_ATTEMPTS,
     PROFILE_BLOCKED_PAGE_EVENT_RECHECK_MAX_ATTEMPTS,
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED,
-    RUNS_GAP_WATCH_INTERVAL_MS
+    RUNS_GAP_WATCH_INTERVAL_MS,
+    EXECUTOR_CLASSIFY_BACKSTOP_MS,
+    ORPHAN_SURFACE_TAB_GRACE_MS,
+    STORED_ERROR_TEXT_MAX_CHARS
 } = require('./tunables')
 // The dashboard's outlier list (swCoordinatorOutliers.js): a running baseline, pushed by each finished row at its archive.
 const {
@@ -4440,33 +4444,20 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
         currentRecord || progress[href] || {}
     )
 
-    let progressProjectionSaved = {saved: true, rows: 0}
+    // The terminal progress record is saved with the row, by the one terminal save (24 Oct).
     if(terminalRecord) {
         progress[href] = terminalRecord
         profileNukeProgress = {
             ...profileNukeProgress,
             [href]: terminalRecord
         }
-        try {
-            progressProjectionSaved = await saveProfileNukeProgressRowProjection({[href]: terminalRecord}, {
-                metricPath: 'reconcile.profileRedirectMismatch.progressProjection'
-            })
-        }
-        catch(error) {
-            progressProjectionSaved = false
-            recordCoordinatorDiagnosticEvent(
-                'terminalize-profile-redirect-mismatch-progress-projection-save-failed',
-                error?.message || 'Profile redirect mismatch progress projection save failed'
-            )
-        }
-        if(progressProjectionSaved === false || progressProjectionSaved?.saved === false) {
-            incrementQueueWakeupMetric('reconcile.profileRedirectMismatch.progressProjectionFailed')
-            scheduleCoordinatorReconcile(1000, {
-                reason: 'terminalize-profile-redirect-mismatch-progress-projection-failed',
-                edgeTriggered: true
-            })
-        }
+        saveTerminalProgressForRow({
+            href,
+            record: terminalRecord,
+            metricPath: 'reconcile.profileRedirectMismatch.progressProjection'
+        }, authorityResult)
     }
+    const progressProjectionSaved = {saved: authorityResult.progressSaved === true, rows: terminalRecord ? 1 : 0}
 
     const affectedRunIds = new Set()
     if(durableItem.runId) affectedRunIds.add(durableItem.runId)
@@ -4902,6 +4893,11 @@ async function mutateCoordinatorActiveFromTerminalProgress(operation = {}) {
             return transitionedItem
         }
     })
+    saveTerminalProgressForRow({
+        href,
+        record,
+        metricPath: 'reconcile.terminalProgressActive.progressProjection'
+    }, authorityResult)
 
     if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
         return {
@@ -6320,6 +6316,20 @@ async function flushTerminalProgressProjectionSaves() {
     }
 }
 
+// The terminal progress half of a terminal write (24 Oct). Every path that finishes a queue row writes the row with its own
+// applyWithinStorageUpdate call (its own checks), then calls this with the result, so the row and its terminal progress record are saved
+// together by one function. Synchronous on purpose: an extra promise hop around the queue write changes fake-timer ordering in the
+// synthetic tests. The result is flagged progressSaved when the record was queued.
+function saveTerminalProgressForRow(progress = {}, authorityResult = null) {
+    if (authorityResult?.accepted === true && authorityResult?.durable === true && progress.href && progress.record) {
+        saveTerminalProgressProjectionAfterAuthority({[progress.href]: progress.record}, progress.metricPath)
+        authorityResult.progressSaved = true
+        // One job finishes once: the count is taken here, where the terminal row is written, for every terminal path (24 Oct).
+        incrementQueueWakeupMetric('job.terminal')
+    }
+    return authorityResult
+}
+
 function saveTerminalProgressProjectionAfterAuthority(progressRecords = {}, metricPath = 'terminalProgress.inline.progressProjection') {
     const normalizedRecords = normalizeStoredProfileNukeProgress(progressRecords || {})
     if(!Object.keys(normalizedRecords).length) return
@@ -6688,7 +6698,7 @@ async function readDashboardSnapshotOrUnavailable(reason = '', metricLabel = 'da
                 refreshed: false,
                 reason,
                 error: 'coordinator-authority-unavailable',
-                detail: `${error?.reason || ''}`.slice(0, 240)
+                detail: `${error?.reason || ''}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
     }
@@ -7305,9 +7315,7 @@ const queueWalStore = createQueueWalStore({
     storage: {
         // A direct reference, not an arrow: metricStorageGet is a hoisted function declaration, and an extra
         // wrapper frame here pushes callers out of V8's default 10-frame stack capture.
-        metricStorageGet,
-        // Recovery B writes back the active slot's records through this, the same write every checkpoint uses.
-        metricStorageSet
+        metricStorageGet
     },
     checkpoints: {
         scheduleSwitch: (...args) => scheduleCoordinatorQueueWalCheckpointSwitch(...args),
@@ -8075,7 +8083,7 @@ async function cleanupRetiredCoordinatorQueueWalPhysicalKeys(previousMeta = null
             keyCount: retiredKeys.length,
             keys: retiredKeys,
             reason: 'storage-remove-failed',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
 }
@@ -8120,7 +8128,7 @@ async function cleanupPreSegmentedCoordinatorQueueWalMonolithBeforeCheckpoint(pr
             keyCount: 1,
             keys: [COORDINATOR_QUEUE_WAL_KEY],
             reason: 'storage-remove-failed',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
 }
@@ -8784,7 +8792,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
                 durable: false,
                 snapshotSeq: maxAppliedSeq,
                 checkpointedRecords,
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             })
             return {
                 checkpointSwitched: false,
@@ -8793,7 +8801,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
                 reason: 'wal-checkpoint-save-failed',
                 snapshotSeq: maxAppliedSeq,
                 checkpointedRecords,
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         if(walSaved === false) {
@@ -8995,7 +9003,7 @@ function appendCoordinatorAuthorityShadowWalRecords(records = [], options = {}) 
                 applied: false,
                 matched: false,
                 reason: 'projection-error',
-                error: `${error?.message || error || 'projection error'}`.slice(0, 240)
+                error: `${error?.message || error || 'projection error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         coordinatorAuthorityShadowWalProjectionMaxSeq = Math.max(
@@ -9101,7 +9109,7 @@ function recordCoordinatorAuthorityShadowWalProjection(result = {}) {
                     appended: false,
                     records: [],
                     reason: 'diagnostic-error',
-                    error: `${error?.message || error || 'diagnostic error'}`.slice(0, 240)
+                    error: `${error?.message || error || 'diagnostic error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
                 }
             }
         }
@@ -9117,7 +9125,7 @@ function recordCoordinatorAuthorityShadowWalProjection(result = {}) {
             checked: true,
             matched: false,
             reason: 'projection-error',
-            error: `${error?.message || error || 'projection error'}`.slice(0, 240),
+            error: `${error?.message || error || 'projection error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS),
             record
         }
     }
@@ -9137,7 +9145,7 @@ function safeRecordCoordinatorAuthorityShadowWalProjection(result = {}) {
             checked: false,
             matched: false,
             reason: 'diagnostic-error',
-            error: `${error?.message || error || 'diagnostic error'}`.slice(0, 240)
+            error: `${error?.message || error || 'diagnostic error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
 }
@@ -9295,7 +9303,7 @@ function recordProgressShadowWalProjection(progressRecords = {}, options = {}) {
                 matched: false,
                 reason: 'projection-error',
                 withPrevious: !!previousRecord,
-                error: `${error?.message || error || 'projection error'}`.slice(0, 240)
+                error: `${error?.message || error || 'projection error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
     }
@@ -9322,7 +9330,7 @@ function safeRecordProgressShadowWalProjection(progressRecords = {}, options = {
             mismatched: 0,
             failed: 1,
             reason: 'diagnostic-error',
-            error: `${error?.message || error || 'diagnostic error'}`.slice(0, 240),
+            error: `${error?.message || error || 'diagnostic error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS),
             results: {}
         }
     }
@@ -9445,7 +9453,7 @@ function appendProgressShadowWalRecords(records = [], options = {}) {
                 applied: false,
                 matched: false,
                 reason: 'projection-error',
-                error: `${error?.message || error || 'projection error'}`.slice(0, 240)
+                error: `${error?.message || error || 'projection error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         progressShadowWalProjectionMaxSeq = Math.max(
@@ -9503,7 +9511,7 @@ function safeAppendProgressShadowWalRecords(records = [], options = {}) {
             appended: false,
             records: [],
             reason: 'diagnostic-error',
-            error: `${error?.message || error || 'diagnostic error'}`.slice(0, 240)
+            error: `${error?.message || error || 'diagnostic error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
 }
@@ -9767,7 +9775,7 @@ function createCoordinatorAuthority() {
         catch(error) {
             if(error?.walDecodeFailed !== true) throw error
             hydrated = false
-            unavailableReason = `${error?.message || 'queue WAL decode failed'}`.slice(0, 240)
+            unavailableReason = `${error?.message || 'queue WAL decode failed'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             recordCoordinatorDiagnosticEvent('coordinator-authority-unavailable', unavailableReason)
             throw makeCoordinatorAuthorityUnavailableError(unavailableReason)
         }
@@ -10348,7 +10356,7 @@ function createCoordinatorAuthority() {
                 reason: 'storage-error',
                 diskSaved,
                 progressSaved,
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         // The resident copy takes the change even when the session write failed: the worker still has the progress it wrote.
@@ -10771,7 +10779,7 @@ function createCoordinatorAuthority() {
                 terminal: isTerminalCoordinatorStatus(nextRow?.status),
                 persistence: {
                     saved: false,
-                    error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                    error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
                 }
             })
         }
@@ -12432,7 +12440,7 @@ async function settleTerminalCoordinatorItemsLocked(options = {}) {
             settlementPersistence = {
                 saved: false,
                 reason: 'persistence-error',
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
 
@@ -24319,7 +24327,7 @@ async function mutateCoordinatorFailedItemsRetry(operation = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -24680,7 +24688,7 @@ async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -25397,7 +25405,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -25809,7 +25817,7 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
                 persistence = {
                     saved: false,
                     reason: 'persistence-error',
-                    error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                    error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
                 }
             }
             if(persistence?.saved !== true) {
@@ -26367,7 +26375,7 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
             persistence = {
                 saved: false,
                 reason: 'persistence-error',
-                error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+                error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
         if(persistence?.saved !== true) {
@@ -26485,7 +26493,7 @@ async function removeQueuedCoordinatorRowForCancel({itemKey, item, href, coordin
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -26790,7 +26798,7 @@ async function mutateCoordinatorStoredWorkCancel(operation = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -26969,7 +26977,7 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -28993,7 +29001,6 @@ function requestQueuedTabRemovalRefill() {
 // released and its row is terminal or gone, so nothing else closes it. This closes such tabs: a Quora profile tab that no active
 // queued runtime tracks and whose row is not active. A tab is closed only after it has looked orphaned for the grace period, so a
 // tab that is still being activated is never taken. The anchor tab is never closed. Returns the window's tabs after any close.
-const ORPHAN_SURFACE_TAB_GRACE_MS = 10000
 const orphanSurfaceTabFirstSeenAt = new Map()
 
 async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
@@ -30685,6 +30692,11 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
                 return transitionedItem
             }
         })
+        saveTerminalProgressForRow({
+            href: normalizedProfileHref,
+            record,
+            metricPath: 'backgroundBlockedSweepTerminal.progressProjection'
+        }, authorityResult)
         if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
             return {
                 recorded: false,
@@ -30875,6 +30887,11 @@ async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, respon
                 return transitionedItem
             }
         })
+        saveTerminalProgressForRow({
+            href: normalizedProfileHref,
+            record,
+            metricPath: 'activeBlockedLiveTabTerminal.progressProjection'
+        }, authorityResult)
         if(authorityResult?.accepted !== true || authorityResult?.durable !== true) {
             return {
                 recorded: false,
@@ -33598,7 +33615,7 @@ async function mutateCoordinatorQueuedProfileTargetResolve(operation = {}) {
         persistence = {
             saved: false,
             reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, 240)
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
     }
     if(persistence?.saved !== true) {
@@ -34041,6 +34058,12 @@ async function applyCoordinatorRowEvents(events = [], options = {}) {
 
             if(!item) {
                 incrementCoordinatorRowEventMetric(eventKind, 'rejected.missingCoordinatorItem')
+                // Diagnostic (24 Oct, phase-timing follow-up): was the row archived before this milestone arrived, and with what status?
+                // The resident completed map is in memory, so this costs no read. Absent means neither queue nor completed log has it.
+                const archivedRow = (coordinatorAuthority.residentCompleted() || {})[normalizedHref] || null
+                incrementCoordinatorRowEventMetric(eventKind, archivedRow
+                    ? `rejected.missingCoordinatorItem.archived.${`${archivedRow.status || 'unknown'}`.trim() || 'unknown'}`
+                    : 'rejected.missingCoordinatorItem.absent')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'missing-coordinator-item'}
                 continue
             }
@@ -34576,6 +34599,33 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         )
     }
 
+    // Progress for a row that is not in the resident queue changes nothing: the body below answers missing-coordinator-item for it and
+    // writes nothing (24 Oct: 265 of 274 direct and 130 of 189 terminal no-op records). Answer those here, without a serialized
+    // storage update. Counted under the same missingItem reason as the body's own answer.
+    const missingItemPreflightResults = {}
+    const missingItemPreflightState = getHydratedCoordinatorAuthorityState('progress.missingItemPreflight.usedResidentAuthority')
+    if(missingItemPreflightState?.queue) {
+        const presentRecords = {}
+        for(const [normalizedHref, patch] of Object.entries(normalizedRecords)) {
+            if(missingItemPreflightState.queue[normalizedHref]) {
+                presentRecords[normalizedHref] = patch
+                continue
+            }
+            incrementQueueWakeupMetric(`${options.expectTerminal === true ? 'terminalProgress' : 'directProgress'}.noop.reason.missingItem`)
+            missingItemPreflightResults[normalizedHref] = {recorded: false, terminal: false, reason: 'missing-coordinator-item'}
+        }
+        if(!Object.keys(presentRecords).length) {
+            const preflightSettled = Object.values(residentTerminalPreflightResults)
+            return {
+                recorded: preflightSettled.some(result => result?.recorded),
+                terminal: preflightSettled.some(result => result?.terminal),
+                terminalSettlementHrefs: [],
+                results: {...residentTerminalPreflightResults, ...missingItemPreflightResults}
+            }
+        }
+        normalizedRecords = presentRecords
+    }
+
     const updateResult = await enqueueSpaceFeedStorageUpdate(async () => {
         const state = await coordinatorQueueReader.runsScopedProgressForMutation({
             metricPath: options.expectTerminal === true ? 'terminalProgress.load' : 'directProgress.load',
@@ -34596,6 +34646,8 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         let progressChangedRows = 0
         let terminalProgressRows = 0
         let restoredTerminalProgressRows = 0
+        // One reason counter per early exit that changes nothing (24 Oct), so the no-op writes can be split by cause.
+        const noteProgressNoop = reason => incrementQueueWakeupMetric(`${options.expectTerminal === true ? 'terminalProgress' : 'directProgress'}.noop.reason.${reason}`)
 
         for(const [normalizedHref, patch] of Object.entries(normalizedRecords)) {
             const item = queue[normalizedHref] || null
@@ -34606,12 +34658,14 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
             const previous = progress[normalizedHref] || null
             let record = normalizeProgressPatch(normalizedHref, patch, previous)
             if(!record) {
+                noteProgressNoop('noRecord')
                 results[normalizedHref] = {recorded: false, terminal: false}
                 continue
             }
 
             let accepted = false
             let terminal = false
+            let progressSavedByAuthority = false
 
             const senderMismatchReason = item
                 ? getActiveCoordinatorProgressSenderTabMismatchReason(item, patch, options)
@@ -34624,16 +34678,19 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     senderTabId: options.senderTabId || patch?.tabId || null,
                     message: 'Ignored direct job progress from stale sender tab'
                 })
+                noteProgressNoop('senderMismatch')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: senderMismatchReason}
                 continue
             }
 
             if(item && options.requireActiveSenderTab === true && patchHasStatus && !patchCanTransitionStatus) {
+                noteProgressNoop('inactiveSenderTab')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'inactive-sender-tab'}
                 continue
             }
 
             if(item && !isCoordinatorQueueAuthoritativeItem(item)) {
+                noteProgressNoop('durableOnlyItem')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'durable-only-coordinator-item'}
                 continue
             }
@@ -34666,6 +34723,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                 terminal = mappedTerminal
                 const runtimeRejectionReason = getActiveCoordinatorDirectProgressRuntimeRejectionReason(item, patch, mapped, options)
                 if(runtimeRejectionReason) {
+                    noteProgressNoop('runtimeRejection')
                     results[normalizedHref] = {
                         recorded: false,
                         terminal: false,
@@ -34704,6 +34762,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                 }
                 else if(isRedundantTerminalProgressForCoordinatorItem(item, record, mapped)) {
                     incrementQueueWakeupMetric('terminalProgress.queueNoopDuplicate')
+                    noteProgressNoop('redundantTerminal')
                     results[normalizedHref] = {
                         recorded: true,
                         terminal: true,
@@ -34746,10 +34805,16 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                                 })
                             }
                         })
+                        saveTerminalProgressForRow({
+                            href: normalizedHref,
+                            record: mappedTerminal ? record : null,
+                            metricPath: 'terminalProgress.inline.progressProjection'
+                        }, authorityResult)
 
                         if(authorityResult?.accepted === true && authorityResult?.durable === true) {
                             currentAuthorityState = coordinatorAuthority.current()
                             queue = currentAuthorityState.queue
+                            progressSavedByAuthority = authorityResult.progressSaved === true
                             if(mappedTerminal) {
                                 terminalSettlementHrefs.add(normalizedHref)
                                 scheduleTerminalProgressContinuation('terminal-progress-authority-continuation', [normalizedHref])
@@ -34780,16 +34845,18 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     senderTabId: options.senderTabId || null,
                     message: 'Ignored direct job progress from stale attempt'
                 })
+                noteProgressNoop('staleAttempt')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'stale-attempt'}
             }
             else if(!item) {
+                noteProgressNoop('missingItem')
                 results[normalizedHref] = {recorded: false, terminal: false, reason: 'missing-coordinator-item'}
                 continue
             }
 
             if(accepted) {
                 progress[normalizedHref] = record
-                inlineProgressProjectionRecords[normalizedHref] = record
+                if(!progressSavedByAuthority) inlineProgressProjectionRecords[normalizedHref] = record
                 profileNukeProgress = {
                     ...profileNukeProgress,
                     [normalizedHref]: record
@@ -34801,13 +34868,14 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
                     rememberQueueLoadProgress('action-phase-progress')
                 }
                 if(terminal) {
-                    incrementQueueWakeupMetric('job.terminal')
                     recordQueueWakeupPhaseSamplesFromProgress(record)
                     terminalProgressRows += 1
                 }
             }
 
             if(!results[normalizedHref]) {
+                // Not accepted and no branch above answered: the item did not apply the progress (see shouldApplyProgressToCoordinatorItem).
+                if(!accepted) noteProgressNoop('notApplicable')
                 results[normalizedHref] = {recorded: accepted, terminal, record}
             }
         }
@@ -34835,7 +34903,7 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
             let inlineDerivedSaved = true
             if(progressChanged) {
                 if(inlineQueueOperation === 'terminal-progress') {
-                    if(restoredTerminalProgressRows > 0) {
+                    if(restoredTerminalProgressRows > 0 && Object.keys(inlineProgressProjectionRecords).length) {
                         let progressProjectionSaved = false
                         try {
                             progressProjectionSaved = await saveProfileNukeProgressRowProjection(
@@ -34926,6 +34994,13 @@ async function recordCoordinatorJobProgressRecords(progressRecords = {}, options
         reason: options.expectTerminal === true ? 'terminal-progress' : 'direct-progress',
         timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
     })
+
+    if(Object.keys(missingItemPreflightResults).length) {
+        updateResult.results = {
+            ...missingItemPreflightResults,
+            ...(updateResult.results || {})
+        }
+    }
 
     if(Object.keys(residentTerminalPreflightResults).length) {
         updateResult.results = {
@@ -36948,9 +37023,15 @@ function getLegacyContentIndexCleanupNames() {
         ...Object.keys(makeProjectionShardDefaults(COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX, COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT)),
         ...Object.keys(makeProjectionShardDefaults(COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX, COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT))
     ]
+    // The progress names are the 1.6 layout (the view and its 32 shards), pinned here so a change of PROFILE_NUKE_PROGRESS_SHARD_COUNT
+    // never puts the live shards on this list (24 Oct: 256 shards).
+    const legacyProgressKeys = [
+        PROFILE_NUKE_PROGRESS_VIEW_KEY,
+        ...Object.keys(makeProjectionShardDefaults(PROFILE_NUKE_PROGRESS_SHARD_PREFIX, LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT))
+    ]
     const progressNames = [
-        ...PROFILE_NUKE_PROGRESS_STORAGE_KEYS,
-        ...PROFILE_NUKE_PROGRESS_STORAGE_KEYS.map(key => getCoordinatorNamespaceStampKey(key))
+        ...legacyProgressKeys,
+        ...legacyProgressKeys.map(key => getCoordinatorNamespaceStampKey(key))
     ]
     return [...indexNames, ...progressNames]
 }
@@ -36993,12 +37074,12 @@ async function retireLegacyContentIndexKeys() {
         }
         catch(markerError) {
             outcome = 'marker-failed'
-            error = `${markerError?.message || markerError || 'marker write failed'}`.slice(0, 240)
+            error = `${markerError?.message || markerError || 'marker write failed'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
         return outcome
     }
     catch(caught) {
-        error = `${caught?.message || caught || 'legacy cleanup failed'}`.slice(0, 240)
+        error = `${caught?.message || caught || 'legacy cleanup failed'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         return outcome
     }
     finally {

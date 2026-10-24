@@ -8,7 +8,8 @@
 
 const {hashState} = require('./walSnapshotStore')
 
-const SPACE_MAP_BUCKET_COUNT = 32
+// The bucket count is declared once, in storageKeys.js (it sets the stored key names).
+const {SPACE_MAP_BUCKET_COUNT} = require('./storageKeys')
 const SPACE_MAP_LAYOUT_KEY = 'mbSpaceMapLayoutVersion'
 const SPACE_MAP_LAYOUT_BUCKETED = 2
 

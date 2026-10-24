@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const {SPACE_MAP_BUCKET_COUNT} = require("../../shared/js/storageKeys")
 const zlib = require('node:zlib')
 const {
     evaluate,
@@ -142,7 +143,7 @@ async function readLiveStorage(config) {
 function readBucketedMap(storage = {}, baseKey = '', layoutKey = '') {
     if (storage[layoutKey] !== 2) return storage[baseKey] || {}
     const merged = {}
-    for (let i = 0; i < 32; i += 1) Object.assign(merged, storage[`${baseKey}.b${i.toString(16).padStart(2, '0')}`] || {})
+    for (let i = 0; i < SPACE_MAP_BUCKET_COUNT; i += 1) Object.assign(merged, storage[`${baseKey}.b${i.toString(16).padStart(2, '0')}`] || {})
     return merged
 }
 

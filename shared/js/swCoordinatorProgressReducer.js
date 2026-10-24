@@ -215,7 +215,9 @@ function createCoordinatorProgressReducer(deps = {}) {
     // rather than just href, so a legitimately separate later run
     // re-processing the same profile still counts.
     const recordedProfileActionOutcomeRowKeys = new Set()
-    function recordCoordinatorProfileActionOutcomeStat(item = {}, mapped = {}, nowMs = now()) {
+    // record is the progress record that makes this terminal transition. Its milestones are part of the finished row (24 Oct, phase timing
+    // follow-up): milestones that were deferred and merged into the terminal record are sampled too, not only the ones already on the row.
+    function recordCoordinatorProfileActionOutcomeStat(item = {}, mapped = {}, nowMs = now(), record = null) {
         if(typeof incrementQueueWakeupMetric !== 'function') return
         if(mapped && typeof mapped === 'object') {
             if(recordedProfileActionOutcomeMappedRecords.has(mapped)) return
@@ -307,7 +309,15 @@ function createCoordinatorProgressReducer(deps = {}) {
         if(typeof recordQueueWakeupMetricMax === 'function') {
             recordQueueWakeupMetricMax(`profileAction.${bucket}.maxDurationMs`, durationMs)
         }
-        recordCoordinatorProfileActionPhaseDurations(item, nowMs, {incrementQueueWakeupMetric, recordQueueWakeupMetricMax})
+        // Only the record's own positive milestones are added: a field the record does not carry reads as 0 and must not erase the row's value.
+        const sampledMilestones = {...(item.milestones || {})}
+        if(record && typeof record === 'object') {
+            for(const [key, value] of Object.entries(getCoordinatorMilestonesFromProgress(record))) {
+                if(Number(value) > 0) sampledMilestones[key] = value
+            }
+        }
+        const sampledItem = {...item, milestones: sampledMilestones}
+        recordCoordinatorProfileActionPhaseDurations(sampledItem, nowMs, {incrementQueueWakeupMetric, recordQueueWakeupMetricMax})
     }
 
 
@@ -515,7 +525,7 @@ function createCoordinatorProgressReducer(deps = {}) {
                 // precondition) but not 'succeeded' -- this promotion is the
                 // only place that ever corrects it to 'succeeded', so if the
                 // stat isn't recorded here it never gets recorded at all.
-                recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
+                recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs, record)
                 return promoteTerminalCoordinatorItemFromSuccessfulProgress(item, record, mapped, {
                     ...options,
                     now: nowMs
@@ -531,7 +541,7 @@ function createCoordinatorProgressReducer(deps = {}) {
                 // happens to route through this rejection branch silently
                 // never counts.
                 if(!isTerminalCoordinatorStatus(item.status)) {
-                    recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
+                    recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs, record)
                 }
                 return projectedItem
             }
@@ -539,7 +549,7 @@ function createCoordinatorProgressReducer(deps = {}) {
         }
 
         if(mappedTerminal && !isTerminalCoordinatorStatus(item.status)) {
-            recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs)
+            recordCoordinatorProfileActionOutcomeStat(item, mapped, nowMs, record)
         }
 
         return mergeReducedCoordinatorProgressItem(item, reduced.item, projectedItem, mapped, record, {

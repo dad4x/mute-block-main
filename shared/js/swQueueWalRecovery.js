@@ -5,6 +5,7 @@
 // walSnapshotStore.js; everything that lives in sw.js (metrics, diagnostics, cloning, map normalisation,
 // the codec options) is injected, so this module can be loaded and tested on its own.
 
+const {STORED_ERROR_TEXT_MAX_CHARS} = require('./tunables')
 const {
     getWalRecordsForGeneration,
     recoverProjectedState
@@ -87,7 +88,7 @@ function createQueueWalRecovery(deps = {}) {
                 queue: normalizedSnapshot,
                 recovered: false,
                 reason: 'recovery-error',
-                error: `${error?.message || error || 'recovery error'}`.slice(0, 240)
+                error: `${error?.message || error || 'recovery error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
     }

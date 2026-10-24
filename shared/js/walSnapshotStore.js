@@ -21,7 +21,8 @@ const GZIP_SNAPSHOT_CODEC = 'gzip'
 const BASE64_ENCODING = 'base64'
 const SEGMENTED_WAL_STORAGE_VERSION = 1
 const CHECKPOINT_SHARD_FORMAT = 'sharded-v1'
-const CHECKPOINT_SHARD_DEFAULT_COUNT = 10
+// Declared once, in storageKeys.js (it sets the stored checkpoint shard keys).
+const {CHECKPOINT_SHARD_DEFAULT_COUNT} = require('./storageKeys')
 
 function cloneJson(value) {
     if(value === undefined) return undefined
@@ -315,18 +316,6 @@ function getCheckpointShardRecord(checkpoint = {}, shard = {}) {
         snapshotEpoch: checkpoint.snapshotEpoch,
         ...shard
     })
-}
-
-// The storage records of one sharded checkpoint slot, keyed as storage keys them: the manifest and one record per shard. The
-// inverse of readStoredCheckpoint. Recovery B rebuilds a torn slot from a checkpoint the worker already holds, so the records
-// must be exactly what the writer would store. A monolithic checkpoint has no such records, and returns null.
-function getCheckpointStorageRecords(checkpoint = null, baseKey = 'wal', checkpointId = CHECKPOINT_A) {
-    if(checkpoint?.format !== CHECKPOINT_SHARD_FORMAT) return null
-    const records = {[getSegmentedWalCheckpointKey(baseKey, checkpointId)]: getCheckpointManifest(checkpoint)}
-    for(const shard of checkpoint.shards || []) {
-        records[getSegmentedWalCheckpointShardKey(baseKey, checkpointId, shard.index)] = getCheckpointShardRecord(checkpoint, shard)
-    }
-    return records
 }
 
 // Reads one checkpoint slot from a stored snapshot. Monolithic (legacy) slots are
@@ -1650,7 +1639,6 @@ module.exports = {
     normalizeCheckpointShardCount,
     DEFAULT_RECOVERY_CRITICAL_AREAS,
     getCheckpointManifest,
-    getCheckpointStorageRecords,
     getSegmentedWalCheckpointShardKey,
     getSegmentedWalCheckpointShardKeys,
     makeShardedCheckpoint,

@@ -632,7 +632,12 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
             // Owner, 23 Oct: one reply covers only the profiles asked about this round, so it is merged into the copy, not used to replace it.
             // Rows from earlier rounds stay; the queue rows are keyed by item and are added over the copy.
             if(result.coordinatorQueue && typeof result.coordinatorQueue === 'object') {
-                coordinatorQueue = {...coordinatorQueue, ...normalizeCoordinatorQueue(result.coordinatorQueue)}
+                // The reply holds every live row of the profiles asked about, so a row of one of them that the reply lacks has left the live
+                // queue (finished and archived). Drop this page's copy of it too, or it stays "pending" (24 Oct: 507 left after a finished run).
+                coordinatorQueue = {
+                    ...dropCoordinatorQueueRowsForProfiles(coordinatorQueue, profileHrefs),
+                    ...normalizeCoordinatorQueue(result.coordinatorQueue)
+                }
                 coordinatorQueueLoaded = true
             }
             if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
@@ -690,7 +695,13 @@ function getSpaceFeedStateFingerprint() {
 
 async function pollSpaceFeedState() {
     if(getPageType() !== 'space') return
-    if(Object.keys(spacePendingNukedPosts || {}).length === 0 && spaceFeedNukingPostKeys.size === 0) return
+    // Owner, 24 Oct: a pending row in this page's queue copy is still polled after the run ends, so the next reply can drop it (a finished
+    // profile the worker no longer lists). Without this the poll stopped and the page kept counting it as left.
+    const hasPendingCoordinatorCopy = Object.values(coordinatorQueue || {}).some(item => isPendingCoordinatorStatus(item?.status))
+    if(Object.keys(spacePendingNukedPosts || {}).length === 0 && spaceFeedNukingPostKeys.size === 0 && !hasPendingCoordinatorCopy) return
+    // Owner, 24 Oct: the pending posts copy is replaced only by the worker's reply to the settle-terminal reconcile, which ran on page start and
+    // after a projection refresh, never on the poll. After a run it stayed "15 left" until a reload. The poll runs the reconcile too.
+    if(Object.keys(spacePendingNukedPosts || {}).length > 0) void reconcileStaleSpaceFeedProgress()
 
     const before = getSpaceFeedStateFingerprint()
     const refreshed = await refreshContentPageCoordinatorStateFromRuntime({force: true, entries: getLatestSpaceFeedEntries()})
@@ -7898,6 +7909,13 @@ function getPendingCoordinatorSpaceFeedWorkCountForSpace(space = resolveCurrentS
         .length
 }
 
+// This page's copy of the queue without the rows of the profiles asked about (see the state reply merge above).
+function dropCoordinatorQueueRowsForProfiles(queue = {}, profileHrefs = []) {
+    const asked = new Set((Array.isArray(profileHrefs) ? profileHrefs : []).map(href => normalizeQuoraProfileHref(href)).filter(Boolean))
+    if(!asked.size) return {...queue}
+    return Object.fromEntries(Object.entries(queue || {}).filter(([itemKey, item]) => !asked.has(getCoordinatorItemProfileHref(itemKey, item))))
+}
+
 function getCoordinatorItemProfileHref(itemKey = '', item = null) {
     return normalizeQuoraProfileHref(
         item?.targetProfileHref ||
@@ -12241,7 +12259,8 @@ async function maybeRunAutoProfileAction() {
     try {
         await recordQueuedProfileProgress({
             status: 'tab-opened',
-            tabOpenedAt: Date.now(),
+            // tabOpenedAt is not sent here: the worker stamped it when it opened the tab (tab-opening), and it is the start of the Load
+            // phase. Sending the report time as well made Load zero by construction (24 Oct).
             contentOpenedAt: Date.now(),
             openedViablePage: false,
             closeRequestedAt: 0,

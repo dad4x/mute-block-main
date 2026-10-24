@@ -205,7 +205,7 @@ test('a state reply covers only the round asked about, so it is merged into the 
     const refresh = extractFunction(content, 'async function refreshContentPageCoordinatorStateFromRuntime(options = {})')
     const hrefs = extractFunction(content, 'function getCurrentPageStateProfileHrefs(options = {})')
 
-    assert.match(refresh, /coordinatorQueue = \{\.\.\.coordinatorQueue, \.\.\.normalizeCoordinatorQueue\(result\.coordinatorQueue\)\}/)
+    assert.match(refresh, /coordinatorQueue = \{\s*\.\.\.dropCoordinatorQueueRowsForProfiles\(coordinatorQueue, profileHrefs\),\s*\.\.\.normalizeCoordinatorQueue\(result\.coordinatorQueue\)\s*\}/)
     assert.doesNotMatch(refresh, /coordinatorQueue = normalizeCoordinatorQueue\(result\.coordinatorQueue\)/)
     assert.match(refresh, /for\(const href of profileHrefs\) delete keptProgress\[href\]/)
     assert.match(refresh, /profileNukeProgress = \{\.\.\.keptProgress, \.\.\.repliedProgress\}/)

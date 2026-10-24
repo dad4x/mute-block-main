@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const {SPACE_MAP_BUCKET_COUNT} = require("../../shared/js/storageKeys")
 const {
     evaluate,
     getCdpConfig,
@@ -47,15 +48,15 @@ runMain(async () => {
     const sw = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))
     let workerSummary = null
     if(sw) {
-        workerSummary = await evaluate(sw.webSocketDebuggerUrl, `(${async function inspectWorker() {
+        workerSummary = await evaluate(sw.webSocketDebuggerUrl, `(${async function inspectWorker(bucketCount) {
             const keys = ['mbSpaceMapLayoutVersion', 'mbCoordinatorRunsLayoutVersion', 'mbCoordinatorQueue', 'mbSpacePendingNukedPosts', 'mbCoordinatorRuns']
-            for (let i = 0; i < 32; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
+            for (let i = 0; i < bucketCount; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
             const storage = await chrome.storage.local.get(keys)
             // Space maps and the run list are kept in 32 buckets each once their layout marker is 2 (1437+). Rebuild each whole map.
             const readBucketed = (base, layoutKey) => {
                 if (storage[layoutKey] !== 2) return storage[base] || {}
                 const merged = {}
-                for (let i = 0; i < 32; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
+                for (let i = 0; i < bucketCount; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
                 return merged
             }
             const pending = readBucketed('mbSpacePendingNukedPosts', 'mbSpaceMapLayoutVersion')
@@ -108,7 +109,7 @@ runMain(async () => {
                 totalQueue: Object.keys(queue).length,
                 totalPendingPosts: Object.keys(pending).length
             }
-        }})()`)
+        }})(${SPACE_MAP_BUCKET_COUNT})`)
     }
 
     console.log(JSON.stringify({pageSummaries, workerSummary}, null, 2))

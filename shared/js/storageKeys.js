@@ -13,6 +13,16 @@ module.exports = {
     QUEUE_WAKEUP_METRICS_VIEW_KEY: 'mbQueueWakeupMetricsView',
     PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView',
     PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard.',
+    // The number of progress shards, and the 1.6 layout's count, which only the legacy cleanup names (sw.js). Not a key name, but it sets the
+    // key names: changing PROFILE_NUKE_PROGRESS_SHARD_COUNT reshards the session copy (the owner clears storage with a change like that).
+    PROFILE_NUKE_PROGRESS_SHARD_COUNT: 256,
+    LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT: 32,
+    // The other storage layout counts (24 Oct, review Appendix C.1). Each one sets the names of stored keys. Changing one reshards the
+    // data under it, so it needs a migration. The space post maps and the checkpoint shards are on disk; the content indexes are derived.
+    SPACE_MAP_BUCKET_COUNT: 32,
+    CHECKPOINT_SHARD_DEFAULT_COUNT: 10,
+    COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT: 32,
+    COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT: 32,
     SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
     SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
     DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled'

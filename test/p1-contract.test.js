@@ -1539,7 +1539,7 @@ test('phase timing breaks the notice-select-open-load-inspect-action-detect-clos
     for(const phaseKey of ['open', 'navigate', 'load', 'claim', 'inspect', 'action', 'detect', 'close']) {
         assert.match(reducer, new RegExp(`key: '${phaseKey}'`))
     }
-    assert.match(reducer, /recordCoordinatorProfileActionPhaseDurations\(item, nowMs, \{incrementQueueWakeupMetric, recordQueueWakeupMetricMax\}\)/)
+    assert.match(reducer, /recordCoordinatorProfileActionPhaseDurations\(sampledItem, nowMs, \{incrementQueueWakeupMetric, recordQueueWakeupMetricMax\}\)/)
 })
 
 test('current work clear button cancels and removes every row, and the epoch stat tiles moved into the Metrics panel', () => {
@@ -1583,7 +1583,7 @@ test('current work clear button cancels and removes every row, and the epoch sta
 
     const queueListStart = html.indexOf('data-panel-scroll-target="queueList"')
     const currentWorkSummaryHtml = html.slice(queueListStart, metricsPanelStart)
-    for(const tileId of ['queuedCount', 'activeCount', 'terminalCount', 'eventCount']) {
+    for(const tileId of ['queuedCount', 'activeCount', 'terminalCount', 'avgPageLoadValue']) {
         assert.match(currentWorkSummaryHtml, new RegExp(`id="${tileId}"`))
     }
     for(const movedTileId of ['secondsPerBlock', 'activationHandoffSeconds', 'reallyBlockedCount', 'alreadyBlockedCount', 'blockAttemptOnFollowingCount']) {

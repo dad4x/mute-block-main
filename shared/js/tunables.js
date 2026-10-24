@@ -101,6 +101,15 @@ module.exports = {
     SPACE_FEED_SCAN_BAND_DOWN_PX: 1000,
     SPACE_FEED_SCAN_BAND_UP_PX: 200,
     // Space page: how long the page-wide render model is reused while the same posts are on the page.
-    SPACE_FEED_RENDER_MODEL_MEMO_MS: 300
+    SPACE_FEED_RENDER_MODEL_MEMO_MS: 300,
+    // Executor classification: the apply pass reuses its last classification while the input generation is unchanged and the
+    // classification is younger than this backstop, so a missed trigger costs at most this long (sw.js, 22 Oct).
+    EXECUTOR_CLASSIFY_BACKSTOP_MS: 30000,
+    // A window's tab that is not the active row's and looks orphaned is closed only after this grace, so a tab still being
+    // activated is never taken (sw.js, orphan surface tab sweep).
+    ORPHAN_SURFACE_TAB_GRACE_MS: 10000,
+    // Text kept on stored errors, diagnostics and event messages: longer text is cut to this many characters (24 Oct, review C.2).
+    // Page context text is a different limit and is not this one.
+    STORED_ERROR_TEXT_MAX_CHARS: 240
 }
 

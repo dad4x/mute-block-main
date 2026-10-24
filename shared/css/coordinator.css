@@ -675,6 +675,26 @@ h2 {
     grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
 }
 
+.row--flight {
+    grid-template-columns: 170px 60px 150px minmax(200px, 1.4fr) 150px minmax(160px, 1fr) minmax(200px, 2fr);
+    font-size: 12px;
+    padding: 8px 14px;
+}
+
+.row--flight-header {
+    font-weight: 600;
+    padding: 6px 14px;
+}
+
+.row--flight-header button {
+    font: inherit;
+    padding: 0;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+}
+
 .row--queue {
     grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
 }

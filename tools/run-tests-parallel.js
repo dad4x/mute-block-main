@@ -25,6 +25,7 @@ const lanes = [
       ['node', 'test/contentSpaceScopedState.test.js'],
       ['node', 'test/contentSpaceProfileStateGate.test.js'],
       ['node', 'test/contentSourcePostResolution.test.js'],
+      ['node', 'test/contentQueueRowDrop.test.js'],
       ['node', 'test/contentEnqueueChunkRetry.test.js'],
       ['node', 'test/contentInlineResolution.test.js'],
       ['node', 'test/contentQueuedClaimHold.test.js'],

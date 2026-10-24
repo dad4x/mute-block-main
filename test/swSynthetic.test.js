@@ -266,6 +266,34 @@ test('a door write that removes or adds a completed row updates the resident map
     assert.deepEqual(plainCopy(fromDisk.completedRows), plainCopy(after.result.completedRows))
 })
 
+test('a direct progress record for a profile with no queue row is a no-op counted by its reason', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Noop-Missing-Item'
+    const {sw} = loadServiceWorkerHarness({
+        now: 5000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    const before = sw.state().queueWakeupCounters
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'running',
+        actionKind: 'mute-block',
+        attemptId: 'attempt-noop-missing',
+        attemptNumber: 1,
+        updatedAt: 5100
+    }, {})
+    const after = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, false, JSON.stringify(result))
+    assert.equal(result.reason, 'missing-coordinator-item')
+    assert.equal((after['directProgress.noop.reason.missingItem'] || 0) - (before['directProgress.noop.reason.missingItem'] || 0), 1)
+    // A row that is not in the resident queue is answered before the storage update: no update is started for it.
+    assert.equal((after['storageUpdate.started'] || 0) - (before['storageUpdate.started'] || 0), 0, 'no storage update is started for a missing row')
+})
+
 test('a queue door write changes its row and the WAL keys only, and leaves the projection it replaced unchanged', async () => {
     // The door builds its next projection on the same stored values as the one it replaces (makeCoordinatorAuthorityProjection
     // with sharedStored). A write must replace the stored values it changes, and must never edit a stored value in place.
@@ -1516,7 +1544,9 @@ test('profile progress is held in session storage only, and a restart after a qu
     assert.ok(await sw.saveProfileNukeProgressRowProjection(seedRecords, {metricPath: 'test.progressSessionOnly.seed'}), 'the seed write is saved')
     assert.deepEqual(Object.keys(browser.__storage).filter(isProgressKey), [], 'no progress key is on disk')
     const sessionProgressKeys = Object.keys(session).filter(isProgressKey)
-    assert.equal(sessionProgressKeys.length, 33, 'the session holds the progress view and all 32 shards')
+    // 256 shards (24 Oct): the view plus each shard that a seeded profile hashes to.
+    const seedShardKeys = new Set(seedHrefs.map(seedHref => getProgressShardKey(seedHref)))
+    assert.equal(sessionProgressKeys.length, 1 + seedShardKeys.size, 'the session holds the progress view and every shard the seed reaches')
 
     // A queue write sets the WAL meta and writes runs as a mirrored write. It leaves the progress copy in session alone.
     const changedHref = seedHrefs[0]
@@ -2331,12 +2361,15 @@ function getProgressShardRecord(storage, href) {
     return null
 }
 
+// The shard count is declared once, in storageKeys.js (24 Oct).
+const {PROFILE_NUKE_PROGRESS_SHARD_COUNT: PROGRESS_SHARD_COUNT_FOR_TESTS} = require('../shared/js/storageKeys')
+
 function getProgressShardKey(href) {
     let hash = 0
     for(let index = 0; index < href.length; index += 1) {
         hash = ((hash * 31) + href.charCodeAt(index)) >>> 0
     }
-    return `mbProfileNukeProgressShard.${(hash % 32).toString(16).padStart(2, '0')}`
+    return `mbProfileNukeProgressShard.${(hash % PROGRESS_SHARD_COUNT_FOR_TESTS).toString(16).padStart(2, '0')}`
 }
 
 function getStoredCoordinatorQueueWal(storage = {}) {
@@ -3098,7 +3131,9 @@ test('service-worker blocked sweep terminalizes owned blocked profile tab', asyn
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, true)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href].status, 'blocking')
-    assert.equal(getProgressShardRecord(storage, href), null)
+    // The sweep writes the terminal progress record with the queue row (24 Oct), so the progress agrees with the archived row.
+    assert.equal(getProgressShardRecord(storage, href)?.status, 'blocked')
+    assert.equal(getProgressShardRecord(storage, href)?.blockSucceeded, true)
 })
 
 test('profile-blocked-state page event terminalizes the row on a re-check, driven by the page event (owner 17 Oct)', async () => {
@@ -7748,6 +7783,81 @@ test('genuine block terminal progress records per-phase open/load/inspect/action
     assert.equal(counters['profileAction.phase.detect.totalMs'] || 0, 600)
     // close: no closeRequestedAt/tabClosedAt recorded -- no sample.
     assert.equal(counters['profileAction.phase.close.sampleCount'] || 0, 0)
+})
+
+test('a milestone that arrives inside the terminal record is sampled as a phase, not only milestones already on the row', async () => {
+    // 24 Oct, phase timing follow-up: a deferred milestone is merged into the terminal record, so the row itself has only its earlier
+    // milestones when the terminal transition is made. The phase samples must use the record's milestones too.
+    const href = 'https://www.quora.com/profile/Synthetic-Phase-Timing-Merged'
+    const runId = 'run-phase-timing-merged'
+    const attemptId = 'attempt-phase-timing-merged'
+    const tabId = 508
+    const pinnedNow = 250000
+    const activeAt = 248000
+    const {sw} = loadServiceWorkerHarness({
+        now: pinnedNow,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 250000}),
+                    activeAt,
+                    milestones: {
+                        tabCreatedAt: activeAt + 50,
+                        navigationStartedAt: 0,
+                        contentOpenedAt: 0,
+                        actionClaimedAt: 0,
+                        profileReadyAt: 0,
+                        muteAttemptedAt: 0,
+                        blockAttemptedAt: 0,
+                        closeRequestedAt: 0,
+                        tabClosedAt: 0
+                    }
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    tabId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: activeAt + 1400
+                }
+            }
+        }
+    })
+
+    const terminalAt = activeAt + 1800
+    const result = await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: terminalAt,
+        terminalAt,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1,
+        tabOpenedAt: activeAt + 100,
+        contentOpenedAt: activeAt + 900,
+        actionReadyAt: activeAt + 1200,
+        blockAttemptedAt: activeAt + 1400
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+    const counters = sw.state().queueWakeupCounters
+
+    assert.equal(result.recorded, true, JSON.stringify(result))
+    assert.equal(counters['profileAction.phase.load.totalMs'] || 0, 800, 'the load phase comes from the record\'s contentOpenedAt')
+    assert.equal(counters['profileAction.phase.action.totalMs'] || 0, 200, 'the action phase comes from the record\'s milestones')
 })
 
 test('already-blocked terminal progress records an alreadyBlocked profileAction stat, not reallyBlocked', async () => {

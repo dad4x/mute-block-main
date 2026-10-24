@@ -625,6 +625,8 @@ let flightRecorderPollTimer = null
 let flightRecorderLastSeq = 0
 let flightRecorderRows = []
 let flightRecorderRenderedKey = ''
+// The card's sort (24 Oct): by time (newest first by default) or by target. Sorting is in the page only.
+let flightRecorderSort = {key: 'at', dir: 'desc'}
 
 function isFlightRecorderCardExpanded() {
     const list = document.getElementById('flightRecorderList')
@@ -665,27 +667,86 @@ async function refreshFlightRecorderCard() {
     renderFlightRecorderCard()
 }
 
+// The entries the card shows, sorted as the header asks. Flight recorder events are not age-limited: the 90-day recent history retention
+// is for terminal history records, not for events.
+function getVisibleFlightRecorderRows() {
+    const rows = flightRecorderRows
+    const dir = flightRecorderSort.dir === 'asc' ? 1 : -1
+    const bySeq = (a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0)
+    if (flightRecorderSort.key === 'target') {
+        return rows.slice().sort((a, b) => (getFlightRecorderTarget(a).localeCompare(getFlightRecorderTarget(b)) * dir) || bySeq(b, a))
+    }
+    return rows.slice().sort((a, b) => ((Number(a.at) || 0) - (Number(b.at) || 0) || bySeq(a, b)) * dir)
+}
+
+// The profile or row a record is about: its target URL, or its row key, or the page it came from.
+function getFlightRecorderTarget(entry) {
+    return `${entry.targetUrl || entry.rowKey || entry.sourcePageUrl || ''}`.trim()
+}
+
+function getFlightRecorderTargetLabel(target) {
+    const match = /\/profile\/([^/?#]+)/.exec(target)
+    return match ? match[1] : target
+}
+
+function buildFlightRecorderHeader() {
+    const header = document.createElement('div')
+    header.className = 'row row--flight row--flight-header'
+    const sortButton = (label, key) => {
+        const active = flightRecorderSort.key === key
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.textContent = active ? `${label} ${flightRecorderSort.dir === 'asc' ? '▲' : '▼'}` : label
+        button.addEventListener('click', () => {
+            flightRecorderSort = active
+                ? {key, dir: flightRecorderSort.dir === 'asc' ? 'desc' : 'asc'}
+                : {key, dir: key === 'at' ? 'desc' : 'asc'}
+            flightRecorderRenderedKey = ''
+            renderFlightRecorderCard()
+        })
+        return button
+    }
+    header.append(
+        sortButton('Time', 'at'),
+        buildTextCell('Seq'),
+        buildTextCell('Kind'),
+        sortButton('Target', 'target'),
+        buildTextCell('Status / outcome'),
+        buildTextCell('Source / reason'),
+        buildTextCell('Message')
+    )
+    return header
+}
+
+function buildFlightRecorderRow(entry) {
+    const target = getFlightRecorderTarget(entry)
+    const row = document.createElement('div')
+    row.className = 'row row--flight row--event'
+    const status = `${entry.status || ''}${entry.outcome ? ` / ${entry.outcome}` : ''}`
+    const source = `${entry.source || ''}${entry.reason ? ` · ${entry.reason}` : ''}`
+    row.append(
+        buildTextCell(formatDateTime(entry.at)),
+        buildTextCell(`#${entry.seq || 0}`),
+        buildBadge(`${entry.kind || 'event'}`),
+        buildTitleCell(getFlightRecorderTargetLabel(target) || '—', target, {title: target}),
+        buildTextCell(status),
+        buildTextCell(source),
+        buildTextCell(`${entry.message || ''}`)
+    )
+    return row
+}
+
 function renderFlightRecorderCard() {
     const countEl = document.getElementById('flightRecorderCount')
     const container = document.getElementById('flightRecorderList')
     if(!container) return
-    if(countEl) countEl.textContent = `${flightRecorderRows.length} events`
-    // Redrawn only when a new event arrived, so an idle recorder costs one small reply a second.
-    const key = `${flightRecorderLastSeq}|${flightRecorderRows.length}`
+    const rows = getVisibleFlightRecorderRows()
+    if(countEl) countEl.textContent = `${rows.length} events`
+    // Redrawn only when a new event arrived or the view changed, so an idle recorder costs one small reply a second.
+    const key = `${flightRecorderLastSeq}|${rows.length}|${flightRecorderSort.key}|${flightRecorderSort.dir}`
     if(key === flightRecorderRenderedKey) return
     flightRecorderRenderedKey = key
-    replaceChildren(container, flightRecorderRows.map(entry => {
-        const row = document.createElement('div')
-        row.className = 'row row--event'
-        const message = `${entry.message || ''}`
-        row.append(
-            buildTitleCell(message || `${entry.kind || 'event'}`, `${entry.channel || ''}`, {title: `${entry.rowKey || entry.runId || ''}`}),
-            buildBadge(`${entry.kind || 'event'}`),
-            buildTextCell(`#${entry.seq || 0}`),
-            buildTextCell(formatDateTime(entry.at))
-        )
-        return row
-    }), 'No flight recorder events yet.')
+    replaceChildren(container, rows.length ? [buildFlightRecorderHeader(), ...rows.map(buildFlightRecorderRow)] : [], 'No flight recorder events yet.')
 }
 
 // Countdown for a dev-mode run limit. Only asks the worker while dev mode is on.
@@ -1296,7 +1357,11 @@ function render() {
     ))
     setText('blockAttemptOnFollowingCount', blockOutcomeCounts.blockAttemptOnFollowingCount)
     setText('terminalCount', terminalCount)
-    setText('eventCount', state.events.length)
+    // The Load phase (navigation start to content script open) of this metrics epoch, averaged over its samples.
+    const pageLoadCounters = ((state.metrics || {}).currentEpoch || state.metrics || {}).counters || {}
+    const pageLoadSamples = getMetricCounter(pageLoadCounters, 'profileAction.phase.load.sampleCount')
+    const pageLoadTotalMs = getMetricCounter(pageLoadCounters, 'profileAction.phase.load.totalMs')
+    setText('avgPageLoadValue', pageLoadSamples ? formatPhaseTimingDurationMs(pageLoadTotalMs / pageLoadSamples) : '--')
     setText('eventListCount', `${state.events.length} event${state.events.length === 1 ? '' : 's'}`)
     setText('runCount', `${runItems.length} run${runItems.length === 1 ? '' : 's'}`)
     const queueTotalCount = getQueueTotalCount(queueItems)

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const {SPACE_MAP_BUCKET_COUNT} = require("../../shared/js/storageKeys")
 const {evaluate, getCdpConfig, getOption, getTargets, readProfileNukeProgressFromWorker, runMain} = require('./lib/cdp')
 
 runMain(async () => {
@@ -40,15 +41,15 @@ runMain(async () => {
     let workerResult = null
     if(serviceWorker) {
         const progressRecords = await readProfileNukeProgressFromWorker(config)
-        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, progress) {
+        workerResult = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectWorker(needle, progress, bucketCount) {
             const keys = ['mbSpaceMapLayoutVersion', 'mbCoordinatorRunsLayoutVersion', 'mbCoordinatorQueue', 'mbSpacePendingNukedPosts', 'mbCoordinatorRuns']
-            for (let i = 0; i < 32; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
+            for (let i = 0; i < bucketCount; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
             const storage = await chrome.storage.local.get(keys)
             // Space maps and the run list are kept in 32 buckets each once their layout marker is 2 (1437+). Rebuild each whole map.
             const readBucketed = (base, layoutKey) => {
                 if (storage[layoutKey] !== 2) return storage[base] || {}
                 const merged = {}
-                for (let i = 0; i < 32; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
+                for (let i = 0; i < bucketCount; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
                 return merged
             }
             const pending = readBucketed('mbSpacePendingNukedPosts', 'mbSpaceMapLayoutVersion')
@@ -119,7 +120,7 @@ runMain(async () => {
                     runs: Object.keys(runs).length
                 }
             }
-        }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)} )`)
+        }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)}, ${SPACE_MAP_BUCKET_COUNT} )`)
     }
 
     console.log(JSON.stringify({needle, pageCount: pages.length, pageResults, workerResult}, null, 2))

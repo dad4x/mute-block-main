@@ -2,11 +2,12 @@
 // The recorder entry's kind is the event type. The event's details are flattened to top-level fields, so the recorder's own
 // per-field caps apply. Reserved recorder fields are never overwritten. Pure: no storage, no recorder access here.
 
+const {STORED_ERROR_TEXT_MAX_CHARS} = require('./tunables')
 const RESERVED_RECORDER_FIELDS = new Set(['kind', 'at', 'seq', 'message', 'runId', 'rowKey'])
 
 function coordinatorEventToFlightRecorderEntry(event = {}) {
     const kind = `${event?.type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic'
-    const entry = {kind, channel: 'event', message: `${event?.message || ''}`.slice(0, 240)}
+    const entry = {kind, channel: 'event', message: `${event?.message || ''}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)}
     if(event?.runId) entry.runId = `${event.runId}`
     if(event?.itemId) entry.rowKey = `${event.itemId}`
     const at = Number.parseInt(event?.at, 10)
