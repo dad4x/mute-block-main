@@ -419,8 +419,10 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
         error: terminal ? normalizeString(event.error || '') : '',
         updatedAt: Math.max(Number.parseInt(item.updatedAt, 10) || 0, now),
         queuedAt: nextStatus === 'queued' ? now : item.queuedAt || 0,
+        // A new activation starts a new clock. The earlier start is kept only while the row is already active, so a row that was
+        // queued again does not inherit the start of the attempt before it (that start gave 3.5 s averages on the dashboard).
         activeAt: nextStatus === 'active' || nextStatus === 'acting' || nextStatus === 'settling'
-            ? item.activeAt || now
+            ? (['active', 'acting', 'settling'].includes(item.status) && item.activeAt ? item.activeAt : now)
             : nextStatus === 'queued' ? 0 : item.activeAt || 0,
         terminalAt: terminal
             ? Number.parseInt(event.terminalAt || event.tabClosedAt, 10) || now

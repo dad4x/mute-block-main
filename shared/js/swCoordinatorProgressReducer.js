@@ -380,11 +380,12 @@ function createCoordinatorProgressReducer(deps = {}) {
             queuedAt: resetRetry && mapped.status === 'queued'
                 ? Number.parseInt(record.queuedAt, 10) || nowMs
                 : item.queuedAt || 0,
+            // A row mapped back to queued has no active start. Keeping the old one would carry it into the next activation.
             activeAt: mapped.status === 'active'
                 ? (options.refreshActiveAt === true
                     ? progressActiveAt
                     : progressActiveAt)
-                : resetRetry ? 0 : mappedTerminal ? terminalActiveAt : item.activeAt || 0,
+                : resetRetry || mapped.status === 'queued' ? 0 : mappedTerminal ? terminalActiveAt : item.activeAt || 0,
             terminalAt,
             actionLease: mappedTerminal || resetRetry ? null : item.actionLease || null,
             actionLeaseReleasedAt: mappedTerminal
