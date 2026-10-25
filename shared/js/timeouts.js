@@ -171,5 +171,9 @@ module.exports = {
     DIAGNOSTIC_EVENT_FLUSH_MIN_INTERVAL_MS: 5000,
     // The one read of the legacy-cleanup names, once per browser session (sw.js, owner 20 Oct; the cleanup has no budget of its own,
     // so it used the space-feed storage budget). Same value as that budget: 15 seconds.
-    LEGACY_CONTENT_INDEX_CLEANUP_READ_TIMEOUT_MS: 15000
+    LEGACY_CONTENT_INDEX_CLEANUP_READ_TIMEOUT_MS: 15000,
+    // A batch enqueue from the search page whose save timed out is checked against the queue for this long, polling at the interval.
+    // The worker can still queue a large batch after the page has stopped waiting (24 Oct: 1100 profiles).
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_TIMEOUT_MS: 60000,
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_INTERVAL_MS: 2000
 }

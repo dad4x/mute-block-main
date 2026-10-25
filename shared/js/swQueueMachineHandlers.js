@@ -51,6 +51,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const recordOwnedBlockedSweepTerminal = requireQueueMachineCapability('durable', durable, 'recordOwnedBlockedSweepTerminal')
     const removePendingSpaceFeedEntries = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedEntries')
     const removePendingSpaceFeedUrls = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedUrls')
+    const mergeSpacePendingNukedPosts = requireQueueMachineCapability('durable', durable, 'mergeSpacePendingNukedPosts')
     const recoverExhaustedRolledBackQueuedCoordinatorItem = requireQueueMachineCapability('durable', durable, 'recoverExhaustedRolledBackQueuedCoordinatorItem')
     const requeueDurableActiveCoordinatorItemWithoutActor = requireQueueMachineCapability('durable', durable, 'requeueDurableActiveCoordinatorItemWithoutActor')
     const settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor = requireQueueMachineCapability('durable', durable, 'settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor')
@@ -142,6 +143,9 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
         },
         [QUEUE_MACHINE_EVENT_TYPES.PENDING_SPACE_FEED_ENTRIES_REMOVE]: async (event = {}) => {
             return removePendingSpaceFeedEntries(event.postKeys || [])
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.SPACE_PENDING_NUKED_POSTS_MERGE]: async (event = {}) => {
+            return mergeSpacePendingNukedPosts(event)
         },
         [QUEUE_MACHINE_EVENT_TYPES.SPACE_FEED_PROFILES_CONFIRM]: async (event = {}) => {
             return confirmSpaceFeedProfilesBlocked(event.profileHrefs || event.urls || [])

@@ -25,5 +25,7 @@ module.exports = {
     COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT: 32,
     SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
     SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
-    DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled'
+    DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled',
+    // The last or current continuous work: its start, and its end once it has ended (24 Oct). Read by the dashboard's Current Work header.
+    COORDINATOR_WORK_SESSION_KEY: 'mbCoordinatorWorkSession'
 }

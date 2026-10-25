@@ -1,6 +1,7 @@
 // The progress bar at the bottom of a queue page. The space page and the dashboard both build it here, so they look and lay out the same.
 // Values are set by the caller through setProgress; this file only builds and styles the bar.
 const { BRAND_RED } = require('./colorTokens')
+const { setMuteBlockHelp } = require('./muteBlockHelp')
 
 function createQueueProgressBar(options = {}) {
     const barId = options.barId || 'mb-queue-progress'
@@ -46,8 +47,7 @@ function createQueueProgressBar(options = {}) {
     if(typeof options.onLogoClick === 'function') {
         const logoButton = document.createElement('button')
         logoButton.type = 'button'
-        logoButton.title = options.logoTitle || ''
-        logoButton.setAttribute('aria-label', options.logoTitle || 'Open')
+        setMuteBlockHelp(logoButton, options.logoTitle || 'Open dashboard')
         logoButton.style.background = 'none'
         logoButton.style.border = 'none'
         logoButton.style.padding = '0'

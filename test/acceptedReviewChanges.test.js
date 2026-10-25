@@ -347,8 +347,11 @@ register('the settings writer keeps a value only when its type matches its defau
     const validatorSource = extractFunction(swSource, 'function isExtensionSettingValueValid(key, value)')
     const writerSource = extractFunction(swSource, 'async function setExtensionSettingsRequested(settings = {})')
     const writes = []
+    const {WORKER_WINDOW_FOREGROUND_MODE_KEY, WORKER_WINDOW_FOREGROUND_MODES} = require('../shared/js/swprefs.js')
     const context = vm.createContext({
         defaults: require('../shared/js/defaults.js'),
+        WORKER_WINDOW_FOREGROUND_MODE_KEY,
+        WORKER_WINDOW_FOREGROUND_MODES,
         metricStorageSet: async values => { writes.push(values) }
     })
     vm.runInContext(`${validatorSource}\n${writerSource}`, context)
@@ -364,6 +367,102 @@ register('the settings writer keeps a value only when its type matches its defau
     const plain = value => JSON.parse(JSON.stringify(value))
     assert.deepEqual(plain(writes), [{targetQueuedTabConcurrency: 6, coordinatorAutoStartOnBrowserStart: true}])
     assert.deepEqual(plain(result), {ok: true, rejected: ['fopDelay', 'flipToAnswers', 'profilesPerBatch']})
+})
+
+// 24 Oct. The Collect N More count belongs to one search page. It starts at the default, takes only the dropdown's choices, and goes
+// back to the default when the search changes. Nothing is stored. Nuke 'Em keeps the default count.
+register('the Collect N More count is kept for one search page, takes only the dropdown choices, and resets with the search', () => {
+    const tunables = require('../shared/js/tunables.js')
+    assert.equal(tunables.PROFILE_SEARCH_COLLECT_LIMIT, 100)
+    assert.deepEqual([...tunables.PROFILE_SEARCH_COLLECT_CHOICES], [25, 50, 100, 250, 500, 1000])
+
+    const location = {origin: 'https://www.quora.com', pathname: '/search', search: '?q=first'}
+    let syncs = 0
+    const context = vm.createContext({
+        PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
+        location,
+        URLSearchParams,
+        profileSearchCollectionKey: '',
+        profileSearchStagedHrefs: [],
+        profileSearchStagedHrefSet: new Set(),
+        profileSearchCollectCursorScrollY: 0,
+        profileSearchCollectCursorHref: '',
+        syncProfileSearchControls: () => { syncs += 1 }
+    })
+    vm.runInContext([
+        'let profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        extractFunction(contentSource, 'function getProfileSearchCollectLimit()'),
+        extractFunction(contentSource, 'function setProfileSearchCollectLimit(value)'),
+        extractFunction(contentSource, 'function getProfileSearchCollectionKey()'),
+        extractFunction(contentSource, 'function resetProfileSearchCollectionState(options = {})'),
+        extractFunction(contentSource, 'function ensureProfileSearchCollectionStateForCurrentSearch()')
+    ].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+
+    run('ensureProfileSearchCollectionStateForCurrentSearch()')
+    assert.equal(run('getProfileSearchCollectLimit()'), 100)
+    run('setProfileSearchCollectLimit(250)')
+    assert.equal(run('getProfileSearchCollectLimit()'), 250)
+    assert.equal(syncs, 1)
+    run('setProfileSearchCollectLimit(7)')
+    assert.equal(run('getProfileSearchCollectLimit()'), 250, 'a value the dropdown does not offer is ignored')
+    run('ensureProfileSearchCollectionStateForCurrentSearch()')
+    assert.equal(run('getProfileSearchCollectLimit()'), 250, 'the same search keeps its count')
+    location.search = '?q=second'
+    run('ensureProfileSearchCollectionStateForCurrentSearch()')
+    assert.equal(run('getProfileSearchCollectLimit()'), 100, 'a different search starts at the default')
+
+    const batchBody = extractFunction(contentSource, 'function getProfileSearchBatchHrefs(rows = getProfileSearchRows(), options = {})')
+    assert.doesNotMatch(batchBody, /getProfileSearchCollectLimit/)
+    assert.match(batchBody, /\|\| PROFILE_SEARCH_COLLECT_LIMIT/)
+})
+
+// 24 Oct. A space page's Collect N More stops once N more are collected since the press. The count is the one Nuke 'Em shows, and the
+// choice is kept for that space page only.
+register('the space Collect N More stops after N more are collected, and its choice is kept for one space page', () => {
+    const tunables = require('../shared/js/tunables.js')
+    const location = {origin: 'https://www.quora.com', pathname: '/space/A'}
+    let syncs = 0
+    const context = vm.createContext({
+        PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
+        location,
+        syncSpaceFeedCollectButton: () => { syncs += 1 }
+    })
+    vm.runInContext([
+        'let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        "let spaceFeedCollectKey = ''",
+        extractFunction(contentSource, 'function getSpaceFeedCollectKey()'),
+        extractFunction(contentSource, 'function ensureSpaceFeedCollectStateForCurrentSpace()'),
+        extractFunction(contentSource, 'function setSpaceFeedCollectLimit(value)'),
+        extractFunction(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
+        extractFunction(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)')
+    ].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+
+    run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    assert.equal(run('spaceFeedCollectLimit'), 100)
+    run('setSpaceFeedCollectLimit(250)')
+    assert.equal(run('spaceFeedCollectLimit'), 250)
+    assert.equal(syncs, 1)
+    run('setSpaceFeedCollectLimit(7)')
+    assert.equal(run('spaceFeedCollectLimit'), 250, 'a value the dropdown does not offer is ignored')
+
+    // Five were collected at the press. The run stops once 100 more are counted on top of that.
+    assert.equal(run('isSpaceFeedCollectDone(5, 104, 100)'), false)
+    assert.equal(run('isSpaceFeedCollectDone(5, 105, 100)'), true)
+    assert.equal(run('getSpaceFeedCollectedSince(5, 3)'), 0, 'a dip in the count does not count as collected')
+
+    location.pathname = '/space/B'
+    run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    assert.equal(run('spaceFeedCollectLimit'), 100, 'another space starts at the default')
+
+    const collectBody = extractFunction(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
+    assert.match(collectBody, /!isSpaceFeedCollectDone\(startCount, peakCount, limit\)/)
+    assert.match(collectBody, /window\.scrollBy\(/)
+    // The copy above the feed's buttons sits on its own row, first in the feed toolbar.
+    assert.match(readRepoFile('shared/css/content.css'), /\.mb-ext_space-feed-toolbar > \.mb-ext_space-collect-feed-host \{\n    order: -1;/)
 })
 
 // Review-3 R3-4. The dashboard's run-status poll is one timer. The dev-mode visibility path starts it while dev mode is on and

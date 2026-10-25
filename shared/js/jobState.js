@@ -444,7 +444,7 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
 // --- Rolled-back queued tab retry classification -------------------------
 // Promoted from swRolledBackQueuedTabRetryClassification.js into the reducer
 // core (P3-5/P3-6 design correction, 2026-09-17, see
-// sw-state-machine-decomposition-plan-2026-09-01.md): every predicate below
+// historical/sw-state-machine-decomposition-plan-2026-09-01.md): every predicate below
 // is a pure, single-argument function of a queue item alone, so
 // reduceJobEvent computes them itself instead of trusting a caller-built
 // copy that could go stale (a caller reads the item at one point in time,
@@ -583,7 +583,7 @@ function isRecentQueueLoadPressureReading(pressure = null, now = Date.now()) {
 // shouldRecoverExhaustedRolledBackQueuedTabRetry and
 // buildForcedRolledBackQueuedTabRetryItem for the two call sites that now
 // build this same narrow intent from the same caller options
-// (P3-5/P3-6, sw-state-machine-decomposition-plan-2026-09-01.md).
+// (P3-5/P3-6, historical/sw-state-machine-decomposition-plan-2026-09-01.md).
 function isExhaustedRollbackRecoveryApproved(item = {}, intent = {}, now = Date.now()) {
     if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
 

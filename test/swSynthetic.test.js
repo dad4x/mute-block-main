@@ -5929,7 +5929,7 @@ test('segmented queue WAL hydrate failure does not fall back to stale raw queue'
 
     // 2026-10-01: mbCoordinatorQueueView is no longer persisted at all (see
     // refreshCoordinatorQueueViewForDashboard's own comment in sw.js), so
-    // the 2026-09-15 auto-recovery-from-view path (since retired -- see LEGACY_QUEUE_VIEW_RETIREMENT.md)
+    // the 2026-09-15 auto-recovery-from-view path (since retired -- see historical/LEGACY_QUEUE_VIEW_RETIREMENT.md)
     // never has a view to recover from any more -- it's left in place but is
     // now always a no-op (view-empty), falling through to the same "refuse
     // silently guessing and surface the failure" behavior this test
@@ -7993,7 +7993,7 @@ test('block-attempt-on-following terminal progress records a blockAttemptOnFollo
 })
 
 // The two tests below exercise the P3-2/P3-3 convergence
-// (sw-state-machine-decomposition-plan-2026-09-01.md): before this fix,
+// (historical/sw-state-machine-decomposition-plan-2026-09-01.md): before this fix,
 // terminalizeActiveCoordinatorItemFromBlockedLiveTab's fallback had no
 // direct behavioral test for the profileAction.reallyBlocked/alreadyBlocked
 // stat at all -- the only coverage (the two tests above) drove the stat
@@ -9968,7 +9968,7 @@ test('an explicit deferProjectionSave: false writes no content index, and the de
 })
 
 test('archive, blocked-tab, checkpoint and full-queue writes put no index, shard or queue-view key on chrome.storage.local (coder item 4 guard)', async () => {
-    // Guard for the no-disk-projection rule (coder-instructions-2026-10-18.md, section 1 rule 14). The content queue index, its
+    // Guard for the no-disk-projection rule (historical/coder-instructions-2026-10-18.md, section 1 rule 14). The content queue index, its
     // shards and the queue view never reach chrome.storage.local. The progress view is a projection too, but it still writes to
     // disk until section 5D is approved, so it is excluded from this guard and not asserted either way. WAL and checkpoint keys
     // are out of scope and are not checked.
@@ -12086,6 +12086,28 @@ test('space-feed confirmation does not rewrite legacy progress mirror from queue
 // specific CI failure instead of quietly-wrong stored data. When adding a
 // new field to profile-progress records, add it to both
 // summarizeProfileNukeProgressRecord AND this test's patch/expected pair.
+test('the page reports its tab visibility into the row, and only a change is a flight recorder event', async () => {
+    // 24 Oct: visibility is read at each progress step. The row keeps the latest reading; a flight event marks the first reading and each change.
+    const href = 'https://www.quora.com/profile/Synthetic-Visibility-Readout'
+    const {browser, sw} = loadServiceWorkerHarness({now: 4000, storage: {mbCoordinatorPaused: false}})
+    const sender = {tab: {id: 21, windowId: 3, active: true}}
+
+    for(const pageVisibility of ['visible', 'visible', 'hidden']) {
+        const result = await browser.runtime.sendMessage({
+            action: 'record-direct-profile-progress',
+            profileHref: href,
+            patch: {status: 'blocked', pageVisibility}
+        }, sender)
+        assert.equal(result.recorded, true, JSON.stringify(result).slice(0, 200))
+    }
+
+    const events = JSON.parse(JSON.stringify(sw.getFlightRecorderSnapshot({kind: 'action-visibility'}).entries))
+    assert.deepEqual(events.map(event => [event.visibilityState, event.previousVisibilityState, event.tabId, event.tabActive]), [
+        ['visible', '', 21, true],
+        ['hidden', 'visible', 21, true]
+    ])
+})
+
 test('profile-progress field allowlist round-trips every known field (schema tripwire)', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Schema-Tripwire'
     const serverNow = 900000
@@ -12099,6 +12121,7 @@ test('profile-progress field allowlist round-trips every known field (schema tri
 
     const patch = {
         status: 'blocked',
+        pageVisibility: 'hidden',
         actionKind: 'mute-block',
         attemptId: 'attempt-schema-check',
         attemptNumber: 3,
@@ -12153,6 +12176,7 @@ test('profile-progress field allowlist round-trips every known field (schema tri
 
     const expected = {
         profileHref: href,
+        pageVisibility: 'hidden',
         // The record's version: the door sets it on every write (see persistCoordinator's progress deltas).
         generation: 1,
         status: 'blocked',
@@ -17671,7 +17695,7 @@ test('coordinator authority reentrant apply rejects outside storage update', asy
 })
 
 test('startup removes the retired queue-view key from storage', async () => {
-    // mbCoordinatorQueueView is retired (see LEGACY_QUEUE_VIEW_RETIREMENT.md). Installs that still hold the
+    // mbCoordinatorQueueView is retired (see historical/LEGACY_QUEUE_VIEW_RETIREMENT.md). Installs that still hold the
     // stale copy lose it at startup, and the cleanup must not disturb other keys.
     const {storage} = loadServiceWorkerHarness({
         now: 1000,
@@ -20839,6 +20863,378 @@ test('getOrCreateQueuedWorkerActionSurface creates the window without touching w
     assert.equal(browser.__windows.get(surface.windowId)?.focused, false)
     assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
     assert.equal(browser.__windowUpdates.some(update => update.windowId === surface.windowId), false)
+})
+
+test('the shipped worker-window foreground default is one of focus, activate and none', () => {
+    const defaults = require('../shared/js/defaults')
+    const {WORKER_WINDOW_FOREGROUND_MODES} = require('../shared/js/swprefs')
+    assert.ok(WORKER_WINDOW_FOREGROUND_MODES.includes(defaults.workerWindowForegroundMode))
+})
+
+// Opens an action in the worker window the way the fill path does. The dynamic-switch tests below read what the open did.
+function makeForegroundModeAction(href) {
+    return {
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    }
+}
+
+test('a worker-window foreground mode saved on the Preferences page is used by the next action, with no reload', async () => {
+    const firstHref = 'https://www.quora.com/profile/Synthetic-Foreground-Switch-First'
+    const secondHref = 'https://www.quora.com/profile/Synthetic-Foreground-Switch-Second'
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000, workerWindowForegroundMode: 'focus'})
+    await browser.tabs.create({url: 'https://www.quora.com/search?q=switch', active: true})
+
+    await settleWithFakeTimers(sw.createOwnedTabInQueuedWorkerActionSurface(makeForegroundModeAction(firstHref), {url: firstHref}), timers)
+    const firstTab = listTabs(browser).find(tab => tab.url === firstHref)
+    assert.equal(firstTab.active, true)
+    assert.equal(browser.__windows.get(firstTab.windowId)?.focused, true)
+
+    // The Preferences page saves through this message. The worker validates the value and writes it, and the storage change moves the mode.
+    const saved = await browser.runtime.sendMessage({
+        action: 'set-extension-settings',
+        settings: {workerWindowForegroundMode: 'none'}
+    })
+    // Arrays made inside the worker's VM carry another realm's prototype, so compare host-realm copies.
+    assert.deepEqual([...saved.rejected], [])
+    await flushAsync(10)
+    await browser.tabs.remove(firstTab.id)
+    browser.__windowUpdates.splice(0, browser.__windowUpdates.length)
+
+    await settleWithFakeTimers(sw.createOwnedTabInQueuedWorkerActionSurface(makeForegroundModeAction(secondHref), {url: secondHref}), timers)
+    const secondTab = listTabs(browser).find(tab => tab.url === secondHref)
+    assert.equal(secondTab.active, false)
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+})
+
+test('a worker-window foreground mode stored before the worker starts is applied at startup', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Foreground-Stored-Mode'
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000, storage: {workerWindowForegroundMode: 'activate'}})
+    await browser.tabs.create({url: 'https://www.quora.com/search?q=stored-mode', active: true})
+    await flushAsync(10)
+
+    await settleWithFakeTimers(sw.createOwnedTabInQueuedWorkerActionSurface(makeForegroundModeAction(href), {url: href}), timers)
+    const actionTab = listTabs(browser).find(tab => tab.url === href)
+    assert.equal(actionTab.active, true)
+    assert.equal(browser.__windows.get(actionTab.windowId)?.focused, false)
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+})
+
+test('an unknown worker-window foreground mode is rejected and nothing is stored', async () => {
+    const {browser} = loadServiceWorkerHarness({now: 4000, workerWindowForegroundMode: 'activate'})
+
+    const result = await browser.runtime.sendMessage({
+        action: 'set-extension-settings',
+        settings: {workerWindowForegroundMode: 'bogus'}
+    })
+
+    assert.deepEqual([...result.rejected], ['workerWindowForegroundMode'])
+    const stored = await browser.storage.local.get({workerWindowForegroundMode: null})
+    assert.equal(stored.workerWindowForegroundMode, null)
+})
+
+// The work session (24 Oct): its start, end and end reason are kept in storage for the dashboard's Current Work line.
+const {COORDINATOR_PAUSED_KEY, COORDINATOR_WORK_SESSION_KEY, SPACE_PENDING_NUKED_POSTS_KEY} = require('../shared/js/storageKeys')
+
+async function readStoredWorkSession(browser, timers) {
+    await timers.tick(0)
+    await flushAsync(100)
+    const stored = await browser.storage.local.get({[COORDINATOR_WORK_SESSION_KEY]: null})
+    return stored[COORDINATOR_WORK_SESSION_KEY]
+}
+
+test('the work session starts with queued work and ends on a pause or an empty queue, and the stored session keeps its times', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Work-Session'
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 10000, workerWindowForegroundMode: 'none'})
+    const withWork = {
+        queue: {[href]: makeQueuedCoordinatorRow({href, runId: 'run-work-session', attemptId: 'attempt-work-session', now: 10000})},
+        progress: {}
+    }
+    const emptyQueue = {queue: {}, progress: {}}
+    // The stored pause is read at startup. A session starts only once that read says the queue is not paused.
+    assert.equal(await sw.isCoordinatorPausedInStorage('synthetic-work-session-settle'), false)
+    assert.equal(await readStoredWorkSession(browser, timers), null)
+
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    let session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 10000)
+    assert.equal(session.endedAt, 0)
+
+    // Classifying again while the session runs keeps its start time.
+    timers.setNow(13000)
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 10000)
+    assert.equal(session.endedAt, 0)
+
+    // A pause ends the session at the pause time, with the reason 'paused'.
+    timers.setNow(15000)
+    void sw.metricStorageSet({[COORDINATOR_PAUSED_KEY]: true}, {metricPath: 'synthetic-work-session-pause'}).catch(() => null)
+    session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 10000)
+    assert.equal(session.endedAt, 15000)
+    assert.equal(session.endReason, 'paused')
+
+    // Queued work while paused starts nothing, and a later end changes nothing.
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    assert.equal(sw.endCoordinatorWorkSession('queue-empty'), false)
+    session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 10000)
+    assert.equal(session.endedAt, 15000)
+    assert.equal(session.endReason, 'paused')
+
+    // Resuming, then queued work, starts a new session.
+    timers.setNow(16000)
+    void sw.metricStorageSet({[COORDINATOR_PAUSED_KEY]: false}, {metricPath: 'synthetic-work-session-resume'}).catch(() => null)
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 16000)
+    assert.equal(session.endedAt, 0)
+
+    // An empty queue ends the running session with the reason 'queue-empty'.
+    timers.setNow(20000)
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: emptyQueue})
+    session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 16000)
+    assert.equal(session.endedAt, 20000)
+    assert.equal(session.endReason, 'queue-empty')
+})
+
+test('a queue paused in storage at startup does not start a work session until it is resumed', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Work-Session-Startup-Pause'
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 30000, storage: {[COORDINATOR_PAUSED_KEY]: true}})
+    const withWork = {
+        queue: {[href]: makeQueuedCoordinatorRow({href, runId: 'run-work-session-startup', attemptId: 'attempt-work-session-startup', now: 30000})},
+        progress: {}
+    }
+    assert.equal(await sw.isCoordinatorPausedInStorage('synthetic-work-session-startup-settle'), true)
+    assert.equal(await readStoredWorkSession(browser, timers), null)
+
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    assert.equal(await readStoredWorkSession(browser, timers), null)
+
+    timers.setNow(31000)
+    void sw.metricStorageSet({[COORDINATOR_PAUSED_KEY]: false}, {metricPath: 'synthetic-work-session-startup-resume'}).catch(() => null)
+    await sw.classifyCoordinatorExecutorState({currentAuthorityState: withWork})
+    const session = await readStoredWorkSession(browser, timers)
+    assert.equal(session.startedAt, 31000)
+    assert.equal(session.endedAt, 0)
+})
+
+// The space page's pending write merges the posts it sends into the worker's map, through the queue (25 Oct). A removal the worker made
+// in between is not put back by a later write for another post.
+test('the space page pending write merges its posts through the queue and keeps what the worker removed', async () => {
+    const spaceKey = 'space-synthetic-pending-merge'
+    const spaceUrl = 'https://www.quora.com/spaces/Synthetic-Pending-Merge'
+    const postA = 'post-synthetic-pending-merge-a'
+    const postB = 'post-synthetic-pending-merge-b'
+    const a1 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-A1'
+    const a2 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-A2'
+    const b1 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-B1'
+    const b2 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-B2'
+    const {sw, browser} = loadServiceWorkerHarness({now: 4000})
+
+    const first = await browser.runtime.sendMessage({
+        action: 'merge-space-pending-nuked-posts',
+        spaceKey,
+        spaceUrl,
+        posts: [
+            {postKey: postA, postUrl: '', candidateUrls: [a1, a2], resolvable: false},
+            {postKey: postB, postUrl: '', candidateUrls: [b1], resolvable: false}
+        ]
+    })
+    assert.equal(first.ok, true)
+    assert.equal(first.saved, true)
+
+    // A row finishes: the worker removes its profile from the post's pending list.
+    await browser.runtime.sendMessage({action: 'remove-pending-space-feed-urls', urls: [a1]})
+
+    // The next Nuke sends post B only. Post A must not come back with a1.
+    const second = await browser.runtime.sendMessage({
+        action: 'merge-space-pending-nuked-posts',
+        spaceKey,
+        spaceUrl,
+        posts: [{postKey: postB, postUrl: '', candidateUrls: [b2], resolvable: false}]
+    })
+    assert.equal(second.ok, true)
+    await flushAsync(20)
+
+    const stored = await sw.readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+    const pending = stored[SPACE_PENDING_NUKED_POSTS_KEY]
+    assert.deepEqual([...pending[postA].remainingUrls], [a2])
+    assert.deepEqual([...pending[postB].remainingUrls].sort(), [b1, b2].sort())
+})
+
+// 24 Oct foreground experiment: does the worker window's action tab need to be foregrounded, and does it need OS focus? The modes
+// differ in what an open does to the action tab and to OS focus. Each test loads its own harness in the mode it checks.
+async function openWorkerWindowActionTabInForegroundMode(mode, href) {
+    const {sw, browser, timers} = loadServiceWorkerHarness({now: 4000, workerWindowForegroundMode: mode})
+    const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=foreground-mode', active: true})
+    await settleWithFakeTimers(sw.createOwnedTabInQueuedWorkerActionSurface({
+        ownerTabId: 'service-worker-queue-owner',
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        profileHref: href,
+        targetUrl: href,
+        requestedUrl: href,
+        url: href,
+        noForegroundFallback: true
+    }, {url: href}), timers)
+    const actionTab = listTabs(browser).find(tab => tab.url === href)
+    assert.ok(actionTab, 'worker-window action tab did not open')
+    return {browser, userTab, actionTab}
+}
+
+test('activate mode: the worker action tab is active in its window and the window takes no OS focus', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Foreground-Activate'
+    const {browser, userTab, actionTab} = await openWorkerWindowActionTabInForegroundMode('activate', href)
+
+    assert.equal(actionTab.active, true)
+    assert.equal(browser.__windows.get(actionTab.windowId)?.focused, false)
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+    assert.equal((await browser.tabs.get(userTab.id)).active, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
+})
+
+test('none mode: the worker action tab stays a background tab and nothing takes OS focus', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Foreground-None'
+    const {browser, userTab, actionTab} = await openWorkerWindowActionTabInForegroundMode('none', href)
+
+    assert.equal(actionTab.active, false)
+    assert.equal(browser.__windows.get(actionTab.windowId)?.focused, false)
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+    assert.equal((await browser.tabs.get(userTab.id)).active, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
+})
+
+// Seeds one queued profile action, opens it in the worker window through the real resume path, and claims it the way the content
+// script does before a foreground-required step. Returns once the action tab is durably active.
+async function openQueuedWorkerWindowActionInForegroundMode(mode, href, runId, attemptId) {
+    const {browser, sw, timers} = loadServiceWorkerHarness({
+        now: 2090,
+        workerWindowForegroundMode: mode,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    runId,
+                    status: 'queued',
+                    actionKind: 'mute-block',
+                    executorTabAction: 'nuke',
+                    executorOwner: 'service-worker',
+                    serviceWorkerOwned: true,
+                    executorNoForegroundFallback: true,
+                    executorMaxConcurrent: 1,
+                    targetProfileHref: href,
+                    requestedUrl: href,
+                    dedupeKey: href,
+                    coordinatorKey: href,
+                    queuedAt: 2000,
+                    updatedAt: 2000,
+                    attemptId,
+                    attemptNumber: 1,
+                    milestones: {}
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'profile-search',
+                    status: 'active',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const userTab = await browser.tabs.create({url: 'https://www.quora.com/search?q=elon', active: true})
+    await settleWithFakeTimers(sw.resumeCoordinatorQueueExecution({
+        tabId: 'service-worker-queue-owner',
+        windowId: null
+    }, {
+        serviceWorkerOwned: true,
+        skipAuthorityReconcile: true,
+        awaitFill: true
+    }), timers)
+    const profileTab = await waitFor(
+        () => listTabs(browser).find(tab => tab.url === href),
+        'worker-window profile tab did not open',
+        {timers, attempts: 20, tickMs: 100}
+    )
+    await waitFor(
+        () => sw.coordinatorAuthority.current().queue[href]?.status === 'active',
+        'worker-window profile tab did not become durable active',
+        {timers, attempts: 20, tickMs: 100}
+    )
+    const claimed = await browser.runtime.sendMessage({action: 'claim-tab-action'}, {tab: profileTab})
+    assert.equal(claimed.noForegroundFallback, true)
+    assert.equal(claimed.actionSurfaceMode, 'worker-window')
+    browser.__windowUpdates.splice(0, browser.__windowUpdates.length)
+    return {browser, sw, userTab, profileTab}
+}
+
+test('none mode: a foreground request for a worker-window tab is refused and no window takes OS focus', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Foreground-None-Promote'
+    const attemptId = 'attempt-foreground-none-promote'
+    const {browser, userTab, profileTab} = await openQueuedWorkerWindowActionInForegroundMode(
+        'none',
+        href,
+        'run-foreground-none-promote',
+        attemptId
+    )
+
+    const result = await browser.runtime.sendMessage({
+        action: 'begin-profile-action',
+        profileHref: href,
+        actionKind: 'mute-block',
+        reason: 'block-confirmation',
+        attemptId,
+        attemptNumber: 1
+    }, {tab: profileTab})
+
+    assert.equal(result.begun, false, JSON.stringify(result).slice(0, 300))
+    assert.equal(result.foregroundPromoted, false)
+    assert.equal(result.reason, 'worker-window-foreground-refused')
+    assert.equal((await browser.tabs.get(profileTab.id)).active, false)
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
+})
+
+test('activate mode: a foreground request for a worker-window tab is granted without taking OS focus', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Foreground-Activate-Promote'
+    const attemptId = 'attempt-foreground-activate-promote'
+    const {browser, sw, userTab, profileTab} = await openQueuedWorkerWindowActionInForegroundMode(
+        'activate',
+        href,
+        'run-foreground-activate-promote',
+        attemptId
+    )
+
+    const result = await browser.runtime.sendMessage({
+        action: 'begin-profile-action',
+        profileHref: href,
+        actionKind: 'mute-block',
+        reason: 'block-confirmation',
+        attemptId,
+        attemptNumber: 1
+    }, {tab: profileTab})
+
+    assert.equal(result.begun, true, JSON.stringify(result).slice(0, 300))
+    assert.equal(result.foregroundPromoted, true)
+    assert.equal(result.foregroundMode, 'worker-window')
+    assert.equal(browser.__windowUpdates.some(update => update.options?.focused === true), false)
+    const metadata = sw.state().queuedTabMetadata.find(([tabId]) => tabId === profileTab.id)?.[1] || {}
+    assert.equal(metadata.foregroundRestoreTabId, undefined)
+    assert.equal((await browser.tabs.get(userTab.id)).active, true)
+    assert.equal(browser.__windows.get(userTab.windowId)?.focused, true)
 })
 
 test('createOwnedTabInQueuedWorkerActionSurface serializes two overlapping opens into one tab', async () => {
@@ -43647,7 +44043,7 @@ function loadListPageHarness() {
                     windows: {getCurrent: async () => null}
                 }
             }
-            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './spaceMapStorage'].includes(name)) {
+            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './spaceMapStorage', './muteBlockHelp'].includes(name)) {
                 return sharedModule(name.slice(2))
             }
             // The dashboard's footer bar is built by this module; the list-page harness does not draw it.
@@ -44034,7 +44430,7 @@ test('the Clear button is enabled when only finished rows exist, because Clear r
     const clear = page.getElement('clearCurrentWorkButton')
     assert.equal(refreshed.view.total, 3, 'the view holds the three finished rows')
     assert.equal(clear.disabled, false, 'Clear is enabled with an empty list and three finished rows')
-    assert.equal(clear.title, 'Cancel and remove all 3 Current Work rows', 'the Clear tooltip counts the rows Clear removes')
+    assert.equal(clear.title, 'Mute Block extension: Cancel and remove all 3 Current Work rows', 'the Clear tooltip counts the rows Clear removes')
 })
 
 test('the soft-fail retry counts come from the full population, so a finished soft-fail at the retry limit still counts', async () => {

@@ -1,4 +1,4 @@
-// The queue bar's summary (coder-instructions-2026-10-18.md, section 4 item 2; decisions 9 and 11). The worker keeps
+// The queue bar's summary (historical/coder-instructions-2026-10-18.md, section 4 item 2; decisions 9 and 11). The worker keeps
 // {total, pending, updatedAt} in memory. It is recorded from each queue view the worker broadcasts, and a change is pushed to every
 // open Quora tab with tabs.sendMessage. Content asks for it by runtime message. Nothing is written to any storage area.
 //

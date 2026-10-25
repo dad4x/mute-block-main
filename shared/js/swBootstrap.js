@@ -70,7 +70,7 @@ function registerServiceWorkerListeners(deps = {}) {
         'clear-coordinator-events',
         'clear-coordinator-outliers',
         'set-space-nuked-posts',
-        'set-space-pending-nuked-posts',
+        'merge-space-pending-nuked-posts',
         'set-coordinator-retry-failed-enabled',
         'resume-paused-coordinator-nukes',
         'cancel-coordinator-current-work',
@@ -133,7 +133,8 @@ function registerServiceWorkerListeners(deps = {}) {
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
-        TARGET_QUEUED_TAB_CONCURRENCY_KEY
+        TARGET_QUEUED_TAB_CONCURRENCY_KEY,
+        WORKER_WINDOW_FOREGROUND_MODE_KEY
     } = deps.constants || {}
     const {
         coordinatorReconcileScheduler,
@@ -215,7 +216,6 @@ function registerServiceWorkerListeners(deps = {}) {
         eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
         setSpaceNukedPostsRequested,
-        setSpacePendingNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
         setSpaceSortRequested,
@@ -262,6 +262,7 @@ function registerServiceWorkerListeners(deps = {}) {
         sendTabMessage,
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
+        setWorkerWindowForegroundMode,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -618,6 +619,9 @@ function registerServiceWorkerListeners(deps = {}) {
         if(changes?.[TARGET_QUEUED_TAB_CONCURRENCY_KEY]) {
             setTargetQueuedTabConcurrency(changes[TARGET_QUEUED_TAB_CONCURRENCY_KEY].newValue)
         }
+        if(changes?.[WORKER_WINDOW_FOREGROUND_MODE_KEY]) {
+            setWorkerWindowForegroundMode(changes[WORKER_WINDOW_FOREGROUND_MODE_KEY].newValue)
+        }
         // Progress lives in session storage (decision 31), and nothing writes its view to disk now, so no progress key is read here.
         // A change to the old disk key is not handled (20 Oct review, decision 2).
     }
@@ -702,8 +706,13 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'set-space-nuked-posts') {
             return setSpaceNukedPostsRequested(request.nukedPosts)
         }
-        else if(request.action === 'set-space-pending-nuked-posts') {
-            return setSpacePendingNukedPostsRequested(request.pendingNukedPosts)
+        else if(request.action === 'merge-space-pending-nuked-posts') {
+            return applyCoordinatorQueueMachineEvent({
+                type: 'SPACE_PENDING_NUKED_POSTS_MERGE',
+                spaceKey: request.spaceKey,
+                spaceUrl: request.spaceUrl,
+                posts: request.posts
+            })
         }
         else if(request.action === 'set-coordinator-retry-failed-enabled') {
             return setCoordinatorRetryFailedEnabledRequested(request.enabled === true)
@@ -1097,7 +1106,7 @@ function registerServiceWorkerListeners(deps = {}) {
             })
         }
         else if(request.action === 'record-direct-profile-progress') {
-            return recordDirectProfileProgressFromRequest(request)
+            return recordDirectProfileProgressFromRequest(request, sender)
         }
         else if(request.action === 'clear-profile-nuke-state') {
             return applyCoordinatorQueueMachineEvent({

@@ -267,6 +267,57 @@
     box-shadow: none;
 }
 
+.mb-ext_profile-search-collect-wrap {
+    position: relative;
+    display: inline-flex;
+}
+
+/* The caret is part of the Collect N More button. The count dropdown is a transparent select over it, so the caret opens the list. */
+.mb-ext_profile-search-collect-btn::after {
+    content: '';
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid currentColor;
+}
+
+.mb-ext_profile-search-collect-limit {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 24px;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+/* While a collect runs the dropdown is disabled and lets clicks through, so the button still stops it. */
+.mb-ext_profile-search-collect-limit:disabled {
+    pointer-events: none;
+}
+
+.mb-ext_profile-search-collect-wrap:focus-within .mb-ext_profile-search-collect-btn {
+    outline: 2px solid #111;
+    outline-offset: 2px;
+}
+
+/* Space pages: the Collect N More button on its own row, above the MB Info and Nuke 'Em buttons of the feed toolbar. */
+.mb-ext_space-feed-toolbar > .mb-ext_space-collect-feed-host {
+    order: -1;
+    flex-basis: 100%;
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* The copy sits after the last box, so it shows only once the boxes have scrolled past. Not sticky: a sticky copy floats over the boxes (owner, 25 Oct). */
+.mb-ext_space-collect-column-host {
+    margin-top: 8px;
+}
+
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn--working,
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn--working:hover,
 .mb-ext_profile-search-action-host .mb-ext_nuke-profiles-btn--working,
@@ -339,6 +390,15 @@
     padding: 8px 18px 8px;
     border-top: 1px solid rgba(17, 24, 39, 0.08);
     background: rgba(255, 255, 255, 0.96);
+}
+
+/* The queue's status beside the Nuke 'Em button and the batch button (owner, 25 Oct): a display only, so it does not hold either button. */
+.mb-ext_space-feed-nuking-status,
+.mb-ext_profile-search-nuking-status {
+    font-size: 12px;
+    color: #374151;
+    white-space: nowrap;
+    align-self: center;
 }
 
 .mb-ext_space-feed-status-host {
@@ -489,15 +549,6 @@
 }
 
 .mb-ext_space-feed-post-queue-btn:hover {
-    background-color: #374151;
-}
-
-.mb-ext_space-feed-pause-btn {
-    background-color: #111827;
-    margin-left: 8px;
-}
-
-.mb-ext_space-feed-pause-btn:hover {
     background-color: #374151;
 }
 

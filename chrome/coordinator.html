@@ -21,11 +21,11 @@
         </div>
         <div class="worker-bar-count" id="workerBarCount" title="Terminal (handled) out of total items in Current Work">0 / 0</div>
         <div class="worker-bar-actions">
-            <button class="worker-bar-button" id="workerBarPauseResume" type="button">Pause</button>
-            <button class="worker-bar-button worker-bar-button--danger" id="workerBarCancel" type="button">Cancel</button>
-            <button class="worker-bar-button" id="workerBarDashboard" type="button">Dashboard</button>
-            <button class="worker-bar-button" id="workerBarHistory" type="button">History</button>
-            <button class="worker-bar-button" id="workerBarPreferences" type="button">Preferences</button>
+            <button class="worker-bar-button" id="workerBarPauseResume" type="button" title="Mute Block extension: Pause the queue, or resume it">Pause</button>
+            <button class="worker-bar-button worker-bar-button--danger" id="workerBarCancel" type="button" title="Mute Block extension: Cancel the current work in the queue">Cancel</button>
+            <button class="worker-bar-button" id="workerBarDashboard" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
+            <button class="worker-bar-button" id="workerBarHistory" type="button" title="Mute Block extension: Open the history page">History</button>
+            <button class="worker-bar-button" id="workerBarPreferences" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
         </div>
     </div>
 
@@ -39,9 +39,9 @@
                 </div>
             </div>
             <div class="header-status">
-                <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button">Clear</button>
-                <button class="clear-button" id="historyDashboardButton" type="button">Dashboard</button>
-                <button class="clear-button" id="historyPreferencesButton" type="button">Preferences</button>
+                <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button" title="Mute Block extension: Delete the block history">Clear</button>
+                <button class="clear-button" id="historyDashboardButton" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
+                <button class="clear-button" id="historyPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
             </div>
         </header>
         <section class="panel-stack" aria-label="Nuked post history">
@@ -66,9 +66,9 @@
                     <span class="dev-mode-toggle-track"><span class="dev-mode-toggle-thumb"></span></span>
                     <span class="dev-mode-toggle-label">Dev mode</span>
                 </label>
-                <button class="clear-button" id="clearAllStatsButton" type="button" title="Clears Metrics, Scan cost, Authority state reads, Recent event counts, and Outliers in one action">Clear All Stats</button>
-                <button class="clear-button" id="openHistoryButton" type="button">History</button>
-                <button class="clear-button" id="openPreferencesButton" type="button">Preferences</button>
+                <button class="clear-button" id="clearAllStatsButton" type="button" title="Mute Block extension: Clears Metrics, Scan cost, Authority state reads, Recent event counts, and Outliers in one action">Clear All Stats</button>
+                <button class="clear-button" id="openHistoryButton" type="button" title="Mute Block extension: Open the history page">History</button>
+                <button class="clear-button" id="openPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
                 <div class="status-pill" id="refreshState">Loading</div>
             </div>
         </header>
@@ -77,27 +77,28 @@
             <section class="panel" data-panel-scroll-target="queueList">
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="queueList" aria-expanded="true" aria-controls="queueList" aria-label="Collapse Current Work">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="queueList" aria-expanded="true" aria-controls="queueList" aria-label="Collapse Current Work" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Current Work is the durable operational job set. Status shows execution state; outcome shows terminal result or current error.">Current Work</h2>
                     </div>
                     <div class="panel-actions panel-actions--queue">
                         <div class="panel-actions-row">
                             <span class="pause-state" id="pauseCurrentWorkState">Running</span>
+                            <span class="work-session" id="workSessionLine" hidden></span>
                             <span id="currentWorkReadyCount">Showing 0, 0 queued, 0 succeeded, 0 soft-fail, 0 hard-fail</span>
                             <span class="queue-count" id="queueCount" hidden>0 jobs</span>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="startCoordinatorButton" type="button" hidden>Start</button>
-                                <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled>Loading...</button>
-                                <button class="clear-button clear-button--danger" id="cancelCurrentWorkButton" type="button">Cancel Queue</button>
-                                <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Cancel and remove all Current Work rows">Clear</button>
-                                <button class="clear-button" id="requeueFailedButton" type="button">Requeue</button>
-                                <button class="clear-button" id="retryFailedButton" type="button" aria-pressed="false">Enable Retry Soft-Fails</button>
+                                <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its stored work">Start</button>
+                                <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled title="Mute Block extension: Pause the current work, or resume it">Loading...</button>
+                                <button class="clear-button clear-button--danger" id="cancelCurrentWorkButton" type="button" title="Mute Block extension: Cancel the current work in the queue">Cancel Queue</button>
+                                <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Mute Block extension: Cancel and remove all Current Work rows">Clear</button>
+                                <button class="clear-button" id="requeueFailedButton" type="button" title="Mute Block extension: Requeue the failed rows so they run again">Requeue</button>
+                                <button class="clear-button" id="retryFailedButton" type="button" aria-pressed="false" title="Mute Block extension: Turn retrying of soft failures on or off">Enable Retry Soft-Fails</button>
                             </div>
                         </div>
                         <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Download the service worker's flight recorder as JSON">Save flight recorder</button>
+                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Download the service worker's flight recorder as JSON">Save flight recorder</button>
                                 <label class="dev-mode-select">Run for
                                     <select id="debugResumeMinutesSelect">
                                         <option value="0">No time limit</option>
@@ -148,12 +149,12 @@
             <section class="panel" data-panel-scroll-target="metricsJournal" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="metricsList" aria-expanded="true" aria-controls="metricsList" aria-label="Collapse Metrics">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="metricsList" aria-expanded="true" aria-controls="metricsList" aria-label="Collapse Metrics" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Queue wakeup metrics show scheduler pumps, nudges, repairs, and per-cycle journal entries.">Metrics</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="metricsUpdated">No metrics yet</span>
-                        <button class="clear-button" id="resetMetricsButton" type="button">Reset metrics</button>
+                        <button class="clear-button" id="resetMetricsButton" type="button" title="Mute Block extension: Reset the metrics counters">Reset metrics</button>
                     </div>
                 </div>
                 <div class="metrics-panel" id="metricsList">
@@ -207,7 +208,7 @@
                     </div>
                     <div class="metrics-grid" id="metricsGrid"></div>
                     <div class="panel-subhead">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="metricsJournal" aria-expanded="true" aria-controls="metricsJournal" aria-label="Collapse Journal">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="metricsJournal" aria-expanded="true" aria-controls="metricsJournal" aria-label="Collapse Journal" title="Mute Block extension: Show or hide this panel">v</button>
                         <h3 title="Per-cycle journal entries from the queue-wakeup metrics system -- pumps, nudges, repairs, and other notable state changes, newest first.">Journal</h3>
                         <span id="metricsJournalCount">0 entries</span>
                     </div>
@@ -218,12 +219,12 @@
             <section class="panel" data-panel-scroll-target="runList" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="runList" aria-expanded="true" aria-controls="runList" aria-label="Collapse Runs">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="runList" aria-expanded="true" aria-controls="runList" aria-label="Collapse Runs" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Runs group targets by enqueue request, source, retry action, and submitted time.">Runs</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="runCount">0 runs</span>
-                        <button class="clear-button" id="clearCompletedRunsButton" type="button">Clear Completed</button>
+                        <button class="clear-button" id="clearCompletedRunsButton" type="button" title="Mute Block extension: Remove the completed runs from this list">Clear Completed</button>
                     </div>
                 </div>
                 <div class="list" id="runList"></div>
@@ -232,7 +233,7 @@
             <section class="panel panel--collapsed" data-panel-scroll-target="flightRecorderList" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="flightRecorderList" aria-expanded="false" aria-controls="flightRecorderList" aria-label="Expand Flight recorder">></button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="flightRecorderList" aria-expanded="false" aria-controls="flightRecorderList" aria-label="Expand Flight recorder" title="Mute Block extension: Show or hide this panel">></button>
                         <h2 title="The service worker's flight recorder: every channel, newest first. Polled only while this card is open, and only in dev mode.">Flight recorder</h2>
                     </div>
                     <div class="panel-actions">
@@ -245,11 +246,11 @@
             <section class="panel" data-panel-scroll-target="scanCostHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="scanCostHistogram" aria-expanded="true" aria-controls="scanCostHistogram" aria-label="Collapse Scan cost">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="scanCostHistogram" aria-expanded="true" aria-controls="scanCostHistogram" aria-label="Collapse Scan cost" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Scan cost by location showing items scanned and calls made for each executor phase.">Scan cost by location</h2>
                     </div>
                     <div class="panel-actions">
-                        <button class="clear-button" id="clearScanCostButton" type="button" title="Scan cost is backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
+                        <button class="clear-button" id="clearScanCostButton" type="button" title="Mute Block extension: Scan cost is backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
                     </div>
                 </div>
                 <div class="histogram-container" id="scanCostHistogram"></div>
@@ -258,11 +259,11 @@
             <section class="panel" data-panel-scroll-target="authorityLoadHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="authorityLoadHistogram" aria-expanded="true" aria-controls="authorityLoadHistogram" aria-label="Collapse Authority state reads">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="authorityLoadHistogram" aria-expanded="true" aria-controls="authorityLoadHistogram" aria-label="Collapse Authority state reads" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Calls to the coordinator-authority-state accessors, by verb (full/cheap/verify/forceReload) and call site -- not flight-recorder events, just calls of interest for tracking which call sites exercise which cost tier.">Authority state reads</h2>
                     </div>
                     <div class="panel-actions">
-                        <button class="clear-button" id="clearAuthorityLoadHistogramButton" type="button" title="Authority-load call counts are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
+                        <button class="clear-button" id="clearAuthorityLoadHistogramButton" type="button" title="Mute Block extension: Authority-load call counts are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
                     </div>
                 </div>
                 <div class="histogram-container" id="authorityLoadHistogram"></div>
@@ -271,11 +272,11 @@
             <section class="panel" data-panel-scroll-target="writeSizeHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="writeSizeHistogram" aria-expanded="true" aria-controls="writeSizeHistogram" aria-label="Collapse Write sizes">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="writeSizeHistogram" aria-expanded="true" aria-controls="writeSizeHistogram" aria-label="Collapse Write sizes" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="How many storage writes that reached disk fell in each size band this epoch, after the bucket split. Same counters as Reset metrics, so a metrics reset clears it too.">Write sizes (physical)</h2>
                     </div>
                     <div class="panel-actions">
-                        <button class="clear-button" id="clearWriteSizeHistogramButton" type="button" title="Write sizes are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
+                        <button class="clear-button" id="clearWriteSizeHistogramButton" type="button" title="Mute Block extension: Write sizes are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
                     </div>
                 </div>
                 <div class="histogram-container" id="writeSizeHistogram"></div>
@@ -284,11 +285,11 @@
             <section class="panel" data-panel-scroll-target="eventHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="eventHistogram" aria-expanded="true" aria-controls="eventHistogram" aria-label="Collapse Recent events">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="eventHistogram" aria-expanded="true" aria-controls="eventHistogram" aria-label="Collapse Recent events" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Recent event counts by kind and reason from the flight recorder.">Recent event counts</h2>
                     </div>
                     <div class="panel-actions">
-                        <button class="clear-button" id="clearEventHistogramButton" type="button" title="Hides counts recorded before now in this dashboard tab; not persisted, cleared on reload">Clear</button>
+                        <button class="clear-button" id="clearEventHistogramButton" type="button" title="Mute Block extension: Hides counts recorded before now in this dashboard tab; not persisted, cleared on reload">Clear</button>
                     </div>
                 </div>
                 <div class="histogram-container" id="eventHistogram"></div>
@@ -297,11 +298,11 @@
             <section class="panel" data-panel-scroll-target="phaseTimingHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="phaseTimingHistogram" aria-expanded="true" aria-controls="phaseTimingHistogram" aria-label="Collapse Phase timing">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="phaseTimingHistogram" aria-expanded="true" aria-controls="phaseTimingHistogram" aria-label="Collapse Phase timing" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Average time spent in each phase of a mute-block action's notice-select-open-load-inspect-action-detect-close cycle this metrics epoch, computed from each terminal row's own milestone timestamps. 'Notice/select' (previous terminal row to this row's own activation) is covered separately by secs/handoff above, not here. Bars are sized relative to the slowest phase -- the phase with the longest bar is where the most time is actually going.">Phase timing</h2>
                     </div>
                     <div class="panel-actions">
-                        <button class="clear-button" id="resetPhaseTimingButton" type="button" title="Phase timing is backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
+                        <button class="clear-button" id="resetPhaseTimingButton" type="button" title="Mute Block extension: Phase timing is backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
                     </div>
                 </div>
                 <div class="histogram-container" id="phaseTimingHistogram"></div>
@@ -310,12 +311,12 @@
             <section class="panel" data-panel-scroll-target="outlierList" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Rows whose active duration exceeded 45s or 2.5 standard deviations above the average active duration of terminal rows. Checked continuously, so a still-running stuck row shows up too. Kept by the worker across reloads until Clear here or Clear All Stats.">Outliers</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="outlierCount">0 outliers</span>
-                        <button class="clear-button" id="clearOutliersButton" type="button">Clear</button>
+                        <button class="clear-button" id="clearOutliersButton" type="button" title="Mute Block extension: Clear the outlier list">Clear</button>
                     </div>
                 </div>
                 <div class="list list--compact" id="outlierList"></div>
@@ -324,12 +325,12 @@
             <section class="panel" data-panel-scroll-target="eventList" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="eventList" aria-expanded="true" aria-controls="eventList" aria-label="Collapse Events">v</button>
+                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="eventList" aria-expanded="true" aria-controls="eventList" aria-label="Collapse Events" title="Mute Block extension: Show or hide this panel">v</button>
                         <h2 title="Events show recent dashboard actions and their source or target context.">Events</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="eventListCount">0 events</span>
-                        <button class="clear-button" id="clearEventsButton" type="button">Clear</button>
+                        <button class="clear-button" id="clearEventsButton" type="button" title="Mute Block extension: Clear the events list">Clear</button>
                     </div>
                 </div>
                 <div class="list list--compact" id="eventList"></div>

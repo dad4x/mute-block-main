@@ -46,7 +46,7 @@ module.exports = {
     OUTLIER_MIN_SAMPLES_FOR_STDDEV: 5,
     OUTLIER_MAX_ENTRIES: 50,
 
-    // Limits that more than one module used to declare (14-oct-review-1.md finding 8). Each is declared here only.
+    // Limits that more than one module used to declare (historical/14-oct-review-1.md finding 8). Each is declared here only.
     // The most records the profile-nuke progress view keeps. sw.js and content.js both prune to it.
     MAX_PROFILE_NUKE_PROGRESS_ENTRIES: 1000,
     // Retry budget for a stale queued tab (sw.js). jobState.js also uses it as the default when an item has no maxRetries.
@@ -81,6 +81,8 @@ module.exports = {
     SPACE_FEED_STATE_POLL_MS: 5000,
     // Dashboard: how often the throttle note is redrawn while Quora throttles the queue.
     DASHBOARD_THROTTLE_NOTE_REFRESH_MS: 1000,
+    // Dashboard: how often the Current Work line's session duration is redrawn while a work session runs. The line reads no storage between redraws.
+    DASHBOARD_WORK_SESSION_REDRAW_MS: 1000,
     // Dashboard flight recorder card (dev mode only): how often it asks the worker for new events while it is expanded, and how many rows it keeps.
     FLIGHT_RECORDER_CARD_POLL_MS: 1000,
     FLIGHT_RECORDER_CARD_ROW_LIMIT: 200,
@@ -112,6 +114,18 @@ module.exports = {
     ORPHAN_SURFACE_TAB_GRACE_MS: 10000,
     // Text kept on stored errors, diagnostics and event messages: longer text is cut to this many characters (24 Oct, review C.2).
     // Page context text is a different limit and is not this one.
-    STORED_ERROR_TEXT_MAX_CHARS: 240
+    STORED_ERROR_TEXT_MAX_CHARS: 240,
+
+    // Profile search "Collect N More" (content.js). The count a search page starts with, and the choices its dropdown offers. The
+    // dropdown's choice is kept for that search page only, in memory: it is not saved, and it resets on reload or a new search.
+    // "Nuke 'Em" keeps the default count.
+    PROFILE_SEARCH_COLLECT_LIMIT: 100,
+    PROFILE_SEARCH_COLLECT_CHOICES: [25, 50, 100, 250, 500, 1000],
+
+    // Scrolling in the collect loops and the modal nuke (content.js). The wait after each scroll before the page is read again. Quora
+    // slows down deeper into a feed, so a feed that stops growing at the bottom only counts as ended after COLLECT_END_CONFIRM_MS.
+    COLLECT_SCROLL_PASS_WAIT_MS: 500,
+    COLLECT_END_CONFIRM_MS: 3000,
+    MODAL_PROFILE_NUKE_SCROLL_WAIT_MS: 900
 }
 

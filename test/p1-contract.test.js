@@ -153,6 +153,7 @@ function loadDashboardHarness() {
             if(name === './tunables') return require(path.join(__dirname, '..', 'shared/js/tunables'))
             if(name === './storageKeys') return require(path.join(__dirname, '..', 'shared/js/storageKeys'))
             if(name === './spaceMapStorage') return require(path.join(__dirname, '..', 'shared/js/spaceMapStorage'))
+            if(name === './muteBlockHelp') return require(path.join(__dirname, '..', 'shared/js/muteBlockHelp'))
             // The dashboard's footer bar is built by this module; the contract tests do not draw it.
             if(name === './queueProgressBar') return {createQueueProgressBar: () => ({bar: {style: {}}, setProgress() {}})}
             throw new Error(`unexpected require: ${name}`)
@@ -436,7 +437,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'set-space-nuked-posts',
         'set-space-registry',
         'set-space-sort',
-        'set-space-pending-nuked-posts',
+        'merge-space-pending-nuked-posts',
         'settle-terminal-coordinator-items',
         'sweep-owned-blocked-profile-tabs',
         'sweep-service-worker-blocked-profile-tabs'
@@ -1507,7 +1508,7 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.match(css, /\.panel-stack \.panel\s*\{[\s\S]*flex: 0 0 auto;/)
     assert.match(css, /\.panel-stack \.panel\[data-panel-scroll-target="metricsJournal"\]\s*\{[\s\S]*max-height: none;/)
     assert.match(css, /\.metrics-panel\s*\{[\s\S]*flex: 0 0 auto;/)
-    // 2026-10-03 (nits6.md): the journal list itself now scrolls within a
+    // 2026-10-03 (historical/nits6.md): the journal list itself now scrolls within a
     // fixed window (its own max-height/overflow, independent of the outer
     // panel's) and has its own collapse toggle, instead of growing the
     // whole Metrics panel unbounded -- same for the Recent event counts
@@ -1988,7 +1989,7 @@ test('profile-search content uses scoped runtime state instead of full storage c
     const sourceRecordsBody = extractFunction(contentPageStateProjectionSource, 'function normalizeCoordinatorContentSourceIndexRecords(shards = {}, request = {})')
     const pendingRefreshBody = extractFunction(content, 'function scheduleProfileSearchPendingRefresh(delayMs = PROFILE_SEARCH_PENDING_REFRESH_MS)')
     const syncBody = extractFunction(content, 'function syncProfileSearchControls()')
-    const nukeBody = extractFunction(content, 'async function nukeProfileSearchHrefs(button, hrefs = [], options = {})')
+    const nukeBody = extractFunction(content, 'async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {})')
     const spaceSyncBody = extractFunction(content, 'function syncSpaceFeedNukeControls()')
     const spaceScopedRefreshBody = extractFunction(content, 'function scheduleSpaceFeedScopedStateRefresh(entries = [])')
 
@@ -2771,7 +2772,7 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.match(recordSweepBody, /if\(result\?\.terminal\)/)
     // recordActiveBlockedLiveTabTerminal (BLOCKED_LIVE_TAB_TERMINAL_RECORD):
     // the sibling added 2026-09-17 for terminalizeActiveCoordinatorItemFromBlockedLiveTab's
-    // fallback (P3-2/P3-3, sw-state-machine-decomposition-plan-2026-09-01.md).
+    // fallback (P3-2/P3-3, historical/sw-state-machine-decomposition-plan-2026-09-01.md).
     // Same classify -> transition -> authority-write -> stat shape as
     // recordSweepBody above, but deliberately does NOT gate on
     // coordinatorItemMatchesQueuedTabRuntime/queueRuntime.hasActiveQueuedTab
@@ -2826,7 +2827,7 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     // feeding a recordCoordinatorJobProgressViaQueueMachine detour (with an
     // allowBlockedLiveTabSender escape hatch for that pipeline's sender-tab
     // gate); converged 2026-09-17 (P3-2/P3-3,
-    // sw-state-machine-decomposition-plan-2026-09-01.md) onto a dedicated
+    // historical/sw-state-machine-decomposition-plan-2026-09-01.md) onto a dedicated
     // BLOCKED_LIVE_TAB_TERMINAL_RECORD event/handler
     // (recordActiveBlockedLiveTabTerminal) instead -- a sibling of
     // recordOwnedBlockedSweepTerminal's BLOCKED_SWEEP_TERMINAL_RECORD, not
@@ -3141,7 +3142,7 @@ test('profile search controls only collect Follow-button profile rows', () => {
 test('profile search collector stages a bounded batch without queueing', () => {
     const source = readRepoFile('shared/js/content.js')
     const collectBody = extractFunction(source, 'async function collectMoreProfileSearchResults(button)')
-    const queueBody = extractFunction(source, 'async function nukeProfileSearchHrefs(button, hrefs = [], options = {})')
+    const queueBody = extractFunction(source, 'async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {})')
     const syncBody = extractFunction(source, 'function syncProfileSearchControls()')
     const pendingCountBody = extractFunction(source, 'function getPendingCoordinatorProfileSearchWorkCount()')
     const nukeableBody = extractFunction(source, 'function isProfileSearchProfileNukeable(href, options = {})')
@@ -3156,7 +3157,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     const animationBody = extractFunction(source, 'async function animateNukeButtonPress(button)')
     const animationFrameBody = extractFunction(source, 'function waitForAnimationFramePair(options = {})')
 
-    assert.match(source, /PROFILE_SEARCH_COLLECT_LIMIT = 100/)
+    assert.match(readRepoFile('shared/js/tunables.js'), /PROFILE_SEARCH_COLLECT_LIMIT: 100/)
     assert.match(source, /PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000/)
     assert.match(source, /PROFILE_SEARCH_PROFILES_PER_BATCH = 3/)
     assert.match(source, /function getProfileSearchProfilesPerBatch\(\)/)
@@ -3169,7 +3170,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(animationFrameBody, /requestAnimationFrame\(\(\) => requestAnimationFrame\(finish\)\)/)
     assert.match(collectBody, /const initialStagedCount = getProfileSearchStagedHrefs\(\)\.length/)
     assert.match(collectBody, /const targetStagedCount = initialStagedCount \+ limit/)
-    assert.match(collectBody, /await restoreProfileSearchCollectCursor\(\)/)
+    assert.match(collectBody, /window\.scrollTo\(\{top: document\.documentElement\.scrollHeight/)
     assert.match(collectBody, /getProfileSearchRows\(\{fromCurrentViewport: true, skipProcessed: true\}\)/)
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
     assert.match(collectBody, /stageProfileSearchHrefs\(\[row\.href\]\)/)
@@ -3196,7 +3197,8 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(queueBody, /maxConcurrent: getProfileSearchProfilesPerBatch\(\)/)
     assert.match(queueBody, /noForegroundFallback: true/)
     assert.doesNotMatch(queueBody, /recordProfileNukeProgressBatch/)
-    assert.match(queueBody, /Nuking \$\{queued\} left/)
+    assert.doesNotMatch(queueBody, /Nuking \$\{queued\}\.\.\./)
+    assert.match(queueBody, /setNukeButtonIdle\(button, remainingHrefs \? `Nuke 'Em \$\{remainingHrefs\}` : `Nuke 'Em 0`\)/)
     assert.match(queueBody, /ignoreStaleCurrentProfileSearchPending: true/)
     assert.match(queueBody, /filter\(href => isProfileSearchHrefMatchForCurrentQuery\(href\)\)/)
     assert.match(pendingCountBody, /const currentSearchItems = Object\.values\(coordinatorQueue \|\| \{\}\)/)
@@ -4384,6 +4386,14 @@ test('visible worker-window queued tabs can proceed locally without a durable ac
     assert.match(actionBody, /Queued tab proceeded locally using worker-window action surface/)
 })
 
+test('a checkpoint switch forgets the remembered slots only when the save reports false', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const switchBody = extractFunction(source, 'async function performCoordinatorQueueWalCheckpointSwitch(options = {})')
+
+    assert.match(switchBody, /if\(walSaved === false\) queueWalStore\.noteCheckpointSaveFailed\(\)\s*else queueWalStore\.noteCheckpointSaved\(prepared\)/)
+    assert.doesNotMatch(switchBody, /walSaved === true/)
+})
+
 test('resume reattaches live active tabs after service worker restart', () => {
     const source = readRepoFile('shared/js/sw.js')
     const reducerSource = readRepoFile('shared/js/swCoordinatorProgressReducer.js')
@@ -4752,19 +4762,56 @@ test('resolved profile handoff remaps queued tab metadata and pending action', (
     assert.match(resolveMutationBody, /pendingPosts: pendingResult\.changed/)
 })
 
-test('space feed pause is explicit, not overloaded on working nuke buttons', () => {
+test('space feed has no pause control; pausing is on the dashboard only', () => {
     const source = readRepoFile('shared/js/content.js')
     const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
     const postBody = extractFunction(source, 'function syncSpaceFeedPostButtons(renderModel)')
-    const pauseBody = extractFunction(source, 'function syncSpaceFeedTopPauseButton(host, workingButton, model = {}, activeWork = false)')
 
-    assert.match(source, /function syncSpaceFeedTopPauseButton/)
-    assert.match(pauseBody, /mb-ext_space-feed-pause-btn/)
-    assert.match(pauseBody, /pauseSpaceFeedQueue/)
+    assert.doesNotMatch(source, /syncSpaceFeedTopPauseButton/)
+    assert.doesNotMatch(source, /pauseSpaceFeedQueue/)
+    assert.doesNotMatch(source, /mb-ext_space-feed-pause-btn/)
     assert.match(topBody, /if\(activeButton\.dataset\.mbNukeState === 'working'\) \{\s*return\s*\}/)
-    assert.match(topBody, /syncSpaceFeedTopPauseButton\(host, button, model, activeSpaceWork\)/)
-    assert.match(topBody, /button\.disabled = true/)
-    assert.doesNotMatch(postBody, /dataset\.mbNukeState === 'working'[\s\S]{0,120}pauseSpaceFeedQueue/)
+    assert.doesNotMatch(postBody, /pauseSpaceFeedQueue/)
+})
+
+test('space collect goes back to the top when done, the column copy sits after the last box, and queued work does not hold the Nuke Em button', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const css = readRepoFile('shared/css/content.css')
+    const collectBody = extractFunction(source, 'async function collectMoreSpaceFeedPosts(button)')
+    const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
+
+    assert.match(collectBody, /finally \{[\s\S]*window\.scrollTo\(\{top: 0, behavior: 'auto'\}\)/)
+    assert.match(css, /\.mb-ext_space-collect-column-host \{\s*margin-top: 8px;\s*\}/)
+    assert.doesNotMatch(css, /\.mb-ext_space-collect-column-host \{[^}]*position: sticky/)
+    assert.match(extractFunction(source, 'function ensureSpaceCollectWrapInRightColumn()'), /getLastSpaceColumnBox\(column\)[\s\S]*insertAdjacentElement\('afterend', host\)/)
+    assert.match(extractFunction(source, 'function getLastSpaceColumnBox(column)'), /qu-borderAll/)
+    assert.match(topBody, /if\(queueSubmissionPending\) \{\s*syncSpaceFeedNukingStatus\(host, model, activeSpaceWork\)\s*return true\s*\}/)
+    assert.match(topBody, /if\(activeSpaceWork\) \{\s*setSpaceFeedButtonSelection\(button, queueableEntries\)/)
+    assert.doesNotMatch(topBody, /setNukeButtonWorking\(button, formatSpaceFeedGlobalWorkLabel/)
+    assert.match(topBody, /syncSpaceFeedNukingStatus\(host, model, activeSpaceWork\)/)
+})
+
+test('choosing a collect count starts the collect at once, on both pages', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const spaceBody = extractFunction(source, 'function syncSpaceFeedCollectButton(options = {})')
+    const searchBody = extractFunction(source, 'function syncProfileSearchControls()')
+
+    assert.match(spaceBody, /setSpaceFeedCollectLimit\(Number\.parseInt\(event\.currentTarget\.value, 10\)\)[\s\S]*void collectMoreSpaceFeedPosts\(collectButton\)/)
+    assert.match(searchBody, /setProfileSearchCollectLimit\(Number\.parseInt\(event\.currentTarget\.value, 10\)\)[\s\S]*void collectMoreProfileSearchResults\(collectButton\)/)
+})
+
+test('every extension button has hover help that starts with "Mute Block extension: "', () => {
+    const pageHtml = readRepoFile('shared/coordinator.html') + readRepoFile('shared/preferences.html')
+    const buttonTags = pageHtml.match(/<button\b[^>]*>/g) || []
+    assert.ok(buttonTags.length >= 45, `expected at least 45 buttons in the pages, found ${buttonTags.length}`)
+    for(const tag of buttonTags) assert.match(tag, /\stitle="Mute Block extension: [^"]+"/, tag)
+
+    assert.match(readRepoFile('shared/js/muteBlockHelp.js'), /const MUTE_BLOCK_HELP_PREFIX = 'Mute Block extension: '/)
+    for(const file of ['shared/js/content.js', 'shared/js/coordinator.js', 'shared/js/preferences.js', 'shared/js/queueProgressBar.js']) {
+        const source = readRepoFile(file)
+        assert.match(source, /require\('\.\/muteBlockHelp'\)/, file)
+        assert.doesNotMatch(source, /Mute-Block Extension: /, file)
+    }
 })
 
 test('space feed action buttons keep Nuke Em labels', () => {
@@ -6150,7 +6197,7 @@ test('no SCREAMING_SNAKE_CASE string constant is independently declared as a lit
     // here. Allowlisted by value so this test still catches any *new*
     // duplicate going forward. The two storage-key values that were
     // allowlisted here (mbSpacePendingNukedPosts, mbProfileNukeProgressView)
-    // moved to shared/js/storageKeys.js on 2026-10-14 (14-oct-review-1.md
+    // moved to shared/js/storageKeys.js on 2026-10-14 (historical/14-oct-review-1.md
     // finding 8), so they are no longer duplicated and no longer allowlisted.
     const knownPreexistingDuplicateValues = new Set([
         'service-worker-queue-owner',
@@ -6181,7 +6228,7 @@ test('no SCREAMING_SNAKE_CASE string constant is independently declared as a lit
     assert.deepEqual(duplicated, [])
 })
 
-// 14-oct-review-1.md finding 8 (Pattern 6, duplicated constants): these storage key names and limits were each declared with a
+// historical/14-oct-review-1.md finding 8 (Pattern 6, duplicated constants): these storage key names and limits were each declared with a
 // literal in two or three shared/js modules, and nothing checked that the copies agreed. Each is now declared once: keys in
 // shared/js/storageKeys.js, limits in shared/js/tunables.js. Every other module imports the name. This test fails if one of these
 // names is declared again (const/let/var NAME =) in another shared/js module, and checks that each value is still the literal it

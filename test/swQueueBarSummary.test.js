@@ -1,4 +1,4 @@
-// The queue bar's summary (coder-instructions-2026-10-18.md, section 4 item 2; decisions 9 and 11). Pure functions and the push, with
+// The queue bar's summary (historical/coder-instructions-2026-10-18.md, section 4 item 2; decisions 9 and 11). Pure functions and the push, with
 // no service worker: the summary is built from a queue view, recorded, and displayed only while work is pending and some has
 // finished. A change of total or pending is pushed to Quora tabs with tabs.sendMessage; a failed tab is skipped.
 const assert = require('node:assert/strict')

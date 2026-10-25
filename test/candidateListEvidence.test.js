@@ -1,4 +1,4 @@
-// Decision 12 (coder-instructions-2026-10-18.md, 18 Oct): each queue row's evidence carries the post's full candidate list, written at
+// Decision 12 (historical/coder-instructions-2026-10-18.md, 18 Oct): each queue row's evidence carries the post's full candidate list, written at
 // enqueue. The content side writes it on every evidence record it builds (getSpaceFeedProfilePostAssociations), and the worker's
 // evidence merge keeps it (mergeCoordinatorEvidence). Source extraction and a vm run for the content side, as the other content tests do.
 const assert = require('node:assert/strict')

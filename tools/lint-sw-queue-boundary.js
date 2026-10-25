@@ -25,6 +25,7 @@ const restrictedSwCalls = [
     'recordOwnedBlockedSweepTerminal',
     'removePendingSpaceFeedEntries',
     'removePendingSpaceFeedUrls',
+    'mergeSpacePendingNukedPosts',
     'settleTerminalCoordinatorItems',
     'settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor',
     'terminalizeExhaustedRolledBackQueuedCoordinatorItem',

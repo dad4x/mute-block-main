@@ -159,13 +159,17 @@ const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     makeCoordinatorDashboardStateKeys
 } = require('./swdashboard')
+const {COORDINATOR_WORK_SESSION_KEY} = require('./storageKeys')
 const {
     COORDINATOR_RETRY_FAILED_ENABLED_KEY,
     COORDINATOR_PAUSED_KEY,
     COORDINATOR_PAUSE_GENERATION_KEY,
     COORDINATOR_AUTO_START_ON_BROWSER_START_KEY,
     TARGET_QUEUED_TAB_CONCURRENCY_KEY,
-    normalizeTargetQueuedTabConcurrency
+    normalizeTargetQueuedTabConcurrency,
+    WORKER_WINDOW_FOREGROUND_MODE_KEY,
+    WORKER_WINDOW_FOREGROUND_MODES,
+    normalizeWorkerWindowForegroundMode
 } = require('./swprefs')
 const {
     createQueueMachineEventDispatcher
@@ -556,7 +560,7 @@ const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 // commit, giving a checkpoint-switch threshold crossing (soft at 128,
 // forced at COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT above) no chance
 // to run between rows -- the same danger zone implicated in this project's
-// "missing-segment" WAL corruption incidents (queue-wal-segmented-record-followup-2026-05-27.md's
+// "missing-segment" WAL corruption incidents (historical/queue-wal-segmented-record-followup-2026-05-27.md's
 // 2026-09-13 TODO). Chunking a large enqueue into several smaller durable
 // commits lets a threshold crossing land between chunks instead of only
 // after the whole batch. Small enqueues (the common case) are left alone.
@@ -569,7 +573,7 @@ const COORDINATOR_QUEUE_WAL_CHECKPOINT_SWITCH_TIMEOUT_MS = 120000
 // macrotask yield in between, so a big batch still monopolized that chain
 // for its whole duration -- starving every other pending durable write
 // (milestone stamps, terminal settlements) for as long as the batch ran.
-// Confirmed live and root-caused in live-batch-fixes-worklist-2026-09-19.md
+// Confirmed live and root-caused in historical/live-batch-fixes-worklist-2026-09-19.md
 // items 3/4. An artificial timer-based yield between chunks was tried and
 // reverted: it requires every test that exercises this path to know to
 // manually advance the harness's fake clock (test/lib/swHarness.js runs
@@ -820,7 +824,7 @@ const STALE_CLOSE_REQUESTED_QUEUED_TAB_MS = 8000
 // config the reducer applies itself rather than a value callers must
 // remember to thread onto every JOB_EVENT_RETRY event. The constant that
 // stood here was never read again, so its literal copy was removed
-// (14-oct-review-1.md finding 8). The incident history above is the record.
+// (historical/14-oct-review-1.md finding 8). The incident history above is the record.
 const FOREGROUND_LEASE_WAIT_EVENT_MS = 5000
 const COORDINATOR_RECONCILE_INTERVAL_MS = 5000
 // Unscoped terminal-owned-tab sweep (orphan cleanup). Job completions clean
@@ -964,6 +968,9 @@ let coordinatorPauseGeneration = 0
 let coordinatorPauseRequested = false
 let queuedTabConcurrency = 1
 let targetQueuedTabConcurrency = normalizeTargetQueuedTabConcurrency(defaults[TARGET_QUEUED_TAB_CONCURRENCY_KEY], 4)
+let workerWindowForegroundMode = defaults[WORKER_WINDOW_FOREGROUND_MODE_KEY]
+// The last or current continuous work (24 Oct): { startedAt, endedAt, endReason }. endedAt is 0 while it is running.
+let coordinatorWorkSession = null
 let queuedTabFillPromise = null
 let queuedTabFillPromiseStartedAt = 0
 let queuedTabFillAuthorityState = null
@@ -2266,6 +2273,23 @@ function setTargetQueuedTabConcurrency(value) {
     targetQueuedTabConcurrency = normalizeTargetQueuedTabConcurrency(value, targetQueuedTabConcurrency)
 }
 
+function setWorkerWindowForegroundMode(value) {
+    workerWindowForegroundMode = normalizeWorkerWindowForegroundMode(value, workerWindowForegroundMode)
+}
+
+// Only a stored value is applied, so a load that finds none keeps the value already in place (the default). The Preferences page
+// saves through set-extension-settings, and the storage change then moves the value (swBootstrap handleStorageChanged).
+async function loadWorkerWindowForegroundModePreference() {
+    const stored = await metricStorageGet({
+        [WORKER_WINDOW_FOREGROUND_MODE_KEY]: null
+    }, {
+        phase: 'startupPreferenceGet'
+    }).catch(() => null)
+
+    const value = stored?.[WORKER_WINDOW_FOREGROUND_MODE_KEY]
+    if(value !== null && value !== undefined) setWorkerWindowForegroundMode(value)
+}
+
 async function loadTargetQueuedTabConcurrencyPreference() {
     const stored = await metricStorageGet({
         [TARGET_QUEUED_TAB_CONCURRENCY_KEY]: defaults[TARGET_QUEUED_TAB_CONCURRENCY_KEY]
@@ -2751,6 +2775,7 @@ async function metricStorageSet(payload = {}, options = {}) {
     if(!keys.length) return
     if(Object.prototype.hasOwnProperty.call(payload, COORDINATOR_PAUSED_KEY)) {
         recordCoordinatorPauseTransition(payload[COORDINATOR_PAUSED_KEY] === true)
+        if(payload[COORDINATOR_PAUSED_KEY] === true) endCoordinatorWorkSession('paused')
         storedCoordinatorPausedMirror = payload[COORDINATOR_PAUSED_KEY] === true
     }
     if(suppressAbandonedStorageOperation('storageSet')) return false
@@ -8836,9 +8861,10 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
                 error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
-        // A save that reported success leaves the prepared slot in storage as the plan named it. Anything else forgets the slots.
-        if(walSaved === true) queueWalStore.noteCheckpointSaved(prepared)
-        else queueWalStore.noteCheckpointSaveFailed()
+        // A write that went through resolves with no value, and a write that did not is false (or threw, leaving walSaved false). Only
+        // false forgets the slots, so a successful save keeps them remembered and the next switch can skip the shards it did not change.
+        if(walSaved === false) queueWalStore.noteCheckpointSaveFailed()
+        else queueWalStore.noteCheckpointSaved(prepared)
         if(walSaved === false) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointSuppressed')
             recordFlightRecorderEvent({
@@ -10821,7 +10847,7 @@ function createCoordinatorAuthority() {
         // page did not see left the profile offered as still queueable (trollsgalore, 22 Oct: 16 finished profiles still listed).
         if(result?.durable === true && isTerminalCoordinatorStatus(nextRow?.status) && !isTerminalCoordinatorStatus(previousRow?.status)) {
             const finishedHref = normalizeQuoraProfileUrl(nextRow?.targetProfileHref || nextRow?.requestedUrl || nextRow?.coordinatorKey || '')
-            if(finishedHref && pendingSpaceFeedNamesHref(finishedHref)) void removePendingSpaceFeedUrls([finishedHref]).catch(() => null)
+            if(finishedHref && pendingSpaceFeedNamesHref(finishedHref)) void applyCoordinatorQueueMachineEvent({type: 'PENDING_SPACE_FEED_URLS_REMOVE', urls: [finishedHref]}).catch(() => null)
         }
         // Archive gate (2026-10-13): a soft failure with automatic retries left stays in the live queue (isArchivableCoordinatorRow).
         if(result?.durable === true && isArchivableCoordinatorRow(nextRow)) {
@@ -15837,6 +15863,158 @@ async function planQueuedActivationIntentForSlotEvent(event = {}) {
     }
 }
 
+// The space's pending map is written from this closure only (25 Oct). Its writers are local here, and the queue's durable handlers are
+// the only holders of them, so nothing else in this file can name them. Every change arrives as a queue event.
+const spacePendingMapWriters = (() => {
+    async function removePendingSpaceFeedUrls(urls = []) {
+        return enqueueSpaceFeedStorageUpdate(async () => {
+            const normalizedUrls = new Set(getNormalizedProfileHrefList(urls))
+            if(!normalizedUrls.size) return {changed: false, pendingPosts: null}
+
+            const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+            const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+            let changed = false
+            const nextPending = {
+                ...currentPending
+            }
+
+            for(const [postKey, record] of Object.entries(currentPending || {})) {
+                const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
+                const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+                const nextAllUrls = allUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileUrl(url)))
+                const nextRemainingUrls = remainingUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileUrl(url)))
+
+                if(nextAllUrls.length === allUrls.length && nextRemainingUrls.length === remainingUrls.length) {
+                    continue
+                }
+
+                changed = true
+
+                if(nextRemainingUrls.length <= 0) {
+                    delete nextPending[postKey]
+                    continue
+                }
+
+                nextPending[postKey] = {
+                    ...record,
+                    allUrls: nextAllUrls,
+                    remainingUrls: nextRemainingUrls,
+                    ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
+                    updatedAt: Date.now()
+                }
+            }
+
+            if(changed) {
+                await coordinatorAuthority.persistCoordinator({stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: nextPending}}, {
+                    storageOptions: {snapshotWriteReason: 'userMemoryNonAuthority'}
+                })
+            }
+
+            return {changed, pendingPosts: nextPending}
+        }, {reason: 'remove-pending-space-feed-urls'})
+    }
+
+    async function removePendingSpaceFeedEntries(postKeys = []) {
+        return enqueueSpaceFeedStorageUpdate(async () => {
+            const resolverPostKeys = new Set((Array.isArray(postKeys) ? postKeys : [])
+                .map(postKey => `${postKey || ''}`.trim())
+                .filter(Boolean))
+            if(!resolverPostKeys.size) return {changed: false, pendingPosts: null}
+
+            const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+            const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+            let changed = false
+            const nextPending = {
+                ...currentPending
+            }
+
+            for(const postKey of resolverPostKeys) {
+                const record = nextPending[postKey]
+                if(record?.resolverPending !== true) continue
+
+                const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+                changed = true
+                if(!remainingUrls.length) {
+                    delete nextPending[postKey]
+                    continue
+                }
+
+                nextPending[postKey] = {
+                    ...record,
+                    resolverPending: false,
+                    resolverUrl: '',
+                    updatedAt: Date.now()
+                }
+            }
+
+            if(changed) {
+                await coordinatorAuthority.persistCoordinator({stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: nextPending}}, {
+                    storageOptions: {snapshotWriteReason: 'userMemoryNonAuthority'}
+                })
+            }
+
+            return {changed, pendingPosts: nextPending}
+        }, {reason: 'remove-pending-space-feed-entries'})
+    }
+
+    // Merges the posts a Nuke sent into the stored pending map (25 Oct). The page sends only the posts it is adding. The worker's own copy
+    // is the base, so a removal the worker made since the page last read the map stays removed. The write runs in the same serialized step
+    // as the removals.
+    async function mergeSpacePendingNukedPosts(payload = {}) {
+        return enqueueSpaceFeedStorageUpdate(async () => {
+            const spaceKey = `${payload?.spaceKey || ''}`.trim()
+            const spaceUrl = `${payload?.spaceUrl || ''}`
+            const posts = Array.isArray(payload?.posts) ? payload.posts : []
+            if(!spaceKey || !posts.length) return {ok: true, saved: true, changed: false, pendingPosts: null}
+
+            const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+            const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
+            const nextPending = {...currentPending}
+            let changed = false
+            for(const post of posts) {
+                const postKey = `${post?.postKey || ''}`.trim()
+                if(!postKey) continue
+                const candidateUrls = getNormalizedProfileHrefList(post.candidateUrls || [])
+                const resolverPending = post.resolvable === true && !candidateUrls.length
+                if(!candidateUrls.length && !resolverPending) continue
+
+                const existing = nextPending[postKey] || {}
+                const jobKeysByProfileHref = {
+                    ...(existing.jobKeysByProfileHref && typeof existing.jobKeysByProfileHref === 'object' ? existing.jobKeysByProfileHref : {})
+                }
+                for(const href of candidateUrls) jobKeysByProfileHref[href] = href
+                nextPending[postKey] = {
+                    ...existing,
+                    postKey,
+                    postUrl: `${post.postUrl || existing.postUrl || ''}`,
+                    spaceKey,
+                    spaceUrl: spaceUrl || existing.spaceUrl || '',
+                    allUrls: getNormalizedProfileHrefList([...getStoredSpaceFeedRecordUrls(existing, 'allUrls'), ...candidateUrls]),
+                    remainingUrls: getNormalizedProfileHrefList([...getStoredSpaceFeedRecordUrls(existing, 'remainingUrls'), ...candidateUrls]),
+                    resolverPending: resolverPending || existing.resolverPending === true,
+                    resolverUrl: resolverPending ? `${post.postUrl || existing.resolverUrl || ''}` : existing.resolverUrl || '',
+                    jobKeys: getNormalizedProfileHrefList([...(Array.isArray(existing.jobKeys) ? existing.jobKeys : []), ...candidateUrls]),
+                    jobKeysByProfileHref,
+                    updatedAt: Date.now()
+                }
+                changed = true
+            }
+            if(!changed) return {ok: true, saved: true, changed: false, pendingPosts: currentPending}
+
+            const persistence = await coordinatorAuthority.persistCoordinator({stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: nextPending}}, {
+                storageOptions: {metricPath: 'contentRequest.mergeSpacePendingNukedPosts'}
+            })
+            return {ok: true, saved: persistence?.saved === true, changed: true, pendingPosts: nextPending}
+        })
+    }
+
+    return {
+        removePendingSpaceFeedUrls,
+        removePendingSpaceFeedEntries,
+        mergeSpacePendingNukedPosts
+    }
+})()
+
 const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher(
     createCoordinatorQueueMachineEventHandlers({
         constants: {
@@ -15873,8 +16051,9 @@ const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher
             recordCoordinatorJobProgress,
             recordOwnedBlockedSweepTerminal,
             recoverExhaustedRolledBackQueuedCoordinatorItem,
-            removePendingSpaceFeedEntries,
-            removePendingSpaceFeedUrls,
+            removePendingSpaceFeedEntries: spacePendingMapWriters.removePendingSpaceFeedEntries,
+            removePendingSpaceFeedUrls: spacePendingMapWriters.removePendingSpaceFeedUrls,
+            mergeSpacePendingNukedPosts: spacePendingMapWriters.mergeSpacePendingNukedPosts,
             mutateCoordinatorRunsPausedSet,
             mutateCoordinatorStaleRetryQueuedTabAdvance,
             mutateCoordinatorStoredWorkCancel,
@@ -16434,6 +16613,36 @@ async function getLiveProfileTabsByHref() {
     return buildLiveProfileTabsByHref(tabs)
 }
 
+// The continuous work session (24 Oct). It starts when the queue has work and is not paused, and it ends when the queue is paused or
+// empty. The last session is kept in storage, where the dashboard's Current Work header reads it.
+async function loadCoordinatorWorkSessionFromStorage() {
+    const stored = await metricStorageGet({[COORDINATOR_WORK_SESSION_KEY]: null}, {
+        phase: 'startupWorkSessionGet'
+    }).catch(() => null)
+    const value = stored?.[COORDINATOR_WORK_SESSION_KEY]
+    if(!coordinatorWorkSession && value && typeof value === 'object') coordinatorWorkSession = value
+}
+
+function persistCoordinatorWorkSession() {
+    void metricStorageSet({[COORDINATOR_WORK_SESSION_KEY]: coordinatorWorkSession}, {
+        metricPath: 'coordinatorWorkSession'
+    }).catch(() => null)
+}
+
+function startCoordinatorWorkSession() {
+    if(coordinatorWorkSession && !coordinatorWorkSession.endedAt) return false
+    coordinatorWorkSession = {startedAt: Date.now(), endedAt: 0, endReason: ''}
+    persistCoordinatorWorkSession()
+    return true
+}
+
+function endCoordinatorWorkSession(reason = '') {
+    if(!coordinatorWorkSession || coordinatorWorkSession.endedAt) return false
+    coordinatorWorkSession = {...coordinatorWorkSession, endedAt: Date.now(), endReason: `${reason || ''}`}
+    persistCoordinatorWorkSession()
+    return true
+}
+
 async function classifyCoordinatorExecutorState(options = {}) {
     const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(
         options.currentAuthorityState || options.authorityState || null
@@ -16709,6 +16918,10 @@ async function classifyCoordinatorExecutorState(options = {}) {
             pendingTabActionsCount: runtimeCounts.pendingTabActions
         })
     }
+    // The work session (24 Oct): an empty queue ends it, and a queue with work starts it only once the stored pause is known to be off.
+    // The stored pause mirror is null until the startup restore reads it, and a queue paused in storage must not start a session.
+    if(queueAndRuntimeDrained) endCoordinatorWorkSession('queue-empty')
+    else if(storedCoordinatorPausedMirror === false && !isCoordinatorPauseRequestedLocally()) startCoordinatorWorkSession()
     if(queueAndRuntimeDrained) {
         cases.push({
             case: 'idle-no-work',
@@ -17802,7 +18015,7 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         // different live tab was independently confirmed blocked instead.
         // See recordActiveBlockedLiveTabTerminal's own comment for the full
         // history (P3-2/P3-3 finding in
-        // sw-state-machine-decomposition-plan-2026-09-01.md).
+        // historical/sw-state-machine-decomposition-plan-2026-09-01.md).
         const recorded = await applyCoordinatorQueueMachineEvent({
             type: 'BLOCKED_LIVE_TAB_TERMINAL_RECORD',
             tabId,
@@ -22464,15 +22677,6 @@ async function setSpaceNukedPostsRequested(nukedPosts = {}) {
     return {ok: true, saved: persistence?.saved === true}
 }
 
-async function setSpacePendingNukedPostsRequested(pendingNukedPosts = {}) {
-    const persistence = await coordinatorAuthority.persistCoordinator({
-        stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: pendingNukedPosts && typeof pendingNukedPosts === 'object' ? pendingNukedPosts : {}}
-    }, {
-        storageOptions: {metricPath: 'contentRequest.setSpacePendingNukedPosts'}
-    })
-    return {ok: true, saved: persistence?.saved === true}
-}
-
 async function setCoordinatorRetryFailedEnabledRequested(enabled = false) {
     await metricStorageSet({[COORDINATOR_RETRY_FAILED_ENABLED_KEY]: enabled === true}, {
         metricPath: 'dashboardRequest.retryFailedEnabled'
@@ -22485,6 +22689,7 @@ async function setCoordinatorRetryFailedEnabledRequested(enabled = false) {
 // review-3 R3-2: a value must have the type of its default (every default is a number or a boolean). A value that does not
 // is not written, and its key comes back in `rejected`. Ranges are not checked here.
 function isExtensionSettingValueValid(key, value) {
+    if(key === WORKER_WINDOW_FOREGROUND_MODE_KEY) return WORKER_WINDOW_FOREGROUND_MODES.includes(value)
     const expectedType = typeof defaults[key]
     if(expectedType === 'number') return typeof value === 'number' && Number.isFinite(value)
     return typeof value === expectedType
@@ -25989,54 +26194,6 @@ async function clearProfileNukeState(profileHref = '', reason = '') {
     return clearResult
 }
 
-async function removePendingSpaceFeedUrls(urls = []) {
-    return enqueueSpaceFeedStorageUpdate(async () => {
-        const normalizedUrls = new Set(getNormalizedProfileHrefList(urls))
-        if(!normalizedUrls.size) return {changed: false, pendingPosts: null}
-
-        const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
-        const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-        let changed = false
-        const nextPending = {
-            ...currentPending
-        }
-
-        for(const [postKey, record] of Object.entries(currentPending || {})) {
-            const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-            const nextAllUrls = allUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileUrl(url)))
-            const nextRemainingUrls = remainingUrls.filter(url => !normalizedUrls.has(normalizeQuoraProfileUrl(url)))
-
-            if(nextAllUrls.length === allUrls.length && nextRemainingUrls.length === remainingUrls.length) {
-                continue
-            }
-
-            changed = true
-
-            if(nextRemainingUrls.length <= 0) {
-                delete nextPending[postKey]
-                continue
-            }
-
-            nextPending[postKey] = {
-                ...record,
-                allUrls: nextAllUrls,
-                remainingUrls: nextRemainingUrls,
-                ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
-                updatedAt: Date.now()
-            }
-        }
-
-        if(changed) {
-            await coordinatorAuthority.persistCoordinator({stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: nextPending}}, {
-                storageOptions: {snapshotWriteReason: 'userMemoryNonAuthority'}
-            })
-        }
-
-        return {changed, pendingPosts: nextPending}
-    }, {reason: 'remove-pending-space-feed-urls'})
-}
-
 // A synchronous look at the resident pending lists, so a finish that no pending record names costs no storage update.
 function pendingSpaceFeedNamesHref(href = '') {
     const pending = coordinatorAuthority.residentStoredFor({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
@@ -26069,51 +26226,8 @@ async function reconcilePendingSpaceFeedWithArchive() {
         if(archived && isTerminalCoordinatorStatus(archived.status)) finished.push(href)
     }
     if(!finished.length) return {changed: false, removed: 0}
-    const result = await removePendingSpaceFeedUrls(finished)
+    const result = await applyCoordinatorQueueMachineEvent({type: 'PENDING_SPACE_FEED_URLS_REMOVE', urls: finished})
     return {changed: result?.changed === true, removed: finished.length}
-}
-
-async function removePendingSpaceFeedEntries(postKeys = []) {
-    return enqueueSpaceFeedStorageUpdate(async () => {
-        const resolverPostKeys = new Set((Array.isArray(postKeys) ? postKeys : [])
-            .map(postKey => `${postKey || ''}`.trim())
-            .filter(Boolean))
-        if(!resolverPostKeys.size) return {changed: false, pendingPosts: null}
-
-        const stored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
-        const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-        let changed = false
-        const nextPending = {
-            ...currentPending
-        }
-
-        for(const postKey of resolverPostKeys) {
-            const record = nextPending[postKey]
-            if(record?.resolverPending !== true) continue
-
-            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-            changed = true
-            if(!remainingUrls.length) {
-                delete nextPending[postKey]
-                continue
-            }
-
-            nextPending[postKey] = {
-                ...record,
-                resolverPending: false,
-                resolverUrl: '',
-                updatedAt: Date.now()
-            }
-        }
-
-        if(changed) {
-            await coordinatorAuthority.persistCoordinator({stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: nextPending}}, {
-                storageOptions: {snapshotWriteReason: 'userMemoryNonAuthority'}
-            })
-        }
-
-        return {changed, pendingPosts: nextPending}
-    }, {reason: 'remove-pending-space-feed-entries'})
 }
 
 async function confirmSpaceFeedProfilesBlocked(profileHrefs = []) {
@@ -29242,7 +29356,10 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         recordQueuedTabOpenStage('create', createStartedAt, action)
         const activatedAt = Date.now()
         const activateStartedAt = activatedAt
-        const activatedTab = await browser.tabs.update(tab.id, {active: true}).catch(() => null)
+        // 'none' keeps the tab as it was created: a background tab, since surfaceCreateOptions.active is false. Nothing here moves focus.
+        const activatedTab = workerWindowForegroundMode ==='none'
+            ? tab
+            : await browser.tabs.update(tab.id, {active: true}).catch(() => null)
         recordQueuedTabOpenStage('activate', activateStartedAt, action)
         const activatedTabId = normalizeTabId(activatedTab?.id)
         const createdTabId = normalizeTabId(tab?.id)
@@ -29254,18 +29371,19 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
             incrementQueueWakeupMetric('actionSurface.workerWindow.activateFailed')
             throw new Error('worker-action-surface-activate-failed')
         }
-        // The worker window is focused for each open, so the action tab's
-        // timers are not throttled and the window stays in front until the
-        // queue run ends. Requested explicitly; it can take focus from the
-        // user while they type, which was the 2026-10-08 trade-off.
-        await browser.windows.update(surface.windowId, {focused: true}).catch(() => null)
-        recordFlightRecorderEvent({
-            kind: 'window-focus-request',
-            source: 'createOwnedTabInQueuedWorkerActionSurface',
-            windowId: surface.windowId,
-            accepted: true,
-            reason: 'worker-surface-open'
-        })
+        // 'focus' asks for OS focus on the worker window at each open, so the action tab's timers are not throttled and the window
+        // stays in front until the queue run ends. It can take focus from the user while they type (the 2026-10-08 trade-off). 'activate'
+        // and 'none' leave OS focus alone (the Worker Window Focus preference).
+        if(workerWindowForegroundMode ==='focus') {
+            await browser.windows.update(surface.windowId, {focused: true}).catch(() => null)
+            recordFlightRecorderEvent({
+                kind: 'window-focus-request',
+                source: 'createOwnedTabInQueuedWorkerActionSurface',
+                windowId: surface.windowId,
+                accepted: true,
+                reason: 'worker-surface-open'
+            })
+        }
         tagActionWithQueuedWorkerSurface(action, surface, activatedTab || tab, activatedAt)
         incrementQueueWakeupMetric('actionSurface.workerWindow.openedTab')
 
@@ -30273,7 +30391,21 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
     if(metadata?.noForegroundFallback && !actionSurfaceMode) {
         return {promoted: false, reason: 'foreground-fallback-disabled'}
     }
-    const captureRestoreTab = actionSurfaceMode && isForegroundRequiredProfileActionRequest({reason})
+    // 'none': a worker-window tab is never brought forward. The request is refused before any state changes.
+    if(actionSurfaceMode && workerWindowForegroundMode ==='none') {
+        incrementQueueWakeupMetric('actionSurface.workerWindow.foregroundRefused')
+        recordFlightRecorderEvent({
+            kind: 'window-focus-request',
+            source: 'promoteQueuedTab',
+            tabId: normalizedTabId,
+            windowId: tab.windowId || null,
+            accepted: false,
+            reason: 'worker-window-foreground-mode-none'
+        })
+        return {promoted: false, reason: 'worker-window-foreground-refused'}
+    }
+    // Only 'focus' remembers the user's tab to return to, so the other modes never move the user's focus.
+    const captureRestoreTab = actionSurfaceMode && workerWindowForegroundMode ==='focus' && isForegroundRequiredProfileActionRequest({reason})
         ? queuedActionSurfaceCallerTab || await getLastFocusedActiveTab().catch(() => null)
         : null
     const updateResult = tab.active === true
@@ -30282,7 +30414,7 @@ async function promoteQueuedTab(tabId, reason = '', options = {}) {
     if(!updateResult?.id) return {promoted: false, reason: 'activate-failed'}
 
     const windowId = updateResult.windowId || tab.windowId || metadata?.ownerWindowId || null
-    if(windowId && browser.windows?.update && (!actionSurfaceMode || isForegroundRequiredProfileActionRequest({reason}))) {
+    if(windowId && browser.windows?.update && (!actionSurfaceMode || (workerWindowForegroundMode ==='focus' && isForegroundRequiredProfileActionRequest({reason})))) {
         recordFlightRecorderEvent({
             kind: 'window-focus-request',
             source: 'promoteQueuedTab',
@@ -30808,7 +30940,7 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
 // Sibling to recordOwnedBlockedSweepTerminal's BLOCKED_SWEEP_TERMINAL_RECORD
 // event, for terminalizeActiveCoordinatorItemFromBlockedLiveTab's fallback --
 // added 2026-09-17 to close the gap the P3-2/P3-3 finding above
-// (sw-state-machine-decomposition-plan-2026-09-01.md) documented. Both
+// (historical/sw-state-machine-decomposition-plan-2026-09-01.md) documented. Both
 // functions do the same classify -> transition -> authority-write -> stat
 // shape, but recordOwnedBlockedSweepTerminal's match
 // (coordinatorItemMatchesQueuedTabRuntime) requires the confirming tab to
@@ -35267,6 +35399,7 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
         return {recorded: false, staleAttempt: true}
     }
 
+    noteProfilePageVisibility(targetProfileHref, patch, sender)
     if(options.expectTerminal !== true) {
         return recordDeferredCoordinatorJobMilestone(targetProfileHref, patch, {
             senderTabId: tabId
@@ -35306,7 +35439,31 @@ async function recordJobProgressFromRequest(request = {}, sender = {}, options =
 // only updated an in-memory content-script variable (see
 // recordProfileNukeProgress's non-queued branch in content.js) and were
 // lost the moment the tab closed.
-async function recordDirectProfileProgressFromRequest(request = {}) {
+// The page reports whether its tab was visible at each progress step (24 Oct: a tab that is not visible gets little action). The reading is
+// kept on the row (pageVisibility), and each change, or the first reading for a row, is a flight recorder event.
+function noteProfilePageVisibility(profileHref = '', patch = {}, sender = {}) {
+    const visibilityState = `${patch?.pageVisibility || ''}`.trim()
+    if(!visibilityState) return false
+
+    const previousVisibilityState = `${getStoredProfileNukeProgressRecord(profileHref)?.pageVisibility || ''}`.trim()
+    if(visibilityState === previousVisibilityState) return false
+
+    recordFlightRecorderEvent({
+        kind: 'action-visibility',
+        source: 'noteProfilePageVisibility',
+        profileHref,
+        tabId: sender.tab?.id || null,
+        windowId: sender.tab?.windowId || null,
+        tabActive: sender.tab?.active === true,
+        visibilityState,
+        previousVisibilityState,
+        attemptId: patch.attemptId || '',
+        attemptNumber: patch.attemptNumber || 0
+    })
+    return true
+}
+
+async function recordDirectProfileProgressFromRequest(request = {}, sender = {}) {
     const profileHref = normalizeQuoraProfileUrl(request.profileHref || request.href || '')
     if(!profileHref) return {recorded: false, reason: 'invalid-profile-href'}
 
@@ -35342,6 +35499,7 @@ async function recordDirectProfileProgressFromRequest(request = {}) {
         return {recorded: false, reason: 'stale-direct-progress-patch'}
     }
 
+    noteProfilePageVisibility(profileHref, incomingPatch, sender)
     const record = normalizeProgressPatch(profileHref, incomingPatch, previous)
     if(!record) return {recorded: false, reason: 'invalid-patch'}
     record.directProgressClientUpdatedAt = incomingClientUpdatedAt || record.updatedAt
@@ -36829,7 +36987,8 @@ registerServiceWorkerListeners({
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
-        TARGET_QUEUED_TAB_CONCURRENCY_KEY
+        TARGET_QUEUED_TAB_CONCURRENCY_KEY,
+        WORKER_WINDOW_FOREGROUND_MODE_KEY
     },
     state: {
         coordinatorReconcileScheduler,
@@ -36916,7 +37075,6 @@ registerServiceWorkerListeners({
         eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
         setSpaceNukedPostsRequested,
-        setSpacePendingNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
         setSpaceSortRequested,
@@ -36963,6 +37121,7 @@ registerServiceWorkerListeners({
         sendTabMessage,
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
+        setWorkerWindowForegroundMode,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -37021,7 +37180,7 @@ function retireUnusedVersion15StorageKeys() {
     return metricStorageRemove(VERSION_15_RETIRED_STORAGE_KEYS, {phase: 'retireVersion15StorageKeys'})
 }
 
-// LEGACY QUEUE VIEW RETIREMENT (for archaeologists; the full notes are in LEGACY_QUEUE_VIEW_RETIREMENT.md).
+// LEGACY QUEUE VIEW RETIREMENT (for archaeologists; the full notes are in historical/LEGACY_QUEUE_VIEW_RETIREMENT.md).
 //
 // mbCoordinatorQueueView was a disk copy of the queue, rebuilt from the live authority on every write.
 // It stopped being written on 2026-10-01. Its last reader, a WAL-hydrate-failure recovery
@@ -37177,6 +37336,8 @@ void scheduleStoredWorkRearmAfterStartupHydrate()
 // regardless of Quora activation (unlike startQueueWakeupMetricsBackedStartupWork
 // above, this doesn't need to wait for that).
 void loadTargetQueuedTabConcurrencyPreference()
+void loadWorkerWindowForegroundModePreference()
+void loadCoordinatorWorkSessionFromStorage()
 void loadCoordinatorStatsClearedAtFromStorage()
 void restoreStoredCoordinatorPausedMirror('startup-pause-restore')
 void loadCoordinatorQueueViewTimingCacheFromSession()

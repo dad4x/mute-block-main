@@ -17,7 +17,7 @@ const VIEW = 'mbProfileNukeProgressView'
 const RUNS = 'mbCoordinatorRuns'
 const OUTLIERS = 'mbCoordinatorOutliers'
 
-// The progress save labels from the review table (progress-path-review-2026-10-18.md, section 3). A label names the save; it does not
+// The progress save labels from the review table (historical/progress-path-review-2026-10-18.md, section 3). A label names the save; it does not
 // decide the exemption, so each label below must be exempt when its write carries only progress keys.
 const PROGRESS_LABELS = [
     'reconcile.nonProfileLanding.progressProjection',

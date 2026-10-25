@@ -6,5 +6,6 @@ module.exports = {
     targetQueuedTabConcurrency: 4,
     coordinatorAutoStartOnBrowserStart: false,
     nukedPostRetentionDays: 90,
-    maxRememberedNukedPosts: 10000
+    maxRememberedNukedPosts: 10000,
+    workerWindowForegroundMode: 'activate'
 }

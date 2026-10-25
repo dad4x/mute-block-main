@@ -507,7 +507,7 @@ function createQueueWalStore(deps = {}) {
             // 2026-09-15: auto-recover instead of leaving the coordinator dead in
             // the water -- this used to require someone running a CDP helper by
             // hand after every "missing-segment" incident (both the helper and the
-            // view recovery have since been retired, see LEGACY_QUEUE_VIEW_RETIREMENT.md) (a hard crash mid checkpoint-switch is
+            // view recovery have since been retired, see historical/LEGACY_QUEUE_VIEW_RETIREMENT.md) (a hard crash mid checkpoint-switch is
             // enough to cause one; chrome.storage.local has no cross-key
             // transaction guarantee). mbCoordinatorQueueView is a materialized
             // read-model independent of the WAL's own physical segments, so it

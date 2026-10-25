@@ -15,6 +15,7 @@ catch {}
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
 const { createQueueProgressBar } = require('./queueProgressBar')
+const { setMuteBlockHelp } = require('./muteBlockHelp')
 const { QUEUE_BAR_GET_ACTION, QUEUE_BAR_PUSH_ACTION, getQueueBarDisplay } = require('./swQueueBarSummary')
 const { PROFILE_NUKE_PROGRESS_PUSH_ACTION } = require('./swProfileNukeProgressPush')
 const {
@@ -59,6 +60,7 @@ const {
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
 const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
@@ -89,7 +91,9 @@ const {
     SPACE_FEED_ENQUEUE_SUMMARY_POLL_TIMEOUT_MS,
     SPACE_FEED_ENQUEUE_SUMMARY_POLL_INTERVAL_MS,
     SPACE_FEED_ENQUEUE_CHUNK_MAX_ATTEMPTS,
-    SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS
+    SPACE_FEED_ENQUEUE_CHUNK_RETRY_BASE_DELAY_MS,
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_TIMEOUT_MS,
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_INTERVAL_MS
 } = require('./timeouts')
 const {
     COORDINATOR_ENQUEUE_CHUNK_SIZE
@@ -98,8 +102,6 @@ const {
 const SPACE_FEED_PROFILES_PER_BATCH = 3
 const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
 const PROFILE_SEARCH_PROFILES_PER_BATCH = 3
-const PROFILE_SEARCH_COLLECT_LIMIT = 100
-const PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES = 120
 const PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000
 const PROFILE_SEARCH_MATCH_IGNORED_TOKENS = new Set([
     'a',
@@ -245,6 +247,8 @@ let profileSearchControlsPending = false
 let profileSearchCollecting = false
 let profileSearchCollectStopRequested = false
 let profileSearchCollectionKey = ''
+// The Collect N More count, for this search page only. It is kept in memory: it is not saved, and it resets when the search changes or the page reloads.
+let profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
 let profileSearchStagedHrefs = []
 let profileSearchStagedHrefSet = new Set()
 let profileSearchCollectCursorScrollY = 0
@@ -255,6 +259,8 @@ let profileSearchFollowUpTimeouts = []
 let profileSearchPendingRefreshTimeout = null
 let profileSearchLastRunId = ''
 let profileSearchLastQueuedAt = 0
+// True while the search batch's enqueue is in flight. The batch button keeps its Queueing label until then.
+let profileSearchQueueingBatch = false
 let profileSearchLastQueuedCount = 0
 let spacePageFollowUpTimeouts = []
 let spaceClassificationTimeout
@@ -269,6 +275,11 @@ let spaceFeedProgressReconcilePending = false
 let suppressSpaceAssetNukeRefreshUntil = 0
 let spaceFeedScrollActiveUntil = 0
 let latestSpaceFeedEntries = []
+// Space pages: the Collect N More count (in memory, for this space page only) and the run state of its collect.
+let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+let spaceFeedCollectKey = ''
+let spaceFeedCollecting = false
+let spaceFeedCollectStopRequested = false
 let discoveredSpaceFeedEntries = new Map()
 let spaceFeedEntryCache = new Map()
 let spaceFeedRootCache = new WeakMap()
@@ -328,7 +339,6 @@ const SPACE_FEED_SCAN_MAX_TIMESTAMPS = 60
 const SPACE_FEED_SCAN_FALLBACK_MAX_CANDIDATES = 160
 const SPACE_FEED_SCAN_SAMPLE_STEP_PX = 140
 const SPACE_FEED_SCAN_SAMPLE_X_RATIOS = [0.28, 0.5, 0.72]
-const MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES = 80
 const MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES = 4
 const FOREGROUND_PROMOTION_MESSAGE_TIMEOUT_MS = 8000
 const FOREGROUND_PROMOTION_LEASE_WAIT_MS = 90000
@@ -1292,7 +1302,12 @@ async function recordProfileNukeProgress(href, patch = {}) {
     const normalizedHref = normalizeQuoraProfileHref(href)
     if(!normalizedHref) return null
 
-    const nextRecord = normalizeProfileProgressPatch(normalizedHref, patch)
+    // The page's tab visibility at this step (24 Oct): an action needs its tab visible, so each row records what the page saw.
+    const nextRecord = normalizeProfileProgressPatch(normalizedHref, {
+        pageVisibility: document.visibilityState || '',
+        pageVisibilityAt: Date.now(),
+        ...patch
+    })
     if(!nextRecord) return null
 
     const useJobProtocol = isActiveQueuedProgressRecord(normalizedHref)
@@ -1861,8 +1876,9 @@ function formatSpaceFeedPostWorkLabel() {
     return 'Nuking this'
 }
 
-function formatSpaceFeedNukingLabel(entries = []) {
-    return formatSpaceFeedGlobalWorkLabel(getSpaceFeedQueuedWorkCount(entries))
+// The Nuke 'Em button's label while idle: the queueable count from the last render (owner, 25 Oct). The nuking status is shown beside it.
+function getSpaceFeedQueueButtonLabel() {
+    return `Nuke 'Em ${Number.parseInt(lastSpaceFeedRenderModel?.queueableCount, 10) || 0}`
 }
 
 function getSpaceFeedNukeButtonMode(button) {
@@ -2655,6 +2671,7 @@ function activateSpacePageControls(assetDelay = 180) {
     if(getPageType() !== 'space') return false
 
     injectSpaceSidebarOpenProfilesBtn()
+    injectSpaceCollectButton()
     scheduleSpaceClassificationControls(0)
     if(shouldRefreshSpaceAssetNukeControls(null)) {
         scheduleSpaceAssetNukeControls(assetDelay)
@@ -2776,14 +2793,6 @@ function setNukeButtonNotice(button, label, restoreLabel = `Nuke 'Em`) {
         delete button.dataset.mbNukeNoticeToken
         setNukeButtonIdle(button, restoreLabel)
     }, 1800)
-}
-
-function setMuteBlockHelp(element, helpText) {
-    if(!element) return
-
-    const text = `Mute-Block Extension: ${helpText}`
-    element.title = text
-    element.setAttribute('aria-label', text)
 }
 
 async function animateNukeButtonPress(button) {
@@ -3966,7 +3975,7 @@ function removeContentProgressBar() {
     contentProgressBarEl = null
 }
 
-// The queue bar (coder-instructions-2026-10-18.md, section 4 item 2). The summary comes from the worker by runtime message on load,
+// The queue bar (historical/coder-instructions-2026-10-18.md, section 4 item 2). The summary comes from the worker by runtime message on load,
 // or as the summary the worker pushed (QUEUE_BAR_PUSH_ACTION). Nothing is read from storage for it, and a failed request shows no
 // bar. The paused flag is still read from storage.local.
 async function refreshContentProgressBar(pushedSummary = undefined) {
@@ -6632,6 +6641,240 @@ function injectSpaceSidebarOpenProfilesBtn() {
     }
 }
 
+// Space pages: the "Collect N More" button, placed under the contributor header in the right column. Like the profile search button,
+// it scrolls the feed until N more are collected, then stops. The collected count is the one Nuke 'Em shows, which grows as the page
+// is scrolled, and the posts it counts are the ones Nuke 'Em acts on (asset or target spaces only). The choice and the default match the
+// search button and are kept for this space page only, in memory.
+function getSpaceFeedCollectKey() {
+    return `${location.origin}${location.pathname}`
+}
+
+function ensureSpaceFeedCollectStateForCurrentSpace() {
+    const key = getSpaceFeedCollectKey()
+    if(spaceFeedCollectKey === key) return
+
+    spaceFeedCollectKey = key
+    spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+}
+
+// Only a count the dropdown offers is taken. It applies to this space page only.
+function setSpaceFeedCollectLimit(value) {
+    if(!PROFILE_SEARCH_COLLECT_CHOICES.includes(value)) return
+    spaceFeedCollectLimit = value
+    syncSpaceFeedCollectButton()
+}
+
+// The stop rule, kept pure so it can be tested. A collect is done once `limit` more were collected since the press. The peak count is
+// used, so a dip while posts scroll out of the scan does not hold the run open.
+function getSpaceFeedCollectedSince(startCount, peakCount) {
+    return Math.max(0, peakCount - startCount)
+}
+
+function isSpaceFeedCollectDone(startCount, peakCount, limit) {
+    return getSpaceFeedCollectedSince(startCount, peakCount) >= limit
+}
+
+// The count Nuke 'Em shows, after a fresh scan of the posts on the page. The count is kept across scrolling, so it grows as the page scrolls.
+function readSpaceFeedCollectedCount() {
+    syncSpaceFeedNukeControls()
+    return Number.parseInt(lastSpaceFeedRenderModel?.queueableCount, 10) || 0
+}
+
+async function collectMoreSpaceFeedPosts(button) {
+    const limit = spaceFeedCollectLimit
+    if(spaceFeedCollecting) {
+        spaceFeedCollectStopRequested = true
+        setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, 'Stopping...'))
+        return false
+    }
+
+    spaceFeedCollecting = true
+    spaceFeedCollectStopRequested = false
+    let stalledStartedAt = 0
+    let endReached = false
+    try {
+        await animateNukeButtonPress(button)
+        const startCount = readSpaceFeedCollectedCount()
+        let peakCount = startCount
+        setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting 0 / ${limit}`))
+
+        // First operation: go to the end of the feed, so Quora loads the next batch. The loop then scrolls down through what loads.
+        window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'auto'})
+
+        while(!spaceFeedCollectStopRequested && !isSpaceFeedCollectDone(startCount, peakCount, limit)) {
+            const beforeCount = peakCount
+            const beforeY = window.scrollY || 0
+            const beforeHeight = document.documentElement.scrollHeight
+            window.scrollBy({top: Math.round(window.innerHeight * 0.8), behavior: 'auto'})
+            await sleep(COLLECT_SCROLL_PASS_WAIT_MS)
+
+            peakCount = Math.max(peakCount, readSpaceFeedCollectedCount())
+            setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting ${getSpaceFeedCollectedSince(startCount, peakCount)} / ${limit}`))
+
+            const madeProgress = peakCount > beforeCount ||
+                (window.scrollY || 0) > beforeY ||
+                document.documentElement.scrollHeight > beforeHeight
+            if(madeProgress) {
+                stalledStartedAt = 0
+                continue
+            }
+            // Nothing moved. At the bottom, Quora may still be loading, so the feed counts as ended only after COLLECT_END_CONFIRM_MS
+            // without growth. Away from the bottom, a page that does not move for the stall timeout is stuck, not finished.
+            const atBottom = window.innerHeight + (window.scrollY || 0) >= document.documentElement.scrollHeight - 4
+            stalledStartedAt = stalledStartedAt || Date.now()
+            if(atBottom && Date.now() - stalledStartedAt >= COLLECT_END_CONFIRM_MS) {
+                endReached = true
+                break
+            }
+            if(!atBottom && Date.now() - stalledStartedAt >= PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS) break
+        }
+
+        const collected = getSpaceFeedCollectedSince(startCount, peakCount)
+        if(spaceFeedCollectStopRequested) {
+            setSpaceFeedCollectButtons(collectButton => setNukeButtonNotice(collectButton, 'Stopped', `Collect ${limit} More`))
+            return false
+        }
+        if(collected < 1) {
+            setSpaceFeedCollectButtons(collectButton => setNukeButtonNotice(collectButton, 'No new posts', `Collect ${limit} More`))
+            return false
+        }
+        setSpaceFeedCollectButtons(collectButton => setNukeButtonNotice(collectButton, endReached ? `Collected ${collected} · end of feed` : `Collected ${collected}`, `Collect ${limit} More`))
+        return true
+    }
+    finally {
+        spaceFeedCollecting = false
+        spaceFeedCollectStopRequested = false
+        // Owner, 25 Oct: when the collect is done or stopped, the page goes back to the top, where the Nuke 'Em buttons are.
+        window.scrollTo({top: 0, behavior: 'auto'})
+        syncSpaceFeedCollectButton({keepLabel: true})
+    }
+}
+
+// The Collect N More button appears in two places, both on asset or target spaces with posts: above the feed's MB Info and Nuke 'Em
+// buttons (always), and under the contributor header in the right column (only where "View Contributors" exists). Both share one collect
+// and show the same progress. The choice and the default are kept for this space page only, in memory.
+function createSpaceCollectWrap(extraClass = '') {
+    const wrap = document.createElement('span')
+    // The profile search classes give this button the same look and caret as the search button.
+    wrap.className = `mb-ext_profile-search-collect-wrap mb-ext_space-collect-wrap ${extraClass}`.trim()
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-collect-btn'
+    wrap.appendChild(button)
+    wrap.appendChild(createProfileSearchCollectLimitSelect())
+    return wrap
+}
+
+// The copy above the feed's buttons. It is a full-width first item of the feed toolbar, so it wraps onto a row of its own above MB Info
+// and Nuke 'Em. It does not depend on the right column.
+function ensureSpaceCollectWrapAboveFeed() {
+    const toolbar = document.querySelector('.mb-ext_space-feed-toolbar')
+    if(!toolbar || toolbar.querySelector(':scope > .mb-ext_space-collect-feed-host')) return
+
+    const host = document.createElement('div')
+    host.className = 'mb-ext_space-collect-feed-host'
+    host.appendChild(createSpaceCollectWrap('mb-ext_space-collect-feed'))
+    toolbar.prepend(host)
+}
+
+// The copy after the last box in the right column (owner, 25 Oct: it appears once the boxes have scrolled past, so it is not sticky). The
+// column can be much taller than its boxes: Quora reserves height for a list that has not rendered, so the copy goes right after the last box,
+// not at the end of the column.
+function ensureSpaceCollectWrapInRightColumn() {
+    const column = getSpaceRightColumn()
+    const existing = document.querySelector('.mb-ext_space-collect-column-host')
+    if(!column) {
+        existing?.remove()
+        return
+    }
+    const lastBox = getLastSpaceColumnBox(column)
+    if(existing && (lastBox ? lastBox.nextElementSibling === existing : column.lastElementChild === existing)) return
+
+    const host = existing || document.createElement('div')
+    if(!existing) {
+        host.className = 'mb-ext_space-collect-column-host'
+        host.appendChild(createSpaceCollectWrap('mb-ext_space-collect-column'))
+    }
+    if(lastBox) lastBox.insertAdjacentElement('afterend', host)
+    else column.appendChild(host)
+}
+
+// The bottom-most bordered box in the column, outside the copy. Where two boxes end on the same line, the outer one is kept.
+function getLastSpaceColumnBox(column) {
+    let last = null
+    let lastBottom = -Infinity
+    for(const box of column.querySelectorAll('[class*="qu-borderAll"]')) {
+        if(box.closest('.mb-ext_space-collect-column-host')) continue
+        const bottom = box.getBoundingClientRect().bottom
+        if(bottom > lastBottom + 1) {
+            last = box
+            lastBottom = bottom
+        }
+    }
+    return last
+}
+
+// The right column is the highest ancestor of the contributor card that is still as wide as the card. It holds any number of boxes, so
+// the button goes after all of them. The card is found from the "View all" link, which the contributors box always has.
+function getSpaceRightColumn() {
+    const viewAll = document.evaluate("//div[contains(@class, 'q-click-wrapper') and contains(string(), 'View all')]", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+    if(!viewAll) return null
+
+    const card = viewAll.closest('[class*="qu-borderAll"]') || viewAll.parentElement?.parentElement?.parentElement
+    if(!card) return null
+
+    const width = card.getBoundingClientRect().width
+    let column = card
+    for(let el = card.parentElement; el && el !== document.body; el = el.parentElement) {
+        if(Math.abs(el.getBoundingClientRect().width - width) > 2) break
+        column = el
+    }
+    return column
+}
+
+function removeSpaceCollectButtons() {
+    for(const node of document.querySelectorAll('.mb-ext_space-collect-feed-host, .mb-ext_space-collect-column-host, .mb-ext_space-collect-wrap')) node.remove()
+}
+
+function injectSpaceCollectButton() {
+    if(getPageType() !== 'space' || !isNukableSpacePage() || !document.querySelector('a.post_timestamp')) {
+        removeSpaceCollectButtons()
+        return false
+    }
+
+    ensureSpaceFeedCollectStateForCurrentSpace()
+    ensureSpaceCollectWrapAboveFeed()
+    ensureSpaceCollectWrapInRightColumn()
+    syncSpaceFeedCollectButton()
+    return true
+}
+
+// Every Collect N More button on the page, so both copies show the same progress.
+function setSpaceFeedCollectButtons(setLabel) {
+    for(const button of document.querySelectorAll('.mb-ext_space-collect-wrap .mb-ext_profile-search-collect-btn')) setLabel(button)
+}
+
+function syncSpaceFeedCollectButton(options = {}) {
+    const limit = spaceFeedCollectLimit
+    for(const wrap of document.querySelectorAll('.mb-ext_space-collect-wrap')) {
+        const button = ensureCurrentInstanceClickHandler(wrap.querySelector('.mb-ext_profile-search-collect-btn'), 'space-feed-collect', event => {
+            void collectMoreSpaceFeedPosts(event.currentTarget)
+        })
+        setMuteBlockHelp(button, `Scroll this space's feed and collect up to ${limit} more posts`)
+        const select = ensureCurrentInstanceClickHandler(wrap.querySelector('.mb-ext_profile-search-collect-limit'), 'space-feed-collect-limit', event => {
+            setSpaceFeedCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+            // Owner, 25 Oct: choosing a count starts the collect at once, so no second click is needed.
+            const collectButton = event.currentTarget.closest('.mb-ext_profile-search-collect-wrap')?.querySelector('.mb-ext_profile-search-collect-btn')
+            if(collectButton && !spaceFeedCollecting) void collectMoreSpaceFeedPosts(collectButton)
+        }, 'change')
+        if(!spaceFeedCollecting && !options.keepLabel) setNukeButtonIdle(button, `Collect ${limit} More`)
+        if(select) {
+            if(select.value !== String(limit)) select.value = String(limit)
+            select.disabled = spaceFeedCollecting
+        }
+    }
+}
+
 function getSpaceHeaderContainer() {
     return document.querySelector('.puppeteer_test_tribe_info_header')
 }
@@ -8672,7 +8915,7 @@ function setSpaceFeedButtonSelection(button, entries) {
     setSpaceFeedButtonEntries(button, entries)
 }
 
-function ensureCurrentInstanceClickHandler(button, handlerKey, handler) {
+function ensureCurrentInstanceClickHandler(button, handlerKey, handler, eventType = 'click') {
     if(!button) return button
     if(button.dataset.mbHandlerInstance === CONTENT_SCRIPT_INSTANCE_ID &&
         button.dataset.mbClickHandler === handlerKey) {
@@ -8688,7 +8931,7 @@ function ensureCurrentInstanceClickHandler(button, handlerKey, handler) {
 
     activeButton.dataset.mbHandlerInstance = CONTENT_SCRIPT_INSTANCE_ID
     activeButton.dataset.mbClickHandler = handlerKey
-    activeButton.addEventListener('click', handler)
+    activeButton.addEventListener(eventType, handler)
     return activeButton
 }
 
@@ -9412,6 +9655,7 @@ function getCopyableReportOverlay() {
     close.style.color = '#fff'
     close.style.padding = '6px 10px'
     close.style.cursor = 'pointer'
+    setMuteBlockHelp(close, 'Close this dialog')
     close.addEventListener('click', () => overlay.remove())
 
     header.appendChild(headerText)
@@ -9473,67 +9717,35 @@ function syncSpaceFeedStatusButton(entries = null) {
     }
 
     button.textContent = formatSpaceFeedStatusLabel(entries)
-    setMuteBlockHelp(button, `Mute-Block ${getExtensionVersion()}, click for more`)
+    setMuteBlockHelp(button, `Version ${getExtensionVersion()}. Click for more.`)
     return true
 }
 
 async function registerPendingSpaceFeedEntries(space, entries) {
     if(!space?.key || !Array.isArray(entries) || !entries.length) return
 
-    let changed = false
-    const nextRecords = {
-        ...spacePendingNukedPosts
-    }
-
+    // The page sends only the posts it is adding (25 Oct). The worker merges them into its own copy, so a removal the worker made since
+    // this page last read the map is not put back. The answer is the map as the worker stored it, and this page takes it.
+    const posts = []
     for(const entry of entries) {
         if(!entry?.postKey) continue
         if(isSpaceFeedEntryNuked(entry)) continue
 
         const entryUrls = getNormalizedProfileHrefList(entry.candidateUrls || [])
             .filter(url => !isRememberedSpaceFeedPostProfile(entry.postKey, url) && !isProfileNukeSucceeded(url))
-        const resolverPending = isResolvableSpaceFeedEntry(entry) && !entryUrls.length
-        if(!entryUrls.length && !resolverPending) continue
-
-        const existing = nextRecords[entry.postKey] || {}
-        const existingAllUrls = getStoredSpaceFeedRecordUrls(existing, 'allUrls')
-        const existingRemainingUrls = getStoredSpaceFeedRecordUrls(existing, 'remainingUrls')
-        const allUrls = getNormalizedProfileHrefList([...existingAllUrls, ...entryUrls])
-        const remainingUrls = getNormalizedProfileHrefList([...existingRemainingUrls, ...entryUrls])
-        const existingJobKeysByProfileHref = existing.jobKeysByProfileHref && typeof existing.jobKeysByProfileHref === 'object'
-            ? existing.jobKeysByProfileHref
-            : {}
-        const jobKeysByProfileHref = {
-            ...existingJobKeysByProfileHref
-        }
-        for(const href of entryUrls) {
-            jobKeysByProfileHref[href] = href
-        }
-
-        nextRecords[entry.postKey] = {
-            ...existing,
-            postKey: entry.postKey,
-            postUrl: entry.postUrl || existing.postUrl || '',
-            spaceKey: space.key,
-            spaceUrl: space.url,
-            allUrls,
-            remainingUrls,
-            resolverPending: resolverPending || existing.resolverPending === true,
-            resolverUrl: resolverPending ? entry.postUrl || existing.resolverUrl || '' : existing.resolverUrl || '',
-            jobKeys: getNormalizedProfileHrefList([
-                ...(Array.isArray(existing.jobKeys) ? existing.jobKeys : []),
-                ...entryUrls
-            ]),
-            jobKeysByProfileHref,
-            updatedAt: Date.now()
-        }
-        changed = true
+        const resolvable = isResolvableSpaceFeedEntry(entry)
+        if(!entryUrls.length && !resolvable) continue
+        posts.push({postKey: entry.postKey, postUrl: entry.postUrl || '', candidateUrls: entryUrls, resolvable})
     }
+    if(!posts.length) return
 
-    if(!changed) return
-
-    spacePendingNukedPosts = nextRecords
-    // The worker owns the pending nuked-post key (set-space-pending-nuked-posts).
-    await safeSendRuntimeMessage({action: 'set-space-pending-nuked-posts', pendingNukedPosts: nextRecords}, null)
+    const result = await safeSendRuntimeMessage({
+        action: 'merge-space-pending-nuked-posts',
+        spaceKey: space.key,
+        spaceUrl: space.url || '',
+        posts
+    }, null)
+    if(result?.pendingPosts && typeof result.pendingPosts === 'object') spacePendingNukedPosts = result.pendingPosts
 }
 
 async function removePendingSpaceFeedUrls(urls) {
@@ -10340,7 +10552,6 @@ async function nukeSpaceFeedEntries(button, entries) {
     try {
         await registerPendingSpaceFeedEntries(space, unfinishedEntries)
         syncSpaceFeedNukeControls()
-        setNukeButtonWorking(button, formatSpaceFeedNukingLabel(unfinishedEntries))
 
         // Each chunk (see sendCoordinatorEnqueueChunked) settles as its own
         // separate message, so the remaining count can visibly drop chunk by
@@ -10360,7 +10571,6 @@ async function nukeSpaceFeedEntries(button, entries) {
 
         if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
-            const workingLabel = formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries()))
             // Merged rows (already-known key: currently queued, or a past
             // terminal outcome) are silently absorbed into the existing row
             // rather than added as new work, and preFilter's counts (see
@@ -10378,11 +10588,8 @@ async function nukeSpaceFeedEntries(button, entries) {
                 setNukeButtonNotice(
                     button,
                     `Queued ${enqueueQueuedCount} new of ${preFilter.totalCandidates} (${noticeParts.join('; ')})`,
-                    workingLabel
+                    getSpaceFeedQueueButtonLabel()
                 )
-            }
-            else {
-                setNukeButtonWorking(button, workingLabel)
             }
             return true
         }
@@ -10390,7 +10597,6 @@ async function nukeSpaceFeedEntries(button, entries) {
         const sweep = await sweepBlockedProfileTabs()
         if(sweep.owned > 0) {
             syncSpaceFeedNukeControls()
-            setNukeButtonWorking(button, formatSpaceFeedNukingLabel(getLiveSpaceFeedEntries(getLatestSpaceFeedEntries())))
             return true
         }
 
@@ -10413,52 +10619,21 @@ async function nukeSpaceFeedEntries(button, entries) {
     }
 }
 
-async function pauseSpaceFeedQueue(button) {
-    if(!button) return false
-
-    const result = await safeSendRuntimeMessage({action: 'pause-coordinator-nukes'}, null) ||
-        await safeSendRuntimeMessage({action: 'pause-owner-nukes'}, {canceledUrls: []})
-    const canceledUrls = getNormalizedProfileHrefList(result?.canceledUrls || [])
-    const pausedUrls = getNormalizedProfileHrefList(result?.pausedUrls || [])
-    updateOwnedNukeStatusCache({
-        ...ownedNukeStatusCache,
-        queued: 0,
-        paused: true
-    })
-    if(canceledUrls.length && !result?.paused) {
-        await removePendingSpaceFeedUrls(canceledUrls)
-    }
-
-    setNukeButtonIdle(button)
-    scheduleSpaceAssetNukeControls(0)
-    return pausedUrls.length > 0 || canceledUrls.length > 0 || result?.paused === true
-}
-
-function syncSpaceFeedTopPauseButton(host, workingButton, model = {}, activeWork = false) {
-    let pauseButton = host.querySelector('.mb-ext_space-feed-pause-btn')
-    if(!activeWork && !model?.ownerPaused) {
-        pauseButton?.remove()
+// The queue's work for this space, as a status beside the Nuke 'Em button (owner, 25 Oct). It is a display only: the button keeps its own
+// label and stays usable while the work runs. A queue paused from the dashboard shows here too, since a space page has no pause button.
+function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false) {
+    if(!host) return
+    const working = activeWork ? formatSpaceFeedGlobalWorkLabel(model?.pendingProfileCount || 0) : ''
+    const text = model?.ownerPaused ? (working ? `Paused · ${working}` : 'Paused') : working
+    const existing = host.querySelector('.mb-ext_space-feed-nuking-status')
+    if(!text) {
+        existing?.remove()
         return
     }
-
-    if(!pauseButton) {
-        pauseButton = document.createElement('button')
-        pauseButton.type = 'button'
-        pauseButton.className = 'mb-ext_nuke-profiles-btn mb-ext_space-feed-pause-btn'
-        pauseButton.textContent = 'Pause'
-        setMuteBlockHelp(pauseButton, 'Pause Current Work without canceling jobs')
-        host.appendChild(pauseButton)
-    }
-
-    pauseButton = ensureCurrentInstanceClickHandler(pauseButton, 'space-feed-pause', event => {
-        event.preventDefault()
-        const activeButton = event.currentTarget
-        activeButton.disabled = true
-        void pauseSpaceFeedQueue(workingButton || activeButton)
-    })
-    pauseButton.disabled = false
-    pauseButton.textContent = 'Pause'
-    setMuteBlockHelp(pauseButton, 'Pause Current Work without canceling jobs')
+    const status = existing || document.createElement('span')
+    status.className = 'mb-ext_space-feed-nuking-status'
+    status.textContent = text
+    if(!existing) host.insertBefore(status, host.querySelector('.mb-ext_space-feed-nuke-btn'))
 }
 
 function syncSpaceFeedTopNukeButton(renderModel) {
@@ -10544,26 +10719,27 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         setMuteBlockHelp(button, 'Scanning visible posts in this space for profiles to nuke')
         setNukeButtonIdle(button, 'Scanning...')
         button.disabled = true
-        syncSpaceFeedTopPauseButton(host, button, model, false)
+        syncSpaceFeedNukingStatus(host, model, false)
         return true
     }
 
+    // While this page queues a batch, the enqueue sets the button's label (Queueing...). A render must not replace it.
+    if(queueSubmissionPending) {
+        syncSpaceFeedNukingStatus(host, model, activeSpaceWork)
+        return true
+    }
     setSpaceFeedButtonSelection(button, displayEntries)
     setMuteBlockHelp(button, shouldPromptScroll ? 'No visible targets. Scroll for more posts to scan.' : buildNukeTargetsHelpText('Queue detected profiles from visible posts in this space for mute and block', getSpaceFeedButtonUrls(button)))
 
+    // Queued work for this space shows beside the button (syncSpaceFeedNukingStatus). It does not hold the button, so the candidates that
+    // can still be queued are queued while earlier work runs (owner, 25 Oct).
     if(activeSpaceWork) {
-        setSpaceFeedButtonSelection(button, [])
+        setSpaceFeedButtonSelection(button, queueableEntries)
         setMuteBlockHelp(button, queueableEntries.length
-            ? 'This space has active queued work. Use the black post buttons to add newly visible candidates.'
-            : 'This space has active queued work.')
-        setNukeButtonWorking(button, formatSpaceFeedGlobalWorkLabel(model?.pendingProfileCount || 0))
-        button.disabled = true
+            ? 'Queue the candidates on visible posts that are not queued yet. Work already queued keeps running.'
+            : 'This space has queued work. Nothing new to queue yet.')
     }
-    else if(model?.ownerPaused && ownerRunningForThisSpace && busyEntries.length) {
-        setNukeButtonIdle(button, formatNukeProgressLabel('Paused', ownedNukeStatusCache))
-        button.disabled = false
-    }
-    else if(model?.singleNukeActive && queueableEntries.length) {
+    if(model?.singleNukeActive && queueableEntries.length) {
         setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
@@ -10579,6 +10755,10 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         setNukeButtonIdle(button, `Nuke 'Em ${queueableCount}`)
         button.disabled = false
     }
+    else if(activeSpaceWork) {
+        setNukeButtonIdle(button, `Nuke 'Em 0`)
+        button.disabled = true
+    }
     else if(model?.allActionableEntriesNuked) {
         setNukeButtonDone(button)
         button.disabled = true
@@ -10592,7 +10772,7 @@ function syncSpaceFeedTopNukeButton(renderModel) {
         button.disabled = true
     }
 
-    syncSpaceFeedTopPauseButton(host, button, model, activeSpaceWork)
+    syncSpaceFeedNukingStatus(host, model, activeSpaceWork)
     return true
 }
 
@@ -11047,6 +11227,7 @@ function syncSpaceFeedNukeControls() {
     }
 
     timedSpaceQuery('phase.topButton', () => syncSpaceFeedTopNukeButton(renderModel))
+    injectSpaceCollectButton()
     syncSpaceFeedTopBarLayout()
     lastSpaceFeedRenderModel = renderModel
     timedSpaceQuery('phase.postButtons', () => syncSpaceFeedPostButtons(renderModel))
@@ -11201,6 +11382,7 @@ function ensureProfileSearchCollectionStateForCurrentSearch() {
     if(profileSearchCollectionKey === key) return
 
     profileSearchCollectionKey = key
+    profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
     resetProfileSearchCollectionState()
 }
 
@@ -11216,17 +11398,6 @@ function saveProfileSearchCollectCursor(rows = []) {
         .sort((left, right) => (left.viewportBottom - right.viewportBottom) || (left.viewportTop - right.viewportTop))
         .pop()
     if(lastVisibleRow?.href) profileSearchCollectCursorHref = normalizeQuoraProfileHref(lastVisibleRow.href) || profileSearchCollectCursorHref
-}
-
-async function restoreProfileSearchCollectCursor() {
-    if(profileSearchCollectCursorScrollY <= getProfileSearchScrollY() + 80) return
-
-    window.scrollTo({
-        top: profileSearchCollectCursorScrollY,
-        left: 0,
-        behavior: 'auto'
-    })
-    await sleep(120)
 }
 
 function getProfileSearchStagedHrefs() {
@@ -11323,7 +11494,14 @@ function nudgeProfileSearchLazyLoad() {
 }
 
 function getProfileSearchCollectLimit() {
-    return PROFILE_SEARCH_COLLECT_LIMIT
+    return profileSearchCollectLimit
+}
+
+// Only a count the dropdown offers is taken. It applies to this search page only (see profileSearchCollectLimit).
+function setProfileSearchCollectLimit(value) {
+    if(!PROFILE_SEARCH_COLLECT_CHOICES.includes(value)) return
+    profileSearchCollectLimit = value
+    syncProfileSearchControls()
 }
 
 function isProfileSearchFollowButton(button) {
@@ -11438,7 +11616,9 @@ function getProfileSearchQueueableRows(rows = getProfileSearchRows(), options = 
 
 function getProfileSearchToolbar() {
     let toolbar = document.querySelector('.mb-ext_profile-search-toolbar')
-    if(toolbar) return toolbar
+    // A toolbar left by an earlier content script has the old layout, so it is replaced.
+    if(toolbar && toolbar.querySelector('.mb-ext_profile-search-collect-wrap')) return toolbar
+    toolbar?.remove()
 
     toolbar = document.createElement('div')
     toolbar.className = 'mb-ext_profile-search-toolbar'
@@ -11448,13 +11628,33 @@ function getProfileSearchToolbar() {
     batchButton.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-batch-btn'
     toolbar.appendChild(batchButton)
 
+    // The count dropdown is built into the Collect N More button: a transparent select sits over the button's caret.
+    const collectWrap = document.createElement('span')
+    collectWrap.className = 'mb-ext_profile-search-collect-wrap'
     const collectButton = document.createElement('button')
     collectButton.type = 'button'
     collectButton.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-collect-btn'
-    toolbar.appendChild(collectButton)
+    collectWrap.appendChild(collectButton)
+    collectWrap.appendChild(createProfileSearchCollectLimitSelect())
+    toolbar.appendChild(collectWrap)
 
     document.body.appendChild(toolbar)
     return toolbar
+}
+
+// The queue's count of this search's work, beside the batch button (owner, 25 Oct). Nothing is shown when nothing is pending.
+function setProfileSearchNukingStatus(toolbar, count = 0) {
+    if(!toolbar) return
+    const remaining = Number.parseInt(count, 10) || 0
+    const existing = toolbar.querySelector('.mb-ext_profile-search-nuking-status')
+    if(remaining < 1) {
+        existing?.remove()
+        return
+    }
+    const status = existing || document.createElement('span')
+    status.className = 'mb-ext_profile-search-nuking-status'
+    status.textContent = `Nuking... ${remaining} left`
+    if(!existing) toolbar.querySelector('.mb-ext_profile-search-batch-btn')?.insertAdjacentElement('afterend', status)
 }
 
 function getProfileSearchToolbarButtons() {
@@ -11462,8 +11662,23 @@ function getProfileSearchToolbarButtons() {
     return {
         toolbar,
         batch: toolbar.querySelector('.mb-ext_profile-search-batch-btn'),
-        collect: toolbar.querySelector('.mb-ext_profile-search-collect-btn')
+        collect: toolbar.querySelector('.mb-ext_profile-search-collect-btn'),
+        limit: toolbar.querySelector('.mb-ext_profile-search-collect-limit')
     }
+}
+
+// The Collect N More count dropdown. Its options come from PROFILE_SEARCH_COLLECT_CHOICES. The toolbar sync sets and reads its value.
+function createProfileSearchCollectLimitSelect() {
+    const select = document.createElement('select')
+    select.className = 'mb-ext_profile-search-collect-limit'
+    setMuteBlockHelp(select, 'How many to collect before stopping')
+    for(const choice of PROFILE_SEARCH_COLLECT_CHOICES) {
+        const option = document.createElement('option')
+        option.value = String(choice)
+        option.textContent = String(choice)
+        select.appendChild(option)
+    }
+    return select
 }
 
 function syncProfileSearchRowButtons(rows = getProfileSearchRows()) {
@@ -11558,7 +11773,8 @@ function getProfileSearchBatchHrefs(rows = getProfileSearchRows(), options = {})
     const stagedHrefs = getProfileSearchStagedHrefs()
     if(stagedHrefs.length) return stagedHrefs
 
-    const limit = Number.parseInt(options.limit, 10) || getProfileSearchCollectLimit()
+    // Nuke 'Em keeps the default count. Only Collect N More takes the count chosen for this search page.
+    const limit = Number.parseInt(options.limit, 10) || PROFILE_SEARCH_COLLECT_LIMIT
     return getProfileSearchQueueableRows(rows, {allowRetry: false})
         .slice(0, limit)
         .map(row => row.href)
@@ -11576,15 +11792,13 @@ function syncProfileSearchControls() {
 
     const buttons = getProfileSearchToolbarButtons()
     const limit = getProfileSearchCollectLimit()
-    const batchHrefs = getProfileSearchBatchHrefs(rows, {limit})
+    const batchHrefs = getProfileSearchBatchHrefs(rows)
     const pendingSearchCount = getPendingCoordinatorProfileSearchWorkCount()
 
     buttons.batch = ensureCurrentInstanceClickHandler(buttons.batch, 'profile-search-batch', event => {
         const activeButton = event.currentTarget
 
-        const hrefs = getProfileSearchBatchHrefs(getProfileSearchRows(), {
-            limit: getProfileSearchCollectLimit()
-        })
+        const hrefs = getProfileSearchBatchHrefs(getProfileSearchRows())
         void (async() => {
             const queued = await nukeProfileSearchHrefs(activeButton, hrefs, {
                 event: 'Queued from profile search'
@@ -11596,6 +11810,16 @@ function syncProfileSearchControls() {
     buttons.collect = ensureCurrentInstanceClickHandler(buttons.collect, 'profile-search-collect', event => {
         void collectMoreProfileSearchResults(event.currentTarget)
     })
+    buttons.limit = ensureCurrentInstanceClickHandler(buttons.limit, 'profile-search-collect-limit', event => {
+        setProfileSearchCollectLimit(Number.parseInt(event.currentTarget.value, 10))
+        // Owner, 25 Oct: choosing a count starts the collect at once, so no second click is needed.
+        const collectButton = event.currentTarget.closest('.mb-ext_profile-search-collect-wrap')?.querySelector('.mb-ext_profile-search-collect-btn')
+        if(collectButton && !profileSearchCollecting) void collectMoreProfileSearchResults(collectButton)
+    }, 'change')
+    if(buttons.limit) {
+        if(buttons.limit.value !== String(limit)) buttons.limit.value = String(limit)
+        buttons.limit.disabled = profileSearchCollecting
+    }
 
     if(profileSearchCollecting) {
         setNukeButtonWorking(buttons.collect, buttons.collect.innerText || `Collecting 0 / ${limit}`)
@@ -11616,7 +11840,11 @@ function syncProfileSearchControls() {
         buttons.batch.disabled = !batchHrefs.length
     }
 
-    setNukeButtonIdle(buttons.batch, batchHrefs.length ? `Nuke 'Em ${batchHrefs.length}` : 'Nuke \'Em 0')
+    if(!profileSearchQueueingBatch) {
+        setNukeButtonIdle(buttons.batch, batchHrefs.length ? `Nuke 'Em ${batchHrefs.length}` : 'Nuke \'Em 0')
+    }
+    // The nuking count is a status beside the batch button (owner, 25 Oct). The button keeps its own label while earlier batches run.
+    setProfileSearchNukingStatus(buttons.toolbar, pendingSearchCount)
     const hasStagedHrefs = getProfileSearchStagedHrefs().length > 0
     setMuteBlockHelp(buttons.batch, batchHrefs.length
         ? buildNukeTargetsHelpText(hasStagedHrefs
@@ -11628,7 +11856,32 @@ function syncProfileSearchControls() {
     return true
 }
 
+// A batch enqueue from the search page whose save timed out may still have been queued by the worker. This asks the worker for the run
+// and counts what it holds, until the run shows up or PROFILE_SEARCH_ENQUEUE_CONFIRM_TIMEOUT_MS passes. Returns that count, or 0.
+async function waitForProfileSearchBatchInQueue(runId, timeoutMs = PROFILE_SEARCH_ENQUEUE_CONFIRM_TIMEOUT_MS) {
+    profileSearchLastRunId = runId || profileSearchLastRunId
+    const deadline = Date.now() + timeoutMs
+    while(Date.now() < deadline) {
+        await refreshContentPageCoordinatorStateFromRuntime({force: true})
+        const pending = getPendingCoordinatorProfileSearchWorkCount()
+        if(pending > 0) return pending
+        await sleep(PROFILE_SEARCH_ENQUEUE_CONFIRM_INTERVAL_MS)
+    }
+    return 0
+}
+
+// The batch button: "Queueing N..." while the enqueue settles, then "Nuking N..." while the queue holds the batch (see syncProfileSearchControls).
 async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
+    profileSearchQueueingBatch = true
+    try {
+        return await nukeProfileSearchHrefsOnce(button, hrefs, options)
+    }
+    finally {
+        profileSearchQueueingBatch = false
+    }
+}
+
+async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
     const profileHrefs = getNormalizedProfileHrefList(hrefs)
         .filter(href => isProfileSearchHrefMatchForCurrentQuery(href))
         .filter(href => isProfileSearchProfileNukeable(href, {
@@ -11648,7 +11901,7 @@ async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
         paused: false
     })
     await animateNukeButtonPress(button)
-    setNukeButtonWorking(button, `Queueing... ${profileHrefs.length}`)
+    setNukeButtonWorking(button, `Queueing ${profileHrefs.length}...`)
 
     const result = await enqueueCoordinatorProfileUrls({
         urls: profileHrefs,
@@ -11662,12 +11915,18 @@ async function nukeProfileSearchHrefs(button, hrefs = [], options = {}) {
             sourceLabel: getProfileSearchQueryLabel()
         }
     })
-    const queued = Number.parseInt(result?.executionQueued || result?.queued || result?.merged || 0, 10) || 0
+    let queued = Number.parseInt(result?.executionQueued || result?.queued || result?.merged || 0, 10) || 0
+    // A save that timed out on this side can still land in the worker. Then the queue, not the reply, says what was queued.
+    if(queued < 1 && result?.storageTimedOut === true) {
+        queued = await waitForProfileSearchBatchInQueue(result.runId)
+    }
     if(queued > 0) {
         profileSearchLastRunId = result?.runId || profileSearchLastRunId
         profileSearchLastQueuedAt = Date.now()
         profileSearchLastQueuedCount = queued
-        setNukeButtonWorking(button, `Nuking ${queued} left`)
+        // The batch button goes back to its idle label, so the batch can be queued again. The nuking count is shown beside it.
+        const remainingHrefs = getProfileSearchBatchHrefs(getProfileSearchRows()).length
+        setNukeButtonIdle(button, remainingHrefs ? `Nuke 'Em ${remainingHrefs}` : `Nuke 'Em 0`)
         scheduleProfileSearchControls(250)
         scheduleProfileSearchPendingRefresh()
         return true
@@ -11694,16 +11953,15 @@ async function collectMoreProfileSearchResults(button) {
     const targetStagedCount = initialStagedCount + limit
     let collectedCount = 0
     let stalledStartedAt = 0
-    let scrollPasses = 0
+    let endReached = false
 
     profileSearchProcessedFollowButtons = new WeakSet()
     await animateNukeButtonPress(button)
-    await restoreProfileSearchCollectCursor()
+    // First operation: go to the end of the results, so the next batch loads. The loop then scrolls down from there.
+    window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'auto'})
 
     try {
-        while(!profileSearchCollectStopRequested &&
-            collectedCount < limit &&
-            scrollPasses < PROFILE_SEARCH_COLLECT_MAX_SCROLL_PASSES) {
+        while(!profileSearchCollectStopRequested && collectedCount < limit) {
             const beforeCount = collectedCount
             const beforeY = getProfileSearchScrollY()
             const beforeHeight = getProfileSearchScrollHeight()
@@ -11720,11 +11978,13 @@ async function collectMoreProfileSearchResults(button) {
 
             if(collectedCount >= limit) break
 
-            if(isProfileSearchEndOfResultsVisible() && !hasUnstagedProfileSearchQueueableRow() && !hasProfileSearchLoadingIndicator()) break
+            if(isProfileSearchEndOfResultsVisible() && !hasUnstagedProfileSearchQueueableRow() && !hasProfileSearchLoadingIndicator()) {
+                endReached = true
+                break
+            }
 
             nudgeProfileSearchLazyLoad()
-            scrollPasses += 1
-            await sleep(700)
+            await sleep(COLLECT_SCROLL_PASS_WAIT_MS)
 
             const afterY = getProfileSearchScrollY()
             const afterHeight = getProfileSearchScrollHeight()
@@ -11749,7 +12009,7 @@ async function collectMoreProfileSearchResults(button) {
             return false
         }
 
-        setNukeButtonNotice(button, `Collected ${collectedCount}`, `Collect ${limit} More`)
+        setNukeButtonNotice(button, endReached ? `Collected ${collectedCount} · end of results` : `Collected ${collectedCount}`, `Collect ${limit} More`)
         return true
     }
     finally {
@@ -11966,7 +12226,7 @@ async function scrollProfileModalForMore(modal = getProfilePeopleModal()) {
 
     scroller.dispatchEvent(new Event('scroll', {bubbles: true}))
     scroller.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: step}))
-    await sleep(900)
+    await sleep(MODAL_PROFILE_NUKE_SCROLL_WAIT_MS)
 
     return scroller.scrollTop > beforeTop + 1 ||
         scroller.scrollHeight > beforeHeight + 1 ||
@@ -12048,10 +12308,8 @@ async function nukeModalProfiles() {
         const urlsToQueue = []
         const queuedUrls = new Set()
         let idlePasses = 0
-        let scrollPasses = 0
 
         while(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES &&
-            scrollPasses < MODAL_PROFILE_NUKE_MAX_SCROLL_PASSES &&
             urlsToQueue.length < queueLimit) {
             items = getNukeableProfileModalItems(modal)
 
@@ -12070,7 +12328,6 @@ async function nukeModalProfiles() {
                     idlePasses = 0
                     items[items.length - 1].scrollIntoView({block: 'nearest'})
                     if(urlsToQueue.length < queueLimit && await scrollProfileModalForMore(modal)) {
-                        scrollPasses += 1
                         idlePasses = 0
                     }
                 }
@@ -12080,7 +12337,6 @@ async function nukeModalProfiles() {
             }
             else {
                 if(await scrollProfileModalForMore(modal)) {
-                    scrollPasses += 1
                     idlePasses = 0
                 }
                 else {
@@ -12088,7 +12344,7 @@ async function nukeModalProfiles() {
                 }
             }
 
-            if(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES) await sleep(900)
+            if(idlePasses < MODAL_PROFILE_NUKE_IDLE_SCROLL_PASSES) await sleep(MODAL_PROFILE_NUKE_SCROLL_WAIT_MS)
         }
 
         if(urlsToQueue.length) {

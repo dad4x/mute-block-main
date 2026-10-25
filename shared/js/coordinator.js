@@ -1,4 +1,5 @@
 const browser = require('webextension-polyfill')
+const { setMuteBlockHelp } = require('./muteBlockHelp')
 const {
     isRetryableJobFailure,
     isRetryableJobFailureFromProgress,
@@ -20,11 +21,12 @@ const {
 } = require('./nukedPosts')
 const {readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT} = require('./tunables')
 const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     COORDINATOR_PAUSED_KEY,
+    COORDINATOR_WORK_SESSION_KEY,
     COORDINATOR_QUEUE_VIEW_KEY,
     COORDINATOR_RETRY_FAILED_ENABLED_KEY,
     COORDINATOR_RUNS_KEY,
@@ -697,6 +699,7 @@ function buildFlightRecorderHeader() {
         const button = document.createElement('button')
         button.type = 'button'
         button.textContent = active ? `${label} ${flightRecorderSort.dir === 'asc' ? '▲' : '▼'}` : label
+        setMuteBlockHelp(button, `Sort by ${label}. Click again to reverse the order.`)
         button.addEventListener('click', () => {
             flightRecorderSort = active
                 ? {key, dir: flightRecorderSort.dir === 'asc' ? 'desc' : 'asc'}
@@ -948,7 +951,8 @@ async function loadState() {
         [HIDDEN_RUNS_KEY]: [],
         [COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false,
         [COORDINATOR_PAUSED_KEY]: false,
-        [COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: null
+        [COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY]: null,
+        [COORDINATOR_WORK_SESSION_KEY]: null
     })
 
     // The paused flag is already in hand, so show it now. It used to wait for
@@ -996,6 +1000,8 @@ async function loadState() {
     retryFailedActive = !!stored[COORDINATOR_RETRY_FAILED_ENABLED_KEY]
     state.paused = !!stored[COORDINATOR_PAUSED_KEY]
     state.lastEnqueueSummary = stored[COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY] || null
+    state.workSession = stored[COORDINATOR_WORK_SESSION_KEY] || null
+    renderWorkSessionLine()
 }
 
 // One round trip for both dashboard views. The service worker reads authority
@@ -1187,7 +1193,7 @@ function getQueueTotalCount(queueItems = []) {
 }
 
 // The worker window's minimal "idiot light" status bar -- deliberately not
-// the full control-panel dashboard (see nits3.md item 5 discussion): just a
+// the full control-panel dashboard (see historical/nits3.md item 5 discussion): just a
 // window-width progress fill of handled-vs-total Current Work items, a
 // count, and the handful of actions relevant to a background worker window.
 function renderWorkerBar() {
@@ -1564,7 +1570,7 @@ function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exha
     if(button) {
         button.textContent = retryFailedActive ? 'Disable Retry Soft-Fails' : 'Enable Retry Soft-Fails'
         button.setAttribute('aria-pressed', retryFailedActive ? 'true' : 'false')
-        button.title = retryFailedActive ? 'Turn soft-fail retry off' : 'Turn soft-fail retry on'
+        setMuteBlockHelp(button, retryFailedActive ? 'Turn soft-fail retry off' : 'Turn soft-fail retry on')
         button.disabled = false
     }
 
@@ -1603,9 +1609,9 @@ function syncStartCoordinatorControls() {
 
     button.hidden = !state.requiresQuoraVisit
     button.disabled = state.loading
-    button.title = state.requiresQuoraVisit
+    setMuteBlockHelp(button, state.requiresQuoraVisit
         ? 'Start Current Work without waiting for a Quora page'
-        : 'Quora runtime is available'
+        : 'Quora runtime is available')
 }
 
 function getRetryFailedWorkWaitText({hasPendingWork = false, hasActiveWork = false} = {}) {
@@ -1620,9 +1626,9 @@ function syncRequeueFailedControls(requeueableCount = 0) {
     if(!button) return
 
     button.disabled = requeueableCount <= 0
-    button.title = requeueableCount > 0
+    setMuteBlockHelp(button, requeueableCount > 0
         ? `Reset and requeue ${requeueableCount} failed/canceled Current Work job${requeueableCount === 1 ? '' : 's'}`
-        : 'No failed or canceled Current Work jobs to requeue'
+        : 'No failed or canceled Current Work jobs to requeue')
 }
 
 async function requeueFailed() {
@@ -1729,7 +1735,7 @@ function syncCurrentWorkPauseControls(queueItems = []) {
         pauseButton.setAttribute('aria-pressed', state.paused ? 'true' : 'false')
         pauseButton.setAttribute('aria-busy', pausePending || resumePending ? 'true' : 'false')
         pauseButton.classList.toggle('clear-button--pause-active', state.paused)
-        pauseButton.title = pausePending
+        setMuteBlockHelp(pauseButton, pausePending
             ? 'Pause request sent; waiting for Current Work to stop'
             : resumePending
                 ? 'Resume request sent; waiting for Current Work to continue'
@@ -1737,7 +1743,7 @@ function syncCurrentWorkPauseControls(queueItems = []) {
                     ? 'Resume paused Current Work'
             : pendingCount > 0
                 ? 'Pause Current Work without canceling jobs'
-                : 'Pause now, before queueing more work'
+                : 'Pause now, before queueing more work')
     }
 
     if(pauseState) {
@@ -1753,9 +1759,9 @@ function syncCurrentWorkPauseControls(queueItems = []) {
 
     if(cancelButton) {
         cancelButton.disabled = pendingCount <= 0
-        cancelButton.title = pendingCount > 0
+        setMuteBlockHelp(cancelButton, pendingCount > 0
             ? `Cancel ${pendingCount} pending Current Work job${pendingCount === 1 ? '' : 's'}`
-            : 'No pending Current Work to cancel'
+            : 'No pending Current Work to cancel')
     }
 
     const clearButton = document.getElementById('clearCurrentWorkButton')
@@ -1763,9 +1769,9 @@ function syncCurrentWorkPauseControls(queueItems = []) {
         // Clear removes finished rows too (mutateCoordinatorStoredWorkClear in sw.js), so the view total decides, not the listed rows.
         const totalCount = getQueueTotalCount(queueItems)
         clearButton.disabled = totalCount <= 0
-        clearButton.title = totalCount > 0
+        setMuteBlockHelp(clearButton, totalCount > 0
             ? `Cancel and remove all ${totalCount} Current Work row${totalCount === 1 ? '' : 's'}`
-            : 'No Current Work to clear'
+            : 'No Current Work to clear')
     }
 }
 
@@ -2246,7 +2252,43 @@ function refreshThrottleNote() {
     el.classList.toggle('status-pill--warn', throttled)
 }
 
+// The Current Work header's work-session line (24 Oct): the start, duration and end of the last or current continuous work. loadState()
+// reads the stored session with the rest of the dashboard state, on the compact refresh cadence. A running session's duration counts up
+// from its start, so the line is redrawn every second from state.workSession, without reading storage.
+function formatWorkSessionClock(ms) {
+    return new Date(ms).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit', second: '2-digit'})
+}
+
+function formatWorkSessionDuration(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000))
+    const hours = Math.floor(total / 3600)
+    const minutes = Math.floor((total % 3600) / 60)
+    const seconds = total % 60
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function renderWorkSessionLine() {
+    const line = document.getElementById('workSessionLine')
+    if(!line) return
+
+    const session = state.workSession
+    if(!session || !(Number(session.startedAt) > 0)) {
+        line.hidden = true
+        line.textContent = ''
+        return
+    }
+
+    const endedAt = Number(session.endedAt) || 0
+    const durationMs = (endedAt || Date.now()) - Number(session.startedAt)
+    const endText = endedAt
+        ? `End ${formatWorkSessionClock(endedAt)} (${session.endReason === 'queue-empty' ? 'queue empty' : 'paused'})`
+        : 'End running'
+    line.textContent = `Start ${formatWorkSessionClock(session.startedAt)} · Duration ${formatWorkSessionDuration(durationMs)} · ${endText}`
+    line.hidden = false
+}
+
 setInterval(refreshThrottleNote, DASHBOARD_THROTTLE_NOTE_REFRESH_MS)
+setInterval(renderWorkSessionLine, DASHBOARD_WORK_SESSION_REDRAW_MS)
 
 function getCurrentQueueLoadThrottle() {
     const metrics = state.metrics || {}
@@ -2442,7 +2484,7 @@ function renderWakeupMetrics(queueItems = []) {
     // dashboard/popup/CDP tools actually read) is written by a SEPARATE,
     // non-atomic storage.set from the WAL append it is supposed to mirror.
     // It can fail independently under load with no guaranteed catch-up
-    // deadline (see queue-wal-segmented-record-followup-2026-05-27.md's
+    // deadline (see historical/queue-wal-segmented-record-followup-2026-05-27.md's
     // 2026-09-17 entry) -- projectionSaved/projectionFailed are the only
     // signal that divergence is happening, so surface them directly rather
     // than leaving them buried in raw counters.
@@ -3008,7 +3050,7 @@ function buildQueueCancelCell(item = {}) {
     button.type = 'button'
     button.className = 'clear-button row-action-button row-cancel-button'
     button.textContent = 'Cancel'
-    button.title = 'Cancel this queued Current Work item'
+    setMuteBlockHelp(button, 'Cancel this queued Current Work item')
     button.addEventListener('click', event => {
         event.preventDefault()
         button.disabled = true
@@ -3029,7 +3071,7 @@ function buildQueueActionCell(item = {}) {
     button.type = 'button'
     button.className = 'clear-button row-action-button'
     button.textContent = 'Requeue'
-    button.title = `Reset and requeue this ${itemStatus} Current Work item`
+    setMuteBlockHelp(button, `Reset and requeue this ${itemStatus} Current Work item`)
     button.addEventListener('click', event => {
         event.preventDefault()
         button.disabled = true

@@ -1,5 +1,6 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const { setMuteBlockHelp } = require('./muteBlockHelp')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -58,6 +59,7 @@ async function init() {
     const coordinatorAutoStartOnBrowserStart = document.getElementById('coordinatorAutoStartOnBrowserStart')
     const profilesPerBatch = document.getElementById('profilesPerBatch')
     const targetQueuedTabConcurrency = document.getElementById('targetQueuedTabConcurrency')
+    const workerWindowForegroundMode = document.getElementById('workerWindowForegroundMode')
     const nukedPostRetentionDays = document.getElementById('nukedPostRetentionDays')
     const maxRememberedNukedPosts = document.getElementById('maxRememberedNukedPosts')
 
@@ -67,6 +69,7 @@ async function init() {
     coordinatorAutoStartOnBrowserStart.checked = settings.coordinatorAutoStartOnBrowserStart === true
     profilesPerBatch.value = settings.profilesPerBatch
     targetQueuedTabConcurrency.value = settings.targetQueuedTabConcurrency
+    workerWindowForegroundMode.value = settings.workerWindowForegroundMode
     popupState.nukedPostRetentionDays = normalizeRetentionDays(settings[NUKED_POST_RETENTION_DAYS_KEY], defaults[NUKED_POST_RETENTION_DAYS_KEY])
     popupState.maxRememberedNukedPosts = normalizeMaxRememberedNukedPosts(settings[MAX_REMEMBERED_NUKED_POSTS_KEY], defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
     nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
@@ -93,6 +96,7 @@ async function init() {
             coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart.checked,
             profilesPerBatch: profilesPerBatch.valueAsNumber,
             targetQueuedTabConcurrency: targetQueuedTabConcurrency.valueAsNumber,
+            workerWindowForegroundMode: workerWindowForegroundMode.value,
             [NUKED_POST_RETENTION_DAYS_KEY]: normalizeRetentionDays(nukedPostRetentionDays.valueAsNumber, defaults[NUKED_POST_RETENTION_DAYS_KEY]),
             [MAX_REMEMBERED_NUKED_POSTS_KEY]: normalizeMaxRememberedNukedPosts(maxRememberedNukedPosts.valueAsNumber, defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
         }
@@ -125,6 +129,7 @@ async function init() {
         coordinatorAutoStartOnBrowserStart.checked = defaults.coordinatorAutoStartOnBrowserStart === true
         profilesPerBatch.value = defaults.profilesPerBatch
         targetQueuedTabConcurrency.value = defaults.targetQueuedTabConcurrency
+        workerWindowForegroundMode.value = defaults.workerWindowForegroundMode
         popupState.nukedPostRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY]
         popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
@@ -297,6 +302,7 @@ function renderSpaceList(container) {
             button.dataset.active = isActive ? 'true' : 'false'
             button.setAttribute('aria-pressed', isActive ? 'true' : 'false')
             button.textContent = getSpaceCategoryShortLabel(option)
+            setMuteBlockHelp(button, `Set this space to ${getSpaceCategoryShortLabel(option)}`)
 
             if(isActive) {
                 button.classList.add('popup-space-button--active', `popup-space-button--${option}`)

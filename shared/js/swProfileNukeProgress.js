@@ -102,6 +102,7 @@ function createProfileNukeProgress(deps = {}) {
             runId: source.runId || '',
             tabId: Number.isFinite(source.tabId) ? source.tabId : source.tabId || null,
             lastUrl: source.lastUrl || '',
+            pageVisibility: source.pageVisibility || '',
             queuedAt: Number.parseInt(source.queuedAt, 10) || 0,
             tabCreatedAt: Number.parseInt(source.tabCreatedAt, 10) || 0,
             tabOpenedAt: Number.parseInt(source.tabOpenedAt, 10) || 0,
@@ -462,7 +463,7 @@ function createProfileNukeProgress(deps = {}) {
             // whatever queue shape happened to be writing at that moment --
             // not the ratcheted/statsClearedAt-filtered view the rest of the
             // app expects -- which the WAL's auto-recovery-from-view path
-            // (since retired -- see LEGACY_QUEUE_VIEW_RETIREMENT.md) then read back
+            // (since retired -- see historical/LEGACY_QUEUE_VIEW_RETIREMENT.md) then read back
             // in as "the truth" on the next hydrate failure, reintroducing
             // old/mismatched row states on top of a live WAL that had since
             // moved on. Confirmed live: reappearing rows and up to 3

@@ -411,6 +411,12 @@ h2 {
     animation: button-flash 650ms ease-out;
 }
 
+.work-session {
+    font-size: 12px;
+    color: var(--mb-grey-600);
+    white-space: nowrap;
+}
+
 .pause-state {
     background: var(--mb-grey-100);
     border: 1px solid var(--mb-grey-200);

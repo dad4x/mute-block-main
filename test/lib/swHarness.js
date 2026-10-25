@@ -94,6 +94,7 @@ function makeEvent() {
 }
 
 const {PROFILE_NUKE_PROGRESS_SHARD_PREFIX, PROFILE_NUKE_PROGRESS_VIEW_KEY} = require('../../shared/js/storageKeys')
+const {WORKER_WINDOW_FOREGROUND_MODES} = require('../../shared/js/swprefs')
 
 // Decision 31: profile progress (the view and the shards) is held in session storage, never on disk. A progress key in a seed goes to
 // the session copy, unless options.progressOnDisk is set (the legacy-copy cleanup test seeds the old disk copy that way).
@@ -649,6 +650,11 @@ module.exports.__test = {
     buildRuntimeSurfaceIndex,
     getCoordinatorResumeMaxConcurrent,
     setTargetQueuedTabConcurrency,
+    setWorkerWindowForegroundMode,
+    startCoordinatorWorkSession,
+    endCoordinatorWorkSession,
+    isCoordinatorPausedInStorage,
+    readResidentCoordinatorStored,
     getTargetQueuedTabConcurrency: () => targetQueuedTabConcurrency,
     summarizeCoordinatorActualBlockTiming,
     summarizeCoordinatorAlreadyBlockedTiming,
@@ -934,6 +940,17 @@ module.exports.__test = {
     const wrapper = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`
     const compiled = new vm.Script(wrapper, {filename: swPath}).runInContext(context)
     compiled(module.exports, localRequire, module, swPath, path.dirname(swPath))
+
+    // The worker-window foreground mode is the worker's stored preference. A test passes workerWindowForegroundMode to choose one.
+    // Otherwise, when the test stores no mode, the synthetic focus assertions run in 'focus', the mode they were written against.
+    const pinnedWorkerWindowForegroundMode = options.workerWindowForegroundMode ||
+        (options.storage?.workerWindowForegroundMode === undefined ? 'focus' : null)
+    if(pinnedWorkerWindowForegroundMode) {
+        if(!WORKER_WINDOW_FOREGROUND_MODES.includes(pinnedWorkerWindowForegroundMode)) {
+            throw new Error(`unknown workerWindowForegroundMode: ${pinnedWorkerWindowForegroundMode}`)
+        }
+        module.exports.__test.setWorkerWindowForegroundMode(pinnedWorkerWindowForegroundMode)
+    }
 
     return {
         browser,
