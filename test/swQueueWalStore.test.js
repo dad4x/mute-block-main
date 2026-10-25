@@ -253,6 +253,72 @@ assert.throws(() => createQueueWalStore({}), /Missing queue WAL store dependency
         assert.equal(mirrorReads.length, 0)
         assert.equal(diagnostics.some(entry => entry.type === MISMATCH_EVENT), false)
     })
+
+    // Checkpoint reuse (step 2). The layer remembers the slots storage holds: recorded at each load, forgotten on a clear, on a removal
+    // of a checkpoint or meta key, and on a save that did not succeed. A save that succeeds remembers the slot it wrote.
+    const reuseState = {queue: {[ROW_HREF]: {status: 'queued', attemptId: 'attempt-reuse', attemptNumber: 1, runId: 'run-reuse'}}, completed: {}}
+    // Two checkpoints, one in each slot, both written in full, as the storage holds them after two switches.
+    function twoSlotPayload() {
+        let store = makePairedCheckpointStore({}, {snapshotSeq: 0})
+        for (const seq of [5, 6]) {
+            const written = writeInactiveCheckpoint(store, reuseState, {snapshotSeq: seq, snapshotEpoch: 1, createdAt: seq, shardCount: 4})
+            const activated = activateCheckpoint(written.store, written.checkpointId, {})
+            assert.equal(activated.activated, true, activated.reason)
+            store = activated.store
+        }
+        return buildSegmentedWalStoragePayload(store, {baseKey: BASE_KEY, writeCheckpoints: true})
+    }
+    // Loads the two-slot storage through the layer, and returns the loaded store.
+    async function loadTwoSlots() {
+        const payload = twoSlotPayload()
+        const {layer} = makeLayer({diskSnapshots: [payload], mirrorCopy: null})
+        const loaded = await layer.loadStoreFromStorage({[META_KEY]: payload[META_KEY]}, {}, {})
+        return {layer, loaded}
+    }
+    // How many shards the next switch write would leave out, for the given stored store.
+    function skippedByNextWrite(layer, storedWal, seq) {
+        const prepared = layer.prepareCheckpointWrite(storedWal, reuseState, {snapshotSeq: seq, createdAt: seq, shardCount: 4})
+        return prepared.writePlan.skipShardIndexes.length
+    }
+
+    await scenario('a load remembers both slots, so an unchanged write of the inactive slot leaves out every shard', async () => {
+        const {layer, loaded} = await loadTwoSlots()
+        assert.equal(skippedByNextWrite(layer, loaded, 7), 4)
+    })
+
+    await scenario('a storage clear forgets both slots, so the next write writes every shard', async () => {
+        const {layer, loaded} = await loadTwoSlots()
+        layer.noteStorageRemovals({[META_KEY]: {oldValue: {}}, [`${BASE_KEY}.checkpoint.A`]: {oldValue: {}}})
+        assert.equal(skippedByNextWrite(layer, loaded, 7), 0)
+    })
+
+    await scenario('removing a segment does not forget the slots', async () => {
+        const {layer, loaded} = await loadTwoSlots()
+        layer.noteStorageRemovals({[`${BASE_KEY}.segment.A.0000`]: {oldValue: {}}})
+        assert.equal(skippedByNextWrite(layer, loaded, 7), 4)
+    })
+
+    await scenario('a save that did not succeed forgets both slots', async () => {
+        const {layer, loaded} = await loadTwoSlots()
+        layer.noteCheckpointSaveFailed()
+        assert.equal(skippedByNextWrite(layer, loaded, 7), 0)
+    })
+
+    await scenario('a save that succeeds remembers the slot it wrote, so that slot is reused on its next write', async () => {
+        const {layer} = makeLayer({diskSnapshots: [], mirrorCopy: null})
+        let store = makePairedCheckpointStore({}, {snapshotSeq: 0})
+        // Nothing is remembered at first, so the first two writes write every shard. Each save that succeeds is recorded.
+        const first = layer.prepareCheckpointWrite(store, reuseState, {snapshotSeq: 5, createdAt: 5, shardCount: 4})
+        assert.equal(first.writePlan.skipShardIndexes.length, 0)
+        layer.noteCheckpointSaved(first)
+        store = activateCheckpoint(first.store, first.checkpointId, {}).store
+        const second = layer.prepareCheckpointWrite(store, reuseState, {snapshotSeq: 6, createdAt: 6, shardCount: 4})
+        assert.equal(second.writePlan.skipShardIndexes.length, 0, 'the other slot was never saved, so it is written in full')
+        layer.noteCheckpointSaved(second)
+        store = activateCheckpoint(second.store, second.checkpointId, {}).store
+        // The first slot is the inactive one again, and its save was recorded: with the same state, every shard is left out.
+        assert.equal(skippedByNextWrite(layer, store, 7), 4)
+    })
 }
 
 if(failedScenarios.length) throw new Error(`${failedScenarios.length} checkpoint binding scenario(s) failed`)

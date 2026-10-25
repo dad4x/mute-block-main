@@ -105,6 +105,8 @@ module.exports = {
     // Executor classification: the apply pass reuses its last classification while the input generation is unchanged and the
     // classification is younger than this backstop, so a missed trigger costs at most this long (sw.js, 22 Oct).
     EXECUTOR_CLASSIFY_BACKSTOP_MS: 30000,
+    // The erase replies to its sender before the extension reloads, so the reload waits this long after the clear.
+    ERASE_RELOAD_DELAY_MS: 300,
     // A window's tab that is not the active row's and looks orphaned is closed only after this grace, so a tab still being
     // activated is never taken (sw.js, orphan surface tab sweep).
     ORPHAN_SURFACE_TAB_GRACE_MS: 10000,

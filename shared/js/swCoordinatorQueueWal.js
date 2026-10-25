@@ -69,11 +69,13 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         return key === COORDINATOR_QUEUE_WAL_KEY || `${key || ''}`.startsWith(`${COORDINATOR_QUEUE_WAL_KEY}.`)
     }
 
+    // The physical WAL values (segments, checkpoint manifests and shards) are write-once: a write puts new objects in place of the old
+    // ones and never edits one. So they are shared, not copied. Copying them here made every mutation pay for the whole WAL again.
     function getCoordinatorQueueWalPhysicalStoredPayload(stored = {}) {
         const payload = {}
         for(const [key, value] of Object.entries(stored || {})) {
             if(isCoordinatorQueueWalPhysicalStorageKey(key)) {
-                payload[key] = cloneCoordinatorAuthorityValue(value)
+                payload[key] = value
             }
         }
         return payload
@@ -179,7 +181,9 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
             generationsToWrite: hasSegmentedPreviousMeta
                 ? [activeGenerationId]
                 : undefined,
-            writeCheckpoints
+            writeCheckpoints,
+            // Set only by the checkpoint switch, from its own write. Every other caller writes every shard, as before.
+            writePlan: options.writePlan
         })
         return {
             payload,

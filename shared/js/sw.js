@@ -120,7 +120,6 @@ const {
     planQueueMirrorAppend,
     planQueueMirrorRebuild,
     selectQueueMirrorRecords,
-    getSegmentedWalCheckpointShardKeys,
     getSegmentedWalSegmentKey,
     projectKeyedRowFromStored,
     planKeyedRowReads,
@@ -133,8 +132,7 @@ const {
     hydrateSegmentedWalStore,
     isSegmentedWalStorageMeta,
     makePairedCheckpointStore,
-    recoverProjectedState,
-    writeInactiveCheckpoint
+    recoverProjectedState
 } = require('./swstorage')
 const {
     createCoordinatorQueueWalStore
@@ -748,6 +746,7 @@ const {
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED,
     RUNS_GAP_WATCH_INTERVAL_MS,
     EXECUTOR_CLASSIFY_BACKSTOP_MS,
+    ERASE_RELOAD_DELAY_MS,
     ORPHAN_SURFACE_TAB_GRACE_MS,
     STORED_ERROR_TEXT_MAX_CHARS
 } = require('./tunables')
@@ -2396,7 +2395,27 @@ const {
     recordPhysicalWriteMetrics
 } = storageMetrics
 
-const coordinatorStorageAdapter = createChromeLocalStorageAdapter(() => browser.storage.local)
+// Set by the erase once its clear is done (eraseBlockHistoryRequested). From then until the reload nothing may write, local or session:
+// the resident WAL and queue are still in memory, and would write themselves back over the cleared storage. Reads still work.
+let storageWritesClosedByErase = false
+
+// The refusal for a write made after the erase closed the writes, or null when the write may go ahead. A refused write is a rejected
+// promise, so every caller sees a failed write the way it sees any other, and nothing throws synchronously.
+function getStorageWriteRefusal() {
+    if(!storageWritesClosedByErase) return null
+    incrementQueueWakeupMetric('eraseBlockHistory.writeRefused')
+    const error = new Error('storage-writes-closed-by-erase')
+    error.storageWritesClosed = true
+    return Promise.reject(error)
+}
+
+const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter(() => browser.storage.local)
+const coordinatorStorageAdapter = {
+    get: defaults => rawCoordinatorStorageAdapter.get(defaults),
+    set: payload => getStorageWriteRefusal() || rawCoordinatorStorageAdapter.set(payload),
+    remove: keys => getStorageWriteRefusal() || rawCoordinatorStorageAdapter.remove(keys),
+    getBytesInUse: keys => rawCoordinatorStorageAdapter.getBytesInUse(keys)
+}
 const storageUpdateState = createSerializedStorageUpdateState()
 // storageUpdateAccessors (sw.js decomposition mop-up slice, 2026-09) constructs
 // immediately after storageUpdateState -- its only hard dependency -- so that
@@ -6465,7 +6484,7 @@ function mergeCoordinatorQueueViewTimingCache(view = null) {
     }
 
     coordinatorQueueViewTimingCache = {epochStartedAt, actualBlockTiming, alreadyBlockedTiming, activationHandoffTiming, terminalCounts}
-    void browser.storage.session?.set?.({
+    void getCoordinatorQueueMirrorSessionArea()?.set({
         [COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY]: coordinatorQueueViewTimingCache
     }).catch(() => {})
 
@@ -6553,7 +6572,7 @@ function sortCompletedWorkRowsNewestFirst(completedMap = {}, limit = 50) {
 function buildCoordinatorDashboardAuthoritySnapshotFromResident(residentCompleted) {
     const current = coordinatorAuthority.current()
     // Copies, as the storage path's fresh objects were: nothing downstream may write into a resident row.
-    const queue = cloneCoordinatorAuthorityValue(current.queue || {})
+    const queue = {...(current.queue || {})}
     recordActiveStorageWorkSnapshot(queue)
     closeRuntimeTabsReclaimedByAuthority(queue, 'queue-projection-reclaimed-runtime')
     // Read after current(), in the same synchronous step, so the queue and the completed history come from one state. The
@@ -6561,7 +6580,7 @@ function buildCoordinatorDashboardAuthoritySnapshotFromResident(residentComplete
     const completed = coordinatorAuthority.residentCompletedRowsFor(residentCompleted)
     return {
         queue,
-        runs: cloneCoordinatorAuthorityValue(current.runs || {}),
+        runs: {...(current.runs || {})},
         globalPaused: current.stored?.[COORDINATOR_PAUSED_KEY] === true,
         // Unbounded, as below: a run's stats need every one of its rows ever archived. Read-only: the rows are shared.
         completedRows: completed.rows,
@@ -6745,7 +6764,7 @@ async function clearCoordinatorTerminalStats() {
     // high-water mark on the very next broadcast, undoing this zeroing.
     coordinatorQueueViewTimingCache = null
     coordinatorQueueViewTimingCacheResetCount += 1
-    void browser.storage.session?.set?.({
+    void getCoordinatorQueueMirrorSessionArea()?.set({
         [COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY]: null
     }).catch(() => {})
     // The Clear All Stats button resets the dashboard's outlier list and its baseline too. The worker owns the list (see
@@ -7343,8 +7362,16 @@ function cacheCoordinatorQueueWalResidentStoreFromWrite(store = null, payload = 
 // Storage stays the authority. A stale or missing mirror costs one disk read and nothing else.
 let coordinatorQueueMirrorWriteChain = Promise.resolve()
 
+// The session area the mirror writes through. Once the erase has closed the writes, a set or remove is refused as the local writes are.
+// Reads go straight to the browser's area.
 function getCoordinatorQueueMirrorSessionArea() {
-    return browser.storage?.session || null
+    const area = browser.storage?.session || null
+    if(!area) return null
+    return {
+        get: defaults => area.get(defaults),
+        set: payload => getStorageWriteRefusal() || area.set(payload),
+        remove: keys => getStorageWriteRefusal() || area.remove(keys)
+    }
 }
 
 // Decision 31: profile progress (the view and the shards) is held in session storage only. These keys never go to disk.
@@ -7959,6 +7986,9 @@ function setCoordinatorWriteQueueBacklogAlertBadge(active = false) {
 
 
 function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {
+    if(storageWritesClosedByErase) {
+        return Promise.resolve({checkpointSwitched: false, saved: false, durable: false, reason: 'storage-writes-closed-by-erase'})
+    }
     const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'
     // 2026-09-14: no more "defer while busy" branch here -- see
     // COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT's comment above for why.
@@ -8720,7 +8750,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         // number assigned. This is the sequence the replay used to report.
         const maxAppliedSeq = Math.max(0, (Number.parseInt(storedWal?.meta?.nextSeq, 10) || 0) - 1)
         const checkpointedRecords = activeRecords.filter(record => (Number.parseInt(record?.seq, 10) || 0) <= maxAppliedSeq).length
-        const prepared = writeInactiveCheckpoint(storedWal, {queue: recoveredQueue, completed: recoveredCompleted}, {
+        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: recoveredCompleted}, {
             snapshotSeq: maxAppliedSeq,
             createdAt: Date.now(),
             codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC,
@@ -8762,7 +8792,8 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             checkpointWal = getCoordinatorQueueWalPhysicalPayload(activated.store, {
                 previousMeta: previousWalMeta,
                 previousStored: stored,
-                forceWriteCheckpoints: true
+                forceWriteCheckpoints: true,
+                writePlan: prepared.writePlan
             })
             recordCoordinatorQueueWalPhysicalPayloadMetrics(checkpointWal)
             preSegmentedWalMonolithCleanup = await cleanupPreSegmentedCoordinatorQueueWalMonolithBeforeCheckpoint(previousWalMeta)
@@ -8780,6 +8811,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             }))
         }
         catch(error) {
+            queueWalStore.noteCheckpointSaveFailed()
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointFailed')
             recordCoordinatorDiagnosticEvent(
                 'coordinator-authority-queue-wal-checkpoint-save-failed',
@@ -8804,6 +8836,9 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
                 error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
             }
         }
+        // A save that reported success leaves the prepared slot in storage as the plan named it. Anything else forgets the slots.
+        if(walSaved === true) queueWalStore.noteCheckpointSaved(prepared)
+        else queueWalStore.noteCheckpointSaveFailed()
         if(walSaved === false) {
             incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointSuppressed')
             recordFlightRecorderEvent({
@@ -9565,18 +9600,16 @@ function normalizeCoordinatorAuthorityStateInput(value = null) {
     if(!value || typeof value !== 'object') return null
 
     const stored = value.stored && typeof value.stored === 'object' ? value.stored : {}
-    const queue = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(
-        value.queue || {}
-    ))
-    const runs = normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(
-        value.runs || stored[COORDINATOR_RUNS_KEY] || {}
-    ))
+    // Top-level copies only: the rows are shared with the resident projection, and nothing edits a row in place (the contract
+    // on current()). The WAL store is still copied, because appends write into its segment list.
+    const queue = normalizeCoordinatorMap({...(value.queue || {})})
+    const runs = normalizeCoordinatorMap({...(value.runs || stored[COORDINATOR_RUNS_KEY] || {})})
 
     return {
         stored: {
             ...getCoordinatorQueueWalPhysicalStoredPayload(stored),
             [COORDINATOR_QUEUE_WAL_KEY]: cloneCoordinatorAuthorityValue(stored[COORDINATOR_QUEUE_WAL_KEY] || null),
-            [COORDINATOR_RUNS_KEY]: cloneCoordinatorAuthorityValue(runs)
+            [COORDINATOR_RUNS_KEY]: runs
         },
         queue,
         runs
@@ -11125,9 +11158,9 @@ function getResidentCoordinatorCopies() {
     const current = coordinatorAuthority.current()
     return {
         stored: coordinatorAuthority.residentStored(),
-        queue: cloneCoordinatorAuthorityValue(current.queue || {}),
-        runs: cloneCoordinatorAuthorityValue(current.runs || {}),
-        events: cloneCoordinatorAuthorityValue(current.events || [])
+        queue: {...(current.queue || {})},
+        runs: {...(current.runs || {})},
+        events: [...(current.events || [])]
     }
 }
 
@@ -22365,6 +22398,7 @@ const ERASE_BLOCK_HISTORY_KEEP_KEYS = new Set()
 
 async function eraseBlockHistoryRequested(request = {}) {
     if(request?.confirmation !== ERASE_BLOCK_HISTORY_CONFIRMATION) return {erased: false, reason: 'confirmation-mismatch'}
+    if(storageWritesClosedByErase) return {erased: false, reason: 'erase-already-scheduled'}
     if(!getHydratedCoordinatorAuthorityState('eraseBlockHistory.usedResidentAuthority')) return {erased: false, reason: 'authority-not-loaded'}
     // Owner, 24 Oct: the erase forces the pause itself. The pause stops new opens and requeues any row that was active, so the
     // in-flight check below reads the queue after the pause.
@@ -22378,13 +22412,22 @@ async function eraseBlockHistoryRequested(request = {}) {
     return enqueueSpaceFeedStorageUpdate(async () => {
         // The marker goes first, so an erase cut short by the reload is finished at the next start (eraseBlockHistoryPending, below).
         await coordinatorStorageAdapter.set({[ERASE_BLOCK_HISTORY_PENDING_KEY]: true})
+        // The switch due flag and the remembered checkpoint slots describe the storage that is about to go, so both are dropped first.
+        coordinatorQueueWalCheckpointSwitchDueReason = ''
+        queueWalStore.forgetCheckpointSlots()
         // Everything is cleared here, then the extension reloads, so the new worker starts with no stored history for its modules to load
         // and write back. Clearing at startup instead left the progress records in session storage: the modules had read them first.
         const stored = await coordinatorStorageAdapter.get(null)
         const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY)
         if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
         await browser.storage.session?.clear?.()
-        setTimeout(() => { browser.runtime.reload?.() }, 300)
+        // The writes close here. The queue runs the next update straight away, and that update would write the resident WAL and queue back
+        // over the cleared storage unless it is refused. The reload ends the worker, and with it that memory.
+        storageWritesClosedByErase = true
+        setTimeout(() => {
+            if(typeof browser.runtime.reload === 'function') browser.runtime.reload()
+            else console.warn('erase: browser.runtime.reload is not a function, so the worker keeps running after the erase')
+        }, ERASE_RELOAD_DELAY_MS)
         return {scheduled: true, removedCount: removeKeys.length}
     })
 }
@@ -36799,6 +36842,8 @@ registerServiceWorkerListeners({
         getProfileNukeProgress: () => profileNukeProgress
     },
     handlers: {
+        // A storage clear, or a removal of the WAL meta or a checkpoint key, forgets the remembered checkpoint slots (swQueueWalStore.js).
+        noteStorageRemovals: (...args) => queueWalStore.noteStorageRemovals(...args),
         activateConfirmationElementInPageWorld,
         applyCoordinatorQueueMachineEvent,
         beginCoordinatorProfileAction,

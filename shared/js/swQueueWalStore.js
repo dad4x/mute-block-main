@@ -23,7 +23,11 @@ const {
     normalizeCheckpointId,
     normalizeCheckpointShardCount,
     hydrateSegmentedWalStore,
-    verifyCheckpoint
+    verifyCheckpoint,
+    writeInactiveCheckpoint,
+    CHECKPOINT_SHARD_FORMAT,
+    getSegmentedWalCheckpointShardKey,
+    getSegmentedWalMetaKey
 } = require('./walSnapshotStore')
 
 // The diagnostic and flight recorder kinds of the checkpoint binding (loadStoreFromStorage below), named once.
@@ -96,6 +100,72 @@ function createQueueWalStore(deps = {}) {
 
     // The resident copy. Only this module writes it; sw.js reads it through resident.get().
     let residentStore = null
+
+    // The checkpoint slots as storage holds them, as this process knows it (checkpoint reuse, step 2). For each slot: the shard identities
+    // (index and content hash) of its manifest, when the manifest matches the meta and every shard record was in the same read; null when
+    // that is not known. It is recorded from storage at each load, and from each save that succeeds. The worker trusts this record,
+    // because nothing else writes these keys. A removal of the meta or a checkpoint key forgets both slots, as a storage clear does, and so
+    // does a save that did not succeed.
+    let rememberedSlots = {[CHECKPOINT_A]: null, [CHECKPOINT_B]: null}
+
+    function getShardIdentities(checkpoint = null) {
+        return (checkpoint?.shards || []).map(shard => ({index: shard.index, shardStateHash: shard.shardStateHash}))
+    }
+
+    function rememberCheckpointSlotsFromRead(stored = {}, meta = null) {
+        for(const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+            rememberedSlots[checkpointId] = null
+            const manifest = stored?.[getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, checkpointId)] || null
+            const metaCheckpoint = meta?.checkpoints?.[checkpointId] || null
+            if(!manifest || manifest.format !== CHECKPOINT_SHARD_FORMAT || !metaCheckpoint) continue
+            if(!checkpointManifestMatchesMeta(manifest, metaCheckpoint, checkpointId)) continue
+            const shards = Array.isArray(manifest.shards) ? manifest.shards : []
+            if(shards.length !== normalizeCheckpointShardCount(manifest.shardCount)) continue
+            const everyShardPresent = shards.every(shard =>
+                stored?.[getSegmentedWalCheckpointShardKey(COORDINATOR_QUEUE_WAL_KEY, checkpointId, shard.index)])
+            if(!everyShardPresent) continue
+            rememberedSlots[checkpointId] = getShardIdentities(manifest)
+        }
+    }
+
+    function forgetCheckpointSlots() {
+        rememberedSlots = {[CHECKPOINT_A]: null, [CHECKPOINT_B]: null}
+    }
+
+    // Removing the meta or a checkpoint key (the manifest or a shard) forgets both slots, and a storage clear removes them. Segments are not
+    // checked: the switch removes its own retired segments, and that does not change a slot.
+    function noteStorageRemovals(changes = {}) {
+        const metaKey = getSegmentedWalMetaKey(COORDINATOR_QUEUE_WAL_KEY)
+        const checkpointPrefix = `${COORDINATOR_QUEUE_WAL_KEY}.checkpoint.`
+        for(const [key, change] of Object.entries(changes || {})) {
+            if(change?.newValue !== undefined) continue
+            if(key !== metaKey && !key.startsWith(checkpointPrefix)) continue
+            forgetCheckpointSlots()
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointSlotsForgotten')
+            return
+        }
+    }
+
+    // The checkpoint switch's write into the inactive slot. Shards the slot already holds are left out of the plan, and the caller
+    // passes the plan on unread.
+    function prepareCheckpointWrite(storedWal = {}, state = {}, options = {}) {
+        return writeInactiveCheckpoint(storedWal, state, {...options, rememberedSlots: {...rememberedSlots}})
+    }
+
+    // A save that reported success: storage now holds the prepared slot, with the shards its checkpoint lists.
+    function noteCheckpointSaved(prepared = null) {
+        const slot = prepared?.checkpointId
+        if(!slot) return
+        rememberedSlots = {
+            ...rememberedSlots,
+            [slot]: prepared.checkpoint?.format === CHECKPOINT_SHARD_FORMAT ? getShardIdentities(prepared.checkpoint) : null
+        }
+    }
+
+    // A save that did not succeed leaves storage unknown, so both slots are forgotten.
+    function noteCheckpointSaveFailed() {
+        forgetCheckpointSlots()
+    }
 
     // Populates coordinatorQueueWalResidentStoreCache (see its declaration
     // above) from a store this process just read or wrote. `store` is whatever
@@ -348,6 +418,8 @@ function createQueueWalStore(deps = {}) {
                         Object.assign(stored, fallbackRead)
                     }
                 }
+                // What this read found in storage, recorded for the checkpoint switch (see rememberedSlots above).
+                if(freshMeta) rememberCheckpointSlotsFromRead(stored, freshMeta)
                 meta = freshMeta || staleMeta
 
                 hydrated = runQueueWakeupMetricPhase('queueWalHydrate', () => hydrateSegmentedWalStore(stored, {
@@ -494,7 +566,12 @@ function createQueueWalStore(deps = {}) {
     return {
         resident,
         cacheFromWrite,
-        loadStoreFromStorage
+        loadStoreFromStorage,
+        prepareCheckpointWrite,
+        noteCheckpointSaved,
+        noteCheckpointSaveFailed,
+        noteStorageRemovals,
+        forgetCheckpointSlots
     }
 }
 

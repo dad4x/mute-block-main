@@ -273,7 +273,8 @@ function registerServiceWorkerListeners(deps = {}) {
         ensureCoordinatorAuthorityHydrated,
         readProfileNukeProgressForTools,
         clearProfileNukeProgressForTools,
-        retireUnusedVersion15StorageKeys
+        retireUnusedVersion15StorageKeys,
+        noteStorageRemovals
     } = deps.handlers || {}
 
     function handleRuntimeInstalled(details) {
@@ -620,9 +621,12 @@ function registerServiceWorkerListeners(deps = {}) {
         // Progress lives in session storage (decision 31), and nothing writes its view to disk now, so no progress key is read here.
         // A change to the old disk key is not handled (20 Oct review, decision 2).
     }
-    browser.storage.onChanged.addListener((changes, areaName) => areaName === 'local'
-        ? runAfterCoordinatorAuthorityReady(() => handleStorageChanged(changes, areaName))
-        : undefined)
+    browser.storage.onChanged.addListener((changes, areaName) => {
+        if(areaName !== 'local') return undefined
+        // Synchronous, before the readiness gate: a clear is seen at once, so a switch that starts after it cannot reuse a slot that is gone.
+        noteStorageRemovals(changes)
+        return runAfterCoordinatorAuthorityReady(() => handleStorageChanged(changes, areaName))
+    })
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = normalizeRuntimeMessageAction(request)
         request = {...(request || {}), action}

@@ -220,6 +220,8 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
             onInstalled: makeEvent(),
             onStartup: makeEvent(),
             onSuspend: makeEvent(),
+            // The erase reloads the extension. The harness does not restart; a test that wants to see the reload replaces this.
+            reload() {},
             onMessage: runtimeOnMessage,
             getURL(relativePath = '') {
                 return `moz-extension://mute-block/${relativePath}`
@@ -529,13 +531,13 @@ function loadServiceWorkerHarness(options = {}) {
         )
     }
     if(options.disableQueueWalCheckpointSwitch === true) {
-        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
+        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n"
         if(!source.includes(needle)) {
             throw new Error('disableQueueWalCheckpointSwitch patch target not found in sw.js -- signature drifted, update swHarness.js')
         }
         source = source.replace(
             needle,
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n"
         )
     }
     if(options.fastExecutorResumeTimeoutMs) {
@@ -592,6 +594,7 @@ module.exports.__test = {
     getResidentCoordinatorQueueWalPhysicalStoredSupplement,
     buildCoordinatorContentQueueIndex,
     coordinatorRawQueueNormalizationChangedRows,
+    coordinatorStorageAdapter,
     normalizeRawCoordinatorQueueForReconcileFallback,
     getOwnedNukeStatus,
     buildQueueWakeupMetricsView,

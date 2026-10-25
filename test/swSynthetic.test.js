@@ -44472,6 +44472,27 @@ test('erase everything forces a pause first when the queue is running, then eras
     assert.equal(restarted.storage.mbProfileNukeProgressView, undefined)
     assert.equal(restarted.storage.mbEraseBlockHistoryPending, undefined, 'the marker is cleared last')
 })
+
+test('erase everything closes the writes, refuses a second erase, and reloads the extension', async () => {
+    const harness = loadServiceWorkerHarness({now: 600000, storage: {
+        mbCoordinatorRuns: {'run-1': {id: 'run-1'}}
+    }})
+    await harness.sw.coordinatorAuthority.hydrate()
+    let reloads = 0
+    harness.browser.runtime.reload = () => { reloads += 1 }
+    const scheduled = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    // Between the clear and the reload, a write made by the resident store is refused, and nothing lands.
+    await assert.rejects(
+        () => harness.sw.coordinatorStorageAdapter.set({mbCoordinatorRuns: {'run-2': {id: 'run-2'}}}),
+        error => error?.storageWritesClosed === true
+    )
+    assert.equal(harness.storage.mbCoordinatorRuns, undefined, 'the refused write did not land')
+    const again = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(again.reason, 'erase-already-scheduled')
+    await harness.timers.tick(400)
+    assert.equal(reloads, 1, 'the extension reloads once, after the reply')
+})
 ;
 (async () => {
     let failed = 0

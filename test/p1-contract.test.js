@@ -2181,11 +2181,13 @@ test('service worker local storage goes through production adapter seam', () => 
     const metricSetBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
     const suppressBody = extractFunction(storageSource, 'function suppressAbandonedStorageOperation(operation = \'storage\')')
     const nonAdapterSource = source.replace(
-        /const coordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/,
+        /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/,
         ''
     )
 
-    assert.match(source, /const coordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/)
+    // The one raw adapter is wrapped by the guard the erase closes, and every local write goes through the wrapper.
+    assert.match(source, /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/)
+    assert.match(source, /const coordinatorStorageAdapter = \{\n    get: defaults => rawCoordinatorStorageAdapter\.get\(defaults\),\n    set: payload => getStorageWriteRefusal\(\) \|\| rawCoordinatorStorageAdapter\.set\(payload\)/)
     assert.match(adapterBody, /getStorageArea\(\)\.get\(defaults\)/)
     assert.match(adapterBody, /getStorageArea\(\)\.set\(payload\)/)
     assert.match(adapterBody, /getStorageArea\(\)\.remove\(keys\)/)
