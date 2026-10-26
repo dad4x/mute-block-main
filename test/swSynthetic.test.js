@@ -44762,6 +44762,49 @@ test('the recorder events of a recorded outlier survive a worker restart with it
     assert.equal(plainCopy(after.outliers).find(entry => entry.rowKey === sigmaHref)?.eventCount, 1, 'the restarted worker lists the outlier with its event count')
 })
 
+// Runs across a checkpoint switch (review item: runs are log records and the checkpoint state is {queue, completed} only). A run
+// written before the switch must survive the switch and a restart even when no later write touches it.
+test('runs-switch case 1: a run written before a checkpoint switch, with no later write to it, is still there after a restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Runs-Switch-Before'
+    const runId = 'run-runs-switch-before'
+    const {sw, browser} = await startNamespaceMirrorHarness(href, runId)
+    const saved = await writeRunsThroughDoor(sw, {[runId]: makeCoordinatorRun({href, runId})})
+    assert.equal(saved.saved, true, saved.reason)
+
+    const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpointSwitch.checkpointSwitched, true, checkpointSwitch.reason)
+
+    const restarted = loadServiceWorkerHarness({now: 600010, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.ok(
+        restarted.sw.coordinatorAuthority.current().runs[runId],
+        'the run written before the switch is in the runs after a restart'
+    )
+    assert.deepEqual(
+        restarted.sw.coordinatorAuthority.current().runs[runId]?.targetProfileHrefs,
+        [href],
+        'the restored run keeps its targets'
+    )
+})
+
+test('runs-switch case 2: a run written after a checkpoint switch is there after a restart', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Runs-Switch-After'
+    const runId = 'run-runs-switch-after'
+    const {sw, browser} = await startNamespaceMirrorHarness(href, runId)
+    const switched = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(switched.checkpointSwitched, true, switched.reason)
+
+    const saved = await writeRunsThroughDoor(sw, {[runId]: makeCoordinatorRun({href, runId})})
+    assert.equal(saved.saved, true, saved.reason)
+
+    const restarted = loadServiceWorkerHarness({now: 600010, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.ok(
+        restarted.sw.coordinatorAuthority.current().runs[runId],
+        'the run written after the switch is in the runs after a restart'
+    )
+})
+
 ;
 (async () => {
     let failed = 0

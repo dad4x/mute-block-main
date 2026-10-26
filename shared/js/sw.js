@@ -8747,11 +8747,17 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
 // queue rows. A reload gives exactly this, since it starts from the same persisted fields and the same queue. Only runs with a persisted
 // record are worked out: a queue row whose run was pruned does not bring the run back (the completed-row filter reads the run set).
 function runsWithDerivedFields(queue = {}, runs = {}) {
+    return recomputeCoordinatorRuns(queue || {}, persistedRunsForCheckpoint(runs))
+}
+
+// The runs map as the checkpoint stores it: each run's persisted fields only (swRunsWal.js), the fields its log records carry. The
+// counts and status are not stored, so a checkpoint and a log replay give the same runs.
+function persistedRunsForCheckpoint(runs = {}) {
     const persisted = {}
     for (const [runId, run] of Object.entries(runs || {})) {
         persisted[runId] = persistedRunFields({...run, id: run?.id || runId})
     }
-    return recomputeCoordinatorRuns(queue || {}, persisted)
+    return persisted
 }
 
 // The runs map after one write's run records, applied in order with the log engine's reducer (24 Oct). Returns a new map.
@@ -8800,6 +8806,9 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         }
         const recoveredQueue = normalizeCoordinatorMap(residentState.queue || {})
         const recoveredCompleted = normalizeCoordinatorMap(coordinatorAuthority.residentCompleted() || {})
+        // Runs are log records (24 Oct), and the old segments retire with the switch. The checkpoint must carry the runs too, or a
+        // restart loses every run written before the switch. Only the persisted fields go in, the same fields the run records carry.
+        const recoveredRuns = persistedRunsForCheckpoint(residentState.runs)
         const activeGenerationId = storedWal?.meta?.activeCheckpoint
         const activeRecords = getWalRecordsForGeneration(storedWal, activeGenerationId)
         // Every record the store holds is applied to the resident state, so the checkpoint covers up to the last sequence
@@ -8814,7 +8823,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             maxRows: recentHistoryMaxEntries
         })
         const completedForCheckpoint = completedPrune.drop.size ? withoutShards(recoveredCompleted, completedPrune.drop) : recoveredCompleted
-        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint}, {
+        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint, runs: recoveredRuns}, {
             snapshotSeq: maxAppliedSeq,
             createdAt: Date.now(),
             codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC,
