@@ -18,12 +18,9 @@ module.exports = {
 
     // Queue wakeup metrics journal. The in-memory journal is what the
     // recorder-style analysis reads while the worker is alive. The copy in the
-    // main metrics blob stays small (the blob is rewritten on every flush), and
-    // the larger stored copy goes under its own key on a slower cadence.
+    // main metrics blob stays small (the blob is rewritten on every flush).
     MAX_QUEUE_WAKEUP_METRIC_JOURNAL: 1200,
     MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL: 30,
-    MAX_QUEUE_WAKEUP_JOURNAL_STORED: 600,
-    QUEUE_WAKEUP_JOURNAL_PERSIST_MIN_MS: 60000,
 
     // Queue wakeup metrics blob: at most one flush per interval (the blob is
     // about 160 KB and was being written on every metric change).

@@ -440,7 +440,6 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'remove-pending-space-feed-entries',
         'remove-pending-space-feed-urls',
         'request-action-lease',
-        'requeue-coordinator-failed',
         'reset-queue-wakeup-metrics',
         'resolve-queued-profile-target',
         'resolve-queued-profile-target-failed',
@@ -462,7 +461,8 @@ test('runtime action contract enumerates current accepted actions and rejects ol
     const forbiddenActions = [
         'record-nuke-progress',
         'record-nuke-progress-batch',
-        'repair-coordinator-storage'
+        'repair-coordinator-storage',
+        'requeue-coordinator-failed'
     ]
 
     assert.deepEqual(runtimeActions, expectedActions)
@@ -1992,8 +1992,7 @@ test('live CDP queue helpers resolve auto extension ids before picking extension
         'tools/cdp/probe-extension-storage.js',
         'tools/cdp/queue-failures.js',
         'tools/cdp/inspect-queue-item.js',
-        'tools/cdp/queue-summary.js',
-        'tools/cdp/requeue-failures.js'
+        'tools/cdp/queue-summary.js'
     ]
 
     for(const helperPath of helpers) {
@@ -2003,16 +2002,6 @@ test('live CDP queue helpers resolve auto extension ids before picking extension
         assert.doesNotMatch(source, /const config = getCdpConfig\(\)/)
         assert.doesNotMatch(source, /chrome-extension:\/\/auto\//)
     }
-})
-
-test('requeue failures helper ignores compact-only failures and selects recovered authority', () => {
-    const source = readRepoFile('tools/cdp/requeue-failures.js')
-    assert.match(source, /mbCoordinatorQueueView/)
-    assert.match(source, /recoverProjectedState/)
-    assert.match(source, /compactIgnored/)
-    assert.match(source, /source: 'wal-recovered-authority'/)
-    assert.doesNotMatch(source, /compactFallbackItems/)
-    assert.doesNotMatch(source, /'compact-view'/)
 })
 
 test('profile-search content uses scoped runtime state instead of full storage change stream', () => {
@@ -2323,7 +2312,6 @@ test('progress repair is explicit, not a hot runtime path', () => {
     const storageReconcileBody = extractFunction(source, 'async function reconcileCoordinatorStorage(options = {})')
     const storageReconcileBestEffortBody = extractFunction(source, 'async function reconcileCoordinatorStorageBestEffort(options = {})')
     const retryBody = extractFunction(source, 'async function retryCoordinatorFailedItems(request = {}, sender = {})')
-    const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const scheduledTickBody = extractFunction(source, 'async function runScheduledCoordinatorReconcileTick(reason = \'coordinator-reconcile-tick\')')
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const retryCandidatesSource = readRepoFile('shared/js/swCoordinatorRetryCandidates.js')
@@ -2364,7 +2352,6 @@ test('progress repair is explicit, not a hot runtime path', () => {
     assert.match(retryCandidatesSource, /resume: \{skipped: true, reason: 'resume-owned-by-reconcile'\}/)
     assert.doesNotMatch(recoveryBody, /resumeCoordinatorQueueExecution\(/)
     assert.match(source, /runCoordinatorReconcileTick\(reason, \{[\s\S]*allowBeforeQuora: true/)
-    assert.match(requeueBody, /runCoordinatorReconcileTick\('requeue-failed-reconcile', \{[\s\S]*awaitFill: false/)
     assert.match(bootstrap, /request\.action === 'reconcile-coordinator-storage'/)
     assert.doesNotMatch(bootstrap, /request\.action === 'repair-coordinator-storage'/)
     assert.match(bootstrap, /request\.action === 'reconcile-coordinator-storage'[\s\S]*display-only-reconcile-disabled/)
@@ -2375,9 +2362,7 @@ test('progress repair is explicit, not a hot runtime path', () => {
     assert.doesNotMatch(source, /repairScheduled/)
     assert.doesNotMatch(source, /repair: reconcile/)
     assert.match(retryBody, /scheduleCoordinatorReconcile\(1000, \{reason: 'retry-failed-request'\}\)/)
-    assert.match(requeueBody, /scheduleCoordinatorReconcile\(1000, \{reason: 'requeue-failed-request'\}\)/)
     assert.doesNotMatch(retryBody, /reconcileCoordinatorStorageBestEffort/)
-    assert.doesNotMatch(requeueBody, /reconcileCoordinatorStorageBestEffort/)
 })
 
 test('request action names do not add new repair entrypoints', () => {
@@ -3017,15 +3002,13 @@ test('unresolved resolver rows clear resolver-pending source records', () => {
     assert.match(transitionBody, /settleTerminalResolverPendingSourceRecordsLocked\(state, itemKey, item\)/)
 })
 
-test('failed resolver requeue preserves source-post resolution mode', () => {
+test('failed resolver retry preserves source-post resolution mode', () => {
     const source = readRepoFile('shared/js/sw.js')
     const retryCandidatesSource = readRepoFile('shared/js/swCoordinatorRetryCandidates.js')
     const candidateBody = extractFunction(retryCandidatesSource, 'function getCoordinatorRetryableFailureCandidates(queue = {}, progress = {}, retryLimit = 2)')
     const resetBody = extractFunction(retryCandidatesSource, 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
     const retryBody = extractFunction(source, 'async function retryCoordinatorFailedItems(request = {}, sender = {})')
-    const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const retryMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRetry(operation = {})')
-    const requeueMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRequeue(operation = {})')
 
     // getFailedItemProfileResolutionRetryUrl moved to
     // swCoordinatorJobEnvelope.js in decomposition Slice 11.
@@ -3038,61 +3021,32 @@ test('failed resolver requeue preserves source-post resolution mode', () => {
     assert.match(resetBody, /resolutionMode: retryViaResolution \? QUEUED_PROFILE_RESOLUTION_MODE : ''/)
     assert.match(resetBody, /resolveProfileFromPage: retryViaResolution/)
     assert.match(retryBody, /type: 'RETRY_FAILED_ITEMS'/)
-    assert.match(requeueBody, /type: 'REQUEUE_FAILED_ITEMS'/)
     assert.match(retryMutationBody, /buildFailedCoordinatorResetItem\(candidate\.itemKey, item/)
-    assert.match(requeueMutationBody, /getFailedItemProfileResolutionRetryUrl\(item, itemKey\)/)
-    assert.match(requeueMutationBody, /buildFailedCoordinatorResetItem\(itemKey, item/)
 })
 
-test('manual failed requeue requests reconcile after durable storage', () => {
+test('manual failed retry requests reconcile after durable storage', () => {
     const source = readRepoFile('shared/js/sw.js')
     const resetBody = extractFunction(readRepoFile('shared/js/swCoordinatorRetryCandidates.js'), 'function buildFailedCoordinatorResetItem(itemKey = \'\', item = {}, options = {})')
     const retryBody = extractFunction(source, 'async function retryCoordinatorFailedItems(request = {}, sender = {})')
-    const requeueBody = extractFunction(source, 'async function requeueCoordinatorFailedItems(request = {}, sender = {})')
     const retryMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRetry(operation = {})')
-    const requeueMutationBody = extractFunction(source, 'async function mutateCoordinatorFailedItemsRequeue(operation = {})')
 
-    const saveIndex = requeueMutationBody.indexOf('await saveCoordinatorState')
-    const reconcileIndex = requeueBody.indexOf("const result = await runCoordinatorReconcileTick('requeue-failed-reconcile'")
-    assert.notEqual(saveIndex, -1)
-    assert.notEqual(reconcileIndex, -1)
     assert.match(retryBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'RETRY_FAILED_ITEMS'/)
-    assert.match(requeueBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'REQUEUE_FAILED_ITEMS'/)
     assert.match(retryMutationBody, /coordinatorQueueReader\.runsEventsProgress\(\{[\s\S]*metricPath: 'failedRetry\.load'/)
     assert.doesNotMatch(retryMutationBody, /loadCoordinatorState\(/)
-    assert.match(requeueMutationBody, /coordinatorQueueReader\.runsEventsProgress\(\{[\s\S]*metricPath: 'failedRequeue\.load'/)
-    assert.doesNotMatch(requeueMutationBody, /loadCoordinatorState\(/)
     assert.match(retryMutationBody, /coordinatorAuthority\.persistCoordinator\(/)
     assert.match(retryMutationBody, /operationKind: 'retry'/)
     assert.match(retryMutationBody, /removedRows/)
     assert.match(retryMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
     assert.match(retryMutationBody, /queueOperation: 'retry-derived'/)
-    assert.match(requeueMutationBody, /coordinatorAuthority\.persistCoordinator\(/)
-    assert.match(requeueMutationBody, /operationKind: 'requeue'/)
-    assert.match(requeueMutationBody, /removedRows/)
-    assert.match(requeueMutationBody, /saveProfileNukeProgressRowProjection\(\s*\n\s*Object\.fromEntries\(Array\.from\(progressProjectionRemovalHrefs/)
-    assert.match(requeueMutationBody, /queueOperation: 'requeue-derived'/)
     assert.doesNotMatch(retryMutationBody, /queue: true/)
-    assert.doesNotMatch(requeueMutationBody, /queue: true/)
     assert.doesNotMatch(retryMutationBody, /progress: progressChanged/)
-    assert.doesNotMatch(requeueMutationBody, /progress: progressChanged/)
     assert.match(retryBody, /enqueueSpaceFeedStorageUpdate\(\(\) =>/)
     assert.match(retryBody, /timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS/)
     assert.match(retryBody, /failureValue:[\s\S]*retry-save-failed/)
-    assert.match(requeueBody, /enqueueSpaceFeedStorageUpdate\(\(\) =>/)
-    assert.match(requeueBody, /timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS/)
-    assert.match(requeueBody, /failureValue:[\s\S]*requeue-save-failed/)
     assert.match(resetBody, /serviceWorkerOwned: true/)
-    assert.match(requeueBody, /executionQueued: result\?\.resume\?\.queued \|\| result\?\.queued \|\| 0/)
     assert.match(retryBody, /runCoordinatorReconcileExecutorActions\('retry-failed-executor-busy'[\s\S]*awaitFill: true/)
-    assert.match(requeueBody, /runCoordinatorReconcileExecutorActions\('requeue-failed-executor-busy'[\s\S]*awaitFill: true/)
     assert.doesNotMatch(retryBody, /await fillQueuedTabs\(\)/)
-    assert.doesNotMatch(requeueBody, /await fillQueuedTabs\(\)/)
-    assert.doesNotMatch(requeueBody, /enqueueExistingExecutorForCoordinator\(selectedItems/)
-    assert.doesNotMatch(requeueBody, /kickCoordinatorQueueResume\('requeue-failed'\)/)
     assert.match(resetBody, /\.\.\.\(executorMaxConcurrent \? \{executorMaxConcurrent\} : \{\}\)/)
-    assert.match(requeueBody, /requeue-started/)
-    assert.match(requeueBody, /requeue-scheduled/)
 })
 
 test('invalid resolver reconcile rows are non-retryable and source-settled', () => {

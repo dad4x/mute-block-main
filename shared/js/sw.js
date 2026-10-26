@@ -47,7 +47,6 @@ const {
     COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
     COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX,
     QUEUE_WAKEUP_METRICS_KEY,
-    QUEUE_WAKEUP_JOURNAL_KEY,
     BROWSER_SESSION_MARKER_KEY,
     QUORA_RUNTIME_ACTIVATED_SESSION_KEY,
     FLIGHT_RECORDER_SESSION_KEY,
@@ -764,8 +763,6 @@ const MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS = 1200
 const {
     MAX_QUEUE_WAKEUP_METRIC_JOURNAL,
     MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL,
-    MAX_QUEUE_WAKEUP_JOURNAL_STORED,
-    QUEUE_WAKEUP_JOURNAL_PERSIST_MIN_MS,
     QUEUE_WAKEUP_METRICS_FLUSH_MIN_MS,
     QUEUE_WAKEUP_METRICS_STORAGE_TIMEOUT_MS,
     FLIGHT_RECORDER_SESSION_SNAPSHOT_LIMIT,
@@ -962,7 +959,6 @@ const COORDINATOR_QUEUE_WAL_MIGRATED_OPERATIONS = new Set([
     'stored-work-cancel',
     'stored-work-pause',
     'retry',
-    'requeue',
     'resolver-remap',
     'enqueue',
     'clear-profile',
@@ -5887,7 +5883,6 @@ const {
 // contended with the queue's own storage traffic. At most one flush per interval now. A change inside the
 // interval leaves the metrics dirty, and the next change after it flushes them.
 let queueWakeupMetricsLastFlushAt = 0
-let queueWakeupJournalLastFlushAt = 0
 
 function scheduleQueueWakeupMetricsFlush() {
     queueWakeupMetricsDirty = true
@@ -5938,23 +5933,10 @@ async function flushQueueWakeupMetrics(options = {}) {
             QUEUE_WAKEUP_METRICS_STORAGE_TIMEOUT_MS,
             'queue wakeup metrics flush'
         )
-        await maybePersistQueueWakeupJournal(options)
     }
     catch {
         queueWakeupMetricsDirty = true
     }
-}
-
-// The stored journal is larger than the one in the metrics blob, so it has its own key and its
-// own cadence (QUEUE_WAKEUP_JOURNAL_PERSIST_MIN_MS). A forced flush, such as the suspend flush, writes it regardless.
-async function maybePersistQueueWakeupJournal(options = {}) {
-    const now = Date.now()
-    if(options.force !== true && now - queueWakeupJournalLastFlushAt < QUEUE_WAKEUP_JOURNAL_PERSIST_MIN_MS) return
-    queueWakeupJournalLastFlushAt = now
-    const entries = (queueWakeupMetrics?.currentEpoch?.journal || []).slice(-MAX_QUEUE_WAKEUP_JOURNAL_STORED)
-    await coordinatorStorageAdapter.set({
-        [QUEUE_WAKEUP_JOURNAL_KEY]: {writtenAt: now, entries}
-    }).catch(() => null)
 }
 
 async function loadQueueWakeupMetrics() {
@@ -8542,8 +8524,7 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         }))
         .filter(Boolean)
     // A row being pulled back out of the completed-work area (e.g. a
-    // requeue reviving an archived failed/canceled row into the live queue)
-    // needs its own area:'completed' removal record -- makeCoordinatorAuthorityQueueWalRemoveRecord
+    // clear removing an archived row) needs its own area:'completed' removal record -- makeCoordinatorAuthorityQueueWalRemoveRecord
     // hardcodes area:'queue', so build off it and override the area rather
     // than duplicating its field-by-field construction.
     const removedCompletedRecords = (Array.isArray(options.removedCompletedRows) ? options.removedCompletedRows : [])
@@ -16161,7 +16142,6 @@ const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher
             mutateCoordinatorActionLeaseRelease,
             mutateCoordinatorActionLeaseRequest,
             mutateCoordinatorActionLeasesForTabRelease,
-            mutateCoordinatorFailedItemsRequeue,
             mutateCoordinatorFailedItemsRetry,
             mutateCoordinatorKeyOnlyItemTerminate: mutateCoordinatorKeyOnlyItemTerminalize,
             mutateCoordinatorPauseStateSet,
@@ -24917,355 +24897,6 @@ async function retryCoordinatorFailedItems(request = {}, sender = {}) {
         remainingRetryable: persisted.remainingRetryable || 0,
         runId: persisted.runId,
         reason: (result?.resume?.queued || result?.queued || 0) > 0 ? 'retry-started' : 'retry-selected-but-not-opened'
-    }
-}
-
-async function mutateCoordinatorFailedItemsRequeue(operation = {}) {
-    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
-    if(snapshotReason !== 'ordinaryMutation') {
-        return {queued: 0, executionQueued: 0, selected: 0, reason: 'invalid-requeue-reason'}
-    }
-
-    const request = operation.request && typeof operation.request === 'object' ? operation.request : {}
-    const requestedHrefs = new Set(getNormalizedProfileHrefList([
-        request.profileHref || '',
-        ...(Array.isArray(request.profileHrefs) ? request.profileHrefs : [])
-    ]))
-    const requestedKeys = new Set([
-        `${request.storageKey || request.coordinatorKey || ''}`.trim(),
-        ...(Array.isArray(request.storageKeys) ? request.storageKeys : []),
-        ...(Array.isArray(request.coordinatorKeys) ? request.coordinatorKeys : [])
-    ].map(value => `${value || ''}`.trim()).filter(Boolean))
-    const hasRequestedTargets = requestedHrefs.size > 0 || requestedKeys.size > 0
-
-    const state = await coordinatorQueueReader.runsEventsProgress({
-        metricPath: 'failedRequeue.load'
-    })
-    const currentAuthorityState = normalizeCoordinatorAuthorityStateInput(state)
-    const queue = currentAuthorityState.queue
-    const runs = normalizeCoordinatorMap(currentAuthorityState.runs || state.runs)
-    const now = Date.now()
-    const runId = makeId('requeue-failed')
-    const selectedItems = []
-    const nextQueue = {...queue}
-    const authorityResults = []
-    const removedRows = []
-    const removedCompletedRows = []
-    const progressProjectionRemovalHrefs = new Set()
-    let nextQueueSequence = getNextCoordinatorQueueSequence(queue)
-
-    // 'canceled' (bulk "Cancel Queue") and 'failed' (soft- and hard-fail
-    // alike -- this has never distinguished the two) are both requeueable.
-    // 'succeeded'/'skipped' are not.
-    const requeueableStatuses = new Set(['failed', 'canceled'])
-
-    const selectItemForRequeue = (itemKey, item, source) => {
-        if(!requeueableStatuses.has(`${item?.status || ''}`)) return
-
-        const sourceHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        const resolutionRetryUrl = getFailedItemProfileResolutionRetryUrl(item, itemKey)
-        const retryViaResolution = !!resolutionRetryUrl
-        const href = retryViaResolution ? '' : sourceHref
-        const coordinatorKey = retryViaResolution
-            ? makeProfileResolutionQueueKey(resolutionRetryUrl)
-            : href || getCoordinatorItemQueueKey(item, itemKey)
-        if(!href && !coordinatorKey) return
-        if(
-            hasRequestedTargets &&
-            !requestedHrefs.has(href) &&
-            !requestedHrefs.has(sourceHref) &&
-            !requestedKeys.has(itemKey) &&
-            !requestedKeys.has(coordinatorKey)
-        ) return
-
-        const reset = buildFailedCoordinatorResetItem(itemKey, item, {
-            now,
-            runId,
-            request,
-            resetQueuedTabRuntime: true,
-            retryCount: 0,
-            lastRetryAt: 0,
-            retryReason: '',
-            maxConcurrent: Math.max(1, Number.parseInt(request.maxConcurrent, 10) || 1),
-            requestedUrlMode: 'coordinator',
-            envelopeSourceType: 'manual-requeue',
-            queueSequence: nextQueueSequence++
-        })
-        const previousDestinationRow = queue[reset.coordinatorKey] || null
-
-        nextQueue[reset.coordinatorKey] = reset.nextItem
-        for(const progressHref of getNormalizedProfileHrefList([reset.sourceHref, reset.href])) {
-            progressProjectionRemovalHrefs.add(progressHref)
-        }
-        selectedItems.push(reset.nextItem)
-        authorityResults.push(makeCoordinatorAuthorityApplyResult({
-            operationKind: 'requeue',
-            rowKey: reset.coordinatorKey,
-            reason: 'ordinaryMutation'
-        }, {
-            accepted: true,
-            changed: true,
-            durable: true,
-            reason: 'persisted',
-            previousRow: previousDestinationRow,
-            nextRow: reset.nextItem,
-            terminal: false,
-            allowTerminalOverwrite: true
-        }))
-        if(source === 'queue' && reset.coordinatorKey !== itemKey) {
-            delete nextQueue[itemKey]
-            removedRows.push({
-                rowKey: itemKey,
-                previousRow: item,
-                operationKind: 'requeue',
-                reason: 'ordinaryMutation'
-            })
-        }
-        else if(source === 'completed') {
-            removedCompletedRows.push({
-                rowKey: itemKey,
-                previousRow: item,
-                operationKind: 'requeue',
-                reason: 'ordinaryMutation'
-            })
-        }
-    }
-
-    for(const [itemKey, item] of Object.entries(queue)) {
-        selectItemForRequeue(itemKey, item, 'queue')
-    }
-    // Failed/canceled rows normally archive out of .queue the moment they
-    // settle (archiveTerminalCoordinatorRow) -- without this, "Queue
-    // All-fails" would never find anything to requeue post-archive. Not
-    // limit-bounded like the reconcile catch-up's recent-completed scan:
-    // this is a rare, explicit user action (not a per-tick hot path), and
-    // getRecentCompletedWorkRows already loads the full completed map into
-    // memory before slicing, so an unbounded limit costs nothing extra.
-    const allCompletedRows = await coordinatorQueueReader.completedRecent(Number.MAX_SAFE_INTEGER)
-    for(const completedRow of allCompletedRows) {
-        if(!completedRow || typeof completedRow !== 'object') continue
-        const completedItemKey = getCoordinatorItemQueueKey(completedRow, '') ||
-            getCoordinatorItemHref(completedRow) || ''
-        if(!completedItemKey) continue
-        if(Object.prototype.hasOwnProperty.call(queue, completedItemKey)) continue
-        selectItemForRequeue(completedItemKey, completedRow, 'completed')
-    }
-
-    if(!selectedItems.length) {
-        return {
-            queued: 0,
-            selected: 0,
-            reason: 'no-failed-items'
-        }
-    }
-
-    const sourcePages = getCoordinatorRetrySourcePages(selectedItems)
-    const targetProfileHrefs = getNormalizedProfileHrefList(selectedItems.map(item => item.targetProfileHref))
-    const targetWorkKeys = mergeUniqueStringList(selectedItems.map(item => item.coordinatorKey || item.targetProfileHref || item.dedupeKey || ''))
-
-    // 2026-09-29: NOT migrated onto applyCoordinatorRunsUpdate -- same
-    // reasoning as mutateCoordinatorFailedItemsRetry's sibling comment
-    // above: runs is bundled into the same WAL batch mutation as the queue
-    // changes, and this creates a brand-new run entry.
-    const nextRuns = {
-        ...runs,
-        [runId]: {
-            id: runId,
-            sourceType: 'failed-requeue',
-            createdAt: now,
-            updatedAt: now,
-            status: 'active',
-            itemCount: selectedItems.length,
-            activeCount: 0,
-            terminalCount: 0,
-            paused: false,
-            sourcePages,
-            targetProfileHrefs,
-            targetWorkKeys
-        }
-    }
-    Object.assign(nextRuns, recomputeCoordinatorRuns(nextQueue, nextRuns, new Set([runId])))
-
-    emitCoordinatorEvent({
-        id: makeId('event'),
-        runId,
-        itemId: '',
-        type: 'requeue',
-        message: `Requeued ${selectedItems.length} failed target${selectedItems.length === 1 ? '' : 's'}`,
-        at: now,
-        details: {
-            queued: selectedItems.length,
-            targetProfileHrefs,
-            targetProfileHref: targetProfileHrefs.length === 1 ? targetProfileHrefs[0] : ''
-        }
-    })
-
-    let persistence = null
-    try {
-        persistence = await coordinatorAuthority.persistCoordinator(
-            {
-                results: authorityResults,
-                removedRows,
-                removedCompletedRows
-            },
-            {
-                operationKind: 'requeue',
-                reason: 'ordinaryMutation',
-                metricPath: 'failedRequeue.save.queueWal',
-                projectionMetricPath: 'failedRequeue.save.projection'
-            }
-        )
-    }
-    catch(error) {
-        persistence = {
-            saved: false,
-            reason: 'persistence-error',
-            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
-        }
-    }
-    if(persistence?.saved !== true) {
-        return {
-            queued: 0,
-            executionQueued: 0,
-            selected: 0,
-            reason: persistence?.reason || 'requeue-save-failed',
-            persistence
-        }
-    }
-
-    // Tombstone rather than delete these rows -- see the matching comment
-    // in the failed-retry path above for why.
-    if(progressProjectionRemovalHrefs.size) {
-        profileNukeProgress = {
-            ...profileNukeProgress
-        }
-        for(const href of progressProjectionRemovalHrefs) {
-            profileNukeProgress[href] = makeTombstonedProfileProgressRecord(href)
-        }
-    }
-
-    let derivedSaved = true
-    let projectionCleanup = {saved: true, rows: 0}
-    try {
-        projectionCleanup = progressProjectionRemovalHrefs.size
-            ? await saveProfileNukeProgressRowProjection(
-                Object.fromEntries(Array.from(progressProjectionRemovalHrefs, href => [href, makeTombstonedProfileProgressRecord(href)])),
-                {metricPath: 'failedRequeue.progressProjectionTombstone'}
-            )
-            : {saved: true, rows: 0}
-    }
-    catch(error) {
-        projectionCleanup = false
-        recordCoordinatorDiagnosticEvent(
-            'requeue-progress-projection-delete-failed',
-            error?.message || 'Requeue progress projection delete failed'
-        )
-    }
-    if(projectionCleanup === false || projectionCleanup?.saved === false) {
-        derivedSaved = false
-    }
-    try {
-        derivedSaved = await saveCoordinatorState({
-            runs: nextRuns
-        }, { metricPath: 'requeue.derived',
-            queue: false,
-            runs: true,
-            progress: false,
-            reason: 'ordinaryMutation',
-            queueOperation: 'requeue-derived',
-            queueChangedRows: 0
-        }) && derivedSaved
-    }
-    catch(error) {
-        derivedSaved = false
-        recordCoordinatorDiagnosticEvent(
-            'requeue-derived-save-failed',
-            error?.message || 'Requeue derived save failed'
-        )
-    }
-    if(derivedSaved === false) {
-        incrementQueueWakeupMetric('requeue.derivedSaveFailed')
-        scheduleCoordinatorReconcile(1000, {
-            reason: 'requeue-derived-save-failed',
-            edgeTriggered: true
-        })
-    }
-
-    incrementQueueWakeupMetric('job.enqueued', selectedItems.length)
-    incrementQueueWakeupMetric('pump.changed.requeued', selectedItems.length)
-
-    return {
-        queued: selectedItems.length,
-        selected: selectedItems.length,
-        selectedItems,
-        runId,
-        reason: 'requeue-persisted',
-        persistence,
-        derivedSaved
-    }
-}
-
-async function requeueCoordinatorFailedItems(request = {}, sender = {}) {
-    const ownerTabId = SERVICE_WORKER_QUEUE_OWNER_ID
-    if(!ownerTabId) return {queued: 0, selected: 0, reason: 'no-coordinator'}
-
-    await ownedTabIdsReady
-    await ensureProfileNukeProgressReady()
-    await sweepStaleQueuedTabs()
-    scheduleCoordinatorReconcile(1000, {reason: 'requeue-failed-request'})
-
-    if(getDurablyActiveQueuedTabCount() || queueRuntime.getActivationIntentCount()) {
-        const executor = await runCoordinatorReconcileExecutorActions('requeue-failed-executor-busy', {
-            awaitFill: true
-        })
-        return {
-            queued: 0,
-            selected: 0,
-            executionQueued: executor?.queued || 0,
-            pending: executor?.pending || 0,
-            active: executor?.active || 0,
-            reason: 'executor-busy'
-        }
-    }
-
-    const persisted = await enqueueSpaceFeedStorageUpdate(() => {
-        return applyCoordinatorQueueMachineEvent({
-            type: 'REQUEUE_FAILED_ITEMS',
-            request
-        })
-    }, {
-        reason: 'requeue-failed',
-        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS,
-        failureValue: {
-            queued: 0,
-            executionQueued: 0,
-            selected: 0,
-            reason: 'requeue-save-failed',
-            storageTimedOut: true
-        }
-    })
-
-    if(!persisted || !persisted.selectedItems?.length) {
-        return persisted || {
-            queued: 0,
-            executionQueued: 0,
-            selected: 0,
-            reason: 'requeue-save-failed'
-        }
-    }
-
-    const result = await runCoordinatorReconcileTick('requeue-failed-reconcile', {
-        direct: true,
-        skipStoredWorkCheck: true,
-        awaitFill: false
-    })
-
-    return {
-        queued: persisted.selectedItems.length,
-        executionQueued: result?.resume?.queued || result?.queued || 0,
-        selected: persisted.selectedItems.length,
-        runId: persisted.runId,
-        reason: (result?.resume?.queued || result?.queued || 0) > 0 ? 'requeue-started' : 'requeue-scheduled'
     }
 }
 
@@ -37289,7 +36920,6 @@ registerServiceWorkerListeners({
         rememberCanceledOwnerUrls,
         rememberQueueLoadPressure,
         requestCoordinatorActionLease,
-        requeueCoordinatorFailedItems,
         resetQueueWakeupMetricsEpochAfterLoad,
         resetQueuedWorkerActionSurface,
         resolveQueuedProfileTarget,

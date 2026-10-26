@@ -43,7 +43,6 @@ module.exports = {
     COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX: 'mbCoordinatorContentSourceIndex.',
     COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX: 'mbCoordinatorNamespaceSeq.',
     QUEUE_WAKEUP_METRICS_KEY: 'mbQueueWakeupMetrics',
-    QUEUE_WAKEUP_JOURNAL_KEY: 'mbQueueWakeupJournal',
     BROWSER_SESSION_MARKER_KEY: 'mbBrowserSessionMarker',
     QUORA_RUNTIME_ACTIVATED_SESSION_KEY: 'mbQuoraRuntimeActivated',
     FLIGHT_RECORDER_SESSION_KEY: 'mbFlightRecorderSnapshot',

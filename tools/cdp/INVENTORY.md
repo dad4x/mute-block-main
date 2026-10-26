@@ -18,7 +18,7 @@ Status as of 24 Oct 2026. This is the list of helpers in this folder that stay f
 
 ## Kept: in the dictionary
 
-`reload-extension.js`, `space-summary.js`, `reload-space-tabs.js`, `inspect-space-state.js`, `space-contributors.js`, `queue-summary.js`, `queue-counts.js`, `queue-failures.js`, `inspect-queue-item.js`, `inject-content-script.js`, `queue-storage-summary.js`, `queue-wakeup-metrics.js`, `requeue-failures.js`, `target-summary.js`, `close-profile-tabs.js`, `requeue-stale-active.js`, `open-queued-storage-tabs.js`, `resume-queue.js`.
+`reload-extension.js`, `space-summary.js`, `reload-space-tabs.js`, `inspect-space-state.js`, `space-contributors.js`, `queue-summary.js`, `queue-counts.js`, `queue-failures.js`, `inspect-queue-item.js`, `inject-content-script.js`, `queue-storage-summary.js`, `queue-wakeup-metrics.js`, `target-summary.js`, `close-profile-tabs.js`, `requeue-stale-active.js`, `open-queued-storage-tabs.js`, `resume-queue.js`.
 
 ## Kept: used by current work
 
@@ -49,7 +49,7 @@ Kept on purpose: `window-focus-summary.js`. The worker-window focus concern (25 
 
 ## Keep in mind: some kept helpers mention retired keys
 
-These helpers mention storage keys that the 1.6 work has retired: `active-queue-rows.js`, `current-work-filter.js`, `inspect-space-state.js`, `queue-counts.js`, `queue-failures.js`, `queue-storage-summary.js`, `queue-summary.js`, `requeue-failures.js`, `space-summary.js`, `storage-read-profile.js`, `wal-snapshot-benchmark.js`, `audit-action-kinds.js`, and `upgrade-regression/run.js`. Check a helper's output against the current keys before trusting it. The dead-ends review lists the readers to point at the log reader; that change is not made yet.
+These helpers mention storage keys that the 1.6 work has retired: `active-queue-rows.js`, `current-work-filter.js`, `inspect-space-state.js`, `queue-counts.js`, `queue-failures.js`, `queue-storage-summary.js`, `queue-summary.js`, `space-summary.js`, `storage-read-profile.js`, `wal-snapshot-benchmark.js`, `audit-action-kinds.js`, and `upgrade-regression/run.js`. Check a helper's output against the current keys before trusting it. The dead-ends review lists the readers to point at the log reader; that change is not made yet.
 
 ## Restored after a test needed it
 

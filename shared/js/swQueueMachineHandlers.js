@@ -41,7 +41,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorActionLeaseRelease = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRelease')
     const mutateCoordinatorActionLeaseRequest = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeaseRequest')
     const mutateCoordinatorActionLeasesForTabRelease = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorActionLeasesForTabRelease')
-    const mutateCoordinatorFailedItemsRequeue = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorFailedItemsRequeue')
     const mutateCoordinatorFailedItemsRetry = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorFailedItemsRetry')
     const mutateCoordinatorKeyOnlyItemTerminate = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorKeyOnlyItemTerminate')
     const mutateCoordinatorPauseStateSet = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorPauseStateSet')
@@ -447,12 +446,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
                 event.metadata || null,
                 event.options || {}
             )
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.REQUEUE_FAILED_ITEMS]: async (event = {}, operation = {}) => {
-            return mutateCoordinatorFailedItemsRequeue({
-                reason: operation.reason || 'ordinaryMutation',
-                request: event.request || {}
-            })
         },
         [QUEUE_MACHINE_EVENT_TYPES.RETRY_FAILED_ITEMS]: async (event = {}, operation = {}) => {
             return mutateCoordinatorFailedItemsRetry({

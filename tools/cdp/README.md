@@ -251,7 +251,6 @@ For small literal source edits where apply_patch is unavailable, use npm run dev
 | `tools/cdp/inject-content-script.js` | Inject the packaged content script and CSS into matching live Quora profile tabs from an extension page, without foregrounding the tabs. | `node tools/cdp/inject-content-script.js --needle Elon-Musk-1923` |
 | `tools/cdp/queue-storage-summary.js` | Summarize persisted coordinator queue/run state from an extension page when the service worker is asleep. | `node tools/cdp/queue-storage-summary.js --needle profile-modal` |
 | `tools/cdp/queue-wakeup-metrics.js` | Summarize persisted queue wakeup/storage metrics from extension storage, or analyze an exported metrics JSON file. | `node tools/cdp/queue-wakeup-metrics.js` |
-| `tools/cdp/requeue-failures.js` | Requeue failed persisted queue rows matching a needle through the extension service worker. | `node tools/cdp/requeue-failures.js --needle profile-modal --max-concurrent 1` |
 | `tools/cdp/target-summary.js` | Summarize open CDP targets without evaluating page or worker JavaScript. Useful when the page or service worker is busy. | `node tools/cdp/target-summary.js` |
 | `tools/cdp/close-profile-tabs.js` | Close open Quora profile page targets, optionally filtered by URL/title text. | `node tools/cdp/close-profile-tabs.js` |
 | `tools/cdp/requeue-stale-active.js` | Requeue persisted active rows for a needle only when no live Quora profile tabs are open. Useful after a service-worker restart strands active rows. | `node tools/cdp/requeue-stale-active.js --needle profile-modal` |

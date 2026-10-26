@@ -89,7 +89,6 @@ function registerServiceWorkerListeners(deps = {}) {
         'get-content-page-coordinator-state',
         'resume-coordinator-queue',
         'retry-coordinator-failed',
-        'requeue-coordinator-failed',
         'claim-tab-action',
         'resolve-queued-profile-target',
         'resolve-queued-profile-target-failed',
@@ -251,7 +250,6 @@ function registerServiceWorkerListeners(deps = {}) {
         rememberCanceledOwnerUrls,
         rememberQueueLoadPressure,
         requestCoordinatorActionLease,
-        requeueCoordinatorFailedItems,
         resetQueueWakeupMetricsEpochAfterLoad,
         resetQueuedWorkerActionSurface,
         resolveQueuedProfileTarget,
@@ -930,9 +928,6 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'retry-coordinator-failed') {
             return retryCoordinatorFailedItems(request, sender)
-        }
-        else if(request.action === 'requeue-coordinator-failed') {
-            return requeueCoordinatorFailedItems(request, sender)
         }
         else if(request.action === 'claim-tab-action') {
             return claimPendingTabAction(sender)

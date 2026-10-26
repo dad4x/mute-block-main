@@ -639,7 +639,6 @@ module.exports.__test = {
     kickCoordinatorQueueResume,
     metricStorageGet,
     metricStorageSet,
-    mutateCoordinatorFailedItemsRequeue,
     recoverStoredCoordinatorWork,
     ensureQueuedTabContentScript,
     handleQueuedTabContentScriptEnsureResult,

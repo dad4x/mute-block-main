@@ -40,7 +40,6 @@ const lanes = [
       ['node', 'test/contentQueuedClaimHold.test.js'],
       ['node', 'test/acceptedReviewChanges.test.js'],
       ['node', 'test/cdpClickProfileExtensionAction.test.js'],
-      ['node', 'test/requeueFailures.test.js'],
       ['node', 'test/swStorageMetrics.test.js'],
       ['node', 'test/swQueueWal.test.js'],
       ['node', 'test/swQueueWalRecovery.test.js'],
