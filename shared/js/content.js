@@ -20,16 +20,8 @@ const { QUEUE_BAR_GET_ACTION, QUEUE_BAR_PUSH_ACTION, getQueueBarDisplay } = requ
 const { PROFILE_NUKE_PROGRESS_PUSH_ACTION } = require('./swProfileNukeProgressPush')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
-    NUKED_POST_RETENTION_DAYS_KEY,
-    SPACE_NUKED_POSTS_KEY,
-    getPrunedNukedPosts,
-    haveSameNukedPostKeys
+    NUKED_POST_RETENTION_DAYS_KEY
 } = require('./nukedPosts')
-const {
-    isSpaceMapStorageKey,
-    readSpaceMapFromStored,
-    spaceMapStorageReadDefaults
-} = require('./spaceMapStorage')
 const {
     SPACE_CATEGORIES,
     SPACE_REGISTRY_KEY,
@@ -56,14 +48,11 @@ const {
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
     COORDINATOR_PAUSED_KEY,
-    COORDINATOR_QUEUE_VIEW_KEY,
-    SPACE_PENDING_NUKED_POSTS_KEY
+    COORDINATOR_QUEUE_VIEW_KEY
 } = require('./storageKeys')
 const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
 const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS} = require('./tunables')
-// The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
-const SPACE_MAP_BASE_KEYS = [SPACE_NUKED_POSTS_KEY, SPACE_PENDING_NUKED_POSTS_KEY]
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
@@ -289,8 +278,6 @@ let blockedCloseCheckTimeouts = []
 let currentUrl = location.href
 let settings = {...defaults}
 let spaceRegistry = {}
-let spaceNukedPosts = {}
-let spacePendingNukedPosts = {}
 let profileNukeProgress = {}
 let coordinatorQueue = {}
 let coordinatorQueueLoaded = false
@@ -304,6 +291,8 @@ let spaceFeedScopedStateRefreshQueuedSignature = ''
 let spaceFeedScopedStateSignature = ''
 let storageChangeListenerInstalled = false
 let spaceFeedNukingPostKeys = new Set()
+// In-memory marks of the batches this page has just sent to the queue (see beginSpaceFeedEnqueueMarks). Never stored.
+let spaceFeedEnqueueMarkBatches = []
 let activeSpaceFeedNukeMode = ''
 let activeSpaceFeedNukeRunId = ''
 let activeSpaceFeedNukeSpaceKey = ''
@@ -444,15 +433,7 @@ async function init() {
 
     settings = await safeStorageGet(defaults)
     spaceRegistry = (await safeStorageGet({[SPACE_REGISTRY_KEY]: {}}))[SPACE_REGISTRY_KEY] || {}
-    const storedSpaceMaps = await safeStorageGet(spaceMapStorageReadDefaults(SPACE_MAP_BASE_KEYS))
-    const storedSpaceNukedPosts = readSpaceMapFromStored(storedSpaceMaps, SPACE_NUKED_POSTS_KEY)
-    spaceNukedPosts = pruneRememberedSpaceNukes(storedSpaceNukedPosts)
-    spacePendingNukedPosts = readSpaceMapFromStored(storedSpaceMaps, SPACE_PENDING_NUKED_POSTS_KEY)
     await refreshCoordinatorQueueFromRuntime({force: true})
-    if(!haveSameNukedPostKeys(storedSpaceNukedPosts, spaceNukedPosts)) {
-        // The worker owns the space nuked-post keys (set-space-nuked-posts). Bounded, so the wait cannot stall init.
-        await safeSendRuntimeMessageWithTimeout({action: 'set-space-nuked-posts', nukedPosts: spaceNukedPosts}, null)
-    }
     setStorageChangeListenerEnabled(true)
     installNavigationHooks()
 
@@ -528,9 +509,8 @@ function getCurrentPageStateProfileHrefs(options = {}) {
         for(const entry of entries) {
             hrefs.push(...(Array.isArray(entry?.candidateUrls) ? entry.candidateUrls : []))
         }
-        for(const record of Object.values(spacePendingNukedPosts || {})) {
-            hrefs.push(...getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
-        }
+        // The profiles the queue holds as pending on this page are asked about too.
+        hrefs.push(...getPendingCoordinatorProfileHrefList())
     }
 
     const list = getNormalizedProfileHrefList(hrefs)
@@ -650,6 +630,8 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
                     ...normalizeCoordinatorQueue(result.coordinatorQueue)
                 }
                 coordinatorQueueLoaded = true
+                // Owner, 26 Oct: the rows this reply shows take over from the in-memory marks of the page's own enqueues.
+                applySpaceFeedEnqueueMarksToStateReply(stateRequestStartedAt, profileHrefs, coordinatorQueue)
             }
             if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
                 // Progress is keyed by profile: the profiles asked about this round take the reply's records, and a profile with no record in the reply has none.
@@ -677,6 +659,13 @@ async function refreshContentPageCoordinatorStateFromRuntime(options = {}) {
         })
 
     return contentPageStateRefreshPromise
+}
+
+// Owner, 26 Oct: after an enqueue settles, the page asks for the state of its profiles again. The scoped refresh is skipped when the scope has
+// not changed, so this is asked directly. A refresh already in flight was asked before the enqueue, so its reply is waited for first.
+async function refreshSpaceFeedStateAfterEnqueue() {
+    if(contentPageStateRefreshPromise) await contentPageStateRefreshPromise.catch(() => false)
+    return refreshContentPageCoordinatorStateFromRuntime({force: true, entries: getLatestSpaceFeedEntries()})
 }
 
 // Owner, 23 Oct: after a timed-out or failed reply, the page asks the worker again after a short wait, so its copy of the queue and progress
@@ -709,10 +698,10 @@ async function pollSpaceFeedState() {
     // Owner, 24 Oct: a pending row in this page's queue copy is still polled after the run ends, so the next reply can drop it (a finished
     // profile the worker no longer lists). Without this the poll stopped and the page kept counting it as left.
     const hasPendingCoordinatorCopy = Object.values(coordinatorQueue || {}).some(item => isPendingCoordinatorStatus(item?.status))
-    if(Object.keys(spacePendingNukedPosts || {}).length === 0 && spaceFeedNukingPostKeys.size === 0 && !hasPendingCoordinatorCopy) return
+    if(spaceFeedNukingPostKeys.size === 0 && !hasPendingCoordinatorCopy) return
     // Owner, 24 Oct: the pending posts copy is replaced only by the worker's reply to the settle-terminal reconcile, which ran on page start and
     // after a projection refresh, never on the poll. After a run it stayed "15 left" until a reload. The poll runs the reconcile too.
-    if(Object.keys(spacePendingNukedPosts || {}).length > 0) void reconcileStaleSpaceFeedProgress()
+    if(hasPendingCoordinatorCopy) void reconcileStaleSpaceFeedProgress()
 
     const before = getSpaceFeedStateFingerprint()
     const refreshed = await refreshContentPageCoordinatorStateFromRuntime({force: true, entries: getLatestSpaceFeedEntries()})
@@ -740,7 +729,6 @@ function onStorageChanged(changes, areaName) {
     // Only this layout's keys, with their plain names (storageNamespace.js).
     changes = namespaceChanges(changes) || {}
 
-    let spaceMapsChanged = false
     for(const [key, change] of Object.entries(changes)) {
         if(Object.prototype.hasOwnProperty.call(defaults, key)) {
             settings[key] = change.newValue
@@ -752,24 +740,11 @@ function onStorageChanged(changes, areaName) {
                 scheduleSpaceAssetNukeControls(0)
             }
         }
-        else if(isSpaceMapStorageKey(key, SPACE_MAP_BASE_KEYS)) {
-            spaceMapsChanged = true
-        }
     }
-    if(spaceMapsChanged) void refreshSpaceMapsFromStorage()
 }
 
 // A change to any layout key of the space post maps (the whole-map keys, the bucket keys or the layout marker) re-reads both
 // maps, so one event with several bucket keys costs one read.
-async function refreshSpaceMapsFromStorage() {
-    const stored = await safeStorageGet(spaceMapStorageReadDefaults(SPACE_MAP_BASE_KEYS))
-    spaceNukedPosts = readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY)
-    spacePendingNukedPosts = readSpaceMapFromStored(stored, SPACE_PENDING_NUKED_POSTS_KEY)
-    if(getPageType() === 'space') {
-        scheduleSpaceFeedProgressDrivenRefresh()
-    }
-}
-
 function scheduleContentPageStateProjectionRefresh() {
     void refreshContentPageCoordinatorStateFromRuntime({force: true})
         .then(() => {
@@ -899,12 +874,7 @@ function isTransientProfileNukeStatus(status) {
     return TRANSIENT_PROGRESS_STATUSES.has(`${status || ''}`.trim())
 }
 
-function getPendingSpaceFeedRecord(postKey) {
-    return postKey ? spacePendingNukedPosts?.[postKey] || null : null
-}
-
-function shouldReconcilePendingProfileRecord(record, pendingRecord) {
-    if(!pendingRecord) return false
+function shouldReconcilePendingProfileRecord(record) {
     if(!record) return false
 
     if(isSuccessfulProfileNukeRecord(record) ||
@@ -958,25 +928,28 @@ function getReconciledProfileRecordPatch(record) {
     }
 }
 
+// The profiles the queue holds as pending. The space post map that used to list them was removed (25 Oct): the queue is the record.
+function getPendingCoordinatorProfileHrefList() {
+    const hrefs = []
+    for(const [itemKey, item] of Object.entries(coordinatorQueue || {})) {
+        if(!isPendingCoordinatorStatus(item?.status)) continue
+        const href = getCoordinatorItemProfileHref(itemKey, item)
+        if(href) hrefs.push(href)
+    }
+    return getNormalizedProfileHrefList(hrefs)
+}
+
 async function reconcileStaleSpaceFeedProgress(entries = null) {
     if(getPageType() !== 'space') return false
 
     await refreshOwnedNukeStatusCacheIfStale()
-    const pendingProfileHrefs = getNormalizedProfileHrefList(
-        Object.values(spacePendingNukedPosts || {})
-            .flatMap(record => getStoredSpaceFeedRecordUrls(record, 'remainingUrls'))
-    )
+    const pendingProfileHrefs = getPendingCoordinatorProfileHrefList()
     if(pendingProfileHrefs.length) {
-        const result = await safeSendRuntimeMessageWithTimeout({
+        // The worker settles the queue rows of these profiles against their progress. Bounded, so the wait cannot stall the page.
+        await safeSendRuntimeMessageWithTimeout({
             action: 'settle-terminal-coordinator-items',
             profileHrefs: pendingProfileHrefs
         }, null, 2500)
-        if(result?.pendingPosts && typeof result.pendingPosts === 'object') {
-            spacePendingNukedPosts = result.pendingPosts
-        }
-        if(result?.nukedPosts && typeof result.nukedPosts === 'object') {
-            spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
-        }
     }
 
     const updatesByHref = new Map()
@@ -989,23 +962,15 @@ async function reconcileStaleSpaceFeedProgress(entries = null) {
         })
     }
 
-    const pendingEntries = Object.entries(spacePendingNukedPosts || {})
-    for(const [postKey, pendingRecord] of pendingEntries) {
-        if(!postKey || !pendingRecord) continue
+    for(const pendingHref of pendingProfileHrefs) {
+        const record = getProfileNukeProgressRecord(pendingHref)
+        if(!shouldReconcilePendingProfileRecord(record)) continue
 
-        for(const url of getStoredSpaceFeedRecordUrls(pendingRecord, 'remainingUrls')) {
-            const normalizedUrl = normalizeQuoraProfileHref(url)
-            if(!normalizedUrl) continue
-
-            const record = getProfileNukeProgressRecord(normalizedUrl)
-            if(!shouldReconcilePendingProfileRecord(record, pendingRecord)) continue
-
-            if(record && isTransientProfileNukeStatus(record.status) && record.status !== 'interrupted') {
-                updatesByHref.set(normalizedUrl, {
-                    profileHref: normalizedUrl,
-                    patch: getReconciledProfileRecordPatch(record)
-                })
-            }
+        if(record && isTransientProfileNukeStatus(record.status) && record.status !== 'interrupted') {
+            updatesByHref.set(pendingHref, {
+                profileHref: pendingHref,
+                patch: getReconciledProfileRecordPatch(record)
+            })
         }
     }
 
@@ -1029,13 +994,6 @@ function recordManualProfileAction(kind) {
     const profileHref = normalizeQuoraProfileHref(location.href)
     if(!profileHref) return null
     return safeSendRuntimeMessageWithTimeout({action: 'record-manual-profile-action', kind, profileHref, at: Date.now()}, null)
-}
-
-function pruneRememberedSpaceNukes(records) {
-    return getPrunedNukedPosts(records, {
-        retentionDays: settings[NUKED_POST_RETENTION_DAYS_KEY],
-        maxEntries: settings[MAX_REMEMBERED_NUKED_POSTS_KEY]
-    })
 }
 
 function pruneProfileNukeProgress(records, maxEntries = MAX_PROFILE_NUKE_PROGRESS_ENTRIES) {
@@ -1594,12 +1552,6 @@ async function clearProfileNukeState(href, reason = '') {
         if(result.profileNukeProgress && typeof result.profileNukeProgress === 'object') {
             profileNukeProgress = normalizeStoredProfileNukeProgress(result.profileNukeProgress)
         }
-        if(result.pendingPosts && typeof result.pendingPosts === 'object') {
-            spacePendingNukedPosts = result.pendingPosts
-        }
-        if(result.nukedPosts && typeof result.nukedPosts === 'object') {
-            spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
-        }
         return !!result.cleared
     }
 
@@ -1904,7 +1856,7 @@ function rememberActiveSpaceFeedNukeMode(button, runId) {
 
 function clearInactiveSpaceFeedNukeMode() {
     if(spaceFeedNukingPostKeys.size ||
-        getStoredPendingSpaceFeedWorkCountForSpace() > 0 ||
+        getPendingCoordinatorSpaceFeedWorkCountForSpace() > 0 ||
         hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) {
         return false
     }
@@ -2234,7 +2186,7 @@ function scheduleSpaceFeedProgressDrivenRefresh() {
     if(getPageType() !== 'space') return false
 
     const entries = getCachedSpaceFeedEntries()
-    const hasActiveSpaceWork = getStoredPendingSpaceFeedWorkCountForSpace() > 0 ||
+    const hasActiveSpaceWork = getPendingCoordinatorSpaceFeedWorkCountForSpace() > 0 ||
         (entries.length ? hasActivePendingSpaceFeedWork(entries) : false)
     if(entries.length && isNukableSpacePage()) {
         const renderModel = buildSpaceFeedRenderModel(entries)
@@ -7974,10 +7926,6 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
     return attachSpaceFeedCandidateMetadata(urls, candidateEvidenceByHref, needsSourceResolution)
 }
 
-function getRememberedSpaceFeedPostUrlSet(postKey) {
-    const record = postKey ? spaceNukedPosts?.[postKey] : null
-    return new Set(getStoredSpaceFeedRecordUrls(record, 'allUrls'))
-}
 
 // Owner, 23 Oct: a profile is counted only once the worker has answered for it. A profile found nuked is kept in a set for the life of
 // the page, so it is not asked about again and does not drop out when the worker's reply is replaced.
@@ -8008,35 +7956,28 @@ function isSpaceFeedProfileStateReady(href) {
     return !!key && spaceFeedAnsweredProfileKeys.has(key)
 }
 
-function isSpaceFeedPostNuked(postKey, candidateUrls = null) {
-    const rememberedUrls = getRememberedSpaceFeedPostUrlSet(postKey)
+// Owner, 22 Oct: nuked is a fact about the profile, not the post. A post is nuked when each of its profiles is settled. A post with no
+// profile link in view has no profile to judge, so it is not nuked (25 Oct: the post-level nuked record was removed).
+function isSpaceFeedPostNuked(candidateUrls = null) {
     const urls = getNormalizedProfileHrefList(candidateUrls || [])
-    if(!urls.length) return rememberedUrls.size > 0
-
-    // Owner, 22 Oct: nuked is a fact about the profile, not the post. A post is nuked when each of its profiles is settled, for every report.
-    return urls.every(url => isKnownNukedSpaceFeedProfile(url))
+    return urls.length > 0 && urls.every(url => isKnownNukedSpaceFeedProfile(url))
 }
+
 
 function isSpaceFeedEntryNuked(entry) {
-    return isSpaceFeedPostNuked(entry?.postKey, entry?.candidateUrls || [])
+    return isSpaceFeedPostNuked(entry?.candidateUrls || [])
 }
 
-function isRememberedSpaceFeedPostProfile(postKey, profileHref) {
-    const href = normalizeQuoraProfileHref(profileHref)
-    if(!href) return false
-
-    return getRememberedSpaceFeedPostUrlSet(postKey).has(href)
-}
 
 function isSpaceFeedPostNuking(postKey) {
     return !!(postKey && spaceFeedNukingPostKeys.has(postKey))
 }
 
 function isSpaceFeedPostPending(postKey) {
-    if(postKey && spacePendingNukedPosts?.[postKey]?.resolverPending) return true
     if(hasPendingCoordinatorSpaceFeedPost(postKey)) return true
     return getActivePendingSpaceFeedUrls(postKey).length > 0
 }
+
 
 function isSpaceFeedPostBusy(postKey) {
     return isSpaceFeedPostNuking(postKey) || isSpaceFeedPostPending(postKey)
@@ -8045,14 +7986,11 @@ function isSpaceFeedPostBusy(postKey) {
 function hasActivePendingSpaceFeedWork(entries = null) {
     const postKeys = Array.isArray(entries) ?
         entries.map(entry => entry?.postKey).filter(Boolean) :
-        Object.keys(spacePendingNukedPosts || {})
+        Array.from(getPendingSpaceFeedIndex().hrefsByPostKey.keys())
 
-    for(const postKey of postKeys) {
-        if(getActivePendingSpaceFeedUrls(postKey).length) return true
-    }
-
-    return false
+    return postKeys.some(postKey => getActivePendingSpaceFeedUrls(postKey).length > 0)
 }
+
 
 function clearStaleLocalSpaceFeedBusyState() {
     const queueingButtons = getSpaceFeedQueueingButtons()
@@ -8068,52 +8006,12 @@ function clearStaleLocalSpaceFeedBusyState() {
     return true
 }
 
-function getStoredSpaceFeedRecordUrls(record, preferredKey = 'remainingUrls') {
-    if(!record || typeof record !== 'object') return []
 
-    const urls = preferredKey === 'allUrls'
-        ? Array.isArray(record.allUrls)
-            ? record.allUrls
-            : Array.isArray(record.urls)
-                ? record.urls
-                : []
-        : Array.isArray(record.remainingUrls)
-            ? record.remainingUrls
-            : Array.isArray(record.allUrls)
-                ? record.allUrls
-                : Array.isArray(record.urls)
-                    ? record.urls
-                    : []
-
-    return getNormalizedProfileHrefList(urls)
-}
-
-function getPendingSpaceFeedJobKeyPatch(record = {}, remainingUrls = []) {
-    const remaining = getNormalizedProfileHrefList(remainingUrls)
-    const existingByHref = record?.jobKeysByProfileHref && typeof record.jobKeysByProfileHref === 'object'
-        ? record.jobKeysByProfileHref
-        : {}
-    const jobKeysByProfileHref = {}
-
-    for(const href of remaining) {
-        jobKeysByProfileHref[href] = normalizeQuoraProfileHref(existingByHref[href] || href) || href
-    }
-
-    return {
-        jobKeys: getNormalizedProfileHrefList(Object.values(jobKeysByProfileHref)),
-        jobKeysByProfileHref
-    }
-}
 
 function getPendingSpaceFeedUrlSet(postKey) {
     return new Set(getActivePendingSpaceFeedUrls(postKey))
 }
 
-function isPendingSpaceFeedRecordForSpace(record = null, space = null) {
-    if(!record || !space?.key) return false
-
-    return `${record.spaceKey || ''}` === `${space.key || ''}`
-}
 
 function normalizeCoordinatorQueue(records = {}) {
     return records && typeof records === 'object' ? records : {}
@@ -8306,58 +8204,128 @@ function getPendingCoordinatorProfileSearchWorkCount() {
     return 0
 }
 
+// The pending state of the space feed is read from the queue copy (25 Oct: the space post map was removed). A profile is pending when a
+// pending queue row names it. A post is pending when a pending row carries its postKey as evidence: a profile row marks the profile of the
+// post, a resolver row (no profile yet) marks the post itself. Built once per queue copy, not once per post.
+let pendingSpaceFeedIndexCache = {queue: null, index: null}
+
+// Owner, 26 Oct: a post this page has just sent to the queue is pending at once, not when the page's copy of the queue next catches up.
+// The stored pending map that used to mark it (HEAD, read on storage change) was removed on 25 Oct, and the enqueue reply carries only
+// counts, so until a state reply the copy lacks the new rows. The page therefore keeps an in-memory mark per batch it sends: each post key
+// with the profile it was sent for ('' for a post whose profile is still to be read). A mark is dropped when the worker's state reply shows
+// the post's row (or, for a profile, a reply asked after the enqueue settled no longer has a live row for it), and at once when the
+// enqueue fails. Marks are never stored: a reload clears them, and the worker's rows take over.
+function touchSpaceFeedEnqueueMarks() {
+    pendingSpaceFeedIndexCache = {queue: null, index: null}
+    spaceFeedRenderModelMemo = null
+}
+
+function beginSpaceFeedEnqueueMarks(associations = []) {
+    const items = []
+    for(const association of Array.isArray(associations) ? associations : []) {
+        const profileHref = association?.resolveProfileFromPage ? '' : `${association?.profileHref || ''}`
+        for(const postKey of Array.isArray(association?.postKeys) ? association.postKeys : []) {
+            const key = `${postKey || ''}`.trim()
+            if(key) items.push({postKey: key, profileHref})
+        }
+    }
+    const batch = {items, settledAt: 0}
+    if(items.length) spaceFeedEnqueueMarkBatches.push(batch)
+    touchSpaceFeedEnqueueMarks()
+    return batch
+}
+
+// settled true: the enqueue is durable, so the marks wait for a state reply asked from now on. settled false: the enqueue failed, so the marks go.
+function settleSpaceFeedEnqueueMarks(batch = null, settled = false) {
+    if(!batch) return
+    if(settled) batch.settledAt = Date.now()
+    else spaceFeedEnqueueMarkBatches = spaceFeedEnqueueMarkBatches.filter(item => item !== batch)
+    touchSpaceFeedEnqueueMarks()
+}
+
+// requestedAt is when the reply's request was sent. queueRows is the page's copy after the reply was merged, askedHrefs the profiles asked.
+function applySpaceFeedEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {}) {
+    if(!spaceFeedEnqueueMarkBatches.length) return
+
+    const asked = new Set(askedHrefs)
+    const rowHrefs = new Set()
+    const rowPostKeys = new Set()
+    for(const [itemKey, item] of Object.entries(queueRows || {})) {
+        const href = getCoordinatorItemProfileHref(itemKey, item)
+        if(href) rowHrefs.add(href)
+        for(const evidence of Array.isArray(item?.evidence) ? item.evidence : []) {
+            const postKey = `${evidence?.postKey || ''}`.trim()
+            if(postKey) rowPostKeys.add(postKey)
+        }
+    }
+    spaceFeedEnqueueMarkBatches = spaceFeedEnqueueMarkBatches
+        .filter(batch => batch.settledAt > 0)
+        .map(batch => {
+            const askedAfterSettle = requestedAt >= batch.settledAt
+            return {
+                ...batch,
+                items: batch.items.filter(item => item.profileHref
+                    ? !(rowHrefs.has(item.profileHref) || (askedAfterSettle && asked.has(item.profileHref)))
+                    : !rowPostKeys.has(item.postKey))
+            }
+        })
+        .filter(batch => batch.items.length)
+    touchSpaceFeedEnqueueMarks()
+}
+
+function getPendingSpaceFeedIndex() {
+    const queue = coordinatorQueue || {}
+    if(pendingSpaceFeedIndexCache.queue === queue && pendingSpaceFeedIndexCache.index) return pendingSpaceFeedIndexCache.index
+
+    const hrefsByPostKey = new Map()
+    const resolverPostKeys = new Set()
+    for(const [itemKey, item] of Object.entries(queue)) {
+        if(!isPendingCoordinatorStatus(item?.status)) continue
+        const href = getCoordinatorItemProfileHref(itemKey, item)
+        for(const evidence of Array.isArray(item?.evidence) ? item.evidence : []) {
+            const postKey = `${evidence?.postKey || ''}`.trim()
+            if(!postKey) continue
+            if(!href) {
+                resolverPostKeys.add(postKey)
+                continue
+            }
+            if(!hrefsByPostKey.has(postKey)) hrefsByPostKey.set(postKey, new Set())
+            hrefsByPostKey.get(postKey).add(href)
+        }
+    }
+    // The posts this page has just sent (owner, 26 Oct; see beginSpaceFeedEnqueueMarks), counted the same as a pending row.
+    for(const batch of spaceFeedEnqueueMarkBatches) {
+        for(const {postKey, profileHref} of batch.items) {
+            if(!profileHref) {
+                resolverPostKeys.add(postKey)
+                continue
+            }
+            if(!hrefsByPostKey.has(postKey)) hrefsByPostKey.set(postKey, new Set())
+            hrefsByPostKey.get(postKey).add(profileHref)
+        }
+    }
+
+    const index = {hrefsByPostKey, resolverPostKeys}
+    pendingSpaceFeedIndexCache = {queue, index}
+    return index
+}
+
 function hasPendingCoordinatorSpaceFeedPost(postKey = '') {
     const key = `${postKey || ''}`.trim()
     if(!key) return false
 
-    return Object.values(coordinatorQueue || {}).some(item => {
-        if(!isPendingCoordinatorStatus(item?.status)) return false
-        return Array.isArray(item?.evidence) && item.evidence.some(evidence => `${evidence?.postKey || ''}` === key)
-    })
+    const index = getPendingSpaceFeedIndex()
+    return index.hrefsByPostKey.has(key) || index.resolverPostKeys.has(key)
 }
 
-function getActivePendingSpaceFeedRecordWorkCount(postKey = '', record = null) {
-    if(!record) return 0
 
-    let count = getActivePendingSpaceFeedUrls(postKey || record.postKey || '').length
-    if(record.resolverPending === true) count += 1
-    return count
-}
 
-function getStoredPendingSpaceFeedRecordWorkCount(postKey = '', record = null) {
-    if(!record) return 0
-
-    const key = postKey || record.postKey || ''
-    let count = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        .filter(url => !isRememberedSpaceFeedPostProfile(key, url))
-        .length
-    if(record.resolverPending === true) count += 1
-    return count
-}
 
 function getActivePendingSpaceFeedWorkCountForSpace(space = resolveCurrentSpaceDescriptor()) {
-    if(!space?.key) return 0
-
-    let count = 0
-    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
-        if(!isPendingSpaceFeedRecordForSpace(record, space)) continue
-        count += getActivePendingSpaceFeedRecordWorkCount(postKey, record)
-    }
-
-    return count
+    return getPendingCoordinatorSpaceFeedWorkCountForSpace(space)
 }
 
-function getStoredPendingSpaceFeedWorkCountForSpace(space = resolveCurrentSpaceDescriptor()) {
-    if(!space?.key) return 0
 
-    let count = 0
-    for(const [postKey, record] of Object.entries(spacePendingNukedPosts || {})) {
-        if(!isPendingSpaceFeedRecordForSpace(record, space)) continue
-        count += getStoredPendingSpaceFeedRecordWorkCount(postKey, record)
-    }
-
-    return count
-}
 
 function isSuccessfulProfileNukeRecord(record) {
     if(record?.actionKind === UNBLOCK_UNMUTE_ACTION_KIND) {
@@ -8426,11 +8394,15 @@ function isActivePendingSpaceFeedProfileUrl(url) {
     return !status || isTransientProfileNukeStatus(status)
 }
 
+// The profiles of a post the queue still holds as pending and the progress does not yet settle.
 function getActivePendingSpaceFeedUrls(postKey) {
-    const record = postKey ? spacePendingNukedPosts?.[postKey] : null
-    return getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        .filter(url => !isRememberedSpaceFeedPostProfile(postKey, url) && isActivePendingSpaceFeedProfileUrl(url))
+    const key = `${postKey || ''}`.trim()
+    if(!key) return []
+
+    return Array.from(getPendingSpaceFeedIndex().hrefsByPostKey.get(key) || [])
+        .filter(url => !isKnownNukedSpaceFeedProfile(url) && isActivePendingSpaceFeedProfileUrl(url))
 }
+
 
 function getSucceededSpaceFeedEntryUrls(entry) {
     return getNormalizedProfileHrefList(entry?.candidateUrls || []).filter(url => isProfileNukeSucceeded(url))
@@ -8473,7 +8445,7 @@ function getSpaceFeedQueuedWorkCount(entries = []) {
         for(const url of getNormalizedProfileHrefList(entry?.candidateUrls || [])) {
             profiles.add(getNormalizedProfileIdentityKey(url) || url)
         }
-        if(isQueueableSpaceFeedResolverEntry(entry) || (isResolvableSpaceFeedEntry(entry) && spacePendingNukedPosts?.[entry.postKey]?.resolverPending)) {
+        if(isQueueableSpaceFeedResolverEntry(entry) || (isResolvableSpaceFeedEntry(entry) && getPendingSpaceFeedIndex().resolverPostKeys.has(entry.postKey))) {
             unresolved += 1
         }
     }
@@ -8482,8 +8454,9 @@ function getSpaceFeedQueuedWorkCount(entries = []) {
 }
 
 function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
+    const index = getPendingSpaceFeedIndex()
     const pendingCoordinatorProfileHrefs = new Set()
-    const pendingCoordinatorPostKeys = new Set()
+    const pendingCoordinatorPostKeys = new Set([...index.hrefsByPostKey.keys(), ...index.resolverPostKeys])
     let coordinatorSpaceWorkCount = 0
 
     for(const [itemKey, item] of Object.entries(coordinatorQueue || {})) {
@@ -8492,15 +8465,15 @@ function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
         const profileHref = getCoordinatorItemProfileHref(itemKey, item)
         if(profileHref) pendingCoordinatorProfileHrefs.add(profileHref)
 
-        if(Array.isArray(item?.evidence)) {
-            for(const evidence of item.evidence) {
-                const postKey = `${evidence?.postKey || ''}`.trim()
-                if(postKey) pendingCoordinatorPostKeys.add(postKey)
-            }
-        }
-
         if(isPendingCoordinatorSpaceFeedItemForSpace(item, space)) {
             coordinatorSpaceWorkCount += 1
+        }
+    }
+
+    // A profile sent in this page's batch is pending for every post that names it, as a queued row is (see beginSpaceFeedEnqueueMarks).
+    for(const batch of spaceFeedEnqueueMarkBatches) {
+        for(const {profileHref} of batch.items) {
+            if(profileHref) pendingCoordinatorProfileHrefs.add(profileHref)
         }
     }
 
@@ -8509,58 +8482,32 @@ function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
         pendingCoordinatorProfileHrefs,
         pendingCoordinatorPostKeys,
         coordinatorSpaceWorkCount,
-        rememberedPostUrls: new Map(),
         activePendingUrls: new Map()
     }
 }
 
-function getRememberedSpaceFeedPostUrlSetForRender(postKey = '', context = null) {
-    if(!context) return getRememberedSpaceFeedPostUrlSet(postKey)
-    const key = `${postKey || ''}`.trim()
-    if(!key) return new Set()
-    if(!context.rememberedPostUrls.has(key)) {
-        context.rememberedPostUrls.set(key, getRememberedSpaceFeedPostUrlSet(key))
-    }
 
-    return context.rememberedPostUrls.get(key)
-}
 
-function isRememberedSpaceFeedPostProfileForRender(postKey = '', profileHref = '', context = null) {
-    const href = normalizeQuoraProfileHref(profileHref)
-    if(!href) return false
 
-    return getRememberedSpaceFeedPostUrlSetForRender(postKey, context).has(href)
-}
-
-function isSpaceFeedPostNukedForRender(postKey = '', candidateUrls = null, context = null) {
-    const rememberedUrls = getRememberedSpaceFeedPostUrlSetForRender(postKey, context)
-    const urls = getNormalizedProfileHrefList(candidateUrls || [])
-    if(!urls.length) return rememberedUrls.size > 0
-
-    // Owner, 22 Oct: nuked is a fact about the profile, not the post. A post is nuked when each of its profiles is settled, for every report.
-    return urls.every(url => isKnownNukedSpaceFeedProfile(url))
-}
 
 function getActivePendingSpaceFeedUrlsForRender(postKey = '', context = null) {
     const key = `${postKey || ''}`.trim()
     if(!key) return []
     if(context?.activePendingUrls?.has(key)) return context.activePendingUrls.get(key)
 
-    const record = spacePendingNukedPosts?.[key] || null
-    const urls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-        .filter(url => !isRememberedSpaceFeedPostProfileForRender(key, url, context) && isActivePendingSpaceFeedProfileUrl(url))
-
+    const urls = getActivePendingSpaceFeedUrls(key)
     if(context?.activePendingUrls) context.activePendingUrls.set(key, urls)
     return urls
 }
 
+
 function isSpaceFeedPostPendingForRender(postKey = '', context = null) {
     const key = `${postKey || ''}`.trim()
     if(!key) return false
-    if(spacePendingNukedPosts?.[key]?.resolverPending) return true
-    if(context?.pendingCoordinatorPostKeys?.has(key)) return true
+    if(context ? context.pendingCoordinatorPostKeys.has(key) : hasPendingCoordinatorSpaceFeedPost(key)) return true
     return getActivePendingSpaceFeedUrlsForRender(key, context).length > 0
 }
+
 
 // Diagnostic, 23 Oct: for one post, how many of its candidate profiles are answered, nuked, retry-blocked, pending, or queueable. Written to
 // the post's button as data-mb-diag, so the reason a post shows nothing can be read from the page.
@@ -8599,7 +8546,7 @@ function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null) {
 }
 
 function isSpaceFeedEntryNukedForRender(entry = null, context = null) {
-    return isSpaceFeedPostNukedForRender(entry?.postKey || '', entry?.candidateUrls || [], context)
+    return isSpaceFeedPostNuked(entry?.candidateUrls || [])
 }
 
 function isQueueableSpaceFeedResolverEntryForRender(entry = null, context = null) {
@@ -8620,7 +8567,7 @@ function buildSpaceFeedRenderEntry(entry = null, context = null) {
     const queueableUrls = postNuked ? [] : getQueueableSpaceFeedEntryUrlsForRender(entry, context)
     const hasResolver = !postNuked && isQueueableSpaceFeedResolverEntryForRender(entry, context)
     const liveUrls = postNuked ? [] : getNormalizedProfileHrefList([...activePendingUrls, ...queueableUrls])
-    const resolverPending = isResolvableSpaceFeedEntry(entry) && spacePendingNukedPosts?.[entry?.postKey]?.resolverPending === true
+    const resolverPending = isResolvableSpaceFeedEntry(entry) && getPendingSpaceFeedIndex().resolverPostKeys.has(entry?.postKey)
     const postBusy = !postNuked && (isSpaceFeedPostNuking(entry?.postKey) || isSpaceFeedPostPendingForRender(entry?.postKey || '', context))
     const queueableWorkCount = queueableUrls.length + (hasResolver ? 1 : 0)
     const liveWorkCount = liveUrls.length + (resolverPending ? 1 : 0)
@@ -8757,7 +8704,6 @@ function computeSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = sca
         actionableEntries.every(entry => isSpaceFeedPostSettled(entry) || entry.postNuked)
     const allActionableEntriesNuked = actionableEntries.length > 0 &&
         actionableEntries.every(entry => entry.postNuked)
-    const storedSpaceWorkCount = getStoredPendingSpaceFeedWorkCountForSpace(context.space)
     const activeSpaceWorkCount = getActivePendingSpaceFeedWorkCountForSpace(context.space)
     const displaySpaceWorkCount = Math.max(activeSpaceWorkCount, context.coordinatorSpaceWorkCount)
     const pendingProfileCount = getSpacePendingProfileCount(totalEntries, context.pendingCoordinatorProfileHrefs)
@@ -8781,7 +8727,6 @@ function computeSpaceFeedRenderModel(scannedEntries = [], aggregateEntries = sca
         allActionableEntriesNuked,
         ownerPaused: ownedNukeStatusCache.paused,
         ownerRunning: hasOwnedNukeWorkInFlight(),
-        storedSpaceWorkCount,
         activeSpaceWorkCount,
         coordinatorSpaceWorkCount: context.coordinatorSpaceWorkCount,
         displaySpaceWorkCount,
@@ -9733,73 +9678,8 @@ function syncSpaceFeedStatusButton(entries = null) {
     return true
 }
 
-async function registerPendingSpaceFeedEntries(space, entries) {
-    if(!space?.key || !Array.isArray(entries) || !entries.length) return
 
-    // The page sends only the posts it is adding (25 Oct). The worker merges them into its own copy, so a removal the worker made since
-    // this page last read the map is not put back. The answer is the map as the worker stored it, and this page takes it.
-    const posts = []
-    for(const entry of entries) {
-        if(!entry?.postKey) continue
-        if(isSpaceFeedEntryNuked(entry)) continue
 
-        const entryUrls = getNormalizedProfileHrefList(entry.candidateUrls || [])
-            .filter(url => !isRememberedSpaceFeedPostProfile(entry.postKey, url) && !isProfileNukeSucceeded(url))
-        const resolvable = isResolvableSpaceFeedEntry(entry)
-        if(!entryUrls.length && !resolvable) continue
-        posts.push({postKey: entry.postKey, postUrl: entry.postUrl || '', candidateUrls: entryUrls, resolvable})
-    }
-    if(!posts.length) return
-
-    const result = await safeSendRuntimeMessage({
-        action: 'merge-space-pending-nuked-posts',
-        spaceKey: space.key,
-        spaceUrl: space.url || '',
-        posts
-    }, null)
-    if(result?.pendingPosts && typeof result.pendingPosts === 'object') spacePendingNukedPosts = result.pendingPosts
-}
-
-async function removePendingSpaceFeedUrls(urls) {
-    const normalizedUrls = new Set(getNormalizedProfileHrefList(urls))
-    if(!normalizedUrls.size) return
-
-    const serviceResult = await safeSendRuntimeMessage({
-        action: 'remove-pending-space-feed-urls',
-        urls: Array.from(normalizedUrls)
-    }, null)
-    if(serviceResult) {
-        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
-            spacePendingNukedPosts = serviceResult.pendingPosts
-        }
-        return
-    }
-}
-
-async function removePendingSpaceFeedEntries(entries = []) {
-    const entryList = Array.isArray(entries) ? entries : []
-    const urls = getDedupedSpaceFeedUrls(entryList)
-    if(urls.length) {
-        await removePendingSpaceFeedUrls(urls)
-    }
-
-    const resolverPostKeys = Array.from(new Set(entryList
-        .filter(entry => isResolvableSpaceFeedEntry(entry) && !getNormalizedProfileHrefList(entry?.candidateUrls || []).length)
-        .map(entry => `${entry?.postKey || ''}`.trim())
-        .filter(Boolean)))
-    if(!resolverPostKeys.length) return
-
-    const serviceResult = await safeSendRuntimeMessage({
-        action: 'remove-pending-space-feed-entries',
-        postKeys: resolverPostKeys
-    }, null)
-    if(serviceResult) {
-        if(serviceResult.pendingPosts && typeof serviceResult.pendingPosts === 'object') {
-            spacePendingNukedPosts = serviceResult.pendingPosts
-        }
-        return
-    }
-}
 
 function getResolvedSpaceFeedProfileHrefs(profileHref = '') {
     const hrefs = []
@@ -9964,16 +9844,10 @@ function scheduleSpaceFeedProgressReconciliation(entries = null, delay = 80) {
                 })))
 
                 if(succeededUrls.length) {
-                    const result = await safeSendRuntimeMessageWithTimeout({
+                    await safeSendRuntimeMessageWithTimeout({
                         action: 'settle-terminal-coordinator-items',
                         profileHrefs: succeededUrls
                     }, null, 2500)
-                    if(result?.pendingPosts && typeof result.pendingPosts === 'object') {
-                        spacePendingNukedPosts = result.pendingPosts
-                    }
-                    if(result?.nukedPosts && typeof result.nukedPosts === 'object') {
-                        spaceNukedPosts = pruneRememberedSpaceNukes(result.nukedPosts)
-                    }
                 }
             }
             finally {
@@ -10421,7 +10295,9 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
                     resolveProfileFromPage: true,
                     resolutionReason: association.resolutionReason || '',
                     source,
-                    evidence: association.evidence || []
+                    evidence: association.evidence || [],
+                    // Provenance (for later shared moderation; nothing decides on it). The post the row came from.
+                    ...(association.postKey ? {sourcePostKey: association.postKey} : {})
                 }
             }
 
@@ -10433,7 +10309,9 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
                 candidateConfidence: association.candidateEvidence?.confidence || '',
                 candidateCollector: association.candidateEvidence?.collector || '',
                 source,
-                evidence: association.evidence || []
+                evidence: association.evidence || [],
+                // Provenance: the first post this profile was found in. A profile linked from several posts keeps the first one.
+                ...(association.postKeys?.[0] ? {sourcePostKey: association.postKeys[0]} : {})
             }
         })
     }, onProgress)
@@ -10490,13 +10368,14 @@ async function nukeSpaceFeedEntries(button, entries) {
     const space = resolveCurrentSpaceDescriptor()
     if(!space) return false
 
-    let alreadyNukedCount = 0
+    // Owner, 25 Oct: the already-nuked count is a count of PROFILES. A profile linked from several posts counts once.
+    const alreadyNukedProfiles = new Set()
     let unqueueableCount = 0
     const unfinishedEntries = entries.flatMap(entry => {
-        if(isSpaceFeedEntryNuked(entry)) {
-            alreadyNukedCount += 1
-            return []
-        }
+        const candidateProfiles = getNormalizedProfileHrefList(entry?.candidateUrls || [])
+        const nukedProfiles = candidateProfiles.filter(url => isKnownNukedSpaceFeedProfile(url))
+        for(const url of nukedProfiles) alreadyNukedProfiles.add(url)
+        if(candidateProfiles.length && nukedProfiles.length === candidateProfiles.length) return []
 
         const candidateUrls = getQueueableSpaceFeedEntryUrls(entry)
         const resolveProfileFromPage = !candidateUrls.length && isQueueableSpaceFeedResolverEntry(entry)
@@ -10534,7 +10413,7 @@ async function nukeSpaceFeedEntries(button, entries) {
     const preFilter = {
         totalCandidates: entries.length,
         rawWorkItems,
-        alreadyNuked: alreadyNukedCount,
+        alreadyNuked: alreadyNukedProfiles.size,
         unqueueable: unqueueableCount,
         duplicateProfile: Math.max(0, rawWorkItems - workAssociations.length)
     }
@@ -10558,11 +10437,12 @@ async function nukeSpaceFeedEntries(button, entries) {
             spaceFeedNukingPostKeys.add(entry.postKey)
         }
     }
+    // Owner, 26 Oct: these posts count as pending from now, before the enqueue settles and before the page's copy of the queue has the rows.
+    const enqueueMarkBatch = beginSpaceFeedEnqueueMarks(workAssociations)
     await animateNukeButtonPress(button)
     setNukeButtonWorking(button, 'Queueing...')
 
     try {
-        await registerPendingSpaceFeedEntries(space, unfinishedEntries)
         syncSpaceFeedNukeControls()
 
         // Each chunk (see sendCoordinatorEnqueueChunked) settles as its own
@@ -10575,12 +10455,14 @@ async function nukeSpaceFeedEntries(button, entries) {
         })
         const enqueueQueuedCount = Number.parseInt(result?.queued, 10) || 0
         const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
-        // Owner, 23 Oct: a profile the worker merged was not queued, so its pending record is cleared rather than left as "left".
-        if(Array.isArray(result?.mergedHrefs) && result.mergedHrefs.length) {
-            await removePendingSpaceFeedUrls(result.mergedHrefs)
-            syncSpaceFeedNukeControls()
+        // The enqueue reply carries counts, not rows, so the marks stay until a state reply asked after the enqueue settles shows the rows.
+        if(result?.durable && !result?.storageTimedOut && enqueueQueuedCount + enqueueMergedCount > 0) {
+            settleSpaceFeedEnqueueMarks(enqueueMarkBatch, true)
+            void refreshSpaceFeedStateAfterEnqueue()
         }
-
+        else {
+            settleSpaceFeedEnqueueMarks(enqueueMarkBatch, false)
+        }
         if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
             // Merged rows (already-known key: currently queued, or a past
@@ -10612,13 +10494,14 @@ async function nukeSpaceFeedEntries(button, entries) {
             return true
         }
 
-        await removePendingSpaceFeedEntries(unfinishedEntries)
         const nothingQueuedBreakdown = formatSpaceFeedPreFilterBreakdown(preFilter)
         setNukeButtonNotice(button, nothingQueuedBreakdown ? `Nothing queued (${nothingQueuedBreakdown})` : 'Nothing queued')
         return false
     }
     finally {
         delete button.dataset.mbQueueing
+        // A thrown enqueue never settled its marks: they go with it, as a failed enqueue does.
+        if(!enqueueMarkBatch.settledAt) settleSpaceFeedEnqueueMarks(enqueueMarkBatch, false)
         for(const entry of unfinishedEntries) {
             if(entry?.postKey) {
                 spaceFeedNukingPostKeys.delete(entry.postKey)
@@ -11049,7 +10932,7 @@ function syncSpaceFeedPostButtons(renderModel) {
             }
 
             const postKey = activeButton.dataset.mbPostKey || ''
-            if(!postKey || isSpaceFeedPostNuked(postKey, getSpaceFeedButtonUrls(activeButton))) {
+            if(!postKey || isSpaceFeedPostNuked(getSpaceFeedButtonUrls(activeButton))) {
                 setNukeButtonDone(activeButton)
                 activeButton.disabled = true
                 return
@@ -11243,7 +11126,7 @@ function syncSpaceFeedNukeControls() {
     syncSpaceFeedTopBarLayout()
     lastSpaceFeedRenderModel = renderModel
     timedSpaceQuery('phase.postButtons', () => syncSpaceFeedPostButtons(renderModel))
-    if(getStoredPendingSpaceFeedWorkCountForSpace() > 0 || hasActivePendingSpaceFeedWork(entries)) {
+    if(getPendingCoordinatorSpaceFeedWorkCountForSpace() > 0 || hasActivePendingSpaceFeedWork(entries)) {
         scheduleSpaceAssetNukeControls(1200)
     }
     return true

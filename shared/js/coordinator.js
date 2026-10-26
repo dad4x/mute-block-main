@@ -1,5 +1,5 @@
 const browser = require('webextension-polyfill')
-const { setMuteBlockHelp } = require('./muteBlockHelp')
+const { setMuteBlockHelp, muteBlockHelpText } = require('./muteBlockHelp')
 const {
     isRetryableJobFailure,
     isRetryableJobFailureFromProgress,
@@ -13,15 +13,8 @@ const {
     COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS,
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
 } = require('./timeouts')
-const {
-    SPACE_NUKED_POSTS_KEY,
-    NUKED_POST_RETENTION_DAYS_KEY,
-    MAX_REMEMBERED_NUKED_POSTS_KEY,
-    getPrunedNukedPosts
-} = require('./nukedPosts')
-const {readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS} = require('./tunables')
 const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
@@ -77,6 +70,9 @@ const state = {
     queueCounts: {},
     queueTotal: 0,
     queueTruncated: false,
+    // {count, durationCount, durationTotalMs} from the worker's completed summary (sw.js summarizeCompletedWorkDurationsSince), carried by the
+    // queue view on both the refresh and the pushed path. Null until a view carries it.
+    completedSummary: null,
     runs: {},
     events: [],
     metrics: {},
@@ -536,6 +532,12 @@ function applyCoordinatorDashboardStateFromMessage(incomingState = {}) {
         if(hasCoordinatorQueueView() && view && typeof view === 'object' && !isRegression) {
             state.queueCounts = normalizeObject(view.counts)
             state.queueTotal = incomingTotal || state.queueTotal
+            applied = true
+        }
+        // The completed summary is not a live-queue count, so the regression guard above does not apply to it.
+        const completedSummary = readCompletedSummary(view)
+        if(completedSummary) {
+            state.completedSummary = completedSummary
             applied = true
         }
     }
@@ -1166,6 +1168,19 @@ function applyCoordinatorQueueView(value = {}) {
     state.queueCounts = normalizeObject(view.counts)
     state.queueTotal = Number.parseInt(view.total, 10) || items.length
     state.queueTruncated = view.truncated === true
+    state.completedSummary = readCompletedSummary(view) || state.completedSummary
+}
+
+// The worker's completed summary, carried by the queue view (sw.js summarizeCompletedWorkDurationsSince). Returns
+// {count, durationCount, durationTotalMs}, or null when the view has no summary, so the page keeps the one it has.
+function readCompletedSummary(view = null) {
+    const summary = view?.completedSummary
+    if(!summary || typeof summary !== 'object') return null
+    return {
+        count: Number.parseInt(summary.count, 10) || 0,
+        durationCount: Number.parseInt(summary.durationCount, 10) || 0,
+        durationTotalMs: Number(summary.durationTotalMs) || 0
+    }
 }
 
 function normalizeObject(value) {
@@ -1238,6 +1253,21 @@ function getQueueTerminalCount(queueItems = []) {
 
 function getQueueTotalCount(queueItems = []) {
     return hasCoordinatorQueueView() ? Number(state.queueTotal) || queueItems.length : queueItems.length
+}
+
+// The TERMINAL card: every completed row since the Clear All Stats cutoff, from the worker's completed summary. It is not the
+// queue-count terminal sum (getQueueTerminalCount), which the worker bar and the bottom bar still read.
+function getCompletedTerminalCount() {
+    return state.completedSummary ? state.completedSummary.count : 0
+}
+
+// Average item time for the card, in ms, or null for '--'. From the worker's completed summary: the sum of durations over the
+// completed rows that have a positive duration (terminalAt minus activeAt, the same base the developer dashboard's timing cell uses),
+// divided by how many there are. Zero-length rows are counted in the TERMINAL card but do not dilute the average.
+function getCompletedItemAverageMs() {
+    const summary = state.completedSummary
+    if(!summary || summary.durationCount <= 0) return null
+    return summary.durationTotalMs / summary.durationCount
 }
 
 // The worker window's minimal "idiot light" status bar -- deliberately not
@@ -1353,7 +1383,7 @@ function render() {
         getQueueStatusCount('active', queueItems) +
         getQueueStatusCount('acting', queueItems) +
         getQueueStatusCount('settling', queueItems)
-    const terminalCount = getQueueTerminalCount(queueItems)
+    const terminalCount = getCompletedTerminalCount()
     const timingEpochStartedAt = getCurrentMetricsEpochStartedAt()
     const secondsPerBlock = rememberTimingTile('secondsPerBlock', timingEpochStartedAt, getSecondsPerActualBlock(timingEpochStartedAt))
     const secondsPerAlreadyBlocked = rememberTimingTile('secondsPerAlreadyBlocked', timingEpochStartedAt, getSecondsPerAlreadyBlocked(timingEpochStartedAt))
@@ -1410,6 +1440,9 @@ function render() {
     ))
     setText('blockAttemptOnFollowingCount', blockOutcomeCounts.blockAttemptOnFollowingCount)
     setText('terminalCount', terminalCount)
+    // Average over every completed row since the stats cutoff (see getCompletedItemAverageMs), not just the listed live rows.
+    const completedItemAverageMs = getCompletedItemAverageMs()
+    setText('avgItemTimeValue', completedItemAverageMs === null ? '--' : formatPhaseTimingDurationMs(completedItemAverageMs))
     // The Load phase (navigation start to content script open) of this metrics epoch, averaged over its samples.
     const pageLoadCounters = ((state.metrics || {}).currentEpoch || state.metrics || {}).counters || {}
     const pageLoadSamples = getMetricCounter(pageLoadCounters, 'profileAction.phase.load.sampleCount')
@@ -1779,7 +1812,24 @@ function readDebugResumeLimitFromControls() {
     return {minutes, targets}
 }
 
-// Dev-mode only: downloads the service worker's flight recorder as JSON.
+// The file name a flight recorder save gets, in local time: mute-block-flight-recorder-2026-10-26T14-05-33.json. usedNames holds the names
+// this page has already handed out, so a second save in the same second gets -2, -3 and so on. Only the names are checked here; the
+// browser's own download handling still decides the folder.
+const flightRecorderSaveFileNames = new Set()
+
+function buildFlightRecorderFileName(date = new Date(), usedNames = new Set()) {
+    const pad = value => String(value).padStart(2, '0')
+    const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+    let fileName = `mute-block-flight-recorder-${stamp}.json`
+    for(let copy = 2; usedNames.has(fileName); copy += 1) {
+        fileName = `mute-block-flight-recorder-${stamp}-${copy}.json`
+    }
+    usedNames.add(fileName)
+    return fileName
+}
+
+// Dev-mode only: downloads the service worker's flight recorder as JSON. The download is an anchor click, so the browser picks the folder
+// (its download folder, unless it is set to ask); the button's hover help says so.
 async function saveFlightRecorder() {
     const button = document.getElementById('saveFlightRecorderButton')
     flashButton(button)
@@ -1798,7 +1848,7 @@ async function saveFlightRecorder() {
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = `flight-recorder-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    link.download = buildFlightRecorderFileName(new Date(), flightRecorderSaveFileNames)
     document.body.appendChild(link)
     link.click()
     link.remove()
@@ -2964,9 +3014,46 @@ function toggleOutlierEvents(outlier = {}) {
     renderOutliers()
 }
 
+// The gap of each event is the time since the event before it in the list as it is shown (the worker's order, oldest first). The first
+// event has no gap. A gap above OUTLIER_EVENT_GAP_ABNORMAL_MS is abnormal and is highlighted. Nothing is re-sorted here.
+function getOutlierEventGaps(events = []) {
+    const toTime = value => (typeof value === 'number' && Number.isFinite(value) ? value : null)
+    return events.map((event, index) => {
+        if(index === 0) return {gapMs: null, abnormal: false}
+        const at = toTime(event?.at)
+        const previousAt = toTime(events[index - 1]?.at)
+        if(at === null || previousAt === null) return {gapMs: null, abnormal: false}
+        const gapMs = at - previousAt
+        return {gapMs, abnormal: gapMs > OUTLIER_EVENT_GAP_ABNORMAL_MS}
+    })
+}
+
+function formatOutlierEventGap(gapMs = null) {
+    if(gapMs === null) return '—'
+    const sign = gapMs > 0 ? '+' : ''
+    if(gapMs > 1000) return `${sign}${(gapMs / 1000).toFixed(2)} s`
+    return `${sign}${Math.round(gapMs)} ms`
+}
+
+// One recorder event in an outlier's list: the flight recorder row, with the gap since the previous event after its time. An abnormal gap
+// gets the highlight class and hover help that says what the highlight means.
+function buildOutlierEventRow(entry, gap = {gapMs: null, abnormal: false}) {
+    const row = buildFlightRecorderRow(entry)
+    row.classList.add('row--outlier-event')
+    const gapCell = buildTextCell(formatOutlierEventGap(gap.gapMs), gap.gapMs === null ? 'No earlier event in this list' : 'Time since the previous event in this list')
+    gapCell.classList.add('outlier-event-gap')
+    row.insertBefore(gapCell, row.children[1] || null)
+    if(gap.abnormal) {
+        row.classList.add('row--event-gap-abnormal')
+        row.title = muteBlockHelpText(`Highlighted: this event came more than ${OUTLIER_EVENT_GAP_ABNORMAL_MS} ms after the event before it in this list. The gap column is the time between consecutive events, as listed.`)
+    }
+    return row
+}
+
 function buildOutlierEventsPanel(outlier = {}) {
     const panel = document.createElement('div')
     panel.className = 'outlier-events'
+    panel.title = muteBlockHelpText(`The gap column is the time since the previous event in this list. A gap above ${OUTLIER_EVENT_GAP_ABNORMAL_MS} ms is highlighted as abnormal.`)
     const events = outlierEventsByKey.get(getOutlierKey(outlier))
     const note = document.createElement('div')
     note.className = 'row-subtitle'
@@ -2983,8 +3070,9 @@ function buildOutlierEventsPanel(outlier = {}) {
         panel.append(note)
     }
     else {
-        note.textContent = `${events.length} recorder event${events.length === 1 ? '' : 's'}, oldest first: this profile's events, and the storage and checkpoint writes inside its span.`
-        panel.append(note, ...events.map(buildFlightRecorderRow))
+        note.textContent = `${events.length} recorder event${events.length === 1 ? '' : 's'}, oldest first: this profile's events, and the storage and checkpoint writes inside its span. Gaps above ${OUTLIER_EVENT_GAP_ABNORMAL_MS} ms are highlighted.`
+        const gaps = getOutlierEventGaps(events)
+        panel.append(note, ...events.map((entry, index) => buildOutlierEventRow(entry, gaps[index])))
     }
     return panel
 }

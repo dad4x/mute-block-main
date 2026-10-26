@@ -18,12 +18,10 @@ module.exports = {
     PROFILE_NUKE_PROGRESS_SHARD_COUNT: 256,
     LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT: 32,
     // The other storage layout counts (24 Oct, review Appendix C.1). Each one sets the names of stored keys. Changing one reshards the
-    // data under it, so it needs a migration. The space post maps and the checkpoint shards are on disk; the content indexes are derived.
-    SPACE_MAP_BUCKET_COUNT: 32,
+    // data under it, so it needs a migration. The checkpoint shards are on disk; the content indexes are derived.
     CHECKPOINT_SHARD_DEFAULT_COUNT: 10,
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT: 32,
     COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT: 32,
-    SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
     SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
     DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled',
     // The last or current continuous work: its start, and its end once it has ended (24 Oct). Read by the dashboard's Current Work header.
@@ -33,8 +31,6 @@ module.exports = {
     STORAGE_BUILD_KEY: 'mbStorageBuild',
     // Key names for the modules above (moved here so every storage key name is declared in one file).
     SPACE_SORT_KEY: 'mbSpaceSortBy',
-    SPACE_NUKED_POSTS_KEY: 'mbSpaceNukedPosts',
-    SPACE_MAP_LAYOUT_KEY: 'mbSpaceMapLayoutVersion',
     COORDINATOR_PAUSE_GENERATION_KEY: 'mbCoordinatorPauseGeneration',
     OWNED_TAB_STATE_KEY: 'mbOwnedTabIdsByParent',
     COORDINATOR_QUEUE_KEY: 'mbCoordinatorQueue',

@@ -70,7 +70,7 @@
                     <span class="dev-mode-toggle-track"><span class="dev-mode-toggle-thumb"></span></span>
                     <span class="dev-mode-toggle-label">Dev mode</span>
                 </label>
-                <button class="clear-button" id="clearAllStatsButton" type="button" title="Mute Block extension: Clears Metrics, Scan cost, Authority state reads, Recent event counts, and Outliers in one action">Clear All Stats</button>
+                <button class="clear-button" id="clearAllStatsButton" type="button" title="Mute Block extension: Clears Metrics, Scan cost, Recent event counts, and Outliers in one action">Clear All Stats</button>
                 <button class="clear-button" id="openHistoryButton" type="button" title="Mute Block extension: Open the history page">History</button>
                 <button class="clear-button" id="openPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
                 <div class="status-pill" id="refreshState">Loading</div>
@@ -93,16 +93,13 @@
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its stored work">Start</button>
                                 <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled title="Mute Block extension: Pause the current work, or resume it">Loading...</button>
-                                <button class="clear-button clear-button--danger" id="cancelCurrentWorkButton" type="button" title="Mute Block extension: Cancel the current work in the queue">Cancel Queue</button>
                                 <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Mute Block extension: Cancel and remove all Current Work rows">Clear</button>
-                                <button class="clear-button" id="requeueFailedButton" type="button" title="Mute Block extension: Requeue the failed rows so they run again">Requeue</button>
-                                <button class="clear-button" id="retryFailedButton" type="button" aria-pressed="false" title="Mute Block extension: Turn retrying of soft failures on or off">Enable Retry Soft-Fails</button>
                             </div>
                         </div>
                         <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Download the service worker's flight recorder as JSON">Save flight recorder</button>
+                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the service worker's flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
                                 <label class="dev-mode-select">Run for
                                     <select id="debugResumeMinutesSelect">
                                         <option value="0">No time limit</option>
@@ -143,6 +140,10 @@
                 <div class="summary-tile">
                     <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>
                     <div class="summary-value" id="terminalCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Mute Block extension: The average over the finished items in this view, each measured from start (activeAt) to finish (terminalAt), same base as the developer dashboard.">Avg item time</div>
+                    <div class="summary-value" id="avgItemTimeValue">--</div>
                 </div>
                 <div class="summary-tile">
                     <div class="summary-label" title="Average page load per profile action this metrics epoch: from navigation start to the content script opening (the Load phase of Phase timing). Shows -- until finished rows carry those milestones.">Avg page load</div>
@@ -260,19 +261,6 @@
                 <div class="histogram-container" id="scanCostHistogram"></div>
             </section>
 
-            <section class="panel" data-panel-scroll-target="authorityLoadHistogram" data-dev-mode-panel hidden>
-                <div class="panel-head">
-                    <div class="panel-title">
-                        <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="authorityLoadHistogram" aria-expanded="true" aria-controls="authorityLoadHistogram" aria-label="Collapse Authority state reads" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="Calls to the coordinator-authority-state accessors, by verb (full/cheap/verify/forceReload) and call site -- not flight-recorder events, just calls of interest for tracking which call sites exercise which cost tier.">Authority state reads</h2>
-                    </div>
-                    <div class="panel-actions">
-                        <button class="clear-button" id="clearAuthorityLoadHistogramButton" type="button" title="Mute Block extension: Authority-load call counts are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
-                    </div>
-                </div>
-                <div class="histogram-container" id="authorityLoadHistogram"></div>
-            </section>
-
             <section class="panel" data-panel-scroll-target="writeSizeHistogram" data-dev-mode-panel hidden>
                 <div class="panel-head">
                     <div class="panel-title">
@@ -316,7 +304,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="Rows whose active duration exceeded 45s or 2.5 standard deviations above the average active duration of terminal rows. Checked continuously, so a still-running stuck row shows up too. Kept by the worker across reloads until Clear here or Clear All Stats.">Outliers</h2>
+                        <h2 title="Finished rows only. A row is listed when it took 45s or more, or 2.5 standard deviations above the average of finished rows, and it took 3.5s or more. Events expands the flight recorder events kept with each outlier. Kept by the worker across reloads until Clear here or Clear All Stats.">Outliers</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="outlierCount">0 outliers</span>

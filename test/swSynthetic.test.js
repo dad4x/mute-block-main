@@ -623,6 +623,48 @@ test('dashboard view counts finished work over the population, so the Quora-visi
     assert.equal(view.view.finishedWork.outcomes.blocked + view.view.finishedWork.outcomes.alreadyBlocked + Object.values(view.view.finishedWork.outcomes.skipped).reduce((n, v) => n + v, 0) + view.view.finishedWork.outcomes.failed + view.view.finishedWork.outcomes.other, 1, 'every finished row is in one outcome bucket')
 })
 
+test('completed summary: the count and duration total cover the completed rows with a positive duration, and skip unfinished and zero-length rows', async () => {
+    // Owner definition (26 Oct): the TERMINAL card counts every completed row since the cutoff. The AVG ITEM TIME card divides the duration total by
+    // the rows with a positive duration (terminalAt - activeAt, with activeAt > 0 and terminalAt > activeAt). Rows A and B have durations; C is completed
+    // but zero-length; D is live and unfinished, so it is not in the completed log.
+    const runId = 'run-finished-duration'
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Finished-Duration-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Finished-Duration-B'
+    const hrefC = 'https://www.quora.com/profile/Synthetic-Finished-Duration-C'
+    const hrefD = 'https://www.quora.com/profile/Synthetic-Finished-Duration-D'
+    const finishedRow = (href, attemptId, status, activeAt, terminalAt) => ({
+        ...makeArchivedCoordinatorRow({href, runId, attemptId, terminalAt}),
+        status,
+        activeAt,
+        terminalAt
+    })
+    const completed = {
+        [hrefA]: finishedRow(hrefA, 'attempt-duration-a', 'succeeded', 1000, 3000),
+        [hrefB]: finishedRow(hrefB, 'attempt-duration-b', 'failed', 5000, 6000),
+        [hrefC]: finishedRow(hrefC, 'attempt-duration-c', 'succeeded', 7000, 7000)
+    }
+    const activeRow = {
+        ...makeQueuedCoordinatorRow({href: hrefD, runId, attemptId: 'attempt-duration-d', now: 8000}),
+        status: 'active',
+        activeAt: 8000,
+        terminalAt: 0
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 9000,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...makeCompletedWalStoragePayload({completed, queue: {[hrefD]: activeRow}}),
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    const {view} = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('finished-duration'))
+    assert.equal(view.counts.succeeded, 2, 'the zero-length succeeded row is in the queue counts')
+    assert.equal(view.counts.failed, 1)
+    assert.deepEqual(view.completedSummary, {count: 3, durationCount: 2, durationTotalMs: 3000}, 'A, B and C are completed; A takes 2000 ms and B takes 1000 ms; C has no duration')
+})
+
 test('terminal cleanup coalesces overlapping per-row calls into one trailing pass', async () => {
     const {sw} = loadServiceWorkerHarness({now: 4000, storage: {}})
     const first = sw.closeTerminalOwnedProfileTabs()
@@ -1611,7 +1653,6 @@ test('legacy cleanup removes only the listed names that are present, keeps prote
         mbCoordinatorEvents: [],
         mbCoordinatorPaused: false,
         'mbCoordinatorNamespaceSeq.mbCoordinatorRuns': 'protected-token',
-        mbSpaceNukedPosts: {},
         [LEGACY_PROFILE_PROGRESS_KEY]: {'legacy-full-copy': {status: 'queued'}}
     }
     const nearMisses = {
@@ -3483,34 +3524,6 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(second.progressOperation.reason, 'projection-persisted')
     assert.equal(second.progressOperation.previousRecord.status, 'page-ready')
     assert.equal(second.progressOperation.nextRecord.status, 'blocking')
-    assert.equal(second.progressShadowWal.checked, true)
-    assert.equal(second.progressShadowWal.matched, true)
-    assert.equal(second.progressShadowWal.withPrevious, true)
-    assert.equal(second.progressShadowWal.operationKind, 'queued-progress-milestone')
-    assert.equal(second.progressShadowWal.record.kind, 'map.set')
-    assert.equal(second.progressShadowWal.record.area, 'progress')
-    assert.equal(second.progressShadowWal.record.key, href)
-    assert.equal(second.progressShadowWal.record.operationKind, 'queued-progress-milestone')
-    assert.equal(second.progressShadowWal.record.reason, 'projection-persisted')
-    assert.equal(second.progressShadowWal.record.value.status, 'blocking')
-    assert.equal(second.progressShadowWal.projectedRecord.status, 'blocking')
-    assert.equal(second.progressShadowWal.append.appended, true)
-    assert.equal(second.progressShadowWal.append.records.length, 1)
-    assert.equal(second.progressShadowWal.append.matched, 1)
-    assert.equal(second.progressShadowWal.append.mismatched, 0)
-    assert.equal(second.progressShadowWal.append.totalRecords, 2)
-    const shadowWalRecords = getWalRecordsForGeneration(
-        sw.state().progressShadowWalStore,
-        second.progressShadowWal.append.generationId
-    )
-    assert.equal(shadowWalRecords.length, 2)
-    assert.equal(shadowWalRecords[1].area, 'progress')
-    assert.equal(shadowWalRecords[1].key, href)
-    assert.equal(shadowWalRecords[1].operationKind, 'queued-progress-milestone')
-    assert.equal(shadowWalRecords[1].reason, 'projection-persisted')
-    const recoveredShadow = recoverProjectedState(sw.state().progressShadowWalStore)
-    assert.equal(recoveredShadow.recovered, true)
-    assert.equal(recoveredShadow.projected.state.progress[href].status, 'blocking')
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'tab-opened')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
@@ -3550,18 +3563,6 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(afterSecond['storagePayload.read.path.rowEvent.queued-progress-milestone.load.bytes'] || 0, 0)
     assert.equal(afterSecond['rowEvent.queued-progress-milestone.accepted'] || 0, 2)
     assert.ok((afterSecond['rowEvent.queued-progress-milestone.queueSnapshotSkipped'] || 0) >= 1)
-    assert.equal(afterSecond['progress.shadowWal.checked'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.matched'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.mismatched'] || 0, 0)
-    assert.equal(afterSecond['progress.shadowWal.withPrevious'] || 0, 2)
-    assert.equal(afterSecond['rowEvent.queued-progress-milestone.shadowWal.checked'] || 0, 2)
-    assert.equal(afterSecond['rowEvent.queued-progress-milestone.shadowWal.matched'] || 0, 2)
-    assert.equal(afterSecond['rowEvent.queued-progress-milestone.shadowWal.withPrevious'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.appended'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.appendBatches'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.appendProjectionMatched'] || 0, 2)
-    assert.equal(afterSecond['progress.shadowWal.appendProjectionMismatched'] || 0, 0)
-    assert.ok(afterSecond['progress.shadowWal.bytes'] > 0)
 
     const repeat = await sw.applyCoordinatorRowEvent({
         eventKind: 'queued-progress-milestone',
@@ -3577,16 +3578,6 @@ test('row event records same-attempt nonterminal queued progress without rereadi
     assert.equal(repeat.progressOperation.changed, false)
     assert.equal(repeat.progressOperation.durable, true)
     assert.equal(repeat.progressOperation.reason, 'projection-persisted')
-    assert.equal(repeat.progressShadowWal.checked, false)
-    assert.equal(repeat.progressShadowWal.matched, false)
-    assert.equal(repeat.progressShadowWal.reason, 'no-change')
-    assert.equal(repeat.progressShadowWal.skippedNoChange, true)
-    assert.equal(repeat.progressShadowWal.append, undefined)
-    assert.equal(afterRepeat['progress.shadowWal.checked'] || 0, afterSecond['progress.shadowWal.checked'] || 0)
-    assert.equal(afterRepeat['progress.shadowWal.matched'] || 0, afterSecond['progress.shadowWal.matched'] || 0)
-    assert.equal(afterRepeat['progress.shadowWal.appended'] || 0, afterSecond['progress.shadowWal.appended'] || 0)
-    assert.equal(afterRepeat['progress.shadowWal.skippedNoChange'] || 0, 1)
-    assert.equal(afterRepeat['rowEvent.queued-progress-milestone.shadowWal.skippedNoChange'] || 0, 1)
 
     await timers.tick(30000)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
@@ -4789,155 +4780,7 @@ test('a row that did not land on a profile page is not retried, and never become
     assert.ok(walRecords.every(record => record.key !== retryKey), 'no resolution row is written')
 })
 
-test('progress shadow WAL append uses bounded incremental replay', async () => {
-    const runId = 'run-bounded-shadow-wal'
-    const attemptId = 'attempt-bounded-shadow-wal'
-    const tabId = 507
-    const expectedRetentionLimit = 8
-    const iterations = expectedRetentionLimit + 12
-    const hrefs = Array.from(
-        {length: iterations},
-        (_, index) => `https://www.quora.com/profile/Synthetic-Bounded-Shadow-Wal-${index}`
-    )
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        shadowWalRecordLimit: expectedRetentionLimit,
-        now: 120000,
-        disableQueueWakeupMetricsFlush: true,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: Object.fromEntries(hrefs.map((href, index) => [
-                href,
-                makeActiveCoordinatorRow({href, runId, attemptId: `${attemptId}-${index}`, tabId: tabId + index, now: 120000})
-            ])),
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'profile-search',
-                    status: 'active',
-                    targetProfileHrefs: hrefs,
-                    targetWorkKeys: hrefs
-                }
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: Object.fromEntries(hrefs.map((href, index) => [
-                href,
-                {
-                    profileHref: href,
-                    status: 'tab-opened',
-                    runId,
-                    tabId: tabId + index,
-                    actionKind: 'mute-block',
-                    attemptId: `${attemptId}-${index}`,
-                    attemptNumber: 1,
-                    updatedAt: 119500
-                }
-            ]))
-        }
-    })
-
-    let last = null
-    for(let index = 0; index < iterations; index += 1) {
-        const href = hrefs[index]
-        last = await sw.applyCoordinatorRowEvent({
-            eventKind: 'queued-progress-milestone',
-            profileHref: href,
-            patch: {
-                status: 'blocking',
-                blockAttemptedAt: 120000 + index,
-                runId,
-                tabId: tabId + index,
-                actionKind: 'mute-block',
-                attemptId: `${attemptId}-${index}`,
-                attemptNumber: 1
-            }
-        })
-        assert.equal(last.recorded, true)
-        assert.equal(last.progressShadowWal.checked, true)
-        assert.equal(last.progressShadowWal.matched, true)
-        assert.equal(last.progressShadowWal.append.records.length, 1)
-        assert.equal(last.progressShadowWal.append.matched, 1)
-        assert.equal(last.progressShadowWal.append.mismatched, 0)
-    }
-
-    const counters = sw.state().queueWakeupCounters
-    const retainedRecords = getWalRecordsForGeneration(
-        sw.state().progressShadowWalStore,
-        sw.state().progressShadowWalStore.meta.activeCheckpoint
-    )
-    const recoveredShadow = recoverProjectedState(sw.state().progressShadowWalStore)
-
-    assert.equal(counters['progress.shadowWal.appended'] || 0, iterations)
-    assert.equal(counters['progress.shadowWal.appendProjectionMatched'] || 0, iterations)
-    assert.equal(counters['progress.shadowWal.appendProjectionMismatched'] || 0, 0)
-    assert.ok((counters['progress.shadowWal.checkpointSwitched'] || 0) >= 1)
-    assert.ok(retainedRecords.length <= expectedRetentionLimit)
-    assert.equal(recoveredShadow.recovered, true)
-    assert.equal(recoveredShadow.projected.state.progress[hrefs.at(-1)].status, 'blocking')
-    assert.equal(recoveredShadow.projected.state.progress[hrefs.at(-1)].blockAttemptedAt, 120000 + iterations - 1)
-    assert.equal(sw.state().profileNukeProgress[hrefs.at(-1)].blockAttemptedAt, 120000 + iterations - 1)
-    assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefs.at(-1)].status, 'tab-opened')
-})
-
-test('progress shadow WAL diagnostic append failure does not change row-event acknowledgement', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Progress-Shadow-Wal-Append-Failure'
-    const runId = 'run-progress-shadow-wal-append-failure'
-    const attemptId = 'attempt-progress-shadow-wal-append-failure'
-    const tabId = 508
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 130000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 130000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'tab-opened',
-                    runId,
-                    tabId,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 129500
-                }
-            }
-        }
-    })
-
-    sw.__testSetProgressShadowWalStore({meta: null})
-
-    const result = await sw.applyCoordinatorRowEvent({
-        eventKind: 'queued-progress-milestone',
-        profileHref: href,
-        patch: {
-            status: 'blocking',
-            blockAttemptedAt: 130100,
-            runId,
-            tabId,
-            actionKind: 'mute-block',
-            attemptId,
-            attemptNumber: 1
-        }
-    })
-    const counters = sw.state().queueWakeupCounters
-
-    assert.equal(result.recorded, true)
-    assert.equal(result.terminal, false)
-    assert.equal(result.progressProjectionDurable, true)
-    assert.equal(result.progressShadowWal.checked, true)
-    assert.equal(result.progressShadowWal.matched, true)
-    assert.equal(result.progressShadowWal.append.appended, false)
-    assert.equal(result.progressShadowWal.append.reason, 'diagnostic-error')
-    assert.equal(getProgressShardRecord(storage, href).status, 'blocking')
-    assert.equal(counters['progress.shadowWal.appendFailed'] || 0, 1)
-})
-
-test('progress shadow WAL parity uses exact persisted projection row after async save', async () => {
+test('row event after an async progress save persists the exact projection row', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Progress-Shadow-Wal-Time-Parity'
     const runId = 'run-progress-shadow-wal-time-parity'
     const attemptId = 'attempt-progress-shadow-wal-time-parity'
@@ -4994,85 +4837,10 @@ test('progress shadow WAL parity uses exact persisted projection row after async
     })
 
     assert.equal(result.recorded, true)
-    if(result.progressShadowWal.checked === true) {
-        assert.equal(result.progressShadowWal.matched, true)
-        assert.equal(result.progressShadowWal.record.value.updatedAt, 140000)
-        assert.equal(result.progressShadowWal.projectedRecord.updatedAt, 140000)
-    }
     assert.equal(getProgressShardRecord(storage, href).updatedAt, 140000)
 })
 
-test('progress shadow WAL appends same-status mutations with distinct ids', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Progress-Shadow-Wal-Same-Status'
-    const runId = 'run-progress-shadow-wal-same-status'
-    const attemptId = 'attempt-progress-shadow-wal-same-status'
-    const tabId = 510
-    const {sw} = loadServiceWorkerHarness({
-        now: 150000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 150000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: {
-                    profileHref: href,
-                    status: 'tab-opened',
-                    runId,
-                    tabId,
-                    actionKind: 'mute-block',
-                    attemptId,
-                    attemptNumber: 1,
-                    updatedAt: 149500
-                }
-            }
-        }
-    })
-
-    const first = await sw.applyCoordinatorRowEvent({
-        eventKind: 'queued-progress-milestone',
-        profileHref: href,
-        patch: {
-            status: 'blocking',
-            blockAttemptedAt: 150010,
-            runId,
-            tabId,
-            actionKind: 'mute-block',
-            attemptId,
-            attemptNumber: 1
-        }
-    })
-    const second = await sw.applyCoordinatorRowEvent({
-        eventKind: 'queued-progress-milestone',
-        profileHref: href,
-        patch: {
-            status: 'blocking',
-            foregroundWaitLastEventAt: 150020,
-            runId,
-            tabId,
-            actionKind: 'mute-block',
-            attemptId,
-            attemptNumber: 1
-        }
-    })
-
-    assert.equal(first.recorded, true)
-    assert.equal(second.recorded, true)
-    assert.equal(first.progressShadowWal.append.matched, 1)
-    assert.equal(second.progressShadowWal.append.matched, 1)
-    assert.equal(second.progressShadowWal.append.mismatched, 0)
-    assert.notEqual(
-        first.progressShadowWal.append.records[0].id,
-        second.progressShadowWal.append.records[0].id
-    )
-    assert.equal(sw.state().queueWakeupCounters['progress.shadowWal.appendProjectionMismatched'] || 0, 0)
-})
-
-test('row event does not report shadow WAL parity for suppressed progress projection storage', async () => {
+test('row event reports suppressed progress projection storage as non-durable', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Suppressed-Progress-Projection'
     const runId = 'run-suppressed-progress-projection'
     const attemptId = 'attempt-suppressed-progress-projection'
@@ -5140,20 +4908,11 @@ test('row event does not report shadow WAL parity for suppressed progress projec
     assert.equal(result.progressOperation.reason, 'projection-suppressed')
     assert.equal(result.progressOperation.previousRecord.status, 'tab-opened')
     assert.equal(result.progressOperation.nextRecord.status, 'blocking')
-    assert.equal(result.progressShadowWal.checked, false)
-    assert.equal(result.progressShadowWal.matched, false)
-    assert.equal(result.progressShadowWal.reason, 'non-durable')
-    assert.equal(result.progressShadowWal.skippedNonDurable, true)
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'tab-opened')
     assert.equal(getProgressShardRecord(storage, href).status, 'tab-opened')
     assert.equal(counters['progress.rowProjectionStorageSuppressed'] || 0, 1)
     assert.equal(counters['progress.rowProjectionStorageWrites'] || 0, 0)
-    assert.equal(counters['progress.shadowWal.checked'] || 0, 0)
-    assert.equal(counters['progress.shadowWal.matched'] || 0, 0)
-    assert.equal(counters['progress.shadowWal.skippedNonDurable'] || 0, 1)
-    assert.equal(counters['rowEvent.queued-progress-milestone.shadowWal.checked'] || 0, 0)
-    assert.equal(counters['rowEvent.queued-progress-milestone.shadowWal.skippedNonDurable'] || 0, 1)
     assert.equal(counters['rowEvent.queued-progress-milestone.projectionSaved'] || 0, 0)
     assert.equal(counters['rowEvent.queued-progress-milestone.projectionSuppressed'] || 0, 1)
 })
@@ -5220,15 +4979,11 @@ test('row event treats throwing progress projection storage as non-durable proje
     assert.equal(result.progressProjectionSuppressed, true)
     assert.equal(result.progressOperation.durable, false)
     assert.equal(result.progressOperation.reason, 'projection-suppressed')
-    assert.equal(result.progressShadowWal.checked, false)
-    assert.equal(result.progressShadowWal.reason, 'non-durable')
     assert.equal(sw.state().profileNukeProgress[href].status, 'blocking')
     assert.equal(storage.mbProfileNukeProgressView, undefined)
     assert.equal(getProgressShardRecord(storage, href), null)
     assert.equal(counters['progress.rowProjectionStorageFailed'] || 0, 1)
     assert.equal(counters['progress.rowProjectionStorageSuppressed'] || 0, 1)
-    assert.equal(counters['progress.shadowWal.checked'] || 0, 0)
-    assert.equal(counters['progress.shadowWal.skippedNonDurable'] || 0, 1)
     assert.equal(counters['rowEvent.queued-progress-milestone.projectionSuppressed'] || 0, 1)
 })
 
@@ -9700,7 +9455,6 @@ test('archive, blocked-tab, checkpoint and full-queue writes put no index, shard
         queue[href] = makeActiveCoordinatorRow({href, runId, attemptId: `attempt-disk-guard-${index}`, tabId: 700 + index, now})
     })
     const {browser, sw, timers} = loadServiceWorkerHarness({
-        shadowWalRecordLimit: 2,
         now,
         disableQueueWakeupMetricsFlush: true,
         storage: {
@@ -9754,7 +9508,7 @@ test('archive, blocked-tab, checkpoint and full-queue writes put no index, shard
         }, {tab: {id: tab.id, url: hrefs[2]}})
         await flushAsync(40)
 
-        // 5. Enough single-row writes to switch the checkpoint (shadowWalRecordLimit is 2).
+        // 5. Several single-row writes to one row.
         for(let index = 0; index < 3; index += 1) {
             await sw.coordinatorAuthority.apply({
                 operationKind: 'current-work-item-cancel',
@@ -10012,17 +9766,6 @@ test('terminal settlement applies terminal row residue through authority in a ba
             },
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {
-                'post-terminal-settlement': {
-                    postKey: 'post-terminal-settlement',
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-settlement',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [hrefA, hrefB],
-                    remainingUrls: [hrefA, hrefB],
-                    updatedAt: 254000
-                }
-            },
-            mbSpaceNukedPosts: {}
         }
     })
 
@@ -10036,7 +9779,6 @@ test('terminal settlement applies terminal row residue through authority in a ba
     assert.equal(sw.coordinatorAuthority.current().queue[hrefA].sourceSettlementOutcome, 'confirmed')
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].sourceSettlementOutcome, 'confirmed')
     assert.equal(getFreshQueueView(sw, storage).counts.succeeded, 2)
-    assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement'], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefA], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][hrefB], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[hrefA].status, 'blocked')
@@ -10082,17 +9824,6 @@ test('terminal settlement confirms missing queue row from projection-only progre
                 terminalAt: 254570,
                 updatedAt: 254570
             }),
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-projection-only-missing',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 254000
-                }
-            },
-            mbSpaceNukedPosts: {}
         }
     })
 
@@ -10101,13 +9832,12 @@ test('terminal settlement confirms missing queue row from projection-only progre
     assert.equal(result.settled, 1)
     assert.equal(result.confirmed, 1)
     assert.equal(result.cleared, 0)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
     assert.equal(storage[LEGACY_PROFILE_PROGRESS_KEY][href], undefined)
     assert.equal(storage.mbProfileNukeProgressView.records[href].status, 'blocked')
     assert.equal(getProgressShardRecord(storage, href).status, 'blocked')
 })
 
-test('terminal settlement clears source posts for WAL-terminal rows over stale snapshot', async () => {
+test('terminal settlement archives WAL-terminal rows over a stale snapshot', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Wal-Handoff'
     const runId = 'run-terminal-settlement-wal-handoff'
     const attemptId = 'attempt-terminal-settlement-wal-handoff'
@@ -10134,17 +9864,6 @@ test('terminal settlement clears source posts for WAL-terminal rows over stale s
                     updatedAt: 254500
                 }
             },
-            mbSpacePendingNukedPosts: {
-                'post-terminal-settlement-wal-handoff': {
-                    postKey: 'post-terminal-settlement-wal-handoff',
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-settlement-wal-handoff',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 254500
-                }
-            },
-            mbSpaceNukedPosts: {}
         }
     })
 
@@ -10169,17 +9888,10 @@ test('terminal settlement clears source posts for WAL-terminal rows over stale s
     assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'succeeded')
     // recordCoordinatorJobProgress above already durably settled and archived
     // the row (it left .queue entirely, not just flipped to 'succeeded' in
-    // place), so settleTerminalCoordinatorItems below no longer finds a
-    // resident row to attach sourceSettlementOutcome to -- its source-post
-    // pending -> nuked handoff (a separate storage area, not gated on the
-    // coordinator row) still completes normally, which is this test's actual
-    // point.
+    // place), so settleTerminalCoordinatorItems below finds no resident row to
+    // attach sourceSettlementOutcome to. The archived row is the record (25 Oct:
+    // the source-post pending record was removed).
     await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
-    await waitFor(
-        () => storage.mbSpacePendingNukedPosts['post-terminal-settlement-wal-handoff'] === undefined,
-        'WAL terminal settlement did not clear source post pending record',
-        {attempts: 40}
-    )
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[href].sourceSettlementOutcome, undefined)
     const archivedRow = await sw.findCompletedWorkRowByKey(href)
@@ -10227,17 +9939,6 @@ test('terminal settlement WAL append failure leaves source post pending', async 
             },
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {
-                'post-terminal-settlement-wal-append-failure': {
-                    postKey: 'post-terminal-settlement-wal-append-failure',
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-settlement-wal-append-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 254600
-                }
-            },
-            mbSpaceNukedPosts: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -10252,7 +9953,6 @@ test('terminal settlement WAL append failure leaves source post pending', async 
 
     assert.equal(result.settled, 0)
     assert.equal(result.confirmed, 0)
-    assert.ok(storage.mbSpacePendingNukedPosts['post-terminal-settlement-wal-append-failure'])
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, undefined)
     assert.equal(sw.state().queueWakeupCounters['terminalSettlement.authorityApplyFailed'] || 0, 1)
@@ -10280,17 +9980,6 @@ test('terminal settlement projection failure does not poison WAL settlement', as
             },
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {
-                'post-terminal-settlement-projection-failure': {
-                    postKey: 'post-terminal-settlement-projection-failure',
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-settlement-projection-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 254600
-                }
-            },
-            mbSpaceNukedPosts: {}
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -10312,7 +10001,6 @@ test('terminal settlement projection failure does not poison WAL settlement', as
 
     assert.equal(result.settled, 1)
     assert.equal(result.confirmed, 1)
-    assert.equal(storage.mbSpacePendingNukedPosts['post-terminal-settlement-projection-failure'], undefined)
     assert.equal(storage.mbCoordinatorQueueView, undefined)
     assert.ok(getStoredCoordinatorQueueWal(storage))
     assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
@@ -10320,62 +10008,6 @@ test('terminal settlement projection failure does not poison WAL settlement', as
     // 601f 1a: no index write can fail, so no reconcile is scheduled for one.
 })
 
-test('terminal settlement derived save failure does not poison authority settlement', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Derived-Failure'
-    const runId = 'run-terminal-settlement-derived-failure'
-    const attemptId = 'attempt-terminal-settlement-derived-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 254700,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: {
-                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId: null, now: 254700}),
-                    status: 'succeeded',
-                    outcome: 'blocked',
-                    terminalAt: 254710,
-                    updatedAt: 254710
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {
-                'post-terminal-settlement-derived-failure': {
-                    postKey: 'post-terminal-settlement-derived-failure',
-                    postUrl: 'https://www.quora.com/q/example/post-terminal-settlement-derived-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 254000
-                }
-            },
-            mbSpaceNukedPosts: {}
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbSpacePendingNukedPosts) {
-            throw new Error('synthetic terminal settlement derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
-
-    assert.equal(result.settled, 1)
-    assert.equal(result.confirmed, 1)
-    assert.equal(storage.mbCoordinatorQueue[href].sourceSettlementOutcome, undefined)
-    assert.equal(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
-    assert.ok(storage.mbSpacePendingNukedPosts['post-terminal-settlement-derived-failure'])
-    assert.equal(sw.state().queueWakeupCounters['terminalSettlement.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-})
 
 test('terminal settlement progress projection failure does not poison authority settlement', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Terminal-Settlement-Progress-Projection-Failure'
@@ -10399,8 +10031,6 @@ test('terminal settlement progress projection failure does not poison authority 
             },
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {},
-            mbSpaceNukedPosts: {}
         }
     })
     const originalSet = browser.storage.session.set.bind(browser.storage.session)
@@ -11693,7 +11323,7 @@ test('terminal job progress acknowledges durable terminal queue before projectio
     )
 })
 
-test('space-feed confirmation does not promote stale failed queue rows from the progress mirror', async () => {
+test('settlement does not promote stale failed queue rows from the progress mirror', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Read-Only'
     const runId = 'run-compatibility-progress-read-only'
     const attemptId = 'attempt-compatibility-progress-read-only'
@@ -11726,72 +11356,16 @@ test('space-feed confirmation does not promote stale failed queue rows from the 
         }
     })
 
-    const result = await browser.runtime.sendMessage({
-        action: 'confirm-space-feed-profiles-blocked',
-        profileHrefs: [href]
-    }, {tab: {id: 12, windowId: 1}})
+    const result = await sw.settleTerminalCoordinatorItems({profileHrefs: [href]})
 
-    assert.equal(result.confirmed, false)
+    // A failed row is not a confirmed profile: settlement may record it as cleared, but never promotes it.
+    assert.equal(result.confirmed, 0)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'failed')
     assert.equal(getRecoveredCoordinatorQueue(storage)[href].status, 'failed')
     assert.equal((await sw.coordinatorAuthority.hydrate()).queue[href].status, 'failed')
-    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbCoordinatorRuns[runId].terminalCount, undefined)
+    assert.notEqual(sw.coordinatorAuthority.current().queue[href].sourceSettlementOutcome, 'confirmed')
 })
 
-test('space-feed confirmation does not rewrite legacy progress mirror from queue authority', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Compatibility-Progress-Retired'
-    const runId = 'run-compatibility-progress-retired'
-    const attemptId = 'attempt-compatibility-progress-retired'
-    const terminalRow = {
-        ...makeFailedCoordinatorRow({href, runId, attemptId, now: 276500}),
-        status: 'succeeded',
-        outcome: 'blocked',
-        error: '',
-        terminalAt: 276500,
-        updatedAt: 276500
-    }
-    const progressRecord = {
-        profileHref: href,
-        status: 'blocking',
-        runId,
-        tabId: 0,
-        actionKind: 'mute-block',
-        attemptId,
-        attemptNumber: 1,
-        updatedAt: 276100
-    }
-    const {browser, storage} = loadServiceWorkerHarness({
-        now: 276500,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: terminalRow
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {
-                [href]: progressRecord
-            },
-            mbSpacePendingNukedPosts: {},
-            mbSpaceNukedPosts: {}
-        }
-    })
-
-    const result = await browser.runtime.sendMessage({
-        action: 'confirm-space-feed-profiles-blocked',
-        profileHrefs: [href]
-    }, {tab: {id: 12, windowId: 1}})
-
-    assert.equal(result.confirmed, false)
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'succeeded')
-    assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    const storedRecord = Object.values(storage[LEGACY_PROFILE_PROGRESS_KEY] || {})
-        .find(record => record?.profileHref === href)
-    assert.deepEqual(storedRecord, progressRecord)
-})
 
 // Entropy-reduction Phase 2 tripwire (see entropy-reduction-action-plan-2026-09-09.md):
 // summarizeProfileNukeProgressRecord (swProfileNukeProgress.js) is the one
@@ -11990,25 +11564,6 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
                 attemptNumber: 1,
                 updatedAt: 278500
             }),
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 278500
-                }
-            },
-            mbSpaceNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-profile-wal-failure',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    urls: [href],
-                    updatedAt: 278500
-                }
-            }
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -12035,8 +11590,6 @@ test('clear profile state WAL failure leaves raw and derived state intact', asyn
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     assert.ok(sw.state().profileNukeProgress[href])
     assert.equal(storage.mbCoordinatorRuns[runId].targetProfileHrefs.includes(href), true)
-    assert.ok(storage.mbSpacePendingNukedPosts[postKey])
-    assert.ok(storage.mbSpaceNukedPosts[postKey])
     const hydrated = await sw.coordinatorAuthority.hydrate()
     assert.equal(hydrated.queue[href].status, 'queued')
     assert.ok(
@@ -14591,14 +14144,6 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
                 }
             },
             mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -14642,9 +14187,6 @@ test('profile resolver remap is WAL-backed and recovers moved key', async () => 
     assert.equal(getFreshQueueView(sw, storage).counts.active, 1)
     assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, false)
-    assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].allUrls, [resolvedHref])
-    assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].remainingUrls, [resolvedHref])
     // After hydrate, the remap answers from the resident state (P2): it reads no coordinator, progress or space key from
     // storage. Metric reads are not coordinator state and are not part of this check.
     const coordinatorStateReads = getDefaults.filter(defaults => Object.keys(defaults || {}).some(key =>
@@ -14874,14 +14416,6 @@ test('profile resolver remap WAL append failure leaves resolver row and runtime 
                 }
             },
             mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
         }
     })
     sw.__testAddProvisionalQueuedTab(tabId, {
@@ -14932,7 +14466,6 @@ test('profile resolver remap WAL append failure leaves resolver row and runtime 
     assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
     assert.equal(storage.mbCoordinatorQueue[resolvedHref], undefined)
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
     const currentAuthority = await sw.coordinatorAuthority.hydrate()
     assert.equal(currentAuthority.queue[key].status, 'active')
     assert.equal(currentAuthority.queue[resolvedHref], undefined)
@@ -14941,98 +14474,6 @@ test('profile resolver remap WAL append failure leaves resolver row and runtime 
     assert.equal(metadata.profileHref, '')
 })
 
-test('profile resolver remap derived save failure does not poison WAL remap', async () => {
-    const requestedUrl = 'https://www.quora.com/q/example/post-resolver-remap-derived-failure'
-    const key = `resolve-profile:${requestedUrl}`
-    const resolvedHref = 'https://www.quora.com/profile/Resolver-Remap-Derived-Failure'
-    const runId = 'run-resolver-remap-derived-failure'
-    const attemptId = 'attempt-resolver-remap-derived-failure'
-    const postKey = 'post-resolver-remap-derived-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 426940,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [key]: {
-                    runId,
-                    status: 'active',
-                    actionKind: 'mute-block',
-                    executorTabAction: 'resolve-profile',
-                    requestedUrl,
-                    dedupeKey: key,
-                    coordinatorKey: key,
-                    resolveProfileFromPage: true,
-                    resolutionMode: 'author-profile',
-                    queuedAt: 425940,
-                    activeAt: 426440,
-                    updatedAt: 426440,
-                    attemptId,
-                    attemptNumber: 1,
-                    evidence: [{postKey, postUrl: requestedUrl}],
-                    milestones: {}
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    ...makeCoordinatorRun({href: key, runId}),
-                    targetProfileHrefs: [],
-                    targetWorkKeys: [key]
-                }
-            },
-            mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbSpacePendingNukedPosts) {
-            throw new Error('synthetic resolver remap derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await browser.runtime.sendMessage({
-        action: 'resolve-queued-profile-target',
-        requestedUrl,
-        coordinatorKey: key,
-        profileHref: resolvedHref,
-        attemptId,
-        attemptNumber: 1
-    }, {
-        tab: {
-            id: 6213,
-            url: resolvedHref
-        }
-    })
-
-    assert.equal(result.resolved, true)
-    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.equal(sw.coordinatorAuthority.current().queue[key], undefined)
-    assert.equal(sw.coordinatorAuthority.current().queue[resolvedHref].status, 'active')
-    assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
-    assert.equal(sw.state().queueWakeupCounters['resolver.resolve.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-
-    browser.storage.local.set = originalSet
-    const reconcileResult = await sw.reconcileCoordinatorStorage()
-
-    assert.equal(reconcileResult.pendingPostsChanged, true)
-    assert.notEqual(storage.mbSpacePendingNukedPosts[postKey]?.resolverPending, true)
-    if(storage.mbSpacePendingNukedPosts[postKey]) {
-        assert.deepEqual(storage.mbSpacePendingNukedPosts[postKey].allUrls, [resolvedHref])
-    }
-})
 
 test('late unresolved resolver failure cannot regress a WAL-terminal resolver row', async () => {
     const requestedUrl = 'https://www.quora.com/q/example/post-key-only-late-unresolved'
@@ -15153,14 +14594,6 @@ test('unresolved resolver terminalization is WAL-backed and recovers after resta
                 }
             },
             mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
         }
     })
 
@@ -15184,7 +14617,6 @@ test('unresolved resolver terminalization is WAL-backed and recovers after resta
     assert.equal(storage.mbCoordinatorQueueView?.counts.skipped, undefined)
     assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'skipped')
     assert.ok(sw.getFlightRecorderSnapshot({channel: 'event', limit: 50}).entries.length >= 1, 'the outcome is in the flight recorder')
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
 
     const walRecords = getWalRecordsForGeneration(
         getStoredCoordinatorQueueWal(storage),
@@ -15246,14 +14678,6 @@ test('unresolved resolver WAL append failure leaves row active', async () => {
                 }
             },
             mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
         }
     })
     const originalSet = browser.storage.local.set.bind(browser.storage.local)
@@ -15284,7 +14708,6 @@ test('unresolved resolver WAL append failure leaves row active', async () => {
     assert.equal(sw.coordinatorAuthority.current().queue[key].status, 'active')
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
     assert.equal(storage.mbCoordinatorEvents.length, 0)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
 })
 
 test('unresolved resolver rejects non-resolution active row before WAL append', async () => {
@@ -15328,101 +14751,6 @@ test('unresolved resolver rejects non-resolution active row before WAL append', 
     assert.equal(getStoredCoordinatorQueueWal(storage), undefined)
 })
 
-test('unresolved resolver derived save failure does not poison authority terminalization', async () => {
-    const requestedUrl = 'https://www.quora.com/q/example/post-unresolved-derived-failure'
-    const key = `resolve-profile:${requestedUrl}`
-    const runId = 'run-unresolved-derived-failure'
-    const attemptId = 'attempt-unresolved-derived-failure'
-    const postKey = 'post-unresolved-derived-failure'
-    const {browser, storage, sw} = loadServiceWorkerHarness({
-        now: 426985,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [key]: {
-                    runId,
-                    status: 'active',
-                    actionKind: 'mute-block',
-                    executorTabAction: 'resolve-profile',
-                    requestedUrl,
-                    dedupeKey: key,
-                    coordinatorKey: key,
-                    resolveProfileFromPage: true,
-                    resolutionMode: 'author-profile',
-                    queuedAt: 425985,
-                    activeAt: 426485,
-                    updatedAt: 426485,
-                    attemptId,
-                    attemptNumber: 1,
-                    evidence: [{postKey, postUrl: requestedUrl}],
-                    milestones: {}
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    ...makeCoordinatorRun({href: key, runId}),
-                    targetProfileHrefs: [],
-                    targetWorkKeys: [key]
-                }
-            },
-            mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: requestedUrl,
-                    resolverPending: true,
-                    resolverUrl: requestedUrl
-                }
-            }
-        }
-    })
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.set = async payload => {
-        if(payload?.mbSpacePendingNukedPosts) {
-            throw new Error('synthetic resolver unresolved derived save failure')
-        }
-        return originalSet(payload)
-    }
-
-    const result = await browser.runtime.sendMessage({
-        action: 'resolve-queued-profile-target-failed',
-        requestedUrl,
-        coordinatorKey: key,
-        attemptId,
-        attemptNumber: 1,
-        error: 'synthetic unresolved derived failure'
-    }, {
-        tab: {
-            id: 625,
-            url: requestedUrl
-        }
-    })
-
-    assert.equal(result.recorded, true)
-    assert.equal(storage.mbCoordinatorQueue[key].status, 'active')
-    assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'skipped')
-    assert.ok(getStoredCoordinatorQueueWal(storage))
-    assert.equal(storage.mbCoordinatorEvents.length, 0)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey].resolverPending, true)
-    assert.equal(sw.state().queueWakeupCounters['resolverUnresolved.derivedSaveFailed'] || 0, 1)
-    assert.ok(
-        sw.state().hasCoordinatorReconcileTimeout ||
-            (sw.state().queueWakeupCounters['reconcile.deferredBeforeQuora'] || 0) >= 1
-    )
-
-    browser.storage.local.set = originalSet
-    const reconcileResult = await sw.reconcileCoordinatorStorage()
-
-    // reconcileCoordinatorStorage's per-row self-healing loop only scans the
-    // live .queue, but this row already archived out of it. A second pass
-    // over a bounded recent-completed-work window
-    // (applyCoordinatorReconcileQueueAuthorityTransitionPhase) re-runs the
-    // same resolver-pending settlement check against archived rows, so this
-    // catch-up still finds and clears the pending post entry.
-    assert.equal(reconcileResult.pendingPostsChanged, true)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined)
-    assert.equal((await sw.findCompletedWorkRowByKey(key))?.status, 'skipped')
-})
 
 test('key-only terminalization rejects stale attempt before authority save', async () => {
     const key = 'resolve-profile:https://www.quora.com/q/example/post-key-only-stale'
@@ -16312,8 +15640,6 @@ test('coordinator authority hydrates resident projection without storage writes'
     assert.equal(hasStorageDefault(hydrateDefaults, LEGACY_PROFILE_PROGRESS_KEY), false)
     assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorEvents'), false, 'events are not read from disk')
     // The one full read also carries the space post keys (P3); none of them is a separate read later.
-    assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpacePendingNukedPosts'), true)
-    assert.equal(hasStorageDefault(hydrateDefaults, 'mbSpaceNukedPosts'), true)
 
     // current() returns a shallow copy, not a full deep clone (see the
     // comment on current() in sw.js, and entropy-reduction-action-plan
@@ -16641,38 +15967,6 @@ test('coordinator authority apply persists accepted row change', async () => {
     assert.equal(result.operation.previousRow.status, 'active')
     assert.equal(result.operation.nextRow.status, 'failed')
     assert.equal(result.operation.durable, true)
-    assert.equal(result.shadowWal.checked, true)
-    assert.equal(result.shadowWal.matched, true)
-    assert.equal(result.shadowWal.record.kind, 'map.set')
-    assert.equal(result.shadowWal.record.area, 'queue')
-    assert.equal(result.shadowWal.record.key, href)
-    assert.equal(result.shadowWal.record.operationKind, 'terminalize-key-only')
-    assert.equal(result.shadowWal.projectedRow.status, 'failed')
-    assert.equal(result.shadowWal.append.appended, true)
-    assert.equal(result.shadowWal.append.records.length, 1)
-    assert.equal(result.shadowWal.append.matched, 1)
-    assert.equal(result.shadowWal.append.mismatched, 0)
-    assert.equal(result.shadowWal.append.totalRecords, 1)
-    const authorityShadowWalRecords = getWalRecordsForGeneration(
-        sw.state().coordinatorAuthorityShadowWalStore,
-        result.shadowWal.append.generationId
-    )
-    // +2: archiveTerminalCoordinatorRow's own batch write (queue removal +
-    // completed-area add) also appends to the same shadow WAL store, on top
-    // of this apply()'s own single-row terminalize-key-only record.
-    assert.equal(authorityShadowWalRecords.length, 3)
-    assert.equal(authorityShadowWalRecords[0].area, 'queue')
-    assert.equal(authorityShadowWalRecords[0].key, href)
-    assert.equal(authorityShadowWalRecords[0].status, 'failed')
-    assert.equal(authorityShadowWalRecords[1].kind, 'map.remove')
-    assert.equal(authorityShadowWalRecords[1].area, 'queue')
-    assert.equal(authorityShadowWalRecords[2].kind, 'map.set')
-    assert.equal(authorityShadowWalRecords[2].area, 'completed')
-    const recoveredShadow = recoverProjectedState(sw.state().coordinatorAuthorityShadowWalStore)
-    assert.equal(recoveredShadow.recovered, true)
-    // The row's own remove record replays too, so it's gone from the
-    // recovered shadow queue as well (archived, not merely status-flipped).
-    assert.equal(recoveredShadow.projected.state.queue[href], undefined)
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(storage.mbCoordinatorQueueView?.counts.failed, undefined)
     assert.equal(storage.mbCoordinatorQueueView?.items.find(item => item.storageKey === href), undefined)
@@ -16681,98 +15975,9 @@ test('coordinator authority apply persists accepted row change', async () => {
     const counters = sw.state().queueWakeupCounters
     assert.ok(counters.storageSetCalls >= 2)
     assert.equal(counters['storageUpdate.started'], 1)
-    assert.equal(counters['coordinatorAuthority.shadowWal.checked'], 1)
-    assert.equal(counters['coordinatorAuthority.shadowWal.matched'], 1)
-    assert.equal(counters['coordinatorAuthority.shadowWal.mismatched'] || 0, 0)
-    // +2 on both: archiveTerminalCoordinatorRow's own batch write appends 2
-    // more shadow WAL records in its own append batch.
-    assert.equal(counters['coordinatorAuthority.shadowWal.appended'], 3)
-    assert.equal(counters['coordinatorAuthority.shadowWal.appendBatches'], 2)
-    assert.equal(counters['coordinatorAuthority.shadowWal.appendProjectionMatched'], 3)
-    assert.ok((counters['coordinatorAuthority.shadowWal.appendProjectionMismatched'] || 0) <=
-        (counters['coordinatorAuthority.shadowWal.appended'] || 0))
-    assert.ok(counters['coordinatorAuthority.shadowWal.bytes'] > 0)
 })
 
-test('coordinator authority shadow WAL append uses bounded incremental replay', async () => {
-    const expectedRetentionLimit = 8
-    const iterations = expectedRetentionLimit + 12
-    const hrefs = Array.from(
-        {length: iterations},
-        (_, index) => `https://www.quora.com/profile/Authority-Bounded-Shadow-Wal-${index}`
-    )
-    const {sw, storage} = loadServiceWorkerHarness({
-        shadowWalRecordLimit: expectedRetentionLimit,
-        now: 5050,
-        storage: {
-            mbCoordinatorQueue: Object.fromEntries(hrefs.map((href, index) => [
-                href,
-                {
-                    id: `authority-bounded-${index}`,
-                    status: 'active',
-                    attemptId: `attempt-bounded-${index}`,
-                    attemptNumber: 1,
-                    targetProfileHref: href,
-                    updatedAt: 5050
-                }
-            ]))
-        }
-    })
-
-    await sw.coordinatorAuthority.hydrate()
-    let last = null
-    for(let index = 0; index < iterations; index += 1) {
-        const href = hrefs[index]
-        last = await sw.coordinatorAuthority.apply({
-            operationKind: 'terminalize-key-only',
-            rowKey: href,
-            expectedAttemptId: `attempt-bounded-${index}`,
-            expectedAttemptNumber: 1,
-            reason: 'ordinaryMutation',
-            mutate(row, context) {
-                return {
-                    ...row,
-                    status: 'failed',
-                    error: `synthetic bounded failure ${index}`,
-                    terminalAt: context.now,
-                    updatedAt: context.now
-                }
-            }
-        })
-        assert.equal(last.accepted, true)
-        assert.equal(last.durable, true)
-        assert.equal(last.shadowWal.checked, true)
-        assert.equal(last.shadowWal.matched, true)
-        assert.equal(last.shadowWal.append.records.length, 1)
-        assert.equal(last.shadowWal.append.matched, 1)
-        assert.equal(last.shadowWal.append.mismatched, 0)
-    }
-
-    const counters = sw.state().queueWakeupCounters
-    const retainedRecords = getWalRecordsForGeneration(
-        sw.state().coordinatorAuthorityShadowWalStore,
-        sw.state().coordinatorAuthorityShadowWalStore.meta.activeCheckpoint
-    )
-    const recoveredShadow = recoverProjectedState(sw.state().coordinatorAuthorityShadowWalStore)
-
-    assert.ok((counters['coordinatorAuthority.shadowWal.appended'] || 0) >= iterations)
-    assert.ok((counters['coordinatorAuthority.shadowWal.appendProjectionMatched'] || 0) >= iterations)
-    assert.ok((counters['coordinatorAuthority.shadowWal.appendProjectionMismatched'] || 0) <=
-        (counters['coordinatorAuthority.shadowWal.appended'] || 0))
-    assert.ok((counters['coordinatorAuthority.shadowWal.checkpointSwitched'] || 0) >= 1)
-    assert.ok(retainedRecords.length <= iterations + expectedRetentionLimit + hrefs.length)
-    assert.equal(recoveredShadow.recovered, true)
-    assert.equal(recoveredShadow.projected.state.queue[hrefs.at(-1)], undefined)
-    assert.equal(storage.mbCoordinatorQueue[hrefs.at(-1)].status, 'active')
-    const archivedLast = await waitFor(
-        () => sw.findCompletedWorkRowByKey(hrefs.at(-1)),
-        'last bounded-shadow-wal row did not archive',
-        {attempts: 40}
-    )
-    assert.equal(archivedLast.status, 'failed')
-})
-
-test('coordinator authority shadow WAL appends same-status mutations with distinct ids', async () => {
+test('coordinator authority apply persists a same-status mutation', async () => {
     const href = 'https://www.quora.com/profile/Authority-Same-Status-Shadow-Wal'
     const {sw, storage} = loadServiceWorkerHarness({
         now: 5060,
@@ -16824,92 +16029,12 @@ test('coordinator authority shadow WAL appends same-status mutations with distin
 
     assert.equal(first.accepted, true)
     assert.equal(first.durable, true)
-    assert.equal(first.shadowWal.matched, true)
     assert.equal(second.accepted, true)
     assert.equal(second.durable, true)
     assert.equal(second.reason, 'persisted')
-    assert.equal(second.shadowWal.matched, true)
-    assert.equal(second.shadowWal.append.matched, 1)
-    assert.equal(second.shadowWal.append.mismatched, 0)
     assert.equal(storage.mbCoordinatorQueue[href].leaseNote, undefined)
     assert.equal(sw.coordinatorAuthority.current().queue[href].leaseNote, 'second same-status mutation')
 
-    const records = getWalRecordsForGeneration(
-        sw.state().coordinatorAuthorityShadowWalStore,
-        sw.state().coordinatorAuthorityShadowWalStore.meta.activeCheckpoint
-    )
-    assert.equal(records.length, 2)
-    assert.notEqual(records[0].id, records[1].id)
-    assert.equal(records[0].seq, 1)
-    assert.equal(records[1].seq, 2)
-    assert.equal(records[0].status, 'active')
-    assert.equal(records[1].status, 'active')
-    assert.equal(records[1].value.leaseNote, 'second same-status mutation')
-    const recoveredShadow = recoverProjectedState(sw.state().coordinatorAuthorityShadowWalStore)
-    assert.equal(recoveredShadow.recovered, true)
-    assert.equal(recoveredShadow.projected.state.queue[href].leaseNote, 'second same-status mutation')
-
-    const counters = sw.state().queueWakeupCounters
-    assert.equal(counters['coordinatorAuthority.shadowWal.appended'], 2)
-    assert.equal(counters['coordinatorAuthority.shadowWal.appendProjectionMatched'], 2)
-    assert.equal(counters['coordinatorAuthority.shadowWal.appendProjectionMismatched'] || 0, 0)
-})
-
-test('coordinator authority shadow WAL diagnostic failure does not change durable result', async () => {
-    const href = 'https://www.quora.com/profile/Authority-Shadow-Wal-Diagnostic-Failure'
-    const {sw, storage} = loadServiceWorkerHarness({
-        now: 5070,
-        storage: {
-            mbCoordinatorQueue: {
-                [href]: {
-                    id: 'authority-shadow-diagnostic-failure',
-                    status: 'active',
-                    attemptId: 'attempt-shadow-diagnostic-failure',
-                    attemptNumber: 1,
-                    targetProfileHref: href,
-                    updatedAt: 5070
-                }
-            }
-        }
-    })
-
-    await sw.coordinatorAuthority.hydrate()
-    sw.__testSetCoordinatorAuthorityShadowWalStore(null)
-    const result = await sw.coordinatorAuthority.apply({
-        operationKind: 'terminalize-key-only',
-        rowKey: href,
-        expectedAttemptId: 'attempt-shadow-diagnostic-failure',
-        expectedAttemptNumber: 1,
-        reason: 'ordinaryMutation',
-        mutate(row, context) {
-            return {
-                ...row,
-                status: 'failed',
-                error: 'durable despite diagnostic failure',
-                terminalAt: context.now,
-                updatedAt: context.now
-            }
-        }
-    })
-
-    assert.equal(result.accepted, true)
-    assert.equal(result.changed, true)
-    assert.equal(result.durable, true)
-    assert.equal(result.reason, 'persisted')
-    assert.equal(result.persistence.saved, true)
-    assert.equal(result.shadowWal.checked, true)
-    assert.equal(result.shadowWal.matched, true)
-    assert.equal(result.shadowWal.append.appended, false)
-    assert.equal(result.shadowWal.append.reason, 'diagnostic-error')
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
-    const archivedRow = await sw.findCompletedWorkRowByKey(href)
-    assert.equal(archivedRow?.status, 'failed')
-    assert.equal(archivedRow?.error, 'durable despite diagnostic failure')
-
-    const counters = sw.state().queueWakeupCounters
-    assert.ok(counters.storageSetCalls >= 2)
-    assert.ok((counters['coordinatorAuthority.shadowWal.appendFailed'] || 0) >= 1)
-    assert.equal(counters['storageUpdate.fallbackReturned'] || 0, 0)
 })
 
 test('coordinator authority apply preserves intervening direct snapshot changes', async () => {
@@ -17162,15 +16287,8 @@ test('coordinator authority reports accepted changed mutation when snapshot pers
     assert.equal(result.operation.changed, true)
     assert.equal(result.operation.durable, false)
     assert.match(result.persistence.error, /synthetic storage failure/)
-    assert.equal(result.shadowWal.checked, false)
-    assert.equal(result.shadowWal.matched, false)
-    assert.equal(result.shadowWal.reason, 'non-durable')
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
-    const counters = sw.state().queueWakeupCounters
-    assert.equal(counters['coordinatorAuthority.shadowWal.skippedNonDurable'], 1)
-    assert.equal(counters['coordinatorAuthority.shadowWal.checked'] || 0, 0)
-    assert.equal(counters['coordinatorAuthority.shadowWal.matched'] || 0, 0)
 })
 
 test('coordinator authority reports serialized storage timeout fallback', async () => {
@@ -20853,47 +19971,6 @@ test('a queue paused in storage at startup does not start a work session until i
 
 // The space page's pending write merges the posts it sends into the worker's map, through the queue (25 Oct). A removal the worker made
 // in between is not put back by a later write for another post.
-test('the space page pending write merges its posts through the queue and keeps what the worker removed', async () => {
-    const spaceKey = 'space-synthetic-pending-merge'
-    const spaceUrl = 'https://www.quora.com/spaces/Synthetic-Pending-Merge'
-    const postA = 'post-synthetic-pending-merge-a'
-    const postB = 'post-synthetic-pending-merge-b'
-    const a1 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-A1'
-    const a2 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-A2'
-    const b1 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-B1'
-    const b2 = 'https://www.quora.com/profile/Synthetic-Pending-Merge-B2'
-    const {sw, browser} = loadServiceWorkerHarness({now: 4000})
-
-    const first = await browser.runtime.sendMessage({
-        action: 'merge-space-pending-nuked-posts',
-        spaceKey,
-        spaceUrl,
-        posts: [
-            {postKey: postA, postUrl: '', candidateUrls: [a1, a2], resolvable: false},
-            {postKey: postB, postUrl: '', candidateUrls: [b1], resolvable: false}
-        ]
-    })
-    assert.equal(first.ok, true)
-    assert.equal(first.saved, true)
-
-    // A row finishes: the worker removes its profile from the post's pending list.
-    await browser.runtime.sendMessage({action: 'remove-pending-space-feed-urls', urls: [a1]})
-
-    // The next Nuke sends post B only. Post A must not come back with a1.
-    const second = await browser.runtime.sendMessage({
-        action: 'merge-space-pending-nuked-posts',
-        spaceKey,
-        spaceUrl,
-        posts: [{postKey: postB, postUrl: '', candidateUrls: [b2], resolvable: false}]
-    })
-    assert.equal(second.ok, true)
-    await flushAsync(20)
-
-    const stored = await sw.readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
-    const pending = stored[SPACE_PENDING_NUKED_POSTS_KEY]
-    assert.deepEqual([...pending[postA].remainingUrls], [a2])
-    assert.deepEqual([...pending[postB].remainingUrls].sort(), [b1, b2].sort())
-})
 
 // 24 Oct foreground experiment: does the worker window's action tab need to be foregrounded, and does it need OS focus? The modes
 // differ in what an open does to the action tab and to OS focus. Each test loads its own harness in the mode it checks.
@@ -22802,9 +21879,7 @@ test('reconcile does not materialize projection-only queued progress as queue au
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueueWal',
-        'mbCoordinatorPaused',
-        'mbSpacePendingNukedPosts',
-        'mbSpaceNukedPosts'
+        'mbCoordinatorPaused'
     ])
     assert.ok(reconcileLoadDefaults)
     // Decision 31: the progress copy is read from session storage, not from disk.
@@ -34708,7 +33783,7 @@ test('queued tab active transition does not carry executor authority state acros
         // key alone no longer distinguishes a full authority-projection
         // reload from this function's narrower meta+checkpoints+segments
         // read. A genuine full projection reload also always requests the
-        // space post keys ('mbSpaceNukedPosts') alongside the WAL defaults
+        // paused flag ('mbCoordinatorPaused') alongside the WAL defaults
         // (see loadCoordinatorCurrentAuthorityState; runs are log records and
         // are not read from a key, 24 Oct); the atomic WAL read never does.
         // That combination is what this test actually cares about:
@@ -34717,7 +33792,7 @@ test('queued tab active transition does not carry executor authority state acros
         if(defaults &&
             !Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue') &&
             Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueueWal.meta') &&
-            Object.prototype.hasOwnProperty.call(defaults, 'mbSpaceNukedPosts')) {
+            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorPaused')) {
             fullAuthorityReads += 1
         }
         return originalGet(defaults)
@@ -41509,8 +40584,6 @@ test('terminal settlement caps requested hrefs per call, leaving the remainder u
             },
             mbCoordinatorEvents: [],
             [LEGACY_PROFILE_PROGRESS_KEY]: {},
-            mbSpacePendingNukedPosts: {},
-            mbSpaceNukedPosts: {}
         }
     })
 
@@ -44784,148 +43857,7 @@ function makeClearPendingQueuedRow(href, runId, attemptId) {
     }
 }
 
-test('clear removes the pending space-feed records of the cleared rows in the same write, and keeps the records of other work', async () => {
-    const hrefQueued = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Queued'
-    const hrefDone = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Done'
-    const hrefMixedOther = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Mixed-Other'
-    const hrefUnrelated = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Unrelated'
-    const runId = 'run-clear-pending-records'
-    const unrelatedRecord = {
-        postKey: 'post-clear-pending-unrelated',
-        postUrl: 'https://www.quora.com/q/example/post-clear-pending-unrelated',
-        spaceUrl: 'https://www.quora.com/q/example',
-        allUrls: [hrefUnrelated],
-        remainingUrls: [hrefUnrelated],
-        updatedAt: 600050
-    }
-    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
-        now: 600000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [hrefQueued]: makeClearPendingQueuedRow(hrefQueued, runId, 'attempt-clear-pending-queued'),
-                [hrefDone]: {
-                    ...makeClearPendingQueuedRow(hrefDone, runId, 'attempt-clear-pending-done'),
-                    status: 'succeeded',
-                    outcome: 'blocked',
-                    activeAt: 600100,
-                    terminalAt: 600200,
-                    updatedAt: 600200
-                }
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'running',
-                    targetProfileHrefs: [hrefQueued, hrefDone, hrefMixedOther],
-                    targetWorkKeys: [hrefQueued, hrefDone, hrefMixedOther]
-                }
-            },
-            mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                'post-clear-pending-queued': {
-                    postKey: 'post-clear-pending-queued',
-                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-queued',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [hrefQueued],
-                    remainingUrls: [hrefQueued],
-                    updatedAt: 600050
-                },
-                'post-clear-pending-mixed': {
-                    postKey: 'post-clear-pending-mixed',
-                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-mixed',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [hrefQueued, hrefMixedOther],
-                    remainingUrls: [hrefQueued, hrefMixedOther],
-                    updatedAt: 600050
-                },
-                'post-clear-pending-done': {
-                    postKey: 'post-clear-pending-done',
-                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-done',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [hrefDone],
-                    remainingUrls: [hrefDone],
-                    updatedAt: 600050
-                },
-                'post-clear-pending-unrelated': unrelatedRecord
-            },
-            mbSpaceNukedPosts: {}
-        }
-    })
 
-    await sw.coordinatorAuthority.hydrate()
-    const doneRow = sw.coordinatorAuthority.current().queue[hrefDone]
-    assert.equal((await sw.archiveTerminalCoordinatorRow(hrefDone, doneRow)).archived, true)
-    assert.ok(storage.mbSpacePendingNukedPosts['post-clear-pending-done'], 'sanity check: the done row record is still pending before clear')
-
-    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
-        action: 'clear-coordinator-current-work'
-    }), timers)
-
-    assert.equal(result.clearedUrls.includes(hrefQueued), true)
-    assert.equal(storage.mbSpacePendingNukedPosts['post-clear-pending-queued'], undefined, 'a record of only cleared work is deleted')
-    assert.equal(storage.mbSpacePendingNukedPosts['post-clear-pending-done'], undefined, 'a record of a cleared completed row is deleted')
-    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-mixed'].remainingUrls, [hrefMixedOther], 'the cleared profile leaves the mixed record, the other profile stays pending')
-    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-mixed'].allUrls, [hrefMixedOther])
-    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-unrelated'], unrelatedRecord, 'a record of work that is not cleared is untouched')
-    assert.equal(storage.mbSpaceNukedPosts['post-clear-pending-queued'], undefined, 'a cleared record is not remembered as nuked')
-    assert.equal(storage.mbSpaceNukedPosts['post-clear-pending-done'], undefined, 'a cleared completed record is not remembered as nuked')
-    assert.equal(Object.keys(sw.coordinatorAuthority.current().queue).length, 0, 'the live queue is cleared in the same run')
-})
-
-test('a pending record removed by clear does not reappear as nuked after a restart, even when its profile is confirmed later', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Restart'
-    const runId = 'run-clear-pending-restart'
-    const postKey = 'post-clear-pending-restart'
-    const {browser, storage, timers} = loadServiceWorkerHarness({
-        now: 600000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeClearPendingQueuedRow(href, runId, 'attempt-clear-pending-restart')
-            },
-            mbCoordinatorRuns: {
-                [runId]: {
-                    id: runId,
-                    sourceType: 'space-feed',
-                    status: 'running',
-                    targetProfileHrefs: [href],
-                    targetWorkKeys: [href]
-                }
-            },
-            mbCoordinatorEvents: [],
-            mbSpacePendingNukedPosts: {
-                [postKey]: {
-                    postKey,
-                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-restart',
-                    spaceUrl: 'https://www.quora.com/q/example',
-                    allUrls: [href],
-                    remainingUrls: [href],
-                    updatedAt: 600050
-                }
-            },
-            mbSpaceNukedPosts: {}
-        }
-    })
-
-    const cleared = await settleWithFakeTimers(browser.runtime.sendMessage({
-        action: 'clear-coordinator-current-work'
-    }), timers)
-    assert.equal(cleared.clearedUrls.includes(href), true)
-    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined, 'the pending record is deleted by the clear')
-
-    const restarted = loadServiceWorkerHarness({now: 600010, storage})
-    await restarted.sw.coordinatorAuthority.hydrate()
-    assert.equal(restarted.storage.mbSpacePendingNukedPosts[postKey], undefined, 'the restart does not read the cleared record back')
-
-    const confirmed = await restarted.browser.runtime.sendMessage({
-        action: 'confirm-space-feed-profiles-blocked',
-        profileHrefs: [href]
-    }, {tab: {id: 12, windowId: 1}})
-    assert.equal(confirmed.confirmed, false, 'the confirmation has no pending record to settle')
-    assert.equal(restarted.storage.mbSpaceNukedPosts[postKey], undefined, 'the cleared record does not reappear as nuked')
-})
 
 // Runs across a checkpoint switch (review item: runs are log records and the checkpoint state is {queue, completed} only). A run
 // written before the switch must survive the switch and a restart even when no later write touches it.
@@ -45072,6 +44004,356 @@ test('over the run cap, a time shard that holds a run a queue row refers to is k
     assert.ok(kept['run-namespace-fixture'], 'the referenced run stays, with its oldest day')
     assert.equal(Object.keys(kept).filter(id => id.includes('-1-')).length, 0, 'the second oldest day goes whole')
     assert.equal(Object.keys(kept).filter(id => id.includes('-2-')).length, 100, 'the third day is kept')
+})
+
+;
+test('a space-feed queue row carries the post key it came from (provenance, 25 Oct)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Provenance-Space'
+    const runId = 'run-provenance-space'
+    const {browser, sw} = loadServiceWorkerHarness({now: 1000})
+    const request = makeCoordinatorEnqueue({href, runId})
+    request.items[0].sourcePostKey = 'post-provenance-space-1'
+
+    await browser.runtime.sendMessage(request, {tab: {id: 10, windowId: 1}})
+
+    assert.equal(sw.coordinatorAuthority.current().queue[href]?.sourcePostKey, 'post-provenance-space-1')
+})
+
+test('a manual queue row has no source post key (provenance, 25 Oct)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Provenance-Manual'
+    const runId = 'run-provenance-manual'
+    const {browser, sw} = loadServiceWorkerHarness({now: 1000})
+    const request = {
+        action: 'enqueue-coordinator-items',
+        run: {id: runId, sourceType: 'profile-list'},
+        source: {type: 'profile-list', pageUrl: 'https://www.quora.com/profile_list'},
+        items: [{targetProfileHref: href, requestedUrl: href, dedupeKey: href}]
+    }
+
+    await browser.runtime.sendMessage(request, {tab: {id: 10, windowId: 1}})
+
+    const row = sw.coordinatorAuthority.current().queue[href]
+    assert.ok(row, 'the manual row was queued')
+    assert.equal(Object.prototype.hasOwnProperty.call(row, 'sourcePostKey'), false)
+})
+
+test('a completed row keeps the source post key it was queued with (provenance, 25 Oct)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Provenance-Archive'
+    const runId = 'run-provenance-archive'
+    const attemptId = 'attempt-provenance-archive'
+    const tabId = 533
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 254600,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {
+                    ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 254600}),
+                    sourcePostKey: 'post-provenance-archive-1'
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {
+                [href]: {
+                    profileHref: href,
+                    status: 'blocking',
+                    runId,
+                    actionKind: 'mute-block',
+                    attemptId,
+                    attemptNumber: 1,
+                    updatedAt: 254500
+                }
+            }
+        }
+    })
+
+    await sw.recordCoordinatorJobProgress(href, {
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: 254610,
+        terminalAt: 254610,
+        actionKind: 'mute-block',
+        runId,
+        tabId,
+        attemptId,
+        attemptNumber: 1
+    }, {
+        expectTerminal: true,
+        senderTabId: tabId
+    })
+
+    const archived = await sw.findCompletedWorkRowByKey(href)
+    assert.equal(archived?.status, 'succeeded')
+    assert.equal(archived?.sourcePostKey, 'post-provenance-archive-1')
+})
+
+test('a later enqueue of an existing row does not add or change its source post key (provenance, 25 Oct)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Provenance-Merge'
+    const runId = 'run-provenance-merge'
+    const attemptId = 'attempt-provenance-merge'
+    const {browser, sw} = loadServiceWorkerHarness({
+        now: 1000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 1000})
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const request = makeCoordinatorEnqueue({href, runId})
+    request.items[0].sourcePostKey = 'post-provenance-merge-new'
+
+    await browser.runtime.sendMessage(request, {tab: {id: 10, windowId: 1}})
+
+    const row = sw.coordinatorAuthority.current().queue[href]
+    assert.equal(Object.prototype.hasOwnProperty.call(row, 'sourcePostKey'), false, 'an old row without the field gets none')
+    assert.equal(row.targetProfileHref, href)
+    assert.equal(row.runId, runId)
+})
+
+// Owner, 26 Oct: a post the space page has just sent to the queue is pending at once. The enqueue reply carries counts, not rows, and the
+// stored pending map that marked it was removed, so the page's copy of the queue lacks the new rows until a state reply. These drive the real
+// content.js functions (extracted from the source, as the content tests do) with a queue copy that does not yet have the rows.
+function markTestContentSource() {
+    return fs.readFileSync(path.join(LIST_REPO_ROOT, 'shared', 'js', 'content.js'), 'utf8')
+}
+
+function markTestExtract(source, signature) {
+    const start = source.indexOf(signature)
+    assert.notEqual(start, -1, `missing ${signature}`)
+    const braceStart = source.indexOf('{', start + signature.length)
+    let depth = 0
+    for(let index = braceStart; index < source.length; index += 1) {
+        if(source[index] === '{') depth += 1
+        else if(source[index] === '}') {
+            depth -= 1
+            if(depth === 0) return source.slice(start, index + 1)
+        }
+    }
+    throw new Error(`unterminated ${signature}`)
+}
+
+const MARK_ALICE = 'https://www.quora.com/profile/Alice-Mark'
+const MARK_BOB = 'https://www.quora.com/profile/Bob-Mark'
+const MARK_CAROL = 'https://www.quora.com/profile/Carol-Mark'
+
+function loadSpaceFeedEnqueueMarkHarness() {
+    const source = markTestContentSource()
+    const context = {console, assert}
+    vm.createContext(context)
+    vm.runInContext([
+        `let coordinatorQueue = {}`,
+        `let pendingSpaceFeedIndexCache = {queue: null, index: null}`,
+        `let spaceFeedRenderModelMemo = null`,
+        `let spaceFeedEnqueueMarkBatches = []`,
+        source.split('\n').find(line => line.startsWith('const PENDING_COORDINATOR_STATUSES')),
+        // Stubs for the lookups these helpers call elsewhere in content.js.
+        `function normalizeQuoraProfileHref(href = '') {
+            const value = \`\${href || ''}\`.split(/[?#]/)[0].replace(/\\/+$/, '')
+            return value.includes('/profile/') ? value : null
+        }`,
+        `function getNormalizedProfileIdentityKey(href) { return \`\${href || ''}\`.split('/profile/')[1] || '' }`,
+        `function getNormalizedProfileHrefList(urls = []) {
+            const seen = new Set()
+            const result = []
+            for(const url of Array.isArray(urls) ? urls : []) {
+                const normalized = normalizeQuoraProfileHref(url)
+                const key = getNormalizedProfileIdentityKey(normalized)
+                if(!normalized || !key || seen.has(key)) continue
+                seen.add(key)
+                result.push(normalized)
+            }
+            return result
+        }`,
+        `function resolveCurrentSpaceDescriptor() { return null }`,
+        `function isPendingCoordinatorSpaceFeedItemForSpace() { return false }`,
+        `function isKnownNukedSpaceFeedProfile() { return false }`,
+        `function isActivePendingSpaceFeedProfileUrl() { return true }`,
+        `function isProfileNukeRetryBlocked() { return false }`,
+        `function isSpaceFeedProfileStateReady() { return true }`,
+        markTestExtract(source, 'function isPendingCoordinatorStatus(status = \'\')'),
+        markTestExtract(source, 'function getCoordinatorItemProfileHref(itemKey = \'\', item = null)'),
+        markTestExtract(source, 'function getSpaceFeedProfileStateKey(href)'),
+        markTestExtract(source, 'function getSpaceFeedUniqueQueueableProfileCount(queueableEntries = [])'),
+        markTestExtract(source, 'function getPendingSpaceFeedIndex()'),
+        markTestExtract(source, 'function hasPendingCoordinatorSpaceFeedPost(postKey = \'\')'),
+        markTestExtract(source, 'function getActivePendingSpaceFeedUrls(postKey)'),
+        markTestExtract(source, 'function getActivePendingSpaceFeedUrlsForRender(postKey = \'\', context = null)'),
+        markTestExtract(source, 'function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null)'),
+        markTestExtract(source, 'function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor())'),
+        markTestExtract(source, 'function touchSpaceFeedEnqueueMarks()'),
+        markTestExtract(source, 'function beginSpaceFeedEnqueueMarks(associations = [])'),
+        markTestExtract(source, 'function settleSpaceFeedEnqueueMarks(batch = null, settled = false)'),
+        markTestExtract(source, 'function applySpaceFeedEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {})'),
+        `globalThis.markHarness = {
+            setQueue: rows => { coordinatorQueue = rows },
+            batches: () => spaceFeedEnqueueMarkBatches,
+            hasPending: postKey => hasPendingCoordinatorSpaceFeedPost(postKey),
+            begin: beginSpaceFeedEnqueueMarks,
+            settle: settleSpaceFeedEnqueueMarks,
+            apply: applySpaceFeedEnqueueMarksToStateReply,
+            queueableCount: entries => {
+                const context = buildSpaceFeedRenderContext()
+                return getSpaceFeedUniqueQueueableProfileCount(entries.map(entry => ({
+                    ...entry,
+                    candidateUrls: getQueueableSpaceFeedEntryUrlsForRender(entry, context)
+                })))
+            },
+            pendingHrefs: () => buildSpaceFeedRenderContext().pendingCoordinatorProfileHrefs
+        }`
+    ].join('\n\n'), context, {filename: 'content-space-enqueue-marks-harness.js'})
+    return context.markHarness
+}
+
+test('a post sent to the queue from the space page is pending and out of the Nuke count at once, before the copy of the queue has its rows', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const entries = [
+        {postKey: 'post-a', candidateUrls: [MARK_ALICE, MARK_BOB]},
+        {postKey: 'post-b', candidateUrls: [MARK_CAROL]}
+    ]
+
+    // The page has read the queue (empty) before the enqueue: nothing is pending and all three profiles are queueable.
+    assert.equal(harness.hasPending('post-a'), false)
+    assert.equal(harness.queueableCount(entries), 3)
+
+    // The enqueue of post-a's two profiles goes out. The reply carries counts, so the copy still has no rows.
+    const batch = harness.begin([
+        {profileHref: MARK_ALICE, postKeys: ['post-a']},
+        {profileHref: MARK_BOB, postKeys: ['post-a']}
+    ])
+    assert.equal(batch.items.length, 2)
+    assert.equal(harness.hasPending('post-a'), true, 'the sent post is pending at once')
+    assert.equal(harness.pendingHrefs().has(MARK_ALICE), true, 'its profile is pending for every post that names it')
+    assert.equal(harness.queueableCount(entries), 1, 'the Nuke count drops by the two sent profiles (only post-b CAROL is left)')
+})
+
+test('a sent post stays pending until a state reply shows its rows, and a reply from before the enqueue settled does not clear it', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const batch = harness.begin([{profileHref: MARK_ALICE, postKeys: ['post-a']}])
+    harness.settle(batch, true)
+    const settledAt = batch.settledAt
+
+    // A state reply sent before the enqueue settled says nothing about the new row: the mark stays.
+    harness.apply(settledAt - 1, [MARK_ALICE], {})
+    assert.equal(harness.hasPending('post-a'), true)
+
+    // A reply asked after the settle, that shows the row, takes over: the page merges it into its copy, then the mark is dropped and the row
+    // is what keeps the post pending.
+    const repliedRows = {
+        [MARK_ALICE]: {status: 'queued', targetProfileHref: MARK_ALICE, evidence: [{postKey: 'post-a'}]}
+    }
+    harness.setQueue(repliedRows)
+    harness.apply(settledAt + 1, [MARK_ALICE], repliedRows)
+    assert.equal(harness.batches().length, 0, 'the mark is gone once the reply shows the row')
+    assert.equal(harness.hasPending('post-a'), true, 'the row of the reply keeps the post pending')
+})
+
+test('a sent profile the worker no longer lists after the enqueue settled is not pending (the reply is authoritative for the profiles asked)', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const batch = harness.begin([{profileHref: MARK_ALICE, postKeys: ['post-a']}])
+    harness.settle(batch, true)
+
+    harness.apply(batch.settledAt + 1, [MARK_ALICE], {})
+    assert.equal(harness.batches().length, 0)
+    assert.equal(harness.hasPending('post-a'), false)
+})
+
+test('a failed enqueue drops its marks at once, so the post is queueable again', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const entries = [{postKey: 'post-a', candidateUrls: [MARK_ALICE]}]
+    const batch = harness.begin([{profileHref: MARK_ALICE, postKeys: ['post-a']}])
+    assert.equal(harness.hasPending('post-a'), true)
+
+    harness.settle(batch, false)
+    assert.equal(harness.batches().length, 0)
+    assert.equal(harness.hasPending('post-a'), false)
+    assert.equal(harness.queueableCount(entries), 1)
+})
+
+test('a post whose profile is still to be read is pending by its post key, and a reply with a row for that post clears the mark', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const batch = harness.begin([{resolveProfileFromPage: true, postKeys: ['post-r']}])
+    assert.equal(harness.hasPending('post-r'), true)
+
+    harness.settle(batch, true)
+    const repliedRows = {
+        'https://www.quora.com/profile/Resolved-Mark': {status: 'queued', targetProfileHref: MARK_BOB, evidence: [{postKey: 'post-r'}]}
+    }
+    harness.setQueue(repliedRows)
+    harness.apply(batch.settledAt + 1, [], repliedRows)
+    assert.equal(harness.batches().length, 0)
+    assert.equal(harness.hasPending('post-r'), true, 'the reply row is what keeps it pending')
+})
+
+test('the space page marks a batch before it enqueues, and settles it from the enqueue result, not before (owner, 26 Oct)', () => {
+    const body = markTestExtract(markTestContentSource(), 'async function nukeSpaceFeedEntries(button, entries)')
+    const begin = body.indexOf('beginSpaceFeedEnqueueMarks(workAssociations)')
+    const enqueue = body.indexOf('enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations')
+
+    assert.ok(begin > 0 && enqueue > begin, 'the mark is set before the enqueue is sent')
+    assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, true\)[\s\S]*refreshSpaceFeedStateAfterEnqueue\(\)/)
+    assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, false\)/)
+    assert.match(body, /if\(!enqueueMarkBatch\.settledAt\) settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, false\)/)
+})
+
+test('completed summary after the Clear All Stats cutoff: rows finished before it and terminal rows still in the queue are not counted, and the summary follows the log', async () => {
+    // The cutoff is the stored Clear All Stats time (mbCoordinatorStatsClearedAt = 5000). A finished before it, so it is not counted. B and C
+    // finish after it, with durations of 500 and 2500 ms. D is terminal but still in the live queue, so it is not in the completed log. The
+    // rows are archived through the door, as the worker archives a finished row. Then a fourth row E is archived, and the summary follows it.
+    const runId = 'run-completed-summary-cutoff'
+    const hrefA = 'https://www.quora.com/profile/Synthetic-Completed-Summary-A'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Completed-Summary-B'
+    const hrefC = 'https://www.quora.com/profile/Synthetic-Completed-Summary-C'
+    const hrefD = 'https://www.quora.com/profile/Synthetic-Completed-Summary-D'
+    const hrefE = 'https://www.quora.com/profile/Synthetic-Completed-Summary-E'
+    const finishedRow = (href, attemptId, activeAt, terminalAt) => ({
+        ...makeArchivedCoordinatorRow({href, runId, attemptId, terminalAt}),
+        activeAt
+    })
+    const queuedTerminalRow = {
+        ...makeArchivedCoordinatorRow({href: hrefD, runId, attemptId: 'attempt-completed-summary-d', terminalAt: 8000}),
+        activeAt: 7000
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 9500,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorStatsClearedAt: 5000,
+            ...makeCompletedWalStoragePayload({completed: {}, queue: {[hrefD]: queuedTerminalRow}}),
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    const archive = async (href, row) => {
+        const saved = await sw.coordinatorAuthority.persistCoordinator({
+            completedRows: [{rowKey: `${href}|${runId}`, previousRow: row, operationKind: 'archive-terminal-row', reason: 'ordinaryMutation'}]
+        }, {operationKind: 'archive-terminal-row', reason: 'ordinaryMutation', metricPath: 'test.completedSummary.archive'})
+        assert.equal(saved.saved, true, saved.reason)
+    }
+    await archive(hrefA, finishedRow(hrefA, 'attempt-completed-summary-a', 1000, 3000))
+    await archive(hrefB, finishedRow(hrefB, 'attempt-completed-summary-b', 5500, 6000))
+    await archive(hrefC, finishedRow(hrefC, 'attempt-completed-summary-c', 6500, 9000))
+
+    const {view} = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('completed-summary-cutoff'))
+    assert.deepEqual(view.completedSummary, {count: 2, durationCount: 2, durationTotalMs: 3000}, 'B (500 ms) and C (2500 ms) count; A finished before the cutoff, and queued D is not in the log')
+
+    // The summary is cached per log change and cutoff: a second read of the same resident log returns the same object.
+    const map = sw.coordinatorAuthority.residentCompleted()
+    assert.equal(sw.coordinatorAuthority.residentCompletedSummaryFor(map, 5000), sw.coordinatorAuthority.residentCompletedSummaryFor(map, 5000))
+
+    // A row archived after the read moves the summary, so the cache is not stale.
+    await archive(hrefE, finishedRow(hrefE, 'attempt-completed-summary-e', 9000, 9400))
+    const after = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('completed-summary-after-archive'))
+    assert.deepEqual(after.view.completedSummary, {count: 3, durationCount: 3, durationTotalMs: 3400}, 'E adds 400 ms to the 3000 ms of B and C')
 })
 
 ;

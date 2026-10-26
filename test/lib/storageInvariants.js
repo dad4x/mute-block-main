@@ -5,7 +5,6 @@ const {
 
 const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
 const COORDINATOR_RUNS_KEY = 'mbCoordinatorRuns'
-const SPACE_PENDING_POSTS_KEY = 'mbSpacePendingNukedPosts'
 
 const TERMINAL_QUEUE_STATUSES = new Set(['succeeded', 'failed', 'skipped', 'canceled'])
 const ACTIVE_QUEUE_STATUSES = new Set(['opening', 'active', 'acting', 'settling'])
@@ -178,23 +177,6 @@ function addIssue(issues, code, severity, fields = {}) {
     })
 }
 
-function findQueueEntryForPendingHref(href, mappedJobKey, indexes) {
-    const normalizedMappedKey = normalizeString(mappedJobKey)
-    if(normalizedMappedKey && indexes.byKey.has(normalizedMappedKey)) {
-        return indexes.byKey.get(normalizedMappedKey)
-    }
-
-    const normalizedProfileKey = normalizeProfileHref(normalizedMappedKey)
-    if(normalizedProfileKey && indexes.byKey.has(normalizedProfileKey)) {
-        return indexes.byKey.get(normalizedProfileKey)
-    }
-
-    if(indexes.byKey.has(href)) return indexes.byKey.get(href)
-
-    const profileMatches = indexes.byProfileHref.get(href) || []
-    return profileMatches[0] || null
-}
-
 function buildNormalizedJobKeysByHref(record = {}) {
     const normalized = {}
     const source = asObjectMap(record.jobKeysByProfileHref)
@@ -237,79 +219,6 @@ function checkQueueInvariants(queue, issues) {
     }
 }
 
-function checkPendingPostInvariants(pendingPosts, indexes, issues) {
-    for(const [postKey, record] of Object.entries(asObjectMap(pendingPosts))) {
-        const remainingUrls = getStoredProfileUrls(record, 'remainingUrls')
-        const remainingSet = new Set(remainingUrls)
-        const jobKeysByHref = buildNormalizedJobKeysByHref(record)
-        const resolverPending = record?.resolverPending === true
-
-        for(const href of remainingUrls) {
-            const mappedJobKey = jobKeysByHref[href] || ''
-            if(!mappedJobKey) {
-                addIssue(issues, 'pending-job-key-missing', 'error', {
-                    postKey,
-                    href,
-                    message: 'pending post remaining URL has no job-key mapping'
-                })
-            }
-
-            const queueEntry = findQueueEntryForPendingHref(href, mappedJobKey, indexes)
-            if(queueEntry && isTerminalQueueItem(queueEntry.item)) {
-                addIssue(issues, 'terminal-url-still-pending', 'error', {
-                    postKey,
-                    href,
-                    key: queueEntry.key,
-                    status: getItemStatus(queueEntry.item),
-                    message: 'pending post still references a terminal queue row'
-                })
-            }
-            else if(!queueEntry && !resolverPending) {
-                addIssue(issues, 'pending-url-missing-queue', 'warning', {
-                    postKey,
-                    href,
-                    message: 'pending post remaining URL has no queue row'
-                })
-            }
-        }
-
-        for(const href of Object.keys(jobKeysByHref)) {
-            if(remainingSet.has(href)) continue
-            addIssue(issues, 'pending-job-key-stale', 'warning', {
-                postKey,
-                href,
-                key: jobKeysByHref[href],
-                message: 'pending post has a job-key mapping for a non-remaining URL'
-            })
-        }
-
-        if(resolverPending) {
-            const resolverUrl = normalizeRequestedUrl(record.resolverUrl || record.postUrl || '')
-            if(!resolverUrl) {
-                addIssue(issues, 'resolver-pending-missing-url', 'error', {
-                    postKey,
-                    message: 'resolver-pending post has no resolver URL or post URL'
-                })
-                continue
-            }
-
-            const resolverEntry = indexes.resolverByRequestedUrl.get(resolverUrl) ||
-                indexes.byKey.get(makeProfileResolutionQueueKey(resolverUrl)) ||
-                null
-
-            if(resolverEntry && isTerminalQueueItem(resolverEntry.item)) {
-                addIssue(issues, 'terminal-resolver-still-pending', 'error', {
-                    postKey,
-                    key: resolverEntry.key,
-                    status: getItemStatus(resolverEntry.item),
-                    resolverUrl,
-                    message: 'resolver-pending post still references a terminal resolver row'
-                })
-            }
-        }
-    }
-}
-
 function checkRunInvariants(runs, indexes, issues) {
     for(const [runKey, run] of Object.entries(asObjectMap(runs))) {
         const runId = normalizeString(run?.id || runKey)
@@ -331,12 +240,10 @@ function checkStorageInvariants(snapshot = {}) {
     const storage = asObjectMap(snapshot)
     const queue = asObjectMap(storage[COORDINATOR_QUEUE_KEY])
     const runs = asObjectMap(storage[COORDINATOR_RUNS_KEY])
-    const pendingPosts = asObjectMap(storage[SPACE_PENDING_POSTS_KEY])
     const issues = []
     const indexes = buildQueueIndexes(queue)
 
     checkQueueInvariants(queue, issues)
-    checkPendingPostInvariants(pendingPosts, indexes, issues)
     checkRunInvariants(runs, indexes, issues)
 
     return issues
@@ -345,6 +252,5 @@ function checkStorageInvariants(snapshot = {}) {
 module.exports = {
     COORDINATOR_QUEUE_KEY,
     COORDINATOR_RUNS_KEY,
-    SPACE_PENDING_POSTS_KEY,
     checkStorageInvariants
 }

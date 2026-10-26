@@ -72,8 +72,6 @@ function registerServiceWorkerListeners(deps = {}) {
         'clear-coordinator-events',
         'clear-coordinator-outliers',
         'get-coordinator-outlier-events',
-        'set-space-nuked-posts',
-        'merge-space-pending-nuked-posts',
         'set-coordinator-retry-failed-enabled',
         'resume-paused-coordinator-nukes',
         'cancel-coordinator-current-work',
@@ -110,9 +108,6 @@ function registerServiceWorkerListeners(deps = {}) {
         'get-recent-history',
         'clear-profile-nuke-state',
         'settle-terminal-coordinator-items',
-        'remove-pending-space-feed-urls',
-        'remove-pending-space-feed-entries',
-        'confirm-space-feed-profiles-blocked',
         'get-owned-nuke-status',
         'get-coordinator-queue-runtime-state',
         'cleanup-owned-nuke-status',
@@ -222,7 +217,6 @@ function registerServiceWorkerListeners(deps = {}) {
         eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
         getCoordinatorOutlierEventsRequested,
-        setSpaceNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
         setSpaceSortRequested,
@@ -725,17 +719,6 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'erase-block-history') {
             return eraseBlockHistoryRequested(request)
         }
-        else if(request.action === 'set-space-nuked-posts') {
-            return setSpaceNukedPostsRequested(request.nukedPosts)
-        }
-        else if(request.action === 'merge-space-pending-nuked-posts') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'SPACE_PENDING_NUKED_POSTS_MERGE',
-                spaceKey: request.spaceKey,
-                spaceUrl: request.spaceUrl,
-                posts: request.posts
-            })
-        }
         else if(request.action === 'set-coordinator-retry-failed-enabled') {
             return setCoordinatorRetryFailedEnabledRequested(request.enabled === true)
         }
@@ -1147,34 +1130,6 @@ function registerServiceWorkerListeners(deps = {}) {
                     profileHrefs: request.profileHrefs || request.urls || []
                 }
             })
-        }
-        else if(request.action === 'remove-pending-space-feed-urls') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'PENDING_SPACE_FEED_URLS_REMOVE',
-                urls: request.urls || []
-            }).then(result => ({
-                changed: !!result?.changed,
-                pendingPosts: result?.pendingPosts || null
-            }))
-        }
-        else if(request.action === 'remove-pending-space-feed-entries') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'PENDING_SPACE_FEED_ENTRIES_REMOVE',
-                postKeys: request.postKeys || []
-            }).then(result => ({
-                changed: !!result?.changed,
-                pendingPosts: result?.pendingPosts || null
-            }))
-        }
-        else if(request.action === 'confirm-space-feed-profiles-blocked') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'SPACE_FEED_PROFILES_CONFIRM',
-                profileHrefs: request.profileHrefs || request.urls || []
-            }).then(result => ({
-                confirmed: !!result?.confirmed,
-                pendingPosts: result?.pendingPosts || null,
-                nukedPosts: result?.nukedPosts || null
-            }))
         }
         else if(request.action === 'get-owned-nuke-status') {
             return ownedTabIdsReady.then(async () => {

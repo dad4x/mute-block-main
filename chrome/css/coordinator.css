@@ -681,6 +681,50 @@ h2 {
     grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
 }
 
+.row--outlier {
+    grid-template-columns: minmax(200px, 1fr) 100px 160px 170px 110px;
+}
+
+.outlier-item {
+    border-bottom: 1px solid var(--mb-grey-110);
+}
+
+.outlier-item:last-child {
+    border-bottom: 0;
+}
+
+.outlier-item > .row {
+    border-bottom: 0;
+}
+
+.outlier-events {
+    padding: 0 14px 12px;
+}
+
+.outlier-events > .row-subtitle {
+    padding: 6px 0;
+}
+
+.outlier-events .row--flight {
+    padding: 6px 0;
+}
+
+/* The outlier event list adds a gap column after the time column. */
+.outlier-events .row--outlier-event {
+    grid-template-columns: 170px 80px 60px 150px minmax(180px, 1.4fr) 140px minmax(150px, 1fr) minmax(180px, 2fr);
+}
+
+/* An event whose gap from the previous event is abnormal (OUTLIER_EVENT_GAP_ABNORMAL_MS, tunables.js). */
+.outlier-events .row--event-gap-abnormal {
+    background: var(--mb-amber-50);
+    box-shadow: inset 3px 0 0 var(--mb-amber-500);
+}
+
+.outlier-events .row--event-gap-abnormal .outlier-event-gap {
+    color: var(--mb-amber-800);
+    font-weight: 600;
+}
+
 .row--flight {
     grid-template-columns: 170px 60px 150px minmax(200px, 1.4fr) 150px minmax(160px, 1fr) minmax(200px, 2fr);
     font-size: 12px;
@@ -702,7 +746,7 @@ h2 {
 }
 
 .row--queue {
-    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
+    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px);
 }
 
 .row-time-cell {
@@ -719,13 +763,6 @@ h2 {
 .row-time-line--detail {
     color: var(--mb-grey-700);
     margin-top: 2px;
-}
-
-.row-action-cell {
-    align-self: start;
-    display: flex;
-    justify-content: flex-end;
-    min-width: 0;
 }
 
 .row-cancel-cell {

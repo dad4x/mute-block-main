@@ -561,18 +561,6 @@ function loadServiceWorkerHarness(options = {}) {
             `const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = ${timeoutMs}`
         )
     }
-    if(options.shadowWalRecordLimit) {
-        const recordLimit = Math.max(2, Number.parseInt(options.shadowWalRecordLimit, 10) || 0)
-        source = source
-            .replace(
-                'const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = 128',
-                `const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = ${recordLimit}`
-            )
-            .replace(
-                'const MAX_PROGRESS_SHADOW_WAL_RECORDS = 128',
-                `const MAX_PROGRESS_SHADOW_WAL_RECORDS = ${recordLimit}`
-            )
-    }
     source = source.replace(
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    clearStaleCoordinatorExecutorStartPromise',
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    if(__testCoordinatorExecutorStartResult) {\n        const result = __testCoordinatorExecutorStartResult\n        __testCoordinatorExecutorStartResult = null\n        return result\n    }\n    clearStaleCoordinatorExecutorStartPromise'
@@ -801,12 +789,6 @@ module.exports.__test = {
     __testClaimQueuedActivationGuard(action = {}, tab = null, reason = 'test') {
         return claimQueuedActivationGuard(action, tab, reason)
     },
-    __testSetCoordinatorAuthorityShadowWalStore(value) {
-        coordinatorAuthorityShadowWalStore = value
-    },
-    __testSetProgressShadowWalStore(value) {
-        progressShadowWalStore = value
-    },
     __testPauseQueuedOwner(ownerTabId) {
         queueRuntime.pauseQueuedOwner(ownerTabId)
     },
@@ -850,8 +832,6 @@ module.exports.__test = {
             pauseWindows: [...(getQueueWakeupMetricEpoch().pauseWindows || [])],
             queueLoadThrottleWindows: [...(getQueueWakeupMetricEpoch().queueLoadThrottleWindows || [])],
             profileNukeProgress: {...profileNukeProgress},
-            coordinatorAuthorityShadowWalStore: JSON.parse(JSON.stringify(coordinatorAuthorityShadowWalStore)),
-            progressShadowWalStore: JSON.parse(JSON.stringify(progressShadowWalStore)),
             // The resident stored copy, not current(): a counters snapshot must still read after a failed hydrate (D4 guard).
             coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.residentStored()?.mbCoordinatorQueueWal || null)),
             spaceFeedStorageUpdateDepth: storageUpdateState.getDepth(),

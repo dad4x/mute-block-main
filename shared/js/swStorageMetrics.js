@@ -30,8 +30,6 @@ function createStorageMetrics(deps = {}) {
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
         COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX,
-        SPACE_PENDING_NUKED_POSTS_KEY,
-        SPACE_NUKED_POSTS_KEY,
         OWNED_TAB_STATE_KEY,
         COORDINATOR_PAUSED_KEY,
         COORDINATOR_PAUSE_GENERATION_KEY,
@@ -68,8 +66,6 @@ function createStorageMetrics(deps = {}) {
         if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY) return 'progressView'
         if(`${key || ''}`.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) return 'progressShard'
         if(`${key || ''}`.startsWith(COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX)) return 'namespaceStamp'
-        if(key === SPACE_PENDING_NUKED_POSTS_KEY) return 'pendingPosts'
-        if(key === SPACE_NUKED_POSTS_KEY) return 'rememberedNukes'
         if(key === OWNED_TAB_STATE_KEY) return 'ownedTabs'
         if(key === COORDINATOR_PAUSED_KEY) return 'paused'
         if(key === COORDINATOR_PAUSE_GENERATION_KEY) return 'pauseGeneration'

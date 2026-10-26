@@ -377,9 +377,86 @@ test('the dashboard expands an outlier to its recorder events, read from the wor
     const loadBody = extractFunction(source, 'async function loadOutlierEvents(outlier = {})')
     assert.match(loadBody, /action: 'get-coordinator-outlier-events'/, 'the events are read from the worker')
     const panelBody = extractFunction(source, 'function buildOutlierEventsPanel(outlier = {})')
-    assert.match(panelBody, /buildFlightRecorderRow/, 'each event is drawn as a flight recorder row')
+    assert.match(panelBody, /buildOutlierEventRow/, 'each event is drawn as a flight recorder row, with its gap')
     const swBootstrap = readRepoFile('shared/js/swBootstrap.js')
     assert.match(swBootstrap, /request\.action === 'get-coordinator-outlier-events'/, 'the worker answers the request')
+})
+
+test('the flight recorder save names its file in local time, never reuses a name, and its hover help names the folder', () => {
+    const evaluate = loadDashboardHarness()
+    assert.equal(
+        evaluate('buildFlightRecorderFileName(new Date(2026, 9, 26, 14, 5, 33), new Set())'),
+        'mute-block-flight-recorder-2026-10-26T14-05-33.json'
+    )
+    assert.equal(
+        evaluate('buildFlightRecorderFileName(new Date(2026, 0, 2, 3, 4, 5), new Set())'),
+        'mute-block-flight-recorder-2026-01-02T03-04-05.json'
+    )
+    const names = JSON.parse(evaluate(`(() => {
+        const used = new Set()
+        const at = new Date(2026, 9, 26, 14, 5, 33)
+        return JSON.stringify([buildFlightRecorderFileName(at, used), buildFlightRecorderFileName(at, used), buildFlightRecorderFileName(at, used)])
+    })()`))
+    assert.deepEqual(names, [
+        'mute-block-flight-recorder-2026-10-26T14-05-33.json',
+        'mute-block-flight-recorder-2026-10-26T14-05-33-2.json',
+        'mute-block-flight-recorder-2026-10-26T14-05-33-3.json'
+    ])
+    assert.equal(new Set(names).size, names.length, 'no two saves get the same name')
+    for(const name of names) {
+        assert.match(name, /^mute-block-flight-recorder-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(-\d+)?\.json$/, name)
+        assert.doesNotMatch(name, /[<>:"/\\|?*\u0000-\u001f]/, name)
+    }
+
+    const source = readRepoFile('shared/js/coordinator.js')
+    const saveBody = extractFunction(source, 'async function saveFlightRecorder()')
+    assert.match(saveBody, /link\.download = buildFlightRecorderFileName\(new Date\(\), flightRecorderSaveFileNames\)/)
+    assert.doesNotMatch(saveBody, /toISOString/, 'the UTC timestamp name is gone')
+    assert.doesNotMatch(saveBody, /downloads\.download/, 'the save stays an anchor download, which needs no downloads permission')
+
+    const pageHtml = readRepoFile('shared/coordinator.html')
+    const saveTag = pageHtml.match(/<button\b[^>]*id="saveFlightRecorderButton"[^>]*>/)[0]
+    const title = saveTag.match(/\stitle="([^"]*)"/)[1]
+    assert.match(title, /^Mute Block extension: /)
+    assert.match(title, /browser's download folder \(usually Downloads\)/, 'the hover help names the folder honestly')
+    assert.match(title, /mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS\.json/, 'the hover help names the file')
+    assert.match(title, /If the browser is set to ask where to save, it asks first\./, 'the hover help says when the browser may ask')
+})
+
+test('outlier events show the gap from the previous event, and highlight gaps above the tunable threshold', () => {
+    const evaluate = loadDashboardHarness()
+    const tunables = require(path.join(__dirname, '..', 'shared/js/tunables'))
+    assert.equal(tunables.OUTLIER_EVENT_GAP_ABNORMAL_MS, 500, 'the threshold lives in tunables.js')
+
+    const events = [{at: 1000}, {at: 1100}, {at: 1700}, {at: 1701}, {at: 3000}, {at: 3500}]
+    const gaps = JSON.parse(evaluate(`JSON.stringify(getOutlierEventGaps(${JSON.stringify(events)}))`))
+    assert.deepEqual(gaps, [
+        {gapMs: null, abnormal: false},
+        {gapMs: 100, abnormal: false},
+        {gapMs: 600, abnormal: true},
+        {gapMs: 1, abnormal: false},
+        {gapMs: 1299, abnormal: true},
+        {gapMs: 500, abnormal: false}
+    ], 'a gap of exactly the threshold is not abnormal')
+
+    const labels = JSON.parse(evaluate('JSON.stringify([formatOutlierEventGap(null), formatOutlierEventGap(12), formatOutlierEventGap(1299), formatOutlierEventGap(2500)])'))
+    assert.deepEqual(labels, ['—', '+12 ms', '+1.30 s', '+2.50 s'])
+
+    const source = readRepoFile('shared/js/coordinator.js')
+    const gapBody = extractFunction(source, 'function getOutlierEventGaps(events = [])')
+    assert.doesNotMatch(gapBody, /\.sort\(/, 'the gaps follow the order the list shows')
+    assert.doesNotMatch(gapBody, /\b500\b/, 'the threshold is not a literal in the code')
+    const panelBody = extractFunction(source, 'function buildOutlierEventsPanel(outlier = {})')
+    assert.doesNotMatch(panelBody, /\.sort\(/)
+    assert.match(panelBody, /getOutlierEventGaps\(events\)/)
+    const rowBody = extractFunction(source, 'function buildOutlierEventRow(entry, gap = {gapMs: null, abnormal: false})')
+    assert.match(rowBody, /row\.classList\.add\('row--event-gap-abnormal'\)/)
+    assert.match(rowBody, /row\.title = muteBlockHelpText\(`Highlighted:[^`]*\$\{OUTLIER_EVENT_GAP_ABNORMAL_MS\} ms/, 'the highlight explains itself on hover')
+
+    const css = readRepoFile('shared/css/coordinator.css')
+    const highlightBody = extractCssRuleBody(css, '.outlier-events .row--event-gap-abnormal')
+    assert.match(highlightBody, /var\(--mb-amber-50\)/)
+    assert.doesNotMatch(highlightBody, /#[0-9a-fA-F]{3,8}\b/, 'the highlight uses color tokens, not hex literals')
 })
 
 test('runtime action contract enumerates current accepted actions and rejects old aliases', () => {
@@ -401,7 +478,6 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'clear-profile-nuke-state',
         'close-tab',
         'cloudflare-challenge-detected',
-        'confirm-space-feed-profiles-blocked',
         'content-claim-retry-hit',
         'content-live-check',
         'coordinator-page-ready',
@@ -437,8 +513,6 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'register-queued-worker-action-surface',
         'release-action-lease',
         'release-job-tab',
-        'remove-pending-space-feed-entries',
-        'remove-pending-space-feed-urls',
         'request-action-lease',
         'reset-queue-wakeup-metrics',
         'resolve-queued-profile-target',
@@ -450,10 +524,8 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'set-dev-mode-enabled',
         'set-extension-settings',
         'set-hidden-run-ids',
-        'set-space-nuked-posts',
         'set-space-registry',
         'set-space-sort',
-        'merge-space-pending-nuked-posts',
         'settle-terminal-coordinator-items',
         'sweep-owned-blocked-profile-tabs',
         'sweep-service-worker-blocked-profile-tabs'
@@ -921,7 +993,6 @@ test('hidden queued profile actions use longer readiness when foreground is disa
 test('legacy progress mirror sync bridge is deleted', () => {
     const source = readRepoFile('shared/js/sw.js')
     const releaseBody = extractFunction(source, 'async function releaseQueuedTab(tabId, options = {})')
-    const confirmBody = extractFunction(source, 'async function confirmSpaceFeedProfilesBlocked(profileHrefs = [])')
 
     assert.doesNotMatch(source, /async function syncCoordinatorProgressRecordsLocked/)
     assert.doesNotMatch(source, /function syncCoordinatorProgressRecords/)
@@ -929,7 +1000,6 @@ test('legacy progress mirror sync bridge is deleted', () => {
     assert.doesNotMatch(source, /enqueueStoredCoordinatorQueueProgressSync/)
     assert.doesNotMatch(source, /compatibility-progress-sync/)
     assert.doesNotMatch(releaseBody, /syncCoordinatorProgressRecords/)
-    assert.doesNotMatch(confirmBody, /PROFILE_NUKE_PROGRESS_KEY/)
 })
 
 test('stale active reconcile ignores queued mirror records as liveness', () => {
@@ -1639,6 +1709,91 @@ test('scan cost and recent event count panels each have their own Clear button',
     const renderHistogramBody = extractFunction(dashboard, 'function renderEventHistogram()')
     assert.match(renderHistogramBody, /entry\.at, 10\) \|\| 0\) < eventHistogramClearedAtMs\) return/)
     assert.match(dashboard, /getElementById\('clearEventHistogramButton'\)\?\.addEventListener\('click', \(\) => \{[\s\S]*clearEventHistogram\(\)/)
+})
+
+test('the TERMINAL and AVG ITEM TIME cards read the worker completed summary, not the queue counts or the listed rows', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+
+    const itemTimeIndex = html.indexOf('id="avgItemTimeValue"')
+    const pageLoadIndex = html.indexOf('id="avgPageLoadValue"')
+    assert.ok(itemTimeIndex >= 0, 'the card exists')
+    assert.ok(itemTimeIndex < pageLoadIndex, 'the card is before the page-load card')
+    assert.match(html, /<div class="summary-label" title="Mute Block extension: The average over the finished items in this view, each measured from start \(activeAt\) to finish \(terminalAt\), same base as the developer dashboard\.">Avg item time<\/div>\s*<div class="summary-value" id="avgItemTimeValue">--<\/div>/)
+    assert.match(dashboard, /const terminalCount = getCompletedTerminalCount\(\)/)
+    assert.match(dashboard, /setText\('terminalCount', terminalCount\)/)
+    assert.match(dashboard, /const completedItemAverageMs = getCompletedItemAverageMs\(\)/)
+    assert.match(dashboard, /setText\('avgItemTimeValue', completedItemAverageMs === null \? '--' : formatPhaseTimingDurationMs\(completedItemAverageMs\)\)/)
+    assert.match(extractFunction(dashboard, 'function getCompletedTerminalCount()'), /return state\.completedSummary \? state\.completedSummary\.count : 0/)
+    assert.match(extractFunction(dashboard, 'function getCompletedItemAverageMs()'), /if\(!summary \|\| summary\.durationCount <= 0\) return null\s*return summary\.durationTotalMs \/ summary\.durationCount/)
+    assert.doesNotMatch(dashboard, /getFinishedItemAverageMs|getAverageFinishedItemMs|queueFinishedDuration|readQueueViewFinishedDuration/)
+})
+
+test('the completed summary is the one measure: the worker queue view carries no finished-duration pair, and the summary is cached per log change and cutoff', () => {
+    const view = readRepoFile('shared/js/swCoordinatorQueueView.js')
+    const buildBody = extractFunction(view, 'function buildCoordinatorQueueView(queue = {}, nowMs = now(), options = {})')
+    assert.doesNotMatch(buildBody, /finishedDuration/)
+
+    const sw = readRepoFile('shared/js/sw.js')
+    const summaryBody = extractFunction(sw, 'function summarizeCompletedWorkDurationsSince(completedMap = {}, clearedAt = 0)')
+    assert.match(summaryBody, /if\(!\(terminalAt > cutoff\)\) continue/)
+    assert.match(summaryBody, /if\(activeAt > 0 && terminalAt > activeAt\) \{\s*durationCount \+= 1\s*durationTotalMs \+= terminalAt - activeAt/)
+
+    const cacheBody = extractFunction(sw, 'function residentCompletedSummaryFor(map = null, clearedAt = 0)')
+    assert.match(cacheBody, /cached\.revision === residentCompletedRevision && cached\.clearedAt === cutoff/)
+    assert.match(cacheBody, /summarizeCompletedWorkDurationsSince\(map \|\| \{\}, cutoff\)/)
+    assert.match(sw, /residentCompletedSummaryFor,\s*isHydrated\(\) \{/)
+
+    // The refresh path and the pushed path both carry the summary under the same field name, and every push site attaches it.
+    assert.match(sw, /completedSummary: coordinatorAuthority\.residentCompletedSummaryFor\(residentCompleted, coordinatorStatsClearedAtResident\)/)
+    assert.match(sw, /finishedWork: summarizeFinishedWorkInPopulation\(population\),\s*completedSummary: snapshot\.completedSummary/)
+    const attachBody = extractFunction(sw, 'function withCoordinatorCompletedSummary(view = null)')
+    assert.match(attachBody, /completedSummary: coordinatorAuthority\.residentCompletedSummaryFor\(completed, coordinatorStatsClearedAtResident\)/)
+    const notifyCount = (sw.match(/\{\[COORDINATOR_QUEUE_VIEW_KEY\]: (?:hotPathQueueView|view|checkpointView)\}/g) || []).length
+    const attachedCount = (sw.match(/withCoordinatorCompletedSummary\(mergeCoordinatorQueueViewTimingCache\(|= withCoordinatorCompletedSummary\(mergeCoordinatorQueueViewTimingCache\(runQueueWakeupMetricPhase/g) || []).length
+    assert.ok(notifyCount >= 5, 'the queue view is pushed from the hot path')
+    assert.ok(attachedCount >= 5, 'every pushed queue view attaches the completed summary')
+    // A completed-log change pushes the view again, so the summary is never one archive behind.
+    assert.match(extractFunction(sw, 'function pushCoordinatorQueueViewAfterCompletedChange(queue = {})'), /withCoordinatorCompletedSummary\(mergeCoordinatorQueueViewTimingCache\(buildCoordinatorQueueView/)
+    assert.match(sw, /pushCoordinatorQueueViewAfterCompletedChange\(projection\.queue\)\s*\}/)
+})
+
+test('the cards read the completed summary from a refresh view or a pushed view, show -- with no timed rows, and keep the last one when a view has none', () => {
+    const evaluate = loadDashboardHarness()
+
+    // Three completed rows since the cutoff, two with a duration (1000 and 2000 ms): the average is 1500 ms (1.5s) over 2 rows, and the
+    // TERMINAL card shows 3. The queue counts say 1, so the TERMINAL card is not reading them.
+    evaluate(`applyCoordinatorQueueView({version: 1, items: [], counts: {succeeded: 1}, total: 1, completedSummary: {count: 3, durationCount: 2, durationTotalMs: 3000}})`)
+    assert.equal(evaluate('JSON.stringify(state.completedSummary)'), '{"count":3,"durationCount":2,"durationTotalMs":3000}')
+    assert.equal(evaluate('getCompletedItemAverageMs()'), 1500)
+    assert.equal(evaluate('formatPhaseTimingDurationMs(getCompletedItemAverageMs())'), '1.5s')
+    assert.equal(evaluate('getCompletedTerminalCount()'), 3)
+    assert.equal(evaluate('getQueueTerminalCount()'), 1)
+
+    // Completed rows with no positive duration: the TERMINAL card still counts them, and the average shows --.
+    evaluate(`applyCoordinatorQueueView({version: 1, items: [], counts: {succeeded: 2}, total: 2, completedSummary: {count: 2, durationCount: 0, durationTotalMs: 0}})`)
+    assert.equal(evaluate('getCompletedItemAverageMs()'), null)
+    assert.equal(evaluate(`(v => v === null ? '--' : formatPhaseTimingDurationMs(v))(getCompletedItemAverageMs())`), '--')
+    assert.equal(evaluate('getCompletedTerminalCount()'), 2)
+
+    // A view without a summary keeps the last one, so the cards cannot blank between views (the flicker fix).
+    evaluate(`applyCoordinatorQueueView({version: 1, items: [], counts: {}, total: 0})`)
+    assert.equal(evaluate('getCompletedTerminalCount()'), 2)
+    assert.equal(evaluate('getCompletedItemAverageMs()'), null)
+
+    // Before any view carries a summary, the TERMINAL card reads 0 and the average reads --.
+    evaluate(`(() => { state.completedSummary = null })()`)
+    assert.equal(evaluate('getCompletedTerminalCount()'), 0)
+    assert.equal(evaluate('getCompletedItemAverageMs()'), null)
+
+    // The pushed path: a pushed view whose live-queue counts are a regression is held back by the guard, but its completed summary is applied.
+    // The push redraws the page, which this harness has no document for, so the draw is stubbed. The test reads state only.
+    evaluate(`render = () => {}`)
+    evaluate(`applyCoordinatorQueueView({version: 1, items: [], counts: {succeeded: 5}, total: 5})`)
+    evaluate(`applyCoordinatorDashboardStateFromMessage({mbCoordinatorQueueView: {version: 1, total: 1, counts: {succeeded: 1}, completedSummary: {count: 4, durationCount: 1, durationTotalMs: 800}}})`)
+    assert.equal(evaluate('getQueueTerminalCount()'), 5, 'the regressed live-queue counts are not applied')
+    assert.equal(evaluate('getCompletedTerminalCount()'), 4)
+    assert.equal(evaluate('getCompletedItemAverageMs()'), 800)
 })
 
 test('archiveTerminalCoordinatorRow resyncs resident state without racing applyLocked', () => {
@@ -2942,65 +3097,7 @@ test('aggregate space-feed buttons preserve resolver-only entries', () => {
     assert.match(postBody, /setSpaceFeedButtonSelection\(queueButton, model\?\.queueableEntries \|\| \[\]\)/)
 })
 
-test('space-feed enqueue rollback clears resolver-only pending rows', () => {
-    const contentSource = readRepoFile('shared/js/content.js')
-    const swSource = readRepoFile('shared/js/sw.js')
-    const nukeBody = extractFunction(contentSource, 'async function nukeSpaceFeedEntries(button, entries)')
-    const contentRemoveUrlBody = extractFunction(contentSource, 'async function removePendingSpaceFeedUrls(urls)')
-    const contentRemoveBody = extractFunction(contentSource, 'async function removePendingSpaceFeedEntries(entries = [])')
-    const swRemoveBody = extractFunction(swSource, 'async function removePendingSpaceFeedEntries(postKeys = [])')
-    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
 
-    assert.match(nukeBody, /registerPendingSpaceFeedEntries\(space, unfinishedEntries\)/)
-    assert.match(nukeBody, /removePendingSpaceFeedEntries\(unfinishedEntries\)/)
-    assert.match(contentRemoveBody, /removePendingSpaceFeedUrls\(urls\)/)
-    assert.match(contentRemoveUrlBody, /remove-pending-space-feed-urls/)
-    assert.match(contentRemoveBody, /remove-pending-space-feed-entries/)
-    assert.doesNotMatch(contentRemoveUrlBody, /safeStorageSet\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]/)
-    assert.doesNotMatch(contentRemoveBody, /safeStorageSet\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]/)
-    assert.doesNotMatch(contentRemoveBody, /delete nextRecords\[postKey\]/)
-    assert.match(swRemoveBody, /resolverPending !== true/)
-    assert.match(swRemoveBody, /delete nextPending\[postKey\]/)
-    assert.match(bootstrap, /request\.action === 'remove-pending-space-feed-entries'/)
-})
-
-test('unresolved resolver rows clear resolver-pending source records', () => {
-    const source = readRepoFile('shared/js/sw.js')
-    const helperBody = extractFunction(readRepoFile('shared/js/swResolvedProfilePendingSpaceRecords.js'), 'function clearResolverPendingSpaceRecords(pendingPosts = {}, item = {}, options = {})')
-    const unresolvedBody = extractFunction(source, 'async function markQueuedProfileResolutionUnresolved(request = {}, sender = {})')
-    const settlementHelperBody = extractFunction(readRepoFile('shared/js/swCoordinatorReconcileLockedMaterialization.js'), 'function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = \'\', item = {})')
-    const transitionBody = extractFunction(source, 'async function applyCoordinatorReconcileQueueAuthorityTransitionPhase(ctx = {})')
-
-    assert.match(helperBody, /resolverPending !== true/)
-    assert.match(helperBody, /record\?\.resolverUrl/)
-    assert.match(helperBody, /record\?\.postUrl/)
-    assert.match(helperBody, /delete nextPending\[recordKey\]/)
-    assert.match(helperBody, /resolverPending: false/)
-
-    assert.match(unresolvedBody, /coordinatorQueueReader\.runs\(\{[\s\S]*metricPath: 'resolver\.unresolved\.load'/)
-    assert.match(unresolvedBody, /readResidentCoordinatorStored\(\{[\s\S]*\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
-    assert.doesNotMatch(unresolvedBody, /COORDINATOR_EVENTS_KEY/)
-    assert.doesNotMatch(unresolvedBody, /metricStorageGet\(/)
-    assert.match(unresolvedBody, /coordinatorAuthority\.applyWithinStorageUpdate\(\{[\s\S]*operationKind: 'resolver-unresolved'/)
-    assert.match(unresolvedBody, /expectedAttemptId: currentAttemptId \? incomingAttemptId : ''/)
-    assert.match(unresolvedBody, /missing-attempt-identity/)
-    assert.match(unresolvedBody, /isProfileResolutionItem\(item\)/)
-    assert.match(unresolvedBody, /isActiveCoordinatorStatus\(item\.status\)/)
-    assert.match(unresolvedBody, /isProfileResolutionItem\(currentItem\)/)
-    assert.match(unresolvedBody, /isActiveCoordinatorStatus\(currentItem\.status\)/)
-    assert.match(unresolvedBody, /\[SPACE_PENDING_NUKED_POSTS_KEY\]: \{\}/)
-    assert.match(unresolvedBody, /clearResolverPendingSpaceRecords\(pendingPosts, nextItem/)
-    assert.match(unresolvedBody, /pendingPosts: pendingResult\.pendingPosts/)
-    assert.match(unresolvedBody, /pendingPosts: pendingResult\.changed/)
-    assert.match(unresolvedBody, /queueOperation: 'resolver-unresolved-derived'/)
-    assert.doesNotMatch(unresolvedBody, /loadCoordinatorState\(/)
-    assert.doesNotMatch(unresolvedBody, /queue: true/)
-    assert.doesNotMatch(unresolvedBody, /browser\.storage\.local\.set\(\{\[SPACE_PENDING_NUKED_POSTS_KEY\]: pendingResult\.pendingPosts\}\)/)
-    assert.match(settlementHelperBody, /isTerminalCoordinatorStatus\(item\.status\)/)
-    assert.match(settlementHelperBody, /isProfileResolutionItem\(item\)/)
-    assert.match(settlementHelperBody, /clearResolverPendingSpaceRecords\(pendingPosts, item/)
-    assert.match(transitionBody, /settleTerminalResolverPendingSourceRecordsLocked\(state, itemKey, item\)/)
-})
 
 test('failed resolver retry preserves source-post resolution mode', () => {
     const source = readRepoFile('shared/js/sw.js')
@@ -3057,18 +3154,14 @@ test('invalid resolver reconcile rows are non-retryable and source-settled', () 
 
     assert.match(transitionBody, /getInvalidProfileResolutionFailure\(item, itemKey\)/)
     assert.match(transitionBody, /invalidTerminalResolutionNeedsReconcile/)
-    assert.match(transitionBody, /applyInvalidProfileResolutionReconcileActionLocked\(\{[\s\S]*queue,[\s\S]*pendingPosts/)
+    assert.match(transitionBody, /applyInvalidProfileResolutionReconcileActionLocked\(\{[\s\S]*queue/)
     assert.match(transitionBody, /kind: 'reconcileInvalidProfileResolution'/)
     assert.match(transitionBody, /getPersistedLiveTabForCoordinatorItem\(item, record, itemKey\)/)
     assert.match(operationBody, /status: 'skipped'/)
     assert.match(operationBody, /outcome: 'unresolved-target'/)
     assert.match(operationBody, /sourceSettlementOutcome: 'cleared'/)
     assert.match(operationBody, /matchesCoordinatorReconcileOperationAttempt\(item, operation\)/)
-    assert.match(operationBody, /clearResolverPendingSpaceRecords\(pendingPosts, nextItem/)
     assert.match(operationBody, /getCoordinatorReconcileOperationTabIdsToClose\(operation, item, operation\.record \|\| null\)/)
-    assert.match(persistBody, /storagePatch\[SPACE_PENDING_NUKED_POSTS_KEY\] = ctx\.pendingPosts/)
-    assert.match(persistBody, /pendingPosts: storagePatch\[SPACE_PENDING_NUKED_POSTS_KEY\]/)
-    assert.match(persistBody, /pendingPosts: ctx\.pendingPostsChanged/)
 })
 
 test('profile search buttons keep live commands dark and disabled commands grey', () => {
@@ -3676,7 +3769,6 @@ test('queued tab open lets durable queued authority outrank stale successful pro
     assert.ok(nonQueuedIndex < successIndex)
     assert.ok(successIndex < openIndex)
     assert.match(body, /options\.currentAuthorityState \|\| options\.authorityState/)
-    assert.match(body, /syncSuccessfulCoordinatorProgress\(normalizedHref, progressRecord\)/)
     assert.match(body, /reason: 'successful-progress-record'/)
 })
 
@@ -4748,7 +4840,7 @@ test('resolved profile handoff remaps queued tab metadata and pending action', (
     assert.match(resolveBody, /result\?\.resolved === true[\s\S]*remapQueuedTabToResolvedProfile\(/)
     assert.match(resolveMutationBody, /delete nextQueue\[itemKey\]/)
     assert.match(resolveMutationBody, /\[resolvedHref\]: nextItem/)
-    assert.match(resolveMutationBody, /coordinatorQueueReader\.runsPending\(\{[\s\S]*metricPath: 'resolver\.resolve\.load'/)
+    assert.match(resolveMutationBody, /coordinatorQueueReader\.runsProgress\(\{[\s\S]*metricPath: 'resolver\.resolve\.load'/)
     assert.doesNotMatch(resolveMutationBody, /loadCoordinatorState\(/)
     assert.match(resolveMutationBody, /terminal-coordinator-item/)
     assert.match(resolveMutationBody, /not-profile-resolution-item/)
@@ -4758,7 +4850,6 @@ test('resolved profile handoff remaps queued tab metadata and pending action', (
     assert.match(resolveMutationBody, /operationKind: 'resolver-remap'/)
     assert.match(resolveMutationBody, /removedRows/)
     assert.match(resolveMutationBody, /queue: false/)
-    assert.match(resolveMutationBody, /pendingPosts: pendingResult\.changed/)
 })
 
 test('space feed has no pause control; pausing is on the dashboard only', () => {
@@ -5278,7 +5369,7 @@ test('every storage write is labelled, sized and recorded once (owner 18 Oct)', 
     assert.notEqual(eventIndex, -1)
     assert.match(writeBody.slice(eventIndex, eventIndex + 400), /label: pathName/)
     // bytes is what reached disk (the logical payload when nothing was translated); logicalBytes is the payload before translation.
-    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /bytes: diskWriteBytes \?\? \(payloadSummary\?\.bytes \|\| 0\)/)
+    assert.match(writeBody.slice(eventIndex, eventIndex + 400), /bytes: payloadSummary\?\.bytes \|\| 0/)
     assert.match(writeBody.slice(eventIndex, eventIndex + 400), /logicalBytes: payloadSummary\?\.bytes/)
     assert.match(writeBody, /storagePayload\.write\.unlabelled/)
     // The coordinator door labels a stored write from its progress metric path or its operation kind, never the phase fallback.
@@ -5618,16 +5709,6 @@ test('mute and unmute confirmations use robust confirmation activation', () => {
     assert.match(mismatchBody, /inverse-unmute-confirmation/)
 })
 
-test('space-feed confirmation no longer syncs legacy progress mirrors', () => {
-    const source = readRepoFile('shared/js/sw.js')
-    const confirmBody = extractFunction(source, 'async function confirmSpaceFeedProfilesBlocked(profileHrefs = [])')
-
-    assert.doesNotMatch(source, /async function syncCoordinatorProgressForHrefs/)
-    assert.doesNotMatch(source, /async function syncCoordinatorProgressForHrefsLocked/)
-    assert.doesNotMatch(confirmBody, /syncCoordinatorProgressForHrefs/)
-    assert.doesNotMatch(confirmBody, /PROFILE_NUKE_PROGRESS_KEY/)
-    assert.doesNotMatch(confirmBody, /saveCoordinatorState/)
-})
 
 test('pause cleanup cannot keep mutating after a newer pause generation wins', () => {
     const source = readRepoFile('shared/js/sw.js')
@@ -5706,7 +5787,6 @@ test('legacy profile progress writes are deleted from service-worker progress pa
 test('terminal settlement separates authority stamping from derived materialization', () => {
     const source = readRepoFile('shared/js/sw.js')
     const settlementBody = extractFunction(source, 'async function settleTerminalCoordinatorItemsLocked(options = {})')
-    const derivedBody = extractFunction(readRepoFile('shared/js/swCoordinatorTerminalSettlement.js'), 'function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {})')
 
     // Terminal settlement stages every qualifying row's mutation in memory
     // and persists them all in one batched WAL write
@@ -5723,18 +5803,13 @@ test('terminal settlement separates authority stamping from derived materializat
     assert.doesNotMatch(settlementBody, /const nextQueueForSettlement = \{\.\.\.queue\}/)
     assert.match(settlementBody, /makeCoordinatorAuthorityApplyResult\(\{[\s\S]*operationKind: 'terminal-settlement',[\s\S]*rowKey: itemKey/)
     assert.match(settlementBody, /coordinatorAuthority\.persistCoordinator\(\s*\{results: settlementResults\}/)
-    assert.match(settlementBody, /buildTerminalCoordinatorSettlementDerivedPayload\(stored, progress, \{[\s\S]*confirmedHrefs,[\s\S]*clearedHrefs,[\s\S]*progressChanged/)
+    assert.match(settlementBody, /normalizeStoredProfileNukeProgress\(progressProjectionRecords\)/)
     // The progress base is the resident stored copy (P2), not a storage read with projection defaults.
     assert.match(settlementBody, /coordinatorAuthority\.residentStored\(\)/)
     assert.doesNotMatch(settlementBody, /metricStorageGet\(|getProfileNukeProgressProjectionDefaults\(/)
     assert.match(settlementBody, /getProfileNukeProgressRecordsFromProjection\(stored, requestedHrefs\)/)
     assert.doesNotMatch(settlementBody, /PROFILE_NUKE_PROGRESS_KEY|getProfileNukeProgressRecordsFromStorage/)
-    assert.match(derivedBody, /SPACE_PENDING_NUKED_POSTS_KEY/)
-    assert.match(derivedBody, /SPACE_NUKED_POSTS_KEY/)
-    assert.match(derivedBody, /progressRecords/)
-    assert.doesNotMatch(derivedBody, /PROFILE_NUKE_PROGRESS_KEY/)
-    assert.match(settlementBody, /saveProfileNukeProgressRowProjection\([\s\S]*derivedSettlement\.progressRecords/)
-    assert.doesNotMatch(derivedBody, /coordinatorAuthority|applyWithinStorageUpdate|metricStorageSet/)
+    assert.match(settlementBody, /saveProfileNukeProgressRowProjection\([\s\S]*progressRecords/)
 })
 
 test('space-feed enqueue does not create progress before durable enqueue', () => {
@@ -6046,9 +6121,7 @@ test('queue-projection loaders answer from the resident state and never replay t
         'loadCoordinatorQueueRunsScopedProgressProjection',
         'loadCoordinatorQueueRunsEventsProjection',
         'loadCoordinatorQueueRunsEventsProgressProjection',
-        'loadCoordinatorReconcileProjection',
-        'loadCoordinatorQueueRunsPendingProjection',
-        'loadCoordinatorQueueRunsProgressPendingNukedProjection'
+        'loadCoordinatorReconcileProjection'
     ]
     for(const name of loaderNames) {
         const body = extractFunction(source, `async function ${name}(options = {})`)
@@ -6247,7 +6320,6 @@ test('storage key names and tunable limits are declared once, in storageKeys.js 
         QUEUE_WAKEUP_METRICS_VIEW_KEY: 'mbQueueWakeupMetricsView',
         PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView',
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard.',
-        SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
         SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
         DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled'
     }

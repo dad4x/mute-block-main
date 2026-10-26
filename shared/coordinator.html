@@ -99,7 +99,7 @@
                         <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Download the service worker's flight recorder as JSON">Save flight recorder</button>
+                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the service worker's flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
                                 <label class="dev-mode-select">Run for
                                     <select id="debugResumeMinutesSelect">
                                         <option value="0">No time limit</option>
@@ -140,6 +140,10 @@
                 <div class="summary-tile">
                     <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>
                     <div class="summary-value" id="terminalCount">0</div>
+                </div>
+                <div class="summary-tile">
+                    <div class="summary-label" title="Mute Block extension: The average over the finished items in this view, each measured from start (activeAt) to finish (terminalAt), same base as the developer dashboard.">Avg item time</div>
+                    <div class="summary-value" id="avgItemTimeValue">--</div>
                 </div>
                 <div class="summary-tile">
                     <div class="summary-label" title="Average page load per profile action this metrics epoch: from navigation start to the content script opening (the Load phase of Phase timing). Shows -- until finished rows carry those milestones.">Avg page load</div>

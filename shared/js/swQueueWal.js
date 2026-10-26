@@ -14,8 +14,6 @@ const QUEUE_READ_METHODS = [
     'runsProgress',
     'runsEvents',
     'runsEventsProgress',
-    'runsPending',
-    'runsProgressPendingNuked',
     'runsScopedProgress',
     'runsScopedProgressForMutation',
     'reconcile',

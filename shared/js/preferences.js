@@ -5,13 +5,9 @@ const { setMuteBlockHelp } = require('./muteBlockHelp')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
     NUKED_POST_RETENTION_DAYS_KEY,
-    SPACE_NUKED_POSTS_KEY,
-    getPrunedNukedPosts,
-    haveSameNukedPostKeys,
     normalizeMaxRememberedNukedPosts,
     normalizeRetentionDays
 } = require('./nukedPosts')
-const {isSpaceMapStorageKey, readSpaceMapFromStored, spaceMapStorageReadDefaults} = require('./spaceMapStorage')
 const {
     SPACE_CATEGORIES,
     SPACE_REGISTRY_KEY,
@@ -26,7 +22,6 @@ const {
 const popupState = {
     sortBy: SPACE_SORT_NAME,
     spaceRegistry: {},
-    nukedPosts: {},
     nukedPostRetentionDays: defaults[NUKED_POST_RETENTION_DAYS_KEY],
     maxRememberedNukedPosts: defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
 }
@@ -38,10 +33,8 @@ async function init() {
     const settings = await namespaceArea(browser.storage.local).get({
         ...defaults,
         [SPACE_REGISTRY_KEY]: {},
-        [SPACE_SORT_KEY]: SPACE_SORT_NAME,
-        ...spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])
+        [SPACE_SORT_KEY]: SPACE_SORT_NAME
     })
-    const storedNukedPosts = readSpaceMapFromStored(settings, SPACE_NUKED_POSTS_KEY)
 
     document.getElementById('appName').textContent = manifest.name
     document.getElementById('appVersion').textContent = `v${manifest.version}`
@@ -74,16 +67,8 @@ async function init() {
     nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
     maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
     popupState.spaceRegistry = settings[SPACE_REGISTRY_KEY] || {}
-    popupState.nukedPosts = getPrunedNukedPosts(storedNukedPosts, {
-        retentionDays: popupState.nukedPostRetentionDays,
-        maxEntries: popupState.maxRememberedNukedPosts
-    })
     popupState.sortBy = settings[SPACE_SORT_KEY] === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME
     spaceSortBy.value = popupState.sortBy
-
-    if(!haveSameNukedPostKeys(storedNukedPosts, popupState.nukedPosts)) {
-        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
-    }
 
     form.addEventListener('submit', async event => {
         event.preventDefault()
@@ -101,16 +86,11 @@ async function init() {
 
         popupState.nukedPostRetentionDays = nextSettings[NUKED_POST_RETENTION_DAYS_KEY]
         popupState.maxRememberedNukedPosts = nextSettings[MAX_REMEMBERED_NUKED_POSTS_KEY]
-        popupState.nukedPosts = getPrunedNukedPosts(popupState.nukedPosts, {
-            retentionDays: popupState.nukedPostRetentionDays,
-            maxEntries: popupState.maxRememberedNukedPosts
-        })
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
         maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
 
-        // The worker owns every write. Settings and nuked posts both go through it.
+        // The worker owns every write. Settings go through it.
         const settingsResult = await browser.runtime.sendMessage({action: 'set-extension-settings', settings: nextSettings})
-        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
         // review-3 R3-2: an empty number field arrives as NaN, which the worker does not save. Say so instead of "saved".
         const rejectedSettings = Array.isArray(settingsResult?.rejected) ? settingsResult.rejected : []
         showStatus(status, rejectedSettings.length
@@ -131,12 +111,6 @@ async function init() {
         popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
         nukedPostRetentionDays.value = popupState.nukedPostRetentionDays
         maxRememberedNukedPosts.value = popupState.maxRememberedNukedPosts
-        popupState.nukedPosts = getPrunedNukedPosts(popupState.nukedPosts, {
-            retentionDays: popupState.nukedPostRetentionDays,
-            maxEntries: popupState.maxRememberedNukedPosts
-        })
-        await browser.runtime.sendMessage({action: 'set-space-nuked-posts', nukedPosts: popupState.nukedPosts})
-
         showStatus(status, 'Settings reset.')
     })
 
@@ -193,12 +167,6 @@ async function init() {
             popupState.sortBy = changes[SPACE_SORT_KEY].newValue === SPACE_SORT_CATEGORY ? SPACE_SORT_CATEGORY : SPACE_SORT_NAME
             spaceSortBy.value = popupState.sortBy
             renderSpaceList(spaceList)
-        }
-
-        if(Object.keys(changes).some(key => isSpaceMapStorageKey(key, [SPACE_NUKED_POSTS_KEY]))) {
-            void namespaceArea(browser.storage.local).get(spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])).then(stored => {
-                popupState.nukedPosts = readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY)
-            })
         }
 
         if(changes[NUKED_POST_RETENTION_DAYS_KEY]) {

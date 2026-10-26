@@ -33,7 +33,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const clearProfileNukeState = requireQueueMachineCapability('durable', durable, 'clearProfileNukeState')
     const enqueueCoordinatorItemsStorageLocked = requireQueueMachineCapability('durable', durable, 'enqueueCoordinatorItemsStorageLocked')
     const markQueuedProfileResolutionUnresolved = requireQueueMachineCapability('durable', durable, 'markQueuedProfileResolutionUnresolved')
-    const confirmSpaceFeedProfilesBlocked = requireQueueMachineCapability('durable', durable, 'confirmSpaceFeedProfilesBlocked')
     const mutateCoordinatorQueuedTabActiveTransition = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabActiveTransition')
     const mutateCoordinatorQueuedTabOpenRollback = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorQueuedTabOpenRollback')
     const mutateCoordinatorInitialBlockedState = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorInitialBlockedState')
@@ -48,9 +47,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const recordActiveBlockedLiveTabTerminal = requireQueueMachineCapability('durable', durable, 'recordActiveBlockedLiveTabTerminal')
     const recordCoordinatorJobProgress = requireQueueMachineCapability('durable', durable, 'recordCoordinatorJobProgress')
     const recordOwnedBlockedSweepTerminal = requireQueueMachineCapability('durable', durable, 'recordOwnedBlockedSweepTerminal')
-    const removePendingSpaceFeedEntries = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedEntries')
-    const removePendingSpaceFeedUrls = requireQueueMachineCapability('durable', durable, 'removePendingSpaceFeedUrls')
-    const mergeSpacePendingNukedPosts = requireQueueMachineCapability('durable', durable, 'mergeSpacePendingNukedPosts')
     const recoverExhaustedRolledBackQueuedCoordinatorItem = requireQueueMachineCapability('durable', durable, 'recoverExhaustedRolledBackQueuedCoordinatorItem')
     const requeueDurableActiveCoordinatorItemWithoutActor = requireQueueMachineCapability('durable', durable, 'requeueDurableActiveCoordinatorItemWithoutActor')
     const settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor = requireQueueMachineCapability('durable', durable, 'settleExhaustedRolledBackQueuedCoordinatorItemsForExecutor')
@@ -136,18 +132,6 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
         },
         [QUEUE_MACHINE_EVENT_TYPES.TERMINAL_COORDINATOR_ITEMS_SETTLE]: async (event = {}) => {
             return settleTerminalCoordinatorItems(event.options || {})
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.PENDING_SPACE_FEED_URLS_REMOVE]: async (event = {}) => {
-            return removePendingSpaceFeedUrls(event.urls || [])
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.PENDING_SPACE_FEED_ENTRIES_REMOVE]: async (event = {}) => {
-            return removePendingSpaceFeedEntries(event.postKeys || [])
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.SPACE_PENDING_NUKED_POSTS_MERGE]: async (event = {}) => {
-            return mergeSpacePendingNukedPosts(event)
-        },
-        [QUEUE_MACHINE_EVENT_TYPES.SPACE_FEED_PROFILES_CONFIRM]: async (event = {}) => {
-            return confirmSpaceFeedProfilesBlocked(event.profileHrefs || event.urls || [])
         },
         [QUEUE_MACHINE_EVENT_TYPES.BLOCKED_LIVE_TAB_TERMINAL_RECORD]: async (event = {}) => {
             return recordActiveBlockedLiveTabTerminal(

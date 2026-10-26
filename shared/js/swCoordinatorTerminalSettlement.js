@@ -2,13 +2,11 @@
 // (decomposition Slice 20). The cluster: the terminal-item settlement-key
 // builder, the terminal-item-entries filter used by
 // settleTerminalCoordinatorItemsLocked (still in sw.js, `async`, out of
-// scope per the plan's "Boundary after Slice 17" section),
-// settleConfirmedSpaceFeedProfiles (the pending/nuked space-feed record
-// settlement step), scheduleTerminalOwnedProfileTabCleanup (the
-// setTimeout-deferred owned-tab cleanup kickoff), and
-// buildTerminalCoordinatorSettlementDerivedPayload (the payload builder that
-// ties settleConfirmedSpaceFeedProfiles together with the pending/nuked
-// storage keys).
+// scope per the plan's "Boundary after Slice 17" section), and
+// scheduleTerminalOwnedProfileTabCleanup (the setTimeout-deferred owned-tab
+// cleanup kickoff). The space post map settlement (settleConfirmedSpaceFeedProfiles,
+// the pending/nuked records) was removed: the feed decides per profile now,
+// from the queue and the profile progress (owner, 25 Oct).
 //
 // Construction-order note: this module constructs well before this
 // cluster's old source-text position (sw.js, right after
@@ -29,33 +27,13 @@
 // existing bare `getCoordinatorItemSettlementKey` reference now resolves to
 // this module's export instead of the old hoisted declaration.
 //
-// Because of that early construction point, two of this module's own
-// dependencies -- getStoredSpaceFeedRecordUrls and
-// getPendingSpaceFeedJobKeyPatch, both from coordinatorJobEnvelope (Slice
-// 11) -- are not yet available as bare consts at construction time
-// (coordinatorJobEnvelope constructs later, further down in sw.js). Each is
-// threaded through as a thunk (`(...args) => getStoredSpaceFeedRecordUrls(...args)`),
-// deferring name resolution to call time, matching the
-// queuedTabOpenUrlCommitHelpers/getTabObservedUrls precedent already used
-// in sw.js for exactly this situation.
+// isTerminalCoordinatorStatus (Slice 12) and normalizeQuoraProfileUrl
+// (top-of-file require) are available as bare consts well before this module's
+// construction point, so they're threaded through directly. getCoordinatorItemHref,
+// closeTerminalOwnedProfileTabs and scheduleCoordinatorReconcile are plain hoisted
+// function declarations in sw.js, so they are threaded through directly too.
 //
-// isTerminalCoordinatorStatus (Slice 12), getNormalizedProfileHrefList
-// (Slice 10/profileResolution), and normalizeQuoraProfileUrl (top-of-file
-// require) are all available as bare consts well before this module's
-// construction point, so they're threaded through directly, no thunk
-// needed. getCoordinatorItemHref, closeTerminalOwnedProfileTabs,
-// scheduleCoordinatorReconcile, removeProfileHrefFromPendingSpaceRecords,
-// and normalizeStoredProfileNukeProgress are all still plain hoisted
-// function declarations in sw.js (untouched by this slice) -- hoisted
-// declarations are visible throughout their enclosing scope regardless of
-// textual position, so these are threaded through directly too, with no
-// ordering risk either way.
-//
-// Clock/environment-global note: settleConfirmedSpaceFeedProfiles read
-// Date.now() directly (twice, for nextPending/nextNuked record
-// `updatedAt` stamps). Per the plan's clock note, `now` is threaded
-// through this module's deps as `() => Date.now()`; both sites now read
-// `now()` instead. setTimeout is threaded through as `setTimeoutFn`,
+// setTimeout is threaded through as `setTimeoutFn`,
 // matching the queuedTabOpenUrlCommitHelpers precedent, since a raw
 // `setTimeout` reference inside an extracted module resolves to the real
 // Node timer rather than the test harness's injected fake one (the same
@@ -81,28 +59,13 @@
 // rest of this module -- it could move back out alone without disturbing
 // the other four).
 //
-// defaults (top-of-file `require('./defaults')`), SPACE_PENDING_NUKED_POSTS_KEY,
-// and SPACE_NUKED_POSTS_KEY (both top-of-file consts/requires) are threaded
-// through as constants, matching the swCoordinatorSourceProvenance.js
-// (Slice 18) precedent for `defaults`.
-
 function createCoordinatorTerminalSettlement(deps = {}) {
-    const {now, setTimeoutFn} = deps
-    const {
-        SPACE_PENDING_NUKED_POSTS_KEY,
-        SPACE_NUKED_POSTS_KEY,
-        defaults
-    } = deps.constants || {}
+    const {setTimeoutFn} = deps
     const {
         isTerminalCoordinatorStatus,
         getNormalizedProfileHrefList,
         getCoordinatorItemHref,
         normalizeQuoraProfileUrl,
-        getStoredSpaceFeedRecordUrls,
-        getPendingSpaceFeedJobKeyPatch,
-        getPrunedNukedPosts,
-        removeProfileHrefFromPendingSpaceRecords,
-        normalizeStoredProfileNukeProgress,
         closeTerminalOwnedProfileTabs,
         scheduleCoordinatorReconcile
     } = deps.handlers || {}
@@ -136,88 +99,6 @@ function createCoordinatorTerminalSettlement(deps = {}) {
         return entries
     }
 
-    function settleConfirmedSpaceFeedProfiles(currentPending = {}, currentNuked = {}, confirmedHrefs = new Set()) {
-        const nextPending = {
-            ...currentPending
-        }
-        const nextNuked = {
-            ...currentNuked
-        }
-        let changedPending = false
-        let changedNuked = false
-
-        for(const [postKey, record] of Object.entries(currentPending || {})) {
-            const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-            const nextRemainingUrls = remainingUrls.filter(url => !confirmedHrefs.has(url))
-
-            if(nextRemainingUrls.length === remainingUrls.length) continue
-
-            changedPending = true
-
-            if(nextRemainingUrls.length > 0) {
-                nextPending[postKey] = {
-                    ...record,
-                    remainingUrls: nextRemainingUrls,
-                    ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
-                    updatedAt: now()
-                }
-                continue
-            }
-
-            delete nextPending[postKey]
-            nextNuked[postKey] = {
-                ...(currentNuked?.[postKey] || {}),
-                postKey,
-                postUrl: record.postUrl || currentNuked?.[postKey]?.postUrl || '',
-                spaceKey: record.spaceKey || currentNuked?.[postKey]?.spaceKey || '',
-                spaceUrl: record.spaceUrl || currentNuked?.[postKey]?.spaceUrl || '',
-                urls: getNormalizedProfileHrefList(allUrls.length ? allUrls : remainingUrls),
-                updatedAt: now()
-            }
-            changedNuked = true
-        }
-
-        return {nextPending, nextNuked, changedPending, changedNuked}
-    }
-
-    // Clear Current Work (owner decision): the pending records of the cleared work are deleted, not settled. A record keeps only the
-    // profiles that were not cleared. A record left with no remaining profile is deleted outright, never moved into the remembered-nuked
-    // map or the completed log: only archive confirmation settles a pending record, and the cleared rows will never be confirmed.
-    // This differs on purpose from removeProfileHrefFromPendingSpaceRecords (swProfileProgressMerge.js), which keeps a record whose
-    // remainingUrls became empty while allUrls remain; such a record never settles, so Clear must not use that rule.
-    function removeClearedRowsFromPendingSpaceRecords(currentPending = {}, clearedHrefs = []) {
-        const hrefs = new Set(getNormalizedProfileHrefList(Array.isArray(clearedHrefs) ? clearedHrefs : []))
-        const nextPending = {
-            ...currentPending
-        }
-        let changed = false
-        if(!hrefs.size) return {nextPending, changed}
-
-        for(const [postKey, record] of Object.entries(currentPending || {})) {
-            const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-            if(!allUrls.some(url => hrefs.has(url)) && !remainingUrls.some(url => hrefs.has(url))) continue
-
-            changed = true
-            const nextRemainingUrls = remainingUrls.filter(url => !hrefs.has(url))
-            if(!nextRemainingUrls.length) {
-                delete nextPending[postKey]
-                continue
-            }
-            const nextAllUrls = allUrls.filter(url => !hrefs.has(url))
-            nextPending[postKey] = {
-                ...record,
-                allUrls: nextAllUrls,
-                remainingUrls: nextRemainingUrls,
-                ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
-                updatedAt: now()
-            }
-        }
-
-        return {nextPending, changed}
-    }
-
     function scheduleTerminalOwnedProfileTabCleanup(profileHrefs = [], delayMs = 0) {
         const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
         // An empty list is skipped. closeTerminalOwnedProfileTabs() with no list
@@ -230,47 +111,10 @@ function createCoordinatorTerminalSettlement(deps = {}) {
         }, Math.max(0, Number.parseInt(delayMs, 10) || 0))
     }
 
-    function buildTerminalCoordinatorSettlementDerivedPayload(stored = {}, progress = {}, options = {}) {
-        const confirmedHrefs = options.confirmedHrefs || new Set()
-        const clearedHrefs = options.clearedHrefs || new Set()
-        const progressChanged = options.progressChanged === true
-        const progressRecords = progressChanged
-            ? normalizeStoredProfileNukeProgress(options.progressRecords || {})
-            : {}
-        const currentPending = stored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {}
-        const currentNuked = stored?.[SPACE_NUKED_POSTS_KEY] || {}
-        const confirmedResult = settleConfirmedSpaceFeedProfiles(currentPending, currentNuked, confirmedHrefs)
-        const clearedResult = removeProfileHrefFromPendingSpaceRecords(confirmedResult.nextPending, Array.from(clearedHrefs))
-        const prunedNuked = confirmedResult.changedNuked
-            ? getPrunedNukedPosts(confirmedResult.nextNuked, {
-                retentionDays: defaults.nukedPostRetentionDays,
-                maxEntries: defaults.maxRememberedNukedPosts
-            })
-            : confirmedResult.nextNuked
-        const payload = {}
-
-        if(confirmedResult.changedPending || clearedResult.changed) {
-            payload[SPACE_PENDING_NUKED_POSTS_KEY] = clearedResult.records
-        }
-        if(confirmedResult.changedNuked) {
-            payload[SPACE_NUKED_POSTS_KEY] = prunedNuked
-        }
-
-        return {
-            payload,
-            progressRecords,
-            pendingPosts: payload[SPACE_PENDING_NUKED_POSTS_KEY] || null,
-            nukedPosts: payload[SPACE_NUKED_POSTS_KEY] || null
-        }
-    }
-
     return {
         getCoordinatorItemSettlementKey,
         getCoordinatorTerminalItemEntries,
-        settleConfirmedSpaceFeedProfiles,
-        removeClearedRowsFromPendingSpaceRecords,
-        scheduleTerminalOwnedProfileTabCleanup,
-        buildTerminalCoordinatorSettlementDerivedPayload
+        scheduleTerminalOwnedProfileTabCleanup
     }
 }
 

@@ -70,8 +70,6 @@ const lanes = [
       ['node', 'test/candidateListEvidence.test.js'],
       ['node', 'test/swResumeExemption.test.js'],
       ['node', 'test/swProfileNukeProgressPush.test.js'],
-      ['node', 'test/spaceMapStorage.test.js'],
-      ['node', 'test/spaceMapBuckets.test.js'],
       ['node', 'test/coordinatorEventRecord.test.js'],
       ['node', 'test/runsWal.test.js'],
       ['node', 'test/walUsersSynthetic.test.js'],

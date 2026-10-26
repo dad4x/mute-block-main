@@ -3,9 +3,8 @@
 // coordinator item's `source`/`sources` metadata from its run's metadata and
 // diagnostic events, normalizes/validates a `provenance` payload attached to
 // an incoming queue item, and the profile-removal-driven derived-state
-// cleanup that strips a nuked/cleared profile's href out of progress
-// records, coordinator runs, pending space-feed records, and remembered
-// nuked posts.
+// cleanup that strips a cleared profile's href out of progress records and
+// coordinator runs. (The pending and remembered space-post maps were removed, 25 Oct.)
 //
 // All 14 functions here are plain synchronous functions with no `async`
 // keyword and no Promise/`.then()`/`.catch()` chain in their bodies (grepped
@@ -37,9 +36,8 @@
 // the latest of this module's five already-extracted-module dependencies --
 // so this module constructs in sw.js immediately after storageMetrics's
 // related setup and immediately before coordinatorReconcileInputs, the
-// earliest eager dependent. getCoordinatorItemHref,
-// removeProfileHrefFromCoordinatorRuns, removeProfileHrefFromPendingSpaceRecords,
-// and removeProfileHrefFromRememberedNukedPosts all stay in sw.js as plain
+// earliest eager dependent. getCoordinatorItemHref and
+// removeProfileHrefFromCoordinatorRuns stay in sw.js as plain
 // hoisted function declarations (untouched by this slice, defined much
 // further below) and are threaded through as handler deps -- hoisted
 // declarations are visible from anywhere in their enclosing scope
@@ -47,14 +45,13 @@
 //
 // getHydratedCoordinatorAuthorityState, refreshResidentCoordinatorAuthorityState,
 // cloneCoordinatorAuthorityValue, createCoordinatorAuthority, and the
-// queue-WAL/shadow-WAL async cluster are all explicitly out of scope for
+// queue-WAL async cluster are all explicitly out of scope for
 // this decomposition effort (see the plan's "Boundary after Slice 17"
 // section) and are untouched here.
 
 function createCoordinatorSourceProvenance(deps = {}) {
     const {
-        COORDINATOR_QUEUE_WAL_KEY,
-        defaults
+        COORDINATOR_QUEUE_WAL_KEY
     } = deps.constants || {}
     const {
         normalizeQuoraProfileUrl,
@@ -62,10 +59,7 @@ function createCoordinatorSourceProvenance(deps = {}) {
         getWalRecordsForGeneration,
         normalizeQueueWriteOperationName,
         getCoordinatorRunIdsForHref,
-        removeProfileHrefFromCoordinatorRuns,
-        removeProfileHrefFromPendingSpaceRecords,
-        removeProfileHrefFromRememberedNukedPosts,
-        getPrunedNukedPosts
+        removeProfileHrefFromCoordinatorRuns
     } = deps.handlers || {}
 
     function getChangedProfileProgressRecords(oldRecords = {}, newRecords = {}) {
@@ -259,26 +253,18 @@ function createCoordinatorSourceProvenance(deps = {}) {
                 changed: false,
                 progressChanged: false,
                 runsChanged: false,
-                pendingPostsChanged: false,
-                nukedPostsChanged: false,
                 affectedRunIds: [],
                 materialized: 0,
-                runs: state.runs || {},
-                pendingPosts: state.pendingPosts || {},
-                nukedPosts: state.nukedPosts || {}
+                runs: state.runs || {}
             }
         }
 
         const liveHrefs = getCoordinatorQueueProfileHrefSet(state.queue || {})
         const progress = state.progress || {}
         let runs = state.runs || {}
-        let pendingPosts = state.pendingPosts || {}
-        let nukedPosts = state.nukedPosts || {}
         const affectedRunIds = new Set()
         let progressChanged = false
         let runsChanged = false
-        let pendingPostsChanged = false
-        let nukedPostsChanged = false
         let materialized = 0
 
         for(const href of removedHrefs) {
@@ -300,37 +286,16 @@ function createCoordinatorSourceProvenance(deps = {}) {
                 }
             }
 
-            const pendingResult = removeProfileHrefFromPendingSpaceRecords(pendingPosts, href)
-            if(pendingResult.changed) {
-                pendingPosts = pendingResult.records
-                pendingPostsChanged = true
-                hrefChanged = true
-            }
-
-            const nukedResult = removeProfileHrefFromRememberedNukedPosts(nukedPosts, href)
-            if(nukedResult.changed) {
-                nukedPosts = getPrunedNukedPosts(nukedResult.records, {
-                    retentionDays: defaults.nukedPostRetentionDays,
-                    maxEntries: defaults.maxRememberedNukedPosts
-                })
-                nukedPostsChanged = true
-                hrefChanged = true
-            }
-
             if(hrefChanged) materialized += 1
         }
 
         return {
-            changed: progressChanged || runsChanged || pendingPostsChanged || nukedPostsChanged,
+            changed: progressChanged || runsChanged,
             progressChanged,
             runsChanged,
-            pendingPostsChanged,
-            nukedPostsChanged,
             affectedRunIds: Array.from(affectedRunIds),
             materialized,
-            runs,
-            pendingPosts,
-            nukedPosts
+            runs
         }
     }
 

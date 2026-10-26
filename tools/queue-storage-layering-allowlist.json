@@ -5,8 +5,6 @@
     "sw.js::loadCoordinatorQueueProjection",
     "sw.js::loadCoordinatorQueueRunsEventsProgressProjection",
     "sw.js::loadCoordinatorQueueRunsEventsProjection",
-    "sw.js::loadCoordinatorQueueRunsPendingProjection",
-    "sw.js::loadCoordinatorQueueRunsProgressPendingNukedProjection",
     "sw.js::loadCoordinatorQueueRunsProgressProjection",
     "sw.js::loadCoordinatorQueueRunsProjection",
     "sw.js::loadCoordinatorQueueRunsScopedProgressProjection",

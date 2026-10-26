@@ -70,17 +70,15 @@ function loadProfileStateHarness() {
             }
             return result
         }`,
-        `function getRememberedSpaceFeedPostUrlSet() { return new Set() }`,
         `function getActivePendingSpaceFeedUrlsForRender() { return [] }`,
-        `function isRememberedSpaceFeedPostProfileForRender() { return false }`,
         `function isProfileNukeRetryBlocked() { return false }`,
         `function isProfileNukeSucceeded(href) { return progress[href]?.status === 'blocked' }`,
         source.slice(source.indexOf('const spaceFeedKnownNukedProfileKeys'), source.indexOf('function getSpaceFeedProfileStateKey')),
         extractFunction(source, 'function getSpaceFeedProfileStateKey(href)'),
         extractFunction(source, 'function isKnownNukedSpaceFeedProfile(href)'),
         extractFunction(source, 'function isSpaceFeedProfileStateReady(href)'),
-        extractFunction(source, 'function isSpaceFeedPostNuked(postKey, candidateUrls = null)'),
         extractFunction(source, 'function getSpaceFeedUniqueQueueableProfileCount(queueableEntries = [])'),
+        extractFunction(source, 'function isSpaceFeedPostNuked(candidateUrls = null)'),
         extractFunction(source, 'function getSpacePendingProfileCount(entries = [], pendingCoordinatorProfileHrefs = new Set())'),
         extractFunction(source, 'function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null)'),
         `globalThis.harness = {
@@ -140,8 +138,8 @@ test('a nuked profile is not offered, and a post whose profiles are all nuked is
     harness.answered.add('Bob-Example')
 
     assert.equal(harness.queueable({postKey: 'post-a', candidateUrls: [ALICE, BOB]}, null).length, 1)
-    assert.equal(harness.postNuked('post-a', [ALICE]), true)
-    assert.equal(harness.postNuked('post-a', [ALICE, BOB]), false)
+    assert.equal(harness.postNuked([ALICE]), true)
+    assert.equal(harness.postNuked([ALICE, BOB]), false)
 })
 
 test('a profile link whose text is its URL is not rejected by the action-word filter', () => {
@@ -487,14 +485,6 @@ test('a post with errors and nothing to queue shows a white Bad Links button, af
     assert.ok(content.indexOf('else if(postBusy) {') < content.indexOf('else if(hasBadLinks) {'))
 })
 
-test('a profile the worker merges is named back to the page, which clears its pending record', () => {
-    const content = readRepoFile('shared/js/content.js')
-    const worker = readRepoFile('shared/js/sw.js')
-
-    assert.equal(worker.split('mergedHrefs.push(targetProfileHref)').length - 1, 2)
-    assert.match(content, /removePendingSpaceFeedUrls\(result\.mergedHrefs\)/)
-    assert.match(content, /status === 'archived-terminal' \|\|/)
-})
 
 test('a blocked queued tab asks the worker to close it before releasing its slot, so the close is not refused as stale', () => {
     const source = readRepoFile('shared/js/content.js')
@@ -529,4 +519,15 @@ test('the count is the unique profiles still to be queued, so a profile linked f
         {postKey: 'post-c', candidateUrls: [CAROL]}
     ]), 3)
     assert.equal(harness.count([]), 0)
+})
+
+test('the nuke run counts already-nuked profiles, not posts, and a profile linked from several posts counts once (25 Oct)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const body = extractFunction(content, 'async function nukeSpaceFeedEntries(button, entries)')
+
+    assert.match(body, /const alreadyNukedProfiles = new Set\(\)/)
+    assert.match(body, /const nukedProfiles = candidateProfiles\.filter\(url => isKnownNukedSpaceFeedProfile\(url\)\)/)
+    assert.match(body, /for\(const url of nukedProfiles\) alreadyNukedProfiles\.add\(url\)/)
+    assert.match(body, /alreadyNuked: alreadyNukedProfiles\.size/)
+    assert.doesNotMatch(body, /alreadyNukedCount/)
 })

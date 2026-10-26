@@ -1098,7 +1098,7 @@ test('recovers from new active checkpoint after pointer flip even if cleanup did
 test('separates recovery-critical checkpoint state from user memory', () => {
     const state = {
         ...baseState(),
-        mbSpaceNukedPosts: {
+        mbSpaceRegistry: {
             post1: {updatedAt: 1000, profileHref: 'https://www.quora.com/profile/A'}
         },
         mbQueueWakeupMetrics: {
@@ -1108,7 +1108,7 @@ test('separates recovery-critical checkpoint state from user memory', () => {
 
     const split = splitCheckpointState(state)
     assert.deepEqual(Object.keys(split.recoveryCritical).sort(), ['events', 'progress', 'queue', 'runs'])
-    assert.deepEqual(Object.keys(split.userMemory).sort(), ['mbQueueWakeupMetrics', 'mbSpaceNukedPosts'])
+    assert.deepEqual(Object.keys(split.userMemory).sort(), ['mbQueueWakeupMetrics', 'mbSpaceRegistry'])
 
     const estimate = estimateStateBytes(state)
     assert.ok(estimate.totalBytes > estimate.recoveryCriticalBytes)

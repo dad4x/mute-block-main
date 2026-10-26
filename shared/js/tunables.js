@@ -73,8 +73,6 @@ module.exports = {
     // pass without waiting, and the tab removal that frees the window refills at once. Off in the comparison run that showed the
     // handoff summary worse with a wait; this is a skip, not a wait, and needs its own measurement run.
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED: true,
-    // Cadence of the store-size sample taken during a timed run (sw.js startStoreSizeWatch).
-    STORE_SIZE_WATCH_INTERVAL_MS: 30000,
     // Wait between reads of the profile menu for its block or unblock item, in ms (the page script). The first read is at once. A fixed
     // 500 ms was measured against an escalating schedule (22 Oct): no difference in blocks, handoff or gaps, so the simpler fixed wait stays.
     PROFILE_MENU_POLL_INTERVAL_MS: 500,
@@ -90,6 +88,9 @@ module.exports = {
     // Dashboard flight recorder card (dev mode only): how often it asks the worker for new events while it is expanded, and how many rows it keeps.
     FLIGHT_RECORDER_CARD_POLL_MS: 1000,
     FLIGHT_RECORDER_CARD_ROW_LIMIT: 200,
+    // Dashboard outlier Events list: the gap between two consecutive recorder events, in the order the list shows them, is highlighted
+    // as abnormal when it is greater than this many ms.
+    OUTLIER_EVENT_GAP_ABNORMAL_MS: 500,
     // The owned nuke status is reused for this long before the page asks the worker again.
     OWNED_NUKE_STATUS_TTL_MS: 2000,
     // The space page's redraw waits at most this long for the owned status. A slower answer lands in the cache for the next redraw.

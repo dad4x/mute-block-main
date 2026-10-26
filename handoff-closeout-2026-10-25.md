@@ -100,3 +100,48 @@ Closeout steps 4 and 5 are built behind no switch. Arrival-order shards are the 
 - Closeout plan: `completed-log-shards-plan-2026-10-25.md` (user-edited, tracked; leave alone).
 - Suffix rules: `historical/suffix-cutting-discussion-2026-10-14.md`.
 - Entropy patterns (read before editing `sw.js`): `entropy-reduction-action-plan-2026-09-09.md`.
+
+## Open items added 26 Oct
+
+Build: 1.6.1635 is built (Chrome dev only, no zips). Everything since 62a67ea is merged into the working tree, and most of it is uncommitted. Commit and tag decision pending.
+
+### Decided and built (uncommitted)
+- Space post maps removed. Pending and remembered-post maps are gone; decisions are per profile. Remembered means completed profile history, which keeps its 90-day and 10,000-entry limits.
+- Clear no longer touches pending records (there are none).
+- Shadow machinery removed from sw.js (about 1,440 lines across sw.js, tests and harness).
+- Avg item time card before Avg page load. It averages (terminalAt - activeAt) over finished rows, using the worker's finished-duration pair.
+- Save flight recorder: file name mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json, with hover text saying it goes to the browser's download folder.
+- Outlier events: gap column; gaps above 500 ms highlighted (OUTLIER_EVENT_GAP_ABNORMAL_MS in tunables.js).
+- Runs survive checkpoint switches (fixed a data-loss bug). Runs use time-day shards and the old bucket layout is gone.
+
+### Open: needs an owner decision
+1. **Dashboard and space-page flicker (one root cause).** The hot path builds the queue view from live rows only. The dashboard refresh also merges the completed log. Archived rows leave the queue, so every hot push drops them: the Terminal count holds (timing cache) but the finished-duration pair does not, and the Avg item time card shows "--". The space page's Nuke 'Em count also reverts after a queue refresh that omits just-queued rows. Options:
+   (a) derive post-write runs before the notify and pass them to the hot-path calls (runs are missing there today);
+   (b) merge completed rows into the hot population (costs a read per WAL write);
+   (c) ratchet the finished pair in the timing cache as well.
+   (a) and (b) are needed together. Decide the cost trade-off first.
+2. **Timing cache ratchet.** mergeCoordinatorQueueViewTimingCache ratchets terminal counts and total, but not finishedDurationTotalMs or finishedDurationCount. After a restart the average can rest on fewer rows than the Terminal count. Same fix family as item 1 (c).
+3. **sourcePostKey is redundant.** Queue rows already carry evidence[].postKey and evidence[].postUrl (content.js association.evidence; the space page's pending index reads them). My earlier statement that rows carry no post key was wrong. Decide: remove sourcePostKey, or keep it as a copy. Not yet decided.
+4. **Runs older than 90 days** are dropped on write by the time-shard retention (new behaviour). Confirm.
+
+### Open: known gaps
+5. Pending depends on the queue copy: between enqueue and the next queue refresh, the page has no pending record for the posts.
+6. Resolver-only posts (no profile yet) get no nuked judgement.
+7. Completed log prunes by whole checkpoint shards, so its limits are approximate.
+8. Other checkpoint writers that pass only the queue (swProfileNukeProgress addContentPageStateProjectionPayload; swCoordinatorContentQueueIndex) could drop runs in fallback paths. Not changed.
+9. Old unprefixed data from earlier builds is not read or migrated (decision: erase policy). It stays in storage.
+10. tools/cdp scripts still read removed keys (inspect-space-state, space-summary, storage-read-profile, wal-snapshot-benchmark, upgrade-regression). They show zero pending. Not updated.
+11. Shadow-removal leftovers: a disk-guard test title still says "checkpoint"; some synthetic URL strings contain "Shadow"; 11 unused sw.js imports predate this work.
+12. Lane count: reports have said 51 and 53 for the same runner. Confirm what the runner lists.
+
+### Open: documentation and measurement
+13. architecture.md: uncommitted rewrite (about 484 lines). Still to do: enumerate every stored key (disk or session, writer, reader, whether still needed) and the major data structures (queue and completed rows, runs, WAL record kinds, checkpoint manifest and shards, progress records, outlier entries, recorder events, metrics view). Include session storage size against the chrome.storage.session quota, after confirming the current quota.
+14. Review dispositions: codex-review-1 item 1 (orphan pending) is superseded by removing the pending map. codex-review-1 item 2 (manual progress) is a documented exception. codex-review-2 item 3 (shadow machinery) is removed. codex-review-2 item 4 (architecture) is item 13.
+15. Outliers: Phase 3 (row timeout) is not built; the baseline is cumulative; Phase 4 (full-field view) is hover text only.
+
+### Open: live checks not yet done
+16. Outlier highlight and gap column; save flight recorder file and folder; Avg item time card (steady, not flickering); space-page Nuke 'Em count after queuing; manual block and pardon end to end (from the 25 Oct list, still open).
+17. Save flight recorder uses an anchor download, so the folder is the browser's default. Not verified in a live browser.
+
+### Parked
+18. nits7 item 17 (poster memory in asset spaces): planning item. Owner has parked it.

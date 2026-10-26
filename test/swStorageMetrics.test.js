@@ -30,8 +30,6 @@ function makeMetrics() {
             QUEUE_WAKEUP_METRICS_VIEW_KEY: 'mbQueueWakeupMetricsView',
             PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView',
             PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard.',
-            SPACE_PENDING_NUKED_POSTS_KEY: 'mbSpacePendingNukedPosts',
-            SPACE_NUKED_POSTS_KEY: 'mbSpaceNukedPosts',
             OWNED_TAB_STATE_KEY: 'mbOwnedTabState',
             COORDINATOR_PAUSED_KEY: 'mbCoordinatorPaused',
             COORDINATOR_PAUSE_GENERATION_KEY: 'mbCoordinatorPauseGeneration',

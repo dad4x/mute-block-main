@@ -274,41 +274,6 @@ function createCoordinatorJobEnvelope(deps = {}) {
         }
     }
 
-    function getStoredSpaceFeedRecordUrls(record, key = 'remainingUrls') {
-        if(!record || typeof record !== 'object') return []
-
-        const urls = key && Array.isArray(record[key])
-            ? record[key]
-            : key === 'remainingUrls'
-                ? Array.isArray(record.remainingUrls)
-                    ? record.remainingUrls
-                    : Array.isArray(record.allUrls)
-                        ? record.allUrls
-                        : Array.isArray(record.urls)
-                            ? record.urls
-                            : []
-                : []
-
-        return getNormalizedProfileHrefList(urls)
-    }
-
-    function getPendingSpaceFeedJobKeyPatch(record = {}, remainingUrls = []) {
-        const remaining = getNormalizedProfileHrefList(remainingUrls)
-        const existingByHref = record?.jobKeysByProfileHref && typeof record.jobKeysByProfileHref === 'object'
-            ? record.jobKeysByProfileHref
-            : {}
-        const jobKeysByProfileHref = {}
-
-        for(const href of remaining) {
-            jobKeysByProfileHref[href] = normalizeQuoraProfileUrl(existingByHref[href] || href) || href
-        }
-
-        return {
-            jobKeys: getNormalizedProfileHrefList(Object.values(jobKeysByProfileHref)),
-            jobKeysByProfileHref
-        }
-    }
-
     function makeStaleAttemptDiagnosticEvent(details = {}) {
         return {
             id: makeId('event'),
@@ -367,8 +332,6 @@ function createCoordinatorJobEnvelope(deps = {}) {
         getFailedItemQuestionResolutionUrl,
         getFailedItemProfileResolutionRetryUrl,
         buildQueuedCoordinatorProgressResetPatch,
-        getStoredSpaceFeedRecordUrls,
-        getPendingSpaceFeedJobKeyPatch,
         makeStaleAttemptDiagnosticEvent,
         recordCoordinatorDiagnosticEvent,
         drainPendingCoordinatorDiagnosticEvents,

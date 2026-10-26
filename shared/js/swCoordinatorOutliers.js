@@ -24,7 +24,7 @@ const {
 } = require('./tunables')
 
 // The recorder kinds that belong to an outlier by its span, whatever their profile: the disk writes and the queue checkpoint switches,
-// which can perturb a row. Storage-update settle records, pause, dashboard and store-size events are left out (plan, section 2).
+// which can perturb a row. Storage-update settle records, pause and dashboard events are left out (plan, section 2).
 // Each kind is recorded at a call site in sw.js or swstorage.js; test/swSynthetic.test.js checks that each one is still recorded.
 const OUTLIER_SPAN_EVENT_KINDS = new Set([
     'storage-write',

@@ -23,8 +23,8 @@ assert.deepEqual(
     [...QUEUE_READ_METHODS].sort(),
     [
         'actionRows', 'completedRecent', 'completedRow', 'currentAuthority', 'full', 'item', 'reconcile', 'row', 'rows',
-        'runs', 'runsEvents', 'runsEventsProgress', 'runsPending',
-        'runsProgress', 'runsProgressPendingNuked', 'runsScopedProgress',
+        'runs', 'runsEvents', 'runsEventsProgress',
+        'runsProgress', 'runsScopedProgress',
         'runsScopedProgressForMutation'
     ]
 )
@@ -60,23 +60,20 @@ assert.deepEqual(
     const facade = createQueueWalReadFacade(deps)
     assert.equal(facade.runsEvents({metricPath: 'e'}), sentinels.runsEvents)
     assert.equal(facade.runsEventsProgress({metricPath: 'ep'}), sentinels.runsEventsProgress)
-    assert.equal(facade.runsPending({metricPath: 'p'}), sentinels.runsPending)
-    assert.equal(facade.runsProgressPendingNuked({metricPath: 'n'}), sentinels.runsProgressPendingNuked)
     assert.equal(facade.runsScopedProgress({metricPath: 's'}), sentinels.runsScopedProgress)
     assert.equal(facade.runsScopedProgressForMutation({metricPath: 'm'}), sentinels.runsScopedProgressForMutation)
     assert.deepEqual(calls.map(call => call.name), [
-        'runsEvents', 'runsEventsProgress', 'runsPending',
-        'runsProgressPendingNuked', 'runsScopedProgress', 'runsScopedProgressForMutation'
+        'runsEvents', 'runsEventsProgress', 'runsScopedProgress', 'runsScopedProgressForMutation'
     ])
 }
 
 // A missing delegate fails when the facade is built, and names the method.
 {
     const {deps} = makeDelegates()
-    delete deps.runsPending
+    delete deps.runsProgress
     assert.throws(
         () => createQueueWalReadFacade(deps),
-        /no delegate for "runsPending"/
+        /no delegate for "runsProgress"/
     )
 }
 

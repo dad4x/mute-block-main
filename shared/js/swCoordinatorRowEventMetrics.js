@@ -18,8 +18,7 @@
 // other environment global the test harness fakes), so no `now` dependency
 // is threaded through.
 //
-// Construction-order note: unlike this slice's other module
-// (swResolvedProfilePendingSpaceRecords.js), this module is constructed in
+// Construction-order note: this module is constructed in
 // place at this cluster's old source-text position: no already-extracted
 // module eagerly references any of its 5 exports at its own
 // construction-call site (checked via grep across shared/js/sw.js), and

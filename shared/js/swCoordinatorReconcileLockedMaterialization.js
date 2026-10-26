@@ -11,8 +11,7 @@
 // share, the three appliers themselves (invalid-profile-resolution, stale-
 // profile-resolution-tab, progress-record), the queue-authority diff builder
 // consumed by the async persist path, the terminal-key-only event predicate/
-// materializer, the two resolver-pending-source-record settlers, the
-// queued-item derived-state materializer, the two affected-run-id
+// materializer, the queued-item derived-state materializer, the two affected-run-id
 // bookkeeping helpers, and the derived-projection-phase orchestrator that
 // ties several of the above together with swCoordinatorSourceProvenance.js's
 // (Slice 18) materializeRemovedProfileDerivedStateFromAuthority.
@@ -68,8 +67,7 @@
 // quoraRuntimeActivated precedent from Slice 7.
 //
 // makeCoordinatorAuthorityApplyResult, getCoordinatorItemHref,
-// buildTerminalCoordinatorQueueItem, clearResolverPendingSpaceRecords,
-// addResolvedProfileToPendingSpaceRecords, and normalizeProgressPatch are
+// buildTerminalCoordinatorQueueItem, and normalizeProgressPatch are
 // all still plain hoisted function declarations in sw.js --
 // makeCoordinatorAuthorityApplyResult is part of the excluded
 // createCoordinatorAuthority-adjacent region per the plan's "Boundary after
@@ -114,7 +112,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         getCoordinatorCurrentWorkAnchor,
         buildTerminalCoordinatorQueueItem,
         getCoordinatorItemSettlementKey,
-        clearResolverPendingSpaceRecords,
         getProfileResolutionRequestedUrl,
         hasMismatchedCoordinatorAttempt,
         transitionCoordinatorItemFromProgress,
@@ -127,7 +124,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         isProfileResolutionItem,
         normalizeQuoraProfileUrl,
         normalizeCoordinatorRequestedUrl,
-        addResolvedProfileToPendingSpaceRecords,
         inferSourceTypeFromRunId,
         getCoordinatorRunTargetHrefs,
         getCoordinatorProgressRecordForItem,
@@ -207,23 +203,9 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
 
         queue[itemKey] = nextItem
 
-        let pendingPostsChanged = false
-        let pendingPosts = state.pendingPosts || {}
-        const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, nextItem, {
-            requestedUrl: operation.requestedUrl || getProfileResolutionRequestedUrl(item, itemKey),
-            evidence: item.evidence || []
-        })
-        if(pendingResult.changed) {
-            pendingPosts = pendingResult.pendingPosts
-            state.pendingPosts = pendingPosts
-            pendingPostsChanged = true
-        }
-
         return {
             changed: true,
             queueChanged: true,
-            pendingPostsChanged,
-            pendingPosts,
             materialized: 1,
             affectedRunIds: item.runId ? [item.runId] : [],
             tabIdsToClose: getCoordinatorReconcileOperationTabIdsToClose(operation, item, operation.record || null),
@@ -402,65 +384,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         }
     }
 
-    function settleTerminalResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
-        if(!item || typeof item !== 'object') return {changed: false}
-        if(!isTerminalCoordinatorStatus(item.status) || !isProfileResolutionItem(item)) return {changed: false}
-        if(item.status !== 'skipped' || `${item.outcome || ''}`.trim() !== 'unresolved-target') return {changed: false}
-
-        const pendingPosts = state.pendingPosts || {}
-        const pendingResult = clearResolverPendingSpaceRecords(pendingPosts, item, {
-            requestedUrl: getProfileResolutionRequestedUrl(item, itemKey),
-            evidence: item.evidence || []
-        })
-        if(!pendingResult.changed) return {changed: false}
-
-        state.pendingPosts = pendingResult.pendingPosts
-        return {
-            changed: true,
-            pendingPostsChanged: true,
-            pendingPosts: pendingResult.pendingPosts,
-            materialized: 1
-        }
-    }
-
-    function settleResolvedResolverPendingSourceRecordsLocked(state = {}, itemKey = '', item = {}) {
-        if(!item || typeof item !== 'object') return {changed: false}
-        const resolvedHref = getCoordinatorItemHref(item) || normalizeQuoraProfileUrl(itemKey)
-        if(!resolvedHref || isProfileResolutionItem(item)) return {changed: false}
-
-        const evidenceList = Array.isArray(item.evidence) ? item.evidence : []
-        if(!evidenceList.some(evidence => evidence?.postKey || evidence?.postUrl)) return {changed: false}
-
-        const pendingPosts = state.pendingPosts || {}
-        const hasMatchingPendingResolver = Object.values(pendingPosts || {}).some(record => {
-            if(record?.resolverPending !== true) return false
-
-            const recordPostKey = `${record?.postKey || ''}`.trim()
-            const recordUrls = new Set([
-                normalizeCoordinatorRequestedUrl(record?.resolverUrl || ''),
-                normalizeCoordinatorRequestedUrl(record?.postUrl || '')
-            ].filter(Boolean))
-            return evidenceList.some(evidence => {
-                const evidencePostKey = `${evidence?.postKey || ''}`.trim()
-                const evidencePostUrl = normalizeCoordinatorRequestedUrl(evidence?.postUrl || '')
-                return (evidencePostKey && evidencePostKey === recordPostKey) ||
-                    (evidencePostUrl && recordUrls.has(evidencePostUrl))
-            })
-        })
-        if(!hasMatchingPendingResolver) return {changed: false}
-
-        const pendingResult = addResolvedProfileToPendingSpaceRecords(pendingPosts, item, resolvedHref)
-        if(!pendingResult.changed) return {changed: false}
-
-        state.pendingPosts = pendingResult.pendingPosts
-        return {
-            changed: true,
-            pendingPostsChanged: true,
-            pendingPosts: pendingResult.pendingPosts,
-            materialized: 1
-        }
-    }
-
     function materializeQueuedCoordinatorDerivedStateLocked(state = {}, itemKey = '', item = {}, nowMs = now()) {
         if(!item || typeof item !== 'object') return {changed: false}
         if(`${item.status || ''}` !== 'queued') return {changed: false}
@@ -587,15 +510,9 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         const clearProfileMaterialized = materializeRemovedProfileDerivedStateFromAuthority(ctx.state)
         if(clearProfileMaterialized.changed) {
             ctx.runs = clearProfileMaterialized.runs || ctx.runs
-            ctx.pendingPosts = clearProfileMaterialized.pendingPosts || ctx.pendingPosts
-            ctx.nukedPosts = clearProfileMaterialized.nukedPosts || ctx.nukedPosts
             ctx.state.runs = ctx.runs
-            ctx.state.pendingPosts = ctx.pendingPosts
-            ctx.state.nukedPosts = ctx.nukedPosts
             ctx.progressChanged = ctx.progressChanged || clearProfileMaterialized.progressChanged
             ctx.runsMetadataChanged = ctx.runsMetadataChanged || clearProfileMaterialized.runsChanged
-            ctx.pendingPostsChanged = ctx.pendingPostsChanged || clearProfileMaterialized.pendingPostsChanged
-            ctx.nukedPostsChanged = ctx.nukedPostsChanged || clearProfileMaterialized.nukedPostsChanged
             ctx.materialized += clearProfileMaterialized.materialized || 0
             addCoordinatorReconcileAffectedRunIds(ctx, clearProfileMaterialized.affectedRunIds)
         }
@@ -610,8 +527,6 @@ function createCoordinatorReconcileLockedMaterialization(deps = {}) {
         buildCoordinatorReconcileQueueAuthorityDiff,
         terminalKeyOnlyDiagnosticKey,
         materializeTerminalKeyOnlyDerivedStateLocked,
-        settleTerminalResolverPendingSourceRecordsLocked,
-        settleResolvedResolverPendingSourceRecordsLocked,
         materializeQueuedCoordinatorDerivedStateLocked,
         addCoordinatorReconcileAffectedRunIds,
         markCoordinatorReconcileRunAffected,
