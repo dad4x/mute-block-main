@@ -1,5 +1,5 @@
+const {SPACE_SORT_KEY} = require('./storageKeys')
 const {SPACE_REGISTRY_KEY} = require('./storageKeys')
-const SPACE_SORT_KEY = 'mbSpaceSortBy'
 const SPACE_SORT_NAME = 'name'
 const SPACE_SORT_CATEGORY = 'category'
 const SPACE_CATEGORY_ASSET = 'asset'

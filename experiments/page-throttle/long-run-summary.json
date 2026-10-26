@@ -1,0 +1,67 @@
+{
+  "durationSeconds": 1800,
+  "sampleSeconds": 10,
+  "samples": 181,
+  "segments": [
+    {
+      "fromSeconds": 0,
+      "toSeconds": 300.262,
+      "fgPageTicksPerSecond": 10,
+      "fgWorkerTicksPerSecond": 10.01,
+      "bgPageTicksPerSecond": 0.99,
+      "bgWorkerTicksPerSecond": 10.01,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    },
+    {
+      "fromSeconds": 300.262,
+      "toSeconds": 600.555,
+      "fgPageTicksPerSecond": 10,
+      "fgWorkerTicksPerSecond": 9.99,
+      "bgPageTicksPerSecond": 0.02,
+      "bgWorkerTicksPerSecond": 10.01,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    },
+    {
+      "fromSeconds": 600.555,
+      "toSeconds": 900.83,
+      "fgPageTicksPerSecond": 10,
+      "fgWorkerTicksPerSecond": 10.01,
+      "bgPageTicksPerSecond": 0.02,
+      "bgWorkerTicksPerSecond": 9.99,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    },
+    {
+      "fromSeconds": 900.83,
+      "toSeconds": 1201.135,
+      "fgPageTicksPerSecond": 8.82,
+      "fgWorkerTicksPerSecond": 9.99,
+      "bgPageTicksPerSecond": 0.02,
+      "bgWorkerTicksPerSecond": 10.01,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    },
+    {
+      "fromSeconds": 1201.135,
+      "toSeconds": 1501.459,
+      "fgPageTicksPerSecond": 10,
+      "fgWorkerTicksPerSecond": 10.01,
+      "bgPageTicksPerSecond": 0.02,
+      "bgWorkerTicksPerSecond": 9.99,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    },
+    {
+      "fromSeconds": 1501.459,
+      "toSeconds": 1801.725,
+      "fgPageTicksPerSecond": 10,
+      "fgWorkerTicksPerSecond": 9.99,
+      "bgPageTicksPerSecond": 0.02,
+      "bgWorkerTicksPerSecond": 10.01,
+      "bgVisibility": "hidden",
+      "fgVisibility": "visible"
+    }
+  ]
+}

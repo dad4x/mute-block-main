@@ -1,0 +1,8 @@
+{
+  "requests": [],
+  "consoleErrors": [
+    "Error (QueryFetcher): MutingSettingsLoadableQuery Unexpected text/html response to GraphQL request",
+    "TempFailureError: Unexpected text/html response to GraphQL request\n    at o (https://qsbr.cf2.quoracdn.net/-4-ans_frontend-relay-rspack-common-27-85079cc0781428ae.webpack:177:493)",
+    "Error (PageLoadable): Showing default error state: {\"errorMessage\":\"Unexpected text/html response to GraphQL request\"}"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "durationSeconds": 2100,
+  "sampleSeconds": 30,
+  "ownerTargetId": "51FF07B1D8028498842A139CE228B7C4",
+  "ownerDestroyedAtSeconds": null,
+  "ownerFirstUnresponsiveAtSeconds": null,
+  "waiterAcquiredAtSeconds": null,
+  "heartbeatStalledSinceSeconds": null,
+  "eventCount": 7
+}

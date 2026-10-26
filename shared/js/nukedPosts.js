@@ -1,4 +1,4 @@
-const SPACE_NUKED_POSTS_KEY = 'mbSpaceNukedPosts'
+const {SPACE_NUKED_POSTS_KEY} = require('./storageKeys')
 const NUKED_POST_RETENTION_DAYS_KEY = 'nukedPostRetentionDays'
 const MAX_REMEMBERED_NUKED_POSTS_KEY = 'maxRememberedNukedPosts'
 const DEFAULT_NUKED_POST_RETENTION_DAYS = 30

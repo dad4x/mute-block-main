@@ -59,6 +59,7 @@ const {
     COORDINATOR_QUEUE_VIEW_KEY,
     SPACE_PENDING_NUKED_POSTS_KEY
 } = require('./storageKeys')
+const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
 const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS} = require('./tunables')
 // The two space post maps, by their whole-map keys. Each is read through its layout keys (spaceMapStorage.js).
@@ -736,6 +737,8 @@ function retrySpaceFeedUnansweredStateLater(delayMs = 0) {
 
 function onStorageChanged(changes, areaName) {
     if(areaName !== 'local') return
+    // Only this layout's keys, with their plain names (storageNamespace.js).
+    changes = namespaceChanges(changes) || {}
 
     let spaceMapsChanged = false
     for(const [key, change] of Object.entries(changes)) {
@@ -796,7 +799,7 @@ function isRuntimeConnectionError(error) {
 }
 
 function getStorageArea() {
-    return browser?.storage?.local || globalThis.chrome?.storage?.local || null
+    return namespaceArea(browser?.storage?.local || globalThis.chrome?.storage?.local || null)
 }
 
 function getStorageChangeSource() {
@@ -1019,6 +1022,13 @@ async function failCurrentQueuedProfile(additionalUrls = []) {
     if(!failedUrls.length) return []
 
     return failedUrls
+}
+
+// A manual block or unblock on a profile page is Recent History: the worker records it (swManualHistory.js).
+function recordManualProfileAction(kind) {
+    const profileHref = normalizeQuoraProfileHref(location.href)
+    if(!profileHref) return null
+    return safeSendRuntimeMessageWithTimeout({action: 'record-manual-profile-action', kind, profileHref, at: Date.now()}, null)
 }
 
 function pruneRememberedSpaceNukes(records) {
@@ -5318,6 +5328,7 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
             button.innerText = 'Retry'
             return
         }
+        void recordManualProfileAction('block')
 
         if(closeAfterSuccess) {
             button.innerText = 'Closing...'
@@ -5402,6 +5413,7 @@ async function handleUnblockUnmuteClick(button) {
         })
 
         button.innerText = result?.ok ? 'Unblocked' : 'Retry'
+        if(result?.ok) void recordManualProfileAction('pardon')
     }
     catch(error) {
         const message = `${error?.message || error || 'Unblock Unmute failed'}`

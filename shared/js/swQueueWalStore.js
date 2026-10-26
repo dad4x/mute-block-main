@@ -17,6 +17,7 @@ const {
     getCheckpointFingerprint,
     getSegmentedWalCheckpointKey,
     getSegmentedWalCheckpointShardKeys,
+    getArrivalShardKeysMissingFromStored,
     getSegmentedWalSegmentKey,
     getSegmentedWalCommittedSegmentCount,
     isSegmentedWalStorageMeta,
@@ -387,6 +388,20 @@ function createQueueWalStore(deps = {}) {
                     phase: 'queueWalSegmentAtomicStorageGet'
                 })
                 Object.assign(stored, atomicRead)
+                // Step 4: an arrival checkpoint can name shard ids past the atomic read's range. The manifests in this read name them,
+                // so they are read here. The shard identity check then verifies each one against its manifest, as it does any shard.
+                const arrivalShardKeys = [CHECKPOINT_A, CHECKPOINT_B].flatMap(checkpointId =>
+                    getArrivalShardKeysMissingFromStored(stored, COORDINATOR_QUEUE_WAL_KEY, checkpointId))
+                if(arrivalShardKeys.length) {
+                    incrementQueueWakeupMetric('coordinatorAuthority.queueWal.arrivalShardFallbackRead')
+                    const arrivalRead = await metricStorageGet(Object.fromEntries(arrivalShardKeys.map(key => [key, null])), {
+                        metricPath: options.metricPath
+                            ? `${options.metricPath}.arrivalShardRead`
+                            : 'coordinatorQueueWal.segmented.load.arrivalShardRead',
+                        phase: 'queueWalArrivalShardRead'
+                    })
+                    Object.assign(stored, arrivalRead)
+                }
 
                 const freshMeta = isSegmentedWalStorageMeta(stored[COORDINATOR_QUEUE_WAL_META_KEY])
                     ? stored[COORDINATOR_QUEUE_WAL_META_KEY]

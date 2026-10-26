@@ -1,5 +1,7 @@
 # Shared Moderation Test Plan, 2026-05-20
 
+> **Status: ROADMAP** (24 Oct 2026). Pure-model and mock test plan (20 May). The safe lane today. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: active supporting test plan.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

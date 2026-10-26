@@ -956,3 +956,8 @@ a.row-subtitle:hover {
    showing it is already the plain dashboard (see the click handler in
    coordinator.js). Brand red (var(--mb-brand-red)), matching the extension's icon and
    popup/content accent color, rather than the worker-bar's neutral fill. */
+
+/* A History row with an error reads in red. */
+.row--history-error {
+    color: var(--mb-red-800);
+}

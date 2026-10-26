@@ -6,6 +6,8 @@ tunnel and no separate regression host in this mode: source, browser, and
 CDP endpoint are all local. Do not regenerate one-off versions in `/tmp`
 unless a probe is truly experimental and not worth preserving.
 
+The forward-going list, with the reason each helper stays and the helpers retired on 24 Oct 2026, is in [INVENTORY.md](INVENTORY.md).
+
 Defaults:
 
 - CDP endpoint: `127.0.0.1:9222`

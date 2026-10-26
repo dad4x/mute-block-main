@@ -1,5 +1,7 @@
 # Browser Upgrade Regression
 
+> **Status: ROADMAP** (24 Oct 2026). Browser upgrade regression plan (10 Jun). The regression tool exists; no live run is recorded in the plan. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 ## Goal
 
 Validate the fresh Chrome profile that started from Chrome Web Store Mute Block

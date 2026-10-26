@@ -1,5 +1,7 @@
 # Mute Block iPhone Safari Plan
 
+> **Status: ROADMAP** (24 Oct 2026). Future iPhone Safari plan, separate from the desktop queue. First version limited to foreground, user-directed actions. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: separate future-platform plan.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

@@ -35,6 +35,7 @@ const {
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
     SPACE_REGISTRY_KEY
 } = require('./storageKeys')
+const {namespaceArea} = require('./storageNamespace')
 
 // coordinatorStatusRules is the same factory sw.js uses, so
 // isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
@@ -137,52 +138,106 @@ async function openCoordinatorViewFromHere(action = 'open-coordinator') {
     }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
 }
 
-async function loadHistoryEntries() {
-    const stored = await browser.storage.local.get({
-        ...spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY]),
-        [NUKED_POST_RETENTION_DAYS_KEY]: defaults[NUKED_POST_RETENTION_DAYS_KEY],
-        [MAX_REMEMBERED_NUKED_POSTS_KEY]: defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
-    })
-    return getPrunedNukedPosts(readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY), {
-        retentionDays: stored[NUKED_POST_RETENTION_DAYS_KEY],
-        maxEntries: stored[MAX_REMEMBERED_NUKED_POSTS_KEY]
+// The History page keeps the rows it has. The worker answers by message: a full query on open (and once a minute, to drop rows the
+// limits have pruned), and an incremental one on the timer, which asks only for the rows completed since the newest it has.
+const HISTORY_REFRESH_INTERVAL_MS = 2000
+const HISTORY_FULL_REFRESH_EVERY_TICKS = 30
+let historyRows = new Map()
+// When the page was last cleared. Clear deletes nothing from storage, so a query can return older rows again; rows completed at or
+// before this time stay off the page, and rows completed after it show.
+let historyClearedAt = 0
+let historySince = 0
+let historyTickCount = 0
+
+// The completion status as a word: Succeeded, Failed, Skipped or Canceled.
+function historyStatusLabel(row = {}) {
+    const status = `${row.status || ''}`
+    return status ? status.charAt(0).toUpperCase() + status.slice(1) : ''
+}
+
+// A row with an error reads in red: a failed row, or any row that carries an error text.
+function historyRowHasError(row = {}) {
+    return `${row.status || ''}` === 'failed' || `${row.error || row.finalError || ''}`.trim() !== ''
+}
+
+function historyRowAt(row = {}) {
+    return Number.parseInt(row.terminalAt || row.updatedAt, 10) || 0
+}
+
+// Asks the worker for the rows. A full query replaces the rows the page has; an incremental one adds the rows it does not have yet.
+async function refreshHistoryRows(full = false) {
+    const result = await sendRuntimeMessageWithTimeout({action: 'get-recent-history', since: full ? 0 : historySince}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(!result || !Array.isArray(result.rows)) return
+    const before = historyRows.size
+    if(full) historyRows = new Map()
+    let added = false
+    for(const row of result.rows) {
+        const key = `${row.coordinatorKey || row.targetProfileHref || ''}`
+        if(!key || historyRowAt(row) <= historyClearedAt) continue
+        if(!historyRows.has(key)) added = true
+        historyRows.set(key, row)
+    }
+    historySince = Math.max(historySince, Number(result.latest) || 0)
+    if(full || added || historyRows.size !== before) renderHistoryRows()
+}
+
+// The order of the status groups: errors first, so they group together.
+const HISTORY_STATUS_ORDER = ['failed', 'skipped', 'canceled', 'succeeded']
+
+function historyStatusRank(row = {}) {
+    const rank = HISTORY_STATUS_ORDER.indexOf(`${row.status || ''}`)
+    return rank === -1 ? HISTORY_STATUS_ORDER.length : rank
+}
+
+// The rows in the order the History page's sort control asks for. Newest first is the default.
+function sortHistoryRows(rows = []) {
+    const sortMode = document.getElementById('historySort')?.value || 'newest'
+    return rows.sort((left, right) => {
+        if (sortMode === 'status') {
+            const byStatus = historyStatusRank(left) - historyStatusRank(right)
+            if (byStatus) return byStatus
+        }
+        return historyRowAt(right) - historyRowAt(left)
     })
 }
 
-async function renderHistoryList() {
-    const entries = await loadHistoryEntries()
-    const rows = Object.entries(entries)
+function renderHistoryRows() {
+    const rows = sortHistoryRows([...historyRows.values()])
     const countEl = document.getElementById('historyCount')
     if(countEl) countEl.textContent = `${rows.length} ${rows.length === 1 ? 'entry' : 'entries'}`
 
     const list = document.getElementById('historyList')
     if(!list) return
 
-    replaceChildren(list, rows.map(([postKey, record]) => {
-        const urls = Array.isArray(record?.urls) ? record.urls : []
-        const singleProfileHref = urls.length === 1 ? urls[0] : ''
-        const profileLabel = singleProfileHref ? getProfileLabelFromHref(singleProfileHref) : ''
-        // Matches renderQueue's own title/subtitle pattern (Current Work
-        // listing): title links to the actual profile, subtitle is the
-        // action mode plus the source it came from -- SPACE_NUKED_POSTS_KEY
-        // entries are always mute-block (there's no unblock/unmute
-        // equivalent of a space-feed post nuke), so that half is constant.
-        const titleLabel = profileLabel || (urls.length > 1 ? `${urls.length} profiles` : (postKey || 'Unknown profile'))
-        const titleHref = singleProfileHref || ''
-        const sourceLabel = getSourceLabelFromUrl(record?.postUrl || record?.spaceUrl || '')
-        const when = record?.updatedAt ? formatDateTime(record.updatedAt) : ''
-        const subtitle = ['Mute Block', sourceLabel, when].filter(Boolean).join(' • ')
-        const row = document.createElement('div')
-        row.className = 'row'
-        row.append(buildTitleCell(titleLabel, subtitle, {titleHref, subtitleHref: record?.postUrl || ''}))
-        return row
+    replaceChildren(list, rows.map(row => {
+        const profileHref = row.targetProfileHref || row.requestedUrl || ''
+        const profileLabel = profileHref ? getProfileLabelFromHref(profileHref) : ''
+        const titleLabel = profileLabel || `${row.coordinatorKey || 'Unknown profile'}`
+        const status = historyStatusLabel(row)
+        const outcome = `${row.outcome || ''}`.replace(/-/g, ' ')
+        const attempt = Number.parseInt(row.attemptNumber, 10) > 1 ? `attempt ${row.attemptNumber}` : ''
+        const source = row.origin === 'manual' ? 'Manual' : 'Space'
+        const at = historyRowAt(row)
+        const when = at ? formatDateTime(at) : ''
+        const error = `${row.error || row.finalError || ''}`.trim().slice(0, 160)
+        const subtitle = [status, outcome, attempt, source, when, error].filter(Boolean).join(' • ')
+        const element = document.createElement('div')
+        element.className = historyRowHasError(row) ? 'row row--history-error' : 'row'
+        element.append(buildTitleCell(titleLabel, subtitle, {titleHref: profileHref, subtitleHref: row.postUrl || ''}))
+        return element
     }), 'No history yet.')
 }
 
+async function renderHistoryList() {
+    await refreshHistoryRows(true)
+}
+
+// Clear empties the rows this page shows. It deletes nothing from storage, and the page keeps asking for rows that arrive later.
 async function clearHistory() {
-    if(!window.confirm('Clear all Recent History?')) return
-    await sendRuntimeMessageWithTimeout({action: 'set-space-nuked-posts', nukedPosts: {}}, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS)
-    await renderHistoryList()
+    if(!window.confirm('Clear the rows on this page? Nothing is deleted from storage.')) return
+    historyClearedAt = Date.now()
+    historyRows = new Map()
+    renderHistoryRows()
 }
 
 // The three coordinator.html views (default dashboard, #progress,
@@ -236,12 +291,17 @@ async function initHistoryPage() {
     document.getElementById('historyPreferencesButton')?.addEventListener('click', () => {
         void openPreferences()
     })
-    // Deliberately no broad storage-change listener here -- this file
-    // avoids that delivery mechanism on purpose elsewhere (see "dashboard
-    // live refresh avoids broad storage change delivery"). This page only
-    // ever changes via its own Clear button, which already re-renders
-    // itself, so a one-time load on open is enough.
     await renderHistoryList()
+    document.getElementById('historySort')?.addEventListener('change', () => renderHistoryRows())
+    setInterval(() => {
+        if(document.hidden) return
+        historyTickCount += 1
+        void refreshHistoryRows(historyTickCount % HISTORY_FULL_REFRESH_EVERY_TICKS === 0)
+    }, HISTORY_REFRESH_INTERVAL_MS)
+    // The worker also says when the completed-work log changed, so the page asks again without waiting for the timer.
+    browser.runtime?.onMessage?.addListener(message => {
+        if(`${message?.action || ''}` === 'recent-history-changed') void refreshHistoryRows(false)
+    })
 }
 
 async function initWorkerBarPage() {
@@ -579,7 +639,7 @@ function isDevModeStoredEnabled() {
 }
 
 async function loadDevModeStoredEnabled() {
-    const stored = await browser.storage.local.get({[DEV_MODE_SYNC_STORAGE_KEY]: false}).catch(() => ({}))
+    const stored = await namespaceArea(browser.storage.local).get({[DEV_MODE_SYNC_STORAGE_KEY]: false}).catch(() => ({}))
     devModeStoredEnabled = stored[DEV_MODE_SYNC_STORAGE_KEY] === true
 }
 
@@ -944,7 +1004,7 @@ async function loadEventsFromFlightRecorder() {
 }
 
 async function loadState() {
-    const stored = await browser.storage.local.get({
+    const stored = await namespaceArea(browser.storage.local).get({
         [COORDINATOR_RUNS_KEY]: {},
         [QUEUE_WAKEUP_METRICS_VIEW_KEY]: {},
         [SPACE_REGISTRY_KEY]: {},
@@ -1081,7 +1141,7 @@ async function refreshCompactMetricsView() {
         return true
     }
 
-    const stored = await browser.storage.local.get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}})
+    const stored = await namespaceArea(browser.storage.local).get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}})
     if(hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
         state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])
         return true

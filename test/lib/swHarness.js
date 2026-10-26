@@ -93,7 +93,7 @@ function makeEvent() {
     }
 }
 
-const {PROFILE_NUKE_PROGRESS_SHARD_PREFIX, PROFILE_NUKE_PROGRESS_VIEW_KEY} = require('../../shared/js/storageKeys')
+const {PROFILE_NUKE_PROGRESS_SHARD_PREFIX, PROFILE_NUKE_PROGRESS_VIEW_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
 const {WORKER_WINDOW_FOREGROUND_MODES} = require('../../shared/js/swprefs')
 
 // Decision 31: profile progress (the view and the shards) is held in session storage, never on disk. A progress key in a seed goes to
@@ -102,45 +102,51 @@ function isProfileProgressStorageKey(key = '') {
     return key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)
 }
 
-// The storage a test reads for the worker: disk keys from the local copy, progress keys from the session copy. Reads, writes and
-// deletes of a progress key go to the session copy. Everything else is the local copy, as before.
-function makeWorkerStorageView(localStorage, sessionStorage) {
+// The storage a test reads for the worker, under plain names: a test reads and writes `storage.mbCoordinatorRuns`, and the raw areas
+// hold `v1.6.mbCoordinatorRuns`. Disk keys come from the local copy and progress keys from the session copy. Reads, writes and
+// deletes of a progress key go to the session copy. Stored names outside this layout are not shown.
+function makeWorkerStorageView(localStorage, sessionStorage, layoutPrefix = '') {
+    const toStored = key => typeof key === 'string' ? `${layoutPrefix}${key}` : key
+    const toPlain = name => typeof name === 'string' && name.startsWith(layoutPrefix) ? name.slice(layoutPrefix.length) : null
     const isProgressKey = key => typeof key === 'string' && isProfileProgressStorageKey(key)
     return new Proxy(localStorage, {
-        get: (target, key) => isProgressKey(key) ? sessionStorage[key] : target[key],
+        get: (target, key) => isProgressKey(key) ? sessionStorage[toStored(key)] : target[toStored(key)],
         set(target, key, value) {
-            if(isProgressKey(key)) sessionStorage[key] = value
-            else target[key] = value
+            if(isProgressKey(key)) sessionStorage[toStored(key)] = value
+            else target[toStored(key)] = value
             return true
         },
-        has: (target, key) => isProgressKey(key) ? key in sessionStorage : key in target,
+        has: (target, key) => isProgressKey(key) ? toStored(key) in sessionStorage : toStored(key) in target,
         deleteProperty(target, key) {
-            if(isProgressKey(key)) delete sessionStorage[key]
-            else delete target[key]
+            if(isProgressKey(key)) delete sessionStorage[toStored(key)]
+            else delete target[toStored(key)]
             return true
         },
         ownKeys: target => [
-            ...Reflect.ownKeys(target).filter(key => !isProgressKey(key)),
-            ...Object.keys(sessionStorage).filter(isProfileProgressStorageKey)
+            ...Object.keys(target).map(toPlain).filter(key => key !== null && !isProgressKey(key)),
+            ...Object.keys(sessionStorage).map(toPlain).filter(key => key !== null && isProfileProgressStorageKey(key))
         ],
         getOwnPropertyDescriptor(target, key) {
-            if(!isProgressKey(key)) return Object.getOwnPropertyDescriptor(target, key)
-            const descriptor = Object.getOwnPropertyDescriptor(sessionStorage, key)
+            if(!isProgressKey(key)) return Object.getOwnPropertyDescriptor(target, toStored(key))
+            const descriptor = Object.getOwnPropertyDescriptor(sessionStorage, toStored(key))
             return descriptor ? {...descriptor, configurable: true} : undefined
         }
     })
 }
 
 function createFakeBrowser(initialStorage = {}, options = {}) {
-    const storage = clone(initialStorage) || {}
+    // The raw areas hold stored names (the layout prefix plus the plain name, storageNamespace.js). A seed is written under plain names,
+    // so the seed is stored under the prefix here; progress keys go to the session copy unless options.progressOnDisk is set.
+    const layoutPrefix = options.layoutPrefix ?? ''
+    const storage = {}
     const sessionStorage = {}
-    if(options.progressOnDisk !== true) {
-        for(const key of Object.keys(storage)) {
-            if(!isProfileProgressStorageKey(key)) continue
-            sessionStorage[key] = storage[key]
-            delete storage[key]
-        }
+    for(const [key, value] of Object.entries(clone(initialStorage) || {})) {
+        const storedName = `${layoutPrefix}${key}`
+        if(options.progressOnDisk !== true && isProfileProgressStorageKey(key)) sessionStorage[storedName] = value
+        else storage[storedName] = value
     }
+    // Stored names as they are (a copy of an earlier run's raw storage, or keys another layout wrote): not prefixed here.
+    for(const [storedName, value] of Object.entries(clone(options.rawStorage) || {})) storage[storedName] = value
     const runtimeOnMessage = makeEvent()
     const storageOnChanged = makeEvent()
     const alarmsOnAlarm = makeEvent()
@@ -475,8 +481,11 @@ function matchUrlPattern(url = '', pattern = '') {
 // context to produce fresh, isolated state per harness instantiation.
 const compiledModuleScripts = new Map() // absolutePath -> vm.Script
 
-function createSharedRealmRequire(context, browser, baseRequire) {
+function createSharedRealmRequire(context, browser, baseRequire, layoutPrefix = '') {
     const moduleCache = new Map() // absolutePath -> {exports}
+    // The storage key names are the real module, with this harness's layout prefix (storageNamespace.js reads the prefix from here).
+    const storageKeysPath = path.resolve(__dirname, '../../shared/js/storageKeys.js')
+    const storageKeysForLayout = {...require('../../shared/js/storageKeys'), STORAGE_LAYOUT_PREFIX: layoutPrefix}
 
     function requireFrom(callerDir) {
         return function localRequire(request) {
@@ -485,6 +494,7 @@ function createSharedRealmRequire(context, browser, baseRequire) {
 
             let resolvedPath = path.resolve(callerDir, request)
             if(!resolvedPath.endsWith('.js')) resolvedPath += '.js'
+            if(resolvedPath === storageKeysPath) return storageKeysForLayout
 
             if(moduleCache.has(resolvedPath)) {
                 return moduleCache.get(resolvedPath).exports
@@ -516,7 +526,10 @@ function loadServiceWorkerHarness(options = {}) {
     const repoRoot = path.resolve(__dirname, '..', '..')
     const swPath = path.join(repoRoot, 'shared/js/sw.js')
     const timers = options.timers || createFakeTimers(options.now || 0)
-    const browser = options.browser || createFakeBrowser(options.storage || {}, {progressOnDisk: options.progressOnDisk})
+    // The layout prefix of this harness's stored keys. The default is no prefix: the behavioural suite runs on plain names. A test
+    // that checks the layout passes layoutPrefix (storageKeys STORAGE_LAYOUT_PREFIX), and then the worker writes prefixed keys only.
+    const layoutPrefix = options.layoutPrefix ?? ''
+    const browser = options.browser || createFakeBrowser(options.storage || {}, {progressOnDisk: options.progressOnDisk, layoutPrefix, rawStorage: options.rawStorage})
     const baseRequire = createRequire(swPath)
     let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\nlet __testCoordinatorExecutorStartResult = null;\n${fs.readFileSync(swPath, 'utf8')}`
 
@@ -934,7 +947,7 @@ module.exports.__test = {
         Math
     }
     vm.createContext(context)
-    const localRequire = createSharedRealmRequire(context, browser, baseRequire)(path.dirname(swPath))
+    const localRequire = createSharedRealmRequire(context, browser, baseRequire, layoutPrefix)(path.dirname(swPath))
     context.require = localRequire
 
     const wrapper = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`
@@ -956,7 +969,7 @@ module.exports.__test = {
         browser,
         timers,
         sw: module.exports.__test,
-        storage: makeWorkerStorageView(browser.__storage, browser.__sessionStorage)
+        storage: makeWorkerStorageView(browser.__storage, browser.__sessionStorage, layoutPrefix)
     }
 }
 

@@ -1,7 +1,7 @@
-// Storage key names that more than one module uses. Each name is declared once, here, and imported by name. A key that only one
-// module uses stays in that module. test/p1-contract.test.js fails if one of these names is declared with an assignment in any
-// other shared/js module, and checks that each value is still the one it had. The values are chrome.storage keys: changing one
-// orphans the data stored under it, so it needs a migration, not an edit here alone.
+// Every chrome.storage key name the worker and its pages use. Each name is declared once, here, and imported by name; no module
+// declares a storage key name of its own. test/p1-contract.test.js fails if one of these names is declared with an assignment in
+// any other shared/js module, and checks that each value is still the one it had. The values are chrome.storage keys: changing one
+// orphans the data stored under it, so it needs a migration, not an edit here alone. Alarm names are not storage keys and stay in sw.js.
 module.exports = {
     COORDINATOR_QUEUE_VIEW_KEY: 'mbCoordinatorQueueView',
     COORDINATOR_PAUSED_KEY: 'mbCoordinatorPaused',
@@ -27,5 +27,40 @@ module.exports = {
     SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
     DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled',
     // The last or current continuous work: its start, and its end once it has ended (24 Oct). Read by the dashboard's Current Work header.
-    COORDINATOR_WORK_SESSION_KEY: 'mbCoordinatorWorkSession'
+    COORDINATOR_WORK_SESSION_KEY: 'mbCoordinatorWorkSession',
+    // The build that last ran against this storage: the running manifest version (for example 1.6.1626). The worker checks it at install
+    // and at startup, and runs the upgrade step when it differs (sw.js checkStorageBuild).
+    STORAGE_BUILD_KEY: 'mbStorageBuild',
+    // Key names for the modules above (moved here so every storage key name is declared in one file).
+    SPACE_SORT_KEY: 'mbSpaceSortBy',
+    SPACE_NUKED_POSTS_KEY: 'mbSpaceNukedPosts',
+    SPACE_MAP_LAYOUT_KEY: 'mbSpaceMapLayoutVersion',
+    COORDINATOR_PAUSE_GENERATION_KEY: 'mbCoordinatorPauseGeneration',
+    OWNED_TAB_STATE_KEY: 'mbOwnedTabIdsByParent',
+    COORDINATOR_QUEUE_KEY: 'mbCoordinatorQueue',
+    COORDINATOR_QUEUE_WAL_KEY: 'mbCoordinatorQueueWal',
+    COORDINATOR_CONTENT_QUEUE_INDEX_KEY: 'mbCoordinatorContentQueueIndex',
+    COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX: 'mbCoordinatorContentSourceIndex.',
+    COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX: 'mbCoordinatorNamespaceSeq.',
+    QUEUE_WAKEUP_METRICS_KEY: 'mbQueueWakeupMetrics',
+    QUEUE_WAKEUP_JOURNAL_KEY: 'mbQueueWakeupJournal',
+    BROWSER_SESSION_MARKER_KEY: 'mbBrowserSessionMarker',
+    QUORA_RUNTIME_ACTIVATED_SESSION_KEY: 'mbQuoraRuntimeActivated',
+    FLIGHT_RECORDER_SESSION_KEY: 'mbFlightRecorderSnapshot',
+    QUEUED_ACTION_SURFACE_STATE_KEY: 'mbQueuedActionSurfaceState',
+    COORDINATOR_STATS_CLEARED_AT_KEY: 'mbCoordinatorStatsClearedAt',
+    COORDINATOR_OUTLIERS_KEY: 'mbCoordinatorOutliers',
+    COORDINATOR_TAB_KEY: 'mbCoordinatorTabId',
+    COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX: 'mbCoordinatorContentQueueIndexShard.',
+    PAUSE_DIAGNOSTIC_SNAPSHOT_KEY: 'mbPauseDiagnosticSnapshot',
+    DEBUG_RUN_AUTOSAVED_ID_KEY: 'mbDebugRunAutosavedId',
+    COORDINATOR_RUNS_LAYOUT_KEY: 'mbCoordinatorRunsLayoutVersion',
+    COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY: 'mbCoordinatorQueueViewTimingCache',
+    COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY: 'mbCoordinatorQueueWalSeq',
+    ERASE_BLOCK_HISTORY_PENDING_KEY: 'mbEraseBlockHistoryPending',
+    ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY: 'mbEraseBlockHistoryGeneration',
+    LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY: 'mbLegacyContentIndexCleanupV1',
+    // Every stored key is this prefix plus its name above (storageNamespace.js). Builds of this layout share the prefix, so they read each
+    // other's keys. A build with the unprefixed layout (1.6.1628 and earlier) never reads or writes these, and never overwrites them.
+    STORAGE_LAYOUT_PREFIX: 'v1.6.'
 }

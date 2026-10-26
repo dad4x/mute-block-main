@@ -1,137 +1,129 @@
-# Completed-work log: own WAL, compressed time shards, row cap, in-memory profile index
+# Persistent stores: one WAL and checkpoint engine, arrival-ordered shards
 
-Status: plan, not built. Written 25 Oct 2026, updated with the owner's decisions below.
+Status: design agreed with the owner (25 Oct 2026). Deferred on 24 Oct: performance is acceptable, so
+this is follow-up work to capture, not to fix now. Partly built: the arrival-order option of the shared
+engine (step 1, and part of step 2) is in commit bfbcee5, and no product code enables it. The queue's
+log is already in arrival order, but its checkpoints are still split by key hash. Steps 4 to 7 are not
+started. This replaces the earlier version of
+this file, which described a separate completed-log store. That design is withdrawn.
+
+## Store interface
+
+Clients see two operations per store. Nothing else is visible outside the store.
+
+- **`store(change)`:** store a change. The change is appended to the store's WAL as one record,
+  then applied to the in-memory index. The call returns when the WAL write is durable.
+- **`get(key)`:** the current record for a key, answered from the in-memory index. Never from a
+  shard.
+- **`list(filter)`:** a scan of the in-memory index, used by History and the dashboard. Also never
+  from a shard.
+
+Everything else is internal to the store: the WAL, the two checkpoint slots, the shards, the
+compression, the expiry and the cap. None of it is part of the interface.
+
+Consequences:
+
+- The in-memory index holds everything the store can return. For terminal history it is bounded by
+  the 10,000-row cap. For the queue it is bounded by the queue's own size.
+- Reads never wait on a disk read after hydrate.
+- The key is the profile for terminal history and runs, and the row for the queue.
 
 ## Why
 
-The completed-work log is the `completed` area of the queue WAL. It holds every terminal row
-(one per profile, by row key). Today:
+The queue, runs and terminal history are persistent stores. They should use one engine: the shared
+WAL and checkpoint code in `shared/js/walSnapshotStore.js`. Each store is an instance of that engine,
+with its own WAL and its own checkpoint slots.
 
-- It is one map. Checkpoints split it into 10 shards by a hash of the key (walSnapshotStore.js,
-  `partitionCheckpointState`), so every checkpoint rewrites all completed rows.
-- Nothing bounds it. There is no age or size limit, so it grows without limit.
-- Dropping old rows one at a time means one removal record per row through the write door, which
-  is expensive and fights the layout.
+The engine today hash-partitions each checkpoint into a fixed number of shards and writes all of them
+on every checkpoint. That has two costs:
 
-## Owner decisions
+- Consecutive WAL records land in different shards, so one flush can touch many shards.
+- Every checkpoint rewrites unchanged shards, so the cost grows with the size of the store.
 
-1. **Scope of history:** any terminal result. History and the completed log are the same set of
-   profiles. History is displayed from the completed log, keyed by profile.
-2. **Limits, counted in rows:** the recent-history retention (90 days, `nukedPostRetentionDays`)
-   and the row cap (10,000, `maxRememberedNukedPosts`). The limit is meant to be read as rows.
-3. **Shards sized by I/O:** a shard is sealed at about one write band (16 KB). The time boundaries
-   are loose: a shard is dropped as a whole, so some expiries drop more time than others.
-4. **Clear is harmless:** clearing history removes only local memory. A re-done profile can cost a
-   duplicate check, nothing else. So deleting old rows is acceptable.
-5. **Storage clear:** the owner clears storage with the change, so there is no migration.
-6. **Own WAL:** the completed log has its own WAL, separate from the queue WAL. The queue WAL no
-   longer carries completed records.
-7. **Compress the shards:** a shard is stored compressed.
-8. **Re-offered profiles are fine:** a profile whose row has aged out is offered again and is
-   processed quickly as already blocked. That cost is accepted.
+## Agreed rules
 
-## Design
+1. **Two slots, always.** Each instance keeps two checkpoint slots, A and B. The active slot is
+   always a complete checkpoint, and the inactive slot takes the next write. Slots are independent:
+   no shard is shared between them, and a slot's garbage collection touches only that slot. This is
+   the redundancy and the recovery path.
 
-### The WAL is a buffer
+2. **The WAL holds deltas.** Every change is a record appended to the instance's WAL. A WAL record is
+   the only delta. Nothing else is stored as a delta.
 
-- The completed WAL is append-only and implicitly **time ordered**: each record is a terminal row or
-  a removal, appended in the order it happened.
-- Its job is to cut the number of shard writes. An archive appends one small record to the WAL. The
-  WAL is not a unit of storage or of expiry.
-- When the WAL holds about 16 KB of records (the flush threshold), its records are written out as
-  one or more **time shards**, then the WAL is cleared. A shard is a contiguous run of WAL records in
-  time order.
+3. **Shards are arrival-ordered, not hashed.** Each store is partitioned by arrival order into
+   shards sized by bytes. A flush of consecutive WAL records lands in one shard, or two at a boundary.
+   Hashing is removed from the engine for these stores.
 
-### Shards
+4. **A checkpoint writes changed shards in full.** A shard that changed since the inactive slot was
+   last written is written in full into that slot. A shard that has not changed since then is skipped.
+   A shard is never written as a delta. Each slot gets its own full copy of a changed shard.
 
-- A shard is one storage key, `mbCompletedLogShard.<seq>` (sequence, zero-padded), holding a run of
-  records in time order, **compressed** (gzip through the same codec hook the WAL engine uses).
-- Shards are never changed after they are written. Removals are not applied to them in place (see
-  below).
-- A small **meta record** (`mbCompletedLogMeta`) lists the shards: sequence, first and last terminal
-  time, row count, stored bytes. It is rewritten on each flush and each drop.
-- The flush writes the new shard and the meta record, then clears the WAL. The WAL is cleared only
-  after both are written, so a crash between them loses nothing: the WAL still holds the records,
-  and a restart replays it.
+5. **The queue is sharded too.** Each queue row stores its shard id. Enqueues land in the tail shard,
+   and completions shrink the head shard. A return to queued (a retry, a requeue, or a timeout that
+   requeues) moves the row to the tail with one WAL record that sets its shard id, its queue sequence
+   and its retry state together. That keeps the head draining, and the move is atomic.
 
-### Writes
+6. **Expiry drops whole shards.** Runs and terminal history expire by age: a shard is dropped when
+   its newest record is past the retention (90 days, the recent-history preference). Terminal history
+   is also capped by row count (10,000, the existing maximum): the oldest shards go first. The
+   resulting timing is loose, by design.
 
-- An archive appends to the WAL: a small write, not a rewrite of the log.
-- A flush, every ~16 KB of WAL, writes one compressed shard plus the meta record.
-- A removal (requeue reviving an archived row) appends a removal record to the WAL. It is applied to
-  the index at once. The stored shard keeps the row until the shard is dropped, and the index hides
-  it. This avoids rewriting a sealed shard for a removal.
+7. **Compression.** Shards are stored compressed through the engine's codec hook. The WAL is plain.
 
-### Limits
+8. **Re-offered profiles are fine.** A profile whose terminal row has aged out can be offered again.
+   It is processed quickly as already blocked, and that cost is accepted.
 
-- **Retention:** a shard whose last terminal time is older than the cutoff is dropped whole. Rows in
-  it that are newer than the cutoff go with it. This is the loose part, by design.
-- **Cap:** when the total row count is over 10,000, the oldest shards are dropped until the count is
-  at or under the cap. Again whole shards.
-- Both checks run after a flush and at startup. They touch only the meta record and the dropped
-  shard keys.
+9. **Clear drops the shards.** Clearing history drops every shard of the terminal store and empties
+   its WAL. Clear is harmless: it removes local memory only, not Quora's state.
 
-### In-memory index
+10. **Storage is cleared with the change.** There is no migration.
 
-- Keyed by **profile href**. Each entry points at the row and its shard sequence (or the WAL, for a
-  row not yet flushed).
-- Built at hydrate from the meta record and the shards, then replayed from the WAL, then kept up to
-  date by archive, removal and drop.
-- Serves: the dashboard completed rows, the History list, the duplicate check
-  (`findCompletedWorkRowByKey`), and the "already done" settlement the content script reads.
-- The resident completed map that exists today is the same idea; it becomes the index.
+## The index in memory
 
-### Clear
+- Keyed by profile for terminal history and runs, and by row for the queue.
+- It is separate from the on-disk layout. It is built at hydrate by reading the shards in order and
+  then replaying the WAL.
+- Lookups (the dashboard, History, the duplicate check, settlement) use the index, not the shards.
+- A removal in the WAL hides the profile in the index. A later row for the profile shows it again.
 
-- Clear history drops every shard, empties the WAL, and resets the meta record. No per-row work.
+## What changes in the engine
 
-## Reuse
-
-- The existing WAL engine (`walSnapshotStore.js`) already has a codec hook (`codec` with
-  `compress`/`decompress`) and key conventions. The completed WAL and its shards should use the same
-  codec hook and key naming as the queue WAL, so the WAL users share one implementation, as the
-  owner asked earlier. The checkpoint partitioning by key hash does not apply here.
-- The browser codec is `CompressionStream` (gzip), which is async. The pure module takes an async
-  codec so tests can use the Node gzip codec the synthetic harness already uses.
-
-## Still open
-
-- **Shard size:** 16 KB is the default from the write bands, used for both the WAL flush threshold and
-  the compressed shard target. Confirm, or give separate values.
+- Partition policy per instance: arrival-ordered shards for every store. The hash partition is
+  removed for these stores.
+- Shard keys are per slot, as they are now.
+- The checkpoint writer compares each shard's content hash with the inactive slot's own last copy,
+  and writes only the shards that differ, in full.
+- Keyed row reads that used the hash are replaced by the in-memory index.
+- Each slot's garbage collection removes only that slot's shards that its new manifest no longer
+  lists.
 
 ## Components touched
 
-- `shared/js/walSnapshotStore.js`: stop partitioning the completed area by key hash.
-- `shared/js/swCoordinatorQueueWal.js`: the completed area leaves the queue WAL.
-- `shared/js/sw.js`: archive, requeue removal, resident completed map, dashboard completed rows,
-  `findCompletedWorkRowByKey`, the prune. The row-by-row prune script is written but not applied, and
-  it is replaced by the shard drop.
-- `shared/js/swQueueWalDurableReads.js`: reads from the index instead of the WAL.
-- `shared/js/coordinator.js`: History reads the profile-keyed completed rows.
-- New module, for example `shared/js/swCompletedLogShards.js`: pure functions for WAL append, flush to
-  a compressed shard, drop by age, drop by cap, index build, and removal tombstones. Testable without
-  storage.
+- `shared/js/walSnapshotStore.js`: partition policy, the changed-shard writer, per-slot garbage
+  collection.
+- `shared/js/swCoordinatorQueueWal.js`: the queue's shard id per row, and the tail move as one record.
+- `shared/js/sw.js`: terminal history, runs, the in-memory index, the retry path that moves rows to
+  the tail, the expiry and cap checks, Clear.
+- `shared/js/coordinator.js`: History reads the profile-keyed index.
+- Tests: the existing WAL and checkpoint tests (walSnapshotStore, walCheckpointShards,
+  walKeyedRead, walIncrementalVerify, the fuzz test) must keep passing, with changes only where they
+  pin hash partitioning or per-slot shard names.
 
 ## Steps
 
-1. Pure module `swCompletedLogShards.js` with unit tests: WAL append, flush at size, compressed shard
-   round trip, drop by age, drop by cap, index by profile, removal hides a row, clear.
-2. Wire archive and requeue removal to the store behind one switch, so the old path can be compared
-   during testing.
-3. Index at hydrate; compare the index with a fresh decode after restart (the same check the runs WAL
-   uses).
-4. Limits: age and cap after a flush and at startup.
-5. History reads the index. Clear drops all shards and the WAL.
-6. Synthetic tests: a restart reads the same rows; a crash between a shard write and the WAL clear
-   loses nothing; a dropped shard leaves no index entry; a removal hides a row without rewriting its
-   shard; each archive write stays small.
-7. Live check: write sizes per archive, flushes and shard drops per day, History against the
-   dashboard terminal count.
+1. Engine: arrival-ordered shard policy behind an instance option. Hash partitioning stays as the
+   default for any caller that has not opted in, until the stores are moved.
+2. Engine: the changed-shard writer, per slot, with the content-hash comparison.
+3. Engine: per-slot garbage collection, and a test that a torn write of one slot leaves the other
+   slot complete.
+4. Queue: shard id per row, and the one-record tail move, behind a switch.
+5. Terminal history and runs: arrival-ordered shards, the in-memory index, the expiry and cap checks.
+6. History and the duplicate check read the index. Clear drops the shards.
+7. Live check: bytes per checkpoint, shards written per checkpoint, and the terminal count.
 
-## Risks
+## Open
 
-- Dropping a shard drops rows that are still "done" on the page. The page then offers those profiles
-  again, which is accepted (owner decision 8). Count them in the flight recorder so the cost shows.
-- Removals stay in the stored shard until it drops. A row removed and then re-added could be read
-  twice unless the index keeps the newest record per profile. The index must resolve this, and the
-  tests must cover it.
+- Shard size: about 16 KB compressed is the default. Confirm.
+- Whether the queue's tail-move audit (every path that returns a row to queued) is done before step 4.
+- Whether to remove the step 1 files, `shared/js/swCompletedLogShards.js` and its test, which are
+  uncommitted and keep their own storage design.

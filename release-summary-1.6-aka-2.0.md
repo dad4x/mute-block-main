@@ -1,5 +1,7 @@
 # Mute Block 2.0 Release Summary Draft
 
+> **Status: ROADMAP** (24 Oct 2026). Draft public release narrative for 2.0, based on 1.6.246. Not an engineering plan. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: release narrative draft.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

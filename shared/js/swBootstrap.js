@@ -1,3 +1,5 @@
+const {namespaceChanges} = require('./storageNamespace')
+
 // Bootstrap/wiring tail extracted from sw.js (decomposition Slice 1).
 //
 // This module is pure composition-root code: a single function that
@@ -104,6 +106,8 @@ function registerServiceWorkerListeners(deps = {}) {
         'record-job-milestone',
         'record-job-terminal',
         'record-direct-profile-progress',
+        'record-manual-profile-action',
+        'get-recent-history',
         'clear-profile-nuke-state',
         'settle-terminal-coordinator-items',
         'remove-pending-space-feed-urls',
@@ -134,7 +138,9 @@ function registerServiceWorkerListeners(deps = {}) {
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
         TARGET_QUEUED_TAB_CONCURRENCY_KEY,
-        WORKER_WINDOW_FOREGROUND_MODE_KEY
+        WORKER_WINDOW_FOREGROUND_MODE_KEY,
+        NUKED_POST_RETENTION_DAYS_KEY,
+        MAX_REMEMBERED_NUKED_POSTS_KEY
     } = deps.constants || {}
     const {
         coordinatorReconcileScheduler,
@@ -229,6 +235,8 @@ function registerServiceWorkerListeners(deps = {}) {
         reconcileReleasedActiveCoordinatorTab,
         recordCoordinatorJobProgressViaQueueMachine,
         recordDirectProfileProgressFromRequest,
+        recordManualProfileActionRequested,
+        getRecentHistoryRequested,
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
@@ -263,6 +271,8 @@ function registerServiceWorkerListeners(deps = {}) {
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
         setWorkerWindowForegroundMode,
+        setRecentHistoryRetentionDays,
+        setRecentHistoryMaxEntries,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -275,11 +285,13 @@ function registerServiceWorkerListeners(deps = {}) {
         readProfileNukeProgressForTools,
         clearProfileNukeProgressForTools,
         retireUnusedVersion15StorageKeys,
+        checkStorageBuild,
         noteStorageRemovals
     } = deps.handlers || {}
 
     function handleRuntimeInstalled(details) {
         void retireUnusedVersion15StorageKeys().catch(() => null)
+        void checkStorageBuild({reason: details.reason, previousVersion: details.previousVersion}).catch(() => null)
         const resetReason = details.reason === 'install'
             ? 'extension-installed'
             : 'extension-updated'
@@ -299,6 +311,7 @@ function registerServiceWorkerListeners(deps = {}) {
     }
     function handleRuntimeStartup() {
         void retireUnusedVersion15StorageKeys().catch(() => null)
+        void checkStorageBuild({reason: 'startup'}).catch(() => null)
         return handleCoordinatorBrowserStartup()
     }
     browser.runtime.onInstalled.addListener(details => runAfterCoordinatorAuthorityReady(() => handleRuntimeInstalled(details)))
@@ -622,14 +635,20 @@ function registerServiceWorkerListeners(deps = {}) {
         if(changes?.[WORKER_WINDOW_FOREGROUND_MODE_KEY]) {
             setWorkerWindowForegroundMode(changes[WORKER_WINDOW_FOREGROUND_MODE_KEY].newValue)
         }
+        // The completed-work log uses the recent-history preferences: applied to the next checkpoint.
+        if(changes?.[NUKED_POST_RETENTION_DAYS_KEY]) setRecentHistoryRetentionDays(changes[NUKED_POST_RETENTION_DAYS_KEY].newValue)
+        if(changes?.[MAX_REMEMBERED_NUKED_POSTS_KEY]) setRecentHistoryMaxEntries(changes[MAX_REMEMBERED_NUKED_POSTS_KEY].newValue)
         // Progress lives in session storage (decision 31), and nothing writes its view to disk now, so no progress key is read here.
         // A change to the old disk key is not handled (20 Oct review, decision 2).
     }
     browser.storage.onChanged.addListener((changes, areaName) => {
         if(areaName !== 'local') return undefined
+        // This layout's keys only, with their plain names (storageNamespace.js).
+        const ownChanges = namespaceChanges(changes)
+        if(!ownChanges) return undefined
         // Synchronous, before the readiness gate: a clear is seen at once, so a switch that starts after it cannot reuse a slot that is gone.
-        noteStorageRemovals(changes)
-        return runAfterCoordinatorAuthorityReady(() => handleStorageChanged(changes, areaName))
+        noteStorageRemovals(ownChanges)
+        return runAfterCoordinatorAuthorityReady(() => handleStorageChanged(ownChanges, areaName))
     })
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = normalizeRuntimeMessageAction(request)
@@ -1107,6 +1126,12 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'record-direct-profile-progress') {
             return recordDirectProfileProgressFromRequest(request, sender)
+        }
+        else if(request.action === 'record-manual-profile-action') {
+            return recordManualProfileActionRequested(request)
+        }
+        else if(request.action === 'get-recent-history') {
+            return getRecentHistoryRequested(request)
         }
         else if(request.action === 'clear-profile-nuke-state') {
             return applyCoordinatorQueueMachineEvent({

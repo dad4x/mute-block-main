@@ -76,16 +76,6 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">Target Concurrency</div>
-                        <div class="hint">How many queued tabs the executor tries to run at once. Lowered automatically when Quora pushes back.</div>
-                    </div>
-                    <input class="input" id="targetQueuedTabConcurrency" type="number" min="1" required>
-                </div>
-            </section>
-
-            <section class="section">
-                <div class="row">
-                    <div>
                         <div class="label">Worker Window Focus</div>
                         <div class="hint">What a queued action does to its tab in the worker window. Focus brings the tab forward and takes OS focus on each action. Activate brings it forward without taking focus. None keeps it in the background and takes no focus, so steps that need the page visible wait, then fail. Applies from the next action.</div>
                     </div>
@@ -101,7 +91,7 @@
                 <div class="row">
                     <div>
                         <div class="label">Recent History Retention (days)</div>
-                        <div class="hint">Auto-prune persisted space-post results older than this. Use `0` to disable age pruning.</div>
+                        <div class="hint">Recent history older than this is pruned. Whichever limit is hit first prunes. Use `0` to disable age pruning.</div>
                     </div>
                     <input class="input" id="nukedPostRetentionDays" type="number" min="0" required>
                 </div>
@@ -111,7 +101,7 @@
                 <div class="row">
                     <div>
                         <div class="label">Recent History Entry Cap</div>
-                        <div class="hint">Keep at most this many persisted history entries, trimming the oldest first. Use `0` to disable the cap.</div>
+                        <div class="hint">Keep at most this many recent history entries, trimming the oldest first. Whichever limit is hit first prunes. Use `0` to disable the cap.</div>
                     </div>
                     <input class="input" id="maxRememberedNukedPosts" type="number" min="0" required>
                 </div>

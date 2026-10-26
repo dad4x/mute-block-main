@@ -1,3 +1,4 @@
+const {SPACE_MAP_LAYOUT_KEY} = require('./storageKeys')
 // Storage layout for the two space-feed post maps (remembered nuked posts and pending records). Both maps are
 // held in memory whole, as before. On disk each map is split into 32 bucket keys by a hash of its post key, the
 // same shape as the profile progress shards. A write rewrites only the buckets whose content changed, so one
@@ -10,7 +11,6 @@ const {hashState} = require('./walSnapshotStore')
 
 // The bucket count is declared once, in storageKeys.js (it sets the stored key names).
 const {SPACE_MAP_BUCKET_COUNT} = require('./storageKeys')
-const SPACE_MAP_LAYOUT_KEY = 'mbSpaceMapLayoutVersion'
 const SPACE_MAP_LAYOUT_BUCKETED = 2
 
 function spaceMapBucketKey(baseKey = '', index = 0) {

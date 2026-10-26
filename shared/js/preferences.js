@@ -1,5 +1,6 @@
 const browser = require('webextension-polyfill')
 const defaults = require('./defaults')
+const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const { setMuteBlockHelp } = require('./muteBlockHelp')
 const {
     MAX_REMEMBERED_NUKED_POSTS_KEY,
@@ -34,7 +35,7 @@ addEventListener('load', init)
 
 async function init() {
     const manifest = browser.runtime.getManifest()
-    const settings = await browser.storage.local.get({
+    const settings = await namespaceArea(browser.storage.local).get({
         ...defaults,
         [SPACE_REGISTRY_KEY]: {},
         [SPACE_SORT_KEY]: SPACE_SORT_NAME,
@@ -58,7 +59,6 @@ async function init() {
     const fopFlipDelay = document.getElementById('fopFlipDelay')
     const coordinatorAutoStartOnBrowserStart = document.getElementById('coordinatorAutoStartOnBrowserStart')
     const profilesPerBatch = document.getElementById('profilesPerBatch')
-    const targetQueuedTabConcurrency = document.getElementById('targetQueuedTabConcurrency')
     const workerWindowForegroundMode = document.getElementById('workerWindowForegroundMode')
     const nukedPostRetentionDays = document.getElementById('nukedPostRetentionDays')
     const maxRememberedNukedPosts = document.getElementById('maxRememberedNukedPosts')
@@ -68,7 +68,6 @@ async function init() {
     fopFlipDelay.value = settings.fopFlipDelay
     coordinatorAutoStartOnBrowserStart.checked = settings.coordinatorAutoStartOnBrowserStart === true
     profilesPerBatch.value = settings.profilesPerBatch
-    targetQueuedTabConcurrency.value = settings.targetQueuedTabConcurrency
     workerWindowForegroundMode.value = settings.workerWindowForegroundMode
     popupState.nukedPostRetentionDays = normalizeRetentionDays(settings[NUKED_POST_RETENTION_DAYS_KEY], defaults[NUKED_POST_RETENTION_DAYS_KEY])
     popupState.maxRememberedNukedPosts = normalizeMaxRememberedNukedPosts(settings[MAX_REMEMBERED_NUKED_POSTS_KEY], defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
@@ -95,7 +94,6 @@ async function init() {
             fopFlipDelay: fopFlipDelay.valueAsNumber,
             coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart.checked,
             profilesPerBatch: profilesPerBatch.valueAsNumber,
-            targetQueuedTabConcurrency: targetQueuedTabConcurrency.valueAsNumber,
             workerWindowForegroundMode: workerWindowForegroundMode.value,
             [NUKED_POST_RETENTION_DAYS_KEY]: normalizeRetentionDays(nukedPostRetentionDays.valueAsNumber, defaults[NUKED_POST_RETENTION_DAYS_KEY]),
             [MAX_REMEMBERED_NUKED_POSTS_KEY]: normalizeMaxRememberedNukedPosts(maxRememberedNukedPosts.valueAsNumber, defaults[MAX_REMEMBERED_NUKED_POSTS_KEY])
@@ -128,7 +126,6 @@ async function init() {
         fopFlipDelay.value = defaults.fopFlipDelay
         coordinatorAutoStartOnBrowserStart.checked = defaults.coordinatorAutoStartOnBrowserStart === true
         profilesPerBatch.value = defaults.profilesPerBatch
-        targetQueuedTabConcurrency.value = defaults.targetQueuedTabConcurrency
         workerWindowForegroundMode.value = defaults.workerWindowForegroundMode
         popupState.nukedPostRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY]
         popupState.maxRememberedNukedPosts = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
@@ -184,7 +181,9 @@ async function init() {
         showStatus(status, result?.error ? 'History open failed.' : 'History opened.')
     })
 
-    browser.storage.onChanged.addListener(changes => {
+    browser.storage.onChanged.addListener(storedChanges => {
+        const changes = namespaceChanges(storedChanges)
+        if(!changes) return
         if(changes[SPACE_REGISTRY_KEY]) {
             popupState.spaceRegistry = changes[SPACE_REGISTRY_KEY].newValue || {}
             renderSpaceList(spaceList)
@@ -197,7 +196,7 @@ async function init() {
         }
 
         if(Object.keys(changes).some(key => isSpaceMapStorageKey(key, [SPACE_NUKED_POSTS_KEY]))) {
-            void browser.storage.local.get(spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])).then(stored => {
+            void namespaceArea(browser.storage.local).get(spaceMapStorageReadDefaults([SPACE_NUKED_POSTS_KEY])).then(stored => {
                 popupState.nukedPosts = readSpaceMapFromStored(stored, SPACE_NUKED_POSTS_KEY)
             })
         }

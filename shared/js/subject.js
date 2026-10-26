@@ -231,11 +231,20 @@ function normalizeQuoraProfileHrefUncached(href, baseUrl = getDefaultBaseUrl()) 
         if(/[\/\\?#]/.test(decodedSlug)) return null
         if(/[\u0000-\u001F\u007F]/.test(decodedSlug)) return null
 
-        return `https://www.quora.com/profile/${encodeURIComponent(decodedSlug)}`
+        return `https://www.quora.com/profile/${encodeURIComponent(stripProfileClosedSetTail(decodedSlug))}`
     }
     catch {
         return null
     }
+}
+
+// The closed set of tails Quora links add to a profile slug (historical/suffix-cutting-discussion-2026-10-14.md). Name-log is the
+// profile Name, not a profile of its own. Only one tail is removed, and the name keeps what is before it.
+const PROFILE_CLOSED_SET_TAIL = /^(.+?)-(?:log|answers|questions|posts|share-\d+|ch-\d+)$/
+
+function stripProfileClosedSetTail(slug = '') {
+    const match = PROFILE_CLOSED_SET_TAIL.exec(slug)
+    return match ? match[1] : slug
 }
 
 function normalizeTabTargetUrl(url) {

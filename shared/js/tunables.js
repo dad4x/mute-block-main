@@ -5,6 +5,11 @@
 // Each entry says what it bounds and what it costs. Rough sizes are measured,
 // not guessed: one metrics journal entry serializes to about 640 bytes.
 module.exports = {
+    // Queue WAL row shard budget (completed-log closeout, step 4): uncompressed JSON per shard. The plan's 16 KB target is
+    // compressed, so this is a proxy to check against a live run. The on/off switch and the completed-log limits are Preferences
+    // page settings (shared/js/defaults.js), not tunables.
+    QUEUE_WAL_SHARD_BYTES: 16384,
+
     // Flight recorder: in-memory ring of recent events, and the cap on the
     // copy persisted to session storage (the session quota is the constraint).
     FLIGHT_RECORDER_CAPACITY: 20000,

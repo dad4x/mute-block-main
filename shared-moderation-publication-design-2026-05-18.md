@@ -1,5 +1,7 @@
 # Shared Moderation Publication Design, 2026-05-18
 
+> **Status: ROADMAP** (24 Oct 2026). Core design of shared-moderation publication (18 May). Runtime integration deferred. The pure module exists and no runtime file imports it. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: active supporting design, runtime integration deferred.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

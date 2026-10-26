@@ -18,6 +18,8 @@ const {
     recoverProjectedState
 } = require('../shared/js/walSnapshotStore')
 const {SOFT_FAIL_RETRY_LIMIT} = require('../shared/js/tunables')
+// The archive stamps its completion shard onto the row when the step 5 switch is on (shared/js/swCompletedShards.js); the fixtures carry none.
+const ARCHIVE_SHARD_FIELDS = {completedShard: 0}
 
 const SYNTHETIC_TEST_WATCHDOG_MS = 20000
 
@@ -256,9 +258,11 @@ test('a door write that removes or adds a completed row updates the resident map
 
     const after = await recordWalStorageReads(browser, () => sw.loadCoordinatorDashboardAuthoritySnapshot('after-door-writes'))
     assert.deepEqual(after.walReads, [], 'the refresh after the door writes asks storage for no WAL key')
-    assert.deepEqual(plainCopy(after.result.completedRows), [rowC, rowB], 'the removed row is gone and the archived row is listed, newest first')
+    // The archive stamps its completion shard onto the row (step 5, shared/js/swCompletedShards.js); the fixture rows do not carry one.
+    const archivedC = {...rowC, ...ARCHIVE_SHARD_FIELDS}
+    assert.deepEqual(plainCopy(after.result.completedRows), [archivedC, rowB], 'the removed row is gone and the archived row is listed, newest first')
     assert.equal(await sw.findCompletedWorkRowByKey(hrefA), null)
-    assert.deepEqual(plainCopy(await sw.findCompletedWorkRowByKey(hrefC)), rowC)
+    assert.deepEqual(plainCopy(await sw.findCompletedWorkRowByKey(hrefC)), archivedC)
 
     // The resident map agrees with what a fresh decode of the WAL on disk gives.
     await sw.coordinatorAuthority.hydrate()
@@ -478,7 +482,7 @@ test('an archive append from the door verifies incrementally: the counter moves,
     const resident = plainCopy(await sw.loadCoordinatorDashboardAuthoritySnapshot('resident-after-archive'))
     assert.deepEqual(Object.keys(resident.queue), [hrefLive], 'the archived row left the resident queue, and the single-row write stayed')
     assert.equal(resident.queue[hrefLive].updatedAt, 746000, 'the single-row write is resident')
-    assert.deepEqual(resident.completedRows, [plainCopy(row), plainCopy(rowDone)], 'the archived row is listed first, newest first')
+    assert.deepEqual(resident.completedRows, [{...plainCopy(row), ...ARCHIVE_SHARD_FIELDS}, plainCopy(rowDone)], 'the archived row is listed first, newest first')
 
     // A fresh decode of the WAL on disk gives the same queue and completed rows as the resident maps.
     await sw.coordinatorAuthority.hydrate()
@@ -523,9 +527,9 @@ test('dashboard snapshot cache: an archive, a removal and a re-decode each show 
     }, {operationKind: 'archive-terminal-row', reason: 'ordinaryMutation', metricPath: 'test.dashboard.cache.archive'})
     assert.equal(archive.saved, true, archive.reason)
     const afterArchive = await sw.loadCoordinatorDashboardAuthoritySnapshot('cache-after-archive')
-    assert.deepEqual(plainCopy(afterArchive.completedRows), [rowC, rowB, rowA], 'the archived row appears on the next poll, newest first')
+    assert.deepEqual(plainCopy(afterArchive.completedRows), [{...rowC, ...ARCHIVE_SHARD_FIELDS}, rowB, rowA], 'the archived row appears on the next poll, newest first')
     assert.equal(afterArchive.completedResidentRows, 3)
-    assert.equal(afterArchive.completedResidentApproxBytes, jsonBytes([rowA, rowB, rowC]))
+    assert.equal(afterArchive.completedResidentApproxBytes, jsonBytes([rowA, rowB, {...rowC, ...ARCHIVE_SHARD_FIELDS}]))
     const archiveView = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('cache-after-archive'))
     assert.equal(archiveView.view.total, 3, 'the next queue view counts the archived row')
     assert.equal(archiveView.view.items.some(item => item.storageKey === hrefC), false,
@@ -537,16 +541,16 @@ test('dashboard snapshot cache: an archive, a removal and a re-decode each show 
     }, {operationKind: 'requeue', reason: 'ordinaryMutation', metricPath: 'test.dashboard.cache.requeue'})
     assert.equal(removal.saved, true, removal.reason)
     const afterRemoval = await sw.loadCoordinatorDashboardAuthoritySnapshot('cache-after-removal')
-    assert.deepEqual(plainCopy(afterRemoval.completedRows), [rowC, rowB], 'the removed row leaves the next poll')
+    assert.deepEqual(plainCopy(afterRemoval.completedRows), [{...rowC, ...ARCHIVE_SHARD_FIELDS}, rowB], 'the removed row leaves the next poll')
     assert.equal(afterRemoval.completedResidentRows, 2)
-    assert.equal(afterRemoval.completedResidentApproxBytes, jsonBytes([rowB, rowC]))
+    assert.equal(afterRemoval.completedResidentApproxBytes, jsonBytes([rowB, {...rowC, ...ARCHIVE_SHARD_FIELDS}]))
 
     // A re-decode replaces the resident map: the poll after it matches a fresh decode of the WAL.
     await sw.coordinatorAuthority.hydrate()
     const afterRedecode = plainCopy(await sw.loadCoordinatorDashboardAuthoritySnapshot('cache-after-redecode'))
-    assert.deepEqual(afterRedecode.completedRows, [rowC, rowB])
+    assert.deepEqual(afterRedecode.completedRows, [{...rowC, ...ARCHIVE_SHARD_FIELDS}, rowB])
     assert.equal(afterRedecode.completedResidentRows, 2)
-    assert.equal(afterRedecode.completedResidentApproxBytes, jsonBytes([rowB, rowC]))
+    assert.equal(afterRedecode.completedResidentApproxBytes, jsonBytes([rowB, {...rowC, ...ARCHIVE_SHARD_FIELDS}]))
 })
 
 test('dashboard snapshot cache: a duplicate href across two runs keeps the newer completed row in the population even when the older one was archived first', async () => {
@@ -16667,6 +16671,110 @@ test('upgrade from 1.5 removes only the 1.5 storage residue this worker does not
     assert.equal(storage.mbCoordinatorPaused, true)
 })
 
+test('the stored build is written at install and replaced at the next start on a new build; a start on the same build writes nothing', async () => {
+    // The harness reports the manifest version 'test' as the running build. The stored build is that version after an update with no
+    // stored build, and a stale stored build is replaced at the next startup.
+    const {browser, storage, timers} = loadServiceWorkerHarness({now: 3600, seedRawQueueFixtureAsWal: false, storage: {mbCoordinatorPaused: true}})
+    const build = browser.runtime.getManifest().version
+    await browser.runtime.onInstalled.emit({reason: 'update', previousVersion: '1.6.1625'})
+    await waitFor(() => storage.mbStorageBuild === build, 'the stored build was not written at update', {timers, attempts: 20, tickMs: 1000})
+
+    storage.mbStorageBuild = '1.6.1625'
+    await browser.runtime.onStartup.emit()
+    await waitFor(() => storage.mbStorageBuild === build, 'the stale stored build was not replaced at startup', {timers, attempts: 20, tickMs: 1000})
+
+    // Positive control first: a stale build is written, and the counter sees that write.
+    let buildWrites = 0
+    const originalSet = browser.storage.local.set
+    browser.storage.local.set = (items, ...rest) => {
+        if (items && Object.prototype.hasOwnProperty.call(items, 'mbStorageBuild')) buildWrites += 1
+        return originalSet.call(browser.storage.local, items, ...rest)
+    }
+    storage.mbStorageBuild = '1.6.1625'
+    await browser.runtime.onStartup.emit()
+    await waitFor(() => buildWrites === 1, 'the control write was not counted', {timers, attempts: 20, tickMs: 1000})
+
+    // A start on the current build writes nothing.
+    await browser.runtime.onStartup.emit()
+    await flushAsync(20)
+    assert.equal(buildWrites, 1, 'a start on the same build wrote the stored build again')
+    browser.storage.local.set = originalSet
+})
+
+test('storage namespace: stored names carry the layout prefix, and reads, clears and changes show only this layout', async () => {
+    const {namespaceArea, namespaceChanges} = require('../shared/js/storageNamespace')
+    const {STORAGE_LAYOUT_PREFIX: prefix} = require('../shared/js/storageKeys')
+    const raw = {[`${prefix}mbA`]: 1, [`${prefix}mbB`]: 2, mbOld: 'older-layout'}
+    const area = {
+        get: async keys => {
+            if(keys === null || keys === undefined) return {...raw}
+            if(typeof keys === 'string') return keys in raw ? {[keys]: raw[keys]} : {}
+            if(Array.isArray(keys)) return Object.fromEntries(keys.filter(key => key in raw).map(key => [key, raw[key]]))
+            return Object.fromEntries(Object.entries(keys).map(([key, fallback]) => [key, key in raw ? raw[key] : fallback]))
+        },
+        set: async items => { Object.assign(raw, items) },
+        remove: async keys => { for(const key of [].concat(keys)) delete raw[key] },
+        getBytesInUse: async () => 0
+    }
+    const namespaced = namespaceArea(area)
+    assert.deepEqual(await namespaced.get(null), {mbA: 1, mbB: 2}, 'a read of everything shows this layout only, under plain names')
+    assert.deepEqual(await namespaced.get({mbA: 0, mbC: 3}), {mbA: 1, mbC: 3}, 'defaults apply to the keys that are missing')
+    await namespaced.set({mbC: 4})
+    assert.equal(raw[`${prefix}mbC`], 4, 'a write is stored under the prefix')
+    assert.equal('mbC' in raw, false, 'and not under the plain name')
+    await namespaced.remove(['mbA'])
+    assert.equal(`${prefix}mbA` in raw, false)
+    await namespaced.clear()
+    assert.deepEqual(Object.keys(raw), ['mbOld'], 'clear removes this layout and keeps the older layout\'s key')
+    assert.equal(namespaceChanges({mbOld: {newValue: 1}}), null, 'a change to an older key is not this layout\'s')
+    assert.deepEqual(namespaceChanges({[`${prefix}mbB`]: {newValue: 5}, mbOld: {newValue: 1}}), {mbB: {newValue: 5}})
+    assert.equal(namespaceArea(null), null, 'a missing area gives null, so optional chains keep working')
+})
+
+test('with the layout prefix on, every key the worker writes is prefixed, and an older layout\'s keys survive writes, a restart and an erase', async () => {
+    const {STORAGE_LAYOUT_PREFIX: prefix} = require('../shared/js/storageKeys')
+    const runId = 'run-layout-prefix'
+    const now = 700000
+    const newHref = 'https://www.quora.com/profile/Synthetic-Layout-New'
+    const oldRaw = {mbOldBuildRuns: {'old-run': {id: 'old-run'}}, mbCoordinatorQueue: {'https://www.quora.com/profile/Synthetic-Layout-Old': {status: 'queued'}}}
+    const {sw, browser} = loadServiceWorkerHarness({
+        now,
+        layoutPrefix: prefix,
+        storage: {mbCoordinatorPaused: true, mbCoordinatorEvents: [], [LEGACY_PROFILE_PROGRESS_KEY]: {}},
+        rawStorage: oldRaw
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const enqueued = await sw.coordinatorAuthority.persistCoordinator({
+        results: [tailMoveResult('enqueue', newHref, null, makeQueuedCoordinatorRow({href: newHref, runId, attemptId: 'attempt-layout-new', now}))]
+    }, {operationKind: 'enqueue', reason: 'ordinaryMutation', recordWorkSnapshot: false, metricPath: 'test.layout.enqueue'})
+    assert.equal(enqueued.saved, true, enqueued.reason)
+    const checkpoint = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpoint.checkpointSwitched, true)
+
+    const outsideLayout = area => Object.keys(area).filter(name => !name.startsWith(prefix)).sort()
+    assert.deepEqual(outsideLayout(browser.__storage), ['mbCoordinatorQueue', 'mbOldBuildRuns'], 'the worker wrote no disk key outside the layout, and left the older keys in place')
+    assert.deepEqual(browser.__storage.mbOldBuildRuns, oldRaw.mbOldBuildRuns, 'an older layout\'s value is unchanged')
+    assert.ok(Object.keys(browser.__storage).some(name => name.startsWith(`${prefix}mbCoordinatorQueueWal`)), 'the queue WAL is stored under the prefix')
+    assert.deepEqual(outsideLayout(browser.__sessionStorage), [], 'the worker wrote no session key outside the layout')
+
+    // A restart reads the queue back from the prefixed keys.
+    const restarted = loadServiceWorkerHarness({now: now + 10, layoutPrefix: prefix, storage: {}, rawStorage: JSON.parse(JSON.stringify(browser.__storage))})
+    const durable = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.ok(durable.queue[newHref], 'the row written under the layout is read back after a restart')
+
+    // An erase clears this layout and leaves the older layout's keys in place.
+    const scheduled = await restarted.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    const erased = loadServiceWorkerHarness({now: now + 20, layoutPrefix: prefix, storage: {}, rawStorage: JSON.parse(JSON.stringify(restarted.browser.__storage))})
+    const hydrating = erased.sw.coordinatorAuthority.hydrate()
+    await erased.timers.tick(1000)
+    await hydrating
+    assert.equal(Object.keys(erased.browser.__storage).filter(name => name.startsWith(`${prefix}mbCoordinatorQueue`)).length, 0, 'the erase removes the queue keys of this layout')
+    assert.deepEqual(outsideLayout(erased.browser.__storage), ['mbCoordinatorQueue', 'mbOldBuildRuns'], 'the erase leaves the older layout\'s keys')
+    assert.deepEqual(erased.browser.__storage.mbOldBuildRuns, oldRaw.mbOldBuildRuns)
+})
+
 test('coordinator authority no-op apply is durable without snapshot write', async () => {
     const href = 'https://www.quora.com/profile/Authority-Noop'
     const queue = {
@@ -27166,8 +27274,10 @@ test('queue WAL checkpoint switch writes a gzip-compressed checkpoint', async ()
     // record, so the payload checks run per shard, and the size check on totals.
     const checkpoint = storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}`]
     assert.equal(checkpoint.format, 'sharded-v1')
-    assert.equal(checkpoint.shardCount, 10)
-    assert.equal(checkpoint.shards.length, 10)
+    // Shards follow the rows (the arrival layout), and two rows fit in one shard.
+    const expectedShards = 1
+    assert.equal(checkpoint.shardCount, expectedShards)
+    assert.equal(checkpoint.shards.length, expectedShards)
     const shardRecords = checkpoint.shards.map((shard, index) =>
         storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}.s${String(index).padStart(2, '0')}`])
     for (const record of shardRecords) {
@@ -39815,7 +39925,8 @@ test('change-only write keeps a runs change made during a slow WAL write', async
     const freshRuns = loadServiceWorkerHarness({now: 5000, storage: JSON.parse(JSON.stringify(storage))})
     await freshRuns.sw.coordinatorAuthority.hydrate()
     assert.deepEqual(plainCopy(residentRuns), plainCopy(freshRuns.sw.coordinatorAuthority.current().runs), 'the resident runs equal a fresh decode')
-    assert.equal(JSON.stringify(sw.coordinatorAuthority.current().queue[hrefB]), JSON.stringify(rowB), 'expected the changed row to be resident after the write')
+    // The batch enqueue moves the row to the tail shard (shard 0 here, the only shard), so the resident row carries that shard.
+    assert.equal(JSON.stringify(sw.coordinatorAuthority.current().queue[hrefB]), JSON.stringify({...rowB, shard: 0}), 'expected the changed row to be resident after the write')
     assert.ok(sw.coordinatorAuthority.current().queue[hrefA], 'expected the untouched row to stay resident')
     assert.equal(getRecoveredCoordinatorQueue(storage)[hrefB]?.status, 'queued', 'expected the changed row to be durable')
 })
@@ -44043,7 +44154,7 @@ function loadListPageHarness() {
                     windows: {getCurrent: async () => null}
                 }
             }
-            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './spaceMapStorage', './muteBlockHelp'].includes(name)) {
+            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './storageNamespace', './spaceMapStorage', './muteBlockHelp'].includes(name)) {
                 return sharedModule(name.slice(2))
             }
             // The dashboard's footer bar is built by this module; the list-page harness does not draw it.
@@ -44888,6 +44999,188 @@ test('erase everything closes the writes, refuses a second erase, and reloads th
     assert.equal(again.reason, 'erase-already-scheduled')
     await harness.timers.tick(400)
     assert.equal(reloads, 1, 'the extension reloads once, after the reply')
+})
+
+// Queue tail moves and the two History limits (completed-work log). The shard budget is 16 KB (tunables.js), so a row padded
+// to about 9 KB takes a shard of its own, and the shard each row lands in is exact.
+const TAIL_DAY_MS = 24 * 60 * 60 * 1000
+const TAIL_HOUR_MS = 60 * 60 * 1000
+const TAIL_PAD_CHARS = 9000
+
+function tailMoveResult(operationKind, rowKey, previousRow, nextRow) {
+    return {accepted: true, changed: true, durable: true, reason: 'persisted', operationKind, rowKey, previousRow, nextRow, terminal: false}
+}
+
+function makePaddedArchivableRow({href, runId, terminalAt}) {
+    return {
+        ...makeQueuedCoordinatorRow({href, runId, attemptId: `attempt-${href.split('/').pop()}`, now: terminalAt}),
+        status: 'succeeded',
+        outcome: 'blocked',
+        queuedAt: terminalAt - 1000,
+        activeAt: terminalAt - 500,
+        terminalAt,
+        updatedAt: terminalAt,
+        tabId: null,
+        note: 'x'.repeat(TAIL_PAD_CHARS)
+    }
+}
+
+test('a row that becomes queued lands in the tail shard on every queue write path: batch enqueue, batch retry and single-row retry', async () => {
+    const runId = 'run-tail-move'
+    const now = 700000
+    const seedHref = 'https://www.quora.com/profile/Synthetic-Tail-Seed'
+    const batchHref = 'https://www.quora.com/profile/Synthetic-Tail-Batch'
+    const newHref = 'https://www.quora.com/profile/Synthetic-Tail-New'
+    const singleHref = 'https://www.quora.com/profile/Synthetic-Tail-Single'
+    const {sw, storage} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: {
+                // A queued row in shard 3 makes the rebuilt tail shard 3; the two failed rows start in shard 0.
+                [seedHref]: {...makeQueuedCoordinatorRow({href: seedHref, runId, attemptId: 'attempt-tail-seed', now}), shard: 3},
+                [batchHref]: {...makeFailedCoordinatorRow({href: batchHref, runId, attemptId: 'attempt-tail-batch', now}), shard: 0},
+                [singleHref]: {...makeFailedCoordinatorRow({href: singleHref, runId, attemptId: 'attempt-tail-single', now}), shard: 0}
+            },
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href: seedHref, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    const queue = () => sw.coordinatorAuthority.current().queue
+    const writeOptions = metricPath => ({operationKind: 'tail-move', reason: 'ordinaryMutation', recordWorkSnapshot: false, metricPath})
+    assert.equal(queue()[seedHref].shard, 3, 'sanity check: the seeded queued row keeps its shard')
+    assert.equal(queue()[batchHref].shard, 0, 'sanity check: the failed row starts in shard 0')
+
+    const enqueued = await sw.coordinatorAuthority.persistCoordinator({
+        results: [tailMoveResult('enqueue', newHref, null, makeQueuedCoordinatorRow({href: newHref, runId, attemptId: 'attempt-tail-new', now}))]
+    }, writeOptions('test.tailMove.enqueueBatch'))
+    assert.equal(enqueued.saved, true, enqueued.reason)
+    assert.equal(queue()[newHref].shard, 3, 'a batch enqueue goes to the tail shard')
+
+    const failedRow = queue()[batchHref]
+    const retried = await sw.coordinatorAuthority.persistCoordinator({
+        // A retry leaves a terminal row, so its result carries allowTerminalOverwrite, as the production retry does.
+        results: [{...tailMoveResult('retry', batchHref, failedRow, {...failedRow, status: 'queued', attemptId: 'attempt-tail-batch-2', attemptNumber: 2, outcome: '', error: ''}), allowTerminalOverwrite: true}]
+    }, writeOptions('test.tailMove.retryBatch'))
+    assert.equal(retried.saved, true, retried.reason)
+    assert.equal(queue()[batchHref].status, 'queued')
+    assert.equal(queue()[batchHref].shard, 3, 'a batch retry moves the row from shard 0 to the tail shard')
+
+    const singleRow = queue()[singleHref]
+    const single = await sw.coordinatorAuthority.apply({
+        operationKind: 'retry',
+        rowKey: singleHref,
+        expectedAttemptId: singleRow.attemptId,
+        reason: 'ordinaryMutation',
+        allowTerminalOverwrite: true,
+        mutate: current => ({...current, status: 'queued', attemptId: 'attempt-tail-single-2', attemptNumber: 2, outcome: '', error: ''})
+    })
+    assert.equal(single.durable, true, single.reason)
+    assert.equal(queue()[singleHref].shard, 3, 'a single-row retry moves the row to the tail shard')
+
+    // Progress on a queued row with the same attempt is not a move, so the row keeps its shard.
+    const heartbeat = await sw.coordinatorAuthority.apply({
+        operationKind: 'action-lease-heartbeat',
+        rowKey: seedHref,
+        expectedAttemptId: 'attempt-tail-seed',
+        mutate: current => ({...current, updatedAt: now + 1000})
+    })
+    assert.equal(heartbeat.durable, true, heartbeat.reason)
+    assert.equal(queue()[seedHref].shard, 3)
+
+    // The shard is in the WAL row, so a restart reads each row back in the shard it was moved to.
+    const restarted = loadServiceWorkerHarness({now: now + 10, storage: JSON.parse(JSON.stringify(storage))})
+    const durable = await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(durable.queue[newHref].shard, 3, 'the batch-enqueued row reads back in the tail shard')
+    assert.equal(durable.queue[batchHref].shard, 3, 'the batch-retried row reads back in the tail shard')
+    assert.equal(durable.queue[singleHref].shard, 3, 'the single-row retry reads back in the tail shard')
+})
+
+test('the History age limit: the page hides rows past the retention, and the checkpoint drops their shards', async () => {
+    const runId = 'run-history-age'
+    const now = 200 * TAIL_DAY_MS
+    const oldHrefs = ['https://www.quora.com/profile/Synthetic-Age-Old-A', 'https://www.quora.com/profile/Synthetic-Age-Old-B']
+    const recentHrefs = ['https://www.quora.com/profile/Synthetic-Age-Recent-A', 'https://www.quora.com/profile/Synthetic-Age-Recent-B']
+    const terminalAt = {
+        [oldHrefs[0]]: now - 10 * TAIL_DAY_MS,
+        [oldHrefs[1]]: now - 9 * TAIL_DAY_MS,
+        [recentHrefs[0]]: now - 2 * TAIL_DAY_MS,
+        [recentHrefs[1]]: now - TAIL_DAY_MS
+    }
+    const queued = {}
+    for (const href of [...oldHrefs, ...recentHrefs]) queued[href] = makePaddedArchivableRow({href, runId, terminalAt: terminalAt[href]})
+    // The Recent History settings are read at startup (loadRecentHistoryPreferences), so the limit goes in the stored preferences.
+    const {sw, storage, browser} = loadServiceWorkerHarness({now, storage: {nukedPostRetentionDays: 7, mbCoordinatorPaused: true, mbCoordinatorQueue: queued, mbCoordinatorRuns: {}, mbCoordinatorEvents: [], [LEGACY_PROFILE_PROGRESS_KEY]: {}}})
+    await sw.coordinatorAuthority.hydrate()
+    for (const href of [...oldHrefs, ...recentHrefs]) {
+        const archived = await sw.archiveTerminalCoordinatorRow(href, sw.coordinatorAuthority.current().queue[href])
+        assert.equal(archived.archived, true, archived.reason)
+    }
+    // Array.from, not map: the worker's rows come from its own vm realm, and a strict deepEqual rejects another realm's array.
+    const keysOf = rows => Array.from(rows, row => row.coordinatorKey).sort()
+
+    // The page applies the window at read time, before any checkpoint.
+    const page = await browser.runtime.sendMessage({action: 'get-recent-history'})
+    assert.deepEqual(keysOf(page.rows), [...recentHrefs].sort(), 'the page shows only the rows completed within 7 days')
+
+    const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpointSwitch.checkpointSwitched, true)
+    assert.deepEqual(Object.keys(sw.coordinatorAuthority.residentCompleted()).sort(), [...recentHrefs].sort(), 'the resident log drops the expired shards once the checkpoint is saved')
+
+    const restarted = loadServiceWorkerHarness({now: now + 1000, storage: JSON.parse(JSON.stringify(storage))})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(Object.keys(restarted.sw.coordinatorAuthority.residentCompleted()).sort(), [...recentHrefs].sort(), 'a restart reads the pruned checkpoint: the expired rows are gone')
+})
+
+test('the History row cap: the page shows at most the cap, newest first, and the checkpoint drops the oldest shards past it', async () => {
+    const runId = 'run-history-cap'
+    const now = 200 * TAIL_DAY_MS
+    const hrefs = [0, 1, 2, 3, 4].map(index => `https://www.quora.com/profile/Synthetic-Cap-${index}`)
+    // hrefs[0] is the oldest completion, one hour apart.
+    const queued = {}
+    hrefs.forEach((href, index) => {
+        queued[href] = makePaddedArchivableRow({href, runId, terminalAt: now - (hrefs.length - index) * TAIL_HOUR_MS})
+    })
+    const {sw, storage, browser} = loadServiceWorkerHarness({now, storage: {maxRememberedNukedPosts: 3, mbCoordinatorPaused: true, mbCoordinatorQueue: queued, mbCoordinatorRuns: {}, mbCoordinatorEvents: [], [LEGACY_PROFILE_PROGRESS_KEY]: {}}})
+    await sw.coordinatorAuthority.hydrate()
+    for (const href of hrefs) {
+        const archived = await sw.archiveTerminalCoordinatorRow(href, sw.coordinatorAuthority.current().queue[href])
+        assert.equal(archived.archived, true, archived.reason)
+    }
+    const newestThree = [hrefs[4], hrefs[3], hrefs[2]]
+
+    const page = await browser.runtime.sendMessage({action: 'get-recent-history'})
+    assert.deepEqual(Array.from(page.rows, row => row.coordinatorKey), newestThree, 'the page shows the newest three rows, newest first')
+
+    const checkpointSwitch = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpointSwitch.checkpointSwitched, true)
+    assert.deepEqual(Object.keys(sw.coordinatorAuthority.residentCompleted()).sort(), [...newestThree].sort(), 'the checkpoint drops the two oldest shards, one row each')
+
+    const restarted = loadServiceWorkerHarness({now: now + 1000, storage: JSON.parse(JSON.stringify(storage))})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(Object.keys(restarted.sw.coordinatorAuthority.residentCompleted()).sort(), [...newestThree].sort(), 'a restart reads the capped log')
+})
+
+test('an incremental History query returns only the rows completed at or after the since time the page sent', async () => {
+    const runId = 'run-history-since'
+    const now = 200 * TAIL_DAY_MS
+    const hrefs = [0, 1, 2].map(index => `https://www.quora.com/profile/Synthetic-Since-${index}`)
+    const queued = {}
+    hrefs.forEach((href, index) => {
+        queued[href] = makePaddedArchivableRow({href, runId, terminalAt: now - (hrefs.length - index) * TAIL_HOUR_MS})
+    })
+    const harness = loadServiceWorkerHarness({now, storage: {mbCoordinatorPaused: true, mbCoordinatorQueue: queued, mbCoordinatorRuns: {}, mbCoordinatorEvents: [], [LEGACY_PROFILE_PROGRESS_KEY]: {}}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    for (const href of hrefs) {
+        const archived = await harness.sw.archiveTerminalCoordinatorRow(href, harness.sw.coordinatorAuthority.current().queue[href])
+        assert.equal(archived.archived, true, archived.reason)
+    }
+    // The page already has the row completed two hours ago, so its since is that time.
+    const since = now - 2 * TAIL_HOUR_MS
+    const incremental = await harness.browser.runtime.sendMessage({action: 'get-recent-history', since})
+    assert.deepEqual(Array.from(incremental.rows, row => row.coordinatorKey), [hrefs[2], hrefs[1]], 'only the rows at or after since come back, newest first')
 })
 ;
 (async () => {

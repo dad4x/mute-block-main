@@ -1,5 +1,7 @@
 # Labeler Management Note
 
+> **Status: ROADMAP** (24 Oct 2026). Future operations design for labelers (20 May). No decision. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: future operations/design context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

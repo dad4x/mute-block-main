@@ -2,7 +2,9 @@ const browser = require('webextension-polyfill')
 const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
 const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
-const {runsChangeRecords, persistedRunFields} = require('./swRunsWal')
+const {runsChangeRecords, persistedRunFields, RUN_RETENTION_MAX_COUNT} = require('./swRunsWal')
+const {makeRunShardTail, selectRunShardsToDrop, withoutRunShards} = require('./swRunShards')
+const {makeManualHistoryRow} = require('./swManualHistory')
 const {
     SPACE_MAP_LAYOUT_KEY,
     SPACE_MAP_LAYOUT_BUCKETED,
@@ -15,6 +17,8 @@ const {
 } = require('./spaceMapStorage')
 const {
     SPACE_NUKED_POSTS_KEY,
+    NUKED_POST_RETENTION_DAYS_KEY,
+    MAX_REMEMBERED_NUKED_POSTS_KEY,
     getPrunedNukedPosts
 } = require('./nukedPosts')
 const {
@@ -34,8 +38,38 @@ const {
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT,
     COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT,
     DEV_MODE_SYNC_STORAGE_KEY,
-    HIDDEN_RUNS_KEY
+    HIDDEN_RUNS_KEY,
+    STORAGE_BUILD_KEY,
+    OWNED_TAB_STATE_KEY,
+    COORDINATOR_QUEUE_KEY,
+    COORDINATOR_QUEUE_WAL_KEY,
+    COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
+    COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX,
+    COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX,
+    QUEUE_WAKEUP_METRICS_KEY,
+    QUEUE_WAKEUP_JOURNAL_KEY,
+    BROWSER_SESSION_MARKER_KEY,
+    QUORA_RUNTIME_ACTIVATED_SESSION_KEY,
+    FLIGHT_RECORDER_SESSION_KEY,
+    QUEUED_ACTION_SURFACE_STATE_KEY,
+    COORDINATOR_STATS_CLEARED_AT_KEY,
+    COORDINATOR_OUTLIERS_KEY,
+    COORDINATOR_TAB_KEY,
+    COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
+    PAUSE_DIAGNOSTIC_SNAPSHOT_KEY,
+    DEBUG_RUN_AUTOSAVED_ID_KEY,
+    COORDINATOR_RUNS_LAYOUT_KEY,
+    COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY,
+    COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY,
+    ERASE_BLOCK_HISTORY_PENDING_KEY,
+    ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY,
+    LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY
 } = require('./storageKeys')
+const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
+const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
+const DEBUG_RESUME_LIMIT_ALARM_NAME = 'mb-debug-resume-limit'
+const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-coordinator-reconcile'
+const {namespaceArea, prefixedName, namespaceChanges} = require('./storageNamespace')
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
     normalizeQuoraProfileHref: normalizeQuoraProfileUrl,
@@ -148,6 +182,13 @@ const {
     MIRROR_REBUILD_SKIPPED_EVENT,
     MIRROR_REBUILD_SKIPPED_FLIGHT_KIND
 } = require('./swQueueWalStore')
+const {makeQueueWalRowShardTail} = require('./swQueueWalRowShard')
+const {
+    makeCompletedShardTail,
+    completedAreaShardOf,
+    selectCompletedShardsToPrune,
+    withoutShards
+} = require('./swCompletedShards')
 const {
     createQueueWalDurableReads
 } = require('./swQueueWalDurableReads')
@@ -169,7 +210,9 @@ const {
     normalizeTargetQueuedTabConcurrency,
     WORKER_WINDOW_FOREGROUND_MODE_KEY,
     WORKER_WINDOW_FOREGROUND_MODES,
-    normalizeWorkerWindowForegroundMode
+    normalizeWorkerWindowForegroundMode,
+    normalizeRecentHistoryRetentionDays,
+    normalizeRecentHistoryMaxEntries
 } = require('./swprefs')
 const {
     createQueueMachineEventDispatcher
@@ -461,11 +504,8 @@ const coordinatorReconcileScheduler = createSchedulerSlot({
     reason: 'coordinator-reconcile',
     ...schedulerClock
 })
-const OWNED_TAB_STATE_KEY = 'mbOwnedTabIdsByParent'
 // The owned-tab map as last saved (owner 18 Oct). persistOwnedTabIdsByParent skips the write when the map is unchanged.
 let ownedTabIdsByParentSavedJson = null
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = getSegmentedWalMetaKey(COORDINATOR_QUEUE_WAL_KEY)
 // 2026-10-08: live storage-footprint audit found the two paired queue-WAL
 // checkpoints (mbCoordinatorQueueWal.checkpoint.A/.B) at ~9.7MB each,
@@ -678,21 +718,12 @@ const COORDINATOR_STORAGE_QUOTA_CHECK_INTERVAL_MS = 60000
 // backlog doesn't spam a diagnostic event per tick.
 const COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS = 30000
 const COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS = 15000
-const COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'
-const COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex.'
 // The namespace stamp prefix (docs/queue-storage-layering.md, section 6, rule 7). Each namespace key has its own stamp key,
 // COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX + the key, which holds the token of the last write that wrote that key.
-const COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX = 'mbCoordinatorNamespaceSeq.'
-const QUEUE_WAKEUP_METRICS_KEY = 'mbQueueWakeupMetrics'
 // The larger stored journal (see tunables.js) lives under its own key, so the metrics blob stays small.
-const QUEUE_WAKEUP_JOURNAL_KEY = 'mbQueueWakeupJournal'
-const BROWSER_SESSION_MARKER_KEY = 'mbBrowserSessionMarker'
-const QUORA_RUNTIME_ACTIVATED_SESSION_KEY = 'mbQuoraRuntimeActivated'
-const FLIGHT_RECORDER_SESSION_KEY = 'mbFlightRecorderSnapshot'
 // Resolves once the startup reseed from session storage has run. get-flight-recorder waits on it, so a
 // restarted worker never answers with an empty buffer that the session copy would have filled.
 let flightRecorderSeedReady = Promise.resolve()
-const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
 // Durable cutoff for the dashboard's Current Work "Terminal" tile, set by
 // the "Clear All Stats" button. A terminal item (live or already archived
 // to the completed-work log) with terminalAt at or before this timestamp is
@@ -702,13 +733,10 @@ const QUEUED_ACTION_SURFACE_STATE_KEY = 'mbQueuedActionSurfaceState'
 // cutoff only ever applies to isTerminalCoordinatorStatus rows. Terminal
 // reads 0 immediately after a clear and climbs again only as new items
 // actually finish afterward.
-const COORDINATOR_STATS_CLEARED_AT_KEY = 'mbCoordinatorStatsClearedAt'
 // The dashboard's outlier list (swCoordinatorOutliers.js): the flagged rows and the baseline. A namespace key (docs/queue-storage-layering.md,
 // section 6): it is written through the door, stamped, and mirrored to the session like the runs key.
-const COORDINATOR_OUTLIERS_KEY = 'mbCoordinatorOutliers'
 
 const QUEUE_WAKEUP_METRICS_VERSION = 4
-const COORDINATOR_TAB_KEY = 'mbCoordinatorTabId'
 const QUEUED_ACTION_SURFACE_COORDINATOR_HASH = '#progress'
 const COORDINATOR_HISTORY_HASH = '#history'
 // The dashboard's dev-mode flag. setDevModeEnabledRequested writes it, and the worker pushes it to every open dashboard with the
@@ -731,7 +759,6 @@ const MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS = 1200
 // comment for why the existing monolithic key's shape stays untouched
 // (many existing tests assert its exact fields) while getContentPageCoordinatorState
 // reads these shards instead of that key for its hot per-request lookup.
-const COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX = 'mbCoordinatorContentQueueIndexShard.'
 const {
     MAX_QUEUE_WAKEUP_METRIC_JOURNAL,
     MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL,
@@ -752,6 +779,7 @@ const {
     EXECUTOR_CLASSIFY_BACKSTOP_MS,
     ERASE_RELOAD_DELAY_MS,
     ORPHAN_SURFACE_TAB_GRACE_MS,
+    QUEUE_WAL_SHARD_BYTES,
     STORED_ERROR_TEXT_MAX_CHARS
 } = require('./tunables')
 // The dashboard's outlier list (swCoordinatorOutliers.js): a running baseline, pushed by each finished row at its archive.
@@ -782,8 +810,6 @@ const MAX_QUEUE_WAKEUP_METRIC_PHASES = 64
 // the current epoch's diagnosticEvents (swQueueWakeupMetricsShape.js) to
 // this durable key from here in sw.js, which owns the storage boundary --
 // not from swflightRecorder.js itself.
-const PAUSE_DIAGNOSTIC_SNAPSHOT_KEY = 'mbPauseDiagnosticSnapshot'
-const DEBUG_RUN_AUTOSAVED_ID_KEY = 'mbDebugRunAutosavedId'
 const MAX_QUEUE_WAKEUP_METRIC_EPOCH_HISTORY = 8
 const CURRENT_WORK_RETENTION_MS = 24 * 60 * 60 * 1000
 const STALE_ACTIVE_QUEUED_TAB_MS = 10000
@@ -858,12 +884,8 @@ const QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS = COORDINATOR_FAST_EXECUTOR_RESUM
 const SCHEDULER_ALARM_LATE_TOLERANCE_MS = 60000
 const COORDINATOR_JOB_MILESTONE_FLUSH_MS = 3000
 const PERSISTENT_FAILED_RETRY_INTERVAL_MS = 5000
-const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
 const PERSISTENT_FAILED_RETRY_ALARM_PERIOD_MINUTES = 0.5
-const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
 // Dev-mode resume limit: fires once when a time-limited resume reaches its deadline.
-const DEBUG_RESUME_LIMIT_ALARM_NAME = 'mb-debug-resume-limit'
-const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-coordinator-reconcile'
 const QUEUED_PROFILE_RESOLUTION_MODE = 'author-profile'
 const CONTENT_SCRIPT_READY_ATTR = 'data-mb-content-script-ready'
 const QUEUED_TAB_CONTENT_SCRIPT_CHECK_DELAY_MS = 750
@@ -969,6 +991,9 @@ let coordinatorPauseRequested = false
 let queuedTabConcurrency = 1
 let targetQueuedTabConcurrency = normalizeTargetQueuedTabConcurrency(defaults[TARGET_QUEUED_TAB_CONCURRENCY_KEY], 4)
 let workerWindowForegroundMode = defaults[WORKER_WINDOW_FOREGROUND_MODE_KEY]
+// The completed-work log uses the recent-history preferences (Recent History Retention and Entry Cap), applied live.
+let recentHistoryRetentionDays = defaults[NUKED_POST_RETENTION_DAYS_KEY]
+let recentHistoryMaxEntries = defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
 // The last or current continuous work (24 Oct): { startedAt, endedAt, endReason }. endedAt is 0 while it is running.
 let coordinatorWorkSession = null
 let queuedTabFillPromise = null
@@ -2277,6 +2302,26 @@ function setWorkerWindowForegroundMode(value) {
     workerWindowForegroundMode = normalizeWorkerWindowForegroundMode(value, workerWindowForegroundMode)
 }
 
+function setRecentHistoryRetentionDays(value) {
+    recentHistoryRetentionDays = normalizeRecentHistoryRetentionDays(value, recentHistoryRetentionDays)
+}
+
+function setRecentHistoryMaxEntries(value) {
+    recentHistoryMaxEntries = normalizeRecentHistoryMaxEntries(value, recentHistoryMaxEntries)
+}
+
+async function loadRecentHistoryPreferences() {
+    const stored = await metricStorageGet({
+        [NUKED_POST_RETENTION_DAYS_KEY]: defaults[NUKED_POST_RETENTION_DAYS_KEY],
+        [MAX_REMEMBERED_NUKED_POSTS_KEY]: defaults[MAX_REMEMBERED_NUKED_POSTS_KEY]
+    }, {
+        phase: 'startupPreferenceGet'
+    }).catch(() => null)
+    if(!stored) return
+    setRecentHistoryRetentionDays(stored[NUKED_POST_RETENTION_DAYS_KEY])
+    setRecentHistoryMaxEntries(stored[MAX_REMEMBERED_NUKED_POSTS_KEY])
+}
+
 // Only a stored value is applied, so a load that finds none keeps the value already in place (the default). The Preferences page
 // saves through set-extension-settings, and the storage change then moves the value (swBootstrap handleStorageChanged).
 async function loadWorkerWindowForegroundModePreference() {
@@ -2433,7 +2478,7 @@ function getStorageWriteRefusal() {
     return Promise.reject(error)
 }
 
-const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter(() => browser.storage.local)
+const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter(() => namespaceArea(browser.storage.local))
 const coordinatorStorageAdapter = {
     get: defaults => rawCoordinatorStorageAdapter.get(defaults),
     set: payload => getStorageWriteRefusal() || rawCoordinatorStorageAdapter.set(payload),
@@ -2656,7 +2701,6 @@ function commitSpaceMapDiskWrite(write = {}) {
 
 // The run list (COORDINATOR_RUNS_KEY) on disk. Same scheme as the space maps, with its own layout marker, so the two can be
 // migrated separately. The session mirror of the run list stays whole. Its disk copy is the buckets once runsLayout.bucketed.
-const COORDINATOR_RUNS_LAYOUT_KEY = 'mbCoordinatorRunsLayoutVersion'
 const runsLayout = {bucketed: false, hash: null}
 
 function getRunsStoredReadDefaults() {
@@ -6446,11 +6490,10 @@ const COORDINATOR_QUEUE_VIEW_TERMINAL_STATUSES = ['succeeded', 'failed', 'skippe
 let coordinatorQueueViewTimingCache = null
 // Counts the Clear All Stats resets (clearCoordinatorTerminalStats). A startup read that began before a reset does not restore what it read (20 Oct review).
 let coordinatorQueueViewTimingCacheResetCount = 0
-const COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY = 'mbCoordinatorQueueViewTimingCache'
 
 async function loadCoordinatorQueueViewTimingCacheFromSession() {
     const resetCountAtStart = coordinatorQueueViewTimingCacheResetCount
-    const stored = await browser.storage.session?.get?.({
+    const stored = await namespaceArea(browser.storage.session)?.get?.({
         [COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY]: null
     }).catch(() => null)
     // A reset that ran during this read cleared the session copy after the read began, so the value read here can be older than the reset.
@@ -7319,7 +7362,8 @@ function makeCoordinatorCompletedWorkWalRecord(entry = {}, options = {}) {
         ].filter(value => value !== '').join(':'),
         operationKind,
         reason: entry.reason || options.reason || '',
-        value: row,
+        // Step 5: an archive takes the completion shard at the tail (a no-op with the switch off).
+        value: completedWalShards.stamp(row),
         runId,
         attemptId,
         attemptNumber,
@@ -7390,7 +7434,7 @@ let coordinatorQueueMirrorWriteChain = Promise.resolve()
 // The session area the mirror writes through. Once the erase has closed the writes, a set or remove is refused as the local writes are.
 // Reads go straight to the browser's area.
 function getCoordinatorQueueMirrorSessionArea() {
-    const area = browser.storage?.session || null
+    const area = namespaceArea(browser.storage?.session || null)
     if(!area) return null
     return {
         get: defaults => area.get(defaults),
@@ -7452,7 +7496,6 @@ function enqueueCoordinatorQueueMirrorWrite(task) {
 // - committed is written with the mirror records after that disk write is acknowledged, in the same
 //   session.set call (getCoordinatorQueueWalCommittedMarker).
 // A reader may use the mirror only when pending === committed and committed matches the mirror meta.
-const COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY = 'mbCoordinatorQueueWalSeq'
 // The pending fingerprint this worker issued last, in issue order. A commit records this value
 // rather than its own write's fingerprint, so a commit never hides a later write that is still pending.
 // undefined until this worker issues one; a commit with no issued pending (a rebuild from disk) then
@@ -8775,12 +8818,22 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         // number assigned. This is the sequence the replay used to report.
         const maxAppliedSeq = Math.max(0, (Number.parseInt(storedWal?.meta?.nextSeq, 10) || 0) - 1)
         const checkpointedRecords = activeRecords.filter(record => (Number.parseInt(record?.seq, 10) || 0) <= maxAppliedSeq).length
-        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: recoveredCompleted}, {
+        // Step 5: the completed log drops its expired shards and the oldest shards over the row cap. The checkpoint is written without
+        // them, and the resident map drops them only once that save succeeds.
+        const completedPrune = selectCompletedShardsToPrune(recoveredCompleted, {
+            nowMs: Date.now(),
+            retentionMs: recentHistoryRetentionDays * 24 * 60 * 60 * 1000,
+            maxRows: recentHistoryMaxEntries
+        })
+        const completedForCheckpoint = completedPrune.drop.size ? withoutShards(recoveredCompleted, completedPrune.drop) : recoveredCompleted
+        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint}, {
             snapshotSeq: maxAppliedSeq,
             createdAt: Date.now(),
             codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC,
             codecName: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC.name,
-            shardCount: COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT
+            shardCount: COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT,
+            // Steps 4 and 5: with the switch on, rows are partitioned by the shard they carry, not by key hash.
+            shardOf: queueWalCheckpointShardOf
         })
         const activated = activateCheckpoint(prepared.store, prepared.checkpointId, COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
         if(activated?.activated !== true) {
@@ -8884,9 +8937,12 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
                 checkpointedRecords
             }
         }
+        // Step 5: the save went through, so the pruned shards leave the resident completed map too.
+        const completedDropped = coordinatorAuthority.dropResidentCompletedShards(completedPrune.drop)
+        if(completedDropped) incrementQueueWakeupMetric('coordinatorAuthority.queueWal.completedShardsPruned', completedPrune.drop.size)
         cacheCoordinatorQueueWalResidentStoreFromWrite(activated.store, checkpointWal?.payload || {})
         // The authority's resident WAL is the store just written (the observer no longer absorbs a door write's WAL, so the
-        // switch installs its own result). The queue and the completed map do not change in a switch.
+        // switch installs its own result). The queue does not change in a switch; the completed map changes only by the prune above.
         coordinatorAuthority.installCheckpointSwitch(activated.store, checkpointWal?.payload || {})
 
         incrementQueueWakeupMetric('coordinatorAuthority.queueWal.checkpointed')
@@ -9788,6 +9844,17 @@ async function runAsCoordinatorDoorWrite(task) {
     }
 }
 
+// Queue row shards (step 4): the tail that new queued rows go to. Off by default; with the switch off it stamps nothing.
+const queueWalRowShards = makeQueueWalRowShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES, enabled: true})
+// Completed-work log shards (step 5): the tail that each archive goes to, and the checkpoint's partition rule. The queue's rule
+// covers the queue and runs; the completed area uses its own completion shard.
+const completedWalShards = makeCompletedShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES, enabled: true})
+// Run shards (swRunShards.js): new runs take the tail, and the run cap drops whole shards. Always on, since the cap is hardcoded.
+const runShardTail = makeRunShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES})
+function queueWalCheckpointShardOf(area = '', key = '', entry = null) {
+    return area === 'completed' ? completedAreaShardOf(area, key, entry) : queueWalRowShards.shardOf(area, key, entry)
+}
+
 function createCoordinatorAuthority() {
     // hydrated means the full resident state is loaded: the queue, runs, events, the coordinator keys and the completed
     // map. Nothing sets it except a successful load (loadResidentState), so a reader never sees a partial state as loaded.
@@ -9840,8 +9907,11 @@ function createCoordinatorAuthority() {
         }
         const queueBeforeHydrate = projection.queue
         projection = makeCoordinatorAuthorityProjection(loaded)
+        queueWalRowShards.rebuild(projection.queue)
+        runShardTail.rebuild(projection.runs)
         syncResidentQueueOrder(queueBeforeHydrate)
         setResidentCompleted(loaded.completed)
+        completedWalShards.rebuild(loaded.completed)
         residentDecode = loaded.decode || null
         closeRuntimeTabsReclaimedByAuthority(projection.queue, 'authority-hydrate-reclaimed-runtime')
         unavailableReason = ''
@@ -9894,6 +9964,15 @@ function createCoordinatorAuthority() {
         }
     }
 
+    // Step 5: after a checkpoint with the pruned log is saved, the resident map drops the same shards. The checkpoint switch runs
+    // under the apply tail, so no archive lands between the prune and this drop.
+    function dropResidentCompletedShards(drop = new Set()) {
+        if(!residentCompletedMap || !drop || drop.size === 0) return 0
+        const before = residentCompletedRowCount
+        setResidentCompleted(withoutShards(residentCompletedMap, drop))
+        return before - residentCompletedRowCount
+    }
+
     // The door's update of the resident completed map. Runs on the applyTail step right after a WAL append was
     // acknowledged. `records` are the completed-area records that append wrote (completedWalRecords), in append order.
     // Each goes through applyWalRecord, the reducer WAL replay uses, so a record the replay would reject (a stale
@@ -9941,6 +10020,13 @@ function createCoordinatorAuthority() {
         return residentCompletedMap
     }
 
+    // When the completed log last changed (Date.now()). A history query compares it with the newest row the page has, so it does
+    // nothing when nothing has changed since.
+    let completedLastChangedAt = 0
+    function residentCompletedLastChangedAt() {
+        return completedLastChangedAt
+    }
+
     function residentCompletedStats() {
         return {rows: residentCompletedRowCount, approxBytes: residentCompletedBytes}
     }
@@ -9950,6 +10036,7 @@ function createCoordinatorAuthority() {
     // so a new write site that goes through either of them cannot skip it.
     function noteResidentCompletedChanged() {
         residentCompletedRevision += 1
+        completedLastChangedAt = Date.now()
         residentCompletedRowsCache = null
     }
 
@@ -10014,6 +10101,8 @@ function createCoordinatorAuthority() {
             queue: normalized.queue,
             runs: normalized.runs || projection.runs || {}
         })
+        queueWalRowShards.rebuild(projection.queue)
+        runShardTail.rebuild(projection.runs)
         syncResidentQueueOrder(queueBeforeSeed)
         return true
     }
@@ -10150,7 +10239,14 @@ function createCoordinatorAuthority() {
     function takeRunsPartFromChange(stored = null) {
         if(!stored || !Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY)) return null
         const value = stored[COORDINATOR_RUNS_KEY]
-        const runsAfter = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+        // The run cap (swRunsWal.js): the oldest runs that no queue row refers to are dropped, in this same write.
+        // Run shards (swRunShards.js): a new run takes the tail shard, and then the cap drops the oldest whole shards that no queue row
+        // refers to, in this same write. Runs already in the log keep the shard they have.
+        const runsIn = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+        const stampedRuns = {}
+        for (const [id, run] of Object.entries(runsIn)) stampedRuns[id] = projection.runs?.[id] ? run : runShardTail.stamp(run)
+        const referencedRunIds = new Set(Object.values(projection.queue || {}).map(row => row?.runId).filter(Boolean))
+        const runsAfter = withoutRunShards(stampedRuns, selectRunShardsToDrop(stampedRuns, {maxRuns: RUN_RETENTION_MAX_COUNT, referencedRunIds}))
         const storedWithoutRuns = {...stored}
         delete storedWithoutRuns[COORDINATOR_RUNS_KEY]
         return {
@@ -10178,7 +10274,13 @@ function createCoordinatorAuthority() {
     // The queue part of the door, run on the applyTail step (persistCoordinator). Returns the WAL batch result.
     async function persistCoordinatorQueueChange(change = {}, options = {}) {
         if(!hydrated) await hydrate()
-        const results = Array.isArray(change.results) ? change.results : []
+        // Step 4: a batch row that becomes queued moves to the tail shard in its own row value, as the single-row path does
+        // (apply, above). The previous row is the resident one. A result that is not an accepted change is passed through as it was.
+        const results = (Array.isArray(change.results) ? change.results : []).map(result => (
+            result?.accepted && result?.changed && result?.nextRow
+                ? {...result, nextRow: queueWalRowShards.stamp(projection.queue?.[result.rowKey] ?? null, result.nextRow)}
+                : result
+        ))
         const removedRows = Array.isArray(change.removedRows) ? change.removedRows : []
         const base = projection
         // Guarded removal (cancel of a queued row, 17 Oct): the row must still be the one the caller read. This runs on the
@@ -10714,7 +10816,8 @@ function createCoordinatorAuthority() {
             })
         }
 
-        const nextRow = normalizeCoordinatorAuthorityMutationRow(mutationResult, previousRow)
+        // Step 4: a row that becomes queued moves to the tail shard in this same row value (a no-op with the switch off).
+        const nextRow = queueWalRowShards.stamp(previousRow, normalizeCoordinatorAuthorityMutationRow(mutationResult, previousRow))
         const changed = JSON.stringify(nextRow) !== JSON.stringify(previousRow)
         if(!changed) {
             return makeCoordinatorAuthorityApplyResult({...operation, operationKind, rowKey}, {
@@ -10847,11 +10950,20 @@ function createCoordinatorAuthority() {
         // page did not see left the profile offered as still queueable (trollsgalore, 22 Oct: 16 finished profiles still listed).
         if(result?.durable === true && isTerminalCoordinatorStatus(nextRow?.status) && !isTerminalCoordinatorStatus(previousRow?.status)) {
             const finishedHref = normalizeQuoraProfileUrl(nextRow?.targetProfileHref || nextRow?.requestedUrl || nextRow?.coordinatorKey || '')
-            if(finishedHref && pendingSpaceFeedNamesHref(finishedHref)) void applyCoordinatorQueueMachineEvent({type: 'PENDING_SPACE_FEED_URLS_REMOVE', urls: [finishedHref]}).catch(() => null)
+            // A successful block settles the profile into Recent History (the same path as a confirmed space-feed nuke). Any other outcome
+            // only drops the profile from the pending post.
+            if(finishedHref && pendingSpaceFeedNamesHref(finishedHref)) {
+                const event = nextRow?.status === 'succeeded'
+                    ? {type: 'SPACE_FEED_PROFILES_CONFIRM', profileHrefs: [finishedHref]}
+                    : {type: 'PENDING_SPACE_FEED_URLS_REMOVE', urls: [finishedHref]}
+                void applyCoordinatorQueueMachineEvent(event).catch(() => null)
+            }
         }
         // Archive gate (2026-10-13): a soft failure with automatic retries left stays in the live queue (isArchivableCoordinatorRow).
         if(result?.durable === true && isArchivableCoordinatorRow(nextRow)) {
-            void archiveTerminalCoordinatorRow(rowKey, nextRow, {currentAuthorityState: projection}).catch(() => null)
+            void archiveTerminalCoordinatorRow(rowKey, nextRow, {currentAuthorityState: projection})
+                .then(result => { if(result?.archived) notifyRecentHistoryChanged() })
+                .catch(() => null)
         }
         return result
     }
@@ -10991,6 +11103,8 @@ function createCoordinatorAuthority() {
         persistCoordinatorWholeState,
         applyWithinStorageUpdate,
         residentCompleted,
+        residentCompletedLastChangedAt,
+        dropResidentCompletedShards,
         residentCompletedStats,
         residentCompletedRowsFor,
         isHydrated() {
@@ -22604,8 +22718,6 @@ async function clearCoordinatorEventsRequested() {
 // the flight recorder, so none of them is written back over the erase. The erase pauses the queue first (owner, 24 Oct), and is refused if a row is
 // still active after that, so no tab is mid-action. Not for routine use: after it the queue has no record of any profile blocked, and will act on them again.
 const ERASE_BLOCK_HISTORY_CONFIRMATION = 'ERASE'
-const ERASE_BLOCK_HISTORY_PENDING_KEY = 'mbEraseBlockHistoryPending'
-const ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY = 'mbEraseBlockHistoryGeneration'
 // Nothing is kept: a clean slate. The marker is the one key the erase itself handles, and it is removed last.
 const ERASE_BLOCK_HISTORY_KEEP_KEYS = new Set()
 
@@ -22633,7 +22745,7 @@ async function eraseBlockHistoryRequested(request = {}) {
         const stored = await coordinatorStorageAdapter.get(null)
         const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY)
         if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
-        await browser.storage.session?.clear?.()
+        await namespaceArea(browser.storage.session)?.clear?.()
         // The writes close here. The queue runs the next update straight away, and that update would write the resident WAL and queue back
         // over the cleared storage unless it is refused. The reload ends the worker, and with it that memory.
         storageWritesClosedByErase = true
@@ -22653,10 +22765,10 @@ async function runPendingBlockHistoryErase() {
     const stored = await coordinatorStorageAdapter.get(null)
     const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY && !ERASE_BLOCK_HISTORY_KEEP_KEYS.has(key))
     if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
-    await browser.storage.session?.clear?.()
+    await namespaceArea(browser.storage.session)?.clear?.()
     // The erase generation lives in session storage, so the worker can say which erase it has finished.
     const eraseGeneration = Date.now()
-    void browser.storage.session?.set?.({[ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY]: eraseGeneration}).catch(() => {})
+    void namespaceArea(browser.storage.session)?.set?.({[ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY]: eraseGeneration}).catch(() => {})
     // The open Quora tabs still hold the state they loaded with, and their content scripts were cut off by the reload. Reloading them
     // starts fresh content scripts, which read the cleared storage and can ask this worker for the erase generation.
     const quoraTabs = await browser.tabs.query({url: ['*://*.quora.com/*']}).catch(() => [])
@@ -22668,6 +22780,71 @@ async function runPendingBlockHistoryErase() {
 
 // Content-script and popup requests for the space nuked-post keys (docs/queue-storage-layering.md, section 6, rule 2).
 // These are non-queue keys, so the door writes only the stored part: no WAL write and no hydrate.
+// Recent History is the completed-work log. A block or unblock made on a profile page is a completed row, written the way an archived
+// row is (swManualHistory.js). The open History pages are told, and they ask for their rows by message.
+async function recordManualProfileActionRequested(request = {}) {
+    const kind = request.kind === 'pardon' ? 'pardon' : request.kind === 'block' ? 'block' : ''
+    const profileHref = normalizeQuoraProfileUrl(request.profileHref || '')
+    const at = Number.parseInt(request.at, 10) || Date.now()
+    const row = makeManualHistoryRow({kind, profileHref, at})
+    if(!row) return {recorded: false, reason: 'invalid-manual-action'}
+    const rowKey = row.coordinatorKey
+    const persistence = await persistCoordinatorWithFinishedOutliers({
+        results: [],
+        removedRows: [],
+        completedRows: [{rowKey, previousRow: row, operationKind: 'archive-terminal-row', reason: 'ordinaryMutation'}]
+    }, {
+        operationKind: 'archive-terminal-row',
+        reason: 'ordinaryMutation',
+        recordWorkSnapshot: false,
+        metricPath: 'manualHistory.save'
+    }).catch(() => null)
+    if(!persistence) return {recorded: false, reason: 'persistence-error'}
+    notifyRecentHistoryChanged()
+    return {recorded: true, kind, rowKey}
+}
+
+// The History page's rows: the completed-work log within the two Recent History limits, newest first. With `since`, only the rows
+// completed at or after that time (an incremental query). `latest` is the newest completion time the worker has, which the page sends
+// back as its next `since`.
+function completedAtOf(row) {
+    return Number.parseInt(row?.terminalAt || row?.updatedAt, 10) || 0
+}
+
+// The History page's rows, from the completed-work log, newest first, within the two Recent History limits. With `since` (the newest
+// completion the page has), only the rows completed after it. The log is in completion order, so the walk starts at the newest row and
+// stops at the first row the page already has, and it does nothing at all when the log has not changed since `since`.
+async function getRecentHistoryRequested(request = {}) {
+    const since = Number.parseInt(request.since, 10) || 0
+    if (since > 0 && coordinatorAuthority.residentCompletedLastChangedAt() <= since) return {rows: [], latest: since}
+    const completed = coordinatorAuthority.residentCompleted() || {}
+    const cutoff = recentHistoryRetentionDays > 0 ? Date.now() - recentHistoryRetentionDays * 24 * 60 * 60 * 1000 : 0
+    const floor = Math.max(cutoff, since)
+    const limit = recentHistoryMaxEntries > 0 ? recentHistoryMaxEntries : Number.MAX_SAFE_INTEGER
+    const log = Object.values(completed)
+    const rows = []
+    let latest = 0
+    for (let index = log.length - 1; index >= 0 && rows.length < limit; index -= 1) {
+        const row = log[index]
+        if (!row || typeof row !== 'object') continue
+        const at = completedAtOf(row)
+        if (at < floor) break
+        if (!latest) latest = at
+        rows.push(cloneCoordinatorAuthorityValue(row))
+    }
+    return {rows, latest: latest || since}
+}
+
+// Tells the open pages that Recent History changed. A page that is not open just rejects, which is fine.
+function notifyRecentHistoryChanged() {
+    try {
+        void browser.runtime.sendMessage({action: 'recent-history-changed'}).catch(() => null)
+    }
+    catch(error) {
+        // no extension page is listening
+    }
+}
+
 async function setSpaceNukedPostsRequested(nukedPosts = {}) {
     const persistence = await coordinatorAuthority.persistCoordinator({
         stored: {[SPACE_NUKED_POSTS_KEY]: nukedPosts && typeof nukedPosts === 'object' ? nukedPosts : {}}
@@ -28614,7 +28791,7 @@ async function persistQueuedWorkerActionSurfaceState(windowId = null, anchorTabI
 
     try {
         await new Promise((resolve, reject) => {
-            chromeSession.set({[QUEUED_ACTION_SURFACE_STATE_KEY]: state}, () => {
+            chromeSession.set({[prefixedName(QUEUED_ACTION_SURFACE_STATE_KEY)]: state}, () => {
                 const error = globalThis.chrome?.runtime?.lastError
                 if(error) reject(new Error(error.message || `${error}`))
                 else resolve()
@@ -28639,10 +28816,10 @@ async function clearPersistedQueuedWorkerActionSurfaceState(reason = '') {
                 else resolve()
             }
             if(typeof chromeSession.remove === 'function') {
-                chromeSession.remove([QUEUED_ACTION_SURFACE_STATE_KEY], finish)
+                chromeSession.remove([prefixedName(QUEUED_ACTION_SURFACE_STATE_KEY)], finish)
             }
             else {
-                chromeSession.set({[QUEUED_ACTION_SURFACE_STATE_KEY]: null}, finish)
+                chromeSession.set({[prefixedName(QUEUED_ACTION_SURFACE_STATE_KEY)]: null}, finish)
             }
         })
         return true
@@ -36988,7 +37165,9 @@ registerServiceWorkerListeners({
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
         TARGET_QUEUED_TAB_CONCURRENCY_KEY,
-        WORKER_WINDOW_FOREGROUND_MODE_KEY
+        WORKER_WINDOW_FOREGROUND_MODE_KEY,
+        NUKED_POST_RETENTION_DAYS_KEY,
+        MAX_REMEMBERED_NUKED_POSTS_KEY
     },
     state: {
         coordinatorReconcileScheduler,
@@ -37088,6 +37267,8 @@ registerServiceWorkerListeners({
         reconcileReleasedActiveCoordinatorTab,
         recordCoordinatorJobProgressViaQueueMachine,
         recordDirectProfileProgressFromRequest,
+        recordManualProfileActionRequested,
+        getRecentHistoryRequested,
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
@@ -37122,6 +37303,8 @@ registerServiceWorkerListeners({
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
         setWorkerWindowForegroundMode,
+        setRecentHistoryRetentionDays,
+        setRecentHistoryMaxEntries,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -37165,7 +37348,8 @@ registerServiceWorkerListeners({
             if(saved) profileNukeProgress = {}
             return {cleared: saved ? hrefs.length : 0, saved, reason: persistence?.reason || ''}
         },
-        retireUnusedVersion15StorageKeys
+        retireUnusedVersion15StorageKeys,
+        checkStorageBuild
     }
 })
 
@@ -37178,6 +37362,22 @@ registerServiceWorkerListeners({
 const VERSION_15_RETIRED_STORAGE_KEYS = ['mbCoordinatorQueue', 'mbProfileNukeProgress']
 function retireUnusedVersion15StorageKeys() {
     return metricStorageRemove(VERSION_15_RETIRED_STORAGE_KEYS, {phase: 'retireVersion15StorageKeys'})
+}
+
+// The build that last ran against this storage (STORAGE_BUILD_KEY, the running manifest version, e.g. 1.6.1626). It is read at
+// install and at startup. When it differs from the running build, the upgrade step runs and then the key is written; when it is the
+// same, nothing is written. The browser's own previousVersion is passed through for the record, but the stored build is the
+// authority: it also covers installs made before this key existed and a storage that was erased. No storage migration exists
+// between builds yet, so the upgrade step only records the change. A migration for a build goes there, keyed by the build it
+// upgrades from.
+async function checkStorageBuild({reason = 'startup', previousVersion = ''} = {}) {
+    const current = `${browser.runtime.getManifest?.()?.version || ''}`.trim()
+    if(!current) return {changed: false, previous: '', current: ''}
+    const stored = await metricStorageGet({[STORAGE_BUILD_KEY]: ''}, {phase: 'storageBuildRead'})
+    const previous = `${stored?.[STORAGE_BUILD_KEY] || ''}`.trim()
+    if(previous === current) return {changed: false, previous, current}
+    await metricStorageSet({[STORAGE_BUILD_KEY]: current}, {snapshotWriteReason: 'userMemoryNonAuthority'})
+    return {changed: true, previous, current, reason, previousVersion: `${previousVersion || ''}`.trim()}
 }
 
 // LEGACY QUEUE VIEW RETIREMENT (for archaeologists; the full notes are in historical/LEGACY_QUEUE_VIEW_RETIREMENT.md).
@@ -37205,7 +37405,6 @@ function retireLegacyQueueViewStorageKey() {
 // Rule (20 Oct review, choice a): no code may write any of these names to chrome.storage.local, the disk. Progress is written to
 // session memory under the same names, which the cleanup does not touch. The cleanup is fire-and-forget and takes no lock, so a
 // disk writer of one of these names would race it.
-const LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY = 'mbLegacyContentIndexCleanupV1'
 
 // The marker's one reader and one writer (20 Oct review). Both go through the session area, not through the storage object directly.
 async function readLegacyContentIndexCleanupMarker() {
@@ -37337,6 +37536,7 @@ void scheduleStoredWorkRearmAfterStartupHydrate()
 // above, this doesn't need to wait for that).
 void loadTargetQueuedTabConcurrencyPreference()
 void loadWorkerWindowForegroundModePreference()
+void loadRecentHistoryPreferences()
 void loadCoordinatorWorkSessionFromStorage()
 void loadCoordinatorStatsClearedAtFromStorage()
 void restoreStoredCoordinatorPausedMirror('startup-pause-restore')

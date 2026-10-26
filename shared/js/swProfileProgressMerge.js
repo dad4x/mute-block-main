@@ -519,6 +519,8 @@ function createProfileProgressMerge(deps = {}) {
         let changed = false
 
         for(const [postKey, record] of Object.entries(records || {})) {
+            // A pardon is history: a profile clear does not erase it (swManualHistory.js).
+            if(record?.kind === 'pardon') continue
             const urls = getNormalizedProfileHrefList(record?.urls || [])
             const nextUrls = urls.filter(url => !hrefs.has(url))
             if(nextUrls.length === urls.length) continue

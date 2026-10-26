@@ -1,5 +1,7 @@
 # Shared Moderation Publication Implementation And Test Plan, 2026-05-18
 
+> **Status: ROADMAP** (24 Oct 2026). Implementation plan (18 May). Runtime integration deferred until queue authority is stable. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: supporting implementation plan, runtime integration deferred.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

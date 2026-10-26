@@ -1,0 +1,14 @@
+[2026-10-12T04:50:40.630Z] loaded extension
+[2026-10-12T04:50:41.046Z] owner page open
+[2026-10-12T04:50:43.137Z] phase 1 steady
+[2026-10-12T04:50:44.157Z] burst progress: setMs samples 90
+[2026-10-12T04:50:45.159Z] burst progress: setMs samples 179
+[2026-10-12T04:50:46.174Z] burst progress: setMs samples 271
+[2026-10-12T04:50:47.189Z] burst progress: setMs samples 300
+[2026-10-12T04:50:48.201Z] burst progress: setMs samples 300
+[2026-10-12T04:50:49.203Z] burst progress: setMs samples 300
+[2026-10-12T04:50:50.204Z] burst progress: setMs samples 300
+[2026-10-12T04:50:51.207Z] burst progress: setMs samples 300
+[2026-10-12T04:50:52.218Z] phase 2 late join
+[2026-10-12T04:54:21.712Z] phase 3 sw stop
+[2026-10-12T04:54:26.074Z] phase 4 handover

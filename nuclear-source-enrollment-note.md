@@ -1,5 +1,7 @@
 # Space Classification And Nuclear Workflow Note
 
+> **Status: ROADMAP** (24 Oct 2026). Future space-classification and nuke workflow. Not proposed for immediate work. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: future workflow design context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

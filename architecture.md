@@ -1,10 +1,58 @@
 # Mute Block Architecture
 
-Date: 2026-05-20
+Date: 2026-05-20. Revised 2026-10-24: the current state map below is as built on that date. The older sections keep their own dates.
 
-This is the canonical architecture front door for the active `1.6`/`2.0`
-stabilization line. Use [planning.md](planning.md) for priority and sequencing;
-use this note for the durable model and design constraints.
+This is the canonical architecture front door for the `1.6`/`2.0` stabilization line. Use [planning.md](planning.md) for priority and sequencing, and [docs/notes-register.md](docs/notes-register.md) for the status of each note. This note holds the durable model and the design constraints.
+
+## Current state map (as built, 24 Oct 2026)
+
+Storage is stable for the current in-flight work (owner, 24 Oct). The version and the UI are moving. The facts below were read from the code and the notes on 24 Oct.
+
+| Store | Where it lives | Role | Survives a browser restart | Notes |
+|---|---|---|---|---|
+| Queue rows | Local storage: a write-ahead log in numbered segments, and two checkpoint slots | Durable authority. The worker is the only writer. | Yes | The log is in arrival order. Checkpoints are split by key hash into 10 pieces. The arrival-order option is built but not enabled; see planning.md, "Deferred follow-up". |
+| Terminal history | The completed area of the queue store | Derived, for display and dedupe | Yes | The 10,000-row cap and 90-day retention are the plan's figures. Pruning for history was not re-verified. |
+| Runs | The shared log (since 24 Oct, commit b20be9e) | Derived, for display | Yes | The old bucket layout is still in the code. Its excise is decided (dead-ends review, decision 2). |
+| Progress, per profile | Session storage only: a view and its shards | Derived. Not authority. | No | Decision 27 (not on disk); decision 28 (lost on restart). The shard count is 256 for live progress and 32 for the legacy cleanup. Some 20 Oct notes say 32. |
+| Space post maps (nuked and pending) | Local storage: 32 hash buckets each, layout marker version 2 | Remembered post state | Yes | Writes send only the buckets that changed. |
+| Pending records | Local storage | Candidates waiting for resolution | Yes | Still on disk: 3,368 on the dev profile (18 Oct). The pending-staging design is open. |
+| Content queue index | Memory only, built from the live queue on the first lookup after a change | Derived | No | Old disk copies are removed once at startup (decision 10; legacy cleanup). |
+| Outlier list | Local storage, written with each archive | Setting-like state | Yes | Decision 29. |
+| Flight recorder | A memory ring of 20,000 entries | Diagnostic only | Its snapshot is in session storage | Not replay input, not authority, not a trace file. |
+| Queue bar summary | Pushed by the worker to tabs that asked; no storage | Derived, for display | No | Decisions 9, 15, 24 and 33. |
+
+Session storage in total: about 9.25 MiB against Chrome's 10 MiB session limit, on the dev data. Not measured live. The code has no quota check on session writes (dead-ends review, item 5).
+
+Every store uses the browser's extension storage areas (local and session). No other storage engine is in use. IndexedDB and SQLite were probed on 11 Oct; nothing was adopted, and no work has been done on either (owner, 24 Oct).
+
+Constraints in force:
+
+- The worker is the only writer of queue state. Content and dashboard code request changes by message (see "Content Scripts"; the outside-writer lint).
+- No new disk writes for progress, projections, or queue data. Disk gets log appends, checkpoints, and the legacy removals only (coder instructions, section 1).
+- Storage key names and layout constants live in the storage key module. Timing and cap values live in the tunables file. Wait timeouts live in the timeouts file until it is merged. Colours live in the token file (dead-ends review, Appendix C).
+- One decision core decides row status, retry, and terminal outcome. A new storage representation, or a new terminal writer, needs a recorded reason (see "Single Decision Core").
+- Identity is exact: the case-sensitive NFC slug, with no suffix cut and no trims (see "Profile Identity, Landing And Resolution").
+- Correctness over speed on hydrate, recovery, and startup: prove the state is current rather than trust a cached copy (coder instructions, section 1).
+- No Puppeteer. Live work uses the DevTools protocol, with `bash -lc` command shapes (AGENTS.md).
+- A version bump in `package.json`, `package-lock.json`, `manifests/chrome.json`, and `manifests/firefox.json` before every build, test builds included (AGENTS.md; coder instructions, section 6).
+- No build, version bump, or live run without the owner's go (standing rule).
+- Any new test file is added to `npm test` and to the parallel test runner (coder instructions, section 1).
+- No freeze or lock patterns, and no promise-hop helpers in the worker. Measure a wait with a time check around the await (coder instructions, section 1).
+
+Known tradeoffs and open risks:
+
+- Progress is lost on browser restart (decision 28, accepted). The set of tabs to push to is held in worker memory and is lost on a worker restart (choice K5, accepted).
+- Progress has many in-memory copies: about 30 writer sites in the worker and 10 in the content script. Open; no change now.
+- Session storage is near its limit on the dev data, and has never been measured live.
+- Checkpoints are split by key hash. Whole-piece expiry is deferred (planning.md).
+- Reuse of unchanged checkpoint pieces works on the first checkpoint after a load only. The reader no longer checks piece versions. An older build may not read a checkpoint written with reused pieces. These are the author's own known issues in commit bfbcee5.
+- Clear current work leaves pending records behind. The 18 Oct audit counted 724 orphaned records; this is the likely cause.
+- Recovery B (torn-checkpoint recovery from a worker copy) is parked. The code no longer has it; the change is in commit bfbcee5, and that commit message does not mention it. Owner to confirm.
+- The landing check reads the URL only. The dry-run design is not built.
+- Medium-confidence candidates are queued with no per-candidate check.
+- The legacy queue view is retired, and its key is removed at startup (historical/LEGACY_QUEUE_VIEW_RETIREMENT.md). The other representations under "Known fragmentation points" were not re-checked on 24 Oct.
+- The worker-window focus concern (25 Sep) is still open (see "Queued Worker Action Surface").
+- Shadow checks and the runs gap check add work to the write path. Their removal is decided (dead-ends review, decision 3).
 
 ## Core Authority Model
 
@@ -36,7 +84,7 @@ Canonical decision core: [jobState.js](shared/js/jobState.js)'s
 `reduceJobEvent`, plus the `swQueueMachine*` dispatcher
 (`swQueueMachineDispatcher.js`, `swQueueMachineEvents.js`,
 `swQueueMachineHandlers.js`) that applies its output. This is what
-[top-level-rethink-1.5.md](top-level-rethink-1.5.md)'s "First Implementation
+[top-level-rethink-1.5.md](historical/top-level-rethink-1.5.md)'s "First Implementation
 Candidate" called for, and it exists and is tested (`test/jobState.test.js`).
 Converged means: every place that decides a row's status, retry eligibility,
 or terminal classification does so by constructing a `JOB_EVENT_*` and calling
@@ -44,7 +92,7 @@ or terminal classification does so by constructing a `JOB_EVENT_*` and calling
 on `item.milestones`/`item.status`/attempt counters inline.
 
 This is a stricter bar than the `sw.js` decomposition effort in
-[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md).
+[sw-state-machine-decomposition-plan-2026-09-01.md](historical/sw-state-machine-decomposition-plan-2026-09-01.md).
 That plan extracts each large orchestrator's inline decision spans into named
 `decide*` sync functions and moves them into their own modules -- valuable for
 readability and unit-testing, but by itself it produces one local decider per
@@ -382,8 +430,14 @@ committed segment. Extra orphan segment keys that are not committed by the
 manifest are ignored. Covered old-generation segment keys are retired only
 after the new checkpoint generation switch is durable. Remaining work is
 reducing compatibility mirrors and shrinking old progress/runs materialization.
+
+Status, 24 Oct: progress is held in session memory only (decision 31). Runs are
+stored as change records in the shared log (commit `b20be9e`). The checkpoint
+pieces are still split by key hash. Moving them to arrival order is deferred;
+see planning.md, "Deferred follow-up: WAL-order storage".
+
 See
-[queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md).
+[queue-wal-segmented-record-followup-2026-05-27.md](historical/queue-wal-segmented-record-followup-2026-05-27.md).
 
 Terminology: older code, metrics, and notes may still say `compaction`. In the
 architecture, read that as checkpoint generation switching plus later
@@ -437,6 +491,10 @@ far" or "recompute onto a seed read moments ago" pattern touching a durable
 key deserves the same scrutiny, especially wherever the read and the eventual
 write are separated by an `await`.
 
+Status, 24 Oct: runs are now stored as change records in the shared log (commit
+`b20be9e`). Whether the stored count fields are still written back, and so
+whether this race still applies, was not re-checked.
+
 ### Stored Work Clear (as built, 15 Oct 2026)
 
 `mutateCoordinatorStoredWorkClear` builds its plan with
@@ -471,7 +529,7 @@ old harness's extra microtask ticks had been masking -- confirmed via A/B
 (the bug reproduced with the realm fix in place and did not reproduce
 without it, against identical `sw.js` logic) before being fixed
 separately. See
-[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md)'s
+[sw-state-machine-decomposition-plan-2026-09-01.md](historical/sw-state-machine-decomposition-plan-2026-09-01.md)'s
 "Phase 0" section for the full design and rollout history. The
 constraint described below no longer applies to new extractions -- an
 `async` function, or one that builds/chains a Promise into another
@@ -567,13 +625,14 @@ UI state, but they do not persist service-worker queue/progress authority.
 
 ## Profile Identity, Landing And Resolution
 
-Status: as built, 15 Oct 2026. The changes are in the working tree on
-`review/shared-wip` (HEAD `abc2307`) and are not committed. They close the
+Status: as built, 15 Oct 2026. The changes were in the working tree on
+`review/shared-wip` (HEAD `abc2307`) on 15 Oct. Whether each one is in HEAD now
+was not re-checked on 24 Oct. They close the
 owner rules from the 14 and 15 Oct reviews. The record is
-[14-oct-review-3-reply.md](14-oct-review-3-reply.md), sections 7 to 10. The
-reviewer responses are [14-oct-review-5.md](14-oct-review-5.md),
-[14-oct-review-5-response.md](14-oct-review-5-response.md) and
-[14-oct-review-5-response-2.md](14-oct-review-5-response-2.md).
+[14-oct-review-3-reply.md](historical/14-oct-review-3-reply.md), sections 7 to 10. The
+reviewer responses are [14-oct-review-5.md](historical/14-oct-review-5.md),
+[14-oct-review-5-response.md](historical/14-oct-review-5-response.md) and
+[14-oct-review-5-response-2.md](historical/14-oct-review-5-response-2.md).
 
 ### Identity rule
 
@@ -717,9 +776,9 @@ The service worker should also keep a bounded in-memory diagnostic journal,
 called the flight recorder. It records compact summaries of authority
 mutations, WAL/storage outcomes, scheduler decisions, page observations, and
 UI controls activated. The flight recorder is remotely probeable for failure
-analysis, but it is not persisted, not replay input, not authority, and not a
-trace file. See
-[flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md).
+analysis. Its newest 2,000 entries are also written to session storage, at most
+every ten seconds. It is not replay input, not authority, and not a trace file. See
+[flight-recorder-plan-2026-06-04.md](historical/flight-recorder-plan-2026-06-04.md).
 
 ### Live-run checks (as built, 15 Oct 2026)
 
@@ -761,24 +820,27 @@ Tests should exercise state snapshots directly:
 
 ## Supporting Architecture Notes
 
+Status of each note is in [docs/notes-register.md](docs/notes-register.md). The
+notes below are CURRENT, NEAR, ROADMAP, or HISTORICAL, as the register says.
+
 - [normal-reconcile.txt](normal-reconcile.txt): latest reconcile-first
   implementation framing.
-- [reconciler-first-fallback-architecture-2026-05-20.md](reconciler-first-fallback-architecture-2026-05-20.md):
+- [reconciler-first-fallback-architecture-2026-05-20.md](historical/reconciler-first-fallback-architecture-2026-05-20.md):
   detailed rationale and pivot criteria.
-- [storage-authority-refactor-plan-for-review-2026-05-20.md](storage-authority-refactor-plan-for-review-2026-05-20.md):
+- [storage-authority-refactor-plan-for-review-2026-05-20.md](historical/storage-authority-refactor-plan-for-review-2026-05-20.md):
   storage authority cleanup plan.
-- [storage-wal-overlay-design-2026-05-20.md](storage-wal-overlay-design-2026-05-20.md):
+- [storage-wal-overlay-design-2026-05-20.md](historical/storage-wal-overlay-design-2026-05-20.md):
   WAL/checkpoint design.
-- [queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md):
+- [queue-wal-segmented-record-followup-2026-05-27.md](historical/queue-wal-segmented-record-followup-2026-05-27.md):
   physical WAL segmentation follow-up.
-- [flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md):
+- [flight-recorder-plan-2026-06-04.md](historical/flight-recorder-plan-2026-06-04.md):
   bounded in-memory diagnostic journal for authority, scheduler, page
   observation, and UI action evidence.
 - [shared-moderation-publication-design-2026-05-18.md](shared-moderation-publication-design-2026-05-18.md):
   shared moderation design.
-- [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable
+- [top-level-rethink-1.5.md](historical/top-level-rethink-1.5.md): historical durable
   job model that informed the current line.
-- [sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md):
+- [sw-state-machine-decomposition-plan-2026-09-01.md](historical/sw-state-machine-decomposition-plan-2026-09-01.md):
   plan for splitting `sw.js`'s remaining decide/act spans into modules. As of
   2026-09-17, redirected by that plan's "Part 3" section to converge into the
   single decision core above rather than stop at one `decide*` module per

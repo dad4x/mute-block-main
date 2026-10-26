@@ -1,0 +1,84 @@
+{
+  "outcomes": [
+    {
+      "trial": 1,
+      "delayMs": 6,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 88,
+      "reopenError": null
+    },
+    {
+      "trial": 2,
+      "delayMs": 2,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 85,
+      "reopenError": null
+    },
+    {
+      "trial": 3,
+      "delayMs": 2,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 91,
+      "reopenError": null
+    },
+    {
+      "trial": 4,
+      "delayMs": 9,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 94,
+      "reopenError": null
+    },
+    {
+      "trial": 5,
+      "delayMs": 6,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 87,
+      "reopenError": null
+    },
+    {
+      "trial": 6,
+      "delayMs": 13,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 88,
+      "reopenError": null
+    },
+    {
+      "trial": 7,
+      "delayMs": 9,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 83,
+      "reopenError": null
+    },
+    {
+      "trial": 8,
+      "delayMs": 3,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 91,
+      "reopenError": null
+    },
+    {
+      "trial": 9,
+      "delayMs": 6,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 94,
+      "reopenError": null
+    },
+    {
+      "trial": 10,
+      "delayMs": 8,
+      "reopenOk": true,
+      "reopenAttempts": 1,
+      "reopenElapsedMs": 87,
+      "reopenError": null
+    }
+  ]
+}

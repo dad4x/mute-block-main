@@ -1,5 +1,7 @@
 # User Note
 
+> **Status: ROADMAP** (24 Oct 2026). Intent: profile search stays usable while work for the same search is pending. Parked UI item, not started. Dated sections; the newest wins. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: local explanatory note.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

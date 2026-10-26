@@ -1,3 +1,5 @@
+const {namespaceArea} = require('./storageNamespace')
+
 // Browser-session marker and Quora-runtime-activation tracking extracted
 // from sw.js (decomposition Slice 7). This is the "has this service worker
 // observed the browser session before, and has it seen a live Quora tab
@@ -98,12 +100,12 @@ function createBrowserSessionRuntime(deps = {}) {
     } = deps.state || {}
 
     function getBrowserSessionStorageArea() {
-        if(browser.storage?.session) return browser.storage.session
+        if(browser.storage?.session) return namespaceArea(browser.storage.session)
 
         const chromeSession = globalThis.chrome?.storage?.session || null
         if(!chromeSession) return null
 
-        return {
+        return namespaceArea({
             get(defaults = {}) {
                 return new Promise((resolve, reject) => {
                     chromeSession.get(defaults, result => {
@@ -128,7 +130,7 @@ function createBrowserSessionRuntime(deps = {}) {
                     })
                 })
             }
-        }
+        })
     }
 
     function hasBrowserSessionStorage() {

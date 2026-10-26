@@ -1,5 +1,7 @@
 # Space page: redraw plan (24 Oct 2026)
 
+> **Status: NEAR** (24 Oct 2026). Four-stage plan for space-page redraws (24 Oct). Stage 1 is marked this build and may be in progress in another session. Owner to confirm. Agreed or in progress. Check planning.md for the order. Register: [notes register](docs/notes-register.md).
+
 ## Problem
 
 Each redraw of the space page re-reads the feed: it finds the posts in view, reads their

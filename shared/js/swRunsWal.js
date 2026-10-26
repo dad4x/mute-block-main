@@ -7,7 +7,7 @@
 
 const RUN_AREA = 'runs'
 const RUN_LIST_FIELDS = Object.freeze(['sourcePages', 'targetProfileHrefs', 'targetWorkKeys'])
-const RUN_SCALAR_FIELDS = Object.freeze(['sourceType', 'createdAt', 'paused'])
+const RUN_SCALAR_FIELDS = Object.freeze(['sourceType', 'createdAt', 'paused', 'runShard'])
 
 function cleanRunValue(value) {
     return typeof value === 'string' ? value.trim() : ''
@@ -78,7 +78,11 @@ function runsChangeRecords(before = {}, after = {}) {
     return records
 }
 
+// The run cap: the most runs the log keeps (hardcoded: a week at 100 runs a day). The cap drops whole run shards, oldest first (swRunShards.js).
+const RUN_RETENTION_MAX_COUNT = 700
+
 module.exports = {
+    RUN_RETENTION_MAX_COUNT,
     RUN_AREA,
     RUN_LIST_FIELDS,
     RUN_SCALAR_FIELDS,

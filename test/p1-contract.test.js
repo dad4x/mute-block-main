@@ -152,6 +152,7 @@ function loadDashboardHarness() {
             if(name === './defaults') return require(path.join(__dirname, '..', 'shared/js/defaults'))
             if(name === './tunables') return require(path.join(__dirname, '..', 'shared/js/tunables'))
             if(name === './storageKeys') return require(path.join(__dirname, '..', 'shared/js/storageKeys'))
+            if(name === './storageNamespace') return require(path.join(__dirname, '..', 'shared/js/storageNamespace'))
             if(name === './spaceMapStorage') return require(path.join(__dirname, '..', 'shared/js/spaceMapStorage'))
             if(name === './muteBlockHelp') return require(path.join(__dirname, '..', 'shared/js/muteBlockHelp'))
             // The dashboard's footer bar is built by this module; the contract tests do not draw it.
@@ -401,6 +402,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'get-debug-resume-limit-status',
         'get-coordinator-why-not-running',
         'get-owned-nuke-status',
+        'get-recent-history',
         'heartbeat-action-lease',
         'open-coordinator',
         'open-coordinator-history',
@@ -409,6 +411,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'promote-queued-tab',
         'reconcile-coordinator-storage',
         'record-direct-profile-progress',
+        'record-manual-profile-action',
         'record-initial-blocked-state',
         'record-page-event',
         'record-job-milestone',
@@ -1705,7 +1708,7 @@ test('dev mode toggle hides the internal-audience panels by default and persists
     const isEnabledBody = extractFunction(dashboard, 'function isDevModeStoredEnabled()')
     assert.match(isEnabledBody, /return devModeStoredEnabled/)
     const loadEnabledBody = extractFunction(dashboard, 'async function loadDevModeStoredEnabled()')
-    assert.match(loadEnabledBody, /browser\.storage\.local\.get\(\{\[DEV_MODE_SYNC_STORAGE_KEY\]: false\}\)/)
+    assert.match(loadEnabledBody, /namespaceArea\(browser\.storage\.local\)\.get\(\{\[DEV_MODE_SYNC_STORAGE_KEY\]: false\}\)/)
     const setEnabledBody = extractFunction(dashboard, 'function setDevModeStoredEnabled(enabled)')
     assert.match(setEnabledBody, /action: 'set-dev-mode-enabled'/)
     assert.doesNotMatch(setEnabledBody, /browser\.storage/)
@@ -2071,8 +2074,8 @@ test('content-page scoped state projections are maintained beside full queue and
     const rebuildBody = extractFunction(sw, "async function rebuildContentPageStateProjectionFromCurrentState(reason = 'missing')")
     const repairBody = extractFunction(sw, 'function repairProfileProgressProjection(options = {})')
 
-    assert.match(sw, /COORDINATOR_CONTENT_QUEUE_INDEX_KEY = 'mbCoordinatorContentQueueIndex'/)
-    assert.match(sw, /COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX = 'mbCoordinatorContentSourceIndex\.'/)
+    assert.match(readRepoFile('shared/js/storageKeys.js'), /COORDINATOR_CONTENT_QUEUE_INDEX_KEY: 'mbCoordinatorContentQueueIndex'/)
+    assert.match(readRepoFile('shared/js/storageKeys.js'), /COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX: 'mbCoordinatorContentSourceIndex\.'/)
     assert.match(readRepoFile('shared/js/storageKeys.js'), /PROFILE_NUKE_PROGRESS_VIEW_KEY: 'mbProfileNukeProgressView'/)
     assert.match(readRepoFile('shared/js/storageKeys.js'), /PROFILE_NUKE_PROGRESS_SHARD_PREFIX: 'mbProfileNukeProgressShard\.'/)
     assert.doesNotMatch(sw, /const PROFILE_NUKE_PROGRESS_SHARD_PREFIX =/)
@@ -2182,12 +2185,12 @@ test('service worker local storage goes through production adapter seam', () => 
     const metricSetBody = extractFunction(source, 'async function metricStorageSet(payload = {}, options = {})')
     const suppressBody = extractFunction(storageSource, 'function suppressAbandonedStorageOperation(operation = \'storage\')')
     const nonAdapterSource = source.replace(
-        /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/,
+        /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => namespaceArea\(browser\.storage\.local\)\)/,
         ''
     )
 
     // The one raw adapter is wrapped by the guard the erase closes, and every local write goes through the wrapper.
-    assert.match(source, /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => browser\.storage\.local\)/)
+    assert.match(source, /const rawCoordinatorStorageAdapter = createChromeLocalStorageAdapter\(\(\) => namespaceArea\(browser\.storage\.local\)\)/)
     assert.match(source, /const coordinatorStorageAdapter = \{\n    get: defaults => rawCoordinatorStorageAdapter\.get\(defaults\),\n    set: payload => getStorageWriteRefusal\(\) \|\| rawCoordinatorStorageAdapter\.set\(payload\)/)
     assert.match(adapterBody, /getStorageArea\(\)\.get\(defaults\)/)
     assert.match(adapterBody, /getStorageArea\(\)\.set\(payload\)/)

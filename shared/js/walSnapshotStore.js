@@ -417,6 +417,19 @@ function getSegmentedWalCheckpointShardKey(baseKey = 'wal', checkpointId = CHECK
     return `${getSegmentedWalCheckpointKey(baseKey, checkpointId)}.s${`${index}`.padStart(2, '0')}`
 }
 
+// Step 4: an arrival checkpoint names its shards by id, and the ids need not be 0 to n-1. A read that takes shard indexes 0 to n-1
+// misses the rest, so this names the shard keys that the manifest lists and the stored copy lacks. Its ids are the ones the manifest
+// gives, and the shard identity check still verifies each one against the manifest. A hash checkpoint needs none: its ids are the
+// range the caller already reads.
+function getArrivalShardKeysMissingFromStored(stored = {}, baseKey = 'wal', checkpointId = CHECKPOINT_A) {
+    const manifest = stored?.[getSegmentedWalCheckpointKey(baseKey, checkpointId)] || null
+    if (!manifest || manifest.format !== CHECKPOINT_SHARD_FORMAT) return []
+    if (getCheckpointPartition(manifest) !== CHECKPOINT_PARTITION_ARRIVAL) return []
+    return getCheckpointShardIds(manifest)
+        .map(index => getSegmentedWalCheckpointShardKey(baseKey, checkpointId, index))
+        .filter(key => !Object.prototype.hasOwnProperty.call(stored, key))
+}
+
 function getSegmentedWalCheckpointShardKeys(baseKey = 'wal', checkpointId = CHECKPOINT_A, shardCount = CHECKPOINT_SHARD_DEFAULT_COUNT) {
     const count = normalizeCheckpointShardCount(shardCount)
     return Array.from({length: count}, (_, index) => getSegmentedWalCheckpointShardKey(baseKey, checkpointId, index))
@@ -1155,10 +1168,15 @@ function buildSegmentedWalStoragePayload(store = {}, options = {}) {
                 payload[getSegmentedWalCheckpointKey(baseKey, id)] = getCheckpointManifest(checkpoint)
                 // The write plan from writeInactiveCheckpoint names the shards of one slot that are already in storage. The payload leaves
                 // them out. A plan for the other slot, or none, writes every shard.
-                const skipped = new Set(options.writePlan?.generationId === id ? options.writePlan.skipShardIndexes : [])
+                const planned = options.writePlan?.generationId === id ? options.writePlan : null
+                const skipped = new Set(planned ? planned.skipShardIndexes : [])
                 for(const shard of checkpoint.shards || []) {
                     if (skipped.has(shard.index)) continue
                     payload[getSegmentedWalCheckpointShardKey(baseKey, id, shard.index)] = getCheckpointShardRecord(checkpoint, shard)
+                }
+                // Step 3: the shard indices the new manifest no longer lists are cleared in this payload (see writeInactiveCheckpoint).
+                for(const index of planned?.removeShardIndexes || []) {
+                    payload[getSegmentedWalCheckpointShardKey(baseKey, id, index)] = null
                 }
             }
             else {
@@ -1340,15 +1358,24 @@ function writeInactiveCheckpoint(store = {}, state = {}, options = {}) {
     // is in that list is left out of the payload, because storage already has it. The plan is returned, not stored on the checkpoint, so
     // it cannot reach storage or a later write. The caller passes it on as writePlan and does not read it. No reuse while a switch is in
     // progress.
+    // Step 3: a shard index that storage holds for the slot but the new manifest does not list is cleared in the same payload, so the
+    // slot keeps no shard the manifest does not name. It is cleared with a null value, not removed, because a removal would look like
+    // the shard keys going away, which forgets both slots. Only the remembered indices are cleared: when the slot's contents are not
+    // known, nothing is cleared.
     const skipShardIndexes = []
+    const removeShardIndexes = []
     const remembered = options.rememberedSlots?.[inactive] || null
     if (Array.isArray(remembered) && checkpoint.format === CHECKPOINT_SHARD_FORMAT && !nextStore.meta?.checkpointSwitch?.inProgress) {
         const rememberedHashes = new Map(remembered.map(shard => [shard.index, shard.shardStateHash]))
+        const listedIndexes = new Set(checkpoint.shards.map(shard => shard.index))
         for (const shard of checkpoint.shards) {
             if (rememberedHashes.has(shard.index) && rememberedHashes.get(shard.index) === shard.shardStateHash) skipShardIndexes.push(shard.index)
         }
+        for (const shard of remembered) {
+            if (!listedIndexes.has(shard.index)) removeShardIndexes.push(shard.index)
+        }
     }
-    const writePlan = {generationId: inactive, skipShardIndexes}
+    const writePlan = {generationId: inactive, skipShardIndexes, removeShardIndexes}
     nextStore.checkpoints[inactive] = checkpoint
     nextStore.wal = {
         ...(nextStore.wal || {}),
@@ -1749,6 +1776,7 @@ module.exports = {
     ARRIVAL_KEYED_READ_REFUSED,
     getSegmentedWalCheckpointShardKey,
     getSegmentedWalCheckpointShardKeys,
+    getArrivalShardKeysMissingFromStored,
     makeShardedCheckpoint,
     mergeCheckpointShardStates,
     partitionCheckpointState,
