@@ -1508,7 +1508,8 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.doesNotMatch(dashboard, /Enable Retry Soft-Fails/)
     // Capability kept (no button): toggle and the storage key stay.
     assert.match(dashboard, /async function toggleRetryFailed\(\)/)
-    assert.match(dashboard, /\[COORDINATOR_RETRY_FAILED_ENABLED_KEY\]: true/)
+    assert.match(dashboard, /action: 'set-coordinator-retry-failed-enabled', enabled: true/)
+    assert.match(dashboard, /COORDINATOR_RETRY_FAILED_ENABLED_KEY/)
     assert.doesNotMatch(dashboard, /eligible \/ \$\{failedCount\} failed/)
     assert.doesNotMatch(dashboard, /button\.textContent = 'Idle Retry'/)
     assert.match(css, /grid-template-rows: auto auto;/)
@@ -4833,7 +4834,8 @@ test('choosing a collect count starts the collect at once, on both pages', () =>
 test('every extension button has hover help that starts with "Mute Block extension: "', () => {
     const pageHtml = readRepoFile('shared/coordinator.html') + readRepoFile('shared/preferences.html')
     const buttonTags = pageHtml.match(/<button\b[^>]*>/g) || []
-    assert.ok(buttonTags.length >= 45, `expected at least 45 buttons in the pages, found ${buttonTags.length}`)
+    // 40 after the Cancel Queue, Requeue, soft-fail toggle and Authority reads panel removals (was 45).
+    assert.ok(buttonTags.length >= 40, `expected at least 40 buttons in the pages, found ${buttonTags.length}`)
     for(const tag of buttonTags) assert.match(tag, /\stitle="Mute Block extension: [^"]+"/, tag)
 
     assert.match(readRepoFile('shared/js/muteBlockHelp.js'), /const MUTE_BLOCK_HELP_PREFIX = 'Mute Block extension: '/)
