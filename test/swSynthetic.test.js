@@ -5313,10 +5313,11 @@ test('row event persists queue only for nonterminal durable status changes', asy
         (after['storagePayload.read.queue.calls'] || 0) -
             (before['storagePayload.read.queue.calls'] || 0) <= 1
     )
+    // The runs are log records (24 Oct): a row event reads no runs key from disk.
     assert.equal(
         (after['storagePayload.read.runs.calls'] || 0) -
             (before['storagePayload.read.runs.calls'] || 0),
-        1
+        0
     )
     assert.equal(after['rowEvent.queued-progress-milestone.queueChanged'] || 0, 1)
     assert.equal(after['rowEvent.queued-progress-milestone.queueSnapshotSkipped'] || 0, 0)
@@ -16300,10 +16301,10 @@ test('coordinator authority hydrates resident projection without storage writes'
     // Hydrate decodes the events with the rest of the state (they are not mirrored, so they come from the one full read).
     assert.deepEqual(current.events, [], 'events are not held in the authority; they are in the flight recorder')
     const hydrateDefaults = findStorageGetDefaults(getDefaults, [
-        'mbCoordinatorQueueWal',
-        'mbCoordinatorRuns'
+        'mbCoordinatorQueueWal'
     ])
     assert.ok(hydrateDefaults)
+    assert.equal(hasStorageDefault(hydrateDefaults, 'mbCoordinatorRuns'), false, 'no runs key is read from disk: the runs are log records')
     // Decision 31: the progress copy is read from session storage, in the same call as the mirror's meta, and never from disk.
     assert.ok(findStorageGetDefaults(sessionGetDefaults, ['mbProfileNukeProgressView', getProgressShardKey(href), 'mbCoordinatorQueueWal.meta']))
     assert.equal(getDefaults.some(defaults => hasStorageDefault(defaults, 'mbProfileNukeProgressView')), false, 'no progress view is read from disk')
@@ -22801,7 +22802,6 @@ test('reconcile does not materialize projection-only queued progress as queue au
     assert.equal(getProgressShardRecord(storage, href).status, 'queued')
     const reconcileLoadDefaults = findStorageGetDefaults(getDefaults, [
         'mbCoordinatorQueueWal',
-        'mbCoordinatorRuns',
         'mbCoordinatorPaused',
         'mbSpacePendingNukedPosts',
         'mbSpaceNukedPosts'
@@ -34707,16 +34707,17 @@ test('queued tab active transition does not carry executor authority state acros
         // the caller's already-fetched copy and never re-request it), so that
         // key alone no longer distinguishes a full authority-projection
         // reload from this function's narrower meta+checkpoints+segments
-        // read. A genuine full projection reload also always requests
-        // COORDINATOR_RUNS_KEY ('mbCoordinatorRuns') alongside the WAL
-        // defaults (see loadCoordinatorCurrentAuthorityState and its
-        // siblings); the atomic WAL read never does. That combination is
-        // what this test actually cares about: confirmQueuedTabOpenDurableActiveEffect
-        // must not re-load the whole authority projection.
+        // read. A genuine full projection reload also always requests the
+        // space post keys ('mbSpaceNukedPosts') alongside the WAL defaults
+        // (see loadCoordinatorCurrentAuthorityState; runs are log records and
+        // are not read from a key, 24 Oct); the atomic WAL read never does.
+        // That combination is what this test actually cares about:
+        // confirmQueuedTabOpenDurableActiveEffect must not re-load the whole
+        // authority projection.
         if(defaults &&
             !Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueue') &&
             Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorQueueWal.meta') &&
-            Object.prototype.hasOwnProperty.call(defaults, 'mbCoordinatorRuns')) {
+            Object.prototype.hasOwnProperty.call(defaults, 'mbSpaceNukedPosts')) {
             fullAuthorityReads += 1
         }
         return originalGet(defaults)
@@ -44803,6 +44804,110 @@ test('runs-switch case 2: a run written after a checkpoint switch is there after
         restarted.sw.coordinatorAuthority.current().runs[runId],
         'the run written after the switch is in the runs after a restart'
     )
+})
+
+// Run time shards (25 Oct; shared/js/swRunShards.js). A run's shard is the day of its creation, and the retention drops whole days.
+const RUN_DAY_MS = 24 * 60 * 60 * 1000
+const RUN_DAY_SPAN_TEST_ID = 'run-time-shard'
+
+function activeCheckpointShardIndexes(store = null) {
+    const active = store?.meta?.activeCheckpoint
+    return (store?.checkpoints?.[active]?.shards || []).map(shard => shard.index)
+}
+
+// `perDay` runs for each of `days` days, ending today. Day k (0 is the oldest) is created at todayStart - (days - 1 - k) days plus a
+// small offset, so each day is one time shard whose index is todayStart / day plus k minus (days - 1).
+function makeDailyRunsForDoor(href, days, perDay, todayStartMs, idsOfOldestDay = []) {
+    const runs = {}
+    for (let day = 0; day < days; day += 1) {
+        for (let index = 0; index < perDay; index += 1) {
+            const id = day === 0 && idsOfOldestDay[index] ? idsOfOldestDay[index] : `${RUN_DAY_SPAN_TEST_ID}-${day}-${index}`
+            const createdAt = todayStartMs - (days - 1 - day) * RUN_DAY_MS + 1000 + index
+            runs[id] = {...makeCoordinatorRun({href, runId: id}), createdAt}
+        }
+    }
+    return runs
+}
+
+test('runs get a time shard from the day of their creation, through the write door', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Run-Time-Shard-Stamp'
+    const runId = 'run-time-shard-stamp-a'
+    const {sw} = await startNamespaceMirrorHarness(href, runId)
+    const todayStart = Math.floor(Date.now() / RUN_DAY_MS) * RUN_DAY_MS
+    const runsWritten = {
+        [runId]: {...makeCoordinatorRun({href, runId}), createdAt: todayStart - 3 * RUN_DAY_MS + 5},
+        'run-time-shard-stamp-b': {...makeCoordinatorRun({href, runId: 'run-time-shard-stamp-b'}), createdAt: todayStart + 10}
+    }
+    const saved = await writeRunsThroughDoor(sw, runsWritten)
+    assert.equal(saved.saved, true, saved.reason)
+    const runs = sw.coordinatorAuthority.current().runs
+    assert.equal(runs[runId].runShard, todayStart / RUN_DAY_MS - 3, 'a run three days old takes the shard of its day')
+    assert.equal(runs['run-time-shard-stamp-b'].runShard, todayStart / RUN_DAY_MS, 'a run created today takes today\'s shard')
+})
+
+test('a checkpoint switch partitions the runs by their time shard: each day is a checkpoint shard of its own', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Run-Time-Shard-Partition'
+    const runId = 'run-time-shard-partition-a'
+    const {sw, browser} = await startNamespaceMirrorHarness(href, runId)
+    const todayStart = Math.floor(Date.now() / RUN_DAY_MS) * RUN_DAY_MS
+    const runsWritten = makeDailyRunsForDoor(href, 3, 2, todayStart)
+    const saved = await writeRunsThroughDoor(sw, runsWritten)
+    assert.equal(saved.saved, true, saved.reason)
+
+    const switched = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(switched.checkpointSwitched, true, switched.reason)
+    const shardIndexes = activeCheckpointShardIndexes(sw.coordinatorAuthority.residentStored()['mbCoordinatorQueueWal'])
+    const dayShardIds = [0, 1, 2].map(day => todayStart / RUN_DAY_MS - (2 - day))
+    for (const shardId of dayShardIds) {
+        assert.ok(shardIndexes.includes(shardId), `the checkpoint has a shard for run day ${shardId}`)
+    }
+
+    const restarted = loadServiceWorkerHarness({now: 600010, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    const restartedRuns = restarted.sw.coordinatorAuthority.current().runs
+    for (const runId of Object.keys(runsWritten)) assert.ok(restartedRuns[runId], `the restart shows run ${runId}`)
+    assert.equal(restartedRuns['run-time-shard-2-1']?.runShard, todayStart / RUN_DAY_MS, 'the newest day keeps its shard across the restart')
+})
+
+test('over the run cap, the oldest whole time shard goes in the write that passes the cap, and a restart shows the same runs', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Run-Time-Shard-Cap'
+    const runId = 'run-time-shard-cap-a'
+    const {sw, browser} = await startNamespaceMirrorHarness(href, runId)
+    const todayStart = Math.floor(Date.now() / RUN_DAY_MS) * RUN_DAY_MS
+    // Eight days of 100 runs: 800 runs, over the cap of 700 by one day. The oldest day goes whole.
+    const runsWritten = makeDailyRunsForDoor(href, 8, 100, todayStart)
+    const saved = await writeRunsThroughDoor(sw, runsWritten)
+    assert.equal(saved.saved, true, saved.reason)
+
+    // The fixture's queue row has a run that is not logged, so the resident map also shows that run as derived. The cap counts the logged runs.
+    const logged = runs => Object.keys(runs).filter(id => id !== 'run-namespace-fixture')
+    const kept = sw.coordinatorAuthority.current().runs
+    assert.equal(logged(kept).length, 700, 'the count is at the cap')
+    assert.equal(logged(kept).filter(id => id.includes('-0-')).length, 0, 'the oldest day is gone whole')
+    assert.equal(logged(kept).filter(id => id.includes('-1-')).length, 100, 'the next day is kept whole')
+
+    const restarted = loadServiceWorkerHarness({now: 600010, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.deepEqual(logged(restarted.sw.coordinatorAuthority.current().runs).sort(), logged(kept).sort(), 'the restart shows the same runs')
+})
+
+test('over the run cap, a time shard that holds a run a queue row refers to is kept, and the next oldest day goes', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Run-Time-Shard-Referenced'
+    const runId = 'run-namespace-fixture'
+    const {sw} = await startNamespaceMirrorHarness(href, runId)
+    const todayStart = Math.floor(Date.now() / RUN_DAY_MS) * RUN_DAY_MS
+    // The queue row of the fixture refers to 'run-namespace-fixture', and that run is in the oldest day, so the day holds a referenced
+    // run. The fixture's run is only derived in memory (it is not logged), so its shard is given by the caller's copy.
+    const runsWritten = makeDailyRunsForDoor(href, 8, 100, todayStart, ['run-namespace-fixture'])
+    runsWritten['run-namespace-fixture'].runShard = todayStart / RUN_DAY_MS - 7
+    const saved = await writeRunsThroughDoor(sw, runsWritten)
+    assert.equal(saved.saved, true, saved.reason)
+
+    const kept = sw.coordinatorAuthority.current().runs
+    assert.equal(Object.keys(kept).length, 700)
+    assert.ok(kept['run-namespace-fixture'], 'the referenced run stays, with its oldest day')
+    assert.equal(Object.keys(kept).filter(id => id.includes('-1-')).length, 0, 'the second oldest day goes whole')
+    assert.equal(Object.keys(kept).filter(id => id.includes('-2-')).length, 100, 'the third day is kept')
 })
 
 ;

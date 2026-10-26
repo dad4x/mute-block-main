@@ -73,8 +73,8 @@ module.exports = {
     // pass without waiting, and the tab removal that frees the window refills at once. Off in the comparison run that showed the
     // handoff summary worse with a wait; this is a skip, not a wait, and needs its own measurement run.
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED: true,
-    // Cadence of the run-list gap check (B15a diagnostic): how often the resident run list is compared with the run buckets on disk.
-    RUNS_GAP_WATCH_INTERVAL_MS: 30000,
+    // Cadence of the store-size sample taken during a timed run (sw.js startStoreSizeWatch).
+    STORE_SIZE_WATCH_INTERVAL_MS: 30000,
     // Wait between reads of the profile menu for its block or unblock item, in ms (the page script). The first read is at once. A fixed
     // 500 ms was measured against an escalating schedule (22 Oct): no difference in blocks, handoff or gaps, so the simpler fixed wait stays.
     PROFILE_MENU_POLL_INTERVAL_MS: 500,
