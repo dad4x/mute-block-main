@@ -1845,6 +1845,7 @@ const {
     getCoordinatorItemSettlementKey,
     getCoordinatorTerminalItemEntries,
     settleConfirmedSpaceFeedProfiles,
+    removeClearedRowsFromPendingSpaceRecords,
     scheduleTerminalOwnedProfileTabCleanup,
     buildTerminalCoordinatorSettlementDerivedPayload
 } = coordinatorTerminalSettlement
@@ -26929,13 +26930,37 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
         return {clearedUrls: [], clearedWorkKeys: [], ownedTabIds: []}
     }
 
+    // The pending space-feed records that belong to the cleared work are deleted in this same write as the queue removal (owner decision,
+    // 25 Oct). The profiles are the hrefs of the cleared live rows and of the cleared completed rows. A record that keeps profiles outside
+    // the cleared work stays, with only the cleared profiles removed. Runs inside the space-feed queue, like the other pending writers.
+    const pendingStored = await readResidentCoordinatorStored({[SPACE_PENDING_NUKED_POSTS_KEY]: {}})
+    const clearedPendingHrefs = [...removedRows, ...removedCompletedRows].map(row => (
+        getCoordinatorItemHref(row.previousRow) || normalizeQuoraProfileUrl(row.rowKey)
+    ))
+    const pendingClear = removeClearedRowsFromPendingSpaceRecords(
+        pendingStored?.[SPACE_PENDING_NUKED_POSTS_KEY] || {},
+        clearedPendingHrefs
+    )
+    const pendingChange = pendingClear.changed
+        ? {
+            stored: {[SPACE_PENDING_NUKED_POSTS_KEY]: pendingClear.nextPending},
+            storageOptions: {
+                snapshotWriteReason: 'ordinaryMutation',
+                metricPath: 'storedWork.clear.save.pending',
+                queueOperation: 'stored-work-clear-pending',
+                queueChangedRows: 0
+            }
+        }
+        : {}
+
     let persistence = null
     try {
         persistence = await coordinatorAuthority.persistCoordinator(
             {
                 results: [],
                 removedRows,
-                removedCompletedRows
+                removedCompletedRows,
+                ...pendingChange
             },
             {
                 operationKind: 'stored-work-clear',
@@ -26960,6 +26985,16 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
             reason: persistence?.reason || 'persistence-failed',
             persistence
         }
+    }
+
+    // The queue part and the pending part are two parts of one door call, and the pending part can fail after the queue part saved. The
+    // pending records then stay, so the failure is counted and recorded rather than swallowed.
+    if(pendingChange.stored && persistence?.storedSaved === false) {
+        incrementQueueWakeupMetric('storedWork.clear.pendingSaveFailed')
+        recordCoordinatorDiagnosticEvent(
+            'stored-work-clear-pending-save-failed',
+            persistence?.storedReason || 'Stored Work clear pending records save failed'
+        )
     }
 
     const totalCleared = clearedUrls.length + clearedWorkKeys.length

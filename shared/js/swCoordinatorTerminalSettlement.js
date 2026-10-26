@@ -181,6 +181,43 @@ function createCoordinatorTerminalSettlement(deps = {}) {
         return {nextPending, nextNuked, changedPending, changedNuked}
     }
 
+    // Clear Current Work (owner decision): the pending records of the cleared work are deleted, not settled. A record keeps only the
+    // profiles that were not cleared. A record left with no remaining profile is deleted outright, never moved into the remembered-nuked
+    // map or the completed log: only archive confirmation settles a pending record, and the cleared rows will never be confirmed.
+    // This differs on purpose from removeProfileHrefFromPendingSpaceRecords (swProfileProgressMerge.js), which keeps a record whose
+    // remainingUrls became empty while allUrls remain; such a record never settles, so Clear must not use that rule.
+    function removeClearedRowsFromPendingSpaceRecords(currentPending = {}, clearedHrefs = []) {
+        const hrefs = new Set(getNormalizedProfileHrefList(Array.isArray(clearedHrefs) ? clearedHrefs : []))
+        const nextPending = {
+            ...currentPending
+        }
+        let changed = false
+        if(!hrefs.size) return {nextPending, changed}
+
+        for(const [postKey, record] of Object.entries(currentPending || {})) {
+            const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
+            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
+            if(!allUrls.some(url => hrefs.has(url)) && !remainingUrls.some(url => hrefs.has(url))) continue
+
+            changed = true
+            const nextRemainingUrls = remainingUrls.filter(url => !hrefs.has(url))
+            if(!nextRemainingUrls.length) {
+                delete nextPending[postKey]
+                continue
+            }
+            const nextAllUrls = allUrls.filter(url => !hrefs.has(url))
+            nextPending[postKey] = {
+                ...record,
+                allUrls: nextAllUrls,
+                remainingUrls: nextRemainingUrls,
+                ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
+                updatedAt: now()
+            }
+        }
+
+        return {nextPending, changed}
+    }
+
     function scheduleTerminalOwnedProfileTabCleanup(profileHrefs = [], delayMs = 0) {
         const hrefs = getNormalizedProfileHrefList(profileHrefs || [])
         // An empty list is skipped. closeTerminalOwnedProfileTabs() with no list
@@ -231,6 +268,7 @@ function createCoordinatorTerminalSettlement(deps = {}) {
         getCoordinatorItemSettlementKey,
         getCoordinatorTerminalItemEntries,
         settleConfirmedSpaceFeedProfiles,
+        removeClearedRowsFromPendingSpaceRecords,
         scheduleTerminalOwnedProfileTabCleanup,
         buildTerminalCoordinatorSettlementDerivedPayload
     }

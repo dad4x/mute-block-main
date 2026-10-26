@@ -44762,6 +44762,170 @@ test('the recorder events of a recorded outlier survive a worker restart with it
     assert.equal(plainCopy(after.outliers).find(entry => entry.rowKey === sigmaHref)?.eventCount, 1, 'the restarted worker lists the outlier with its event count')
 })
 
+// Clear Current Work (owner decision, 25 Oct): the pending space-feed records of the cleared work are deleted in the same write as the
+// queue removal. A record that names a cleared profile loses that profile; a record left with no profile is deleted, never nuked.
+function makeClearPendingQueuedRow(href, runId, attemptId) {
+    return {
+        runId,
+        status: 'queued',
+        actionKind: 'mute-block',
+        targetProfileHref: href,
+        requestedUrl: href,
+        dedupeKey: href,
+        coordinatorKey: href,
+        queuedAt: 600100,
+        activeAt: 0,
+        updatedAt: 600100,
+        tabId: null,
+        attemptId,
+        attemptNumber: 1,
+        milestones: {}
+    }
+}
+
+test('clear removes the pending space-feed records of the cleared rows in the same write, and keeps the records of other work', async () => {
+    const hrefQueued = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Queued'
+    const hrefDone = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Done'
+    const hrefMixedOther = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Mixed-Other'
+    const hrefUnrelated = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Unrelated'
+    const runId = 'run-clear-pending-records'
+    const unrelatedRecord = {
+        postKey: 'post-clear-pending-unrelated',
+        postUrl: 'https://www.quora.com/q/example/post-clear-pending-unrelated',
+        spaceUrl: 'https://www.quora.com/q/example',
+        allUrls: [hrefUnrelated],
+        remainingUrls: [hrefUnrelated],
+        updatedAt: 600050
+    }
+    const {browser, storage, timers, sw} = loadServiceWorkerHarness({
+        now: 600000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [hrefQueued]: makeClearPendingQueuedRow(hrefQueued, runId, 'attempt-clear-pending-queued'),
+                [hrefDone]: {
+                    ...makeClearPendingQueuedRow(hrefDone, runId, 'attempt-clear-pending-done'),
+                    status: 'succeeded',
+                    outcome: 'blocked',
+                    activeAt: 600100,
+                    terminalAt: 600200,
+                    updatedAt: 600200
+                }
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'running',
+                    targetProfileHrefs: [hrefQueued, hrefDone, hrefMixedOther],
+                    targetWorkKeys: [hrefQueued, hrefDone, hrefMixedOther]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                'post-clear-pending-queued': {
+                    postKey: 'post-clear-pending-queued',
+                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-queued',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [hrefQueued],
+                    remainingUrls: [hrefQueued],
+                    updatedAt: 600050
+                },
+                'post-clear-pending-mixed': {
+                    postKey: 'post-clear-pending-mixed',
+                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-mixed',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [hrefQueued, hrefMixedOther],
+                    remainingUrls: [hrefQueued, hrefMixedOther],
+                    updatedAt: 600050
+                },
+                'post-clear-pending-done': {
+                    postKey: 'post-clear-pending-done',
+                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-done',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [hrefDone],
+                    remainingUrls: [hrefDone],
+                    updatedAt: 600050
+                },
+                'post-clear-pending-unrelated': unrelatedRecord
+            },
+            mbSpaceNukedPosts: {}
+        }
+    })
+
+    await sw.coordinatorAuthority.hydrate()
+    const doneRow = sw.coordinatorAuthority.current().queue[hrefDone]
+    assert.equal((await sw.archiveTerminalCoordinatorRow(hrefDone, doneRow)).archived, true)
+    assert.ok(storage.mbSpacePendingNukedPosts['post-clear-pending-done'], 'sanity check: the done row record is still pending before clear')
+
+    const result = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'clear-coordinator-current-work'
+    }), timers)
+
+    assert.equal(result.clearedUrls.includes(hrefQueued), true)
+    assert.equal(storage.mbSpacePendingNukedPosts['post-clear-pending-queued'], undefined, 'a record of only cleared work is deleted')
+    assert.equal(storage.mbSpacePendingNukedPosts['post-clear-pending-done'], undefined, 'a record of a cleared completed row is deleted')
+    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-mixed'].remainingUrls, [hrefMixedOther], 'the cleared profile leaves the mixed record, the other profile stays pending')
+    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-mixed'].allUrls, [hrefMixedOther])
+    assert.deepEqual(storage.mbSpacePendingNukedPosts['post-clear-pending-unrelated'], unrelatedRecord, 'a record of work that is not cleared is untouched')
+    assert.equal(storage.mbSpaceNukedPosts['post-clear-pending-queued'], undefined, 'a cleared record is not remembered as nuked')
+    assert.equal(storage.mbSpaceNukedPosts['post-clear-pending-done'], undefined, 'a cleared completed record is not remembered as nuked')
+    assert.equal(Object.keys(sw.coordinatorAuthority.current().queue).length, 0, 'the live queue is cleared in the same run')
+})
+
+test('a pending record removed by clear does not reappear as nuked after a restart, even when its profile is confirmed later', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Clear-Pending-Restart'
+    const runId = 'run-clear-pending-restart'
+    const postKey = 'post-clear-pending-restart'
+    const {browser, storage, timers} = loadServiceWorkerHarness({
+        now: 600000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: makeClearPendingQueuedRow(href, runId, 'attempt-clear-pending-restart')
+            },
+            mbCoordinatorRuns: {
+                [runId]: {
+                    id: runId,
+                    sourceType: 'space-feed',
+                    status: 'running',
+                    targetProfileHrefs: [href],
+                    targetWorkKeys: [href]
+                }
+            },
+            mbCoordinatorEvents: [],
+            mbSpacePendingNukedPosts: {
+                [postKey]: {
+                    postKey,
+                    postUrl: 'https://www.quora.com/q/example/post-clear-pending-restart',
+                    spaceUrl: 'https://www.quora.com/q/example',
+                    allUrls: [href],
+                    remainingUrls: [href],
+                    updatedAt: 600050
+                }
+            },
+            mbSpaceNukedPosts: {}
+        }
+    })
+
+    const cleared = await settleWithFakeTimers(browser.runtime.sendMessage({
+        action: 'clear-coordinator-current-work'
+    }), timers)
+    assert.equal(cleared.clearedUrls.includes(href), true)
+    assert.equal(storage.mbSpacePendingNukedPosts[postKey], undefined, 'the pending record is deleted by the clear')
+
+    const restarted = loadServiceWorkerHarness({now: 600010, storage})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(restarted.storage.mbSpacePendingNukedPosts[postKey], undefined, 'the restart does not read the cleared record back')
+
+    const confirmed = await restarted.browser.runtime.sendMessage({
+        action: 'confirm-space-feed-profiles-blocked',
+        profileHrefs: [href]
+    }, {tab: {id: 12, windowId: 1}})
+    assert.equal(confirmed.confirmed, false, 'the confirmation has no pending record to settle')
+    assert.equal(restarted.storage.mbSpaceNukedPosts[postKey], undefined, 'the cleared record does not reappear as nuked')
+})
+
 ;
 (async () => {
     let failed = 0
