@@ -2,8 +2,8 @@ const browser = require('webextension-polyfill')
 const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
 const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
-const {runsChangeRecords, persistedRunFields, RUN_RETENTION_MAX_COUNT} = require('./swRunsWal')
-const {makeRunShardTail, selectRunShardsToDrop, withoutRunShards} = require('./swRunShards')
+const {runsChangeRecords, persistedRunFields, RUN_RETENTION_MAX_COUNT, RUN_SHARD_SPAN_MS} = require('./swRunsWal')
+const {keepOrStampRunShard, selectRunShardsToDrop, withoutRunShards, runAreaShardOf} = require('./swRunShards')
 const {makeManualHistoryRow} = require('./swManualHistory')
 const {
     SPACE_MAP_LAYOUT_KEY,
@@ -57,7 +57,6 @@ const {
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
     PAUSE_DIAGNOSTIC_SNAPSHOT_KEY,
     DEBUG_RUN_AUTOSAVED_ID_KEY,
-    COORDINATOR_RUNS_LAYOUT_KEY,
     COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY,
     COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY,
     ERASE_BLOCK_HISTORY_PENDING_KEY,
@@ -774,7 +773,7 @@ const {
     STORED_WORK_CLEAR_REREAD_ATTEMPTS,
     PROFILE_BLOCKED_PAGE_EVENT_RECHECK_MAX_ATTEMPTS,
     FILL_PRE_SCAN_BUSY_SKIP_ENABLED,
-    RUNS_GAP_WATCH_INTERVAL_MS,
+    STORE_SIZE_WATCH_INTERVAL_MS,
     EXECUTOR_CLASSIFY_BACKSTOP_MS,
     ERASE_RELOAD_DELAY_MS,
     ORPHAN_SURFACE_TAB_GRACE_MS,
@@ -2698,74 +2697,7 @@ function commitSpaceMapDiskWrite(write = {}) {
     if(write.migrated) spaceMapLayout.bucketed = true
 }
 
-// The run list (COORDINATOR_RUNS_KEY) on disk. Same scheme as the space maps, with its own layout marker, so the two can be
-// migrated separately. The session mirror of the run list stays whole. Its disk copy is the buckets once runsLayout.bucketed.
-const runsLayout = {bucketed: false, hash: null}
-
-function getRunsStoredReadDefaults() {
-    return {[COORDINATOR_RUNS_LAYOUT_KEY]: null, [COORDINATOR_RUNS_KEY]: {}, ...Object.fromEntries(spaceMapBucketKeys(COORDINATOR_RUNS_KEY).map(key => [key, {}]))}
-}
-
-// The layout keys only: used when the run list comes from the session mirror, so the legacy key is not read from disk.
-function getRunsLayoutStoredReadDefaults() {
-    return {[COORDINATOR_RUNS_LAYOUT_KEY]: null, ...Object.fromEntries(spaceMapBucketKeys(COORDINATOR_RUNS_KEY).map(key => [key, {}]))}
-}
-
-// From a hydrate read. fromMirror: the run list is the session copy, already in stored, and only the layout is read from disk.
-function applyRunsStoredLayout(stored = {}, options = {}) {
-    const bucketed = stored[COORDINATOR_RUNS_LAYOUT_KEY] === SPACE_MAP_LAYOUT_BUCKETED
-    const runs = options.fromMirror === true ? (stored[COORDINATOR_RUNS_KEY] || {}) : readSpaceMapFromStored(stored, COORDINATOR_RUNS_KEY)
-    for (const key of [COORDINATOR_RUNS_LAYOUT_KEY, ...spaceMapBucketKeys(COORDINATOR_RUNS_KEY)]) delete stored[key]
-    stored[COORDINATOR_RUNS_KEY] = runs
-    runsLayout.bucketed = bucketed
-    runsLayout.hash = bucketed ? hashSpaceMapBuckets(splitSpaceMapIntoBuckets(COORDINATOR_RUNS_KEY, runs)) : null
-}
-
-// The disk write of the run list. Once bucketed, a write sends only the changed buckets; a migration writes all of them with the marker.
-function getRunsDiskWrite(payload = {}, options = {}) {
-    if (!Object.prototype.hasOwnProperty.call(payload, COORDINATOR_RUNS_KEY)) return {disk: payload, hashes: null, migrated: false}
-    const migrating = options.runsMigrate === true
-    if (!migrating && !runsLayout.bucketed) return {disk: payload, hashes: null, migrated: false}
-    const disk = {...payload}
-    delete disk[COORDINATOR_RUNS_KEY]
-    const next = changedSpaceMapBuckets(COORDINATOR_RUNS_KEY, payload[COORDINATOR_RUNS_KEY], migrating ? null : runsLayout.hash)
-    Object.assign(disk, next.changed)
-    if (migrating) disk[COORDINATOR_RUNS_LAYOUT_KEY] = SPACE_MAP_LAYOUT_BUCKETED
-    return {disk, hashes: next.hashes, migrated: migrating}
-}
-
-function commitRunsDiskWrite(write = {}) {
-    if (!write.hashes) return
-    runsLayout.hash = write.hashes
-    if (write.migrated) runsLayout.bucketed = true
-}
-
-// Diagnostic only (B15a): compares the resident run list with the buckets last written or loaded, and records a gap
-// when they differ. Writes nothing. Compares against the disk baseline, so a run changed in memory with no write shows here.
-// Every call records one runs-gap-check entry, so a zero-gap pass is visible in the recorder too. A gap also records runs-disk-gap.
-function recordRunsResidentDiskGap(residentRuns = {}, source = '') {
-    const runs = residentRuns || {}
-    const residentRunCount = Object.keys(runs).length
-    if (!runsLayout.bucketed || !runsLayout.hash) {
-        recordFlightRecorderEvent({kind: 'runs-gap-check', source, residentRunCount, gapBucketCount: 0, reason: 'no-bucketed-layout'})
-        return
-    }
-    const gap = changedSpaceMapBuckets(COORDINATOR_RUNS_KEY, runs, runsLayout.hash)
-    const gapBuckets = Object.keys(gap.changed)
-    recordFlightRecorderEvent({kind: 'runs-gap-check', source, residentRunCount, gapBucketCount: gapBuckets.length})
-    if (!gapBuckets.length) return
-    recordFlightRecorderEvent({
-        kind: 'runs-disk-gap',
-        source,
-        residentRunCount,
-        gapBucketCount: gapBuckets.length,
-        gapBuckets: gapBuckets.slice(0, 8).join(',')
-    })
-}
-
-// The timer that makes the gap check regular: a reconcile pass runs only when one is scheduled, so it can go quiet for a whole run.
-// Skips until the authority is hydrated, so it never compares against an empty resident copy.
-// Diagnostic only (21 Oct): a time series of the store's size and the queue's counts, sampled on the same timer as the gap check.
+// Diagnostic only (21 Oct): a time series of the store's size and the queue's counts, sampled on the store-size watch timer.
 // It shows whether storage writes slow as the store grows, or as more work is queued. Writes nothing.
 async function recordStoreSizeSample() {
     let bytesInUse = -1
@@ -2777,7 +2709,7 @@ async function recordStoreSizeSample() {
     const counts = getCoordinatorQueueWorkCounts(queue)
     recordFlightRecorderEvent({
         kind: 'store-size',
-        source: 'runsGapWatch',
+        source: 'storeSizeWatch',
         bytesInUse: Number.isFinite(bytesInUse) ? bytesInUse : -1,
         queueRows: Object.keys(queue).length,
         queued: counts.durableQueuedRows || 0,
@@ -2785,21 +2717,18 @@ async function recordStoreSizeSample() {
     })
 }
 
-// Started by a timed run (startDebugResumeLimit) and stopped when that run's limit clears, so it runs for the length of the run.
-let runsGapWatchTimer = null
-function startRunsGapWatch() {
-    if (runsGapWatchTimer !== null) return
+// The store-size watch, started by a timed run (startDebugResumeLimit) and stopped when that run's limit clears, so it runs for the
+// length of the run. Skips until the authority is hydrated, as the sample reads the resident queue.
+let storeSizeWatchTimer = null
+function startStoreSizeWatch() {
+    if (storeSizeWatchTimer !== null) return
     const tick = async () => {
-        runsGapWatchTimer = null
+        storeSizeWatchTimer = null
         if (!debugResumeLimit) return
-        if (coordinatorAuthority.isHydrated()) {
-            const runs = coordinatorAuthority.residentStoredFor({[COORDINATOR_RUNS_KEY]: {}})[COORDINATOR_RUNS_KEY]
-            recordRunsResidentDiskGap(runs, 'timer')
-            await recordStoreSizeSample()
-        }
-        runsGapWatchTimer = setTimeout(tick, RUNS_GAP_WATCH_INTERVAL_MS)
+        if (coordinatorAuthority.isHydrated()) await recordStoreSizeSample()
+        storeSizeWatchTimer = setTimeout(tick, STORE_SIZE_WATCH_INTERVAL_MS)
     }
-    runsGapWatchTimer = setTimeout(tick, RUNS_GAP_WATCH_INTERVAL_MS)
+    storeSizeWatchTimer = setTimeout(tick, STORE_SIZE_WATCH_INTERVAL_MS)
 }
 
 async function metricStorageSet(payload = {}, options = {}) {
@@ -2848,15 +2777,13 @@ async function metricStorageSet(payload = {}, options = {}) {
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
         const spaceMapWrite = getSpaceMapDiskWrite(payload, options)
-        const runsWrite = getRunsDiskWrite(spaceMapWrite.disk, options)
-        const diskPayload = options.namespaceStamps ? {...runsWrite.disk, ...options.namespaceStamps} : runsWrite.disk
-        if(spaceMapWrite.hashes || runsWrite.hashes) diskWriteBytes = measureDiskWriteBytes(diskPayload)
+        const diskPayload = options.namespaceStamps ? {...spaceMapWrite.disk, ...options.namespaceStamps} : spaceMapWrite.disk
+        if(spaceMapWrite.hashes) diskWriteBytes = measureDiskWriteBytes(diskPayload)
         result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
             ? coordinatorStorageAdapter.set(diskPayload)
             : true))
         if(result !== false) {
             commitSpaceMapDiskWrite(spaceMapWrite)
-            commitRunsDiskWrite(runsWrite)
             // The bytes that reached storage: the bucket-split size when the write was translated, else the payload itself.
             recordPhysicalWriteMetrics(diskWriteBytes ?? payloadSummary.bytes)
         }
@@ -8748,11 +8675,17 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
 // queue rows. A reload gives exactly this, since it starts from the same persisted fields and the same queue. Only runs with a persisted
 // record are worked out: a queue row whose run was pruned does not bring the run back (the completed-row filter reads the run set).
 function runsWithDerivedFields(queue = {}, runs = {}) {
+    return recomputeCoordinatorRuns(queue || {}, persistedRunsForCheckpoint(runs))
+}
+
+// The runs map as the checkpoint stores it: each run's persisted fields only (swRunsWal.js), the fields its log records carry. The
+// counts and status are not stored, so a checkpoint and a log replay give the same runs.
+function persistedRunsForCheckpoint(runs = {}) {
     const persisted = {}
     for (const [runId, run] of Object.entries(runs || {})) {
         persisted[runId] = persistedRunFields({...run, id: run?.id || runId})
     }
-    return recomputeCoordinatorRuns(queue || {}, persisted)
+    return persisted
 }
 
 // The runs map after one write's run records, applied in order with the log engine's reducer (24 Oct). Returns a new map.
@@ -8801,6 +8734,9 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         }
         const recoveredQueue = normalizeCoordinatorMap(residentState.queue || {})
         const recoveredCompleted = normalizeCoordinatorMap(coordinatorAuthority.residentCompleted() || {})
+        // Runs are log records (24 Oct), and the old segments retire with the switch. The checkpoint must carry the runs too, or a
+        // restart loses every run written before the switch. Only the persisted fields go in, the same fields the run records carry.
+        const recoveredRuns = persistedRunsForCheckpoint(residentState.runs)
         const activeGenerationId = storedWal?.meta?.activeCheckpoint
         const activeRecords = getWalRecordsForGeneration(storedWal, activeGenerationId)
         // Every record the store holds is applied to the resident state, so the checkpoint covers up to the last sequence
@@ -8815,7 +8751,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             maxRows: recentHistoryMaxEntries
         })
         const completedForCheckpoint = completedPrune.drop.size ? withoutShards(recoveredCompleted, completedPrune.drop) : recoveredCompleted
-        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint}, {
+        const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint, runs: recoveredRuns}, {
             snapshotSeq: maxAppliedSeq,
             createdAt: Date.now(),
             codec: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC,
@@ -9838,9 +9774,9 @@ const queueWalRowShards = makeQueueWalRowShardTail({budgetBytes: QUEUE_WAL_SHARD
 // Completed-work log shards (step 5): the tail that each archive goes to, and the checkpoint's partition rule. The queue's rule
 // covers the queue and runs; the completed area uses its own completion shard.
 const completedWalShards = makeCompletedShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES, enabled: true})
-// Run shards (swRunShards.js): new runs take the tail, and the run cap drops whole shards. Always on, since the cap is hardcoded.
-const runShardTail = makeRunShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES})
+// The checkpoint's partition: runs by their time shard (swRunShards.js), the completed log by its completion shard, and the queue by its row shard.
 function queueWalCheckpointShardOf(area = '', key = '', entry = null) {
+    if (area === 'runs') return runAreaShardOf(area, key, entry)
     return area === 'completed' ? completedAreaShardOf(area, key, entry) : queueWalRowShards.shardOf(area, key, entry)
 }
 
@@ -9897,7 +9833,6 @@ function createCoordinatorAuthority() {
         const queueBeforeHydrate = projection.queue
         projection = makeCoordinatorAuthorityProjection(loaded)
         queueWalRowShards.rebuild(projection.queue)
-        runShardTail.rebuild(projection.runs)
         syncResidentQueueOrder(queueBeforeHydrate)
         setResidentCompleted(loaded.completed)
         completedWalShards.rebuild(loaded.completed)
@@ -10091,7 +10026,6 @@ function createCoordinatorAuthority() {
             runs: normalized.runs || projection.runs || {}
         })
         queueWalRowShards.rebuild(projection.queue)
-        runShardTail.rebuild(projection.runs)
         syncResidentQueueOrder(queueBeforeSeed)
         return true
     }
@@ -10228,14 +10162,18 @@ function createCoordinatorAuthority() {
     function takeRunsPartFromChange(stored = null) {
         if(!stored || !Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY)) return null
         const value = stored[COORDINATOR_RUNS_KEY]
-        // The run cap (swRunsWal.js): the oldest runs that no queue row refers to are dropped, in this same write.
-        // Run shards (swRunShards.js): a new run takes the tail shard, and then the cap drops the oldest whole shards that no queue row
-        // refers to, in this same write. Runs already in the log keep the shard they have.
+        // Run shards (swRunShards.js): a new run takes the time shard of its creation. Then the retention drops the oldest whole time
+        // shards that no queue row refers to, by age (the completed log's retention) and then by the run cap, in this same write.
+        // Runs already in the log keep the shard they have.
         const runsIn = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+        const nowMs = Date.now()
         const stampedRuns = {}
-        for (const [id, run] of Object.entries(runsIn)) stampedRuns[id] = projection.runs?.[id] ? run : runShardTail.stamp(run)
+        // A run already in the resident map keeps the shard it has; a new run takes its time shard (keepOrStampRunShard).
+        for (const [id, run] of Object.entries(runsIn)) stampedRuns[id] = keepOrStampRunShard(run, projection.runs?.[id], nowMs, RUN_SHARD_SPAN_MS)
         const referencedRunIds = new Set(Object.values(projection.queue || {}).map(row => row?.runId).filter(Boolean))
-        const runsAfter = withoutRunShards(stampedRuns, selectRunShardsToDrop(stampedRuns, {maxRuns: RUN_RETENTION_MAX_COUNT, referencedRunIds}))
+        const retentionMs = recentHistoryRetentionDays * 24 * 60 * 60 * 1000
+        const drop = selectRunShardsToDrop(stampedRuns, {nowMs, retentionMs, maxRuns: RUN_RETENTION_MAX_COUNT, referencedRunIds})
+        const runsAfter = withoutRunShards(stampedRuns, drop)
         const storedWithoutRuns = {...stored}
         delete storedWithoutRuns[COORDINATOR_RUNS_KEY]
         return {
@@ -10606,7 +10544,7 @@ function createCoordinatorAuthority() {
     function migrateSpaceMapLayout(options = {}) {
         return runExclusiveOnApplyTail(async () => {
             if(!hydrated) await hydrate()
-            if(spaceMapLayout.bucketed && runsLayout.bucketed) return {migrated: false, reason: 'already-bucketed'}
+            if(spaceMapLayout.bucketed) return {migrated: false, reason: 'already-bucketed'}
             // Each map is migrated on its own marker. Both writes go through the door, so no settlement write can interleave.
             if(!spaceMapLayout.bucketed) {
                 const stored = residentStoredFor({[SPACE_NUKED_POSTS_KEY]: {}, [SPACE_PENDING_NUKED_POSTS_KEY]: {}})
@@ -10617,13 +10555,7 @@ function createCoordinatorAuthority() {
                     [SPACE_PENDING_NUKED_POSTS_KEY]: stored[SPACE_PENDING_NUKED_POSTS_KEY]
                 })
             }
-            if(!runsLayout.bucketed) {
-                const stored = residentStoredFor({[COORDINATOR_RUNS_KEY]: {}})
-                await persistCoordinatorStoredChange({
-                    storageOptions: {metricPath: 'runs.migrate', runsMigrate: true}
-                }, {[COORDINATOR_RUNS_KEY]: stored[COORDINATOR_RUNS_KEY]})
-            }
-            const migrated = spaceMapLayout.bucketed && runsLayout.bucketed
+            const migrated = spaceMapLayout.bucketed
             return {migrated, reason: migrated ? 'migrated' : 'write-not-saved'}
         })
     }
@@ -11163,7 +11095,8 @@ function getHydratedCoordinatorAuthorityState(metricName = '') {
 // function decodes the WAL or replays it.
 async function loadCoordinatorCurrentAuthorityState() {
     return runQueueWakeupMetricPhase('loadCoordinatorCurrentAuthorityState', async () => {
-        // The WAL keys, the runs key and the progress keys come from a valid session mirror when there is one (rule 7). The
+        // The WAL keys and the progress keys come from a valid session mirror when there is one (rule 7). The runs are log records,
+        // so they are not read from a key here. The
         // paused flag, its generation, the events and the space post keys are read in the same storage call, so the resident
         // state holds every coordinator key a reader answers from. The disk stamps of the mirrored keys are read in that call
         // too: a mirrored key is used only when its disk stamp is its session stamp (docs/queue-storage-layering.md, section 6).
@@ -11173,10 +11106,8 @@ async function loadCoordinatorCurrentAuthorityState() {
         const mirroredNamespace = mirror?.namespace || {}
         const mirroredStamps = mirror?.stamps || {}
         const candidateKeys = Object.keys(mirroredNamespace)
-        const runsFromMirror = mirroredNamespace[COORDINATOR_RUNS_KEY] !== undefined
         const stored = await metricStorageGet({
             ...(mirror ? {} : getCoordinatorQueueWalStorageDefaults()),
-            ...(runsFromMirror ? getRunsLayoutStoredReadDefaults() : getRunsStoredReadDefaults()),
             ...Object.fromEntries(candidateKeys.map(key => [getCoordinatorNamespaceStampKey(key), null])),
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
@@ -11199,21 +11130,10 @@ async function loadCoordinatorCurrentAuthorityState() {
             if(mirroredStamps[key] === stored[stampKey]) confirmed.add(key)
             delete stored[stampKey]
         }
-        let runsFromMirrorConfirmed = false
         if(mirror) {
             Object.assign(stored, mirror.wal)
-            const runsConfirmed = runsFromMirror && confirmed.has(COORDINATOR_RUNS_KEY)
-            runsFromMirrorConfirmed = runsConfirmed
-            if(runsConfirmed) {
-                stored[COORDINATOR_RUNS_KEY] = mirroredNamespace[COORDINATOR_RUNS_KEY]
-                incrementQueueWakeupMetric('queueNamespace.hydrateRunsFromMirror')
-            }
             const rejectedCount = candidateKeys.length - confirmed.size
             if(rejectedCount > 0) incrementQueueWakeupMetric('queueNamespace.hydrateStampRejected', rejectedCount)
-            const readFromDisk = runsFromMirror && !runsConfirmed ? getRunsStoredReadDefaults() : {}
-            if(Object.keys(readFromDisk).length) {
-                Object.assign(stored, await metricStorageGet(readFromDisk, {metricPath: 'authority.hydrate.namespace'}))
-            }
         }
         // Decision 31: progress comes from the session copy whether or not the disk mirror is valid. A key the session does not hold
         // starts at its empty default.
@@ -11221,7 +11141,6 @@ async function loadCoordinatorCurrentAuthorityState() {
         for(const key of PROFILE_NUKE_PROGRESS_STORAGE_KEYS) stored[key] = hydrateSession.progress[key] ?? progressDefaults[key]
         // The space post maps: whole maps again, from whichever layout the disk holds (spaceMapStorage.js).
         applySpaceMapStoredLayout(stored)
-        applyRunsStoredLayout(stored, {fromMirror: runsFromMirrorConfirmed})
         const queueSnapshot = {}
         const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
             metricPath: 'authority.hydrate.segments'
@@ -12315,7 +12234,6 @@ async function persistCoordinatorReconcileAuthorityTransitionPhase(ctx = {}) {
         })
         if(stateSaved === false) saved = false
     }
-    recordRunsResidentDiskGap(nextRuns, 'reconcile-tail')
     if(ctx.terminalSettlementHrefs.size) {
         const terminalSettlementHrefs = Array.from(ctx.terminalSettlementHrefs)
         const terminalSettlementHrefsThisPass = terminalSettlementHrefs.slice(0, COORDINATOR_TERMINAL_SETTLEMENT_CHUNK_SIZE)
@@ -22624,7 +22542,7 @@ function startDebugResumeLimit(limit = null) {
     }
     if(untilAt) {
         void Promise.resolve(browser.alarms?.create?.(DEBUG_RESUME_LIMIT_ALARM_NAME, {when: untilAt})).catch(() => null)
-        startRunsGapWatch()
+        startStoreSizeWatch()
     }
     recordFlightRecorderEvent({
         kind: 'debug-resume-limit-set',

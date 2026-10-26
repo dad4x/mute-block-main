@@ -78,11 +78,16 @@ function runsChangeRecords(before = {}, after = {}) {
     return records
 }
 
-// The run cap: the most runs the log keeps (hardcoded: a week at 100 runs a day). The cap drops whole run shards, oldest first (swRunShards.js).
+// The run cap: the most runs the log keeps (hardcoded: a week at 100 runs a day). The cap drops whole time shards, oldest first (swRunShards.js).
 const RUN_RETENTION_MAX_COUNT = 700
+
+// A run's time shard is the day its creation falls in (swRunShards.js). Hardcoded with the cap, as a layout constant: changing it
+// moves new runs to other shards and does not move the runs already written.
+const RUN_SHARD_SPAN_MS = 24 * 60 * 60 * 1000
 
 module.exports = {
     RUN_RETENTION_MAX_COUNT,
+    RUN_SHARD_SPAN_MS,
     RUN_AREA,
     RUN_LIST_FIELDS,
     RUN_SCALAR_FIELDS,

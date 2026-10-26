@@ -1,71 +1,91 @@
-// Run shards: the runs cap works on whole shards, the same way the completed-work log does (completed-log closeout, rules 3 and 6).
-// A new run carries the shard it was created into, assigned in creation order: each new run goes to the tail, and a new shard starts
-// when the tail is full. The runs are log records, so a dropped shard leaves as map.remove records in the write that drops it.
+// Run shards (25 Oct, owner decision): a run's shard is its time shard. A time shard is the span of time its creation falls in
+// (RUN_SHARD_SPAN_MS, one day), so the shards are ordered by time, the same way the completed log's shards are ordered by completion.
+// A new run carries the shard it was created into (stampRunShard). The runs are log records, so a dropped shard leaves as map.remove
+// records in the write that drops it.
 //
-// The cap is RUN_RETENTION_MAX_COUNT (hardcoded: a week at 100 a day). It counts runs, and it drops the oldest whole shards until the
-// count is at or under the cap, so it is loose by up to one shard. Two rules keep this safe:
+// Retention works on whole time shards, oldest first, and has two limits in order:
+//   1. time: a shard whose newest run is older than the retention is dropped (the completed log's retention, nukedPostRetentionDays;
+//      0 turns this limit off). A shard whose runs carry no time is not dropped by this limit.
+//   2. count: while the run count is over RUN_RETENTION_MAX_COUNT (700), the oldest shards are dropped. The count is loose by up to
+//      one shard, as the cap is a shard boundary, not an exact count.
+// Two rules keep this safe under both limits:
 //   - a shard that holds a run a queue row still refers to is never dropped, so a live queue never loses its run;
 //   - the newest shard is never dropped.
-// A run with no shard (written before this step) is in shard 0, the oldest.
+// A run with no shard (one written before the shards were time-based) is in shard 0, the oldest. A run that already carries a shard
+// keeps it, so a run's shard never moves after it is written.
+
+const {RUN_SHARD_SPAN_MS} = require('./swRunsWal')
 
 const RUN_SHARD_DEFAULT = 0
+const RUN_AREA_NAME = 'runs'
 
 function runShardIdOf(run) {
     const shard = run?.runShard
     return Number.isInteger(shard) && shard >= 0 ? shard : RUN_SHARD_DEFAULT
 }
 
-function rowBytesOf(run) {
-    return JSON.stringify(run || {}).length
+// The shard of a point in time: the span it falls in. A time that is not a positive number has no span of its own, so it is
+// read as time 0 (the oldest shard).
+function runShardForTime(timeMs = 0, spanMs = RUN_SHARD_SPAN_MS) {
+    const time = Number.isFinite(timeMs) && timeMs > 0 ? timeMs : 0
+    return Math.floor(time / spanMs)
 }
 
-// The tail takes each new run. `bytes` is what the tail shard holds, measured on uncompressed JSON like the other shards.
-function makeRunShardTail({budgetBytes = 16384} = {}) {
-    let tail = {id: RUN_SHARD_DEFAULT, bytes: 0}
-
-    // Rebuilt from the runs map at hydrate: the tail is the highest shard id, and `bytes` is what that shard holds.
-    function rebuild(runs = {}) {
-        let maxId = RUN_SHARD_DEFAULT
-        const bytesById = new Map()
-        for (const run of Object.values(runs || {})) {
-            const id = runShardIdOf(run)
-            if (id > maxId) maxId = id
-            bytesById.set(id, (bytesById.get(id) || 0) + rowBytesOf(run))
-        }
-        tail = {id: maxId, bytes: bytesById.get(maxId) || 0}
-        return {...tail}
-    }
-
-    // The new run, with its shard. A run that already has a shard is returned as it was given.
-    function stamp(run = null) {
-        if (!run || typeof run !== 'object') return run
-        if (Number.isInteger(run.runShard) && run.runShard >= 0) return run
-        const size = rowBytesOf(run)
-        if (tail.bytes > 0 && tail.bytes + size > budgetBytes) tail = {id: tail.id + 1, bytes: 0}
-        tail = {id: tail.id, bytes: tail.bytes + size}
-        return {...run, runShard: tail.id}
-    }
-
-    return {rebuild, stamp, tailState: () => ({...tail})}
+// The time a run is filed under: its creation time, or `nowMs` when the run has none.
+function runTimeOf(run, nowMs = 0) {
+    const created = Number(run?.createdAt)
+    return Number.isFinite(created) && created > 0 ? created : nowMs
 }
 
-// The shard ids to drop for the cap. A shard is dropped only as a whole, oldest first, while the run count is over `maxRuns`. A shard
-// that holds a referenced run is skipped, and so is the newest shard. Returns the ids; `runs` is not changed.
-function selectRunShardsToDrop(runs = {}, {maxRuns = 0, referencedRunIds = new Set()} = {}) {
+// The run with its shard. A run that already has a shard is returned as it was given. A new run takes the shard of its creation time,
+// and `nowMs` stands in for a run that has no creation time.
+function stampRunShard(run = null, nowMs = 0, spanMs = RUN_SHARD_SPAN_MS) {
+    if (!run || typeof run !== 'object') return run
+    if (Number.isInteger(run.runShard) && run.runShard >= 0) return run
+    return {...run, runShard: runShardForTime(runTimeOf(run, nowMs), spanMs)}
+}
+
+// The run a write stores. A run already in the resident map keeps the shard it has, whatever shard the caller's copy carries. A new run
+// takes its time shard (stampRunShard). A resident run with no shard stays without one, so it is still in shard 0.
+function keepOrStampRunShard(run = null, previous = null, nowMs = 0, spanMs = RUN_SHARD_SPAN_MS) {
+    if (!run || typeof run !== 'object') return run
+    if (!previous || typeof previous !== 'object') return stampRunShard(run, nowMs, spanMs)
+    if (Number.isInteger(previous.runShard) && previous.runShard >= 0) return {...run, runShard: previous.runShard}
+    return run
+}
+
+// The shard ids to drop, oldest first, under the two limits (see the header). `runs` is not changed. `retentionMs` 0 turns the time
+// limit off, and `maxRuns` 0 turns the count limit off.
+function selectRunShardsToDrop(runs = {}, {nowMs = 0, retentionMs = 0, maxRuns = 0, referencedRunIds = new Set()} = {}) {
     const countByShard = new Map()
+    const newestTimeByShard = new Map()
     const referencedShards = new Set()
     for (const [id, run] of Object.entries(runs || {})) {
         const shard = runShardIdOf(run)
         countByShard.set(shard, (countByShard.get(shard) || 0) + 1)
+        const time = Number(run?.createdAt)
+        if (Number.isFinite(time) && time > 0) newestTimeByShard.set(shard, Math.max(newestTimeByShard.get(shard) || 0, time))
+        else if (!newestTimeByShard.has(shard)) newestTimeByShard.set(shard, 0)
         if (referencedRunIds.has(id)) referencedShards.add(shard)
     }
-    const drop = new Set()
-    let total = [...countByShard.values()].reduce((sum, count) => sum + count, 0)
+
     const shardIds = [...countByShard.keys()].sort((left, right) => left - right)
     const newest = shardIds[shardIds.length - 1]
+    const protectedShard = shard => shard === newest || referencedShards.has(shard)
+    const drop = new Set()
+
+    if (retentionMs > 0) {
+        const cutoff = nowMs - retentionMs
+        for (const shard of shardIds) {
+            const newestTime = newestTimeByShard.get(shard) || 0
+            if (!protectedShard(shard) && newestTime > 0 && newestTime < cutoff) drop.add(shard)
+        }
+    }
+
+    let total = shardIds.reduce((sum, shard) => (drop.has(shard) ? sum : sum + countByShard.get(shard)), 0)
     for (const shard of shardIds) {
-        if (total <= maxRuns) break
-        if (shard === newest || referencedShards.has(shard)) continue
+        if (maxRuns <= 0 || total <= maxRuns) break
+        if (drop.has(shard) || protectedShard(shard)) continue
         drop.add(shard)
         total -= countByShard.get(shard)
     }
@@ -81,10 +101,19 @@ function withoutRunShards(runs = {}, drop = new Set()) {
     return kept
 }
 
+// The checkpoint's partition rule for the runs area: a run's entry goes to the shard it carries. Other areas keep the default shard here.
+function runAreaShardOf(area = '', key = '', entry = null) {
+    return area === RUN_AREA_NAME ? runShardIdOf(entry) : RUN_SHARD_DEFAULT
+}
+
 module.exports = {
-    makeRunShardTail,
+    stampRunShard,
+    keepOrStampRunShard,
+    runShardForTime,
+    runTimeOf,
     selectRunShardsToDrop,
     withoutRunShards,
+    runAreaShardOf,
     runShardIdOf,
     RUN_SHARD_DEFAULT
 }

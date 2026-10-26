@@ -53,7 +53,6 @@ module.exports = {
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX: 'mbCoordinatorContentQueueIndexShard.',
     PAUSE_DIAGNOSTIC_SNAPSHOT_KEY: 'mbPauseDiagnosticSnapshot',
     DEBUG_RUN_AUTOSAVED_ID_KEY: 'mbDebugRunAutosavedId',
-    COORDINATOR_RUNS_LAYOUT_KEY: 'mbCoordinatorRunsLayoutVersion',
     COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY: 'mbCoordinatorQueueViewTimingCache',
     COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY: 'mbCoordinatorQueueWalSeq',
     ERASE_BLOCK_HISTORY_PENDING_KEY: 'mbEraseBlockHistoryPending',
