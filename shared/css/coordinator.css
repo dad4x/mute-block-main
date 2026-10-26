@@ -730,7 +730,7 @@ h2 {
 }
 
 .row--queue {
-    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px) 96px;
+    grid-template-columns: minmax(180px, 1fr) 80px 120px 140px minmax(190px, 230px);
 }
 
 .row-time-cell {
@@ -747,13 +747,6 @@ h2 {
 .row-time-line--detail {
     color: var(--mb-grey-700);
     margin-top: 2px;
-}
-
-.row-action-cell {
-    align-self: start;
-    display: flex;
-    justify-content: flex-end;
-    min-width: 0;
 }
 
 .row-cancel-cell {

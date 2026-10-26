@@ -361,9 +361,6 @@ async function init() {
     document.getElementById('clearScanCostButton')?.addEventListener('click', () => {
         void resetMetrics()
     })
-    document.getElementById('clearAuthorityLoadHistogramButton')?.addEventListener('click', () => {
-        void resetMetrics()
-    })
     document.getElementById('clearWriteSizeHistogramButton')?.addEventListener('click', () => {
         void resetMetrics()
     })
@@ -379,20 +376,11 @@ async function init() {
     document.getElementById('clearAllStatsButton')?.addEventListener('click', () => {
         void clearAllStats()
     })
-    document.getElementById('retryFailedButton')?.addEventListener('click', () => {
-        void toggleRetryFailed()
-    })
-    document.getElementById('requeueFailedButton')?.addEventListener('click', () => {
-        void requeueFailed()
-    })
     document.getElementById('pauseCurrentWorkButton')?.addEventListener('click', () => {
         void toggleCurrentWorkPause()
     })
     document.getElementById('saveFlightRecorderButton')?.addEventListener('click', () => {
         void saveFlightRecorder()
-    })
-    document.getElementById('cancelCurrentWorkButton')?.addEventListener('click', () => {
-        void cancelCurrentWork()
     })
     document.getElementById('clearCurrentWorkButton')?.addEventListener('click', () => {
         void clearCurrentWork()
@@ -952,9 +940,9 @@ async function clearCoordinatorTerminalStats() {
 }
 
 // One button for the dev-mode panels' individually-scattered clear buttons
-// (Metrics, Scan cost, Authority state reads, Recent event counts,
+// (Metrics, Scan cost, Recent event counts,
 // Outliers) plus the Current Work summary row's Terminal/Events tiles --
-// resetMetrics covers the first three (all backed by the same
+// resetMetrics covers the first two (all backed by the same
 // queue-wakeup-metrics storage), clearEventHistogram is tab-local only,
 // clearCoordinatorTerminalStats (the worker) stamps the dashboard-side
 // cutoff Terminal reads against (see COORDINATOR_STATS_CLEARED_AT_KEY in
@@ -1371,7 +1359,6 @@ function render() {
     const secondsPerAlreadyBlocked = rememberTimingTile('secondsPerAlreadyBlocked', timingEpochStartedAt, getSecondsPerAlreadyBlocked(timingEpochStartedAt))
     const activationHandoff = rememberTimingTile('activationHandoff', timingEpochStartedAt, getActivationHandoffSeconds(timingEpochStartedAt))
     const failedCount = getQueueStatusCount('failed', queueItems)
-    const canceledCount = getQueueStatusCount('canceled', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
     const {eligible: retryableFailedCount, exhausted: exhaustedRetryableFailedCount} = getSoftFailRetryCounts(queueItems)
     const hardFailedCount = Math.max(0, failedCount - retryableFailedCount)
@@ -1440,7 +1427,6 @@ function render() {
     renderEvents()
     renderWakeupMetrics(queueItems)
     renderScanCostHistogram()
-    renderAuthorityLoadHistogram()
     renderEventHistogram()
     renderPhaseTimingHistogram()
     renderWriteSizeHistogram()
@@ -1448,7 +1434,6 @@ function render() {
     renderOutliers()
     renderDashboardBottomBar(queueItems)
     syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
-    syncRequeueFailedControls(failedCount + canceledCount)
     syncCurrentWorkPauseControls(queueItems)
     syncStartCoordinatorControls()
     syncLastEnqueueSummary()
@@ -1626,14 +1611,6 @@ function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exha
     const hasPendingWork = hasPendingCoordinatorQueueWork(queueItems) || hasRawPendingCoordinatorQueueWork()
     const hasActiveWork = hasActiveCoordinatorQueueWork(queueItems) || hasRawActiveCoordinatorQueueWork()
     const waitText = getRetryFailedWorkWaitText({hasPendingWork, hasActiveWork})
-    const button = document.getElementById('retryFailedButton')
-    if(button) {
-        button.textContent = retryFailedActive ? 'Disable Retry Soft-Fails' : 'Enable Retry Soft-Fails'
-        button.setAttribute('aria-pressed', retryFailedActive ? 'true' : 'false')
-        setMuteBlockHelp(button, retryFailedActive ? 'Turn soft-fail retry off' : 'Turn soft-fail retry on')
-        button.disabled = false
-    }
-
     const lastReason = retryFailedLastResult?.reason || ''
     let stateText = ''
     if(retryFailedActive && waitText) {
@@ -1681,45 +1658,6 @@ function getRetryFailedWorkWaitText({hasPendingWork = false, hasActiveWork = fal
     return 'queued work is waiting to start'
 }
 
-function syncRequeueFailedControls(requeueableCount = 0) {
-    const button = document.getElementById('requeueFailedButton')
-    if(!button) return
-
-    button.disabled = requeueableCount <= 0
-    setMuteBlockHelp(button, requeueableCount > 0
-        ? `Reset and requeue ${requeueableCount} failed/canceled Current Work job${requeueableCount === 1 ? '' : 's'}`
-        : 'No failed or canceled Current Work jobs to requeue')
-}
-
-async function requeueFailed() {
-    const items = getDisplayQueueItems()
-    const requeueableCount = getQueueStatusCount('failed', items) + getQueueStatusCount('canceled', items)
-    if(requeueableCount <= 0) {
-        retryFailedLastResult = {reason: 'no-failed-current-work'}
-        render()
-        return
-    }
-
-    const button = document.getElementById('requeueFailedButton')
-    if(button) button.disabled = true
-    retryFailedLastResult = {reason: 'requeueing-failed'}
-    render()
-
-    const result = await sendRuntimeMessageWithTimeout({
-        action: 'requeue-coordinator-failed'
-    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
-        error: error?.message || `${error || ''}`
-    }))
-
-    retryFailedLastResult = {
-        reason: result?.error
-            ? 'requeue-failed'
-            : `requeued-${Number.parseInt(result?.selected, 10) || 0}`
-    }
-    await loadState()
-    render()
-}
-
 async function cancelCurrentWorkItem(item = {}) {
     if(!isPendingQueueStatus(`${item?.status || ''}`.trim())) return
 
@@ -1746,33 +1684,6 @@ async function cancelCurrentWorkItem(item = {}) {
     render()
 }
 
-async function requeueFailedItem(item = {}) {
-    const itemStatus = `${item?.status || ''}`
-    if(itemStatus !== 'failed' && itemStatus !== 'canceled') return
-
-    const storageKey = `${item.storageKey || ''}`.trim()
-    const profileHref = getQueueItemHref('', item)
-    retryFailedLastResult = {reason: 'requeueing-one-failed'}
-    render()
-
-    const result = await sendRuntimeMessageWithTimeout({
-        action: 'requeue-coordinator-failed',
-        storageKey,
-        coordinatorKey: storageKey,
-        profileHref
-    }, null, COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS).catch(error => ({
-        error: error?.message || `${error || ''}`
-    }))
-
-    retryFailedLastResult = {
-        reason: result?.error
-            ? 'requeue-failed'
-            : `requeued-${Number.parseInt(result?.selected, 10) || 0}`
-    }
-    await loadState()
-    render()
-}
-
 function getPendingCurrentWorkItems() {
     return getDisplayQueueItems().filter(item => isPendingQueueStatus(`${item?.status || ''}`.trim()))
 }
@@ -1781,7 +1692,6 @@ function syncCurrentWorkPauseControls(queueItems = []) {
     const pendingCount = queueItems.filter(item => isPendingQueueStatus(`${item?.status || ''}`.trim())).length
     const pauseButton = document.getElementById('pauseCurrentWorkButton')
     const pauseState = document.getElementById('pauseCurrentWorkState')
-    const cancelButton = document.getElementById('cancelCurrentWorkButton')
     const pausePending = currentWorkPausePending === 'pause'
     const resumePending = currentWorkPausePending === 'resume'
 
@@ -1815,13 +1725,6 @@ function syncCurrentWorkPauseControls(queueItems = []) {
         pauseState.classList.toggle('pause-state--paused', state.paused && !pausePending && !resumePending)
         pauseState.classList.toggle('pause-state--pending', pausePending || resumePending)
         pauseState.classList.toggle('pause-state--running', !state.paused && !pausePending && !resumePending)
-    }
-
-    if(cancelButton) {
-        cancelButton.disabled = pendingCount <= 0
-        setMuteBlockHelp(cancelButton, pendingCount > 0
-            ? `Cancel ${pendingCount} pending Current Work job${pendingCount === 1 ? '' : 's'}`
-            : 'No pending Current Work to cancel')
     }
 
     const clearButton = document.getElementById('clearCurrentWorkButton')
@@ -1910,8 +1813,6 @@ async function cancelCurrentWork() {
         return
     }
 
-    const button = document.getElementById('cancelCurrentWorkButton')
-    if(button) button.disabled = true
     retryFailedLastResult = {reason: 'canceling-current-work'}
     render()
 
@@ -1963,6 +1864,9 @@ async function clearCurrentWork() {
     render()
 }
 
+// No dashboard control calls this now (the Enable/Disable Retry Soft-Fails
+// button was removed). Kept, with stopRetryFailed and the storage key, so the
+// soft-fail retry capability can come back without rebuilding it.
 async function toggleRetryFailed() {
     if(retryFailedActive) {
         stopRetryFailed('stopped')
@@ -2571,7 +2475,6 @@ function renderWakeupMetrics(queueItems = []) {
                 title: 'Whether the scheduler is deliberately backing off queued-tab activity (e.g. after slow/unscriptable tabs or Cloudflare challenges). Concerning if this stays "active" for more than a couple of QUEUE_LOAD_THROTTLE_MAX_MS windows (120s each, escalating) -- that means whatever tripped it keeps recurring rather than clearing.'
             }),
             buildMetricCard('Wakeups/job', jobs ? formatRatio(wakeups / jobs) : '--', `${wakeups} wakeups / ${jobs} enqueued`, {
-                alert: jobs > 0 && (wakeups / jobs) > 3,
                 title: 'Nudges + pump requests + reconciles per enqueued job -- how many scheduler wakeups it takes to move work through the queue. Concerning if this trends well above 2-3x enqueued jobs; that suggests the scheduler is being woken repeatedly without making proportional progress.'
             }),
             buildMetricCard('Nudge accept', nudgeDispatched ? formatPercent(nudgeAccepted / nudgeDispatched) : '--', `${nudgeAccepted} / ${nudgeDispatched} dispatched (${nudgeCoalesced} coalesced, not counted)`, {
@@ -2645,16 +2548,6 @@ function renderWakeupMetrics(queueItems = []) {
                 title: 'Breaks Storage timeouts down by where in the read/write cycle they happened. Concerning if "unknown" is a large share -- that means a timeout is happening somewhere this breakdown can\'t attribute, which is itself worth investigating.'
             }),
             buildMetricCard('No-work writes', `${storageNoDurableWork}`, `${storageNoRuntimeWork} no runtime; ${storageNoDurableWork} no durable`, {
-                // 2026-09-27: a paused queue (or one with nothing pending)
-                // legitimately racks up "no durable work" cycles just from
-                // periodic polling and reconcile ticks -- that's expected,
-                // not a problem, and lighting this up red while paused was
-                // actively misleading (confirmed live: a several-hour idle
-                // stretch with the dashboard open drove this to a high
-                // ratio on its own, via the dashboard poll fixed above).
-                // Only alert when the queue is actually supposed to be
-                // busy.
-                alert: !state.paused && storageStarted > 0 && (storageNoDurableWork / storageStarted) > 0.5,
                 title: 'Storage updates that ran and found nothing durable to persist. Expect a high share of these whenever the queue is paused or has nothing pending -- that alone drives this up with no problem behind it. Concerning only while the queue is actually running and this still dominates total storage updates, since each one still pays the full serialized-queue cost for no benefit.'
             }),
             buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait), {
@@ -2986,8 +2879,7 @@ function renderQueue(items) {
             buildQueueCancelCell(item),
             buildBadge(item.status || 'unknown', `${item.status || ''}`.trim() === 'failed' ? (item.error || item.outcome || '') : ''),
             buildTextCell(item.outcome || item.error || '', getOutcomeHelp(item.outcome || item.error || '')),
-            buildQueueTimingCell(item),
-            buildQueueActionCell(item)
+            buildQueueTimingCell(item)
         )
         return row
     }), state.loading ? 'Loading history...' : 'No current work yet.')
@@ -3214,27 +3106,6 @@ function buildQueueCancelCell(item = {}) {
         event.preventDefault()
         button.disabled = true
         void cancelCurrentWorkItem(item)
-    })
-    cell.appendChild(button)
-    return cell
-}
-
-function buildQueueActionCell(item = {}) {
-    const cell = document.createElement('div')
-    cell.className = 'row-action-cell'
-
-    const itemStatus = `${item?.status || ''}`
-    if(itemStatus !== 'failed' && itemStatus !== 'canceled') return cell
-
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'clear-button row-action-button'
-    button.textContent = 'Requeue'
-    setMuteBlockHelp(button, `Reset and requeue this ${itemStatus} Current Work item`)
-    button.addEventListener('click', event => {
-        event.preventDefault()
-        button.disabled = true
-        void requeueFailedItem(item)
     })
     cell.appendChild(button)
     return cell
@@ -3649,33 +3520,6 @@ function renderScanCostHistogram() {
 
     scanData.sort((a, b) => b.value - a.value)
     renderHorizontalHistogram(container, scanData)
-}
-
-function renderAuthorityLoadHistogram() {
-    const container = document.getElementById('authorityLoadHistogram')
-    if(!container) return
-
-    const metricsDocument = state.metrics || {}
-    const counters = (metricsDocument.currentEpoch || metricsDocument).counters || {}
-
-    // authorityLoad.<verb>.<from>.calls -- calls of interest to the
-    // coordinator-authority-state accessors, not flight-recorder events.
-    const authorityLoadData = []
-    Object.keys(counters).forEach(key => {
-        const match = key.match(/^authorityLoad\.([^.]+)\.(.+)\.calls$/)
-        if(!match) return
-        const [, verb, from] = match
-        const callsCount = getMetricCounter(counters, key)
-        if(callsCount <= 0) return
-        authorityLoadData.push({
-            label: `${verb}: ${from}`,
-            value: callsCount,
-            detail: `${callsCount} call${callsCount === 1 ? '' : 's'}`
-        })
-    })
-
-    authorityLoadData.sort((a, b) => b.value - a.value)
-    renderHorizontalHistogram(container, authorityLoadData)
 }
 
 function renderEventHistogram() {
