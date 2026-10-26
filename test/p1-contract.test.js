@@ -1479,13 +1479,15 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.ok(metricsIndex < runsIndex, 'metrics sits above runs')
     assert.ok(runsIndex < eventsIndex)
     assert.match(html, /Showing 0, 0 queued, 0 succeeded, 0 soft-fail, 0 hard-fail/)
-    assert.match(html, /id="pauseCurrentWorkState">Running[\s\S]*id="currentWorkReadyCount"[\s\S]*id="startCoordinatorButton"[\s\S]*id="pauseCurrentWorkButton"[\s\S]*id="cancelCurrentWorkButton"[\s\S]*id="requeueFailedButton"[\s\S]*id="retryFailedButton"/)
+    assert.match(html, /id="pauseCurrentWorkState">Running[\s\S]*id="currentWorkReadyCount"[\s\S]*id="startCoordinatorButton"[\s\S]*id="pauseCurrentWorkButton"[\s\S]*id="clearCurrentWorkButton"/)
     assert.match(html, />Queued<\/div>/)
     assert.doesNotMatch(html, /Ready to Run/)
     assert.match(html, /Start/)
-    assert.match(html, />Requeue</)
-    assert.match(html, /Cancel Queue/)
-    assert.match(html, /Enable Retry Soft-Fails/)
+    assert.doesNotMatch(html, />Requeue</)
+    assert.doesNotMatch(html, /Cancel Queue/)
+    assert.doesNotMatch(html, /Enable Retry Soft-Fails|id="retryFailedButton"|id="requeueFailedButton"|id="cancelCurrentWorkButton"/)
+    assert.match(html, /id="clearCurrentWorkButton" type="button"[^>]*>Clear</)
+    assert.match(html, /id="workerBarCancel"/)
     assert.doesNotMatch(html, /Requeue Failed|Cancel Current Work|Idle Retry/)
     assert.match(dashboard, /startCoordinatorQueue\(\)/)
     assert.match(dashboard, /allowBeforeQuora: true/)
@@ -1502,7 +1504,11 @@ test('dashboard layout keeps current work first and panel blocks wheel-scroll th
     assert.match(dashboard, /const hardFailedCount = Math\.max\(0, failedCount - retryableFailedCount\)/)
     assert.match(dashboard, /setText\('currentWorkReadyCount', getCurrentWorkSummaryText\(queueItems, \{[\s\S]*queuedCount,[\s\S]*succeededCount,[\s\S]*retryableFailedCount,[\s\S]*hardFailedCount/)
     assert.match(dashboard, /Showing \$\{listedCount\} of \$\{totalCount\}/)
-    assert.match(dashboard, /button\.textContent = retryFailedActive \? 'Disable Retry Soft-Fails' : 'Enable Retry Soft-Fails'/)
+    assert.doesNotMatch(dashboard, /getElementById\('retryFailedButton'\)/)
+    assert.doesNotMatch(dashboard, /Enable Retry Soft-Fails/)
+    // Capability kept (no button): toggle and the storage key stay.
+    assert.match(dashboard, /async function toggleRetryFailed\(\)/)
+    assert.match(dashboard, /\[COORDINATOR_RETRY_FAILED_ENABLED_KEY\]: true/)
     assert.doesNotMatch(dashboard, /eligible \/ \$\{failedCount\} failed/)
     assert.doesNotMatch(dashboard, /button\.textContent = 'Idle Retry'/)
     assert.match(css, /grid-template-rows: auto auto;/)
@@ -1554,7 +1560,7 @@ test('current work clear button cancels and removes every row, and the epoch sta
     const events = readRepoFile('shared/js/swQueueMachineEvents.js')
     const handlers = readRepoFile('shared/js/swQueueMachineHandlers.js')
 
-    assert.match(html, /id="cancelCurrentWorkButton"[\s\S]*id="clearCurrentWorkButton"/)
+    assert.match(html, /id="pauseCurrentWorkButton"[\s\S]*id="clearCurrentWorkButton"/)
     assert.match(html, /id="clearCurrentWorkButton" type="button"[^>]*>Clear</)
 
     const clearBody = extractFunction(dashboard, 'async function clearCurrentWork()')
@@ -1809,15 +1815,36 @@ test('dashboard current-work list shows queued rows in real dispatch order, not 
     assert.deepEqual(orderedKeys, ['front-of-line', 'recently-added'])
 })
 
-test('dashboard bulk requeue uses compact failed count beyond displayed rows', () => {
+test('dashboard has no requeue control; Clear is the only Current Work reset', () => {
     const dashboard = readRepoFile('shared/js/coordinator.js')
-    const body = extractFunction(dashboard, 'async function requeueFailed()')
+    const html = readRepoFile('shared/coordinator.html')
 
-    assert.match(body, /const items = getDisplayQueueItems\(\)/)
-    assert.match(body, /getQueueStatusCount\('failed', items\)/)
-    assert.match(body, /getQueueStatusCount\('canceled', items\)/)
-    assert.doesNotMatch(body, /filter\(item => item\?\.status === 'failed'\)/)
-    assert.match(body, /action: 'requeue-coordinator-failed'/)
+    assert.doesNotMatch(dashboard, /requeue-coordinator-failed/)
+    assert.doesNotMatch(dashboard, /requeueFailed|syncRequeueFailedControls|buildQueueActionCell/)
+    assert.doesNotMatch(html, /requeueFailedButton|>Requeue</)
+    assert.match(dashboard, /action: 'clear-coordinator-current-work'/)
+})
+
+test('dashboard drops the authority-state-reads panel and the Wakeups and No-work red alerts', () => {
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const html = readRepoFile('shared/coordinator.html')
+
+    assert.doesNotMatch(html, /authorityLoadHistogram|Authority state reads/)
+    assert.doesNotMatch(dashboard, /renderAuthorityLoadHistogram|clearAuthorityLoadHistogramButton/)
+
+    const cardSource = (start, end) => {
+        const from = dashboard.indexOf(start)
+        const to = dashboard.indexOf(end, from + 1)
+        assert.ok(from >= 0 && to > from, 'card not found: ' + start)
+        return dashboard.slice(from, to)
+    }
+    const wakeupsCard = cardSource("buildMetricCard('Wakeups/job'", "buildMetricCard('Nudge accept'")
+    const noWorkCard = cardSource("buildMetricCard('No-work writes'", "buildMetricCard('Storage queue wait'")
+    assert.doesNotMatch(wakeupsCard, /alert:/)
+    assert.doesNotMatch(noWorkCard, /alert:/)
+    // values and labels stay
+    assert.match(wakeupsCard, /formatRatio\(wakeups \/ jobs\)/)
+    assert.match(noWorkCard, /\$\{storageNoDurableWork\}/)
 })
 
 test('dashboard queued rows expose per-item cancel before status', () => {
@@ -4862,8 +4889,9 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
 
     assert.match(html, /id="pauseCurrentWorkButton"/)
     assert.match(html, /id="pauseCurrentWorkState"/)
-    assert.match(html, /id="cancelCurrentWorkButton"/)
-    assert.match(html, /Cancel Queue/)
+    assert.doesNotMatch(html, /id="cancelCurrentWorkButton"/)
+    assert.doesNotMatch(html, /Cancel Queue/)
+    assert.match(html, /id="workerBarCancel"/)
     assert.match(dashboard, /resume-paused-coordinator-nukes/)
     assert.match(dashboard, /cancel-coordinator-current-work/)
     assert.match(dashboard, /cancel-coordinator-current-work-item/)
@@ -4915,7 +4943,7 @@ test('dashboard has reversible pause and explicit current work cancel', () => {
     assert.match(cancelBody, /coordinatorPauseRequested = true/)
     assert.match(cancelBody, /setCoordinatorPauseControlState\(true, pauseGeneration, 'ordinaryMutation'\)/)
     assert.match(cancelBody, /shouldContinueSync: \(\) => isCoordinatorPauseGenerationLocallyCurrent\(pauseGeneration\)/)
-    // Cancel Queue stops the *current* work; it should not leave the
+    // Cancel (the header button, via cancelCurrentWork) stops the *current* work; it should not leave the
     // coordinator indefinitely unable to pick up anything new afterward.
     // The pause set above is only a teardown-safety guard for the duration
     // of the cancel itself (so a resume/new-queue race can't sneak in
