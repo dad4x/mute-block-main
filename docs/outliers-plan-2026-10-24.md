@@ -1,6 +1,6 @@
 # Outliers: recording limit and related events (24 Oct 2026)
 
-> **Status: ROADMAP** (24 Oct 2026). Plan for the outlier list: a recording limit, and the flight recorder events kept with each kept outlier until it is cleared. Decisions made: the limit (3.5 seconds or more, tentative wording); the average counts all rows (its effect on the spread test is open); the scope of related events (the same target profile, tentative, plus storage and checkpoint writes inside the span); storage (the events persist with their outlier until Clear); the list shows terminal rows only; the records are for diagnostics and root-cause analysis, not audit. Nothing is built or changed in code, and there is no version bump, build or change to the live run. Not scheduled. If features go first, the tuning items (section 5, questions 1 and 2, and the heartbeat) may be parked (owner, 24 Oct); the duration accounting fix (section 8a) is the near-term correctness item. Check [planning.md](../planning.md) before acting on it. Register: [notes register](../docs/notes-register.md).
+> **Status: BUILT in the worktree lane (25 Oct 2026), not built to a package.** Section 10 lists what was built and the choices made on the section 5 questions. Earlier, 24 Oct: Plan for the outlier list: a recording limit, and the flight recorder events kept with each kept outlier until it is cleared. Decisions made: the limit (3.5 seconds or more, tentative wording); the average counts all rows (its effect on the spread test is open); the scope of related events (the same target profile, tentative, plus storage and checkpoint writes inside the span); storage (the events persist with their outlier until Clear); the list shows terminal rows only; the records are for diagnostics and root-cause analysis, not audit. Nothing is built or changed in code, and there is no version bump, build or change to the live run. Not scheduled. If features go first, the tuning items (section 5, questions 1 and 2, and the heartbeat) may be parked (owner, 24 Oct); the duration accounting fix (section 8a) is the near-term correctness item. Check [planning.md](../planning.md) before acting on it. Register: [notes register](../docs/notes-register.md).
 
 Facts are from the code as read on 24 Oct. Line numbers move, so search by name.
 
@@ -147,3 +147,12 @@ Smaller points, decided by default until the owner says otherwise: storage-updat
 
 - [Flight recorder display plan](flight-recorder-display-plan-2026-10-24.md): subject model (D2), detail view (D4), the phase 1 worker filter, storage principle (section 9).
 - [planning.md](../planning.md): decided items 5 to 8, loose ends 33 to 35.
+
+## 10. Built (25 Oct 2026)
+
+- **Recording limit.** A flagged row is recorded only at 3.5 seconds (OUTLIER_MIN_RECORD_MS in tunables.js). Every finished row still counts toward the baseline. Future rows only.
+- **Listing.** Only finished rows are listed. Running rows are not judged or served; the dashboard shows the Events count for each listed outlier.
+- **Recorder events.** When a row is terminal, the recorder is scanned once, and a row at the recording limit or more keeps: the events of its target profile (any time, exact normalized address), and the storage-write and queue checkpoint switch events inside its span. The events are stored inside the outlier entry in mbCoordinatorOutliers, so they persist until Clear or until the entry leaves the newest-50 list. No new storage key.
+- **Dashboard.** Each listed outlier has an Events button. The first expand reads the events from the worker (get-coordinator-outlier-events), and the page keeps them until Clear. Each event is drawn as a flight recorder row, with its fields as hover text.
+- **Section 5 choices.** (1) Baseline window: not built; the baseline stays cumulative, the simplest option, until the owner picks a decayed or capped statistic. (2) Row timeout: not built (Phase 3 needs a yes). (3) Working-tab subject: none, as settled on 24 Oct; events match by profile only.
+- **Not built.** Full field view per event beyond hover text (Phase 4 click view); events are copied only when the row terminates, as the plan says.

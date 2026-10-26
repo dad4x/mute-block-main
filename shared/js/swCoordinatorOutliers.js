@@ -2,24 +2,35 @@
 //
 // The baseline is a running statistic (IncrementalStats, Welford), not a population. Each finished row is pushed into it exactly once,
 // when its archive write is saved, and it is judged just before that push, against the baseline as it stood then, so a row never
-// inflates its own baseline. A finished row over the threshold is stored as a final outlier entry. Nothing is recomputed from the rows
-// on the dashboard.
+// inflates its own baseline. A finished row over the threshold is stored as an outlier entry. Nothing is recomputed from the rows
+// on the dashboard, and only finished rows are listed: a running row is not judged.
 //   - a finished row's duration is terminalAt minus activeAt, when both are positive; any other row is neither pushed nor judged;
 //   - a row is flagged when its duration reaches the 45-second floor, or the stddev threshold (mean + 2.5 sigma) once
 //     OUTLIER_MIN_SAMPLES_FOR_STDDEV rows have been pushed;
-//   - an active row is judged at each dashboard refresh against the current threshold. That judgement is served, but it is neither
-//     pushed nor stored: its status is decided when the row finishes;
+//   - a flagged row is recorded only at OUTLIER_MIN_RECORD_MS or more (owner, 24 Oct). Every finished row is still pushed;
+//   - a recorded entry keeps the flight recorder events that belong to it: the events of its target profile, and the storage and
+//     checkpoint writes inside its span. They are copied once, when the row is terminal, and kept until the entry leaves the list;
 //   - the stored list keeps its newest OUTLIER_MAX_ENTRIES entries;
 //   - Clear Outliers dismisses the listed attempts and keeps the baseline; Clear All Stats resets the baseline and the dismissals.
 // The stored record is {entries, baseline: {n, mean, M2}, dismissedKeys}. sw.js persists it under its own namespace key, in the same
 // door write as the archive that pushes the row, so it survives a worker restart. This module does no storage I/O and reads no clock:
-// the caller passes the times and the active-status test.
+// the caller passes the times, the recorder events and the scan of the recorder.
 const {
     OUTLIER_FLOOR_MS,
     OUTLIER_MAX_ENTRIES,
+    OUTLIER_MIN_RECORD_MS,
     OUTLIER_MIN_SAMPLES_FOR_STDDEV,
     OUTLIER_STDDEV_MULTIPLIER
 } = require('./tunables')
+
+// The recorder kinds that belong to an outlier by its span, whatever their profile: the disk writes and the queue checkpoint switches,
+// which can perturb a row. Storage-update settle records, pause, dashboard and store-size events are left out (plan, section 2).
+// Each kind is recorded at a call site in sw.js or swstorage.js; test/swSynthetic.test.js checks that each one is still recorded.
+const OUTLIER_SPAN_EVENT_KINDS = new Set([
+    'storage-write',
+    'queue-wal-checkpoint-switch-start',
+    'queue-wal-checkpoint-switch-result'
+])
 
 function toInteger(value) {
     return Number.parseInt(value, 10) || 0
@@ -82,6 +93,11 @@ function getCoordinatorOutlierAttemptId(item = {}) {
     return `${item?.attemptId || ''}`.trim()
 }
 
+// The profile an outlier belongs to, as the row names it (not normalized). The recorder matches its own normalized copy of it.
+function getCoordinatorOutlierTargetUrl(item = {}) {
+    return toText(item?.targetProfileHref || item?.requestedUrl || getCoordinatorOutlierRowKey(item))
+}
+
 function makeCoordinatorOutlierDismissalKey(rowKey = '', attemptId = '') {
     return `${rowKey}|${attemptId}`
 }
@@ -98,9 +114,11 @@ function getCoordinatorOutlierFinishedDuration(item = {}) {
     return activeAt > 0 && terminalAt > activeAt ? terminalAt - activeAt : 0
 }
 
-// The flag test. The floor always applies. The stddev threshold applies once OUTLIER_MIN_SAMPLES_FOR_STDDEV rows have been pushed.
-// Returns the reason the duration is flagged for, or '' when it is not flagged.
+// The flag test. The floor always applies. The stddev threshold applies once OUTLIER_MIN_SAMPLES_FOR_STDDEV rows have been pushed. A
+// duration under OUTLIER_MIN_RECORD_MS is never flagged, whichever test it would pass. Returns the reason the duration is flagged for, or
+// '' when it is not flagged.
 function getCoordinatorOutlierThresholdReason(stats, durationMs) {
+    if(durationMs < OUTLIER_MIN_RECORD_MS) return ''
     const exceedsAbsolute = durationMs >= OUTLIER_FLOOR_MS
     const exceedsStdDev = stats.count >= OUTLIER_MIN_SAMPLES_FOR_STDDEV &&
         durationMs >= stats.mean + OUTLIER_STDDEV_MULTIPLIER * stats.sampleStdev
@@ -125,12 +143,14 @@ function normalizeOutlierEntry(entry = {}) {
         thresholdReason: toText(entry.thresholdReason),
         meanDurationMsAtCapture: toNumber(entry.meanDurationMsAtCapture),
         stdDevMsAtCapture: toNumber(entry.stdDevMsAtCapture),
-        capturedAt: toInteger(entry.capturedAt)
+        capturedAt: toInteger(entry.capturedAt),
+        events: Array.isArray(entry.events) ? entry.events.filter(event => event && typeof event === 'object') : []
     }
 }
 
 // Any stored value becomes a well-formed record: a missing or malformed value is an empty list with an empty baseline. A record written
-// before the accumulator has no n, mean or M2, so its baseline starts at zero.
+// before the accumulator has no n, mean or M2, so its baseline starts at zero. A record written before the recorder events existed has
+// no events, so its entries read as empty.
 function normalizeCoordinatorOutliersRecord(value = null) {
     const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
     const entries = Array.isArray(source.entries) ? source.entries : []
@@ -144,18 +164,18 @@ function normalizeCoordinatorOutliersRecord(value = null) {
     }
 }
 
-// The record sw.js keeps as its base: the stored record with only its decided (final) outliers. An active judgement is never stored
-// (judgeCoordinatorOutlierActiveRows), so a non-final entry found in storage is dropped here.
+// The record sw.js keeps as its base: the stored record with only its listed (final) entries. A non-final entry found in storage is
+// dropped here, since only finished rows are listed.
 function toCoordinatorOutlierBaseRecord(value = null) {
     const record = normalizeCoordinatorOutliersRecord(value)
     return {...record, entries: record.entries.filter(entry => entry.final)}
 }
 
-// The stored entry for a row, from the row's fields. thresholdReason, final and the baseline the row was judged against are given by the caller.
+// The stored entry for a row, from the row's fields. thresholdReason and the baseline the row was judged against are given by the caller.
 function makeCoordinatorOutlierEntry(item = {}, fields = {}) {
     return normalizeOutlierEntry({
         rowKey: getCoordinatorOutlierRowKey(item),
-        targetUrl: item.targetProfileHref || item.requestedUrl || getCoordinatorOutlierRowKey(item),
+        targetUrl: getCoordinatorOutlierTargetUrl(item),
         runId: item.runId || '',
         attemptId: getCoordinatorOutlierAttemptId(item),
         attemptNumber: item.attemptNumber,
@@ -164,11 +184,12 @@ function makeCoordinatorOutlierEntry(item = {}, fields = {}) {
         outcome: item.outcome || item.error || '',
         activeAt: item.activeAt,
         terminalAt: item.terminalAt,
-        final: fields.final === true,
+        final: true,
         thresholdReason: fields.thresholdReason,
         meanDurationMsAtCapture: Math.round(fields.mean),
         stdDevMsAtCapture: Math.round(fields.stdDev),
-        capturedAt: fields.capturedAt
+        capturedAt: fields.capturedAt,
+        events: fields.events
     })
 }
 
@@ -177,11 +198,44 @@ function keepNewestCoordinatorOutlierEntries(entries = []) {
     return entries.length > OUTLIER_MAX_ENTRIES ? entries.slice(-OUTLIER_MAX_ENTRIES) : entries
 }
 
+// The scope a recorder event is matched against: the profile, and the row's span.
+function makeCoordinatorOutlierScope(item = {}, normalizeTargetUrl = value => value) {
+    return {
+        targetUrl: normalizeTargetUrl(getCoordinatorOutlierTargetUrl(item)),
+        activeAt: toInteger(item.activeAt),
+        terminalAt: toInteger(item.terminalAt)
+    }
+}
+
+// True when a recorder event belongs to an outlier's scope: it is for the same target profile (exact match on the normalized address),
+// or it is a span kind (a disk write or checkpoint switch) inside the span. Pure.
+function isCoordinatorOutlierRecorderEventInScope(event = {}, scope = {}) {
+    if(scope.targetUrl && event.targetUrl === scope.targetUrl) return true
+    if(!OUTLIER_SPAN_EVENT_KINDS.has(event.kind)) return false
+    const at = toInteger(event.at)
+    return at >= scope.activeAt && at <= scope.terminalAt
+}
+
+// The recorder events kept with each finished row that may be recorded: the rows at OUTLIER_MIN_RECORD_MS or more, each with its events.
+// scanRecorder(predicate) returns the recorder's matching events in order; it is the only read of the recorder, and it is made once per
+// such row here, at the terminal time. normalizeTargetUrl is the recorder's own normalization of a target address. Returns a Map from
+// the row's dismissal key to its events.
+function collectCoordinatorOutlierRecorderEvents(rows = [], scanRecorder = () => [], normalizeTargetUrl = value => value) {
+    const eventsByKey = new Map()
+    for(const row of rows) {
+        if(getCoordinatorOutlierFinishedDuration(row) < OUTLIER_MIN_RECORD_MS) continue
+        const scope = makeCoordinatorOutlierScope(row, normalizeTargetUrl)
+        const events = scanRecorder(event => isCoordinatorOutlierRecorderEventInScope(event, scope))
+        eventsByKey.set(getCoordinatorOutlierDismissalKey(row), Array.isArray(events) ? events : [])
+    }
+    return eventsByKey
+}
+
 // Judges and pushes finished rows, in the order given. Each row is judged against the baseline before its own push; a flagged row is
 // stored as a final entry (a row already stored under its attempt is updated in place); then its duration is pushed. A row without a
-// positive duration is neither judged nor pushed. A dismissed attempt is pushed but not listed. Returns the next record; the input is
-// not changed.
-function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0) {
+// positive duration is neither judged nor pushed. A dismissed attempt is pushed but not listed. recorderEvents is the Map from
+// collectCoordinatorOutlierRecorderEvents: a recorded entry takes the events of its row. Returns the next record; the input is not changed.
+function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0, recorderEvents = new Map()) {
     const now = toInteger(nowMs)
     const next = normalizeCoordinatorOutliersRecord(record)
     const stats = new IncrementalStats(next.baseline)
@@ -195,14 +249,14 @@ function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0
         const key = getCoordinatorOutlierDismissalKey(item)
         if(thresholdReason && getCoordinatorOutlierRowKey(item) && !dismissed.has(key)) {
             const entry = makeCoordinatorOutlierEntry(item, {
-                final: true,
                 thresholdReason,
                 mean: stats.mean,
                 stdDev: stats.sampleStdev,
-                capturedAt: now
+                capturedAt: now,
+                events: recorderEvents.get(key) || []
             })
             const existing = entries.find(candidate => makeCoordinatorOutlierDismissalKey(candidate.rowKey, candidate.attemptId) === key)
-            if(existing) Object.assign(existing, {...entry, capturedAt: existing.capturedAt})
+            if(existing) Object.assign(existing, {...entry, capturedAt: existing.capturedAt, events: entry.events.length ? entry.events : existing.events})
             else entries.push(entry)
         }
         stats.push(durationMs)
@@ -214,76 +268,29 @@ function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0
     }
 }
 
-// The active rows, judged at this refresh against the current threshold. An active row's duration is nowMs minus activeAt. A row that
-// has a terminalAt is not judged here: it is judged when it archives. A dismissed attempt, or one already stored as final, is not
-// listed. Returns the judgements, which are served and never stored. options.previous keeps the capture time of an unchanged judgement.
-function judgeCoordinatorOutlierActiveRows(record = null, items = [], options = {}) {
-    const nowMs = toInteger(options.nowMs)
-    const isActive = typeof options.isActive === 'function' ? options.isActive : () => false
+// The list as the dashboard shows it: the stored outliers, newest last. Each entry is served with its duration and the number of recorder
+// events it keeps; the events themselves are served by getCoordinatorOutlierEvents, on request.
+function serveCoordinatorOutliers(record = null) {
     const normalized = normalizeCoordinatorOutliersRecord(record)
-    const stats = new IncrementalStats(normalized.baseline)
-    const dismissed = new Set(normalized.dismissedKeys)
-    const finalKeys = new Set(
-        normalized.entries
-            .filter(entry => entry.final)
-            .map(entry => makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId))
-    )
-    const previousCapturedAt = new Map(
-        (Array.isArray(options.previous) ? options.previous : [])
-            .map(entry => [makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId), toInteger(entry.capturedAt)])
-    )
-    const judged = []
-    for(const item of items) {
-        const activeAt = toInteger(item?.activeAt)
-        if(activeAt <= 0 || toInteger(item?.terminalAt) > 0 || !isActive(item?.status)) continue
-        const durationMs = nowMs - activeAt
-        if(durationMs <= 0) continue
-
-        const rowKey = getCoordinatorOutlierRowKey(item)
-        const key = getCoordinatorOutlierDismissalKey(item)
-        if(!rowKey || dismissed.has(key) || finalKeys.has(key)) continue
-        const thresholdReason = getCoordinatorOutlierThresholdReason(stats, durationMs)
-        if(!thresholdReason) continue
-        judged.push(makeCoordinatorOutlierEntry(item, {
-            final: false,
-            thresholdReason,
-            mean: stats.mean,
-            stdDev: stats.sampleStdev,
-            capturedAt: previousCapturedAt.get(key) || nowMs
-        }))
-    }
-    // Ordered by activeAt, newest activity first, whatever order the live rows came in. A full list keeps its newest entries.
-    judged.sort((left, right) => right.activeAt - left.activeAt || left.rowKey.localeCompare(right.rowKey))
-    return judged.length > OUTLIER_MAX_ENTRIES ? judged.slice(0, OUTLIER_MAX_ENTRIES) : judged
-}
-
-// The list as the dashboard shows it: the stored final outliers, then the active judgements that are not dismissed and not already
-// final. A final entry keeps its fixed duration; an active one runs to the time of the answer.
-function serveCoordinatorOutliers(record = null, activeJudgements = [], nowMs = 0) {
-    const now = toInteger(nowMs)
-    const normalized = normalizeCoordinatorOutliersRecord(record)
-    const dismissed = new Set(normalized.dismissedKeys)
-    const finals = normalized.entries
+    return normalized.entries
         .filter(entry => entry.final)
-        .map(entry => ({...entry, durationMs: entry.terminalAt - entry.activeAt}))
-    const finalKeys = new Set(finals.map(entry => makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId)))
-    const active = (Array.isArray(activeJudgements) ? activeJudgements : [])
-        .map(entry => normalizeOutlierEntry(entry))
-        .filter(entry => {
-            const key = makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId)
-            return !dismissed.has(key) && !finalKeys.has(key)
-        })
-        .map(entry => ({...entry, durationMs: now - entry.activeAt}))
-    return keepNewestCoordinatorOutlierEntries([...finals, ...active])
+        .map(({events, ...entry}) => ({...entry, durationMs: entry.terminalAt - entry.activeAt, eventCount: events.length}))
 }
 
-// Clear Outliers: every listed attempt is dismissed, so no later pass lists it again, and the stored list is emptied. The baseline is kept.
-// extraDismissKeys are the active judgements the page is clearing too.
-function applyCoordinatorOutlierClearEntries(record = null, extraDismissKeys = []) {
+// The recorder events kept with one listed outlier, by its row key and attempt. An unknown attempt has none.
+function getCoordinatorOutlierEvents(record = null, rowKey = '', attemptId = '') {
+    const key = makeCoordinatorOutlierDismissalKey(toText(rowKey), toText(attemptId))
+    const entry = normalizeCoordinatorOutliersRecord(record).entries
+        .find(candidate => candidate.final && makeCoordinatorOutlierDismissalKey(candidate.rowKey, candidate.attemptId) === key)
+    return entry ? entry.events : []
+}
+
+// Clear Outliers: every listed attempt is dismissed, so no later pass lists it again, and the stored list is emptied with its events. The
+// baseline is kept.
+function applyCoordinatorOutlierClearEntries(record = null) {
     const next = normalizeCoordinatorOutliersRecord(record)
     const dismissed = new Set(next.dismissedKeys)
     for(const entry of next.entries) dismissed.add(makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId))
-    for(const key of extraDismissKeys) if(key) dismissed.add(key)
     return {entries: [], baseline: next.baseline, dismissedKeys: [...dismissed]}
 }
 
@@ -305,13 +312,17 @@ function getCoordinatorOutliersRecordSignature(value = null) {
 
 module.exports = {
     IncrementalStats,
+    OUTLIER_SPAN_EVENT_KINDS,
     applyCoordinatorOutlierClearEntries,
     applyCoordinatorOutlierFinishedRows,
     applyCoordinatorOutlierReset,
+    collectCoordinatorOutlierRecorderEvents,
     getCoordinatorOutlierDismissalKey,
+    getCoordinatorOutlierEvents,
     getCoordinatorOutlierFinishedDuration,
+    getCoordinatorOutlierTargetUrl,
     getCoordinatorOutliersRecordSignature,
-    judgeCoordinatorOutlierActiveRows,
+    isCoordinatorOutlierRecorderEventInScope,
     makeCoordinatorOutlierDismissalKey,
     normalizeCoordinatorOutliersRecord,
     pruneCoordinatorOutlierDismissals,

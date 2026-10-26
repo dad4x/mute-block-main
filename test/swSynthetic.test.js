@@ -43311,7 +43311,7 @@ test('a soft error archived before the retry limit existed does not keep its run
 
 // Dashboard outliers, owned by the worker (shared/js/swCoordinatorOutliers.js). The baseline is a running statistic: each finished row
 // is judged, and then pushed, when its archive is saved, and a flagged row is stored as a final outlier. A row is flagged beyond 2.5
-// sigma once five rows have been pushed, or at the 45-second floor. An active row is judged at each refresh and is not stored. Clear
+// sigma once five rows have been pushed, or at the 45-second floor. Only finished rows are listed: a running row is never judged. Clear
 // Outliers keeps the baseline; Clear All Stats resets it. Fixtures are WAL checkpoint state, so the namespace door, its stamp and the
 // session mirror are the real ones.
 const OUTLIER_RECORD_KEY = 'mbCoordinatorOutliers'
@@ -43540,8 +43540,8 @@ test('Clear All Stats clears the stored outlier list and its baseline, and a lat
     const before = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-clear-all-before'})
     assert.deepEqual(
         summarizeOutlierEntries(before.outliers).map(entry => entry.rowKey),
-        [sigmaHref, stuckHref].sort(),
-        'the finished outlier and the active row over the floor are both listed before the clear'
+        [sigmaHref],
+        'the finished outlier is listed; the running row over the floor is not'
     )
 
     const cleared = await browser.runtime.sendMessage({action: 'clear-coordinator-terminal-stats'})
@@ -43551,16 +43551,15 @@ test('Clear All Stats clears the stored outlier list and its baseline, and a lat
     assert.deepEqual(record.baseline, {n: 0, mean: 0, M2: 0}, 'the stored baseline is reset to zero')
     assert.deepEqual(record.dismissedKeys, [], 'Clear All Stats clears the dismissals too')
 
-    // The finished outlier is not judged again: its row has archived. The active row is still over the floor, and the reset has cleared
-    // the dismissals, so this refresh judges it again and lists it.
+    // Only finished rows are listed, so the running row is not listed after the clear either.
     const after = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-clear-all-after'})
     assert.deepEqual(
         summarizeOutlierEntries(after.outliers).map(entry => entry.rowKey),
-        [stuckHref],
-        'the cleared finished outlier does not come back; the active row is judged again'
+        [],
+        'the cleared finished outlier does not come back'
     )
     const again = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-clear-all-again'})
-    assert.deepEqual(summarizeOutlierEntries(again.outliers).map(entry => entry.rowKey), [stuckHref], 'a second refresh lists the same active row')
+    assert.deepEqual(summarizeOutlierEntries(again.outliers).map(entry => entry.rowKey), [], 'a second refresh lists nothing')
 })
 
 test('a row that archives to the completed log updates the stored outlier list with no dashboard open', async () => {
@@ -43609,7 +43608,7 @@ test('Clear Outliers clears the stored list through the worker, and the cleared 
     await sw.loadCoordinatorOutliersRecord()
     await archiveOutlierRows(sw, [...normalHrefs, sigmaHref])
     const before = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-clear-list-before'})
-    assert.equal(summarizeOutlierEntries(before.outliers).length, 2, 'the finished outlier and the active row are listed before Clear Outliers')
+    assert.equal(summarizeOutlierEntries(before.outliers).length, 1, 'the finished outlier is listed before Clear Outliers; the running row is not')
 
     const cleared = await browser.runtime.sendMessage({action: 'clear-coordinator-outliers'})
     assert.deepEqual(plainCopy(cleared.outliers), [], 'the worker answers Clear Outliers with the cleared list')
@@ -43678,8 +43677,8 @@ test('a refresh that computes while Clear Outliers is still writing does not bri
     const after = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-race-after'})
     assert.deepEqual(
         summarizeOutlierEntries(after.outliers).map(entry => entry.rowKey),
-        [stuckHref],
-        'the cleared finished row does not come back; the active row is listed once it crosses the floor'
+        [],
+        'the cleared finished row does not come back, and the running row is not listed even over the floor'
     )
 })
 
@@ -43894,7 +43893,7 @@ test('outlier rejected archive write pushes nothing, so the retried archive coun
     assertStoredOutlierBaseline(storage[OUTLIER_RECORD_KEY], [...durationsBefore, targetDurationMs], 'the retried archive counts the row once')
 })
 
-test('outlier active row over the threshold is listed at refresh and is not pushed into the baseline', async () => {
+test('outlier running row over the threshold is not listed at refresh and is not pushed into the baseline', async () => {
     const runId = 'run-outlier-active-not-pushed'
     const stuckHref = 'https://www.quora.com/profile/Synthetic-Outlier-Active-Stuck'
     const finishedHref = 'https://www.quora.com/profile/Synthetic-Outlier-Active-Finished'
@@ -43905,9 +43904,7 @@ test('outlier active row over the threshold is listed at refresh and is not push
     const {browser, sw, storage} = await startOutlierHarness({queue, runId})
     await sw.loadCoordinatorOutliersRecord()
     const refreshed = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-active-refresh'})
-    const listed = summarizeOutlierEntries(refreshed.outliers)
-    assert.deepEqual(listed.map(entry => entry.rowKey), [stuckHref], 'the active row over the 45-second floor is listed')
-    assert.equal(listed[0].thresholdReason, 'absolute')
+    assert.deepEqual(summarizeOutlierEntries(refreshed.outliers), [], 'a running row is not listed, even over the 45-second floor')
     assert.equal(plainCopy(storage[OUTLIER_RECORD_KEY]?.baseline || {}).n || 0, 0, 'the refresh pushes nothing into the baseline')
 
     await archiveOutlierRows(sw, [finishedHref])
@@ -44312,188 +44309,6 @@ const LIST_GOLDEN_LIVE_KEYS = [
     "https://www.quora.com/profile/List-soft-29"
 ]
 const LIST_GOLDEN_LIVE_ITEMS_DIGEST = "f9559c42b501de20904aafa41b0d647eebe4ccc3ddb62049ad577d1ccd57d596"
-const LIST_GOLDEN_OUTLIERS = [
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-9",
-        "targetUrl": "https://www.quora.com/profile/List-active-9",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-9",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950900,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49100
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-8",
-        "targetUrl": "https://www.quora.com/profile/List-active-8",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-8",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950800,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49200
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-7",
-        "targetUrl": "https://www.quora.com/profile/List-active-7",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-7",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950700,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49300
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-6",
-        "targetUrl": "https://www.quora.com/profile/List-active-6",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-6",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950600,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49400
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-5",
-        "targetUrl": "https://www.quora.com/profile/List-active-5",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-5",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950500,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49500
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-4",
-        "targetUrl": "https://www.quora.com/profile/List-active-4",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-4",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950400,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49600
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-3",
-        "targetUrl": "https://www.quora.com/profile/List-active-3",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-3",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950300,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49700
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-2",
-        "targetUrl": "https://www.quora.com/profile/List-active-2",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-2",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950200,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49800
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-1",
-        "targetUrl": "https://www.quora.com/profile/List-active-1",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-1",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950100,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 49900
-    },
-    {
-        "rowKey": "https://www.quora.com/profile/List-active-0",
-        "targetUrl": "https://www.quora.com/profile/List-active-0",
-        "runId": "run-list-a",
-        "attemptId": "attempt-https://www.quora.com/profile/List-active-0",
-        "attemptNumber": 1,
-        "actionKind": "mute-block",
-        "status": "active",
-        "outcome": "",
-        "activeAt": 1950000,
-        "terminalAt": 0,
-        "final": false,
-        "thresholdReason": "absolute",
-        "meanDurationMsAtCapture": 0,
-        "stdDevMsAtCapture": 0,
-        "capturedAt": 2000000,
-        "durationMs": 50000
-    }
-]
 const LIST_GOLDEN_SOFT_FAIL_RETRY = {"eligible":30,"exhausted":20}
 const LIST_GOLDEN_RUNS = [["run-list-a","running",216],["run-list-b","empty",92],["run-list-gone","running",11]]
 // LIST_GOLDEN_END
@@ -44515,10 +44330,10 @@ test('the view total and status counts are built from every compact row, finishe
     assert.deepEqual(listPlainCopy(refreshed.view.authoritativeCounts), LIST_GOLDEN_AUTHORITATIVE_COUNTS, 'the authoritative counts are unchanged')
 })
 
-test('the worker outlier list serves the active rows over the floor, newest activity first; finished rows are not judged from the population', async () => {
+test('the worker outlier list serves no running row, even the ten over the 45-second floor', async () => {
     const harness = await startListFixtureHarness(buildListFixture())
     const refreshed = await harness.browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'list-outliers'})
-    assert.deepEqual(listPlainCopy(refreshed.outliers), LIST_GOLDEN_OUTLIERS, 'the served outliers are the ten active rows at the 45-second floor; no finished row is pushed in this fixture')
+    assert.deepEqual(listPlainCopy(refreshed.outliers), [], 'the running rows over the floor are not listed; no finished row is pushed in this fixture')
 })
 
 test('the Current Work header counts the listed rows, not the view total', async () => {
@@ -45182,6 +44997,167 @@ test('an incremental History query returns only the rows completed at or after t
     const incremental = await harness.browser.runtime.sendMessage({action: 'get-recent-history', since})
     assert.deepEqual(Array.from(incremental.rows, row => row.coordinatorKey), [hrefs[2], hrefs[1]], 'only the rows at or after since come back, newest first')
 })
+// Outlier management (owner, 24 Oct; docs/outliers-plan-2026-10-24.md). A flagged row is recorded only at 3.5 seconds or more. A recorded
+// outlier keeps the flight recorder events of its target profile, and the storage and checkpoint writes inside its span, until it leaves
+// the list. The dashboard reads those events on request, so a refresh does not carry them.
+const OUTLIER_LIMIT_NORMAL_MS = [1000, 1200, 1100, 1300, 1400, 1250, 1050, 1150]
+const OUTLIER_LIMIT_UNDER_MS = 3000
+const OUTLIER_LIMIT_AT_MS = 3600
+
+test('outlier recording limit: a finished row under 3.5 seconds is not recorded even when it passes the spread test; one at 3.5 seconds is', async () => {
+    const runId = 'run-outlier-record-limit'
+    const normalHrefs = OUTLIER_LIMIT_NORMAL_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Limit-Normal-${index}`)
+    const underHref = 'https://www.quora.com/profile/Synthetic-Outlier-Limit-Under'
+    const atHref = 'https://www.quora.com/profile/Synthetic-Outlier-Limit-At'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_LIMIT_NORMAL_MS[index]
+        })])),
+        [underHref]: makeOutlierTerminalRow({href: underHref, runId, activeAt, durationMs: OUTLIER_LIMIT_UNDER_MS}),
+        [atHref]: makeOutlierTerminalRow({href: atHref, runId, activeAt, durationMs: OUTLIER_LIMIT_AT_MS})
+    }
+    const {sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, normalHrefs)
+    await archiveOutlierRows(sw, [underHref])
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'a 3-second row passes the spread test but is under the limit, so it is not recorded')
+    await archiveOutlierRows(sw, [atHref])
+    const entries = plainCopy(storage[OUTLIER_RECORD_KEY].entries)
+    assert.deepEqual(entries.map(entry => entry.rowKey), [atHref], 'a 3.6-second row that passes the spread test is recorded')
+    assert.equal(entries[0].thresholdReason, 'stddev')
+    assertStoredOutlierBaseline(
+        storage[OUTLIER_RECORD_KEY],
+        [...OUTLIER_LIMIT_NORMAL_MS, OUTLIER_LIMIT_UNDER_MS, OUTLIER_LIMIT_AT_MS],
+        'the row under the limit still counts toward the baseline'
+    )
+})
+
+test('the outlier recorder scope: a profile matches at any time, a span write only inside the span, and an empty profile matches nothing', () => {
+    const {isCoordinatorOutlierRecorderEventInScope} = require('../shared/js/swCoordinatorOutliers')
+    const scope = {targetUrl: 'https://www.quora.com/profile/A', activeAt: 100, terminalAt: 200}
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'action-visibility', targetUrl: scope.targetUrl, at: 1}, scope), true,
+        'the same profile matches whatever the time')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'action-visibility', at: 150}, scope), false,
+        'an event with no profile is not a profile match')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 100}, scope), true, 'a disk write at the span start is inside')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 200}, scope), true, 'a disk write at the span end is inside')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 201}, scope), false, 'a disk write after the span is not')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-update', at: 150}, scope), false, 'settle records are left out')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 150}, {targetUrl: '', activeAt: 100, terminalAt: 200}), true)
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'action-visibility', at: 150}, {targetUrl: '', activeAt: 100, terminalAt: 200}), false,
+        'an empty profile matches no event')
+})
+
+test('the outlier span kinds are still recorded at a call site, so the outlier scan keeps matching them', () => {
+    const {OUTLIER_SPAN_EVENT_KINDS} = require('../shared/js/swCoordinatorOutliers')
+    const sharedJsDir = path.join(__dirname, '..', 'shared', 'js')
+    const corpus = fs.readdirSync(sharedJsDir)
+        .filter(name => name.endsWith('.js'))
+        .map(name => fs.readFileSync(path.join(sharedJsDir, name), 'utf8'))
+        .join('\n')
+    for(const kind of OUTLIER_SPAN_EVENT_KINDS) {
+        assert.match(corpus, new RegExp(`kind: ['"]${kind}['"]`), `the recorder kind ${kind} is still recorded at a call site`)
+    }
+})
+
+test('a recorded outlier keeps its profile events and the disk and checkpoint writes in its span, serves them on request, and drops them on Clear', async () => {
+    const {OUTLIER_SPAN_EVENT_KINDS} = require('../shared/js/swCoordinatorOutliers')
+    const runId = 'run-outlier-events'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Events-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Events-Sigma'
+    const otherHref = 'https://www.quora.com/profile/Synthetic-Outlier-Events-Other'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const terminalAt = activeAt + OUTLIER_SIGMA_DURATION_MS
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_SIGMA_DURATION_MS})
+    }
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, normalHrefs)
+    // Recorder events written before the outlier's terminal time. The tag names each one, so the kept set can be read back.
+    const recorded = [
+        {tag: 'profile-before-span', kind: 'action-visibility', targetUrl: sigmaHref, at: activeAt - 60000},
+        {tag: 'profile-in-span', kind: 'tab-action-claim', targetUrl: sigmaHref, at: activeAt + 5000},
+        {tag: 'write-in-span', kind: 'storage-write', at: activeAt + 1000},
+        {tag: 'checkpoint-in-span', kind: 'queue-wal-checkpoint-switch-result', at: activeAt + 2000},
+        {tag: 'write-before-span', kind: 'storage-write', at: activeAt - 1000},
+        {tag: 'write-after-span', kind: 'storage-write', at: terminalAt + 1000},
+        {tag: 'other-profile', kind: 'action-visibility', targetUrl: otherHref, at: activeAt + 1000},
+        {tag: 'settle-not-kept', kind: 'storage-update', at: activeAt + 1000},
+        {tag: 'dashboard-not-kept', kind: 'dashboard-refresh', at: activeAt + 1000}
+    ]
+    for(const entry of recorded) sw.recordFlightRecorderEvent(entry)
+    await archiveOutlierRows(sw, [sigmaHref])
+
+    const kept = plainCopy(storage[OUTLIER_RECORD_KEY].entries.find(entry => entry.rowKey === sigmaHref).events)
+    assert.deepEqual(
+        kept.map(event => event.tag).filter(Boolean),
+        ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span'],
+        'the profile events (at any time) and the span writes are kept; the rest are not'
+    )
+    for(const event of kept) {
+        const profileMatch = event.targetUrl === sigmaHref
+        const spanWrite = OUTLIER_SPAN_EVENT_KINDS.has(event.kind) && event.at >= activeAt && event.at <= terminalAt
+        assert.ok(profileMatch || spanWrite, `kept event ${event.kind} at ${event.at} belongs to the outlier`)
+    }
+
+    const refreshed = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-events-refresh'})
+    const listed = plainCopy(refreshed.outliers).find(entry => entry.rowKey === sigmaHref)
+    assert.equal(listed.eventCount, kept.length, 'the refresh counts the kept events')
+    assert.equal(listed.events, undefined, 'the refresh does not carry the events')
+
+    const served = await browser.runtime.sendMessage({action: 'get-coordinator-outlier-events', rowKey: sigmaHref, attemptId: `attempt-${sigmaHref}`})
+    assert.deepEqual(
+        plainCopy(served.events).map(event => event.tag).filter(Boolean),
+        ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span'],
+        'the events are served on request, oldest first'
+    )
+
+    await browser.runtime.sendMessage({action: 'clear-coordinator-outliers'})
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'Clear removes the outlier with its events')
+    const afterClear = await browser.runtime.sendMessage({action: 'get-coordinator-outlier-events', rowKey: sigmaHref, attemptId: `attempt-${sigmaHref}`})
+    assert.deepEqual(plainCopy(afterClear.events), [], 'the cleared outlier has no events to serve')
+})
+
+test('the recorder events of a recorded outlier survive a worker restart with it', async () => {
+    const runId = 'run-outlier-events-restart'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Events-Restart-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Events-Restart-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_SIGMA_DURATION_MS})
+    }
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, normalHrefs)
+    sw.recordFlightRecorderEvent({tag: 'write-in-span', kind: 'storage-write', at: activeAt + 1000})
+    await archiveOutlierRows(sw, [sigmaHref])
+
+    const stored = plainCopy(storage[OUTLIER_RECORD_KEY].entries.find(entry => entry.rowKey === sigmaHref))
+    assert.deepEqual(stored.events.map(event => event.tag), ['write-in-span'], 'the stored outlier keeps its event on disk')
+
+    const restarted = loadServiceWorkerHarness({now: OUTLIER_NOW_MS, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    const after = await restarted.sw.refreshCoordinatorDashboardViewsForDashboard('outlier-events-restart')
+    assert.equal(plainCopy(after.outliers).find(entry => entry.rowKey === sigmaHref)?.eventCount, 1, 'the restarted worker lists the outlier with its event count')
+})
+
 ;
 (async () => {
     let failed = 0

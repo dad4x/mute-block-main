@@ -71,6 +71,7 @@ function registerServiceWorkerListeners(deps = {}) {
         'pause-coordinator-nukes',
         'clear-coordinator-events',
         'clear-coordinator-outliers',
+        'get-coordinator-outlier-events',
         'set-space-nuked-posts',
         'merge-space-pending-nuked-posts',
         'set-coordinator-retry-failed-enabled',
@@ -221,6 +222,7 @@ function registerServiceWorkerListeners(deps = {}) {
         clearCoordinatorEventsRequested,
         eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
+        getCoordinatorOutlierEventsRequested,
         setSpaceNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
@@ -718,6 +720,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'clear-coordinator-outliers') {
             return clearCoordinatorOutliersRequested()
+        }
+        else if(request.action === 'get-coordinator-outlier-events') {
+            return getCoordinatorOutlierEventsRequested(request)
         }
         else if(request.action === 'erase-block-history') {
             return eraseBlockHistoryRequested(request)

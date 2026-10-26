@@ -224,9 +224,11 @@ const {
     FLIGHT_RECORDER_CAPACITY,
     __testResetFlightRecorder,
     getFlightRecorder,
+    getFlightRecorderEntriesWhere,
     getFlightRecorderSnapshot,
     getFlightRecorderPersistableSnapshot,
     clearFlightRecorderEntries,
+    normalizeFlightRecorderTargetUrl,
     recordFlightRecorderEvent,
     seedFlightRecorderFromPersisted
 } = require('./swflightRecorder')
@@ -787,11 +789,11 @@ const {
     applyCoordinatorOutlierClearEntries,
     applyCoordinatorOutlierFinishedRows,
     applyCoordinatorOutlierReset,
+    collectCoordinatorOutlierRecorderEvents,
     getCoordinatorOutlierDismissalKey,
+    getCoordinatorOutlierEvents,
     getCoordinatorOutlierFinishedDuration,
     getCoordinatorOutliersRecordSignature,
-    judgeCoordinatorOutlierActiveRows,
-    makeCoordinatorOutlierDismissalKey,
     pruneCoordinatorOutlierDismissals,
     serveCoordinatorOutliers,
     toCoordinatorOutlierBaseRecord
@@ -6853,8 +6855,6 @@ let coordinatorOutliersBase = null
 let coordinatorOutliersLoad = null
 let coordinatorOutliersOps = []
 let coordinatorOutliersIssuedSeq = 0
-// The active judgements of the last dashboard refresh. They are served and never stored, so they are not in the base or the ops.
-let coordinatorOutliersActive = []
 
 async function readCoordinatorOutliersRecordFromStorage() {
     const stampKey = getCoordinatorNamespaceStampKey(COORDINATOR_OUTLIERS_KEY)
@@ -6901,14 +6901,18 @@ let coordinatorOutliersAwaiting = []
 
 function flushCoordinatorOutliersAwaiting() {
     const rows = []
-    for(const batch of coordinatorOutliersAwaiting) rows.push(...batch.rows)
+    const recorderEvents = new Map()
+    for(const batch of coordinatorOutliersAwaiting) {
+        rows.push(...batch.rows)
+        for(const [key, events] of batch.recorderEvents) recorderEvents.set(key, events)
+    }
     const nowMs = Date.now()
     coordinatorOutliersAwaiting = []
     // A Clear All Stats that ran before the load moved the cutoff, so a row that finished before it is not pushed here either.
     const counted = rows.filter(row => row.terminalAt > coordinatorStatsClearedAtResident)
     if(!counted.length) return
     issueCoordinatorOutliersWrite(
-        record => applyCoordinatorOutlierFinishedRows(record, counted, nowMs),
+        record => applyCoordinatorOutlierFinishedRows(record, counted, nowMs, recorderEvents),
         {},
         {},
         {metricPath: 'outliers.archive'}
@@ -6990,18 +6994,16 @@ function persistCoordinatorWithFinishedOutliers(change = {}, options = {}) {
         if(getCoordinatorOutlierFinishedDuration(row) > 0 && row.terminalAt > cutoff) finished.push(row)
     }
     if(!finished.length) return coordinatorAuthority.persistCoordinator(change, options)
-    // A finished row is no longer active, so its active judgement is withdrawn now. Its outcome is decided by the push below.
-    const finishedKeys = new Set(finished.map(row => getCoordinatorOutlierDismissalKey(row)))
-    coordinatorOutliersActive = coordinatorOutliersActive
-        .filter(entry => !finishedKeys.has(makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId)))
+    // The recorder events of each row that may be recorded are copied now, at its terminal time, once (swCoordinatorOutliers.js).
+    const recorderEvents = collectCoordinatorOutlierRecorderEvents(finished, getFlightRecorderEntriesWhere, normalizeFlightRecorderTargetUrl)
     const nowMs = Date.now()
     if(!coordinatorOutliersBase) {
         // Not in memory yet: the rows are archived without their push, and flushCoordinatorOutliersAwaiting pushes them once it is loaded.
-        coordinatorOutliersAwaiting.push({rows: finished})
+        coordinatorOutliersAwaiting.push({rows: finished, recorderEvents})
         return coordinatorAuthority.persistCoordinator(change, options)
     }
     return issueCoordinatorOutliersWrite(
-        record => applyCoordinatorOutlierFinishedRows(record, finished, nowMs),
+        record => applyCoordinatorOutlierFinishedRows(record, finished, nowMs, recorderEvents),
         change,
         options,
         {metricPath: 'outliers.archive'}
@@ -7012,24 +7014,22 @@ function persistCoordinatorWithFinishedOutliers(change = {}, options = {}) {
 // dashboard is told, so the write is not suppressed. Answers with the list as served.
 async function resetCoordinatorOutliers(metricPath = 'outliers.reset') {
     if(!coordinatorOutliersBase) await loadCoordinatorOutliersRecord()
-    coordinatorOutliersActive = []
     const previous = getCoordinatorOutliersPendingRecord()
     if(getCoordinatorOutliersRecordSignature(applyCoordinatorOutlierReset()) !== getCoordinatorOutliersRecordSignature(previous)) {
         await issueCoordinatorOutliersWrite(() => applyCoordinatorOutlierReset(), {}, {}, {metricPath}).catch(() => null)
     }
-    return serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord(), coordinatorOutliersActive, Date.now())
+    return serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord())
 }
 
-// Clear Outliers on the dashboard: the listed attempts are dismissed, so no later pass lists them again, and the stored list is emptied.
-// The baseline is kept: it is not reset and it is not restored.
+// Clear Outliers on the dashboard: the listed attempts are dismissed, so no later pass lists them again, and the stored list is emptied with
+// its recorder events. The baseline is kept: it is not reset and it is not restored.
 async function clearCoordinatorOutliersRequested() {
     if(!coordinatorOutliersBase) await loadCoordinatorOutliersRecord()
-    const activeKeys = coordinatorOutliersActive.map(entry => makeCoordinatorOutlierDismissalKey(entry.rowKey, entry.attemptId))
     const previous = getCoordinatorOutliersPendingRecord()
-    if(getCoordinatorOutliersRecordSignature(applyCoordinatorOutlierClearEntries(previous, activeKeys)) !==
+    if(getCoordinatorOutliersRecordSignature(applyCoordinatorOutlierClearEntries(previous)) !==
         getCoordinatorOutliersRecordSignature(previous)) {
         await issueCoordinatorOutliersWrite(
-            record => applyCoordinatorOutlierClearEntries(record, activeKeys),
+            record => applyCoordinatorOutlierClearEntries(record),
             {},
             {},
             {metricPath: 'dashboardRequest.clearOutliers'}
@@ -7037,13 +7037,25 @@ async function clearCoordinatorOutliersRequested() {
     }
     return {
         cleared: true,
-        outliers: serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord(), coordinatorOutliersActive, Date.now())
+        outliers: serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord())
     }
 }
 
-// The pass of a dashboard refresh. The active rows among the live rows are judged against the current threshold, and the answer is the stored
-// final outliers with those judgements. Nothing is written: an active judgement is not stored (swCoordinatorOutliers.js). Only the live rows
-// are read; the completed-work log is not scanned. Dismissals of rows that have left the live queue are dropped here.
+// The recorder events kept with one listed outlier, for the dashboard's expand. The events are not in the refresh answer, so a refresh stays
+// small; they are read here from the stored record.
+async function getCoordinatorOutlierEventsRequested(request = {}) {
+    if(!coordinatorOutliersBase) await loadCoordinatorOutliersRecord()
+    const rowKey = `${request?.rowKey || ''}`
+    const attemptId = `${request?.attemptId || ''}`
+    return {
+        rowKey,
+        attemptId,
+        events: getCoordinatorOutlierEvents(getCoordinatorOutliersPendingRecord(), rowKey, attemptId)
+    }
+}
+
+// The pass of a dashboard refresh. The answer is the stored outliers. Nothing is judged or written here: only finished rows are listed, and
+// they were judged when they archived. Dismissals of rows that have left the live queue are dropped here.
 function refreshCoordinatorOutliersForDashboard(liveRows = [], nowMs = Date.now()) {
     if(!coordinatorOutliersBase) {
         return loadCoordinatorOutliersRecord().then(
@@ -7053,12 +7065,7 @@ function refreshCoordinatorOutliersForDashboard(liveRows = [], nowMs = Date.now(
     }
     const liveKeys = new Set(liveRows.map(row => getCoordinatorOutlierDismissalKey(row)))
     coordinatorOutliersBase = pruneCoordinatorOutlierDismissals(coordinatorOutliersBase, liveKeys)
-    coordinatorOutliersActive = judgeCoordinatorOutlierActiveRows(getCoordinatorOutliersPendingRecord(), liveRows, {
-        nowMs,
-        isActive: isActiveCoordinatorStatus,
-        previous: coordinatorOutliersActive
-    })
-    return serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord(), coordinatorOutliersActive, nowMs)
+    return serveCoordinatorOutliers(getCoordinatorOutliersPendingRecord())
 }
 
 // Dashboard-facing run stats, computed fresh every call instead of trusting
@@ -37253,6 +37260,7 @@ registerServiceWorkerListeners({
         clearCoordinatorEventsRequested,
         eraseBlockHistoryRequested,
         clearCoordinatorOutliersRequested,
+        getCoordinatorOutlierEventsRequested,
         setSpaceNukedPostsRequested,
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,

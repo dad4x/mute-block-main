@@ -369,6 +369,19 @@ test('the dashboard no longer computes outliers: the worker serves the list and 
     assert.doesNotMatch(clearAllStatsBody, /clearOutliers\(\)/)
 })
 
+test('the dashboard expands an outlier to its recorder events, read from the worker on first expand', () => {
+    const source = readRepoFile('shared/js/coordinator.js')
+    const itemBody = extractFunction(source, 'function buildOutlierItem(outlier = {})')
+    assert.match(itemBody, /setMuteBlockHelp\(toggle, expanded/, 'the expand button has hover help')
+    assert.match(itemBody, /toggleOutlierEvents\(outlier\)/, 'the button toggles the outlier events')
+    const loadBody = extractFunction(source, 'async function loadOutlierEvents(outlier = {})')
+    assert.match(loadBody, /action: 'get-coordinator-outlier-events'/, 'the events are read from the worker')
+    const panelBody = extractFunction(source, 'function buildOutlierEventsPanel(outlier = {})')
+    assert.match(panelBody, /buildFlightRecorderRow/, 'each event is drawn as a flight recorder row')
+    const swBootstrap = readRepoFile('shared/js/swBootstrap.js')
+    assert.match(swBootstrap, /request\.action === 'get-coordinator-outlier-events'/, 'the worker answers the request')
+})
+
 test('runtime action contract enumerates current accepted actions and rejects old aliases', () => {
     const source = readRepoFile('shared/js/swBootstrap.js')
     const runtimeActions = getRuntimeRequestActionNames(source)
@@ -396,6 +409,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'enqueue-coordinator-items',
         'erase-block-history',
         'get-content-page-coordinator-state',
+        'get-coordinator-outlier-events',
         'get-coordinator-queue-accounting',
         'get-coordinator-queue-runtime-state',
         'get-flight-recorder',

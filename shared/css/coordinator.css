@@ -681,6 +681,34 @@ h2 {
     grid-template-columns: minmax(220px, 1fr) 120px 160px 180px;
 }
 
+.row--outlier {
+    grid-template-columns: minmax(200px, 1fr) 100px 160px 170px 110px;
+}
+
+.outlier-item {
+    border-bottom: 1px solid var(--mb-grey-110);
+}
+
+.outlier-item:last-child {
+    border-bottom: 0;
+}
+
+.outlier-item > .row {
+    border-bottom: 0;
+}
+
+.outlier-events {
+    padding: 0 14px 12px;
+}
+
+.outlier-events > .row-subtitle {
+    padding: 6px 0;
+}
+
+.outlier-events .row--flight {
+    padding: 6px 0;
+}
+
 .row--flight {
     grid-template-columns: 170px 60px 150px minmax(200px, 1.4fr) 150px minmax(160px, 1fr) minmax(200px, 2fr);
     font-size: 12px;

@@ -3023,7 +3023,122 @@ async function clearOutliers() {
     catch(error) {
         console.warn('Failed to clear outliers', error)
     }
+    // The cleared attempts are gone from the worker, so their read events and expanded state go with them.
+    outlierEventsByKey.clear()
+    expandedOutlierKeys.clear()
     renderOutliers()
+}
+
+// The recorder events of a listed outlier are read from the worker the first time it is expanded, and then kept for the page. They do not
+// change once the outlier is listed. outlierEventsByKey holds the events, or null when the read failed (the next expand reads again).
+const outlierEventsByKey = new Map()
+const outlierEventsPending = new Set()
+const expandedOutlierKeys = new Set()
+
+function getOutlierKey(outlier = {}) {
+    return `${outlier.rowKey || ''}|${outlier.attemptId || ''}`
+}
+
+async function loadOutlierEvents(outlier = {}) {
+    const key = getOutlierKey(outlier)
+    if(outlierEventsPending.has(key)) return
+    outlierEventsPending.add(key)
+    let events = null
+    try {
+        const result = await sendRuntimeMessageWithTimeout({
+            action: 'get-coordinator-outlier-events',
+            rowKey: outlier.rowKey || '',
+            attemptId: outlier.attemptId || ''
+        }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS)
+        events = Array.isArray(result?.events) ? result.events : []
+    }
+    catch(error) {
+        console.warn('Failed to read outlier events', error)
+    }
+    outlierEventsPending.delete(key)
+    outlierEventsByKey.set(key, events)
+    renderOutliers()
+}
+
+function toggleOutlierEvents(outlier = {}) {
+    const key = getOutlierKey(outlier)
+    if(expandedOutlierKeys.has(key)) {
+        expandedOutlierKeys.delete(key)
+    }
+    else {
+        expandedOutlierKeys.add(key)
+        if(outlierEventsByKey.get(key) === undefined || outlierEventsByKey.get(key) === null) void loadOutlierEvents(outlier)
+    }
+    renderOutliers()
+}
+
+function buildOutlierEventsPanel(outlier = {}) {
+    const panel = document.createElement('div')
+    panel.className = 'outlier-events'
+    const events = outlierEventsByKey.get(getOutlierKey(outlier))
+    const note = document.createElement('div')
+    note.className = 'row-subtitle'
+    if(events === undefined) {
+        note.textContent = 'Reading the recorder events...'
+        panel.append(note)
+    }
+    else if(events === null) {
+        note.textContent = 'Could not read the events. Collapse and expand this outlier to try again.'
+        panel.append(note)
+    }
+    else if(!events.length) {
+        note.textContent = 'No flight recorder events were kept with this outlier.'
+        panel.append(note)
+    }
+    else {
+        note.textContent = `${events.length} recorder event${events.length === 1 ? '' : 's'}, oldest first: this profile's events, and the storage and checkpoint writes inside its span.`
+        panel.append(note, ...events.map(buildFlightRecorderRow))
+    }
+    return panel
+}
+
+function buildOutlierItem(outlier = {}) {
+    const key = getOutlierKey(outlier)
+    const expanded = expandedOutlierKeys.has(key)
+    const profileLabel = outlier.targetUrl ? getProfileLabelFromHref(outlier.targetUrl) : outlier.rowKey
+    const eventCount = Number.parseInt(outlier.eventCount, 10) || 0
+
+    const toggle = document.createElement('button')
+    toggle.type = 'button'
+    toggle.className = 'clear-button row-action-button'
+    toggle.textContent = expanded ? 'Hide events' : `Events (${eventCount})`
+    toggle.setAttribute('aria-expanded', String(expanded))
+    setMuteBlockHelp(toggle, expanded
+        ? 'Hide the flight recorder events kept with this outlier'
+        : 'Show the flight recorder events kept with this outlier')
+    toggle.addEventListener('click', event => {
+        event.preventDefault()
+        toggleOutlierEvents(outlier)
+    })
+    const actionCell = document.createElement('div')
+    actionCell.className = 'row-action-cell'
+    actionCell.append(toggle)
+
+    const row = document.createElement('div')
+    row.className = 'row row--outlier'
+    row.append(
+        buildTitleCell(profileLabel || outlier.rowKey, outlier.runId, {
+            titleHref: normalizeExternalHref(outlier.targetUrl)
+        }),
+        buildBadge(outlier.status || 'unknown'),
+        buildTextCell(
+            `${formatDuration(outlier.durationMs)} (${outlier.thresholdReason})`,
+            `mean ${formatDuration(outlier.meanDurationMsAtCapture)}, stddev ${formatDuration(outlier.stdDevMsAtCapture)} at capture`
+        ),
+        buildTextCell(formatDateTime(outlier.capturedAt)),
+        actionCell
+    )
+
+    const item = document.createElement('div')
+    item.className = 'outlier-item'
+    item.append(row)
+    if(expanded) item.append(buildOutlierEventsPanel(outlier))
+    return item
 }
 
 function renderOutliers() {
@@ -3035,23 +3150,7 @@ function renderOutliers() {
     if(!container) return
 
     const sortedOutliers = [...state.outliers].sort((left, right) => right.durationMs - left.durationMs)
-    replaceChildren(container, sortedOutliers.map(outlier => {
-        const profileLabel = outlier.targetUrl ? getProfileLabelFromHref(outlier.targetUrl) : outlier.rowKey
-        const row = document.createElement('div')
-        row.className = 'row row--event'
-        row.append(
-            buildTitleCell(profileLabel || outlier.rowKey, outlier.runId, {
-                titleHref: normalizeExternalHref(outlier.targetUrl)
-            }),
-            buildBadge(outlier.final ? (outlier.status || 'unknown') : 'active'),
-            buildTextCell(
-                `${formatDuration(outlier.durationMs)} (${outlier.thresholdReason})`,
-                `mean ${formatDuration(outlier.meanDurationMsAtCapture)}, stddev ${formatDuration(outlier.stdDevMsAtCapture)} at capture`
-            ),
-            buildTextCell(formatDateTime(outlier.capturedAt))
-        )
-        return row
-    }), 'No outliers.')
+    replaceChildren(container, sortedOutliers.map(buildOutlierItem), 'No outliers.')
 }
 
 function buildQueueTimingCell(item = {}) {

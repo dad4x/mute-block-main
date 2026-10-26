@@ -44,11 +44,13 @@ module.exports = {
     // Dashboard outlier list (swCoordinatorOutliers.js). A finished row is judged when its archive is saved, against the running
     // baseline as it stood then: it is flagged when its duration (terminalAt minus activeAt) reaches OUTLIER_FLOOR_MS, or the stddev
     // threshold, the baseline mean plus OUTLIER_STDDEV_MULTIPLIER times its sample stddev. The stddev test needs
-    // OUTLIER_MIN_SAMPLES_FOR_STDDEV pushed samples. An active row is judged at each refresh and is not stored. The stored list keeps
-    // its newest OUTLIER_MAX_ENTRIES entries.
+    // OUTLIER_MIN_SAMPLES_FOR_STDDEV pushed samples. A flagged row is recorded only at OUTLIER_MIN_RECORD_MS or more (owner, 24 Oct);
+    // every finished row still counts toward the baseline. Only finished rows are listed; the stored list keeps its newest
+    // OUTLIER_MAX_ENTRIES entries.
     OUTLIER_FLOOR_MS: 45000,
     OUTLIER_STDDEV_MULTIPLIER: 2.5,
     OUTLIER_MIN_SAMPLES_FOR_STDDEV: 5,
+    OUTLIER_MIN_RECORD_MS: 3500,
     OUTLIER_MAX_ENTRIES: 50,
 
     // Limits that more than one module used to declare (historical/14-oct-review-1.md finding 8). Each is declared here only.

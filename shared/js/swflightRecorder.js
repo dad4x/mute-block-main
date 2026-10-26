@@ -168,6 +168,29 @@ function getFlightRecorder(request = {}) {
     return Promise.resolve(getFlightRecorderSnapshot(request))
 }
 
+// The retained entries that satisfy predicate, oldest first. The predicate sees each entry in place and only the matches are copied,
+// so a scan for one outlier does not copy the whole ring. A predicate that throws matches nothing.
+function getFlightRecorderEntriesWhere(predicate = () => false) {
+    const bounds = getFlightRecorderBounds()
+    const matches = []
+    for(let seq = bounds.oldestSeq; seq <= bounds.newestSeq; seq += 1) {
+        if(!seq) continue
+        const entry = flightRecorderEntries[seq % FLIGHT_RECORDER_CAPACITY]
+        if(entry?.seq !== seq) continue
+        try {
+            if(predicate(entry)) matches.push({...entry})
+        }
+        catch {}
+    }
+    return matches
+}
+
+// The normalized form of a target address, as the recorder stores it in the targetUrl field. A scan that matches a profile compares
+// against this form.
+function normalizeFlightRecorderTargetUrl(value = "") {
+    return sanitizeFlightRecorderUrl(value)
+}
+
 // Clears the ring (the dashboard's Clear Events). The sequence keeps counting, and empty slots are skipped by the reader.
 function clearFlightRecorderEntries() {
     flightRecorderEntries.fill(undefined)
@@ -222,8 +245,10 @@ module.exports = {
     __testResetFlightRecorder,
     clearFlightRecorderEntries,
     getFlightRecorder,
+    getFlightRecorderEntriesWhere,
     getFlightRecorderSnapshot,
     getFlightRecorderPersistableSnapshot,
+    normalizeFlightRecorderTargetUrl,
     recordFlightRecorderEvent,
     seedFlightRecorderFromPersisted
 }
