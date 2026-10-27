@@ -519,6 +519,82 @@ h2 {
     border-color: var(--mb-red-200);
 }
 
+/* Duration histograms (owner, 26 Oct): one column per bucket. A bar's height is its share of the largest bucket. Colours are tokens only. */
+.duration-histograms {
+    border-bottom: 1px solid var(--mb-grey-110);
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 10px 12px;
+}
+
+.duration-histogram {
+    background: var(--mb-grey-50);
+    border: 1px solid var(--mb-grey-200);
+    border-radius: 6px;
+    min-width: 0;
+    padding: 8px;
+}
+
+.duration-histogram-head {
+    align-items: baseline;
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+}
+
+.duration-histogram-total {
+    color: var(--mb-grey-500);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.duration-histogram-bars {
+    align-items: end;
+    display: grid;
+    gap: 4px;
+    grid-template-columns: repeat(10, minmax(0, 1fr));
+    margin-top: 8px;
+}
+
+.duration-histogram-column {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.duration-histogram-count {
+    color: var(--mb-grey-700);
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+}
+
+.duration-histogram-track {
+    background: var(--mb-grey-110);
+    border-radius: 3px;
+    display: flex;
+    align-items: flex-end;
+    height: 80px;
+    margin-top: 4px;
+}
+
+.duration-histogram-bar {
+    background: var(--mb-blue-500);
+    border-radius: 3px 3px 0 0;
+    min-height: 0;
+    width: 100%;
+}
+
+.duration-histogram-label {
+    color: var(--mb-grey-500);
+    font-size: 10px;
+    overflow: hidden;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .metric-card--alert .metric-value {
     color: var(--mb-red-800);
 }
@@ -611,6 +687,41 @@ h2 {
 .empty {
     color: var(--mb-grey-500);
     padding: 18px 14px;
+}
+
+/* First-load spinner (owner, 27 Oct). It spins only when the user has not asked for reduced motion; with reduced motion the
+   "Loading…" text stays and nothing turns. Colours come from the shared tokens in tokens.css. */
+.loading-indicator {
+    align-items: center;
+    color: var(--mb-grey-500);
+    display: inline-flex;
+    gap: 8px;
+}
+
+.list > .loading-indicator {
+    padding: 18px 14px;
+}
+
+.loading-spinner {
+    border: 2px solid var(--mb-grey-200);
+    border-radius: 50%;
+    border-top-color: var(--mb-indigo-600);
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    height: 14px;
+    width: 14px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .loading-spinner {
+        animation: loading-spin 0.9s linear infinite;
+    }
+}
+
+@keyframes loading-spin {
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 .histogram-container {
@@ -868,7 +979,8 @@ a.row-subtitle:hover {
         margin-bottom: 12px;
     }
 
-    .metrics-grid {
+    .metrics-grid,
+    .duration-histograms {
         grid-template-columns: 1fr;
     }
 
@@ -997,4 +1109,31 @@ a.row-subtitle:hover {
 /* A History row with an error reads in red. */
 .row--history-error {
     color: var(--mb-red-800);
+}
+
+/* The History sort control, filter box and count share one row under the title. */
+.history-controls {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.history-filter {
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 6px;
+    box-sizing: border-box;
+    min-width: 200px;
+    padding: 6px 8px;
+}
+
+.history-count {
+    margin-top: 0;
+}
+
+.history-dedupe {
+    align-items: center;
+    display: inline-flex;
+    gap: 6px;
 }

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_QUEUE_WAL_KEY} = require('../../shared/js/storageKeys')
+const {plainName} = require('../../shared/js/storageNamespace')
+
 const {gzipSync, gunzipSync} = require('fflate')
 const {
     hydrateSegmentedWalStore,
@@ -28,9 +31,14 @@ const QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {
     }
 }
 
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
+
+// The plain names of this layout's stored keys (storageNamespace.js). Stored keys of other layouts are left out.
+function plainStored(storage = {}) {
+    return Object.fromEntries(Object.entries(storage || {})
+        .map(([storedName, value]) => [plainName(storedName), value])
+        .filter(([key]) => key !== null))
+}
 
 function normalize(value) {
     try {
@@ -98,10 +106,11 @@ runMain(async () => {
         return
     }
 
-    const stored = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
+    const storedRaw = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
         return chrome.storage.local.get(null)
     }})()`, 60000)
-    const {queue, recovered, reason, wal} = recoverQueue(stored || {})
+    const stored = plainStored(storedRaw)
+    const {queue, recovered, reason, wal} = recoverQueue(stored)
     const progress = await readProfileNukeProgressFromWorker(config)
     const tabs = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readTabs() {
         return chrome.tabs.query({})

@@ -1,6 +1,20 @@
 #!/usr/bin/env node
 
 const {
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
+
+// The stored names this tool reads: the layout prefix plus the plain key name (storageNamespace.js).
+const STORED_NAMES = {
+    paused: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_PAUSED_KEY}`,
+    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
+    retryFailed: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RETRY_FAILED_ENABLED_KEY}`
+}
+
+const {
     evaluate,
     getCdpConfig,
     getOption,
@@ -28,13 +42,13 @@ runMain(async () => {
     }
 
     const progressRecords = await readProfileNukeProgressFromWorker(config)
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function inspectQueueItem(needle, limit, progress) {
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function inspectQueueItem(needle, limit, progress, keys) {
         const storage = await chrome.storage.local.get({
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {},
-            mbCoordinatorRetryFailedEnabled: false
+            [keys.paused]: false,
+            [keys.queue]: {},
+            [keys.retryFailed]: false
         })
-        const queue = storage.mbCoordinatorQueue || {}
+        const queue = storage[keys.queue] || {}
         const tabs = await chrome.tabs.query({})
         const normalize = value => {
             try {
@@ -126,8 +140,8 @@ runMain(async () => {
             : []
         return {
             needle,
-            paused: !!storage.mbCoordinatorPaused,
-            retryFailedEnabled: !!storage.mbCoordinatorRetryFailedEnabled,
+            paused: !!storage[keys.paused],
+            retryFailedEnabled: !!storage[keys.retryFailed],
             matchedCount: matched.length,
             items: matched,
             runtime: {
@@ -141,7 +155,7 @@ runMain(async () => {
                     : []
             }
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)}, ${JSON.stringify(progressRecords)} )`, 30000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(limit)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)} )`, 30000)
 
     console.log(JSON.stringify(result, null, 2))
 })

@@ -78,9 +78,18 @@ async function main() {
         assert.equal(runShards.keepOrStampRunShard({id: 'new', createdAt: 5 * DAY + 1}, undefined, 99 * DAY).runShard, 5)
     })
 
-    await test('under the cap and with no time limit, nothing is dropped', async () => {
+    await test('under the cap, nothing is dropped', async () => {
         assert.equal(runShards.selectRunShardsToDrop(makeRuns(700), {maxRuns: 700}).size, 0)
-        assert.equal(runShards.selectRunShardsToDrop(makeDailyRuns(8, 10, TODAY_START), {maxRuns: 0, retentionMs: 0}).size, 0)
+        assert.equal(runShards.selectRunShardsToDrop(makeDailyRuns(8, 10, TODAY_START), {maxRuns: 0}).size, 0)
+    })
+
+    await test('runs inside the cap are kept regardless of age: old runs are not dropped by age', async () => {
+        // 30 days of 10 runs (300 runs), the oldest 30 days before today. The count is under the cap, so nothing goes, even though
+        // the time options are passed: the selector no longer reads them.
+        const runs = makeDailyRuns(30, 10, TODAY_START)
+        const drop = runShards.selectRunShardsToDrop(runs, {maxRuns: RUN_RETENTION_MAX_COUNT, nowMs: TODAY_START + 1000 * DAY, retentionMs: DAY})
+        assert.equal(drop.size, 0)
+        assert.equal(Object.keys(runShards.withoutRunShards(runs, drop)).length, 300)
     })
 
     await test('over the cap, the oldest whole shards go until the count is at or under it', async () => {
@@ -91,52 +100,65 @@ async function main() {
         assert.equal(Object.keys(runShards.withoutRunShards(runs, drop)).length, 700)
     })
 
-    await test('retention by time drops the whole time shards whose newest run is older than the retention, oldest first', async () => {
-        // Eight days of 10 runs, today last. A 3-day retention keeps a shard whose newest run is at or after now minus 3 days, which is
-        // days 4 to 7 here. Days 0 to 3 go, oldest first.
-        const runs = makeDailyRuns(8, 10, TODAY_START)
-        const nowMs = TODAY_START + 1000
-        const drop = runShards.selectRunShardsToDrop(runs, {nowMs, retentionMs: 3 * DAY, maxRuns: 0})
-        const dayShard = day => TODAY_START / DAY - (7 - day)
-        assert.deepEqual([...drop].sort((a, b) => a - b), [0, 1, 2, 3].map(dayShard))
-        assert.equal(Object.keys(runShards.withoutRunShards(runs, drop)).length, 40)
+    await test('the newest shard is never dropped, even when the count is over the cap', async () => {
+        // One shard of 800 runs, over the cap of 700. It is the newest shard, so it stays.
+        const runs = makeRuns(800, () => 5)
+        assert.equal(runShards.selectRunShardsToDrop(runs, {maxRuns: 700}).size, 0)
     })
 
-    await test('retention by time never drops the newest shard, even when it is older than the retention', async () => {
-        const runs = makeDailyRuns(2, 5, TODAY_START)
-        const drop = runShards.selectRunShardsToDrop(runs, {nowMs: TODAY_START + 100 * DAY, retentionMs: DAY, maxRuns: 0})
-        assert.ok(!drop.has(TODAY_START / DAY), 'the newest shard stays')
-        assert.ok(drop.has(TODAY_START / DAY - 1), 'the older shard goes')
-    })
-
-    await test('a shard that holds a run a queue row refers to is kept by the time limit and by the cap', async () => {
+    await test('a shard that holds a run a queue row still refers to is kept by the cap', async () => {
+        // Eight days of 100 runs (800), cap 700. The oldest day holds the referenced run, so it stays and the next oldest goes.
         const runs = makeDailyRuns(8, 100, TODAY_START)
         const referencedRunIds = new Set(['day-0-run-3'])
-        const drop = runShards.selectRunShardsToDrop(runs, {
-            nowMs: TODAY_START + 1000, retentionMs: 3 * DAY, maxRuns: 700, referencedRunIds
-        })
+        const drop = runShards.selectRunShardsToDrop(runs, {maxRuns: 700, referencedRunIds})
         assert.ok(!drop.has(TODAY_START / DAY - 7), 'the oldest day holds the referenced run, so it stays')
         assert.ok(drop.has(TODAY_START / DAY - 6), 'the next oldest day goes instead')
+        assert.equal(drop.size, 1)
     })
 
-    await test('runs with no creation time are not dropped by the time limit, only by the cap', async () => {
+    await test('a shard with no creation time is dropped by the count like any other shard', async () => {
         const runs = {
             'old-a': {id: 'old-a', runShard: 1},
             'old-b': {id: 'old-b', runShard: 1},
             'newer': {id: 'newer', createdAt: TODAY_START, runShard: TODAY_START / DAY}
         }
-        const drop = runShards.selectRunShardsToDrop(runs, {nowMs: TODAY_START + DAY, retentionMs: DAY, maxRuns: 0})
-        assert.equal(drop.has(1), false, 'a shard with no time is not dropped by age')
+        const drop = runShards.selectRunShardsToDrop(runs, {maxRuns: 2})
+        assert.equal(drop.has(1), true, 'the oldest shard goes to bring the count to the cap')
+        assert.equal(drop.has(TODAY_START / DAY), false, 'the newest shard stays')
     })
 
-    await test('a write that drops a time shard carries map.remove for each run of that shard', async () => {
+    await test('a write that drops a time shard is one map.dropShard per shard, with no map.remove for its runs', async () => {
         const before = makeRuns(1000, index => Math.floor(index / 100))
         const drop = runShards.selectRunShardsToDrop(before, {maxRuns: 700})
         const after = runShards.withoutRunShards(before, drop)
-        const records = runsChangeRecords(before, after)
-        const removed = records.filter(record => record.kind === 'map.remove').map(record => record.key).sort()
-        assert.equal(removed.length, 300)
-        assert.ok(removed.includes('run-0') && removed.includes('run-299') && !removed.includes('run-300'))
+        // The write path (sw.js takeRunsPartFromChange) diffs against the runs without the dropped shards.
+        const records = [
+            ...runShards.runShardDropRecords(drop),
+            ...runsChangeRecords(runShards.withoutRunShards(before, drop), after)
+        ]
+        assert.deepEqual(records.filter(record => record.kind === 'map.remove'), [], 'no per-run removal')
+        assert.deepEqual(records.filter(record => record.kind === 'map.dropShard'), [
+            {kind: 'map.dropShard', area: 'runs', shardField: 'runShard', shard: 0},
+            {kind: 'map.dropShard', area: 'runs', shardField: 'runShard', shard: 1},
+            {kind: 'map.dropShard', area: 'runs', shardField: 'runShard', shard: 2}
+        ])
+    })
+
+    await test('the map.dropShard record removes exactly the runs of its shard when replayed', async () => {
+        const wal = require('../shared/js/walSnapshotStore')
+        const before = makeRuns(1000, index => Math.floor(index / 100))
+        const drop = runShards.selectRunShardsToDrop(before, {maxRuns: 700})
+        const expected = runShards.withoutRunShards(before, drop)
+        const records = runShards.runShardDropRecords(drop).map((record, index) => ({...record, seq: index + 1, id: `drop-${index}`}))
+        const replayed = wal.projectSnapshot({snapshotSeq: 0, state: {runs: before}}, records).state
+        assert.deepEqual(replayed.runs, expected)
+    })
+
+    await test('a run with no shard field is shard 0 when a map.dropShard record replays', async () => {
+        const wal = require('../shared/js/walSnapshotStore')
+        const runs = {legacy: {id: 'legacy'}, kept: {id: 'kept', runShard: 3}}
+        const result = wal.applyWalRecord({runs}, {kind: 'map.dropShard', area: 'runs', shardField: 'runShard', shard: 0, seq: 1, id: 'd'}, {snapshotSeq: 0, appliedIds: new Set()})
+        assert.deepEqual(Object.keys(result.state.runs), ['kept'])
     })
 
     await test('the checkpoint partition puts a run in the shard it carries, and the other areas in the default shard', async () => {

@@ -23,7 +23,7 @@ Status as of 24 Oct 2026. This is the list of helpers in this folder that stay f
 ## Kept: used by current work
 
 - `audit-action-kinds.js`, `enqueue-visible-profile-search.js`, `inspect-queue-brief.js`, `inspect-recovered-queue-item.js`, `sw-queue-summary.js`, `clear-coordinator-test-state.js`: converted to read progress through the worker (coder instructions, section 4a).
-- `wal-snapshot-benchmark.js`: named in the 25 Oct review. Its bucket reader changes with the run-list excise.
+- `wal-snapshot-benchmark.js`: named in the 25 Oct review. The space post map and its bucket reader are gone; it reads the queue and the run list as single prefixed keys.
 - `storage-read-profile.js`: measures what is on disk, by design (coder instructions, section 4a).
 - `storage-footprint.js`: the session storage measurement that the live check needs.
 - `flight-recorder.js`: reads the recorder for the live checks.
@@ -49,7 +49,7 @@ Kept on purpose: `window-focus-summary.js`. The worker-window focus concern (25 
 
 ## Keep in mind: some kept helpers mention retired keys
 
-These helpers mention storage keys that the 1.6 work has retired: `active-queue-rows.js`, `current-work-filter.js`, `inspect-space-state.js`, `queue-counts.js`, `queue-failures.js`, `queue-storage-summary.js`, `queue-summary.js`, `space-summary.js`, `storage-read-profile.js`, `wal-snapshot-benchmark.js`, `audit-action-kinds.js`, and `upgrade-regression/run.js`. Check a helper's output against the current keys before trusting it. The dead-ends review lists the readers to point at the log reader; that change is not made yet.
+These helpers mention storage keys that the 1.6 work has retired: `active-queue-rows.js`, `current-work-filter.js`, `queue-counts.js`, `queue-failures.js`, `queue-storage-summary.js`, `queue-summary.js`, `audit-action-kinds.js`, and `upgrade-regression/run.js`. `inspect-space-state.js`, `space-summary.js`, `storage-read-profile.js`, and `wal-snapshot-benchmark.js` read the stored (prefixed) names now, and no longer read the removed space post maps. Check a helper's output against the current keys before trusting it. The dead-ends review lists the readers to point at the log reader; that change is not made yet.
 
 ## Restored after a test needed it
 

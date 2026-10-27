@@ -242,7 +242,7 @@ For small literal source edits where apply_patch is unavailable, use npm run dev
 | `tools/cdp/reload-extension.js` | Clear/report extension errors and reload only when the install is not Web Store-backed. Prefer `reload-chrome-dev.js` for the dev loop. | `node tools/cdp/reload-extension.js --extension-id auto` |
 | `tools/cdp/space-summary.js` | Summarize all open Quora space tabs and service-worker space/queue state. | `node tools/cdp/space-summary.js` |
 | `tools/cdp/reload-space-tabs.js` | Reload all open Quora space tabs without creating new tabs. | `node tools/cdp/reload-space-tabs.js` |
-| `tools/cdp/inspect-space-state.js` | Inspect one space by URL/title substring, including source-page controls, pending post records, queue rows, and worker ownership. | `node tools/cdp/inspect-space-state.js --needle theobvioustrollshootinggallery` |
+| `tools/cdp/inspect-space-state.js` | Inspect one space by URL/title substring, including source-page controls, queue rows, and worker ownership. | `node tools/cdp/inspect-space-state.js --needle theobvioustrollshootinggallery` |
 | `tools/cdp/space-contributors.js` | Inspect, open, or nuke the visible contributor modal for one space tab without switching to profile targets. | `node tools/cdp/space-contributors.js --needle itsoktobewhite --action open-and-nuke` |
 | `tools/cdp/queue-summary.js` | Summarize coordinator queue/run state and open profile tabs, optionally filtered by source/target text. | `node tools/cdp/queue-summary.js --needle itsoktobewhite` |
 | `tools/cdp/queue-counts.js` | Compact persisted queue counts plus open profile tabs for quick monitoring. | `node tools/cdp/queue-counts.js --needle profile-modal` |

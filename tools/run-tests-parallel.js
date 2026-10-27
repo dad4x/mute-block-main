@@ -30,6 +30,7 @@ const lanes = [
       ['node', 'test/walArrivalShards.test.js'],
       ['node', 'test/walChangedShards.test.js'],
       ['node', 'test/walShardGc.test.js'],
+      ['node', 'test/walAreaShardLayout.test.js'],
       ['node', 'test/swQueueWalRowShard.test.js'],
       ['node', 'test/walQueueRowShards.test.js'],
       ['node', 'test/swCompletedShards.test.js'],

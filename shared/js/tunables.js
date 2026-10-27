@@ -131,6 +131,12 @@ module.exports = {
     // slows down deeper into a feed, so a feed that stops growing at the bottom only counts as ended after COLLECT_END_CONFIRM_MS.
     COLLECT_SCROLL_PASS_WAIT_MS: 500,
     COLLECT_END_CONFIRM_MS: 3000,
-    MODAL_PROFILE_NUKE_SCROLL_WAIT_MS: 900
+    MODAL_PROFILE_NUKE_SCROLL_WAIT_MS: 900,
+
+    // Dashboard duration histograms (owner, 26 Oct; semi-log scale changed 26 Oct): the real-block and already-blocked completed rows, bucketed by
+    // active-to-terminal time. Each entry is the lower bound of a bucket in seconds, inclusive; a bucket runs up to the next entry, exclusive, and
+    // the last one has no upper bound (the page labels it "over 10 s"). The worker counts them (sw.js makeCompletedDurationHistogram) and the page
+    // labels them from this same array. The values are seconds, so 750 ms is 0.75 and 1000 ms is 1: a duration compares against edge * 1000 ms.
+    HISTOGRAM_DURATION_EDGES_SEC: [0, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 10]
 }
 

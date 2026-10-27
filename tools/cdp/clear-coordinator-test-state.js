@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const {STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
@@ -13,7 +15,10 @@ const {
     sleep
 } = require('./lib/cdp')
 
-function shouldRemoveStorageKey(key = '') {
+// A stored name is removed when it carries this layout's prefix and its plain name starts with one of these prefixes.
+function shouldRemoveStorageKey(key = '', layoutPrefix = '') {
+    if(!key.startsWith(layoutPrefix)) return false
+    const plainKey = key.slice(layoutPrefix.length)
     return [
         'mbCoordinator',
         'mbProfileNukeProgressView',
@@ -21,7 +26,7 @@ function shouldRemoveStorageKey(key = '') {
         'mbQueuedActionSurface',
         'mbQueueWakeup',
         'mbFlightRecorder'
-    ].some(prefix => key.startsWith(prefix))
+    ].some(prefix => plainKey.startsWith(prefix))
 }
 
 runMain(async () => {
@@ -60,7 +65,7 @@ runMain(async () => {
                 resolve({ok: false, error: lastError})
                 return
             }
-            const keys = Object.keys(stored || {}).filter(shouldRemoveStorageKey)
+            const keys = Object.keys(stored || {}).filter(key => shouldRemoveStorageKey(key, ${JSON.stringify(STORAGE_LAYOUT_PREFIX)}))
             chrome.storage.local.remove(keys, () => {
                 const removeError = chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
                 resolve({

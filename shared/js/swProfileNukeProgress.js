@@ -73,8 +73,6 @@ function createProfileNukeProgress(deps = {}) {
         isTerminalProfileNukeRecord,
         getCoordinatorItemHref,
         normalizeProfileNukeProgressView,
-        normalizeCoordinatorMap,
-        makeCoordinatorQueueWalCheckpoint,
         buildCoordinatorQueueView
     } = deps.handlers || {}
     const {
@@ -82,8 +80,6 @@ function createProfileNukeProgress(deps = {}) {
         PROFILE_NUKE_PROGRESS_SHARD_COUNT,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
-        COORDINATOR_QUEUE_KEY,
-        COORDINATOR_QUEUE_WAL_KEY,
         COORDINATOR_QUEUE_VIEW_KEY
     } = deps.constants || {}
 
@@ -439,42 +435,6 @@ function createProfileNukeProgress(deps = {}) {
         return progress
     }
 
-    function addContentPageStateProjectionPayload(payload = {}) {
-        if(!payload || typeof payload !== 'object') return payload
-        const next = {
-            ...payload
-        }
-        const nowMs = now()
-        if(
-            Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_KEY) &&
-            next[COORDINATOR_QUEUE_KEY] &&
-            typeof next[COORDINATOR_QUEUE_KEY] === 'object'
-        ) {
-            const queue = normalizeCoordinatorMap(next[COORDINATOR_QUEUE_KEY])
-            if(!Object.prototype.hasOwnProperty.call(next, COORDINATOR_QUEUE_WAL_KEY)) {
-                next[COORDINATOR_QUEUE_WAL_KEY] = makeCoordinatorQueueWalCheckpoint(queue, {createdAt: nowMs})
-            }
-            // 2026-10-02: used to also inject a freshly-built
-            // COORDINATOR_QUEUE_VIEW_KEY here unconditionally on every full-
-            // queue write -- missed during the 2026-10-01 "remove all on-disk
-            // mbCoordinatorQueueView persistence" work (this call site isn't
-            // near any of the other projection-payload builders that work
-            // touched). That kept the disk key perpetually re-populated with
-            // whatever queue shape happened to be writing at that moment --
-            // not the ratcheted/statsClearedAt-filtered view the rest of the
-            // app expects -- which the WAL's auto-recovery-from-view path
-            // (since retired -- see historical/LEGACY_QUEUE_VIEW_RETIREMENT.md) then read back
-            // in as "the truth" on the next hydrate failure, reintroducing
-            // old/mismatched row states on top of a live WAL that had since
-            // moved on. Confirmed live: reappearing rows and up to 3
-            // concurrently active tabs right after a
-            // coordinator-authority-queue-wal-auto-recovered-from-view event.
-            // Owner 601f 1a: the content queue index and its shards are no longer added to a full-queue write. They are derived
-            // from the resident queue on read (readResidentDerivedQueueIndex in sw.js), so nothing stores them.
-        }
-        return next
-    }
-
     return {
         summarizeProfileNukeProgressRecord,
         buildProfileNukeProgressView,
@@ -493,8 +453,7 @@ function createProfileNukeProgress(deps = {}) {
         removeProfileNukeProgressViewRecords,
         removeProfileNukeProgressShardRecords,
         normalizeProfileNukeProgressShardRecords,
-        getProfileNukeProgressRecordsFromProjection,
-        addContentPageStateProjectionPayload
+        getProfileNukeProgressRecordsFromProjection
     }
 }
 

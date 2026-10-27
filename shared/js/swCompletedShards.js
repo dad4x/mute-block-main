@@ -12,6 +12,11 @@
 // rows again, and the next checkpoint prunes them again, so the prune is safe to repeat.
 //
 // The shard id is storage layout only. Clear removes every key, shards included (eraseBlockHistoryRequested), so it needs no step here.
+//
+// Drop path (area-v1): a dropped shard leaves the checkpoint as one delete of its key (completedDropShardIds, passed to the slot write).
+// The rows leave the resident map only after that save succeeds (dropResidentCompletedShards in sw.js).
+
+const {checkpointAreaShardId} = require('./walSnapshotStore')
 
 const COMPLETED_SHARD_DEFAULT = 0
 
@@ -107,10 +112,17 @@ function withoutShards(completed = {}, drop = new Set()) {
     return kept
 }
 
+// The checkpoint shard ids of the dropped completed shards (area-v1 namespace). The checkpoint switch passes them to the slot write,
+// which deletes each one's key: one delete per dropped shard, and no other shard of the log is rewritten for the drop.
+function completedDropShardIds(drop = new Set()) {
+    return [...(drop || [])].sort((left, right) => left - right).map(id => checkpointAreaShardId('completed', id))
+}
+
 module.exports = {
     makeCompletedShardTail,
     completedAreaShardOf,
     completedShardIdOf,
+    completedDropShardIds,
     selectCompletedShardsToPrune,
     withoutShards,
     COMPLETED_SHARD_DEFAULT

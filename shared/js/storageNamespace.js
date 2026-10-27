@@ -76,9 +76,31 @@ function namespaceChanges(changes) {
     return Object.keys(entries).length ? entries : null
 }
 
+// The one read of plain (unprefixed) names, for the one-time import of the 1.5 space registry (27 Oct, sw.js
+// importSpaceRegistryFromVersion15). Version 1.5 stored that key under its plain name, which this layout never reads through
+// namespaceArea. The names are read as they are, from the browser's local area, and nothing is written here.
+async function readPlainLocalNames(browserApi, names) {
+    const area = browserApi?.storage?.local || null
+    if(!area) return {}
+    return (await area.get(names)) || {}
+}
+
+// The one removal of plain (unprefixed) names, for the erase (owner, 27 Oct; sw.js eraseBlockHistoryRequested and runPendingBlockHistoryErase).
+// The 1.5 space registry is under its plain name, so the erase removes it here as well as through namespaceArea. Nothing else is removed here.
+// It rejects when the browser rejects, so the caller can count the failure and carry on with the erase. With no local area it rejects too,
+// since a removal that did not happen must not look like one that did.
+async function removePlainLocalNames(browserApi, names) {
+    const area = browserApi?.storage?.local || null
+    if(!area) throw new Error('removePlainLocalNames: no local storage area')
+    if(!Array.isArray(names) || !names.length) return
+    await area.remove(names)
+}
+
 module.exports = {
     namespaceArea,
     namespaceChanges,
     prefixedName,
-    plainName
+    plainName,
+    readPlainLocalNames,
+    removePlainLocalNames
 }

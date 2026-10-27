@@ -45,8 +45,6 @@ runMain(async () => {
             currentWorkReadyCount: text('currentWorkReadyCount'),
             requeueFailedButton: text('requeueFailedButton'),
             cancelCurrentWorkButton: text('cancelCurrentWorkButton'),
-            retryFailedButton: text('retryFailedButton'),
-            retryFailedState: text('retryFailedState'),
             rowCancelButtons: document.querySelectorAll('#queueList .row-cancel-button').length,
             queueRows: queueRows.length,
             runRows: runRows.length,

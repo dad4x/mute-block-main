@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored names of the queue and the run list: the layout prefix plus the plain key name (storageNamespace.js).
+const STORED_NAMES = {
+    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
+    runs: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RUNS_KEY}`
+}
+
 const {
     evaluate,
     getCdpConfig,
@@ -22,13 +30,13 @@ runMain(async () => {
     }
 
     const progressRecords = await readProfileNukeProgressFromWorker(config)
-    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectQueue(needle, progressRecords) {
+    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectQueue(needle, progressRecords, names) {
         const storage = await chrome.storage.local.get({
-            mbCoordinatorQueue: {},
-            mbCoordinatorRuns: {}
+            [names.queue]: {},
+            [names.runs]: {}
         })
-        const queue = storage.mbCoordinatorQueue || {}
-        const runs = storage.mbCoordinatorRuns || {}
+        const queue = storage[names.queue] || {}
+        const runs = storage[names.runs] || {}
         const tabs = await chrome.tabs.query({})
         const profileTabs = tabs.filter(tab => /^https:\/\/www\.quora\.com\/profile\//i.test(tab.url || ''))
         const runtimeQueuedActions = typeof queuedTabActions !== 'undefined'
@@ -132,7 +140,7 @@ runMain(async () => {
             })).slice(0, 60),
             profileTabCount: profileTabs.length
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)} )`, 30000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)} )`, 30000)
 
     console.log(JSON.stringify(result, null, 2))
 })

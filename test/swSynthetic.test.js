@@ -662,7 +662,7 @@ test('completed summary: the count and duration total cover the completed rows w
     const {view} = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('finished-duration'))
     assert.equal(view.counts.succeeded, 2, 'the zero-length succeeded row is in the queue counts')
     assert.equal(view.counts.failed, 1)
-    assert.deepEqual(view.completedSummary, {count: 3, durationCount: 2, durationTotalMs: 3000}, 'A, B and C are completed; A takes 2000 ms and B takes 1000 ms; C has no duration')
+    assert.deepEqual(completedSummaryTotals(view.completedSummary), {count: 3, durationCount: 2, durationTotalMs: 3000}, 'A, B and C are completed; A takes 2000 ms and B takes 1000 ms; C has no duration')
 })
 
 test('terminal cleanup coalesces overlapping per-row calls into one trailing pass', async () => {
@@ -953,6 +953,451 @@ test('hydrate reads the queue WAL from a valid session mirror, and from disk whe
     assert.equal(sw.coordinatorAuthority.current().queue[hrefB].tabId, 882)
 })
 
+// The namespace of a checkpoint shard key (`<base>.checkpoint.<A|B>.s<id>`): 0 the queue, 1 the completed log, 2 the runs. Null for any other
+// key, so a test can pick the WAL shard keys out of a storage copy. Only the given slot's keys when a slot is passed.
+function checkpointShardKeyNamespace(key = '', slot = '') {
+    const match = /\.checkpoint\.([AB])\.s(\d+)$/.exec(`${key}`)
+    if(!match || (slot && match[1] !== slot)) return null
+    return Math.floor(Number(match[2]) / require('../shared/js/walSnapshotStore').CHECKPOINT_AREA_SHARD_STRIDE)
+}
+
+// A worker with an area-v1 checkpoint on disk and a session mirror of it. The queue holds one live row and one archived (completed) row,
+// and a run is written, so the shards of all three areas are on disk, and a checkpoint switch writes them under the area-v1 layout.
+async function startAreaMirrorHarness(runId) {
+    const now = 600000
+    const doneHref = 'https://www.quora.com/profile/Synthetic-Area-Mirror-Done'
+    const liveHref = 'https://www.quora.com/profile/Synthetic-Area-Mirror-Live'
+    const queued = {
+        [doneHref]: makePaddedArchivableRow({href: doneHref, runId, terminalAt: now - 1000}),
+        [liveHref]: makeQueuedCoordinatorRow({href: liveHref, runId, attemptId: 'attempt-area-mirror-live', now})
+    }
+    const harness = loadServiceWorkerHarness({
+        now,
+        storage: {
+            nukedPostRetentionDays: 7,
+            mbCoordinatorPaused: true,
+            mbCoordinatorQueue: queued,
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await harness.sw.coordinatorAuthority.hydrate()
+    const archived = await harness.sw.archiveTerminalCoordinatorRow(doneHref, harness.sw.coordinatorAuthority.current().queue[doneHref])
+    assert.equal(archived.archived, true, archived.reason)
+    const saved = await writeRunsThroughDoor(harness.sw, {[runId]: makeCoordinatorRun({href: liveHref, runId})})
+    assert.equal(saved.saved, true, saved.reason)
+    const checkpointSwitch = await harness.sw.switchCoordinatorAuthorityQueueWalCheckpoint()
+    assert.equal(checkpointSwitch.checkpointSwitched, true, checkpointSwitch.reason)
+    return {...harness, now, doneHref, liveHref}
+}
+
+// The active slot of a storage copy: its id, and the namespaces of its shard keys on disk or in a session copy.
+function activeSlotOf(storage) {
+    return storage['mbCoordinatorQueueWal.meta'].activeCheckpoint
+}
+
+// The resident queue, runs and completed map as text with every object's keys sorted, so two copies of one state compare equal whatever
+// order their keys were built in.
+function residentSnapshotOf(sw) {
+    const current = sw.coordinatorAuthority.current()
+    const canonical = value => {
+        if(Array.isArray(value)) return value.map(canonical)
+        if(value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]))
+        return value
+    }
+    return JSON.stringify(canonical({queue: current.queue, runs: current.runs, completed: sw.coordinatorAuthority.residentCompleted()}))
+}
+
+test('the session mirror of an area-v1 checkpoint holds the queue shards only, and disk holds the completed and runs shards as well', async () => {
+    const {browser} = await startAreaMirrorHarness('run-area-mirror-only')
+    const storage = browser.__storage
+    const session = browser.__sessionStorage
+    const slot = activeSlotOf(storage)
+    const manifest = storage[`mbCoordinatorQueueWal.checkpoint.${slot}`]
+    assert.equal(manifest.shardLayout, 'area-v1', 'the switch writes the area-v1 layout')
+
+    const sessionNamespaces = Object.keys(session).map(key => checkpointShardKeyNamespace(key, slot)).filter(ns => ns !== null)
+    assert.ok(sessionNamespaces.length > 0, 'the session holds the queue shard of the active slot')
+    assert.deepEqual(sessionNamespaces.filter(ns => ns !== 0), [], 'the session holds no completed or runs shard')
+    const diskNamespaces = new Set(Object.keys(storage).map(key => checkpointShardKeyNamespace(key, slot)).filter(ns => ns !== null))
+    assert.ok(diskNamespaces.has(1), 'disk holds the completed shard of the active slot')
+    assert.ok(diskNamespaces.has(2), 'disk holds the runs shard of the active slot')
+    assert.ok(session['mbCoordinatorQueueWal.meta'], 'the mirror still holds the meta')
+})
+
+test('a hydrate from a valid area-v1 mirror returns the same resident state as a hydrate from disk alone', async () => {
+    const {sw, browser, now} = await startAreaMirrorHarness('run-area-mirror-equal')
+    const reference = residentSnapshotOf(sw)
+
+    const fromMirror = loadServiceWorkerHarness({now, browser})
+    await fromMirror.sw.coordinatorAuthority.hydrate()
+    assert.equal(fromMirror.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.hydrateFromMirror'], 1, 'the restart reads the mirror')
+    assert.equal(residentSnapshotOf(fromMirror.sw), reference, 'the mirror hydrate holds the same state as the worker that wrote it')
+
+    // Disk alone: the session copy is emptied, so the restart cannot use the mirror.
+    for (const key of Object.keys(browser.__sessionStorage)) delete browser.__sessionStorage[key]
+    const fromDisk = loadServiceWorkerHarness({now, browser})
+    await fromDisk.sw.coordinatorAuthority.hydrate()
+    assert.equal(fromDisk.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.hydrateFromMirror'] || 0, 0, 'no mirror without a session copy')
+    assert.equal(residentSnapshotOf(fromDisk.sw), reference, 'the disk hydrate holds the same state')
+})
+
+test('a hydrate after a worker restart with a valid area-v1 mirror reads the completed and runs shards from disk, and the session holds neither', async () => {
+    const {browser, now, doneHref} = await startAreaMirrorHarness('run-area-mirror-restart')
+    const requested = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = defaults => {
+        requested.push(...(Array.isArray(defaults) ? defaults : Object.keys(defaults || {})))
+        return originalGet(defaults)
+    }
+    let restarted = null
+    try {
+        restarted = loadServiceWorkerHarness({now, browser})
+        await restarted.sw.coordinatorAuthority.hydrate()
+    }
+    finally {
+        browser.storage.local.get = originalGet
+    }
+    const counters = restarted.sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.hydrateFromMirror'], 1, 'the restart reads the mirror')
+    assert.ok(requested.some(key => checkpointShardKeyNamespace(key) === 1), 'a completed shard is read from disk')
+    assert.ok(requested.some(key => checkpointShardKeyNamespace(key) === 2), 'a runs shard is read from disk')
+    assert.ok(counters['queueMirror.hydrateCompletedRunsDiskRead'] > 0, 'the mirror hydrate counts the completed and runs keys it read from disk')
+    assert.ok(restarted.sw.coordinatorAuthority.residentCompleted()[doneHref], 'the completed row comes back from disk')
+    const sessionNamespaces = Object.keys(browser.__sessionStorage).map(key => checkpointShardKeyNamespace(key)).filter(ns => ns !== null)
+    assert.deepEqual(sessionNamespaces.filter(ns => ns !== 0), [], 'the session still holds no completed or runs shard')
+})
+
+test('a session copy missing one of its queue shards is not used: the restart reads the whole WAL from disk', async () => {
+    const {browser, now, liveHref} = await startAreaMirrorHarness('run-area-mirror-incomplete')
+    const queueShardKey = Object.keys(browser.__sessionStorage).find(key => checkpointShardKeyNamespace(key) === 0)
+    assert.ok(queueShardKey, 'the session holds a queue shard to remove')
+    delete browser.__sessionStorage[queueShardKey]
+
+    const restarted = loadServiceWorkerHarness({now, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    const counters = restarted.sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.hydrateMirrorIncomplete'], 1, 'the partial copy is refused')
+    assert.equal(counters['coordinatorAuthority.queueWal.hydrateFromMirror'] || 0, 0, 'the mirror is not used')
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the queue row comes back from disk')
+})
+
+test('a torn active manifest is recovered from an area-v1 session copy, and the completed and runs shards it does not hold come from disk', async () => {
+    const {browser, now, liveHref, doneHref} = await startAreaMirrorHarness('run-area-mirror-torn')
+    const storage = browser.__storage
+    const manifestKey = `mbCoordinatorQueueWal.checkpoint.${activeSlotOf(storage)}`
+    // The disk manifest disagrees with the disk meta (a torn write), while the session copy still agrees with the meta.
+    storage[manifestKey] = {...storage[manifestKey], stateHash: 'torn-manifest'}
+
+    const restarted = loadServiceWorkerHarness({now, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    const counters = restarted.sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointRecoveredFromMirror'], 1, 'the session copy is used for the recovery')
+    assert.equal(counters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 0)
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the queue comes from the copy')
+    assert.ok(restarted.sw.coordinatorAuthority.residentCompleted()[doneHref], 'the completed row comes from disk')
+})
+
+// Session restart (architecture.md, section 4.8). A restart keeps the browser's storage: the session copy and the disk. The disk-only
+// reference is the same storage with the session emptied, so both restarts read the same disk. The helpers below copy and replace
+// storage areas as plain JSON, the way the fake browser stores them.
+const SESSION_MARKER_KEY = require('../shared/js/storageKeys').COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY
+const SESSION_RESTART_COUNTERS = {
+    used: 'coordinatorAuthority.queueWal.restartUsedSessionQueue',
+    refused: 'coordinatorAuthority.queueWal.restartSessionRefused',
+    diskQueue: 'coordinatorAuthority.queueWal.restartQueueShardsReadFromDisk',
+    tailRead: 'coordinatorAuthority.queueWal.restartTailRecordsRead',
+    tailApplied: 'coordinatorAuthority.queueWal.restartTailRecordsApplied'
+}
+
+function copyStorageArea(area) {
+    return JSON.parse(JSON.stringify(area))
+}
+
+function replaceStorageArea(target, saved) {
+    for (const key of Object.keys(target)) delete target[key]
+    Object.assign(target, copyStorageArea(saved))
+}
+
+// A restart: a new worker on the same browser. The keys the restart reads from disk are recorded, and the storage read is restored after.
+async function restartWorkerOnBrowser(browser, now) {
+    const requested = []
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = defaults => {
+        requested.push(...(Array.isArray(defaults) ? defaults : Object.keys(defaults || {})))
+        return originalGet(defaults)
+    }
+    let restarted = null
+    try {
+        restarted = loadServiceWorkerHarness({now, browser})
+        await restarted.sw.coordinatorAuthority.hydrate()
+    }
+    finally {
+        browser.storage.local.get = originalGet
+    }
+    return {restarted, requested}
+}
+
+function restartCounters(restarted) {
+    const counters = restarted.sw.state().queueWakeupCounters
+    return Object.fromEntries(Object.entries(SESSION_RESTART_COUNTERS).map(([name, key]) => [name, counters[key] || 0]))
+}
+
+test('a restart with agreeing manifests and a committed session copy uses the session queue and reads no queue shard from disk', async () => {
+    const {browser, now, liveHref, doneHref} = await startAreaMirrorHarness('run-session-restart-agree')
+    const slot = activeSlotOf(browser.__storage)
+    const {restarted, requested} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.used, 1, 'the restart used the session queue')
+    assert.equal(counted.diskQueue, 0, 'no queue shard was read from disk')
+    assert.equal(counted.refused, 0, 'the copy was not refused')
+    assert.deepEqual(requested.filter(key => checkpointShardKeyNamespace(key) === 0), [], 'no queue shard key of either slot is read from disk')
+    assert.ok(requested.some(key => checkpointShardKeyNamespace(key, slot) === 1), 'the completed shard is still read from disk')
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the live row comes from the session copy')
+    assert.ok(restarted.sw.coordinatorAuthority.residentCompleted()[doneHref], 'the completed row comes from disk')
+})
+
+test('a restart with agreeing manifests applies the disk WAL tail the session copy does not hold, and matches a disk-only restart', async () => {
+    const {sw, browser, now, liveHref} = await startAreaMirrorHarness('run-session-tail-first')
+    const runId = 'run-session-tail-second'
+    const firstId = 'run-session-tail-first-write'
+    const firstWrite = await writeRunsThroughDoor(sw, {[firstId]: makeCoordinatorRun({href: liveHref, runId: firstId})})
+    assert.equal(firstWrite.saved, true, firstWrite.reason)
+    // The copy holds the state before the second write. The disk takes that write and the copy does not: that write is the tail.
+    const copy = copyStorageArea(browser.__sessionStorage)
+    const secondWrite = await writeRunsThroughDoor(sw, {[runId]: makeCoordinatorRun({href: liveHref, runId})})
+    assert.equal(secondWrite.saved, true, secondWrite.reason)
+    replaceStorageArea(browser.__sessionStorage, copy)
+    const slot = activeSlotOf(browser.__storage)
+    const copyCommitted = copy['mbCoordinatorQueueWal.meta'].segmentedStorage.committedSegments[slot]
+    assert.equal(browser.__storage['mbCoordinatorQueueWal.meta'].segmentedStorage.committedSegments[slot], copyCommitted + 1, 'the disk holds one segment the copy does not')
+    const disk = copyStorageArea(browser.__storage)
+
+    const {restarted} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.used, 1, 'the restart used the session queue')
+    assert.equal(counted.diskQueue, 0, 'no queue shard was read from disk')
+    assert.ok(counted.tailRead >= 1, 'the disk tail was read')
+    assert.ok(counted.tailApplied >= 1, 'the disk tail record was applied')
+    assert.ok(restarted.sw.coordinatorAuthority.current().runs[runId], 'the tail write is in the restarted state')
+    const fromSession = residentSnapshotOf(restarted.sw)
+
+    replaceStorageArea(browser.__storage, disk)
+    replaceStorageArea(browser.__sessionStorage, {})
+    const diskOnly = await restartWorkerOnBrowser(browser, now)
+    assert.equal(restartCounters(diskOnly.restarted).used, 0, 'the disk-only restart uses no session copy')
+    assert.equal(fromSession, residentSnapshotOf(diskOnly.restarted.sw), 'the session restart holds the same state as the disk-only restart')
+})
+
+test('a restart with an uncommitted session copy takes the disk path and uses no session queue', async () => {
+    const {browser, now, liveHref} = await startAreaMirrorHarness('run-session-pending')
+    const marker = browser.__sessionStorage[SESSION_MARKER_KEY]
+    // A write in flight at shutdown: the copy's pending marker names a sequence its committed marker does not.
+    browser.__sessionStorage[SESSION_MARKER_KEY] = {...marker, pending: `${marker.committed}-in-flight`}
+    const {restarted} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.used, 0, 'the session queue is not used')
+    assert.equal(counted.diskQueue, 1, 'the queue is read from disk')
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the queue comes from disk')
+})
+
+test('a restart whose session manifest disagrees with the disk manifest on the queue area takes the disk path', async () => {
+    const first = await startAreaMirrorHarness('run-session-disagree')
+    const {browser, now, liveHref} = first
+    const reference = residentSnapshotOf(first.sw)
+    const slot = activeSlotOf(browser.__storage)
+    const manifestKey = `mbCoordinatorQueueWal.checkpoint.${slot}`
+    const sessionManifest = browser.__sessionStorage[manifestKey]
+    browser.__sessionStorage[manifestKey] = {
+        ...sessionManifest,
+        areaShards: {...sessionManifest.areaShards, queue: {...sessionManifest.areaShards.queue, hash: 'session-queue-area-other'}}
+    }
+    const {restarted} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.refused, 1, 'the copy is refused')
+    assert.equal(counted.used, 0, 'the session queue is not used')
+    assert.equal(counted.diskQueue, 1, 'the queue is read from disk')
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the queue comes from disk')
+    assert.equal(residentSnapshotOf(restarted.sw), reference, 'the disk path holds the same state as the worker that wrote it')
+})
+
+// A worker with an area-v1 checkpoint and a session copy of it, and one more run written after that copy was taken (in the copy the disk
+// tail is absent). The slot is the active one. Tests that change the disk tail start from here.
+async function startTailHarness(runId) {
+    const first = await startAreaMirrorHarness(runId)
+    const {sw, browser, liveHref} = first
+    const copiedId = `${runId}-copied`
+    const saved = await writeRunsThroughDoor(sw, {[copiedId]: makeCoordinatorRun({href: liveHref, runId: copiedId})})
+    assert.equal(saved.saved, true, saved.reason)
+    return {...first, slot: activeSlotOf(browser.__storage)}
+}
+
+// Appends one segment to the active slot on disk, as the next committed segment, and bumps the meta to name it.
+function addDiskTailSegment(browser, slot, segment) {
+    const meta = browser.__storage['mbCoordinatorQueueWal.meta']
+    const segmentNo = meta.segmentedStorage.committedSegments[slot]
+    browser.__storage[`mbCoordinatorQueueWal.segment.${slot}.${`${segmentNo}`.padStart(4, '0')}`] = {
+        version: 1,
+        generation: slot,
+        segmentNo,
+        segment
+    }
+    meta.segmentedStorage.committedSegments[slot] = segmentNo + 1
+    meta.generations[slot].segments = segmentNo + 1
+}
+
+function lastDiskSegmentOf(browser, slot) {
+    const segmentNo = browser.__storage['mbCoordinatorQueueWal.meta'].segmentedStorage.committedSegments[slot] - 1
+    return browser.__storage[`mbCoordinatorQueueWal.segment.${slot}.${`${segmentNo}`.padStart(4, '0')}`].segment
+}
+
+test('a restart reads no segment of the other slot: a leftover segment there is not applied', async () => {
+    const {browser, now, sw, liveHref, slot} = await startTailHarness('run-session-leftover')
+    const other = slot === 'A' ? 'B' : 'A'
+    const leftoverId = 'run-session-leftover-other-slot'
+    browser.__storage[`mbCoordinatorQueueWal.segment.${other}.0000`] = {
+        version: 1,
+        generation: other,
+        segmentNo: 0,
+        segment: {id: 'leftover-segment', fromSeq: 900000, toSeq: 900000, sealed: true, records: [{
+            version: 1, seq: 900000, id: 'leftover-record', kind: 'map.set', area: 'runs', key: leftoverId, at: 0,
+            value: makeCoordinatorRun({href: liveHref, runId: leftoverId})
+        }]}
+    }
+    const reference = residentSnapshotOf(sw)
+    const {restarted, requested} = await restartWorkerOnBrowser(browser, now)
+    assert.equal(requested.filter(key => key.startsWith(`mbCoordinatorQueueWal.segment.${other}.`)).length, 0, 'no segment of the other slot is read')
+    assert.equal(restartCounters(restarted).used, 1, 'the session restart is the one that reads')
+    assert.equal(restarted.sw.coordinatorAuthority.current().runs[leftoverId], undefined, 'the leftover record is not applied')
+    assert.equal(residentSnapshotOf(restarted.sw), reference)
+})
+
+test('a disk tail segment that repeats a record the copy holds does not apply that record twice', async () => {
+    const {browser, now, sw, slot} = await startTailHarness('run-session-duplicate')
+    const reference = residentSnapshotOf(sw)
+    const repeated = copyStorageArea(lastDiskSegmentOf(browser, slot))
+    // The disk tail is the copy's last segment again, under the next segment number.
+    addDiskTailSegment(browser, slot, repeated)
+    const {restarted} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.used, 1, 'the session restart is used')
+    assert.equal(counted.tailRead, repeated.records.length, 'the repeated records are read from the tail')
+    assert.equal(counted.tailApplied, 0, 'none of the repeated records is applied again')
+    assert.equal(residentSnapshotOf(restarted.sw), reference, 'the state is the state before the repeat')
+})
+
+test('a disk tail record the checkpoint already covers is not applied on a session restart', async () => {
+    const {browser, now, sw, slot} = await startTailHarness('run-session-covered')
+    const reference = residentSnapshotOf(sw)
+    const template = lastDiskSegmentOf(browser, slot).records[0]
+    const coveredId = 'run-session-covered-record'
+    // A record at sequence 1, which the checkpoint of the switch already covers, with an id no other record has.
+    addDiskTailSegment(browser, slot, {
+        id: 'covered-segment', fromSeq: 1, toSeq: 1, sealed: true,
+        records: [{...copyStorageArea(template), seq: 1, id: coveredId, key: coveredId, value: makeCoordinatorRun({href: 'https://www.quora.com/profile/Synthetic-Covered', runId: coveredId})}]
+    })
+    const {restarted} = await restartWorkerOnBrowser(browser, now)
+    const counted = restartCounters(restarted)
+    assert.equal(counted.used, 1, 'the session restart is used')
+    assert.equal(counted.tailRead, 1, 'the covered record is read from the tail')
+    assert.equal(counted.tailApplied, 0, 'the covered record is not applied')
+    assert.equal(restarted.sw.coordinatorAuthority.current().runs[coveredId], undefined, 'the covered record is not in the state')
+    assert.equal(residentSnapshotOf(restarted.sw), reference)
+})
+
+test('a seeded run of writes, switches and restarts gives the same state from a session restart as from a disk-only restart', async () => {
+    for (const seed of [11, 23, 37]) {
+        let random = seed
+        const nextRandom = () => {
+            random = (random * 1103515245 + 12345) % 2147483648
+            return random / 2147483648
+        }
+        const first = await startAreaMirrorHarness(`run-round-trip-${seed}`)
+        const {browser, now, liveHref} = first
+        let writer = first.sw
+        const restartAt = 2 + Math.floor(nextRandom() * 4)
+        let writes = 0
+        for (let step = 0; step < 8; step += 1) {
+            if (step === restartAt) {
+                const reopened = await restartWorkerOnBrowser(browser, now)
+                assert.equal(restartCounters(reopened.restarted).used, 1, `seed ${seed}: the mid-run restart uses the session queue`)
+                writer = reopened.restarted.sw
+            }
+            if (nextRandom() < 0.7) {
+                writes += 1
+                const runId = `run-round-trip-${seed}-${writes}`
+                const saved = await writeRunsThroughDoor(writer, {[runId]: makeCoordinatorRun({href: liveHref, runId})})
+                assert.equal(saved.saved, true, `seed ${seed}: ${saved.reason}`)
+            }
+            else {
+                await writer.switchCoordinatorAuthorityQueueWalCheckpoint()
+            }
+        }
+        const written = residentSnapshotOf(writer)
+        const disk = copyStorageArea(browser.__storage)
+        const fromSession = await restartWorkerOnBrowser(browser, now)
+        assert.equal(restartCounters(fromSession.restarted).used, 1, `seed ${seed}: the final restart uses the session queue`)
+        assert.equal(residentSnapshotOf(fromSession.restarted.sw), written, `seed ${seed}: the session restart matches the writer`)
+
+        replaceStorageArea(browser.__storage, disk)
+        replaceStorageArea(browser.__sessionStorage, {})
+        const fromDisk = await restartWorkerOnBrowser(browser, now)
+        assert.equal(restartCounters(fromDisk.restarted).used, 0, `seed ${seed}: the disk restart uses no session copy`)
+        assert.equal(residentSnapshotOf(fromDisk.restarted.sw), written, `seed ${seed}: the disk restart matches the writer`)
+    }
+})
+
+test('a shared-layout checkpoint mirror keeps every shard the meta names, and a restart hydrates from that copy', async () => {
+    const wal = require('../shared/js/walSnapshotStore')
+    const now = 600000
+    const runId = 'run-shared-layout-mirror'
+    const doneHref = 'https://www.quora.com/profile/Synthetic-Shared-Layout-Done'
+    const liveHref = 'https://www.quora.com/profile/Synthetic-Shared-Layout-Live'
+    const state = {
+        queue: {[liveHref]: makeQueuedCoordinatorRow({href: liveHref, runId, attemptId: 'attempt-shared-layout-live', now})},
+        completed: {[doneHref]: makePaddedArchivableRow({href: doneHref, runId, terminalAt: now - 1000})},
+        runs: {},
+        progress: {},
+        events: []
+    }
+    // No shardOf: the hash partition, which has no area record, so this is the shared layout.
+    const written = wal.writeInactiveCheckpoint(wal.makePairedCheckpointStore({}, {snapshotSeq: 0}), state, {
+        snapshotSeq: 5,
+        snapshotEpoch: 1,
+        createdAt: now,
+        codec: TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS.codec,
+        codecName: TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS.codec.name,
+        shardCount: 10
+    })
+    const activated = wal.activateCheckpoint(written.store, written.checkpointId, TEST_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
+    assert.equal(activated.activated, true, activated.reason)
+    const payload = wal.buildSegmentedWalStoragePayload(activated.store, {baseKey: 'mbCoordinatorQueueWal', writeCheckpoints: true})
+    const slot = payload['mbCoordinatorQueueWal.meta'].activeCheckpoint
+    assert.equal(payload[`mbCoordinatorQueueWal.checkpoint.${slot}`].shardLayout, undefined, 'the shared layout has no area record')
+
+    const {sw, browser} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...payload,
+            mbCoordinatorRuns: {},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    assert.equal(await sw.rebuildCoordinatorQueueMirrorFromDisk(), true)
+    const sessionShardKeys = Object.keys(browser.__sessionStorage).filter(key => key.startsWith(`mbCoordinatorQueueWal.checkpoint.${slot}.s`))
+    assert.equal(sessionShardKeys.length, 10, 'the shared-layout copy holds every shard the meta names, as before')
+
+    const restarted = loadServiceWorkerHarness({now, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(restarted.sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.hydrateFromMirror'], 1, 'the restart reads the shared-layout copy')
+    assert.ok(restarted.sw.coordinatorAuthority.current().queue[liveHref], 'the queue row comes back')
+    assert.ok(restarted.sw.coordinatorAuthority.residentCompleted()[doneHref], 'the completed row comes back')
+})
+
 // Checkpoint binding (docs/queue-storage-layering.md, section 6; loadStoreFromStorage in swQueueWalStore.js). A torn write leaves
 // the active slot's manifest and shard records from an older checkpoint, while the disk meta names the current one. The session
 // mirror holds the current checkpoint, because it was built from disk before the tear.
@@ -1018,7 +1463,59 @@ test('a torn checkpoint manifest is recovered on restart from the session mirror
     assert.equal(restarted.sw.coordinatorAuthority.current().queue[current.href].attemptId, 'attempt-binding-current')
     const counters = restarted.sw.state().queueWakeupCounters
     assert.equal(counters['coordinatorAuthority.queueWal.checkpointRecoveredFromMirror'], 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointMirrorCopyUsedDiskTorn'], 1, 'the copy is counted as used because disk was torn')
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointMirrorCopyRefusedDiskIntact'] || 0, 0)
     assert.equal(counters['coordinatorAuthority.queueWal.segmentedHydrateFailed'] || 0, 0)
+})
+
+// Disk first (slice 4). The session copy is a consistent mirror of an older checkpoint, and disk holds an intact current one. The disk
+// checkpoint wins, the copy is not read, and the next mirror rebuild writes the copy over from disk.
+test('an intact disk checkpoint wins over a consistent session copy of an older checkpoint, and the next mirror rebuild rewrites the copy from disk', async () => {
+    const stale = makeCheckpointBindingFixture('attempt-binding-stale', 500000)
+    const current = makeCheckpointBindingFixture('attempt-binding-current', 600000)
+    const older = await hydrateWithCurrentCheckpointMirror(stale)
+    const {manifestKey} = activeSlotAndManifestKey(current.payload)
+    const staleSessionManifest = older.browser.__sessionStorage[manifestKey]
+    assert.ok(staleSessionManifest, 'the session copy holds the stale active manifest')
+    // Disk becomes the current checkpoint, intact. The session copy is left as the stale mirror.
+    const browser = older.browser
+    for(const key of Object.keys(browser.__storage)) if(key.startsWith('mbCoordinatorQueueWal')) delete browser.__storage[key]
+    Object.assign(browser.__storage, current.payload)
+
+    const restarted = loadServiceWorkerHarness({now: 600010, browser})
+    await restarted.sw.coordinatorAuthority.hydrate()
+    assert.equal(restarted.sw.coordinatorAuthority.current().queue[current.href].attemptId, 'attempt-binding-current', 'disk wins')
+    const counters = restarted.sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointRecoveredFromMirror'] || 0, 0, 'the copy is not used')
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointMirrorCopyRejected'] || 0, 0, 'the copy is not read, so none is rejected')
+    assert.equal(await restarted.sw.rebuildCoordinatorQueueMirrorFromDisk(), true)
+    assert.notDeepEqual(browser.__sessionStorage[manifestKey], staleSessionManifest, 'the session copy has moved on')
+    assert.equal(browser.__sessionStorage[manifestKey].stateHash, current.payload[manifestKey].stateHash, 'the session copy is the disk checkpoint')
+})
+
+test('a torn area-v1 manifest is not recovered from a session copy whose queue area hash is wrong, and the authority stays unavailable', async () => {
+    const {browser, now} = await startAreaMirrorHarness('run-area-mirror-bad-hash')
+    const storage = browser.__storage
+    const manifestKey = `mbCoordinatorQueueWal.checkpoint.${activeSlotOf(storage)}`
+    storage[manifestKey] = {...storage[manifestKey], stateHash: 'torn-manifest'}
+    const sessionManifest = browser.__sessionStorage[manifestKey]
+    browser.__sessionStorage[manifestKey] = {
+        ...sessionManifest,
+        areaShards: {...sessionManifest.areaShards, queue: {...sessionManifest.areaShards.queue, hash: 'tampered-queue-area-hash'}}
+    }
+
+    const restarted = loadServiceWorkerHarness({now, browser})
+    await assert.rejects(
+        () => restarted.sw.coordinatorAuthority.hydrate(),
+        /checkpoint-manifest-meta-mismatch/
+    )
+    assert.equal(restarted.sw.coordinatorAuthority.isHydrated(), false)
+    const counters = restarted.sw.state().queueWakeupCounters
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointMirrorCopyRejected'], 1)
+    assert.equal(counters['coordinatorAuthority.queueWal.checkpointRecoveredFromMirror'] || 0, 0)
+    const rejected = restarted.sw.getFlightRecorderSnapshot({kind: 'queue-wal-checkpoint-mismatch'}).entries
+    assert.equal(rejected.length, 1, 'the rejected copy is recorded')
+    assert.match(rejected[0].mirror, /^unusable \(checkpoint-area-hash-mismatch/, 'the rejection names the area hash check')
 })
 
 test('a torn checkpoint manifest with no session mirror leaves the authority unavailable, and the mismatch is counted', async () => {
@@ -1291,7 +1788,12 @@ test('a verify-rejected append leaves the session mirror on the durable WAL, so 
     assert.equal(saved.saved, true, saved.reason)
 
     // The session mirror holds the durable WAL of the active generation, segment for segment: the same keys, and the same content.
-    const activeKeys = wal.getQueueMirrorKeys(storage['mbCoordinatorQueueWal.meta'], {baseKey: 'mbCoordinatorQueueWal'})
+    // The mirror key set is named by the active manifest (area-v1: the queue's shards only, so a completed or runs shard is not in the session).
+    const activeManifestKey = `mbCoordinatorQueueWal.checkpoint.${storage['mbCoordinatorQueueWal.meta'].activeCheckpoint}`
+    const activeKeys = wal.getQueueMirrorKeys(storage['mbCoordinatorQueueWal.meta'], {
+        baseKey: 'mbCoordinatorQueueWal',
+        manifest: storage[activeManifestKey]
+    })
     const mirrorWalKeys = Object.keys(session).filter(key => key.startsWith('mbCoordinatorQueueWal.')).sort()
     assert.deepEqual(mirrorWalKeys, [...activeKeys].sort(), 'the mirror holds the active generation and no other WAL key')
     for(const key of activeKeys) {
@@ -4589,6 +5091,78 @@ test('clear-coordinator-terminal-stats hides terminal rows from the dashboard vi
     assert.equal(getRecoveredCoordinatorQueue(storage)[terminalHref]?.status, 'succeeded')
 })
 
+test('Clear All Stats keeps completed rows and runs in storage, hides the earlier rows from the display counts, and a row finished after the cutoff still shows (owner rule, 27 Oct)', async () => {
+    const runId = 'run-clear-keeps-storage'
+    const hrefB = 'https://www.quora.com/profile/Synthetic-Clear-Keeps-B'
+    const hrefC = 'https://www.quora.com/profile/Synthetic-Clear-Keeps-C'
+    const hrefD = 'https://www.quora.com/profile/Synthetic-Clear-Keeps-D'
+    const hrefE = 'https://www.quora.com/profile/Synthetic-Clear-Keeps-E'
+    const finishedRow = (href, attemptId, activeAt, terminalAt) => ({
+        ...makeArchivedCoordinatorRow({href, runId, attemptId, terminalAt}),
+        activeAt
+    })
+    // D is terminal but still in the live queue, so it is not in the completed log and is never counted here.
+    const queuedTerminalRow = {
+        ...makeArchivedCoordinatorRow({href: hrefD, runId, attemptId: 'attempt-clear-keeps-d', terminalAt: 8000}),
+        activeAt: 7000
+    }
+    const {browser, sw, storage} = loadServiceWorkerHarness({
+        now: 9500,
+        storage: {
+            mbCoordinatorPaused: false,
+            ...makeCompletedWalStoragePayload({completed: {}, queue: {[hrefD]: queuedTerminalRow}}),
+            mbCoordinatorRuns: {
+                [runId]: {id: runId, sourceType: 'space-feed', targetProfileHrefs: [hrefB, hrefC], targetWorkKeys: [hrefB, hrefC], status: 'running'}
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+    const archive = async (href, row) => {
+        const saved = await sw.coordinatorAuthority.persistCoordinator({
+            completedRows: [{rowKey: `${href}|${runId}`, previousRow: row, operationKind: 'archive-terminal-row', reason: 'ordinaryMutation'}]
+        }, {operationKind: 'archive-terminal-row', reason: 'ordinaryMutation', metricPath: 'test.clearKeepsStorage.archive'})
+        assert.equal(saved.saved, true, saved.reason)
+    }
+    await archive(hrefB, finishedRow(hrefB, 'attempt-clear-keeps-b', 5500, 6000))
+    await archive(hrefC, finishedRow(hrefC, 'attempt-clear-keeps-c', 6500, 9000))
+
+    const beforeView = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('clear-keeps-before'))
+    assert.equal(beforeView.view.completedSummary.count, 2, 'before the clear, B and C are counted')
+    // Stored keys other than the cutoff and the outlier list (the outlier list is cleared with Clear All Stats by design).
+    const ignoredKeys = new Set(['mbCoordinatorStatsClearedAt', 'mbCoordinatorOutliers', 'mbCoordinatorNamespaceSeq.mbCoordinatorOutliers'])
+    const storedSnapshot = source => Object.fromEntries(Object.entries(plainCopy(source)).filter(([key]) => !ignoredKeys.has(key)))
+    const storedBefore = storedSnapshot(storage)
+
+    const cleared = await browser.runtime.sendMessage({action: 'clear-coordinator-terminal-stats'})
+    assert.equal(cleared.cleared, true)
+    assert.equal(storage.mbCoordinatorStatsClearedAt, cleared.clearedAt, 'the cutoff is recorded')
+    assert.deepEqual(storedSnapshot(storage), storedBefore, 'no stored key is removed or changed: completed rows, shards, runs and the queue are as they were')
+    // The log is keyed by the row key (href and run, encoded), so the key is found by its href.
+    const completedKeyOf = href => Object.keys(sw.coordinatorAuthority.residentCompleted()).find(key => key.startsWith(href))
+    assert.ok(await sw.findCompletedWorkRowByKey(completedKeyOf(hrefB)), 'B is still in the completed log')
+    assert.ok(await sw.findCompletedWorkRowByKey(completedKeyOf(hrefC)), 'C is still in the completed log')
+    assert.ok(sw.coordinatorAuthority.current().runs[runId], 'the run is still in storage')
+
+    const afterView = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('clear-keeps-after'))
+    assert.deepEqual(
+        completedSummaryTotals(afterView.view.completedSummary),
+        {count: 0, durationCount: 0, durationTotalMs: 0},
+        'B and C, finished before the cutoff, are hidden from the display counts'
+    )
+
+    // A row finished after the cutoff still shows: E is counted, and only E.
+    await archive(hrefE, finishedRow(hrefE, 'attempt-clear-keeps-e', cleared.clearedAt + 100, cleared.clearedAt + 400))
+    const shownView = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('clear-keeps-shown'))
+    assert.deepEqual(
+        completedSummaryTotals(shownView.view.completedSummary),
+        {count: 1, durationCount: 1, durationTotalMs: 300},
+        'E, finished after the cutoff, is counted (300 ms); B and C still are not'
+    )
+    assert.ok(await sw.findCompletedWorkRowByKey(completedKeyOf(hrefB)), 'B is still stored after the later archive')
+})
+
 test('fresh run-status summary reflects current pause state, not a stale per-run flag', async () => {
     // Live bug (2026-10-01): materializeCoordinatorRunsPausedStateFromControl
     // only stamps run.paused onto runs that already have a pending item at
@@ -4781,7 +5355,7 @@ test('a row that did not land on a profile page is not retried, and never become
 })
 
 test('row event after an async progress save persists the exact projection row', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Progress-Shadow-Wal-Time-Parity'
+    const href = 'https://www.quora.com/profile/Synthetic-Progress-Diag-Wal-Time-Parity'
     const runId = 'run-progress-shadow-wal-time-parity'
     const attemptId = 'attempt-progress-shadow-wal-time-parity'
     const tabId = 509
@@ -7086,7 +7660,7 @@ test('terminal job progress applies queue mutation through authority without dup
     // completed-area add), appended right after this row's own terminal
     // settlement record.
     assert.equal(after['coordinatorAuthority.queueWal.appended'] || 0, 3)
-    assert.equal(after['coordinatorAuthority.postMutationQueueStorageSetRejected'] || 0, 0)
+    assert.equal(after['coordinatorAuthority.rawQueueKeyStorageSetRejected'] || 0, 0)
     assert.equal(sw.state().hasCoordinatorQueueResumeTimeout, true)
     assert.equal(sw.state().hasCoordinatorReconcileTimeout, false)
 })
@@ -9442,7 +10016,7 @@ test('an explicit deferProjectionSave: false writes no content index, and the de
     assert.ok((sw.state().queueWakeupCounters['coordinatorAuthority.queueWal.projectionSaved'] || 0) >= 1)
 })
 
-test('archive, blocked-tab, checkpoint and full-queue writes put no index, shard or queue-view key on chrome.storage.local (coder item 4 guard)', async () => {
+test('archive, blocked-tab, single-row and full-queue writes put no index, shard or queue-view key on chrome.storage.local (coder item 4 guard)', async () => {
     // Guard for the no-disk-projection rule (historical/coder-instructions-2026-10-18.md, section 1 rule 14). The content queue index, its
     // shards and the queue view never reach chrome.storage.local. The progress view is a projection too, but it still writes to
     // disk until section 5D is approved, so it is excluded from this guard and not asserted either way. WAL and checkpoint keys
@@ -9518,15 +10092,16 @@ test('archive, blocked-tab, checkpoint and full-queue writes put no index, shard
             })
         }
 
-        // 6. A full-queue write, the legacy path that used to carry the index with it.
-        await sw.metricStorageSet({mbCoordinatorQueue: sw.coordinatorAuthority.current().queue}, {metricPath: 'guard.fullQueue'})
+        // 6. A full-queue write carrying the raw legacy queue key: refused, so it never reaches the disk.
+        const rawQueueWrite = await sw.metricStorageSet({mbCoordinatorQueue: sw.coordinatorAuthority.current().queue}, {metricPath: 'guard.fullQueue'})
+        assert.equal(rawQueueWrite, false, 'a write carrying the raw queue key is refused')
     }
     finally {
         browser.storage.local.set = originalSet
     }
 
     assert.ok(diskKeys.length > 0)
-    assert.ok(diskKeys.includes('mbCoordinatorQueue'), 'the full-queue write reached disk, so the injection path ran')
+    assert.equal(diskKeys.includes('mbCoordinatorQueue'), false, 'the refused raw queue key write did not reach the disk')
     assert.deepEqual(diskKeys.filter(isForbiddenDiskKey), [], 'no index, shard or queue-view key reached chrome.storage.local')
 })
 
@@ -15541,7 +16116,7 @@ test('direct raw queue storage writes maintain content queue index but not a per
 
     // 2026-10-02: a direct raw-queue write no longer persists a queue view
     // to disk at all (see "get rid of it all") -- a dedicated write path
-    // (shared/js/swProfileNukeProgress.js's addContentPageStateProjectionPayload)
+    // (shared/js/swProfileNukeProgress.js's addContentPageStateProjectionPayload, since removed)
     // used to inject one here unconditionally, missed during that removal,
     // which kept the disk key perpetually re-populated with a stale/
     // unratcheted snapshot the WAL's auto-recovery-from-view path later read
@@ -15978,7 +16553,7 @@ test('coordinator authority apply persists accepted row change', async () => {
 })
 
 test('coordinator authority apply persists a same-status mutation', async () => {
-    const href = 'https://www.quora.com/profile/Authority-Same-Status-Shadow-Wal'
+    const href = 'https://www.quora.com/profile/Authority-Same-Status-Diag-Wal'
     const {sw, storage} = loadServiceWorkerHarness({
         now: 5060,
         storage: {
@@ -16164,7 +16739,8 @@ test('coordinator authority ignores direct raw queue storage payloads', async ()
     assert.equal(storage.mbCoordinatorQueue[href].status, 'active')
     assert.equal((await sw.findCompletedWorkRowByKey(href))?.status, 'failed')
 
-    await sw.metricStorageSet({
+    // A raw queue payload is refused by metricStorageSet, so it never overwrites the stored row.
+    const rawWrite = await sw.metricStorageSet({
         mbCoordinatorQueue: {
             [href]: {
                 id: 'authority-raw-observer-ignored',
@@ -16182,13 +16758,15 @@ test('coordinator authority ignores direct raw queue storage payloads', async ()
         queueChangedRows: 1
     })
 
-    assert.equal(storage.mbCoordinatorQueue[href].status, 'queued')
+    assert.equal(rawWrite, false, 'the raw queue payload is refused')
+    assert.equal(storage.mbCoordinatorQueue[href].status, 'active', 'the stored raw row is not overwritten')
     const archivedRow = await sw.findCompletedWorkRowByKey(href)
     assert.equal(archivedRow?.status, 'failed')
     assert.equal(archivedRow?.error, 'wal authority wins')
 
     const counters = sw.state().queueWakeupCounters
-    assert.equal(counters['queueWrite.operation.synthetic-raw-observer-ignored.calls'], 1)
+    assert.equal(counters['coordinatorAuthority.rawQueueKeyStorageSetRejected'], 1)
+    assert.equal(counters['queueWrite.operation.synthetic-raw-observer-ignored.calls'], undefined, 'a refused write is not counted as a queue write')
 })
 
 test('coordinator authority rejects stale and explicit mutations before persistence', async () => {
@@ -16593,7 +17171,7 @@ test('coordinator authority rejects later direct queue storage set in same stora
 
     const counters = sw.state().queueWakeupCounters
     assert.equal(counters['storageUpdate.started'], 1)
-    assert.equal(counters['coordinatorAuthority.postMutationQueueStorageSetRejected'], 1)
+    assert.equal(counters['coordinatorAuthority.rawQueueKeyStorageSetRejected'], 1)
     assert.equal(counters['queueWrite.operation.synthetic-direct-stale-set.calls'], undefined)
 })
 
@@ -17346,9 +17924,10 @@ test('metrics loading does not flush default epoch before persisted metrics reso
         mbCoordinatorQueue: {}
     })
     browser.__sessionStorage.mbBrowserSessionMarker = {id: 'existing-session'}
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    // The metrics are read from session storage (owner decision 26 Oct), so the gate sits on the session area.
+    const originalGet = browser.storage.session.get.bind(browser.storage.session)
     let metricsGetStarted = false
-    browser.storage.local.get = async defaults => {
+    browser.storage.session.get = async defaults => {
         if(defaults && typeof defaults === 'object' && Object.prototype.hasOwnProperty.call(defaults, 'mbQueueWakeupMetrics')) {
             metricsGetStarted = true
             await gate.promise
@@ -17800,15 +18379,16 @@ test('manual metrics reset is bounded when metrics storage is wedged', async () 
     const metricsGetGate = deferred()
     const metricsSetGate = deferred()
     const browser = createFakeBrowser({})
-    const originalGet = browser.storage.local.get.bind(browser.storage.local)
-    const originalSet = browser.storage.local.set.bind(browser.storage.local)
-    browser.storage.local.get = async defaults => {
+    // The metrics record is read and written through session storage (owner decision 26 Oct), so both gates sit on the session area.
+    const originalGet = browser.storage.session.get.bind(browser.storage.session)
+    const originalSet = browser.storage.session.set.bind(browser.storage.session)
+    browser.storage.session.get = async defaults => {
         if(defaults && typeof defaults === 'object' && Object.prototype.hasOwnProperty.call(defaults, 'mbQueueWakeupMetrics')) {
             await metricsGetGate.promise
         }
         return originalGet(defaults)
     }
-    browser.storage.local.set = async payload => {
+    browser.storage.session.set = async payload => {
         if(payload && Object.prototype.hasOwnProperty.call(payload, 'mbQueueWakeupMetrics')) {
             await metricsSetGate.promise
         }
@@ -19332,9 +19912,8 @@ test('content-page progress rebuild keeps queued and terminal progress and drops
             }
         }
     })
-    await sw.metricStorageSet({
-        mbCoordinatorQueue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}
-    }, {metricPath: 'seed.rebuildKeepRules'})
+    // Seeded as a WAL checkpoint in the stored keys (the WAL is the queue authority; metricStorageSet refuses the raw queue key).
+    storage.mbCoordinatorQueueWal = makePairedCheckpointStore({queue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}, completed: {}}, {snapshotSeq: 0, nextSeq: 1, createdAt: 0})
     await sw.coordinatorAuthority.hydrate()
 
     const rebuilt = await sw.rebuildContentPageStateProjectionFromCurrentState('test-keep-rules')
@@ -19370,9 +19949,8 @@ test('content-page progress rebuild in a steady state writes no progress keys', 
             }
         }
     })
-    await sw.metricStorageSet({
-        mbCoordinatorQueue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}
-    }, {metricPath: 'seed.rebuildSteady'})
+    // Seeded as a WAL checkpoint in the stored keys (the WAL is the queue authority; metricStorageSet refuses the raw queue key).
+    storage.mbCoordinatorQueueWal = makePairedCheckpointStore({queue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}, completed: {}}, {snapshotSeq: 0, nextSeq: 1, createdAt: 0})
     await sw.coordinatorAuthority.hydrate()
     await sw.rebuildContentPageStateProjectionFromCurrentState('test-steady-first')
     // Move the worker's clock on: each derived record and shard carries a new updatedAt, so only the content comparison
@@ -19416,9 +19994,8 @@ test('content-page progress rebuild does not lose a progress save for a queued p
             }
         }
     })
-    await sw.metricStorageSet({
-        mbCoordinatorQueue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}
-    }, {metricPath: 'seed.rebuildRace'})
+    // Seeded as a WAL checkpoint in the stored keys (the WAL is the queue authority; metricStorageSet refuses the raw queue key).
+    storage.mbCoordinatorQueueWal = makePairedCheckpointStore({queue: {[queuedHref]: makeRebuildQueuedRow(queuedHref)}, completed: {}}, {snapshotSeq: 0, nextSeq: 1, createdAt: 0})
     await sw.coordinatorAuthority.hydrate()
 
     // The rebuild's progress base is the resident copy (P2), read inside the door's serialized step. A save issued while the
@@ -25991,12 +26568,14 @@ test('queue WAL checkpoint switch writes a gzip-compressed checkpoint', async ()
     // record, so the payload checks run per shard, and the size check on totals.
     const checkpoint = storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}`]
     assert.equal(checkpoint.format, 'sharded-v1')
-    // Shards follow the rows (the arrival layout), and two rows fit in one shard.
-    const expectedShards = 1
+    // Shards follow the rows (the arrival layout), and two rows fit in one shard. Each area has its own shard set (area-v1): the two
+    // queue rows are in the queue's shard, and the one run is in its own runs shard, so the checkpoint has two shards.
+    const expectedShards = 2
+    assert.equal(checkpoint.shardLayout, 'area-v1')
     assert.equal(checkpoint.shardCount, expectedShards)
     assert.equal(checkpoint.shards.length, expectedShards)
-    const shardRecords = checkpoint.shards.map((shard, index) =>
-        storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}.s${String(index).padStart(2, '0')}`])
+    const shardRecords = checkpoint.shards.map(shard =>
+        storage[`mbCoordinatorQueueWal.checkpoint.${walMeta.activeCheckpoint}.s${String(shard.index).padStart(2, '0')}`])
     for (const record of shardRecords) {
         assert.equal(record.codec, 'gzip')
         assert.equal(record.encoding, 'base64')
@@ -42302,6 +42881,37 @@ test('Clear Outliers clears the stored list through the worker, and the cleared 
     assert.deepEqual(plainCopy(afterRestart.outliers), [], 'the cleared rows do not come back after a restart')
 })
 
+test('Clear wipes the outlier list in memory, on disk and in the session copy, and keeps the baseline counters (owner rule, 27 Oct)', async () => {
+    const runId = 'run-outlier-clear-three-places'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Three-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Three-Sigma'
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt: OUTLIER_NOW_MS - 100000,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt: OUTLIER_NOW_MS - 100000, durationMs: OUTLIER_SIGMA_DURATION_MS})
+    }
+    const {browser, sw, storage, session} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, [...normalHrefs, sigmaHref])
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries).map(entry => entry.rowKey), [sigmaHref], 'the disk list holds the outlier before the clear')
+    assert.deepEqual(plainCopy(session[OUTLIER_RECORD_KEY].entries).map(entry => entry.rowKey), [sigmaHref], 'the session copy holds the outlier before the clear')
+    const baselineBefore = plainCopy(storage[OUTLIER_RECORD_KEY].baseline)
+    assert.ok(baselineBefore.n > 0, 'the baseline has counted the archived rows')
+
+    const cleared = await browser.runtime.sendMessage({action: 'clear-coordinator-outliers'})
+    assert.deepEqual(plainCopy(cleared.outliers), [], 'memory: the worker answers with an empty list')
+    const after = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-clear-three-places-after'})
+    assert.deepEqual(plainCopy(after.outliers), [], 'memory: a later refresh serves no outliers')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'disk: the stored outlier list is emptied')
+    assert.deepEqual(plainCopy(session[OUTLIER_RECORD_KEY].entries), [], 'session: the session copy of the list is emptied')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].baseline), baselineBefore, 'Clear Outliers keeps the baseline counters')
+    assert.equal(plainCopy(storage[OUTLIER_RECORD_KEY].dismissedKeys).length, 1, 'the cleared attempt is dismissed, so no later pass lists it again')
+})
+
 test('a refresh that computes while Clear Outliers is still writing does not bring the cleared rows back', async () => {
     const runId = 'run-outlier-race'
     const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Race-Normal-${index}`)
@@ -42829,7 +43439,7 @@ function loadListPageHarness() {
                     windows: {getCurrent: async () => null}
                 }
             }
-            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './storageNamespace', './spaceMapStorage', './muteBlockHelp'].includes(name)) {
+            if(['./jobState', './swCoordinatorStatusRules', './timeouts', './nukedPosts', './defaults', './tunables', './storageKeys', './storageNamespace', './muteBlockHelp'].includes(name)) {
                 return sharedModule(name.slice(2))
             }
             // The dashboard's footer bar is built by this module; the list-page harness does not draw it.
@@ -43021,8 +43631,9 @@ test('the Current Work header counts the listed rows, not the view total', async
     page.run(`applyCoordinatorQueueView(${JSON.stringify(listPlainCopy(refreshed.view))})`)
     const listedCount = page.run('getDisplayQueueItems().length')
     assert.equal(listedCount, LIST_GOLDEN_LIVE_KEYS.length, 'the page lists the live rows')
-    const header = page.run('getCurrentWorkSummaryText(getDisplayQueueItems(), {queuedCount: 0, succeededCount: 0, retryableFailedCount: 0, hardFailedCount: 0})')
+    const header = page.run('getCurrentWorkSummaryText(getDisplayQueueItems(), {queuedCount: 0, succeededCount: 0})')
     assert.ok(header.startsWith(`Showing ${listedCount},`), `the header counts the listed rows, not the ${LIST_GOLDEN_TOTAL} in the view total: ${header}`)
+    assert.ok(!/soft-fail|hard-fail/.test(header), `the header has no soft-fail or hard-fail counts (owner, 27 Oct): ${header}`)
 })
 
 test('the Clear button is enabled when only finished rows exist, because Clear removes them too: the view total decides, not the list', async () => {
@@ -43037,17 +43648,13 @@ test('the Clear button is enabled when only finished rows exist, because Clear r
     assert.equal(clear.title, 'Mute Block extension: Cancel and remove all 3 Current Work rows', 'the Clear tooltip counts the rows Clear removes')
 })
 
-test('the soft-fail retry counts come from the full population, so a finished soft-fail at the retry limit still counts', async () => {
+test('the worker still counts the soft-fail retry figures over the full population (plumbing kept; the page no longer shows them)', async () => {
     const harness = await startListFixtureHarness(buildListFixture())
     const refreshed = await harness.browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'list-retry'})
     assert.deepEqual(listPlainCopy(refreshed.view.softFailRetry), LIST_GOLDEN_SOFT_FAIL_RETRY, 'the worker counts the soft-fails over every compact row')
     const page = loadListPageHarness()
     page.run(`applyCoordinatorQueueView(${JSON.stringify(listPlainCopy(refreshed.view))})`)
-    assert.deepEqual(
-        JSON.parse(page.run('JSON.stringify(getSoftFailRetryCounts(getDisplayQueueItems()))')),
-        LIST_GOLDEN_SOFT_FAIL_RETRY,
-        'the page shows the same retry-limit figure as before the change'
-    )
+    assert.equal(page.run("typeof getSoftFailRetryCounts"), 'undefined', 'the page no longer computes the soft-fail retry counts for the removed line')
 })
 
 test('the dashboard Runs rows (status and item count per run) are the same when the list holds only live rows', async () => {
@@ -43724,7 +44331,9 @@ test('the outlier recorder scope: a profile matches at any time, a span write on
     assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 100}, scope), true, 'a disk write at the span start is inside')
     assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 200}, scope), true, 'a disk write at the span end is inside')
     assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 201}, scope), false, 'a disk write after the span is not')
-    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-update', at: 150}, scope), false, 'settle records are left out')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-update', at: 150}, scope), true, 'a storage update inside the span is kept')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-update', at: 250}, scope), false, 'a storage update after the span is not')
+    assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'queue-wal-checkpoint-switch-result', at: 150}, scope), true, 'a checkpoint switch in the span is kept')
     assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'storage-write', at: 150}, {targetUrl: '', activeAt: 100, terminalAt: 200}), true)
     assert.equal(isCoordinatorOutlierRecorderEventInScope({kind: 'action-visibility', at: 150}, {targetUrl: '', activeAt: 100, terminalAt: 200}), false,
         'an empty profile matches no event')
@@ -43771,17 +44380,19 @@ test('a recorded outlier keeps its profile events and the disk and checkpoint wr
         {tag: 'write-before-span', kind: 'storage-write', at: activeAt - 1000},
         {tag: 'write-after-span', kind: 'storage-write', at: terminalAt + 1000},
         {tag: 'other-profile', kind: 'action-visibility', targetUrl: otherHref, at: activeAt + 1000},
-        {tag: 'settle-not-kept', kind: 'storage-update', at: activeAt + 1000},
+        {tag: 'settle-in-span', kind: 'storage-update', at: activeAt + 1000},
+        {tag: 'settle-after-span', kind: 'storage-update', at: terminalAt + 1000},
         {tag: 'dashboard-not-kept', kind: 'dashboard-refresh', at: activeAt + 1000}
     ]
     for(const entry of recorded) sw.recordFlightRecorderEvent(entry)
     await archiveOutlierRows(sw, [sigmaHref])
 
+    const expectedKept = ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span', 'settle-in-span']
     const kept = plainCopy(storage[OUTLIER_RECORD_KEY].entries.find(entry => entry.rowKey === sigmaHref).events)
     assert.deepEqual(
         kept.map(event => event.tag).filter(Boolean),
-        ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span'],
-        'the profile events (at any time) and the span writes are kept; the rest are not'
+        expectedKept,
+        'the profile events (at any time) and the storage operations in the span are kept; the rest are not'
     )
     for(const event of kept) {
         const profileMatch = event.targetUrl === sigmaHref
@@ -43797,7 +44408,7 @@ test('a recorded outlier keeps its profile events and the disk and checkpoint wr
     const served = await browser.runtime.sendMessage({action: 'get-coordinator-outlier-events', rowKey: sigmaHref, attemptId: `attempt-${sigmaHref}`})
     assert.deepEqual(
         plainCopy(served.events).map(event => event.tag).filter(Boolean),
-        ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span'],
+        expectedKept,
         'the events are served on request, oldest first'
     )
 
@@ -43902,6 +44513,44 @@ test('runs-switch case 2: a run written after a checkpoint switch is there after
     )
 })
 
+// The raw legacy queue key is refused by metricStorageSet on every write. No caller writes it (persistCoordinator refuses it too), so a
+// write that carries it returns false, reaches neither the disk nor the resident queue, and is counted.
+test('a metricStorageSet write that carries the raw queue key is refused: nothing reaches the disk and the resident queue is unchanged', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Raw-Queue-Refused'
+    const runId = 'run-raw-queue-refused'
+    const now = 610000
+    const queue = {[href]: makeActiveCoordinatorRow({href, runId, attemptId: 'attempt-raw-queue-refused', tabId: 790, now})}
+    const {sw, browser} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: queue,
+            mbCoordinatorRuns: {[runId]: makeCoordinatorRun({href, runId})},
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const diskKeys = []
+    const originalSet = browser.storage.local.set.bind(browser.storage.local)
+    browser.storage.local.set = async payload => {
+        diskKeys.push(...Object.keys(payload || {}))
+        return originalSet(payload)
+    }
+    try {
+        const result = await sw.metricStorageSet({mbCoordinatorQueue: {}}, {metricPath: 'test.rawQueueKeyWrite'})
+        assert.equal(result, false, 'the raw queue key write is refused')
+    }
+    finally {
+        browser.storage.local.set = originalSet
+    }
+
+    assert.deepEqual(diskKeys, [], 'the refused write reached no disk key')
+    assert.equal(sw.state().queueWakeupCounters['coordinatorAuthority.rawQueueKeyStorageSetRejected'], 1)
+    assert.ok(sw.coordinatorAuthority.current().queue[href], 'the resident queue still holds the row')
+})
+
 // Run time shards (25 Oct; shared/js/swRunShards.js). A run's shard is the day of its creation, and the retention drops whole days.
 const RUN_DAY_MS = 24 * 60 * 60 * 1000
 const RUN_DAY_SPAN_TEST_ID = 'run-time-shard'
@@ -43953,7 +44602,9 @@ test('a checkpoint switch partitions the runs by their time shard: each day is a
     const switched = await sw.switchCoordinatorAuthorityQueueWalCheckpoint()
     assert.equal(switched.checkpointSwitched, true, switched.reason)
     const shardIndexes = activeCheckpointShardIndexes(sw.coordinatorAuthority.residentStored()['mbCoordinatorQueueWal'])
-    const dayShardIds = [0, 1, 2].map(day => todayStart / RUN_DAY_MS - (2 - day))
+    // area-v1: a run day's shard id is that day in the runs namespace.
+    const {checkpointAreaShardId} = require('../shared/js/walSnapshotStore')
+    const dayShardIds = [0, 1, 2].map(day => checkpointAreaShardId('runs', todayStart / RUN_DAY_MS - (2 - day)))
     for (const shardId of dayShardIds) {
         assert.ok(shardIndexes.includes(shardId), `the checkpoint has a shard for run day ${shardId}`)
     }
@@ -44007,19 +44658,22 @@ test('over the run cap, a time shard that holds a run a queue row refers to is k
 })
 
 ;
-test('a space-feed queue row carries the post key it came from (provenance, 25 Oct)', async () => {
+test('a space-feed queue row carries the post key it came from in its evidence, with no separate field', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Provenance-Space'
     const runId = 'run-provenance-space'
     const {browser, sw} = loadServiceWorkerHarness({now: 1000})
     const request = makeCoordinatorEnqueue({href, runId})
-    request.items[0].sourcePostKey = 'post-provenance-space-1'
+    request.items[0].evidence = [{postKey: 'post-provenance-space-1', postUrl: 'https://www.quora.com/post/provenance-1'}]
 
     await browser.runtime.sendMessage(request, {tab: {id: 10, windowId: 1}})
 
-    assert.equal(sw.coordinatorAuthority.current().queue[href]?.sourcePostKey, 'post-provenance-space-1')
+    const row = sw.coordinatorAuthority.current().queue[href]
+    assert.ok(row, 'the space-feed row was queued')
+    assert.ok(row.evidence.some(entry => entry?.postKey === 'post-provenance-space-1'), 'the post key is in the row evidence')
+    assert.equal(Object.prototype.hasOwnProperty.call(row, 'sourcePostKey'), false)
 })
 
-test('a manual queue row has no source post key (provenance, 25 Oct)', async () => {
+test('a manual queue row carries no post key', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Provenance-Manual'
     const runId = 'run-provenance-manual'
     const {browser, sw} = loadServiceWorkerHarness({now: 1000})
@@ -44037,7 +44691,7 @@ test('a manual queue row has no source post key (provenance, 25 Oct)', async () 
     assert.equal(Object.prototype.hasOwnProperty.call(row, 'sourcePostKey'), false)
 })
 
-test('a completed row keeps the source post key it was queued with (provenance, 25 Oct)', async () => {
+test('a completed row keeps the evidence post key it was queued with', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Provenance-Archive'
     const runId = 'run-provenance-archive'
     const attemptId = 'attempt-provenance-archive'
@@ -44049,7 +44703,7 @@ test('a completed row keeps the source post key it was queued with (provenance, 
             mbCoordinatorQueue: {
                 [href]: {
                     ...makeActiveCoordinatorRow({href, runId, attemptId, tabId, now: 254600}),
-                    sourcePostKey: 'post-provenance-archive-1'
+                    evidence: [{postKey: 'post-provenance-archive-1', postUrl: 'https://www.quora.com/post/provenance-archive-1'}]
                 }
             },
             mbCoordinatorRuns: {
@@ -44087,36 +44741,8 @@ test('a completed row keeps the source post key it was queued with (provenance, 
 
     const archived = await sw.findCompletedWorkRowByKey(href)
     assert.equal(archived?.status, 'succeeded')
-    assert.equal(archived?.sourcePostKey, 'post-provenance-archive-1')
-})
-
-test('a later enqueue of an existing row does not add or change its source post key (provenance, 25 Oct)', async () => {
-    const href = 'https://www.quora.com/profile/Synthetic-Provenance-Merge'
-    const runId = 'run-provenance-merge'
-    const attemptId = 'attempt-provenance-merge'
-    const {browser, sw} = loadServiceWorkerHarness({
-        now: 1000,
-        storage: {
-            mbCoordinatorPaused: false,
-            mbCoordinatorQueue: {
-                [href]: makeQueuedCoordinatorRow({href, runId, attemptId, now: 1000})
-            },
-            mbCoordinatorRuns: {
-                [runId]: makeCoordinatorRun({href, runId})
-            },
-            mbCoordinatorEvents: [],
-            [LEGACY_PROFILE_PROGRESS_KEY]: {}
-        }
-    })
-    const request = makeCoordinatorEnqueue({href, runId})
-    request.items[0].sourcePostKey = 'post-provenance-merge-new'
-
-    await browser.runtime.sendMessage(request, {tab: {id: 10, windowId: 1}})
-
-    const row = sw.coordinatorAuthority.current().queue[href]
-    assert.equal(Object.prototype.hasOwnProperty.call(row, 'sourcePostKey'), false, 'an old row without the field gets none')
-    assert.equal(row.targetProfileHref, href)
-    assert.equal(row.runId, runId)
+    assert.equal(archived?.evidence?.[0]?.postKey, 'post-provenance-archive-1')
+    assert.equal(Object.prototype.hasOwnProperty.call(archived || {}, 'sourcePostKey'), false)
 })
 
 // Owner, 26 Oct: a post the space page has just sent to the queue is pending at once. The enqueue reply carries counts, not rows, and the
@@ -44154,6 +44780,11 @@ function loadSpaceFeedEnqueueMarkHarness() {
         `let pendingSpaceFeedIndexCache = {queue: null, index: null}`,
         `let spaceFeedRenderModelMemo = null`,
         `let spaceFeedEnqueueMarkBatches = []`,
+        `let spaceFeedNukingPostKeys = new Set()`,
+        `let queueingButtonsStub = []`,
+        `let latestEntriesStub = []`,
+        `function getSpaceFeedQueueingButtons() { return queueingButtonsStub.filter(button => button.dataset.mbQueueing === 'true') }`,
+        `function getLatestSpaceFeedEntries() { return latestEntriesStub }`,
         source.split('\n').find(line => line.startsWith('const PENDING_COORDINATOR_STATUSES')),
         // Stubs for the lookups these helpers call elsewhere in content.js.
         `function normalizeQuoraProfileHref(href = '') {
@@ -44193,13 +44824,23 @@ function loadSpaceFeedEnqueueMarkHarness() {
         markTestExtract(source, 'function beginSpaceFeedEnqueueMarks(associations = [])'),
         markTestExtract(source, 'function settleSpaceFeedEnqueueMarks(batch = null, settled = false)'),
         markTestExtract(source, 'function applySpaceFeedEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {})'),
+        markTestExtract(source, 'function finishSpaceFeedEnqueueMarks(batch = null)'),
+        markTestExtract(source, 'function releaseSpaceFeedEnqueueMarks(batch = null)'),
+        markTestExtract(source, 'function hasActivePendingSpaceFeedWork(entries = null)'),
+        markTestExtract(source, 'function clearStaleLocalSpaceFeedBusyState()'),
         `globalThis.markHarness = {
             setQueue: rows => { coordinatorQueue = rows },
+            setEntries: entries => { latestEntriesStub = entries },
+            setQueueingButtons: buttons => { queueingButtonsStub = buttons },
+            nukingKeys: () => spaceFeedNukingPostKeys,
+            clearStale: () => clearStaleLocalSpaceFeedBusyState(),
             batches: () => spaceFeedEnqueueMarkBatches,
             hasPending: postKey => hasPendingCoordinatorSpaceFeedPost(postKey),
             begin: beginSpaceFeedEnqueueMarks,
             settle: settleSpaceFeedEnqueueMarks,
             apply: applySpaceFeedEnqueueMarksToStateReply,
+            finish: finishSpaceFeedEnqueueMarks,
+            release: releaseSpaceFeedEnqueueMarks,
             queueableCount: entries => {
                 const context = buildSpaceFeedRenderContext()
                 return getSpaceFeedUniqueQueueableProfileCount(entries.map(entry => ({
@@ -44301,7 +44942,96 @@ test('the space page marks a batch before it enqueues, and settles it from the e
     assert.ok(begin > 0 && enqueue > begin, 'the mark is set before the enqueue is sent')
     assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, true\)[\s\S]*refreshSpaceFeedStateAfterEnqueue\(\)/)
     assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, false\)/)
-    assert.match(body, /if\(!enqueueMarkBatch\.settledAt\) settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, false\)/)
+    assert.match(body, /finishSpaceFeedEnqueueMarks\(enqueueMarkBatch\)/)
+    assert.match(body, /refreshSpaceFeedStateAfterEnqueue\(\)[\s\S]*\.finally\(\(\) => releaseSpaceFeedEnqueueMarks\(enqueueMarkBatch\)\)/)
+    // The try starts before the press animation, so every path after the marks are set reaches the finally.
+    assert.ok(body.indexOf('try {') < body.indexOf('await animateNukeButtonPress(button)'), 'the try wraps the press animation')
+})
+
+test('a batch still queueing keeps the Nuke Em label in the queueing state through a state reply without its rows, then shows the normal state once settled (owner, 26 Oct)', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const entries = [{postKey: 'post-a', candidateUrls: [MARK_ALICE, MARK_BOB]}]
+    const button = {dataset: {mbQueueing: 'true'}}
+    harness.setEntries(entries)
+    harness.setQueueingButtons([button])
+    harness.nukingKeys().add('post-a')
+
+    // The batch is going out in chunks: marked, the button is queueing, the post is nuking. The enqueue has not settled.
+    const batch = harness.begin([
+        {profileHref: MARK_ALICE, postKeys: ['post-a']},
+        {profileHref: MARK_BOB, postKeys: ['post-a']}
+    ])
+
+    // A state reply arrives mid-batch and shows none of the rows yet. The marks must not go, and the render's stale check must leave the label alone.
+    harness.apply(Date.now(), [MARK_ALICE, MARK_BOB], {})
+    assert.equal(harness.batches().length, 1, 'the running batch keeps its marks')
+    assert.equal(harness.hasPending('post-a'), true, 'the post stays pending during the batch')
+    assert.equal(harness.clearStale(), false, 'a render during the batch does not clear the queueing state')
+    assert.equal(button.dataset.mbQueueing, 'true', 'the label stays in the queueing state, so it does not flip to Nuke Em')
+    assert.equal(harness.nukingKeys().has('post-a'), true)
+
+    // A post whose profile is still to be read is held the same way while its batch runs.
+    const resolverHarness = loadSpaceFeedEnqueueMarkHarness()
+    const resolverButton = {dataset: {mbQueueing: 'true'}}
+    resolverHarness.setEntries([{postKey: 'post-r', candidateUrls: []}])
+    resolverHarness.setQueueingButtons([resolverButton])
+    resolverHarness.nukingKeys().add('post-r')
+    resolverHarness.begin([{resolveProfileFromPage: true, postKeys: ['post-r']}])
+    resolverHarness.apply(Date.now(), [], {})
+    assert.equal(resolverHarness.clearStale(), false, 'a resolver-only batch still in flight is not stale either')
+    assert.equal(resolverButton.dataset.mbQueueing, 'true')
+
+    // The enqueue settles, and the reply asked after it shows the rows. The batch's finally clears the flag and the nuking key.
+    harness.settle(batch, true)
+    const rows = {
+        [MARK_ALICE]: {status: 'queued', targetProfileHref: MARK_ALICE, evidence: [{postKey: 'post-a'}]},
+        [MARK_BOB]: {status: 'queued', targetProfileHref: MARK_BOB, evidence: [{postKey: 'post-a'}]}
+    }
+    harness.setQueue(rows)
+    harness.apply(batch.settledAt + 1, [MARK_ALICE, MARK_BOB], rows)
+    delete button.dataset.mbQueueing
+    harness.nukingKeys().delete('post-a')
+
+    assert.equal(harness.batches().length, 0, 'the marks go once the reply shows the rows')
+    assert.equal(harness.hasPending('post-a'), true, 'the rows keep the post pending')
+    assert.equal(button.dataset.mbQueueing, undefined, 'the button is no longer queueing')
+    assert.equal(harness.clearStale(), false, 'nothing is left to clear')
+    assert.equal(harness.queueableCount(entries), 0, 'both profiles are pending, so the normal state has no queueable count')
+})
+
+test('a finished batch releases a stale queueing label, a running batch still holds it, and a durable batch keeps its marks only until the worker answers (owner, 26 Oct)', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const entries = [{postKey: 'post-a', candidateUrls: [MARK_ALICE, MARK_BOB]}]
+    const button = {dataset: {mbQueueing: 'true'}}
+    harness.setEntries(entries)
+    harness.setQueueingButtons([button])
+    harness.nukingKeys().add('post-a')
+    const batch = harness.begin([{profileHref: MARK_ALICE, postKeys: ['post-a']}])
+
+    // Running: the sends have not returned. The stale clear leaves the label queueing and the marks held.
+    assert.equal(batch.running, true)
+    assert.equal(harness.clearStale(), false, 'a running batch is not stale')
+    assert.equal(button.dataset.mbQueueing, 'true', 'the label stays queueing')
+    assert.equal(harness.hasPending('post-a'), true, 'the marks are held while it runs')
+
+    // The send returned with a failure, so nothing settled it: finishing drops the marks, and the stale clear releases the label.
+    harness.finish(batch)
+    assert.equal(batch.running, false)
+    assert.equal(harness.batches().length, 0, 'an unsettled batch that finished goes at once')
+    assert.equal(harness.clearStale(), true, 'with no running batch the stale clear runs')
+    assert.equal(button.dataset.mbQueueing, undefined, 'the label is released')
+    assert.equal(harness.nukingKeys().has('post-a'), false)
+    assert.equal(harness.hasPending('post-a'), false)
+
+    // A durable batch: settled, then finished. Its marks hold until the worker has answered the post-enqueue refresh, then they are released.
+    const durable = harness.begin([{profileHref: MARK_BOB, postKeys: ['post-a']}])
+    harness.settle(durable, true)
+    harness.finish(durable)
+    assert.equal(durable.running, false)
+    assert.equal(harness.hasPending('post-a'), true, 'the posts stay pending until the worker answers')
+    harness.release(durable)
+    assert.equal(harness.batches().length, 0, 'the answer releases what is left of the batch')
+    assert.equal(harness.hasPending('post-a'), false)
 })
 
 test('completed summary after the Clear All Stats cutoff: rows finished before it and terminal rows still in the queue are not counted, and the summary follows the log', async () => {
@@ -44344,7 +45074,7 @@ test('completed summary after the Clear All Stats cutoff: rows finished before i
     await archive(hrefC, finishedRow(hrefC, 'attempt-completed-summary-c', 6500, 9000))
 
     const {view} = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('completed-summary-cutoff'))
-    assert.deepEqual(view.completedSummary, {count: 2, durationCount: 2, durationTotalMs: 3000}, 'B (500 ms) and C (2500 ms) count; A finished before the cutoff, and queued D is not in the log')
+    assert.deepEqual(completedSummaryTotals(view.completedSummary), {count: 2, durationCount: 2, durationTotalMs: 3000}, 'B (500 ms) and C (2500 ms) count; A finished before the cutoff, and queued D is not in the log')
 
     // The summary is cached per log change and cutoff: a second read of the same resident log returns the same object.
     const map = sw.coordinatorAuthority.residentCompleted()
@@ -44353,7 +45083,1006 @@ test('completed summary after the Clear All Stats cutoff: rows finished before i
     // A row archived after the read moves the summary, so the cache is not stale.
     await archive(hrefE, finishedRow(hrefE, 'attempt-completed-summary-e', 9000, 9400))
     const after = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('completed-summary-after-archive'))
-    assert.deepEqual(after.view.completedSummary, {count: 3, durationCount: 3, durationTotalMs: 3400}, 'E adds 400 ms to the 3000 ms of B and C')
+    assert.deepEqual(completedSummaryTotals(after.view.completedSummary), {count: 3, durationCount: 3, durationTotalMs: 3400}, 'E adds 400 ms to the 3000 ms of B and C')
+})
+
+// Stop collecting (owner, 26 Oct). The space and search collect loops run for real from content.js in a VM. The page, the timers and the
+// Nuke 'Em helpers are stubs. The sleep stub is the pass boundary: a stop click made there is the check the next pass makes.
+function contentFunctionSource(source, signature) {
+    const start = source.indexOf(signature)
+    if(start === -1) throw new Error(`missing ${signature} in content.js`)
+    const braceStart = source.indexOf('{', start + signature.length)
+    let depth = 0
+    for(let index = braceStart; index < source.length; index += 1) {
+        if(source[index] === '{') depth += 1
+        else if(source[index] === '}') {
+            depth -= 1
+            if(depth === 0) return source.slice(start, index + 1)
+        }
+    }
+    throw new Error(`unterminated ${signature}`)
+}
+
+function makeSpaceCollectHarness(stopOnPass = 0) {
+    const contentSource = fs.readFileSync(path.join(__dirname, '..', 'shared/js/content.js'), 'utf8')
+    const {setMuteBlockHelp} = require('../shared/js/muteBlockHelp')
+    const scrolls = []
+    const handlers = {}
+    const notices = []
+    const stopButton = {hidden: true, remove() { stopButton.removed = true }}
+    const collectButton = {}
+    const state = {queueable: 0, pass: 0, stopOnPass, hiddenDuringRun: []}
+    const context = vm.createContext({
+        window: {
+            scrollY: 0,
+            innerHeight: 1000,
+            scrollTo: options => scrolls.push({kind: 'to', top: options.top}),
+            scrollBy: options => scrolls.push({kind: 'by', top: options.top})
+        },
+        document: {
+            documentElement: {scrollHeight: 5000},
+            body: {appendChild: () => {}},
+            createElement: () => ({setAttribute: () => {}}),
+            // The Stop button is one element on the body, so the lookup is by its class, not a list in the right column.
+            querySelector: selector => (selector === '.mb-ext_space-collect-stop-btn' ? stopButton : null),
+            querySelectorAll: selector => {
+                if(selector === '.mb-ext_space-collect-wrap .mb-ext_profile-search-collect-btn') return [collectButton]
+                return []
+            }
+        },
+        ensureCurrentInstanceClickHandler: (element, key, handler) => {
+            handlers[key] = handler
+            return element
+        },
+        setMuteBlockHelp,
+        animateNukeButtonPress: async() => {},
+        setNukeButtonWorking: () => {},
+        setNukeButtonNotice: (element, label) => { notices.push(label) },
+        syncSpaceFeedCollectButton: () => {},
+        COLLECT_SCROLL_PASS_WAIT_MS: require('../shared/js/tunables').COLLECT_SCROLL_PASS_WAIT_MS,
+        readSpaceFeedCollectedCount: () => state.queueable,
+        sleep: async() => {
+            state.pass += 1
+            state.hiddenDuringRun.push(stopButton.hidden)
+            state.queueable += 1
+            if(state.pass === state.stopOnPass) handlers['space-feed-stop']()
+        }
+    })
+    vm.runInContext([
+        'let spaceFeedCollecting = false',
+        'let spaceFeedCollectStopRequested = false',
+        'let spaceFeedCollectLimit = 10',
+        contentFunctionSource(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
+        contentFunctionSource(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)'),
+        contentFunctionSource(contentSource, 'function setSpaceFeedCollectButtons(setLabel)'),
+        contentFunctionSource(contentSource, 'function createSpaceCollectStopButton()'),
+        contentFunctionSource(contentSource, 'function requestSpaceFeedCollectStop()'),
+        contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'),
+        contentFunctionSource(contentSource, 'function removeSpaceCollectButtons()'),
+        contentFunctionSource(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
+    ].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+    return {run, scrolls, handlers, notices, stopButton, state}
+}
+
+function makeSearchCollectHarness(stopOnPass = 0) {
+    const contentSource = fs.readFileSync(path.join(__dirname, '..', 'shared/js/content.js'), 'utf8')
+    const {setMuteBlockHelp} = require('../shared/js/muteBlockHelp')
+    const scrolls = []
+    const handlers = {}
+    const notices = []
+    const stopButton = {hidden: true}
+    const state = {seq: 0, pass: 0, limit: 5, stopOnPass, hiddenDuringRun: []}
+    const context = vm.createContext({
+        window: {
+            scrollY: 0,
+            innerHeight: 1000,
+            scrollTo: options => scrolls.push({kind: 'to', top: options.top})
+        },
+        document: {
+            documentElement: {scrollHeight: 5000},
+            createElement: () => ({setAttribute: () => {}}),
+            querySelector: selector => (selector === '.mb-ext_profile-search-stop-btn' ? stopButton : null)
+        },
+        ensureCurrentInstanceClickHandler: (element, key, handler) => {
+            handlers[key] = handler
+            return element
+        },
+        setMuteBlockHelp,
+        PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS: Number.POSITIVE_INFINITY,
+        COLLECT_SCROLL_PASS_WAIT_MS: require('../shared/js/tunables').COLLECT_SCROLL_PASS_WAIT_MS,
+        getProfileSearchCollectLimit: () => state.limit,
+        ensureProfileSearchCollectionStateForCurrentSearch: () => {},
+        animateNukeButtonPress: async() => {},
+        getProfileSearchStagedHrefs: () => [],
+        getProfileSearchRows: () => [],
+        getProfileSearchQueueableRows: () => [{href: `row-${++state.seq}`}],
+        stageProfileSearchHrefs: hrefs => hrefs.length,
+        saveProfileSearchCollectCursor: () => {},
+        setNukeButtonWorking: () => {},
+        setNukeButtonNotice: (element, label) => { notices.push(label) },
+        syncProfileSearchControls: () => {},
+        scheduleProfileSearchControls: () => {},
+        isProfileSearchEndOfResultsVisible: () => false,
+        hasUnstagedProfileSearchQueueableRow: () => false,
+        hasProfileSearchLoadingIndicator: () => false,
+        nudgeProfileSearchLazyLoad: () => {},
+        getProfileSearchScrollY: () => 0,
+        getProfileSearchScrollHeight: () => 0,
+        sleep: async() => {
+            state.pass += 1
+            state.hiddenDuringRun.push(stopButton.hidden)
+            if(state.pass === state.stopOnPass) handlers['profile-search-stop']()
+        }
+    })
+    vm.runInContext([
+        'let profileSearchCollecting = false',
+        'let profileSearchCollectStopRequested = false',
+        'let profileSearchProcessedFollowButtons = new WeakSet()',
+        'let profileSearchCollectCursorScrollY = 0',
+        contentFunctionSource(contentSource, 'function createProfileSearchStopButton()'),
+        contentFunctionSource(contentSource, 'function requestProfileSearchCollectStop()'),
+        contentFunctionSource(contentSource, 'function syncProfileSearchStopButton()'),
+        contentFunctionSource(contentSource, 'async function collectMoreProfileSearchResults(button)')
+    ].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+    return {run, scrolls, handlers, notices, stopButton, state}
+}
+
+test('space Stop collecting stops at the next pass, scrolls to the top, keeps the collected count, and hides again', async() => {
+    const h = makeSpaceCollectHarness(2)
+    h.run('syncSpaceFeedStopButtons()')
+    assert.equal(h.stopButton.hidden, true, 'hidden while no collect runs')
+    assert.equal(h.run('requestSpaceFeedCollectStop()'), false, 'a stop with no collect running does nothing')
+    assert.equal(h.run('spaceFeedCollectStopRequested'), false)
+
+    const result = await h.run('collectMoreSpaceFeedPosts({})')
+    assert.equal(result, false, 'a stopped collect reports no success')
+    assert.deepEqual(h.state.hiddenDuringRun, [false, false], 'the button is shown on each pass of a running collect')
+    assert.equal(h.state.pass, 2, 'the loop ends at the pass after the stop, and starts no third pass')
+    assert.deepEqual(h.scrolls, [
+        {kind: 'to', top: 5000},
+        {kind: 'by', top: 800},
+        {kind: 'by', top: 800},
+        {kind: 'to', top: 0}
+    ], 'no scroll starts after the stop, and the page ends at the top')
+    assert.equal(h.state.queueable, 2, 'the collected count is what it was when the loop stopped')
+    assert.equal(h.notices.at(-1), 'Stopped')
+    assert.equal(h.stopButton.hidden, true, 'the button hides once the collect ends')
+    assert.equal(h.run('spaceFeedCollecting'), false)
+    assert.equal(h.run('spaceFeedCollectStopRequested'), false)
+})
+
+test('the space Stop collecting button survives the collect-button removal that runs mid-collect, and goes only when no collect runs', () => {
+    const h = makeSpaceCollectHarness(0)
+    h.run('syncSpaceFeedStopButtons()')
+    assert.equal(h.stopButton.removed, undefined)
+
+    // Mid-run: a page that looks momentarily unnukable (no timestamp) runs the removal. The Stop button must stay.
+    h.run('spaceFeedCollecting = true')
+    h.run('removeSpaceCollectButtons()')
+    assert.equal(h.stopButton.removed, undefined, 'the Stop button is not removed while a collect runs')
+
+    h.run('spaceFeedCollecting = false')
+    h.run('removeSpaceCollectButtons()')
+    assert.equal(h.stopButton.removed, true, 'with no collect running, the page removal takes the Stop button too')
+})
+
+test('a new space collect is not stopped by a stop from an earlier run', async() => {
+    const h = makeSpaceCollectHarness(2)
+    h.run('syncSpaceFeedStopButtons()')
+    await h.run('collectMoreSpaceFeedPosts({})')
+    assert.equal(h.state.queueable, 2)
+
+    h.state.stopOnPass = 0
+    h.run('spaceFeedCollectLimit = 3')
+    h.run('spaceFeedCollectStopRequested = true')
+    const passesBefore = h.state.pass
+    const result = await h.run('collectMoreSpaceFeedPosts({})')
+    assert.equal(result, true, 'the stale flag is cleared when the run starts, so the run collects its 3')
+    assert.equal(h.state.pass - passesBefore, 3)
+    assert.equal(h.state.queueable, 5, 'the earlier 2 stay, and the new run adds 3')
+})
+
+test('Stop collecting carries Mute Block hover help on the space and search pages', () => {
+    const space = makeSpaceCollectHarness(0)
+    const spaceButton = space.run('createSpaceCollectStopButton()')
+    assert.ok(spaceButton.title.startsWith('Mute Block extension: '), spaceButton.title)
+    assert.equal(spaceButton.hidden, true)
+
+    const search = makeSearchCollectHarness(0)
+    const searchButton = search.run('createProfileSearchStopButton()')
+    assert.ok(searchButton.title.startsWith('Mute Block extension: '), searchButton.title)
+    assert.equal(searchButton.hidden, true)
+})
+
+test('Stop collecting on space and search pages is not in the toolbar or the right column: it is fixed at the bottom, its left edge on the Collect N More left edge, and above the Next notification pill', () => {
+    const contentSource = fs.readFileSync(path.join(__dirname, '..', 'shared/js/content.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, '..', 'shared/css/content.css'), 'utf8')
+
+    // The toolbar holds the batch and Collect N More only. The Stop button is appended to the page body on first use.
+    const toolbarBody = contentFunctionSource(contentSource, 'function getProfileSearchToolbar()')
+    assert.doesNotMatch(toolbarBody, /createProfileSearchStopButton/)
+    assert.match(toolbarBody, /toolbar\.appendChild\(collectWrap\)\s*document\.body\.appendChild\(toolbar\)/)
+    const syncBody = contentFunctionSource(contentSource, 'function syncProfileSearchStopButton()')
+    assert.match(syncBody, /document\.body\?\.appendChild\(stopButton\)/)
+    // The space page's right column does not hold the Stop button any more, and its sync adds the button to the body on first use.
+    assert.doesNotMatch(contentFunctionSource(contentSource, 'function ensureSpaceCollectWrapInRightColumn()'), /createSpaceCollectStopButton/)
+    assert.match(contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'), /document\.body\?\.appendChild\(stopButton\)/)
+
+    // The CSS rule: fixed, at the bottom, with the same stacking as the toolbar and no hard-coded colours.
+    const rule = css.match(/\.mb-ext_space-collect-stop-btn,\s*\n\.mb-ext_profile-search-stop-btn \{([^}]*)\}/)
+    assert.ok(rule, 'the Stop collecting buttons share a fixed-position CSS rule')
+    assert.match(rule[1], /position:\s*fixed;/)
+    const toolbarZ = css.match(/\.mb-ext_profile-search-toolbar \{[^}]*z-index:\s*(\d+);/)[1]
+    assert.match(rule[1], new RegExp(`z-index:\\s*${toolbarZ};`))
+    assert.doesNotMatch(rule[1], /#[0-9a-fA-F]{3,8}\b|rgba?\(\s*\d/)
+
+    // Left edge on the Collect N More left edge (owner correction): measured on the search page, Collect left 906.5px at a 1064px layout width.
+    // Collect sits 18px in from the right in the toolbar and is 139.5px wide; the Stop button is 113.5px wide, so right = 18 + 139.5 - 113.5 = 44px.
+    const right = Number(rule[1].match(/right:\s*([\d.]+)px;/)[1])
+    const bottom = Number(rule[1].match(/bottom:\s*(\d+)px;/)[1])
+    assert.ok(Math.abs(right - (18 + 139.5 - 113.5)) < 0.05, `right ${right}px puts the Stop left edge on the Collect N More left edge (906.5px at a 1064px layout)`)
+    // Above the Next notification pill (owner decision, option 3): its top is about 66-68px above the bottom, so bottom clears it with a 16px gap.
+    assert.ok(bottom >= 68 + 16, `bottom ${bottom}px clears the pill top (about 68px above the bottom) with a 16px gap`)
+})
+
+test('search Stop collecting stops at the next pass, scrolls to the top, keeps the collected count, and a new run is not stopped by an old flag', async() => {
+    const h = makeSearchCollectHarness(2)
+    h.run('syncProfileSearchStopButton()')
+    assert.equal(h.stopButton.hidden, true, 'hidden while no collect runs')
+    assert.equal(h.run('requestProfileSearchCollectStop()'), false, 'a stop with no collect running does nothing')
+
+    const result = await h.run('collectMoreProfileSearchResults({})')
+    assert.equal(result, false, 'a stopped collect reports no success')
+    assert.deepEqual(h.state.hiddenDuringRun, [false, false], 'the button is shown on each pass of a running collect')
+    assert.equal(h.state.pass, 2, 'the loop ends at the pass after the stop')
+    assert.equal(h.state.seq, 2, 'the collected count is what it was when the loop stopped')
+    assert.deepEqual(h.scrolls, [{kind: 'to', top: 5000}, {kind: 'to', top: 0}], 'the page ends at the top, after the stop')
+    assert.equal(h.notices.at(-1), 'Stopped')
+    assert.equal(h.stopButton.hidden, true, 'the button hides once the collect ends')
+
+    h.state.stopOnPass = 0
+    h.run('profileSearchCollectStopRequested = true')
+    const seqBefore = h.state.seq
+    const next = await h.run('collectMoreProfileSearchResults({})')
+    assert.equal(next, true, 'the stale flag is cleared when the run starts')
+    assert.equal(h.state.seq - seqBefore, 5, 'the new run collects its full limit of 5')
+    assert.equal(h.state.seq, 7, 'the earlier 2 stay, and the new run adds 5')
+})
+
+// Owner, 26 Oct: the nuking count on a space page is this space's in-progress work. The page's copy of the queue holds other spaces' rows too.
+test('the space page nuking count counts only this space\'s rows in progress, not another space\'s row for a profile on the page (26 Oct)', () => {
+    const source = fs.readFileSync(path.join(LIST_REPO_ROOT, 'shared', 'js', 'content.js'), 'utf8')
+    const extract = signature => {
+        const start = source.indexOf(signature)
+        assert.notEqual(start, -1, `missing ${signature}`)
+        const braceStart = source.indexOf('{', start + signature.length)
+        let depth = 0
+        for(let index = braceStart; index < source.length; index += 1) {
+            if(source[index] === '{') depth += 1
+            else if(source[index] === '}') {
+                depth -= 1
+                if(depth === 0) return source.slice(start, index + 1)
+            }
+        }
+        throw new Error(`unterminated ${signature}`)
+    }
+    const statusSetLine = source.slice(source.indexOf('const PENDING_COORDINATOR_STATUSES'), source.indexOf('\n', source.indexOf('const PENDING_COORDINATOR_STATUSES')))
+    const context = {progressByHref: {}, console}
+    vm.createContext(context)
+    vm.runInContext([
+        // Stubs for lookups these functions call. The real ones live in the progress and subject code.
+        `const UNBLOCK_UNMUTE_ACTION_KIND = 'unblock-unmute'`,
+        `function getProfileNukeProgressRecord(href) { return progressByHref[href] || null }`,
+        `function isTransientProfileNukeStatus(status) { return status === 'running' }`,
+        `function normalizeSpaceUrl(url) { return \`\${url || ''}\` }`,
+        `function normalizeQuoraProfileHref(href = '') {
+            const value = \`\${href || ''}\`.split(/[?#]/)[0].replace(/\\/+$/, '')
+            return value.includes('/profile/') ? value : null
+        }`,
+        `function getNormalizedProfileIdentityKey(href) { return \`\${href || ''}\`.split('/profile/')[1] || '' }`,
+        `function getNormalizedProfileHrefList(urls = []) {
+            const seen = new Set()
+            const result = []
+            for(const url of Array.isArray(urls) ? urls : []) {
+                const normalized = normalizeQuoraProfileHref(url)
+                const key = getNormalizedProfileIdentityKey(normalized)
+                if(!normalized || !key || seen.has(key)) continue
+                seen.add(key)
+                result.push(normalized)
+            }
+            return result
+        }`,
+        `let coordinatorQueue = {}`,
+        `let spaceFeedEnqueueMarkBatches = []`,
+        `let pendingSpaceFeedIndexCache = {queue: null, index: null}`,
+        `const spaceFeedKnownNukedProfileKeys = new Set()`,
+        statusSetLine,
+        extract('function isSuccessfulProfileNukeRecord(record)'),
+        extract('function isSettledProfileNukeRecord(record)'),
+        extract('function isProfileNukeSucceeded(href)'),
+        extract('function isActivePendingSpaceFeedProfileUrl(url)'),
+        extract('function getSpaceFeedProfileStateKey(href)'),
+        extract('function isKnownNukedSpaceFeedProfile(href)'),
+        extract("function isPendingCoordinatorStatus(status = '')"),
+        extract("function getCoordinatorItemProfileHref(itemKey = '', item = null)"),
+        extract('function getPendingSpaceFeedIndex()'),
+        extract('function getActivePendingSpaceFeedUrls(postKey)'),
+        extract('function getCoordinatorItemSources(item = {})'),
+        extract('function isCoordinatorSourceForSpace(source = null, space = null)'),
+        extract('function isPendingCoordinatorSpaceFeedItemForSpace(item = null, space = null)'),
+        extract('function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor())'),
+        extract('function getSpacePendingProfileCount(entries = [], pendingCoordinatorProfileHrefs = new Set())'),
+        extract('function formatSpaceFeedGlobalWorkLabel(count = 0)'),
+        `globalThis.harness = {
+            setQueue(queue) { coordinatorQueue = queue },
+            context: buildSpaceFeedRenderContext,
+            activePending: getActivePendingSpaceFeedUrls,
+            pendingCount: getSpacePendingProfileCount,
+            label: formatSpaceFeedGlobalWorkLabel
+        }`
+    ].join('\n\n'), context, {filename: 'content-space-nuking-count-harness.js'})
+    const {harness} = context
+
+    const ALICE = 'https://www.quora.com/profile/Alice-Example'
+    const BOB = 'https://www.quora.com/profile/Bob-Example'
+    const CAROL = 'https://www.quora.com/profile/Carol-Example'
+    const DAVE = 'https://www.quora.com/profile/Dave-Example'
+    const space = {key: 'space-a', url: 'https://www.quora.com/Taking-out-the-Trash'}
+    const row = (href, postKey, spaceKey, status = 'queued') => ({
+        status,
+        targetProfileHref: href,
+        evidence: [{postKey}],
+        source: {type: 'space-feed', spaceKey}
+    })
+    // The page's posts, with the pending profiles each post has in the queue copy (as computeSpaceFeedRenderModel builds them).
+    const pageEntries = () => [
+        {postKey: 'post-1', candidateUrls: [ALICE, BOB]},
+        {postKey: 'post-2', candidateUrls: [CAROL]},
+        {postKey: 'post-3', candidateUrls: [DAVE]}
+    ].map(entry => ({...entry, activePendingUrls: harness.activePending(entry.postKey)}))
+
+    // This space has Bob and Carol in progress on this page. Space B has Alice and Dave queued, on posts that are not on this page.
+    harness.setQueue({
+        [ALICE]: row(ALICE, 'post-elsewhere-1', 'space-b'),
+        [DAVE]: row(DAVE, 'post-elsewhere-2', 'space-b', 'active'),
+        [BOB]: row(BOB, 'post-1', 'space-a'),
+        [CAROL]: row(CAROL, 'post-2', 'space-a', 'active')
+    })
+    const mixed = harness.context(space)
+    const mixedCount = harness.pendingCount(pageEntries(), mixed.pendingSpaceProfileHrefs)
+    assert.equal(mixedCount, 2, 'only Bob and Carol, this space\'s rows, are counted')
+    assert.equal(mixed.pendingSpaceProfileHrefs.has(ALICE), false, 'another space\'s row is not this space\'s work')
+    assert.equal(mixed.pendingSpaceProfileHrefs.has(DAVE), false, 'another space\'s row is not this space\'s work')
+    assert.equal(mixed.pendingCoordinatorProfileHrefs.has(ALICE), true, 'Nuke \'Em still treats the other space\'s profile as taken')
+    assert.equal(harness.label(mixedCount), 'Nuking... 2 left', 'the status shows the count of this space\'s work')
+
+    // Only other spaces' rows are in the copy: nothing is in progress for this page, so no count is shown.
+    harness.setQueue({
+        [ALICE]: row(ALICE, 'post-elsewhere-1', 'space-b'),
+        [DAVE]: row(DAVE, 'post-elsewhere-2', 'space-b', 'active')
+    })
+    const none = harness.context(space)
+    const noneCount = harness.pendingCount(pageEntries(), none.pendingSpaceProfileHrefs)
+    assert.equal(noneCount, 0)
+    assert.equal(harness.label(noneCount), 'Nuking...', 'zero rows in progress shows no nuking count')
+})
+
+// Owner, 26 Oct: a profile whose row is queued or nuking in the worker is not queueable on the search page, even when the row's run is not this page's
+// last run (a batch merges into a row and keeps the run that first queued it). Nuke 'Em counts only the free profiles.
+test('the search page Nuke \'Em count excludes profiles already queued or nuking, whatever run queued them (26 Oct)', () => {
+    const source = fs.readFileSync(path.join(LIST_REPO_ROOT, 'shared', 'js', 'content.js'), 'utf8')
+    const extract = signature => {
+        const start = source.indexOf(signature)
+        assert.notEqual(start, -1, `missing ${signature}`)
+        const braceStart = source.indexOf('{', start + signature.length)
+        let depth = 0
+        for(let index = braceStart; index < source.length; index += 1) {
+            if(source[index] === '{') depth += 1
+            else if(source[index] === '}') {
+                depth -= 1
+                if(depth === 0) return source.slice(start, index + 1)
+            }
+        }
+        throw new Error(`unterminated ${signature}`)
+    }
+    const statusSetLine = source.slice(source.indexOf('const PENDING_COORDINATOR_STATUSES'), source.indexOf('\n', source.indexOf('const PENDING_COORDINATOR_STATUSES')))
+    const SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
+    const context = {progressByHref: {}, console, URL, URLSearchParams, location: {href: SEARCH_URL, search: '?q=elon%20musk&type=profile'}}
+    vm.createContext(context)
+    vm.runInContext([
+        // Stubs for lookups these functions call. The real ones live in the progress, search and subject code.
+        `const UNBLOCK_UNMUTE_ACTION_KIND = 'unblock-unmute'`,
+        `const PROFILE_SEARCH_COLLECT_LIMIT = 100`,
+        `function getProfileNukeProgressRecord(href) { return progressByHref[href] || null }`,
+        `function isTransientProfileNukeStatus(status) { return status === 'running' }`,
+        `function isRetryableProfileNukeRecord(record) { return false }`,
+        `function getProfileSearchRows() { return [] }`,
+        `function getProfileSearchStagedHrefs() { return [] }`,
+        `function normalizeQuoraProfileHref(href = '') {
+            const value = \`\${href || ''}\`.split(/[?#]/)[0].replace(/\\/+$/, '')
+            return value.includes('/profile/') ? value : null
+        }`,
+        `let coordinatorQueue = {}`,
+        `let profileSearchLastRunId = 'profile-search-LAST'`,
+        statusSetLine,
+        extract('function isSuccessfulProfileNukeRecord(record)'),
+        extract('function isSettledProfileNukeRecord(record)'),
+        extract("function isPendingCoordinatorStatus(status = '')"),
+        extract("function getCoordinatorItemProfileHref(itemKey = '', item = null)"),
+        extract("function getCoordinatorItemSources(item = {})"),
+        extract('function normalizeCurrentProfileSearchPageUrl()'),
+        extract('function isCoordinatorSourceForCurrentProfileSearch(source = null)'),
+        extract('function isCurrentProfileSearchRuntimeCoordinatorItem(item = null)'),
+        extract('function isStaleCurrentProfileSearchCoordinatorItem(item = null)'),
+        extract("function getPendingCoordinatorProfileHrefEntries(profileHref = '')"),
+        extract("function isPendingCoordinatorProfileHref(profileHref = '', options = {})"),
+        `let profileSearchEnqueueMarkBatches = []`,
+        extract("function getProfileSearchEnqueueMarkState(profileHref = '')"),
+        extract('function isProfileSearchProfileNukeable(href, options = {})'),
+        extract('function getProfileSearchQueueableRows(rows = getProfileSearchRows(), options = {})'),
+        extract('function getProfileSearchBatchHrefs(rows = getProfileSearchRows(), options = {})'),
+        `globalThis.harness = {
+            setQueue(queue) { coordinatorQueue = queue },
+            queueable: getProfileSearchQueueableRows,
+            batchHrefs: getProfileSearchBatchHrefs,
+            label: count => \`Nuke 'Em \${count}\`
+        }`
+    ].join('\n\n'), context, {filename: 'content-search-nuke-count-harness.js'})
+    const {harness} = context
+
+    const FREE_1 = 'https://www.quora.com/profile/Elon-Musk-Free-1'
+    const FREE_2 = 'https://www.quora.com/profile/Elon-Musk-Free-2'
+    const FREE_3 = 'https://www.quora.com/profile/Elon-Musk-Free-3'
+    const MERGED = 'https://www.quora.com/profile/Elon-Musk-Merged'
+    const ACTIVE = 'https://www.quora.com/profile/Elon-Musk-Active'
+    const OTHER_SEARCH = 'https://www.quora.com/profile/Elon-Musk-Other-Search'
+    const rows = [FREE_1, MERGED, FREE_2, ACTIVE, FREE_3, OTHER_SEARCH].map(href => ({href, row: null, followButton: null}))
+    const searchSource = {type: 'profile-search', pageUrl: SEARCH_URL, searchQuery: 'elon musk'}
+
+    // MERGED is queued by an earlier batch of this search: its row keeps that run, which is not the page's last run (the stale case).
+    // ACTIVE is in progress from this page's last run. OTHER_SEARCH is in progress from a different search.
+    harness.setQueue({
+        [MERGED]: {status: 'queued', targetProfileHref: MERGED, runId: 'profile-search-OLD', source: searchSource},
+        [ACTIVE]: {status: 'active', targetProfileHref: ACTIVE, runId: 'profile-search-LAST', source: searchSource},
+        [OTHER_SEARCH]: {
+            status: 'queued',
+            targetProfileHref: OTHER_SEARCH,
+            runId: 'profile-search-X',
+            source: {type: 'profile-search', pageUrl: 'https://www.quora.com/search?q=other&type=profile', searchQuery: 'other'}
+        }
+    })
+    const free = harness.queueable(rows, {allowRetry: false}).map(row => row.href)
+    assert.deepEqual(free, [FREE_1, FREE_2, FREE_3], 'only the profiles with no queued or nuking row are queueable')
+    assert.equal(harness.batchHrefs(rows).length, 3)
+    assert.equal(harness.label(harness.batchHrefs(rows).length), 'Nuke \'Em 3', 'the Nuke \'Em label counts the free profiles')
+
+    // Once every row is queued or nuking in the worker, nothing is queueable and the label shows 0.
+    harness.setQueue({
+        [FREE_1]: {status: 'queued', targetProfileHref: FREE_1, runId: 'profile-search-OLD', source: searchSource},
+        [FREE_2]: {status: 'active', targetProfileHref: FREE_2, runId: 'profile-search-LAST', source: searchSource},
+        [FREE_3]: {status: 'queued', targetProfileHref: FREE_3, runId: 'profile-search-OLD', source: searchSource},
+        [MERGED]: {status: 'queued', targetProfileHref: MERGED, runId: 'profile-search-OLD', source: searchSource},
+        [ACTIVE]: {status: 'active', targetProfileHref: ACTIVE, runId: 'profile-search-LAST', source: searchSource},
+        [OTHER_SEARCH]: {status: 'queued', targetProfileHref: OTHER_SEARCH, runId: 'profile-search-X', source: searchSource}
+    })
+    assert.equal(harness.queueable(rows, {allowRetry: false}).length, 0, 'every row is queued or nuking, so none is queueable')
+    assert.equal(harness.label(harness.batchHrefs(rows).length), 'Nuke \'Em 0')
+})
+// Owner, 26 Oct: the search page does what the space page does. A batch this page has just sent marks its profiles in memory, keyed by profile
+// href: queueing while the enqueue runs, nuking once it settles, dropped when a state reply shows the row or the enqueue fails. These drive the
+// real search functions from content.js, extracted from the source, with a queue copy that does not yet have the rows.
+const SEARCH_MARK_ALICE = 'https://www.quora.com/profile/Alice-Search-Mark'
+const SEARCH_MARK_BOB = 'https://www.quora.com/profile/Bob-Search-Mark'
+const SEARCH_MARK_CAROL = 'https://www.quora.com/profile/Carol-Search-Mark'
+
+// The counts are built by the vm context, so they are copied into this realm's objects before a deep comparison.
+function searchMarkCounts(harness) {
+    const counts = harness.counts()
+    return {nuking: counts.nuking, queueing: counts.queueing}
+}
+
+function loadSearchEnqueueMarkHarness() {
+    const source = markTestContentSource()
+    const context = {console, assert}
+    vm.createContext(context)
+    vm.runInContext([
+        `let coordinatorQueue = {}`,
+        `let profileSearchEnqueueMarkBatches = []`,
+        `let profileSearchLastRunId = ''`,
+        `let profileNukeRecords = {}`,
+        source.split('\n').find(line => line.startsWith('const PENDING_COORDINATOR_STATUSES')),
+        // Stubs for the lookups these helpers call elsewhere in content.js.
+        `function normalizeQuoraProfileHref(href = '') {
+            const value = \`\${href || ''}\`.split(/[?#]/)[0].replace(/\\/+$/, '')
+            return value.includes('/profile/') ? value : null
+        }`,
+        `function getNormalizedProfileIdentityKey(href) { return \`\${href || ''}\`.split('/profile/')[1] || '' }`,
+        `function getNormalizedProfileHrefList(urls = []) {
+            const seen = new Set()
+            const result = []
+            for(const url of Array.isArray(urls) ? urls : []) {
+                const normalized = normalizeQuoraProfileHref(url)
+                const key = getNormalizedProfileIdentityKey(normalized)
+                if(!normalized || !key || seen.has(key)) continue
+                seen.add(key)
+                result.push(normalized)
+            }
+            return result
+        }`,
+        `function getProfileNukeProgressRecord(href) { return profileNukeRecords[href] || null }`,
+        `function isSuccessfulProfileNukeRecord(record) { return !!record && record.status === 'blocked' }`,
+        `function isSettledProfileNukeRecord(record) { return !!record && record.status === 'error' }`,
+        `function isRetryableProfileNukeRecord() { return false }`,
+        `function normalizeCurrentProfileSearchPageUrl() { return '' }`,
+        `function isCoordinatorSourceForCurrentProfileSearch() { return false }`,
+        markTestExtract(source, 'function isPendingCoordinatorStatus(status = \'\')'),
+        markTestExtract(source, 'function getCoordinatorItemProfileHref(itemKey = \'\', item = null)'),
+        markTestExtract(source, 'function getCoordinatorItemSources(item = {})'),
+        markTestExtract(source, 'function isCurrentProfileSearchRuntimeCoordinatorItem(item = null)'),
+        markTestExtract(source, 'function isStaleCurrentProfileSearchCoordinatorItem(item = null)'),
+        markTestExtract(source, 'function getPendingCoordinatorProfileHrefEntries(profileHref = \'\')'),
+        markTestExtract(source, 'function isPendingCoordinatorProfileHref(profileHref = \'\', options = {})'),
+        markTestExtract(source, 'function beginProfileSearchEnqueueMarks(profileHrefs = [])'),
+        markTestExtract(source, 'function settleProfileSearchEnqueueMarks(batch = null, settled = false)'),
+        markTestExtract(source, 'function finishProfileSearchEnqueueMarks(batch = null)'),
+        markTestExtract(source, 'function releaseProfileSearchEnqueueMarks(batch = null)'),
+        markTestExtract(source, 'function applyProfileSearchEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {})'),
+        markTestExtract(source, 'function getProfileSearchEnqueueMarkState(profileHref = \'\')'),
+        markTestExtract(source, 'function getProfileSearchEnqueueMarkCounts()'),
+        markTestExtract(source, 'function isProfileSearchProfileNukeable(href, options = {})'),
+        `globalThis.searchMarkHarness = {
+            setQueue: rows => { coordinatorQueue = rows },
+            setNukeRecords: records => { profileNukeRecords = records },
+            batches: () => profileSearchEnqueueMarkBatches,
+            begin: beginProfileSearchEnqueueMarks,
+            settle: settleProfileSearchEnqueueMarks,
+            finish: finishProfileSearchEnqueueMarks,
+            release: releaseProfileSearchEnqueueMarks,
+            apply: applyProfileSearchEnqueueMarksToStateReply,
+            state: getProfileSearchEnqueueMarkState,
+            counts: getProfileSearchEnqueueMarkCounts,
+            nukeable: isProfileSearchProfileNukeable
+        }`
+    ].join('\n\n'), context, {filename: 'content-search-enqueue-marks-harness.js'})
+    return context.searchMarkHarness
+}
+
+test('search page enqueue marks: a batch in progress marks its profiles as queueing, and they are not queueable', () => {
+    const harness = loadSearchEnqueueMarkHarness()
+    assert.equal(harness.nukeable(SEARCH_MARK_ALICE, {allowRetry: true}), true, 'before the batch the profile is queueable')
+
+    // The batch's enqueue goes out. The marks are set before any reply, so the rows read queueing at once.
+    const batch = harness.begin([SEARCH_MARK_ALICE, SEARCH_MARK_BOB])
+    assert.equal(batch.running, true)
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'queueing')
+    assert.equal(harness.state(SEARCH_MARK_BOB), 'queueing')
+    assert.equal(harness.state(SEARCH_MARK_CAROL), '', 'a profile outside the batch is not marked')
+    assert.deepEqual(searchMarkCounts(harness),{nuking: 0, queueing: 2}, 'the toolbar counts two queueing and none nuking')
+
+    // Not queueable: no second enqueue, and not counted by Nuke 'Em or Collect while the batch runs.
+    assert.equal(harness.nukeable(SEARCH_MARK_ALICE, {allowRetry: true}), false)
+    assert.equal(harness.nukeable(SEARCH_MARK_CAROL, {allowRetry: true}), true)
+})
+
+test('search page enqueue marks: a settled batch shows as nuking, and a state reply that does not yet show its rows keeps the marks', () => {
+    const harness = loadSearchEnqueueMarkHarness()
+    const batch = harness.begin([SEARCH_MARK_ALICE, SEARCH_MARK_BOB])
+
+    // A reply sent while the enqueue is still running says nothing about the batch: the marks are kept whole.
+    harness.apply(Date.now(), [SEARCH_MARK_ALICE, SEARCH_MARK_BOB], {})
+    assert.equal(harness.batches().length, 1, 'a running batch keeps its marks through a reply')
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'queueing')
+
+    // The enqueue settles. A reply asked from before the settle does not clear the marks either.
+    harness.settle(batch, true)
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'nuking', 'once settled the marks show as nuking')
+    assert.deepEqual(searchMarkCounts(harness),{nuking: 2, queueing: 0})
+    harness.apply(batch.settledAt - 1, [SEARCH_MARK_ALICE, SEARCH_MARK_BOB], {})
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'nuking', 'a reply from before the settle keeps the marks')
+    assert.equal(harness.state(SEARCH_MARK_BOB), 'nuking')
+    assert.equal(harness.nukeable(SEARCH_MARK_ALICE, {allowRetry: true}), false, 'a nuking profile is still not queueable')
+})
+
+test('search page enqueue marks: a state reply that shows a profile row clears that profile only', () => {
+    const harness = loadSearchEnqueueMarkHarness()
+    const batch = harness.begin([SEARCH_MARK_ALICE, SEARCH_MARK_BOB])
+    harness.settle(batch, true)
+
+    // The reply, asked after the settle, shows Alice's row and asks only about Alice. Bob is neither shown nor asked, so his mark stays.
+    const repliedRows = {
+        [SEARCH_MARK_ALICE]: {status: 'queued', targetProfileHref: SEARCH_MARK_ALICE, runId: 'profile-search-LAST'}
+    }
+    harness.setQueue(repliedRows)
+    harness.apply(batch.settledAt + 1, [SEARCH_MARK_ALICE], repliedRows)
+
+    assert.equal(harness.state(SEARCH_MARK_ALICE), '', 'Alice\'s mark is cleared by her row')
+    assert.equal(harness.state(SEARCH_MARK_BOB), 'nuking', 'Bob\'s mark stays until a reply shows him or asks after the settle')
+    assert.deepEqual(searchMarkCounts(harness),{nuking: 1, queueing: 0}, 'the count follows the marks that are left, and Alice\'s row is the queue\'s to count')
+    assert.equal(harness.nukeable(SEARCH_MARK_ALICE, {allowRetry: true}), false, 'Alice is still not queueable: her row is pending in the queue')
+
+    // A later reply, asked after the settle, that has no row for Bob clears his mark too.
+    harness.apply(batch.settledAt + 2, [SEARCH_MARK_BOB], {})
+    assert.equal(harness.state(SEARCH_MARK_BOB), '')
+    assert.equal(harness.batches().length, 0)
+})
+
+test('search page enqueue marks: a failed enqueue releases its marks at once, and the profiles are queueable again', () => {
+    const harness = loadSearchEnqueueMarkHarness()
+    const batch = harness.begin([SEARCH_MARK_ALICE, SEARCH_MARK_BOB])
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'queueing')
+
+    // The enqueue failed: it is settled as failed, then the enqueue's finally runs. Both marks go.
+    harness.settle(batch, false)
+    harness.finish(batch)
+    assert.equal(harness.batches().length, 0, 'a failed enqueue leaves no marks')
+    assert.equal(harness.state(SEARCH_MARK_ALICE), '')
+    assert.deepEqual(searchMarkCounts(harness),{nuking: 0, queueing: 0})
+    assert.equal(harness.nukeable(SEARCH_MARK_ALICE, {allowRetry: true}), true, 'the profile is queueable again')
+
+    // A throw before any settle is released by the finally alone.
+    const thrown = harness.begin([SEARCH_MARK_CAROL])
+    harness.finish(thrown)
+    assert.equal(harness.state(SEARCH_MARK_CAROL), '')
+    assert.equal(harness.batches().length, 0)
+
+    // A durable batch keeps its marks until the refresh answers. The reply shows only Alice's row, so Bob's mark is trimmed in place and the
+    // batch stays in the array. The enqueue holds the same batch object, so its release by identity still finds and drops it.
+    const durable = harness.begin([SEARCH_MARK_ALICE, SEARCH_MARK_BOB])
+    harness.settle(durable, true)
+    harness.finish(durable)
+    assert.equal(harness.state(SEARCH_MARK_ALICE), 'nuking', 'a durable batch keeps its marks until the refresh answers')
+    harness.apply(durable.settledAt + 1, [SEARCH_MARK_ALICE], {[SEARCH_MARK_ALICE]: {status: 'queued', targetProfileHref: SEARCH_MARK_ALICE}})
+    assert.equal(harness.batches().length, 1, 'Bob is still marked, so the batch is still held')
+    assert.equal(harness.state(SEARCH_MARK_BOB), 'nuking')
+    harness.release(durable)
+    assert.equal(harness.batches().length, 0, 'release finds the batch the enqueue holds, so nothing lingers')
+    assert.equal(harness.state(SEARCH_MARK_BOB), '')
+})
+
+test('search page enqueue marks: the batch marks before it enqueues, settles only on a durable result, and releases after the refresh answers', () => {
+    const body = markTestExtract(markTestContentSource(), 'async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {})')
+    const begin = body.indexOf('beginProfileSearchEnqueueMarks(profileHrefs)')
+    const enqueue = body.indexOf('enqueueCoordinatorProfileUrls({')
+
+    assert.ok(begin > 0 && enqueue > begin, 'the marks are set before the enqueue is sent')
+    assert.ok(body.indexOf('try {') < body.indexOf('await animateNukeButtonPress(button)'), 'the try wraps the press animation')
+    assert.match(body, /settleProfileSearchEnqueueMarks\(enqueueMarkBatch, true\)[\s\S]*refreshProfileSearchStateAfterEnqueue\(profileHrefs\)/)
+    assert.match(body, /settleProfileSearchEnqueueMarks\(enqueueMarkBatch, false\)/)
+    assert.match(body, /finally \{\s*finishProfileSearchEnqueueMarks\(enqueueMarkBatch\)/)
+    assert.match(body, /releaseProfileSearchEnqueueMarks\(enqueueMarkBatch\)/)
+    // The batch and row paths both reach the nukeable check, so a marked profile never gets a second enqueue.
+    const nukeable = markTestExtract(markTestContentSource(), 'function isProfileSearchProfileNukeable(href, options = {})')
+    assert.match(nukeable, /getProfileSearchEnqueueMarkState\(normalizedHref\)\) return false/)
+    const batchHrefs = markTestExtract(markTestContentSource(), 'function getProfileSearchBatchHrefs(rows = getProfileSearchRows(), options = {})')
+    assert.match(batchHrefs, /stagedHrefs\.filter\(href => !getProfileSearchEnqueueMarkState\(href\)\)/)
+})
+
+test('a space enqueue batch that a state reply trims is still released by its enqueue, and no label is left queueing (26 Oct release fix)', () => {
+    const harness = loadSpaceFeedEnqueueMarkHarness()
+    const button = {dataset: {mbQueueing: 'true'}}
+    harness.setEntries([])
+    harness.setQueueingButtons([button])
+    harness.nukingKeys().add('post-a')
+
+    // The batch is sent for Alice and Bob. The enqueue settles durably, and the batch's sends have returned (finish).
+    const batch = harness.begin([
+        {profileHref: MARK_ALICE, postKeys: ['post-a']},
+        {profileHref: MARK_BOB, postKeys: ['post-a']}
+    ])
+    harness.settle(batch, true)
+    harness.finish(batch)
+
+    // A state reply asked after the settle shows Alice's row and asks only Alice. It trims Alice from the batch, and Bob stays marked.
+    const rows = {[MARK_ALICE]: {status: 'queued', targetProfileHref: MARK_ALICE, evidence: [{postKey: 'post-a'}]}}
+    harness.setQueue(rows)
+    harness.apply(batch.settledAt + 1, [MARK_ALICE], rows)
+    assert.equal(batch.items.length, 1, 'the trim is applied to the batch the enqueue holds')
+    assert.equal(harness.batches().includes(batch), true, 'the trimmed batch is the same object in the marks list')
+    assert.equal(harness.pendingHrefs().has(MARK_BOB), true, 'Bob is still marked')
+
+    // The enqueue's refresh answers: the release is looked up by the batch the enqueue holds, so the trimmed batch is found and dropped.
+    harness.release(batch)
+    assert.equal(harness.batches().length, 0, 'the trimmed batch is released')
+    assert.equal(harness.pendingHrefs().has(MARK_BOB), false, 'no mark of the batch is left')
+
+    // The label is not left stuck in the queueing state.
+    harness.clearStale()
+    assert.equal(button.dataset.mbQueueing, undefined, 'the queueing label is released')
+    assert.equal(harness.nukingKeys().has('post-a'), false, 'the nuking key is released')
+})
+
+// Outlier capture scope (owner rule): an outlier keeps every event of its own profile or row, and every storage operation inside its span
+// whatever the profile. Nothing else. The capture is fed a small recorder history directly.
+test('the outlier capture keeps its profile events, the storage operations inside its span once each, and no other row event', () => {
+    const {collectCoordinatorOutlierRecorderEvents} = require('../shared/js/swCoordinatorOutliers')
+    const href = 'https://www.quora.com/profile/Synthetic-Capture-Scope'
+    const otherHref = 'https://www.quora.com/profile/Synthetic-Capture-Scope-Other'
+    const activeAt = 100000
+    const terminalAt = activeAt + 5000
+    const row = {rowKey: href, targetProfileHref: href, activeAt, terminalAt, runId: 'run-capture-scope', attemptId: 'attempt-capture-scope'}
+    const history = [
+        {seq: 1, kind: 'tab-action-claim', rowKey: href, targetUrl: href, at: activeAt + 500, tag: 'profile'},
+        {seq: 2, kind: 'queued-tab-open-decision', rowKey: otherHref, targetUrl: otherHref, at: activeAt + 1000, tag: 'other-row'},
+        {seq: 3, kind: 'storage-write', at: activeAt + 2000, tag: 'write-in-span'},
+        {seq: 4, kind: 'storage-write', at: terminalAt + 1000, tag: 'write-after-span'},
+        {seq: 5, kind: 'queue-wal-checkpoint-switch-result', at: activeAt + 3000, tag: 'checkpoint-in-span'},
+        {seq: 6, kind: 'storage-write', targetUrl: href, at: activeAt + 3500, tag: 'profile-and-span'},
+        {seq: 7, kind: 'storage-update', at: activeAt + 4000, tag: 'settle-in-span'},
+        {seq: 8, kind: 'tab-open-stage', targetUrl: otherHref, at: activeAt + 4500, tag: 'other-stage'}
+    ]
+    const eventsByKey = collectCoordinatorOutlierRecorderEvents([row], predicate => history.filter(predicate))
+    const kept = eventsByKey.get(`${href}|attempt-capture-scope`) || []
+    assert.deepEqual(
+        kept.map(event => event.tag),
+        ['profile', 'write-in-span', 'checkpoint-in-span', 'profile-and-span', 'settle-in-span'],
+        'the profile event, the storage operations in the span and the checkpoint switch are kept, each once; other rows and the out-of-span write are not'
+    )
+    assert.equal(kept.filter(event => event.tag === 'profile-and-span').length, 1, 'an event that matches both rules is kept once')
+})
+
+// The completed summary's count, durationCount and durationTotalMs, without the duration histograms (the histograms have their own test).
+function completedSummaryTotals(summary = {}) {
+    return {count: summary.count, durationCount: summary.durationCount, durationTotalMs: summary.durationTotalMs}
+}
+
+test('duration histograms: real-block and already-blocked completed rows are bucketed by active-to-terminal time at the edges, and other rows are in neither', async () => {
+    // Owner (26 Oct): the histograms read the same completed rows and duration as the summary. Real-block rows have outcome blocked, and
+    // already-blocked rows have outcome already-blocked. Real block: 999 ms (0.75-1 s), 1000 ms (1-1.5 s), 4999 ms (4-6 s) and 300000 ms (over 10 s).
+    // Already blocked: 5000 ms (5-10 s) and 30000 ms (30-60 s). Neither histogram takes: a skipped row, a failed row with outcome blocked, an
+    // unblock-unmute row, or a zero-length row. The skipped, failed and unblock-unmute rows still have a duration, so they count in the
+    // summary's durationCount and durationTotalMs. The row finished before the Clear All Stats cutoff (5000) is not counted at all.
+    const runId = 'run-duration-histograms'
+    const href = name => `https://www.quora.com/profile/Synthetic-Duration-Histogram-${name}`
+    const row = (name, {status = 'succeeded', outcome, actionKind = '', activeAt, terminalAt}) => ({
+        ...makeArchivedCoordinatorRow({href: href(name), runId, attemptId: `attempt-duration-histogram-${name}`, terminalAt}),
+        status,
+        outcome,
+        ...(actionKind ? {actionKind} : {}),
+        activeAt
+    })
+    const completed = {
+        [href('real-1')]: row('real-1', {outcome: 'blocked', activeAt: 10000, terminalAt: 10999}),
+        [href('real-2')]: row('real-2', {outcome: 'blocked', activeAt: 20000, terminalAt: 21000}),
+        [href('real-3')]: row('real-3', {outcome: 'blocked', activeAt: 30000, terminalAt: 34999}),
+        [href('real-4')]: row('real-4', {outcome: 'blocked', activeAt: 40000, terminalAt: 340000}),
+        [href('already-1')]: row('already-1', {outcome: 'already-blocked', activeAt: 50000, terminalAt: 55000}),
+        [href('already-2')]: row('already-2', {outcome: 'already-blocked', activeAt: 60000, terminalAt: 90000}),
+        [href('skipped')]: row('skipped', {outcome: 'skipped', activeAt: 100000, terminalAt: 102000}),
+        [href('failed')]: row('failed', {status: 'failed', outcome: 'blocked', activeAt: 110000, terminalAt: 111000}),
+        [href('unblock')]: row('unblock', {outcome: 'blocked', actionKind: 'unblock-unmute', activeAt: 120000, terminalAt: 121000}),
+        [href('zero')]: row('zero', {outcome: 'blocked', activeAt: 130000, terminalAt: 130000}),
+        [href('before-cutoff')]: row('before-cutoff', {outcome: 'blocked', activeAt: 1000, terminalAt: 2000})
+    }
+    const {sw} = loadServiceWorkerHarness({
+        now: 400000,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorStatsClearedAt: 5000,
+            ...makeCompletedWalStoragePayload({completed}),
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    await sw.coordinatorAuthority.hydrate()
+
+    const {view} = plainCopy(await sw.refreshCoordinatorQueueViewForDashboard('duration-histograms'))
+    assert.deepEqual(completedSummaryTotals(view.completedSummary), {count: 10, durationCount: 9, durationTotalMs: 345998}, 'ten rows after the cutoff; nine have a duration (the zero-length row has none)')
+    // Edges from tunables: 0, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 10 seconds, so 999 ms is bucket 1 (0.75-1 s) and 1000 ms is bucket 2 (1-1.5 s).
+    assert.deepEqual(view.completedSummary.realBlockHistogram, {counts: [0, 1, 1, 0, 0, 0, 1, 0, 0, 1], sampleCount: 4, totalMs: 306998}, 'real block: 999, 1000, 4999 and 300000 ms')
+    assert.deepEqual(view.completedSummary.alreadyBlockedHistogram, {counts: [0, 0, 0, 0, 0, 0, 1, 0, 0, 1], sampleCount: 2, totalMs: 35000}, 'already blocked: 5000 and 30000 ms')
+
+    // The pushed path reads the same cached summary, so the pushed view carries the same histograms.
+    const pushed = sw.coordinatorAuthority.residentCompletedSummaryFor(sw.coordinatorAuthority.residentCompleted(), 5000)
+    assert.deepEqual(plainCopy(pushed), view.completedSummary)
+})
+
+test('queue wakeup metrics are held in session storage: a flush writes both keys there and none to disk, and a restart reads them back (owner decision 26 Oct)', async () => {
+    const browser = createFakeBrowser({})
+    // An existing browser session, so the startup does not roll a browser-startup epoch over the first one.
+    browser.__sessionStorage.mbBrowserSessionMarker = {id: 'existing-session', reason: 'observed', observedAt: 9000}
+    const first = loadServiceWorkerHarness({browser, now: 10000})
+    const reset = await first.sw.resetQueueWakeupMetricsEpochAfterLoad('manual')
+    assert.equal(reset.reset, true)
+
+    // The forced flush writes the record and its view together, to session storage only.
+    assert.ok(browser.__sessionStorage.mbQueueWakeupMetrics, 'the metrics record is in session storage')
+    assert.ok(browser.__sessionStorage.mbQueueWakeupMetricsView, 'the metrics view is in session storage')
+    assert.equal(browser.__storage.mbQueueWakeupMetrics, undefined, 'the metrics record is not on disk')
+    assert.equal(browser.__storage.mbQueueWakeupMetricsView, undefined, 'the metrics view is not on disk')
+
+    // A restart loads the record from session storage: the same epoch comes back, and the dashboard view is written to session too.
+    const restarted = loadServiceWorkerHarness({browser, now: 10010})
+    const refreshed = await restarted.sw.refreshQueueWakeupMetricsViewForDashboard('test')
+    assert.equal(refreshed.refreshed, true)
+    assert.equal(refreshed.view.currentEpoch.epochId, reset.epochId, 'the restart reads the epoch back from session storage')
+    assert.equal(refreshed.view.currentEpoch.startedAt, reset.startedAt)
+    assert.equal(browser.__storage.mbQueueWakeupMetrics, undefined, 'the restart writes no metrics record to disk')
+    assert.equal(browser.__storage.mbQueueWakeupMetricsView, undefined, 'the restart writes no metrics view to disk')
+})
+
+// One-time import of the 1.5 space classifications (27 Oct). The 1.5 registry is the plain key mbSpaceRegistry, so these tests seed it
+// with rawStorage. The 1.6 layout prefix is set explicitly: the harness default is unprefixed, where the two names are the same key.
+const SPACE_IMPORT_LAYOUT_PREFIX = 'v1.6.'
+function spaceImportRecord(spaceKey, category) {
+    return {key: spaceKey, url: `https://${spaceKey}.quora.com`, slug: spaceKey, name: spaceKey.toUpperCase(), category, updatedAt: 1}
+}
+// The import runs in the background of hydrate (sw.js), so a test lets its promise chain settle before it reads storage. No timers are
+// involved: the import only awaits in-memory storage and the change listeners.
+async function settleBackgroundWork(rounds = 300) {
+    for(let index = 0; index < rounds; index += 1) await Promise.resolve()
+}
+
+test('one-time space import: a fresh 1.6 start copies the 1.5 spaces into the 1.6 registry and sets the marker', async () => {
+    const harness = loadServiceWorkerHarness({now: 700000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: {mbSpaceRegistry: {
+        'space-a': spaceImportRecord('space-a', 'asset'),
+        'space-b': spaceImportRecord('space-b', 'target')
+    }}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.deepEqual(Object.keys(harness.storage.mbSpaceRegistry).sort(), ['space-a', 'space-b'])
+    assert.equal(harness.storage.mbSpaceRegistry['space-a'].category, 'asset')
+    assert.equal(harness.storage.mbSpaceRegistry['space-b'].category, 'target')
+    assert.equal(harness.storage.mbSpaceRegistryImportedFromV15?.imported, 2, 'the marker is written with the import')
+    assert.equal(harness.browser.__storage.mbSpaceRegistry['space-a'].category, 'asset', 'the 1.5 key is left as it was')
+    const counters = harness.sw.state().queueWakeupCounters
+    assert.equal(counters['spaceRegistryImport.spacesImported'], 2)
+    assert.equal(counters['spaceRegistryImport.spacesKeptFrom16'] || 0, 0)
+})
+
+test('one-time space import: a second start does not import again, even while the 1.5 key still holds the space', async () => {
+    const first = loadServiceWorkerHarness({now: 700000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: {mbSpaceRegistry: {
+        'space-a': spaceImportRecord('space-a', 'asset'),
+        'space-b': spaceImportRecord('space-b', 'target')
+    }}})
+    await first.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    // The user takes space-b off the 1.6 registry. The 1.5 key still holds it.
+    const raw = JSON.parse(JSON.stringify(first.browser.__storage))
+    raw[`${SPACE_IMPORT_LAYOUT_PREFIX}mbSpaceRegistry`] = {'space-a': first.browser.__storage[`${SPACE_IMPORT_LAYOUT_PREFIX}mbSpaceRegistry`]['space-a']}
+    const second = loadServiceWorkerHarness({now: 700100, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: raw})
+    await second.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.deepEqual(Object.keys(second.storage.mbSpaceRegistry), ['space-a'], 'the space the user removed stays removed')
+    assert.equal(second.sw.state().queueWakeupCounters['spaceRegistryImport.spacesImported'] || 0, 0)
+})
+
+test('one-time space import: a 1.6 entry for the same space wins over the 1.5 entry', async () => {
+    const harness = loadServiceWorkerHarness({now: 700000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX,
+        storage: {mbSpaceRegistry: {'space-a': spaceImportRecord('space-a', 'target')}},
+        rawStorage: {mbSpaceRegistry: {
+            'space-a': spaceImportRecord('space-a', 'asset'),
+            'space-b': spaceImportRecord('space-b', 'neutral')
+        }}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.equal(harness.storage.mbSpaceRegistry['space-a'].category, 'target', 'the 1.6 record is kept')
+    assert.equal(harness.storage.mbSpaceRegistry['space-b'].category, 'neutral', 'the space only 1.5 has is imported')
+    const counters = harness.sw.state().queueWakeupCounters
+    assert.equal(counters['spaceRegistryImport.spacesImported'], 1)
+    assert.equal(counters['spaceRegistryImport.spacesKeptFrom16'], 1)
+})
+
+test('one-time space import: with no 1.5 key the marker is set and the registry is not written', async () => {
+    const seed = {'space-a': spaceImportRecord('space-a', 'asset')}
+    const harness = loadServiceWorkerHarness({now: 700000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, storage: {mbSpaceRegistry: seed}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.deepEqual(harness.storage.mbSpaceRegistry, seed, 'the 1.6 registry is untouched')
+    assert.ok(harness.storage.mbSpaceRegistryImportedFromV15, 'the marker is set')
+    const counters = harness.sw.state().queueWakeupCounters
+    assert.equal(counters['spaceRegistryImport.spacesImported'] || 0, 0)
+    assert.equal(counters['spaceRegistryImport.spacesKeptFrom16'] || 0, 0)
+})
+
+test('one-time space import: a failed read of the 1.5 key writes no marker, and the next start retries', async () => {
+    const browser = createFakeBrowser({}, {layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: {mbSpaceRegistry: {
+        'space-a': spaceImportRecord('space-a', 'asset')
+    }}})
+    const originalGet = browser.storage.local.get.bind(browser.storage.local)
+    browser.storage.local.get = async keys => {
+        const names = Array.isArray(keys) ? keys : Object.keys(keys || {})
+        if(names.includes('mbSpaceRegistry')) throw new Error('disk read failed')
+        return originalGet(keys)
+    }
+    const failed = loadServiceWorkerHarness({now: 700000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, browser})
+    await failed.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.equal(failed.browser.__storage[`${SPACE_IMPORT_LAYOUT_PREFIX}mbSpaceRegistryImportedFromV15`], undefined, 'no marker after a failed read')
+    assert.equal(failed.storage.mbSpaceRegistry, undefined, 'nothing is imported')
+    assert.equal(failed.sw.state().queueWakeupCounters['spaceRegistryImport.legacyReadFailed'], 1, 'the failure is counted')
+    const retried = loadServiceWorkerHarness({now: 700100, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: JSON.parse(JSON.stringify(failed.browser.__storage))})
+    await retried.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.equal(retried.storage.mbSpaceRegistry['space-a'].category, 'asset', 'the next start imports the space')
+    assert.equal(retried.storage.mbSpaceRegistryImportedFromV15?.imported, 1)
+})
+
+// Erase and the 1.5 space registry (owner, 27 Oct). A clean-slate erase removes the plain key mbSpaceRegistry, and keeps the one-time import
+// marker, so the 1.5 spaces do not come back. These tests use the prefixed layout, where the 1.5 key is a plain name the erase must reach itself.
+function copyRawStorage(harnessOrBrowser) {
+    const browser = harnessOrBrowser.browser || harnessOrBrowser
+    return JSON.parse(JSON.stringify(browser.__storage))
+}
+// A browser whose remove of the plain 1.5 key always fails. Every other remove is the fake browser's own.
+function browserWithFailingPlainRemove(initialStorage, rawStorage) {
+    const browser = createFakeBrowser(initialStorage, {layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage})
+    const originalRemove = browser.storage.local.remove.bind(browser.storage.local)
+    browser.storage.local.remove = async keys => {
+        const names = Array.isArray(keys) ? keys : [keys]
+        if(names.includes('mbSpaceRegistry')) throw new Error('disk remove failed')
+        return originalRemove(keys)
+    }
+    return browser
+}
+
+test('erase: the 1.5 space registry under its plain name is removed as well, and the erase reports no failure', async () => {
+    const harness = loadServiceWorkerHarness({now: 800000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX,
+        storage: {mbCoordinatorRuns: {'run-1': {id: 'run-1'}}},
+        rawStorage: {mbSpaceRegistry: {'space-a': spaceImportRecord('space-a', 'asset')}}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.ok(harness.browser.__storage.mbSpaceRegistry, 'precondition: the 1.5 key is present before the erase')
+    const scheduled = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    assert.equal(scheduled.plainRemoveFailed, 0)
+    assert.equal(harness.browser.__storage.mbSpaceRegistry, undefined, 'the erase removes the 1.5 key under its plain name')
+    const restarted = loadServiceWorkerHarness({now: 800010, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: copyRawStorage(harness)})
+    const hydrating = restarted.sw.coordinatorAuthority.hydrate()
+    await restarted.timers.tick(1000)
+    await hydrating
+    await settleBackgroundWork()
+    assert.equal(restarted.browser.__storage.mbSpaceRegistry, undefined, 'still gone after a restart')
+    assert.equal(restarted.storage.mbCoordinatorRuns, undefined, 'the history goes as before')
+    assert.equal(restarted.sw.state().queueWakeupCounters['eraseBlockHistory.plainRemoveFailed'] || 0, 0)
+})
+
+test('erase: the one-time import marker survives, so a restart after the erase does not import the 1.5 spaces again', async () => {
+    const harness = loadServiceWorkerHarness({now: 800000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX,
+        rawStorage: {mbSpaceRegistry: {'space-a': spaceImportRecord('space-a', 'asset')}}})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.equal(harness.storage.mbSpaceRegistry['space-a'].category, 'asset', 'precondition: the import ran before the erase')
+    const scheduled = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true)
+    const restarted = loadServiceWorkerHarness({now: 800010, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: copyRawStorage(harness)})
+    const hydrating = restarted.sw.coordinatorAuthority.hydrate()
+    await restarted.timers.tick(1000)
+    await hydrating
+    await settleBackgroundWork()
+    assert.ok(restarted.storage.mbSpaceRegistryImportedFromV15, 'the import marker is still set after the erase')
+    assert.equal(restarted.storage.mbSpaceRegistry, undefined, 'the erase cleared the 1.6 registry')
+    // A 1.5 copy of the key comes back (as a stale copy would). The next start must not import it: the marker is still there.
+    const raw = copyRawStorage(restarted)
+    raw.mbSpaceRegistry = {'space-a': spaceImportRecord('space-a', 'asset')}
+    const again = loadServiceWorkerHarness({now: 800020, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX, rawStorage: raw})
+    await again.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    assert.equal(again.storage.mbSpaceRegistry, undefined, 'the 1.5 spaces are not imported after the erase')
+    assert.equal(again.sw.state().queueWakeupCounters['spaceRegistryImport.spacesImported'] || 0, 0)
+})
+
+test('erase: a failed remove of the 1.5 space registry is counted, and the erase still completes', async () => {
+    const harness = loadServiceWorkerHarness({now: 800000, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX,
+        browser: browserWithFailingPlainRemove({mbCoordinatorRuns: {'run-1': {id: 'run-1'}}}, {mbSpaceRegistry: {'space-a': spaceImportRecord('space-a', 'asset')}})})
+    await harness.sw.coordinatorAuthority.hydrate()
+    await settleBackgroundWork()
+    const scheduled = await harness.browser.runtime.sendMessage({action: 'erase-block-history', confirmation: 'ERASE'})
+    assert.equal(scheduled.scheduled, true, 'the erase still completes')
+    assert.equal(scheduled.plainRemoveFailed, 1, 'the failed remove is reported in the reply')
+    assert.ok(harness.browser.__storage.mbSpaceRegistry, 'the 1.5 key is still there, since its remove failed')
+    // The restart retries the erase, and the same remove fails again: it is counted there too, and the history still goes.
+    const restarted = loadServiceWorkerHarness({now: 800010, layoutPrefix: SPACE_IMPORT_LAYOUT_PREFIX,
+        browser: browserWithFailingPlainRemove({}, copyRawStorage(harness))})
+    const hydrating = restarted.sw.coordinatorAuthority.hydrate()
+    await restarted.timers.tick(1000)
+    await hydrating
+    await settleBackgroundWork()
+    assert.equal(restarted.storage.mbCoordinatorRuns, undefined, 'the history is erased although the plain remove failed')
+    assert.equal(restarted.storage.mbEraseBlockHistoryPending, undefined, 'the marker is cleared last')
+    assert.equal(restarted.storage.mbSpaceRegistry, undefined, 'the failed plain key does not bring the spaces back')
+    assert.equal(restarted.sw.state().queueWakeupCounters['eraseBlockHistory.plainRemoveFailed'], 1, 'the failure is counted')
 })
 
 ;

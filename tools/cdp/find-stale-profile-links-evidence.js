@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_WAL_KEY} = require('../../shared/js/storageKeys')
+const {plainName} = require('../../shared/js/storageNamespace')
+
 const {gzipSync, gunzipSync} = require('fflate')
 const {
     hydrateSegmentedWalStore,
@@ -14,8 +17,14 @@ const {
     runMain
 } = require('./lib/cdp')
 
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
+
+// The plain names of this layout's stored keys (storageNamespace.js). Stored keys of other layouts are left out.
+function plainStored(storage = {}) {
+    return Object.fromEntries(Object.entries(storage || {})
+        .map(([storedName, value]) => [plainName(storedName), value])
+        .filter(([key]) => key !== null))
+}
 
 const CODEC_OPTIONS = {
     codec: {
@@ -38,9 +47,10 @@ runMain(async () => {
         return
     }
 
-    const stored = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
+    const storedRaw = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
         return chrome.storage.local.get(null)
     }})()`, 60000)
+    const stored = plainStored(storedRaw)
 
     const meta = stored[COORDINATOR_QUEUE_WAL_META_KEY] || null
     let store = null

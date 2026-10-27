@@ -318,6 +318,42 @@
     margin-top: 8px;
 }
 
+/* Stop collecting, on space and search pages alike (owner, 26 Oct): fixed above the Next notification pill row, with its LEFT edge on the
+   "Collect N More" button's left edge (owner correction, option 3). Measured offsets, not tokens.
+   Search page (measured 1079px window, 1064px layout width): the Collect N More button's left edge is 906.5px. That button sits in the fixed toolbar,
+   which is anchored 18px from the right edge and is 139.5px wide here (text "Collect 100 More"). The Stop button's natural width is 113.5px
+   (text 91.5px + 20px padding + 2px border; measured by canvas from the shared button font).
+   right: 44px = 18px toolbar gap + 139.5px Collect button - 113.5px Stop width. A wider count (for example 1000) widens the Collect button and this offset then drifts.
+   Space page: not measured (no space page was open to probe), so this is the search-page offset, unverified for spaces.
+   bottom: 84px (owner decision, option 3: keep the full label and sit above the Next notification pill). From the owner's screenshot the pill's top edge
+   is about 66-68px above the viewport bottom (pill y 798 to 836 with the 28px Progress bar below it, in an ~866px-tall window), so 84px leaves a 16px gap above it.
+   The pill is not in the DOM, so this is a measured offset, not a token. Same z-index as the search toolbar. */
+.mb-ext_space-collect-stop-btn,
+.mb-ext_profile-search-stop-btn {
+    position: fixed;
+    right: 44px;
+    bottom: 84px;
+    z-index: 2147483646;
+    margin: 0;
+    background-color: var(--mb-grey-900);
+    color: var(--mb-white);
+    border: 1px solid var(--mb-grey-900);
+    box-shadow: 0 1px 2px rgba(var(--mb-black-rgb), 0.12);
+    white-space: nowrap;
+}
+
+.mb-ext_space-collect-stop-btn:not(:disabled):hover,
+.mb-ext_profile-search-stop-btn:not(:disabled):hover {
+    background-color: var(--mb-black);
+    color: var(--mb-white);
+    border-color: var(--mb-black);
+}
+
+.mb-ext_space-collect-stop-btn[hidden],
+.mb-ext_profile-search-stop-btn[hidden] {
+    display: none;
+}
+
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn--working,
 .mb-ext_profile-search-toolbar .mb-ext_nuke-profiles-btn--working:hover,
 .mb-ext_profile-search-action-host .mb-ext_nuke-profiles-btn--working,

@@ -4,6 +4,10 @@
 
 Status: release narrative draft.
 
+Corrected 27 Oct: removed the claims of a Dashboard requeue control, an Idle
+Retry control, and a Ready to Run section. The queue is owned by the queue
+Worker; in Chrome that Worker is the MV3 service worker.
+
 Canonical planning now starts at [planning.md](planning.md). Canonical
 architecture starts at [architecture.md](architecture.md). This file is for
 public release framing, not engineering priority or architecture authority.
@@ -60,7 +64,7 @@ still had to stay close to the page-local workflow.
   only obvious follower/following/list pages;
 - resolve author profiles from Space posts when the feed does not expose a
   direct profile URL up front;
-- retry failed work without losing the intended action;
+- retry soft-failed work automatically, up to a fixed limit, without changing the intended action;
 - prepare shared Space posts so one person's block work can be exported,
   imported, reviewed, and executed locally by another person's extension.
 
@@ -76,8 +80,8 @@ still had to stay close to the page-local workflow.
   retries, and failures.
 - Better recovery after closing the Dashboard, reloading pages, restarting the
   service worker, or losing worker tabs.
-- Safer retry behavior: failed rows can be requeued without accidentally
-  changing the intended action.
+- Safer retry behavior: retries keep the intended action. The Dashboard has no
+  requeue control.
 - Better handling of resolver-only space posts where the author profile has to
   be resolved from the source page before mute/block can run.
 - Space-feed buttons more accurately reflect durable pending work instead of
@@ -92,7 +96,7 @@ Use this distinction when writing public copy:
 
 | Status | Public framing |
 | --- | --- |
-| Implemented/current 1.6 work | Durable background queue, Dashboard recovery, multi-context queueing, space-feed queueing, resolver-only author resolution, profile/modal/list queueing, retry/requeue controls, and deterministic test coverage. |
+| Implemented/current 1.6 work | Durable background queue, Dashboard recovery, multi-context queueing, space-feed queueing, resolver-only author resolution, profile/modal/list queueing, automatic soft-fail retry, and deterministic test coverage. |
 | Release-candidate work if it lands before public 2.0 | Shared-post parser, export to a chosen Space, import from other public Spaces, imported provenance storage, and local review/execute controls. |
 | Future 2.x work | Deeper ATproto integration beyond the local shared moderation model. |
 
@@ -108,9 +112,9 @@ pieces that have actually landed and passed release validation.
 can keep going after the page that started the work is no longer the center of
 the workflow:
 
-- service-worker-owned queue rows are authoritative;
-- worker tabs report milestones and terminal results back to the service
-  worker;
+- queue rows owned by the queue Worker are authoritative (in Chrome, the Worker
+  is the MV3 service worker);
+- worker tabs report milestones and terminal results back to the queue Worker;
 - legacy `mbProfileNukeProgress` records become compatibility/reporting data
   rather than a parallel state authority;
 - queue rows carry canonical job envelope fields such as `jobKey`,
@@ -140,11 +144,9 @@ like babysitting individual Quora pages.
 
 The old coordinator concept has been reframed as a Dashboard:
 
-- `Current Work`, `Ready to Run`, and `Recent History` separate live work from
-  retryable and completed rows;
-- manual `Requeue Failed` controls support targeted recovery;
-- `Idle Retry` can resume eligible failures without requiring the original
-  page state;
+- `Current Work` and the History page separate live work from completed rows;
+- the Dashboard shows a soft-fail retry status, and has no requeue or
+  idle-retry control in 1.6;
 - active/retry/terminal statuses are easier to distinguish;
 - Dashboard and Preferences cross-link to each other.
 
@@ -185,7 +187,7 @@ UI path has been validated in the release candidate.
 
 The release line includes fixes for reverse workflows:
 
-- `unblock-unmute` retry/requeue preserves the reverse action instead of
+- `unblock-unmute` retries preserve the reverse action instead of
   falling back into a mute/block executor path;
 - reverse action progress and terminal states are tracked through the same
   attempt-aware job model;
@@ -212,7 +214,7 @@ Live browser work uses direct Chrome DevTools Protocol over the remote-debugging
 endpoint. Puppeteer is intentionally not part of the validation workflow.
 
 CDP helper scripts summarize queue state, inspect space tabs, reload the
-extension, resume queues, requeue failures, close profile tabs, and inspect
+extension, resume queues, requeue stale active rows, close profile tabs, and inspect
 storage-backed queue state.
 
 ## Shared Moderation Foundation
@@ -291,7 +293,7 @@ Highlights:
 - clearer Dashboard for active, queued, failed, and completed work;
 - better recovery after reloads, closed tabs, and service-worker restarts;
 - improved space-feed handling, including author-profile resolution;
-- safer retry and requeue behavior;
+- safer retry behavior;
 - collaboration groundwork for exporting shared blocks to a Quora Space and
   importing public shared lists from other users.
 
@@ -305,7 +307,7 @@ If shared import/export lands before release, replace the last highlight with:
 
 The `1.6` line is the private stabilization series for public `2.0`. It closes
 the `1.5` coordinator/debugging lane and moves the product toward a
-service-worker-owned durable queue.
+queue-Worker-owned durable queue (in Chrome, the service worker).
 
 Position this as a major release, not just a reliability patch. The user-facing
 promise is easier high-volume cleanup: background `Nuke 'Em` from many Spaces,
@@ -323,7 +325,7 @@ Ship criteria should focus on:
 - source-page pending state settles from terminal job outcomes;
 - background jobs can be started from multiple source contexts without
   requiring the operator to wait on each page;
-- retry/requeue preserves action kind and attempt identity;
+- retries preserve action kind and attempt identity;
 - Dashboard closure/reload does not strand active work;
 - any public shared import/export claim is backed by parser, provenance,
   publisher/importer, and local review policy validation;

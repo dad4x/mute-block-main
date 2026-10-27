@@ -35,11 +35,18 @@
                 <img class="brand-mark" src="icons/116.png" alt="" aria-hidden="true">
                 <div>
                     <h1>History</h1>
-                    <div class="version" id="historyCount">0 entries</div>
-                    <select class="select" id="historySort" title="Mute Block extension: Order the history rows">
-                        <option value="newest">Newest first</option>
-                        <option value="status">By status (errors first)</option>
-                    </select>
+                    <div class="history-controls">
+                        <select class="select" id="historySort" title="Mute Block extension: Order the history rows">
+                            <option value="newest">Newest first</option>
+                            <option value="status">By status (errors first)</option>
+                        </select>
+                        <input class="history-filter" id="historyFilter" type="text" placeholder="Filter history" aria-label="Filter history" title="Mute Block extension: Show only the rows that contain every word typed, in any order, in the profile, status, outcome, source or error text (not case-sensitive)" autocomplete="off">
+                        <label class="history-dedupe" for="historyDedupe" title="Mute Block extension: Show only the most recent row for each profile (by completion time). Rows with no profile are each kept.">
+                            <input type="checkbox" id="historyDedupe">
+                            <span>Remove duplicates</span>
+                        </label>
+                        <div class="version history-count" id="historyCount" aria-live="polite">Showing 0 of 0</div>
+                    </div>
                 </div>
             </div>
             <div class="header-status">
@@ -54,6 +61,12 @@
             </section>
         </section>
     </main>
+
+    <!-- The first-load spinner (owner, 27 Oct). coordinator.js clones it into the Current Work header and list and the History list
+         until the worker first answers; the spin itself is set in coordinator.css and stops under reduced motion. -->
+    <template id="loadingIndicatorTemplate">
+        <span class="loading-indicator" role="status" aria-live="polite"><span class="loading-spinner" aria-hidden="true"></span><span class="loading-text">Loading…</span></span>
+    </template>
 
     <main class="coordinator" id="dashboardView">
         <header class="coordinator-header">
@@ -88,7 +101,7 @@
                         <div class="panel-actions-row">
                             <span class="pause-state" id="pauseCurrentWorkState">Running</span>
                             <span class="work-session" id="workSessionLine" hidden></span>
-                            <span id="currentWorkReadyCount">Showing 0, 0 queued, 0 succeeded, 0 soft-fail, 0 hard-fail</span>
+                            <span id="currentWorkReadyCount">Showing 0, 0 queued, 0 succeeded</span>
                             <span class="queue-count" id="queueCount" hidden>0 jobs</span>
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its stored work">Start</button>
@@ -96,7 +109,6 @@
                                 <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Mute Block extension: Cancel and remove all Current Work rows">Clear</button>
                             </div>
                         </div>
-                        <div class="panel-action-state" id="retryFailedState">Soft-fail retry is off</div>
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the service worker's flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
@@ -210,6 +222,22 @@
                             <div class="summary-label" title="Average seconds from one terminal Current Work row to the next row activation in the current metrics epoch, excluding any time the queue spent paused in between. Concerning if this is large relative to secs/real block -- it means worker slots are sitting idle between jobs instead of picking up queued work immediately (check for queue throttling or a backed-up write queue).">secs / handoff</div>
                             <div class="summary-value" id="activationHandoffSeconds">--</div>
                         </div>
+                    </div>
+                    <div class="duration-histograms" aria-label="Block duration histograms">
+                        <section class="duration-histogram" id="realBlockDurationHistogram" title="Mute Block extension: Completed real-block rows since the last Clear All Stats, bucketed by active-to-terminal time (the same rows and duration as Avg item time). Each column is the number of rows in that time range; the count is above it.">
+                            <div class="duration-histogram-head">
+                                <div class="summary-label">Real block</div>
+                                <div class="duration-histogram-total" id="realBlockDurationTotal">no samples</div>
+                            </div>
+                            <div class="duration-histogram-bars" id="realBlockDurationBars"></div>
+                        </section>
+                        <section class="duration-histogram" id="alreadyBlockedDurationHistogram" title="Mute Block extension: Completed already-blocked rows since the last Clear All Stats, bucketed by active-to-terminal time. These rows confirmed the profile was already blocked and performed no block action. Each column is the number of rows in that time range; the count is above it.">
+                            <div class="duration-histogram-head">
+                                <div class="summary-label">Already blocked</div>
+                                <div class="duration-histogram-total" id="alreadyBlockedDurationTotal">no samples</div>
+                            </div>
+                            <div class="duration-histogram-bars" id="alreadyBlockedDurationBars"></div>
+                        </section>
                     </div>
                     <div class="metrics-grid" id="metricsGrid"></div>
                     <div class="panel-subhead">

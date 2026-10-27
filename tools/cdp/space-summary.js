@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const {SPACE_MAP_BUCKET_COUNT} = require("../../shared/js/storageKeys")
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require("../../shared/js/storageKeys")
 const {
     evaluate,
     getCdpConfig,
@@ -9,6 +9,9 @@ const {
     runMain,
     spaceKeyFromUrl
 } = require('./lib/cdp')
+
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
 
 runMain(async () => {
     const config = getCdpConfig()
@@ -48,23 +51,11 @@ runMain(async () => {
     const sw = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))
     let workerSummary = null
     if(sw) {
-        workerSummary = await evaluate(sw.webSocketDebuggerUrl, `(${async function inspectWorker(bucketCount) {
-            const keys = ['mbSpaceMapLayoutVersion', 'mbCoordinatorRunsLayoutVersion', 'mbCoordinatorQueue', 'mbSpacePendingNukedPosts', 'mbCoordinatorRuns']
-            for (let i = 0; i < bucketCount; i += 1) keys.push(`mbSpacePendingNukedPosts.b${i.toString(16).padStart(2, '0')}`, `mbCoordinatorRuns.b${i.toString(16).padStart(2, '0')}`)
-            const storage = await chrome.storage.local.get(keys)
-            // Space maps and the run list are kept in 32 buckets each once their layout marker is 2 (1437+). Rebuild each whole map.
-            const readBucketed = (base, layoutKey) => {
-                if (storage[layoutKey] !== 2) return storage[base] || {}
-                const merged = {}
-                for (let i = 0; i < bucketCount; i += 1) Object.assign(merged, storage[`${base}.b${i.toString(16).padStart(2, '0')}`] || {})
-                return merged
-            }
-            const pending = readBucketed('mbSpacePendingNukedPosts', 'mbSpaceMapLayoutVersion')
-            const queue = storage.mbCoordinatorQueue || {}
+        workerSummary = await evaluate(sw.webSocketDebuggerUrl, `(${async function inspectWorker(queueKey) {
+            const storage = await chrome.storage.local.get([queueKey])
+            const queue = storage[queueKey] || {}
             const bySpace = {}
             const addSpace = key => bySpace[key] || (bySpace[key] = {
-                pendingPosts: 0,
-                pendingRemaining: 0,
                 queued: 0,
                 active: 0,
                 terminal: 0,
@@ -73,13 +64,6 @@ runMain(async () => {
                 other: 0,
                 runIds: {}
             })
-            for(const record of Object.values(pending)) {
-                const key = record?.spaceKey || ''
-                if(!key) continue
-                const item = addSpace(key)
-                item.pendingPosts += 1
-                item.pendingRemaining += Array.isArray(record.remainingUrls) ? record.remainingUrls.length : 0
-            }
             const terminalStatuses = new Set(['succeeded', 'failed', 'canceled'])
             const activeStatuses = new Set(['opening', 'active', 'acting', 'settling', 'tab-opening', 'tab-opened', 'page-ready', 'muting', 'blocking'])
             for(const item of Object.values(queue)) {
@@ -106,10 +90,9 @@ runMain(async () => {
                 bySpace,
                 profileTabCount: profileTabs.length,
                 profileTabs,
-                totalQueue: Object.keys(queue).length,
-                totalPendingPosts: Object.keys(pending).length
+                totalQueue: Object.keys(queue).length
             }
-        }})(${SPACE_MAP_BUCKET_COUNT})`)
+        }})(${JSON.stringify(QUEUE_STORED_KEY)})`)
     }
 
     console.log(JSON.stringify({pageSummaries, workerSummary}, null, 2))

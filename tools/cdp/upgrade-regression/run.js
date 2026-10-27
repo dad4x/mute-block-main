@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_QUEUE_WAL_KEY, SPACE_REGISTRY_KEY, STORAGE_LAYOUT_PREFIX} = require('../../../shared/js/storageKeys')
+const {plainName} = require('../../../shared/js/storageNamespace')
+
+// The stored name of the space registry: the layout prefix plus the plain key name (storageNamespace.js).
+const SPACE_REGISTRY_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${SPACE_REGISTRY_KEY}`
+
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
@@ -88,8 +94,6 @@ const PHASE10_HARNESS_WATCHDOG_MS = 180000
 const PHASE10_TARGET_SELECTION_TIMEOUT_MS = 180000
 const PHASE10_FLIGHT_RECORDER_LIMIT = 2000
 const EXPECTED_EXTENSION_NAMES = new Set(['Mute Block', 'Mute Block Dev'])
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
 const SUPPORTED_PHASES = [
     PHASE1,
@@ -154,7 +158,7 @@ const ALLOWED_STORAGE_KEY_PATTERNS = [
     /^mbProfileNukeProgressShard\./,
     /^mbCoordinator/,
     /^mbQueueWakeupMetrics(?:View)?$/,
-    /^mbSpace(?:Registry|PendingNukedPosts|NukedPosts)$/,
+    /^mbSpaceRegistry$/,
     /^mbOwnedTabIdsByParent$/,
     /^mbBrowserSessionMarker$/,
     /^mbQuoraRuntimeActivated$/,
@@ -934,8 +938,23 @@ async function readStorage(target) {
     return {...snapshot, workerProgress}
 }
 
+// The stored names of this layout are the layout prefix plus the plain name (storageNamespace.js). The checks in this file read plain
+// names, so a snapshot maps this layout's stored keys to their plain names. An unprefixed key (an older layout's) keeps its own name.
+function plainStorageSnapshot(snapshot = {}) {
+    const stored = snapshot?.data && typeof snapshot.data === 'object' ? snapshot.data : {}
+    const data = {}
+    for(const [storedName, value] of Object.entries(stored)) {
+        if(plainName(storedName) === null) data[storedName] = value
+    }
+    for(const [storedName, value] of Object.entries(stored)) {
+        const key = plainName(storedName)
+        if(key !== null) data[key] = value
+    }
+    return {...snapshot, data, keys: Object.keys(data).sort()}
+}
+
 async function readDiskStorage(target) {
-    return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
+    const snapshot = await evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
             let settled = false
             const finish = value => {
@@ -1012,6 +1031,7 @@ async function readDiskStorage(target) {
             tryRead()
         })
     }})()`, 60000)
+    return plainStorageSnapshot(snapshot)
 }
 
 async function readAlarms(target) {
@@ -1033,6 +1053,11 @@ async function readAlarms(target) {
     }})()`, 10000)
 }
 
+// The values as the stored names they are written under: the layout prefix plus each plain key name (storageNamespace.js).
+function prefixedValues(values = {}) {
+    return Object.fromEntries(Object.entries(values || {}).map(([key, value]) => [`${STORAGE_LAYOUT_PREFIX}${key}`, value]))
+}
+
 async function setStorageValues(target, values = {}) {
     return evaluate(target.webSocketDebuggerUrl, `(${function writeLocalStorage(nextValues) {
         return new Promise(resolve => {
@@ -1046,7 +1071,7 @@ async function setStorageValues(target, values = {}) {
                 lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
             }))
         })
-    }})(${JSON.stringify(values || {})})`, 10000)
+    }})(${JSON.stringify(prefixedValues(values))})`, 10000)
 }
 
 function isAllowedStorageKey(key) {
@@ -1234,8 +1259,6 @@ function summarizeAuthorityState(storage) {
             ? Object.keys(storage.workerProgress).length
             : countRecordMap(data.mbProfileNukeProgressView),
         progressShardRecords,
-        pendingSpacePostRecords: countRecordMap(data.mbSpacePendingNukedPosts),
-        nukedSpacePostRecords: countRecordMap(data.mbSpaceNukedPosts),
         queuedActionSurfaceRecords: countRecordMap(queuedActionSurfaceState)
     }
 }
@@ -2287,18 +2310,6 @@ function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
             after: after.progressShardRecords
         })
     }
-    if(after.pendingSpacePostRecords !== before.pendingSpacePostRecords) {
-        changed('pending space post records', {
-            before: before.pendingSpacePostRecords,
-            after: after.pendingSpacePostRecords
-        })
-    }
-    if(after.nukedSpacePostRecords !== before.nukedSpacePostRecords) {
-        changed('nuked space post records', {
-            before: before.nukedSpacePostRecords,
-            after: after.nukedSpacePostRecords
-        })
-    }
     if(after.queuedActionSurfaceRecords !== before.queuedActionSurfaceRecords) {
         changed('queued action surface records', {
             before: before.queuedActionSurfaceRecords,
@@ -2834,11 +2845,11 @@ async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = 
     ].filter(Boolean)
     if(!records.length) return {updated: 0, records: []}
 
-    return evaluate(context.webSocketDebuggerUrl, `(${function setSpaceRegistry(nextRecords) {
+    return evaluate(context.webSocketDebuggerUrl, `(${function setSpaceRegistry(nextRecords, registryKey) {
         return new Promise(resolve => {
-            chrome.storage.local.get({mbSpaceRegistry: {}}, stored => {
-                const registry = stored.mbSpaceRegistry && typeof stored.mbSpaceRegistry === 'object'
-                    ? stored.mbSpaceRegistry
+            chrome.storage.local.get({[registryKey]: {}}, stored => {
+                const registry = stored[registryKey] && typeof stored[registryKey] === 'object'
+                    ? stored[registryKey]
                     : {}
                 let updated = 0
                 for(const record of nextRecords || []) {
@@ -2850,13 +2861,13 @@ async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = 
                     }
                     updated += 1
                 }
-                chrome.storage.local.set({mbSpaceRegistry: registry}, () => resolve({
+                chrome.storage.local.set({[registryKey]: registry}, () => resolve({
                     updated,
                     keys: nextRecords.map(record => record.key).filter(Boolean)
                 }))
             })
         })
-    }})(${JSON.stringify(records)})`, 10000)
+    }})(${JSON.stringify(records)}, ${JSON.stringify(SPACE_REGISTRY_STORED_KEY)})`, 10000)
 }
 
 

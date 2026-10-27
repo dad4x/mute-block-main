@@ -23,6 +23,9 @@ module.exports = {
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT: 32,
     COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT: 32,
     SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
+    // The one-time import of the 1.5 space classifications (27 Oct). Written in the same write as the imported registry, so it exists
+    // only once the import has run. The 1.5 registry itself is read under its plain name SPACE_REGISTRY_KEY, outside this layout.
+    SPACE_REGISTRY_IMPORT_MARKER_KEY: 'mbSpaceRegistryImportedFromV15',
     DEV_MODE_SYNC_STORAGE_KEY: 'mbDashboardDevModeEnabled',
     // The last or current continuous work: its start, and its end once it has ended (24 Oct). Read by the dashboard's Current Work header.
     COORDINATOR_WORK_SESSION_KEY: 'mbCoordinatorWorkSession',

@@ -93,7 +93,13 @@ function makeEvent() {
     }
 }
 
-const {PROFILE_NUKE_PROGRESS_SHARD_PREFIX, PROFILE_NUKE_PROGRESS_VIEW_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+const {
+    PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
+    PROFILE_NUKE_PROGRESS_VIEW_KEY,
+    QUEUE_WAKEUP_METRICS_KEY,
+    QUEUE_WAKEUP_METRICS_VIEW_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
 const {WORKER_WINDOW_FOREGROUND_MODES} = require('../../shared/js/swprefs')
 
 // Decision 31: profile progress (the view and the shards) is held in session storage, never on disk. A progress key in a seed goes to
@@ -102,13 +108,23 @@ function isProfileProgressStorageKey(key = '') {
     return key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)
 }
 
+// Owner decision 26 Oct: the queue-wakeup metrics record and its dashboard view are held in session storage, never on disk.
+function isQueueWakeupMetricsStorageKey(key = '') {
+    return key === QUEUE_WAKEUP_METRICS_KEY || key === QUEUE_WAKEUP_METRICS_VIEW_KEY
+}
+
+// Every key that lives in session storage, as opposed to the disk copy.
+function isSessionOnlyStorageKey(key = '') {
+    return isProfileProgressStorageKey(key) || isQueueWakeupMetricsStorageKey(key)
+}
+
 // The storage a test reads for the worker, under plain names: a test reads and writes `storage.mbCoordinatorRuns`, and the raw areas
-// hold `v1.6.mbCoordinatorRuns`. Disk keys come from the local copy and progress keys from the session copy. Reads, writes and
-// deletes of a progress key go to the session copy. Stored names outside this layout are not shown.
+// hold `v1.6.mbCoordinatorRuns`. Disk keys come from the local copy and progress and metrics keys from the session copy. Reads, writes
+// and deletes of those keys go to the session copy. Stored names outside this layout are not shown.
 function makeWorkerStorageView(localStorage, sessionStorage, layoutPrefix = '') {
     const toStored = key => typeof key === 'string' ? `${layoutPrefix}${key}` : key
     const toPlain = name => typeof name === 'string' && name.startsWith(layoutPrefix) ? name.slice(layoutPrefix.length) : null
-    const isProgressKey = key => typeof key === 'string' && isProfileProgressStorageKey(key)
+    const isProgressKey = key => typeof key === 'string' && isSessionOnlyStorageKey(key)
     return new Proxy(localStorage, {
         get: (target, key) => isProgressKey(key) ? sessionStorage[toStored(key)] : target[toStored(key)],
         set(target, key, value) {
@@ -124,7 +140,7 @@ function makeWorkerStorageView(localStorage, sessionStorage, layoutPrefix = '') 
         },
         ownKeys: target => [
             ...Object.keys(target).map(toPlain).filter(key => key !== null && !isProgressKey(key)),
-            ...Object.keys(sessionStorage).map(toPlain).filter(key => key !== null && isProfileProgressStorageKey(key))
+            ...Object.keys(sessionStorage).map(toPlain).filter(key => key !== null && isSessionOnlyStorageKey(key))
         ],
         getOwnPropertyDescriptor(target, key) {
             if(!isProgressKey(key)) return Object.getOwnPropertyDescriptor(target, toStored(key))
@@ -142,7 +158,8 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
     const sessionStorage = {}
     for(const [key, value] of Object.entries(clone(initialStorage) || {})) {
         const storedName = `${layoutPrefix}${key}`
-        if(options.progressOnDisk !== true && isProfileProgressStorageKey(key)) sessionStorage[storedName] = value
+        const onSession = isQueueWakeupMetricsStorageKey(key) || (options.progressOnDisk !== true && isProfileProgressStorageKey(key))
+        if(onSession) sessionStorage[storedName] = value
         else storage[storedName] = value
     }
     // Stored names as they are (a copy of an earlier run's raw storage, or keys another layout wrote): not prefixed here.
@@ -730,7 +747,7 @@ module.exports.__test = {
     terminalizeActiveCoordinatorItemFromBlockedLiveTab,
     terminalizeExhaustedRolledBackQueuedCoordinatorItem,
     terminalizeExhaustedRolledBackQueuedCoordinatorItems,
-    __testResetFlightRecorder,
+    __testResetFlightRecorder: require('./swflightRecorder').__testResetFlightRecorder,
     __testDeactivateHarness() {
         __testHarnessDeactivated = true
         if(storageUpdateState.getActiveRawToken()) {

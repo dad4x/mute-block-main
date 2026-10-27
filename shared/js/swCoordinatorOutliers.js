@@ -8,8 +8,9 @@
 //   - a row is flagged when its duration reaches the 45-second floor, or the stddev threshold (mean + 2.5 sigma) once
 //     OUTLIER_MIN_SAMPLES_FOR_STDDEV rows have been pushed;
 //   - a flagged row is recorded only at OUTLIER_MIN_RECORD_MS or more (owner, 24 Oct). Every finished row is still pushed;
-//   - a recorded entry keeps the flight recorder events that belong to it: the events of its target profile, and the storage and
-//     checkpoint writes inside its span. They are copied once, when the row is terminal, and kept until the entry leaves the list;
+//   - a recorded entry keeps the flight recorder events that belong to it: every event of its profile or row, and every storage
+//     operation (write, update, checkpoint switch) inside its span, whatever its profile. Nothing else. They are copied once, when the
+//     row is terminal, and kept until the entry leaves the list;
 //   - the stored list keeps its newest OUTLIER_MAX_ENTRIES entries;
 //   - Clear Outliers dismisses the listed attempts and keeps the baseline; Clear All Stats resets the baseline and the dismissals.
 // The stored record is {entries, baseline: {n, mean, M2}, dismissedKeys}. sw.js persists it under its own namespace key, in the same
@@ -23,11 +24,14 @@ const {
     OUTLIER_STDDEV_MULTIPLIER
 } = require('./tunables')
 
-// The recorder kinds that belong to an outlier by its span, whatever their profile: the disk writes and the queue checkpoint switches,
-// which can perturb a row. Storage-update settle records, pause and dashboard events are left out (plan, section 2).
-// Each kind is recorded at a call site in sw.js or swstorage.js; test/swSynthetic.test.js checks that each one is still recorded.
+// The storage kinds of the flight recorder: every disk write, every storage update (its settle record and its timeout), and every queue
+// checkpoint switch. A storage kind belongs to an outlier by its span, whatever its profile, because it can perturb the row. These are
+// the only kinds kept by span. Each kind is recorded at a call site in sw.js or swstorage.js; test/swSynthetic.test.js checks that each
+// one is still recorded. The recorder has no storage-read kind.
 const OUTLIER_SPAN_EVENT_KINDS = new Set([
     'storage-write',
+    'storage-update',
+    'storage-update-timeout',
     'queue-wal-checkpoint-switch-start',
     'queue-wal-checkpoint-switch-result'
 ])
@@ -198,19 +202,37 @@ function keepNewestCoordinatorOutlierEntries(entries = []) {
     return entries.length > OUTLIER_MAX_ENTRIES ? entries.slice(-OUTLIER_MAX_ENTRIES) : entries
 }
 
-// The scope a recorder event is matched against: the profile, and the row's span.
+// The scope a recorder event is matched against: the row key, the profile (normalized as the recorder normalizes it), and the row's span.
 function makeCoordinatorOutlierScope(item = {}, normalizeTargetUrl = value => value) {
     return {
+        rowKey: getCoordinatorOutlierRowKey(item),
         targetUrl: normalizeTargetUrl(getCoordinatorOutlierTargetUrl(item)),
         activeAt: toInteger(item.activeAt),
-        terminalAt: toInteger(item.terminalAt)
+        terminalAt: toInteger(item.terminalAt),
+        normalizeTargetUrl
     }
 }
 
-// True when a recorder event belongs to an outlier's scope: it is for the same target profile (exact match on the normalized address),
-// or it is a span kind (a disk write or checkpoint switch) inside the span. Pure.
+// True when an event is about the scope's profile or row. An event that carries a rowKey is judged by that key alone: it is this row's
+// event, or its rowKey names this profile; any other rowKey is another row's event, even when its targetUrl is this profile. An event
+// with no rowKey is judged by its targetUrl, or its profileHref, against the profile. Pure.
+function isCoordinatorOutlierRecorderEventForProfile(event = {}, scope = {}) {
+    const normalize = typeof scope.normalizeTargetUrl === 'function' ? scope.normalizeTargetUrl : value => value
+    const rowKey = toText(event.rowKey).trim()
+    if(rowKey) {
+        if(rowKey === scope.rowKey) return true
+        return Boolean(scope.targetUrl) && normalize(rowKey) === scope.targetUrl
+    }
+    if(!scope.targetUrl) return false
+    if(event.targetUrl === scope.targetUrl) return true
+    return Boolean(event.profileHref) && normalize(event.profileHref) === scope.targetUrl
+}
+
+// True when a recorder event belongs to an outlier's scope: it is about the outlier's profile or row (see
+// isCoordinatorOutlierRecorderEventForProfile), at any time, or it is a storage kind (OUTLIER_SPAN_EVENT_KINDS) inside the span, from the
+// span start to the span end, whatever its profile. An event that matches both is one event. Pure.
 function isCoordinatorOutlierRecorderEventInScope(event = {}, scope = {}) {
-    if(scope.targetUrl && event.targetUrl === scope.targetUrl) return true
+    if(isCoordinatorOutlierRecorderEventForProfile(event, scope)) return true
     if(!OUTLIER_SPAN_EVENT_KINDS.has(event.kind)) return false
     const at = toInteger(event.at)
     return at >= scope.activeAt && at <= scope.terminalAt

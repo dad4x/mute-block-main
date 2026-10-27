@@ -279,8 +279,11 @@ function createCoordinatorContentQueueIndex(deps = {}) {
         }
     }
 
+    // Builds a queue-only WAL checkpoint. Callers: the empty-fallback in swCoordinatorQueueWal.js and the WAL store's makeCheckpoint
+    // (sw.js). None of them passes runs, so the checkpoint holds the queue alone.
     function makeCoordinatorQueueWalCheckpoint(queue = {}, options = {}) {
-        return makePairedCheckpointStore({queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(queue || {}))}, {
+        const state = {queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(queue || {}))}
+        return makePairedCheckpointStore(state, {
             snapshotSeq: Number.parseInt(options.snapshotSeq, 10) || 0,
             nextSeq: Number.parseInt(options.nextSeq, 10) || 1,
             createdAt: Number.parseInt(options.createdAt, 10) || now()

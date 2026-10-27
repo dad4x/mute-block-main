@@ -9,6 +9,12 @@ const {
     applyWalRecord,
     makeWalRecord
 } = require('./swstorage')
+const {
+    CHECKPOINT_A,
+    CHECKPOINT_B,
+    getSegmentedWalCheckpointKey,
+    storedNamesNonQueueCheckpointShards
+} = require('./walSnapshotStore')
 
 function requireCoordinatorQueueWalCapability(groupName = '', capabilities = {}, name = '') {
     const capability = capabilities?.[name]
@@ -459,9 +465,25 @@ function createCoordinatorQueueWalStore(capabilities = {}) {
         }
     }
 
+    // The queue-only fallback guard (27 Oct). normalizeCoordinatorQueueWalStore builds a queue-only checkpoint when the store is missing, and
+    // the caller writes that checkpoint over the disk meta and manifests. It must not be built while the disk names a completed or runs
+    // shard, because the write would orphan those shards. The disk is read here (readDisk is the caller's storage read), not the resident
+    // copy, since the resident store is the thing that is missing. Returns 'missing-wal' (the reason the checkpoint switch already gives for a
+    // missing store) when the fallback is refused, or null when it may go ahead. A read that throws propagates, so the write does not go ahead.
+    async function refuseQueueOnlyCheckpointFallback(readDisk) {
+        const disk = await readDisk({
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_A)]: null,
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_B)]: null
+        }, {metricPath: 'coordinatorAuthority.queueWal.queueOnlyFallbackGuard'})
+        if(!storedNamesNonQueueCheckpointShards(disk, COORDINATOR_QUEUE_WAL_KEY)) return null
+        incrementQueueWakeupMetric('coordinatorAuthority.queueWal.queueOnlyCheckpointRefused')
+        return 'missing-wal'
+    }
+
     return {
         shouldUseCoordinatorQueueWalBackend,
         normalizeCoordinatorQueueWalStore,
+        refuseQueueOnlyCheckpointFallback,
         isCoordinatorQueueWalPhysicalStorageKey,
         getCoordinatorQueueWalPhysicalStoredPayload,
         getCoordinatorQueueWalStorageDefaults,

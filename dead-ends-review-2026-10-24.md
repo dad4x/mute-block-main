@@ -2,6 +2,27 @@
 
 Status (25 Oct): owner decisions are recorded below with their plans. Nothing is built or committed. Four working-tree files were changed by an unrequested edit of mine. The owner has said keep them (25 Oct). Another session is editing the same tree (see "Working tree"). This note is the only file written for this review.
 
+## Status update (27 Oct, checked against the code)
+
+The findings table and the owner decisions below are the 25 Oct record. Their status as of 27 Oct:
+
+| # | 27 Oct status |
+|---|---------------|
+| 1 | Recovery B is not parked. It is Recovery A, built (session copy, used only when the disk checkpoint is torn). The 25 Oct worker-side copy is not in the code. |
+| 2 | Built (commit `8d08054`). The bucket writer, the gap watch and the runs part of the startup migration are not in `shared/js`. The dev tools in `tools/cdp` that read run buckets were not re-checked. |
+| 3 | Built (commit `8e146cc`). The progress shadow, the coordinator-authority shadow, the deep-pending compare, the runs gap watch and the store-size sampler are not in `shared/js`. The suffix counter stays. |
+| 4 | Open. No change. |
+| 5 | Session mirror reduced to the queue's shards and WAL (built 27 Oct). The 26 Oct figure (8,880,912 bytes) predates it. The live measurement is still open. |
+| 6 | Partly built: the shadow checks, the gap watch and the store-size sampler are gone. Other counters and events remain. |
+| 7 | Partly built: the space-map layout migration is gone. Still in code: `repairProfileProgressProjection`, `cleanupRetiredCoordinatorQueueWalPhysicalKeys`, the legacy queue-view and content-index cleanup, and the legacy slug shadow cut in `subject.js`. |
+| 8 | The erase keep set holds one key (the 1.5 import marker, 27 Oct). `EXECUTOR_CLASSIFY_BACKSTOP_MS` and `ORPHAN_SURFACE_TAB_GRACE_MS` are in `tunables.js`. `lastSpaceFeedRenderModel` is read now, so it is no longer write-only. |
+| 9 | Open. Not changed. |
+| 10 | Open. Not checked on 27 Oct. |
+| 11 | Open. Not checked on 27 Oct. |
+| 12 | Open. Not checked on 27 Oct. |
+| 13 | Open. No test run or build on 27 Oct. |
+| 14 | Partly: `PROFILE_NUKE_PROGRESS_SHARD_COUNT` is in `storageKeys.js`; `SPACE_MAP_BUCKET_COUNT` went with the space post maps; the two constants named in item 8 are in `tunables.js`. Not re-audited. |
+
 ## Findings summary (25 Oct)
 
 Fourteen findings from the 17 commits (8b245a1 to b20be9e), the working tree and the magic-number audit (Appendix C). Details are in the sections below.

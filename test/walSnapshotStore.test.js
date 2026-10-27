@@ -4,6 +4,8 @@ const zlib = require('node:zlib')
 const {
     CHECKPOINT_A,
     CHECKPOINT_B,
+    checkpointAreaShardId,
+    getSegmentedWalCheckpointShardKey,
     activateCheckpoint,
     applyWalRecord,
     appendWalRecordsToGeneration,
@@ -1189,17 +1191,130 @@ test('corrupted compressed inactive checkpoint does not flip active pointer', ()
     assert.equal(activated.store.meta.activeCheckpoint, CHECKPOINT_A)
 })
 
-test('the queue namespace mirror keys include the outlier list key, after the runs key and before the progress keys', () => {
+test('the queue namespace mirror keys include the outlier list key and the progress keys, and no runs key (runs are log records)', () => {
     const {queueNamespaceMirrorKeys} = require('../shared/js/walSnapshotStore')
     assert.deepEqual(
-        queueNamespaceMirrorKeys({runsKey: 'runs', outliersKey: 'outliers', progressDefaults: {progressView: null, progressShard0: null}}),
-        ['runs', 'outliers', 'progressView', 'progressShard0']
+        queueNamespaceMirrorKeys({outliersKey: 'outliers', progressDefaults: {progressView: null, progressShard0: null}}),
+        ['outliers', 'progressView', 'progressShard0']
     )
     assert.deepEqual(
-        queueNamespaceMirrorKeys({runsKey: 'runs', progressDefaults: {progressView: null}}),
-        ['runs', 'progressView'],
+        queueNamespaceMirrorKeys({progressDefaults: {progressView: null}}),
+        ['progressView'],
         'the outlier key is optional'
     )
+})
+
+// An area-v1 checkpoint (the arrival partition, as the queue writes it): each area's shards in its own namespace.
+const MIRROR_BASE = 'wal'
+function mirrorAreaShardOf(area, key, entry) {
+    return checkpointAreaShardId(area, entry.local)
+}
+function makeMirrorAreaV1Payload() {
+    const state = {
+        queue: {q: {local: 0}},
+        completed: {c: {local: 7}},
+        runs: {r: {local: 20000}}
+    }
+    const written = writeInactiveCheckpoint(makePairedCheckpointStore({}, {snapshotSeq: 0}), state, {
+        snapshotSeq: 1, snapshotEpoch: 1, createdAt: 1, shardOf: mirrorAreaShardOf
+    })
+    const activated = activateCheckpoint(written.store, written.checkpointId)
+    assert.equal(activated.activated, true, activated.reason)
+    const store = appendWalRecordsToGeneration(activated.store, [{
+        seq: 2, kind: 'map.patch', area: 'queue', key: 'q', patch: {status: 'active', tabId: 7}
+    }], {}).store
+    const payload = buildSegmentedWalStoragePayload(store, {baseKey: MIRROR_BASE, writeCheckpoints: true})
+    const slot = written.checkpointId
+    return {
+        payload,
+        slot,
+        meta: payload[getSegmentedWalMetaKey(MIRROR_BASE)],
+        manifest: payload[getSegmentedWalCheckpointKey(MIRROR_BASE, slot)],
+        queueShardKey: getSegmentedWalCheckpointShardKey(MIRROR_BASE, slot, 0),
+        completedShardKey: getSegmentedWalCheckpointShardKey(MIRROR_BASE, slot, checkpointAreaShardId('completed', 7)),
+        runsShardKey: getSegmentedWalCheckpointShardKey(MIRROR_BASE, slot, checkpointAreaShardId('runs', 20000))
+    }
+}
+
+test('the session mirror keys of an area-v1 checkpoint are the meta, the manifest, every segment and the queue shards only', () => {
+    const {getQueueMirrorKeys} = require('../shared/js/walSnapshotStore')
+    const fixture = makeMirrorAreaV1Payload()
+    assert.equal(fixture.manifest.shardLayout, 'area-v1')
+    const keys = getQueueMirrorKeys(fixture.meta, {baseKey: MIRROR_BASE, manifest: fixture.manifest})
+    const segmentKeys = Object.keys(fixture.payload).filter(key => key.startsWith(`${MIRROR_BASE}.segment.`))
+    assert.ok(segmentKeys.length > 0, 'the fixture has a committed segment')
+    assert.deepEqual([...keys].sort(), [
+        getSegmentedWalMetaKey(MIRROR_BASE),
+        getSegmentedWalCheckpointKey(MIRROR_BASE, fixture.slot),
+        fixture.queueShardKey,
+        ...segmentKeys
+    ].sort(), 'the mirror key set, with no completed or runs shard')
+    assert.ok(!keys.includes(fixture.completedShardKey), 'the completed shard is not a mirror key')
+    assert.ok(!keys.includes(fixture.runsShardKey), 'the runs shard is not a mirror key')
+})
+
+test('a mirror key set needs the active manifest, and a shared-layout manifest keeps every shard the meta names', () => {
+    const {getQueueMirrorKeys, getQueueMirrorSupersetKeys} = require('../shared/js/walSnapshotStore')
+    const fixture = makeMirrorAreaV1Payload()
+    assert.equal(getQueueMirrorKeys(fixture.meta, {baseKey: MIRROR_BASE}), null, 'no manifest, no key set')
+    // A hash-partition checkpoint has no area record: its shards are the shared layout, so the mirror keeps all of them, as before.
+    const hashWritten = writeInactiveCheckpoint(makePairedCheckpointStore({}, {snapshotSeq: 0}), {
+        queue: {q: {local: 0}}, completed: {c: {local: 7}}, runs: {}
+    }, {snapshotSeq: 1, snapshotEpoch: 1, createdAt: 1, shardCount: 4})
+    const hashActivated = activateCheckpoint(hashWritten.store, hashWritten.checkpointId)
+    assert.equal(hashActivated.activated, true, hashActivated.reason)
+    const hashPayload = buildSegmentedWalStoragePayload(hashActivated.store, {baseKey: MIRROR_BASE, writeCheckpoints: true})
+    const hashMeta = hashPayload[getSegmentedWalMetaKey(MIRROR_BASE)]
+    const hashManifest = hashPayload[getSegmentedWalCheckpointKey(MIRROR_BASE, hashWritten.checkpointId)]
+    assert.equal(hashManifest.shardLayout, undefined, 'a hash-partition manifest has no shard layout')
+    const hashShardKeys = getSegmentedWalCheckpointShardKeysForMetaFor(hashMeta, hashWritten.checkpointId)
+    const hashKeys = getQueueMirrorKeys(hashMeta, {baseKey: MIRROR_BASE, manifest: hashManifest})
+    for (const key of hashShardKeys) assert.ok(hashKeys.includes(key), `${key} is a shared-layout mirror key`)
+    assert.deepEqual(hashKeys.sort(), getQueueMirrorSupersetKeys(hashMeta, {baseKey: MIRROR_BASE}).sort())
+})
+
+function getSegmentedWalCheckpointShardKeysForMetaFor(meta, slot) {
+    const {getSegmentedWalCheckpointShardKeysForMeta} = require('../shared/js/walSnapshotStore')
+    return getSegmentedWalCheckpointShardKeysForMeta(meta, MIRROR_BASE, slot)
+}
+
+test('a mirror rebuild plan takes the queue shards from the stored manifest, and refuses a stored set with no manifest', () => {
+    const {planQueueMirrorRebuild, selectQueueMirrorRecords} = require('../shared/js/walSnapshotStore')
+    const fixture = makeMirrorAreaV1Payload()
+    const plan = planQueueMirrorRebuild(fixture.payload, fixture.meta, {baseKey: MIRROR_BASE})
+    assert.equal(plan.ok, true, plan.reason)
+    assert.ok(plan.records[fixture.queueShardKey], 'the queue shard is in the plan')
+    assert.equal(plan.records[fixture.completedShardKey], undefined, 'the completed shard is not in the plan')
+    assert.equal(plan.records[fixture.runsShardKey], undefined, 'the runs shard is not in the plan')
+    assert.deepEqual(selectQueueMirrorRecords(fixture.payload, fixture.meta, {baseKey: MIRROR_BASE}), plan.records)
+
+    const withoutManifest = {...fixture.payload}
+    delete withoutManifest[getSegmentedWalCheckpointKey(MIRROR_BASE, fixture.slot)]
+    const refused = planQueueMirrorRebuild(withoutManifest, fixture.meta, {baseKey: MIRROR_BASE})
+    assert.equal(refused.ok, false)
+    assert.equal(refused.reason, 'mirror-manifest-missing')
+
+    const missingQueueShard = {...fixture.payload}
+    delete missingQueueShard[fixture.queueShardKey]
+    const incomplete = planQueueMirrorRebuild(missingQueueShard, fixture.meta, {baseKey: MIRROR_BASE})
+    assert.equal(incomplete.ok, false)
+    assert.equal(incomplete.reason, 'mirror-keys-missing')
+    assert.deepEqual(incomplete.missingKeys, [fixture.queueShardKey])
+})
+
+test('the non-queue shard count names the completed and runs shard keys of either slot, and no other key', () => {
+    const {countNonQueueShardKeys} = require('../shared/js/walSnapshotStore')
+    const fixture = makeMirrorAreaV1Payload()
+    const otherSlot = fixture.slot === CHECKPOINT_A ? CHECKPOINT_B : CHECKPOINT_A
+    assert.equal(countNonQueueShardKeys([
+        getSegmentedWalMetaKey(MIRROR_BASE),
+        getSegmentedWalCheckpointKey(MIRROR_BASE, fixture.slot),
+        fixture.queueShardKey,
+        fixture.completedShardKey,
+        fixture.runsShardKey,
+        getSegmentedWalCheckpointShardKey(MIRROR_BASE, otherSlot, checkpointAreaShardId('completed', 1))
+    ], {baseKey: MIRROR_BASE}), 3)
+    assert.equal(countNonQueueShardKeys([fixture.queueShardKey], {baseKey: MIRROR_BASE}), 0)
 })
 
 test('raw and compressed checkpoint modes project to identical state', () => {
@@ -1223,3 +1338,47 @@ test('raw and compressed checkpoint modes project to identical state', () => {
         projectSnapshot(raw, records).state
     )
 })
+
+// The session restart helpers (architecture.md, section 4.8): the queue-area agreement of two manifests, the namespace of a shard key, and
+// the superset keys of the areas other than the queue's.
+{
+    const helpers = require('../shared/js/walSnapshotStore')
+    const areaManifest = (shardIds, areaHash, shardHashes = shardIds.map(id => `hash-${id}`)) => ({
+        shardLayout: 'area-v1',
+        areaShards: {queue: {shardIds, hash: areaHash}},
+        shards: shardIds.map((index, position) => ({index, shardStateHash: shardHashes[position]}))
+    })
+
+    test('two area-v1 manifests agree on the queue area when the queue hash, the shard ids and every queue shard hash match', () => {
+        const disk = areaManifest([0, 2], 'area-hash')
+        assert.equal(helpers.getQueueAreaDisagreement(areaManifest([0, 2], 'area-hash'), disk), '')
+        assert.equal(helpers.getQueueAreaDisagreement(areaManifest([0, 2], 'other-hash'), disk), 'queue-area-hash-differs')
+        assert.equal(helpers.getQueueAreaDisagreement(areaManifest([0, 2], 'area-hash', ['hash-0', 'other']), disk), 'queue-shard-hash-differs')
+        assert.equal(helpers.getQueueAreaDisagreement(areaManifest([0, 3], 'area-hash', ['hash-0', 'hash-2']), disk), 'queue-shard-ids-differ')
+        assert.equal(helpers.getQueueAreaDisagreement({shardLayout: 'sharded-v1', shards: []}, disk), 'layout-not-area-v1')
+        assert.equal(helpers.getQueueAreaDisagreement(disk, null), 'layout-not-area-v1')
+    })
+
+    test('two area-v1 manifests with no queue area agree, and one with a queue area and one without do not', () => {
+        const empty = {shardLayout: 'area-v1', areaShards: {}, shards: []}
+        assert.equal(helpers.getQueueAreaDisagreement(empty, {shardLayout: 'area-v1', shards: []}), '')
+        assert.equal(helpers.getQueueAreaDisagreement(empty, areaManifest([0], 'area-hash')), 'queue-area-differs')
+    })
+
+    test('a checkpoint shard key names its area namespace, and a key that is not a shard key names none', () => {
+        const base = 'wal'
+        assert.equal(helpers.getCheckpointShardKeyNamespace(helpers.getSegmentedWalCheckpointShardKey(base, 'A', 0), base), 0)
+        assert.equal(helpers.getCheckpointShardKeyNamespace(helpers.getSegmentedWalCheckpointShardKey(base, 'B', helpers.checkpointAreaShardId('completed', 3)), base), 1)
+        assert.equal(helpers.getCheckpointShardKeyNamespace(helpers.getSegmentedWalCheckpointShardKey(base, 'A', helpers.checkpointAreaShardId('runs', 1)), base), 2)
+        assert.equal(helpers.getCheckpointShardKeyNamespace(helpers.getSegmentedWalMetaKey(base), base), null)
+        assert.equal(helpers.getCheckpointShardKeyNamespace(helpers.getSegmentedWalSegmentKey(base, 'A', 0), base), null)
+    })
+
+    test('the superset keys of the completed and runs areas name no queue shard, and cover both of those areas for one slot', () => {
+        const keys = helpers.getNonQueueAreaShardSupersetKeys('wal', 'A', 2)
+        assert.equal(keys.length, 4)
+        assert.deepEqual(keys.map(key => helpers.getCheckpointShardKeyNamespace(key, 'wal')).sort(), [1, 1, 2, 2])
+        const all = helpers.getAreaShardSupersetKeys('wal', 'A', 2)
+        assert.ok(keys.every(key => all.includes(key)), 'each key is one the full superset names')
+    })
+}

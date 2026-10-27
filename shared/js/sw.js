@@ -3,7 +3,7 @@ const {gzipSync, gunzipSync} = require('fflate')
 const defaults = require('./defaults')
 const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
 const {runsChangeRecords, persistedRunFields, RUN_RETENTION_MAX_COUNT, RUN_SHARD_SPAN_MS} = require('./swRunsWal')
-const {keepOrStampRunShard, selectRunShardsToDrop, withoutRunShards, runAreaShardOf} = require('./swRunShards')
+const {keepOrStampRunShard, selectRunShardsToDrop, withoutRunShards, runAreaShardOf, runShardDropRecords} = require('./swRunShards')
 const {makeManualHistoryRow} = require('./swManualHistory')
 const {
     NUKED_POST_RETENTION_DAYS_KEY,
@@ -13,7 +13,8 @@ const {
     SPACE_REGISTRY_KEY,
     SPACE_SORT_CATEGORY,
     SPACE_SORT_KEY,
-    SPACE_SORT_NAME
+    SPACE_SORT_NAME,
+    normalizeSpaceCategory
 } = require('./spaceRegistry')
 const {
     PROFILE_NUKE_PROGRESS_VIEW_KEY,
@@ -47,13 +48,14 @@ const {
     COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY,
     ERASE_BLOCK_HISTORY_PENDING_KEY,
     ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY,
-    LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY
+    LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY,
+    SPACE_REGISTRY_IMPORT_MARKER_KEY
 } = require('./storageKeys')
 const PERSISTENT_FAILED_RETRY_ALARM_NAME = 'mb-persistent-failed-retry'
 const COORDINATOR_RESUME_ALARM_NAME = 'mb-coordinator-resume'
 const DEBUG_RESUME_LIMIT_ALARM_NAME = 'mb-debug-resume-limit'
 const COORDINATOR_RECONCILE_ALARM_NAME = 'mb-coordinator-reconcile'
-const {namespaceArea, prefixedName, namespaceChanges} = require('./storageNamespace')
+const {namespaceArea, prefixedName, readPlainLocalNames} = require('./storageNamespace')
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
     normalizeQuoraProfileHref: normalizeQuoraProfileUrl,
@@ -117,8 +119,6 @@ const {
     activateCheckpoint,
     applyWalRecord,
     buildSegmentedWalStoragePayload,
-    CHECKPOINT_A,
-    CHECKPOINT_B,
     createChromeLocalStorageAdapter,
     normalizeCheckpointId,
     normalizeCheckpointShardCount,
@@ -126,9 +126,14 @@ const {
     createSerializedStorageUpdateState,
     createStorageUpdateAccessors,
     getWalRecordsForGeneration,
-    getSegmentedWalCheckpointKey,
     getKeyedRowReadKeys,
+    checkpointAreaShardId,
     getQueueMirrorKeys,
+    getQueueMirrorSupersetKeys,
+    getStoredActiveManifest,
+    getSegmentedWalCheckpointKey,
+    CHECKPOINT_A,
+    CHECKPOINT_B,
     queueNamespaceMirrorKeys,
     queueNamespaceStampKey,
     queueNamespaceStampKeys,
@@ -136,17 +141,11 @@ const {
     getQueueWalSeqFingerprint,
     planQueueMirrorAppend,
     planQueueMirrorRebuild,
-    selectQueueMirrorRecords,
-    getSegmentedWalSegmentKey,
     projectKeyedRowFromStored,
-    planKeyedRowReads,
-    projectKeyedRows,
-    projectKeyedRowFromResidentStore,
     getSegmentedWalCommittedSegmentCount,
     getSegmentedWalMetaKey,
     findCheckpointManifestDisagreements,
     payloadHasCheckpointKeys,
-    hydrateSegmentedWalStore,
     isSegmentedWalStorageMeta,
     makePairedCheckpointStore,
     recoverProjectedState
@@ -169,6 +168,7 @@ const {makeQueueWalRowShardTail} = require('./swQueueWalRowShard')
 const {
     makeCompletedShardTail,
     completedAreaShardOf,
+    completedDropShardIds,
     selectCompletedShardsToPrune,
     withoutShards
 } = require('./swCompletedShards')
@@ -205,7 +205,6 @@ const {
 } = require('./swQueueMachineHandlers')
 const {
     FLIGHT_RECORDER_CAPACITY,
-    __testResetFlightRecorder,
     getFlightRecorder,
     getFlightRecorderEntriesWhere,
     getFlightRecorderSnapshot,
@@ -290,7 +289,8 @@ const {
     createCoordinatorProgressRules
 } = require('./swCoordinatorProgressRules')
 const {
-    createCoordinatorQueueView
+    createCoordinatorQueueView,
+    countDurationHistogramBuckets
 } = require('./swCoordinatorQueueView')
 const {
     createCoordinatorContentQueueIndex
@@ -759,7 +759,8 @@ const {
     ERASE_RELOAD_DELAY_MS,
     ORPHAN_SURFACE_TAB_GRACE_MS,
     QUEUE_WAL_SHARD_BYTES,
-    STORED_ERROR_TEXT_MAX_CHARS
+    STORED_ERROR_TEXT_MAX_CHARS,
+    HISTOGRAM_DURATION_EDGES_SEC
 } = require('./tunables')
 // The dashboard's outlier list (swCoordinatorOutliers.js): a running baseline, pushed by each finished row at its archive.
 const {
@@ -2413,6 +2414,19 @@ const coordinatorStorageAdapter = {
     remove: keys => getStorageWriteRefusal() || rawCoordinatorStorageAdapter.remove(keys),
     getBytesInUse: keys => rawCoordinatorStorageAdapter.getBytesInUse(keys)
 }
+// Owner decision 26 Oct: the queue-wakeup metrics and their dashboard view are held in session storage, never on disk. This adapter is
+// the session area of this layout, and a write is refused by the erase's close the same way a disk write is. With no session area, a
+// read and a write both fail: a failed read starts from empty metrics (loadQueueWakeupMetrics) and a failed write leaves them dirty.
+const sessionStorageAdapter = {
+    get: defaults => {
+        const area = namespaceArea(browser.storage.session)
+        return area ? area.get(defaults) : Promise.reject(new Error('session storage is unavailable'))
+    },
+    set: payload => {
+        const area = namespaceArea(browser.storage.session)
+        return getStorageWriteRefusal() || (area ? area.set(payload) : Promise.reject(new Error('session storage is unavailable')))
+    }
+}
 const storageUpdateState = createSerializedStorageUpdateState()
 // storageUpdateAccessors (sw.js decomposition mop-up slice, 2026-09) constructs
 // immediately after storageUpdateState -- its only hard dependency -- so that
@@ -2567,16 +2581,15 @@ async function metricStorageGet(defaults = {}, options = {}) {
 
 async function metricStorageSet(payload = {}, options = {}) {
     const storageContext = getActiveStorageContext()
+    // The raw legacy queue key is refused on every write, as persistCoordinator refuses it (the queue belongs to the WAL). Nothing
+    // writes it, so the refusal returns false and the write does not reach the adapter. The payload's other keys are refused with it.
     if(payload &&
         typeof payload === 'object' &&
-        Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY) &&
-        storageContext?.coordinatorAuthorityQueueMutationApplied === true &&
-        options.coordinatorAuthorityWrite !== true) {
-        incrementQueueWakeupMetric('coordinatorAuthority.postMutationQueueStorageSetRejected')
-        setActiveStorageMetricDetail('rejectedOperation', 'postAuthorityQueueStorageSet')
+        Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY)) {
+        incrementQueueWakeupMetric('coordinatorAuthority.rawQueueKeyStorageSetRejected')
+        setActiveStorageMetricDetail('rejectedOperation', 'rawQueueKeyStorageSet')
         return false
     }
-    payload = addContentPageStateProjectionPayload(payload)
     const keys = Object.keys(payload || {})
     if(!keys.length) return
     if(Object.prototype.hasOwnProperty.call(payload, COORDINATOR_PAUSED_KEY)) {
@@ -2609,8 +2622,10 @@ async function metricStorageSet(payload = {}, options = {}) {
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
         const diskPayload = options.namespaceStamps ? {...payload, ...options.namespaceStamps} : payload
+        // storageArea 'session' sends the write to session storage (the queue-wakeup metrics view, owner decision 26 Oct). Every other write is a disk write.
+        const writeAdapter = options.storageArea === 'session' ? sessionStorageAdapter : coordinatorStorageAdapter
         result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
-            ? coordinatorStorageAdapter.set(diskPayload)
+            ? writeAdapter.set(diskPayload)
             : true))
         if(result !== false) recordPhysicalWriteMetrics(payloadSummary.bytes)
         writeOutcome = 'saved'
@@ -5626,9 +5641,10 @@ const {
     decideFillQueuedTabsOnceOutcome
 } = fillQueuedTabsOnceDecisions
 
-// The persisted metrics blob and its view are ~300 KB, and they were written on every metric change, which
+// The metrics blob and its view are ~300 KB, and they were written on every metric change, which
 // contended with the queue's own storage traffic. At most one flush per interval now. A change inside the
-// interval leaves the metrics dirty, and the next change after it flushes them.
+// interval leaves the metrics dirty, and the next change after it flushes them. Both keys are held in session
+// storage, never on disk (owner decision 26 Oct), so the lifetime totals reset when the browser restarts.
 let queueWakeupMetricsLastFlushAt = 0
 
 function scheduleQueueWakeupMetricsFlush() {
@@ -5673,7 +5689,7 @@ async function flushQueueWakeupMetrics(options = {}) {
     queueWakeupMetricsDirty = false
     try {
         await promiseWithTimeout(
-            coordinatorStorageAdapter.set({
+            sessionStorageAdapter.set({
                 [QUEUE_WAKEUP_METRICS_KEY]: buildPersistedQueueWakeupMetrics(queueWakeupMetrics),
                 [QUEUE_WAKEUP_METRICS_VIEW_KEY]: buildQueueWakeupMetricsView(queueWakeupMetrics)
             }),
@@ -5688,8 +5704,9 @@ async function flushQueueWakeupMetrics(options = {}) {
 
 async function loadQueueWakeupMetrics() {
     try {
+        // Read from session storage only. A session read that finds nothing gives the in-memory empty record, as a fresh install does.
         const stored = await promiseWithTimeout(
-            coordinatorStorageAdapter.get({[QUEUE_WAKEUP_METRICS_KEY]: queueWakeupMetrics}),
+            sessionStorageAdapter.get({[QUEUE_WAKEUP_METRICS_KEY]: queueWakeupMetrics}),
             QUEUE_WAKEUP_METRICS_STORAGE_TIMEOUT_MS,
             'queue wakeup metrics load'
         )
@@ -5729,7 +5746,8 @@ async function refreshQueueWakeupMetricsViewForDashboard(reason = 'dashboard-ref
     await ensureQueueWakeupMetricsLoaded().catch(() => null)
     const view = buildQueueWakeupMetricsView(queueWakeupMetrics)
     await metricStorageSet({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: view}, {
-        metricPath: `metricsView.${normalizeStorageMetricPathName(reason)}`
+        metricPath: `metricsView.${normalizeStorageMetricPathName(reason)}`,
+        storageArea: 'session'
     }).catch(() => null)
     return {
         refreshed: true,
@@ -5959,8 +5977,6 @@ const profileNukeProgressShape = createProfileNukeProgress({
         PROFILE_NUKE_PROGRESS_SHARD_COUNT,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
-        COORDINATOR_QUEUE_KEY,
-        COORDINATOR_QUEUE_WAL_KEY,
         COORDINATOR_QUEUE_VIEW_KEY,
         COORDINATOR_CONTENT_QUEUE_INDEX_KEY,
         COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX,
@@ -5980,8 +5996,6 @@ const profileNukeProgressShape = createProfileNukeProgress({
         isTerminalProfileNukeRecord,
         getCoordinatorItemHref,
         normalizeProfileNukeProgressView,
-        normalizeCoordinatorMap,
-        makeCoordinatorQueueWalCheckpoint,
         buildCoordinatorQueueView,
         buildCoordinatorContentQueueIndex,
         buildCoordinatorContentQueueIndexShardPayload,
@@ -6006,19 +6020,18 @@ const {
     removeProfileNukeProgressViewRecords,
     removeProfileNukeProgressShardRecords,
     normalizeProfileNukeProgressShardRecords,
-    getProfileNukeProgressRecordsFromProjection,
-    addContentPageStateProjectionPayload
+    getProfileNukeProgressRecordsFromProjection
 } = profileNukeProgressShape
 
 // The progress layout: the view plus every shard (PROFILE_NUKE_PROGRESS_SHARD_COUNT shards, hashed per href). Progress is held in
 // session storage only (decision 31), under these keys. It is not part of the disk namespace below, so it has no disk token.
 const PROFILE_NUKE_PROGRESS_STORAGE_KEYS = Object.keys(getProfileNukeProgressProjectionDefaults([]))
 // The non-WAL queue namespace the session mirror holds beside the WAL keys (docs/queue-storage-layering.md, section 6, rule 7):
-// the runs key and the outlier list key. Every disk write of one of these keys goes through the write door (persistCoordinator).
-// The outlier list key's stamp and session copy come from the same door. The dashboard path reads it
+// the outlier list key only. Runs are log records, not a namespace key, so they are not mirrored (owner, 26 Oct).
+// Every disk write of the outlier list key goes through the write door (persistCoordinator).
+// Its stamp and session copy come from the same door. The dashboard path reads it
 // (readCoordinatorOutliersRecordFromStorage), not hydrate.
 const QUEUE_NAMESPACE_MIRROR_KEYS = queueNamespaceMirrorKeys({
-    runsKey: COORDINATOR_RUNS_KEY,
     outliersKey: COORDINATOR_OUTLIERS_KEY,
     progressDefaults: {}
 })
@@ -6370,22 +6383,44 @@ function sortCompletedWorkRowsNewestFirst(completedMap = {}, limit = 50) {
 // the rows of the completed log, whose terminal time is after the Clear All Stats cutoff. Terminal rows still in the live queue are not in the
 // log and are not counted. count is every such row. A row's duration is terminalAt - activeAt, counted only when activeAt > 0 and
 // terminalAt > activeAt, so durationCount and durationTotalMs cover those rows; the average is durationTotalMs / durationCount.
+// The duration histograms (owner, 26 Oct): the real-block and already-blocked rows among those with a duration, bucketed by the same duration.
+// The classes are the completed-row predicates from swCoordinatorQueueView.js. They are exact complements over succeeded rows, so a row is
+// counted in at most one class, and a row in neither is in neither histogram. The bucket edges are HISTOGRAM_DURATION_EDGES_SEC (tunables.js).
+function makeCompletedDurationHistogram(durationsMs = []) {
+    return {
+        counts: countDurationHistogramBuckets(durationsMs, HISTOGRAM_DURATION_EDGES_SEC),
+        sampleCount: durationsMs.length,
+        totalMs: durationsMs.reduce((total, duration) => total + duration, 0)
+    }
+}
+
 function summarizeCompletedWorkDurationsSince(completedMap = {}, clearedAt = 0) {
     const cutoff = Number.parseInt(clearedAt, 10) || 0
     let count = 0
     let durationCount = 0
     let durationTotalMs = 0
+    const realBlockDurationsMs = []
+    const alreadyBlockedDurationsMs = []
     for(const row of Object.values(completedMap || {})) {
         const terminalAt = Number.parseInt(row?.terminalAt, 10) || 0
         if(!(terminalAt > cutoff)) continue
         count += 1
         const activeAt = Number.parseInt(row?.activeAt, 10) || 0
         if(activeAt > 0 && terminalAt > activeAt) {
+            const duration = terminalAt - activeAt
             durationCount += 1
-            durationTotalMs += terminalAt - activeAt
+            durationTotalMs += duration
+            if(isCoordinatorActualBlockSuccess(row)) realBlockDurationsMs.push(duration)
+            else if(isCoordinatorAlreadyBlockedSuccess(row)) alreadyBlockedDurationsMs.push(duration)
         }
     }
-    return {count, durationCount, durationTotalMs}
+    return {
+        count,
+        durationCount,
+        durationTotalMs,
+        realBlockHistogram: makeCompletedDurationHistogram(realBlockDurationsMs),
+        alreadyBlockedHistogram: makeCompletedDurationHistogram(alreadyBlockedDurationsMs)
+    }
 }
 
 // Builds the dashboard snapshot from the authority's resident state (queue, runs, the paused flag and the completed map):
@@ -7406,9 +7441,13 @@ async function readCoordinatorSessionForHydrate() {
     if(!session) throw new Error('coordinator-authority-unavailable: session storage is not available for profile progress')
     let sessionRead = null
     try {
+        // Both slots' manifests ride in this read: the mirror's active manifest says which shards the session copy holds, and the second
+        // read asks for exactly those (readValidCoordinatorQueueMirrorFromSession). No await is added.
         sessionRead = await session.get({
             [COORDINATOR_QUEUE_WAL_META_KEY]: null,
             [COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY]: null,
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_A)]: null,
+            [getSegmentedWalCheckpointKey(COORDINATOR_QUEUE_WAL_KEY, CHECKPOINT_B)]: null,
             ...Object.fromEntries(PROFILE_NUKE_PROGRESS_STORAGE_KEYS.map(key => [key, null]))
         })
     }
@@ -7427,9 +7466,11 @@ async function readCoordinatorSessionForHydrate() {
 // candidate. hydrate uses a candidate only when the disk stamp of the key is the same token. The mirror is valid when its committed marker is set, no commit is pending, and the
 // marker matches the mirror meta. Disk is not read here. A null result means the caller reads the WAL from disk as before.
 // Why trusting the marker here is safe: a lost pending write can leave the marker at the previous commit, so the mirror can
-// look valid at a state that disk has already moved past. The hydrate path is safe because loadStoreFromStorage re-reads the
-// disk WAL meta and segments on every load, and that read overwrites these WAL keys before the store is used. Any caller that
-// uses this result without that re-read must compare the disk meta fingerprint with the marker's committed value first.
+// look valid at a state that disk has already moved past. The hydrate path is safe because loadStoreFromStorage reads the disk meta and
+// both manifests on every load, before it uses any copy. The copy's queue is used only when the queue-area manifests agree (the session
+// restart rule, decideSessionRestart in swQueueWalStore.js); otherwise the whole WAL is read from disk and that read overwrites the copy.
+// The disk tail the copy does not hold is always read from disk. Any caller that uses this result without that read must compare the disk
+// meta fingerprint with the marker's committed value first.
 // The mirror part of the hydrate read. Returns null when there is no valid mirror, or when its second read fails: the caller then
 // reads disk.
 async function readValidCoordinatorQueueMirrorFromSession(session, sessionRead) {
@@ -7444,11 +7485,24 @@ async function readValidCoordinatorQueueMirrorFromSession(session, sessionRead) 
         // Review F7: the outlier list is not read at startup, so neither its value nor its stamp is in this read.
         const hydrateNamespaceKeys = QUEUE_NAMESPACE_MIRROR_KEYS.filter(key => key !== COORDINATOR_OUTLIERS_KEY)
         const hydrateStampKeys = hydrateNamespaceKeys.map(key => getCoordinatorNamespaceStampKey(key))
+        // The keys the copy holds, as its own active manifest names them: the meta, the manifest, the queue's shards, and the segments.
+        // The completed and runs shards are not among them, so they are not read from the session.
+        const mirrorWalKeys = getQueueMirrorKeys(mirrorMeta, {
+            baseKey: COORDINATOR_QUEUE_WAL_KEY,
+            manifest: getStoredActiveManifest(sessionRead, mirrorMeta, COORDINATOR_QUEUE_WAL_KEY)
+        })
+        if(!mirrorWalKeys) return null
         const mirror = await session.get([
-            ...getQueueMirrorKeys(mirrorMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY}),
+            ...mirrorWalKeys,
             ...hydrateNamespaceKeys,
             ...hydrateStampKeys
         ])
+        // A copy that lacks one of its own keys is partial, and a partial copy would answer wrongly, so it is not used: the disk read
+        // supplies the whole WAL instead.
+        if(mirrorWalKeys.some(key => mirror[key] === undefined || mirror[key] === null)) {
+            incrementQueueWakeupMetric('coordinatorAuthority.queueWal.hydrateMirrorIncomplete')
+            return null
+        }
         const namespace = {}
         const stamps = {}
         for(const key of hydrateNamespaceKeys) {
@@ -7472,8 +7526,8 @@ async function readValidCoordinatorQueueMirrorFromSession(session, sessionRead) 
 }
 
 // The session mirror's copy of the given WAL keys, read in one session call (recovery A of the checkpoint binding, in
-// swQueueWalStore.js). Nothing is checked here: the caller uses a copy only when it agrees with the disk meta. Returns null
-// when there is no session area or the read fails, which the caller treats as no copy.
+// swQueueWalStore.js). Nothing is checked here: the caller reads it only when the disk checkpoint is torn, and uses it only when it
+// agrees with the disk meta and verifies. Returns null when there is no session area or the read fails, which the caller treats as no copy.
 async function readCoordinatorQueueWalCopyFromSessionMirror(keys = []) {
     const session = getCoordinatorQueueMirrorSessionArea()
     if(!session || !keys.length) return null
@@ -7555,8 +7609,9 @@ async function rebuildCoordinatorQueueMirrorFromDisk() {
     })
     const diskMeta = metaRead?.[COORDINATOR_QUEUE_WAL_META_KEY]
     if(!isSegmentedWalStorageMeta(diskMeta)) return false
+    // Every shard the meta names is read, and the write below takes the queue's only (planQueueMirrorRebuild, from the manifest read here).
     const readKeys = Object.fromEntries(
-        getQueueMirrorKeys(diskMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY}).map(key => [key, null])
+        getQueueMirrorSupersetKeys(diskMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY}).map(key => [key, null])
     )
     const stored = await metricStorageGet(readKeys, {metricPath: 'queueMirror.rebuild'})
     if(!isQueueMirrorFresh(stored?.[COORDINATOR_QUEUE_WAL_META_KEY], diskMeta)) {
@@ -7601,8 +7656,9 @@ async function rebuildCoordinatorQueueMirrorFromDisk() {
     // mirror does not are removed, so no retired segment lingers in the session area.
     const previous = await session.get({[COORDINATOR_QUEUE_WAL_META_KEY]: null})
     const previousMeta = previous?.[COORDINATOR_QUEUE_WAL_META_KEY]
+    // The superset, so a copy of either layout is retired (removing a key that is not there is harmless).
     const previousKeys = isSegmentedWalStorageMeta(previousMeta)
-        ? getQueueMirrorKeys(previousMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
+        ? getQueueMirrorSupersetKeys(previousMeta, {baseKey: COORDINATOR_QUEUE_WAL_KEY})
         : []
     const retired = previousKeys.filter(key => !Object.prototype.hasOwnProperty.call(plan.records, key))
     if(retired.length) await session.remove(retired)
@@ -8085,10 +8141,17 @@ async function persistCoordinatorAuthorityQueueWalMutation(result = {}, nextProj
         }
     }
 
+    const residentWal = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY]
     const storedWal = normalizeCoordinatorQueueWalStore(
-        nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY],
+        residentWal,
         result.previousProjectionQueue || {}
     )
+    // A missing store makes the normaliser build a queue-only checkpoint. That is refused, before any append, when the disk names a
+    // completed or runs shard (refuseQueueOnlyCheckpointFallback, swCoordinatorQueueWal.js). A valid store passes with no read.
+    if(storedWal !== residentWal) {
+        const refused = await coordinatorQueueWal.refuseQueueOnlyCheckpointFallback(metricStorageGet)
+        if(refused) return {saved: false, backend: 'queue-wal', reason: refused}
+    }
     const previousWalMeta = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
     const appendRecord = cloneCoordinatorAuthorityValue(record)
     delete appendRecord.id
@@ -8350,10 +8413,16 @@ async function persistCoordinatorAuthorityQueueWalBatchMutation(results = [], ne
         }
     }
 
+    const residentWal = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY]
     const storedWal = normalizeCoordinatorQueueWalStore(
-        nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_KEY],
+        residentWal,
         options.previousProjectionQueue || {}
     )
+    // The same guard as the single-row path above: a queue-only checkpoint is refused before any append when the disk names completed or runs shards.
+    if(storedWal !== residentWal) {
+        const refused = await coordinatorQueueWal.refuseQueueOnlyCheckpointFallback(metricStorageGet)
+        if(refused) return {saved: false, backend: 'queue-wal', reason: refused}
+    }
     const previousWalMeta = nextProjection?.stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || null
     const appendRecords = records.map(record => {
         const next = cloneCoordinatorAuthorityValue(record)
@@ -8609,7 +8678,9 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             codecName: COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC.name,
             shardCount: COORDINATOR_QUEUE_WAL_CHECKPOINT_SHARD_COUNT,
             // Steps 4 and 5: with the switch on, rows are partitioned by the shard they carry, not by key hash.
-            shardOf: queueWalCheckpointShardOf
+            shardOf: queueWalCheckpointShardOf,
+            // The pruned completed shards: each one's key is deleted in this slot (one delete per shard, no other shard rewritten).
+            dropShardIds: completedDropShardIds(completedPrune.drop)
         })
         const activated = activateCheckpoint(prepared.store, prepared.checkpointId, COORDINATOR_QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS)
         if(activated?.activated !== true) {
@@ -8975,9 +9046,12 @@ const queueWalRowShards = makeQueueWalRowShardTail({budgetBytes: QUEUE_WAL_SHARD
 // covers the queue and runs; the completed area uses its own completion shard.
 const completedWalShards = makeCompletedShardTail({budgetBytes: QUEUE_WAL_SHARD_BYTES, enabled: true})
 // The checkpoint's partition: runs by their time shard (swRunShards.js), the completed log by its completion shard, and the queue by its row shard.
+// Each area's local shard id goes into that area's namespace (walSnapshotStore.js checkpointAreaShardId), so the ids of different areas
+// cannot collide and a shard id names one area.
 function queueWalCheckpointShardOf(area = '', key = '', entry = null) {
-    if (area === 'runs') return runAreaShardOf(area, key, entry)
-    return area === 'completed' ? completedAreaShardOf(area, key, entry) : queueWalRowShards.shardOf(area, key, entry)
+    if (area === 'runs') return checkpointAreaShardId(area, runAreaShardOf(area, key, entry))
+    if (area === 'completed') return checkpointAreaShardId(area, completedAreaShardOf(area, key, entry))
+    return checkpointAreaShardId('queue', queueWalRowShards.shardOf(area, key, entry))
 }
 
 function createCoordinatorAuthority() {
@@ -9384,7 +9458,7 @@ function createCoordinatorAuthority() {
         if(!stored || !Object.prototype.hasOwnProperty.call(stored, COORDINATOR_RUNS_KEY)) return null
         const value = stored[COORDINATOR_RUNS_KEY]
         // Run shards (swRunShards.js): a new run takes the time shard of its creation. Then the retention drops the oldest whole time
-        // shards that no queue row refers to, by age (the completed log's retention) and then by the run cap, in this same write.
+        // shards that no queue row refers to, by the run cap, in this same write. Runs are not dropped by age (26 Oct).
         // Runs already in the log keep the shard they have.
         const runsIn = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
         const nowMs = Date.now()
@@ -9392,13 +9466,17 @@ function createCoordinatorAuthority() {
         // A run already in the resident map keeps the shard it has; a new run takes its time shard (keepOrStampRunShard).
         for (const [id, run] of Object.entries(runsIn)) stampedRuns[id] = keepOrStampRunShard(run, projection.runs?.[id], nowMs, RUN_SHARD_SPAN_MS)
         const referencedRunIds = new Set(Object.values(projection.queue || {}).map(row => row?.runId).filter(Boolean))
-        const retentionMs = recentHistoryRetentionDays * 24 * 60 * 60 * 1000
-        const drop = selectRunShardsToDrop(stampedRuns, {nowMs, retentionMs, maxRuns: RUN_RETENTION_MAX_COUNT, referencedRunIds})
+        const drop = selectRunShardsToDrop(stampedRuns, {maxRuns: RUN_RETENTION_MAX_COUNT, referencedRunIds})
         const runsAfter = withoutRunShards(stampedRuns, drop)
         const storedWithoutRuns = {...stored}
         delete storedWithoutRuns[COORDINATOR_RUNS_KEY]
+        // A dropped shard is one map.dropShard record. The runs of the dropped shards are left out of the "before" side, so the
+        // per-run diff does not add a map.remove for each of them.
         return {
-            records: runsChangeRecords(projection.runs || {}, runsAfter),
+            records: [
+                ...runShardDropRecords(drop),
+                ...runsChangeRecords(withoutRunShards(projection.runs || {}, drop), runsAfter)
+            ],
             runsAfter,
             storedWithoutRuns
         }
@@ -10273,6 +10351,18 @@ function getHydratedCoordinatorAuthorityState(metricName = '') {
 }
 
 
+// The restart counters of one accepted hydrate (architecture.md, section 4.8). The loader fills the report; this counts it after recovery,
+// so "applied" means the record was applied, not only read. A disk tail record that recovery ignored (already in the checkpoint, or a
+// duplicate) is not counted as applied.
+function recordRestartSourceMetrics(report = {}, appliedRecords = []) {
+    if(report.queueSource === 'session') incrementQueueWakeupMetric('coordinatorAuthority.queueWal.restartUsedSessionQueue')
+    if(report.queueSource === 'disk') incrementQueueWakeupMetric('coordinatorAuthority.queueWal.restartQueueShardsReadFromDisk')
+    if(report.tailRecordCount) incrementQueueWakeupMetric('coordinatorAuthority.queueWal.restartTailRecordsRead', report.tailRecordCount)
+    if(!report.tailIds) return
+    const appliedTail = appliedRecords.filter(record => report.tailIds.has(`${record?.id ?? ''}`.trim())).length
+    if(appliedTail) incrementQueueWakeupMetric('coordinatorAuthority.queueWal.restartTailRecordsApplied', appliedTail)
+}
+
 // THE decode of the coordinator state (P3). Only hydrate calls this. It reads the WAL keys (a valid session mirror when there
 // is one, else disk) and the coordinator keys the resident authority holds, in one storage read, decodes the WAL once, and
 // returns the complete state: the queue, runs, events, the stored keys, the progress and the completed-work map. A WAL that
@@ -10297,7 +10387,9 @@ async function loadCoordinatorCurrentAuthorityState() {
             [COORDINATOR_PAUSED_KEY]: false,
             [COORDINATOR_PAUSE_GENERATION_KEY]: 0,
             // The erase marker rides in this read, so the common start adds no await (the hydrate tick counts depend on it).
-            [ERASE_BLOCK_HISTORY_PENDING_KEY]: false
+            [ERASE_BLOCK_HISTORY_PENDING_KEY]: false,
+            // The space import marker (27 Oct) rides in this read too. It is taken out of stored below, as it is not coordinator state.
+            [SPACE_REGISTRY_IMPORT_MARKER_KEY]: null
         }, {
             metricPath: 'authority.hydrate'
         })
@@ -10305,6 +10397,15 @@ async function loadCoordinatorCurrentAuthorityState() {
         if(stored[ERASE_BLOCK_HISTORY_PENDING_KEY] === true) {
             await runPendingBlockHistoryErase()
             return loadCoordinatorCurrentAuthorityState()
+        }
+        // The one-time import of the 1.5 spaces (importSpaceRegistryFromVersion15) runs in the background while the marker is absent. It is
+        // not awaited: its write awaits the storage change listeners, and those wait for this hydrate to finish, so an awaited write here
+        // would never settle. It never throws: a failed read or write leaves no marker and the next start retries. With no layout prefix
+        // the plain name is this layout's own key, so there is no separate 1.5 key (the test harness runs unprefixed).
+        const spaceRegistryImportMarker = stored[SPACE_REGISTRY_IMPORT_MARKER_KEY]
+        delete stored[SPACE_REGISTRY_IMPORT_MARKER_KEY]
+        if(!spaceRegistryImportMarker && prefixedName(SPACE_REGISTRY_KEY) !== SPACE_REGISTRY_KEY) {
+            void importSpaceRegistryFromVersion15().catch(() => null)
         }
         // The stamps are not coordinator state, so they are removed from stored once read. A key is confirmed when its disk
         // stamp is the session stamp it was mirrored with.
@@ -10324,8 +10425,14 @@ async function loadCoordinatorCurrentAuthorityState() {
         const progressDefaults = getProfileNukeProgressProjectionDefaults([])
         for(const key of PROFILE_NUKE_PROGRESS_STORAGE_KEYS) stored[key] = hydrateSession.progress[key] ?? progressDefaults[key]
         const queueSnapshot = {}
+        // The restart report: where the loader took the queue from (the session copy, or disk), why the copy was refused, and the sequence
+        // numbers of the disk tail it read. Counted below, once recovery has applied the records (architecture.md, section 4.8).
+        const restartReport = {queueSource: '', tailIds: null, tailRecordCount: 0}
         const walStore = await loadCoordinatorQueueWalProjection(stored, queueSnapshot, {
-            metricPath: 'authority.hydrate.segments'
+            metricPath: 'authority.hydrate.segments',
+            // A mirror hydrate counts the completed and runs shards it reads from disk (queueMirror.hydrateCompletedRunsDiskRead).
+            fromMirror: Boolean(mirror),
+            restartReport
         })
         const recovery = runQueueWakeupMetricPhase('recoverQueueWal', () => recoverCoordinatorQueueFromWal(
             queueSnapshot,
@@ -10336,6 +10443,7 @@ async function loadCoordinatorCurrentAuthorityState() {
             error.walDecodeFailed = true
             throw error
         }
+        recordRestartSourceMetrics(restartReport, recovery.wal?.projected?.applied || [])
         const queue = recovery.queue
         const completed = normalizeCoordinatorMap(recovery.wal?.projected?.state?.completed || {})
         recordActiveStorageWorkSnapshot(queue)
@@ -21382,8 +21490,9 @@ async function clearCoordinatorEventsRequested() {
 // the flight recorder, so none of them is written back over the erase. The erase pauses the queue first (owner, 24 Oct), and is refused if a row is
 // still active after that, so no tab is mid-action. Not for routine use: after it the queue has no record of any profile blocked, and will act on them again.
 const ERASE_BLOCK_HISTORY_CONFIRMATION = 'ERASE'
-// Nothing is kept: a clean slate. The marker is the one key the erase itself handles, and it is removed last.
-const ERASE_BLOCK_HISTORY_KEEP_KEYS = new Set()
+// Owner, 27 Oct: the one-time space import marker is kept, so a restart after an erase does not import the 1.5 spaces again. Nothing else is
+// kept: the rest is a clean slate. The pending erase marker is the one key the erase itself handles, and it is removed last.
+const ERASE_BLOCK_HISTORY_KEEP_KEYS = new Set([SPACE_REGISTRY_IMPORT_MARKER_KEY])
 
 async function eraseBlockHistoryRequested(request = {}) {
     if(request?.confirmation !== ERASE_BLOCK_HISTORY_CONFIRMATION) return {erased: false, reason: 'confirmation-mismatch'}
@@ -21407,9 +21516,19 @@ async function eraseBlockHistoryRequested(request = {}) {
         // Everything is cleared here, then the extension reloads, so the new worker starts with no stored history for its modules to load
         // and write back. Clearing at startup instead left the progress records in session storage: the modules had read them first.
         const stored = await coordinatorStorageAdapter.get(null)
-        const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY)
+        const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY && !ERASE_BLOCK_HISTORY_KEEP_KEYS.has(key))
         if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
+        // The 1.5 space registry is under its plain name, outside this layout's prefix, so the erase removes that name too (owner, 27 Oct).
+        // A failed remove is counted and the erase goes on.
+        let plainRemoveFailed = 0
+        try {
+            await require('./storageNamespace').removePlainLocalNames(browser, [SPACE_REGISTRY_KEY])
+        }
+        catch {
+            plainRemoveFailed = 1
+        }
         await namespaceArea(browser.storage.session)?.clear?.()
+        if(plainRemoveFailed) incrementQueueWakeupMetric('eraseBlockHistory.plainRemoveFailed')
         // The writes close here. The queue runs the next update straight away, and that update would write the resident WAL and queue back
         // over the cleared storage unless it is refused. The reload ends the worker, and with it that memory.
         storageWritesClosedByErase = true
@@ -21417,7 +21536,7 @@ async function eraseBlockHistoryRequested(request = {}) {
             if(typeof browser.runtime.reload === 'function') browser.runtime.reload()
             else console.warn('erase: browser.runtime.reload is not a function, so the worker keeps running after the erase')
         }, ERASE_RELOAD_DELAY_MS)
-        return {scheduled: true, removedCount: removeKeys.length}
+        return {scheduled: true, removedCount: removeKeys.length, plainRemoveFailed}
     })
 }
 
@@ -21429,7 +21548,16 @@ async function runPendingBlockHistoryErase() {
     const stored = await coordinatorStorageAdapter.get(null)
     const removeKeys = Object.keys(stored).filter(key => key !== ERASE_BLOCK_HISTORY_PENDING_KEY && !ERASE_BLOCK_HISTORY_KEEP_KEYS.has(key))
     if(removeKeys.length) await coordinatorStorageAdapter.remove(removeKeys)
+    // The 1.5 space registry under its plain name goes here too (owner, 27 Oct). A failed remove is counted, and the erase goes on.
+    let plainRemoveFailed = 0
+    try {
+        await require('./storageNamespace').removePlainLocalNames(browser, [SPACE_REGISTRY_KEY])
+    }
+    catch {
+        plainRemoveFailed = 1
+    }
     await namespaceArea(browser.storage.session)?.clear?.()
+    if(plainRemoveFailed) incrementQueueWakeupMetric('eraseBlockHistory.plainRemoveFailed')
     // The erase generation lives in session storage, so the worker can say which erase it has finished.
     const eraseGeneration = Date.now()
     void namespaceArea(browser.storage.session)?.set?.({[ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY]: eraseGeneration}).catch(() => {})
@@ -21439,7 +21567,7 @@ async function runPendingBlockHistoryErase() {
     for(const tab of quoraTabs) void browser.tabs.reload(tab.id).catch(() => null)
     await coordinatorStorageAdapter.remove(ERASE_BLOCK_HISTORY_PENDING_KEY)
     incrementQueueWakeupMetric('eraseBlockHistory.ran')
-    return {ran: true, removedCount: removeKeys.length, reloadedTabs: quoraTabs.length, eraseGeneration}
+    return {ran: true, removedCount: removeKeys.length, reloadedTabs: quoraTabs.length, eraseGeneration, plainRemoveFailed}
 }
 
 // Content-script and popup requests for the space nuked-post keys (docs/queue-storage-layering.md, section 6, rule 2).
@@ -23981,10 +24109,7 @@ async function enqueueCoordinatorItemsStorageLocked(request = {}) {
             sourceSettledAt: resetExisting ? 0 : existing?.sourceSettledAt || 0,
             sourceSettlementKey: resetExisting ? '' : existing?.sourceSettlementKey || '',
             sourceSettlementOutcome: resetExisting ? '' : existing?.sourceSettlementOutcome || '',
-            milestones: resetExisting ? makeEmptyCoordinatorMilestones() : existing?.milestones || makeEmptyCoordinatorMilestones(),
-            // Provenance for later shared moderation (nothing decides on it). Set only when the row is created: an existing row keeps
-            // what it has (old rows have none), so no later write changes it, and it is not part of any dedupe key. A manual row has none.
-            ...(!existing && `${rawItem?.sourcePostKey || ''}`.trim() ? {sourcePostKey: `${rawItem.sourcePostKey}`.trim()} : {})
+            milestones: resetExisting ? makeEmptyCoordinatorMilestones() : existing?.milestones || makeEmptyCoordinatorMilestones()
         }, {
             runInput,
             source: itemSource,
@@ -35444,6 +35569,73 @@ registerServiceWorkerListeners({
 const VERSION_15_RETIRED_STORAGE_KEYS = ['mbCoordinatorQueue', 'mbProfileNukeProgress']
 function retireUnusedVersion15StorageKeys() {
     return metricStorageRemove(VERSION_15_RETIRED_STORAGE_KEYS, {phase: 'retireVersion15StorageKeys'})
+}
+
+// One-time import of the 1.5 space classifications (owner, 27 Oct). Version 1.5 kept them under the plain key mbSpaceRegistry. This layout
+// never reads a plain name (storageNamespace.js), so that one value is read with a raw read. The 1.5 value has the same shape as the 1.6
+// registry (spaceRegistry.js): a map from the space key to a record whose category is asset, neutral or target. A space the 1.6 registry
+// already has keeps its 1.6 record. The imported records and the marker go in ONE write through the storage door, so the marker exists
+// only together with the import. A failed read or write writes no marker, and the next start retries. The erase keeps this marker
+// (ERASE_BLOCK_HISTORY_KEEP_KEYS) and removes the plain 1.5 key with the prefixed keys, so an erase does not bring the 1.5 spaces back
+// (owner, 27 Oct). The function never throws. Outcomes are counted under spaceRegistryImport.*.
+async function importSpaceRegistryFromVersion15() {
+    let legacy = null
+    try {
+        legacy = (await readPlainLocalNames(browser, [SPACE_REGISTRY_KEY]))[SPACE_REGISTRY_KEY]
+    }
+    catch {
+        incrementQueueWakeupMetric('spaceRegistryImport.legacyReadFailed')
+        return {outcome: 'legacy-read-failed'}
+    }
+    // An absent or non-object 1.5 value holds no spaces: the marker is still written, and nothing else is.
+    const legacyEntries = legacy && typeof legacy === 'object' && !Array.isArray(legacy) ? legacy : {}
+    let current = {}
+    const imported = {}
+    let kept = 0
+    let invalid = 0
+    if(Object.keys(legacyEntries).length) {
+        try {
+            const value = (await metricStorageGet({[SPACE_REGISTRY_KEY]: {}}, {metricPath: 'spaceRegistryImport.read'}))?.[SPACE_REGISTRY_KEY]
+            current = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+        }
+        catch {
+            incrementQueueWakeupMetric('spaceRegistryImport.readFailed')
+            return {outcome: 'registry-read-failed'}
+        }
+        for(const [spaceKey, record] of Object.entries(legacyEntries)) {
+            const valid = Boolean(spaceKey) && Boolean(record) && typeof record === 'object' &&
+                Boolean(normalizeSpaceCategory(record.category)) && typeof record.url === 'string'
+            if(!valid) {
+                invalid += 1
+                continue
+            }
+            if(Object.prototype.hasOwnProperty.call(current, spaceKey)) {
+                kept += 1
+                continue
+            }
+            imported[spaceKey] = record
+        }
+    }
+    const importedCount = Object.keys(imported).length
+    const markerValue = {version: 1, completedAt: Date.now(), imported: importedCount, kept, invalid}
+    const payload = importedCount
+        ? {[SPACE_REGISTRY_KEY]: {...current, ...imported}, [SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
+        : {[SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
+    try {
+        const written = await metricStorageSet(payload, {metricPath: 'spaceRegistryImport.write', phase: 'spaceRegistryImport.write'})
+        if(written === false) {
+            incrementQueueWakeupMetric('spaceRegistryImport.writeRefused')
+            return {outcome: 'write-refused'}
+        }
+    }
+    catch {
+        incrementQueueWakeupMetric('spaceRegistryImport.writeFailed')
+        return {outcome: 'write-failed'}
+    }
+    if(importedCount) incrementQueueWakeupMetric('spaceRegistryImport.spacesImported', importedCount)
+    if(kept) incrementQueueWakeupMetric('spaceRegistryImport.spacesKeptFrom16', kept)
+    if(invalid) incrementQueueWakeupMetric('spaceRegistryImport.invalidSkipped', invalid)
+    return {outcome: 'imported', imported: importedCount, kept, invalid}
 }
 
 // The build that last ran against this storage (STORAGE_BUILD_KEY, the running manifest version, e.g. 1.6.1626). It is read at

@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
+
 const {
     evaluate,
     getCdpConfig,
@@ -83,7 +88,7 @@ runMain(async () => {
     }})()`, 15000)
 
     const progressRecords = await readProfileNukeProgressFromWorker(config)
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${function enqueueVisibleProfileSearch(visible, limit, maxConcurrent, noForegroundFallback, progress) {
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${function enqueueVisibleProfileSearch(visible, limit, maxConcurrent, noForegroundFallback, progress, queueKey) {
         const sendMessage = message => new Promise(resolve => {
             let settled = false
             const finish = value => {
@@ -106,8 +111,8 @@ runMain(async () => {
             sourceLabel: visible?.sourceLabel || visible?.title || ''
         }
 
-        return chrome.storage.local.get({mbCoordinatorQueue: {}}).then(async stored => {
-            const queue = stored.mbCoordinatorQueue || {}
+        return chrome.storage.local.get({[queueKey]: {}}).then(async stored => {
+            const queue = stored[queueKey] || {}
             const selected = unique.filter(href => {
                 const row = queue[href]
                 const record = progress[href]
@@ -158,7 +163,7 @@ runMain(async () => {
                 response
             }
         })
-    }})( ${JSON.stringify(visible)}, ${JSON.stringify(limit)}, ${JSON.stringify(maxConcurrent)}, ${JSON.stringify(noForegroundFallback)}, ${JSON.stringify(progressRecords)} )`, 30000)
+    }})( ${JSON.stringify(visible)}, ${JSON.stringify(limit)}, ${JSON.stringify(maxConcurrent)}, ${JSON.stringify(noForegroundFallback)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(QUEUE_STORED_KEY)} )`, 30000)
 
     console.log(JSON.stringify({
         target: target ? {id: target.id, title: target.title || '', url: target.url || ''} : null,

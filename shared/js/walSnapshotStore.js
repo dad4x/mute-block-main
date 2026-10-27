@@ -21,6 +21,13 @@ const GZIP_SNAPSHOT_CODEC = 'gzip'
 const BASE64_ENCODING = 'base64'
 const SEGMENTED_WAL_STORAGE_VERSION = 1
 const CHECKPOINT_SHARD_FORMAT = 'sharded-v1'
+// Area layout (manifest field shardLayout). Each shard holds the entries of one area only, and its id is the area's namespace times the
+// stride plus the area's local id, so a shard id names one area and no two areas share an id. The queue is namespace 0, so its ids are
+// its local ids, the same keys the shared layout already wrote for it. Manifests without shardLayout are the shared layout and are read
+// as they were written. The namespace table is the one place that names the areas that have shard namespaces.
+const CHECKPOINT_SHARD_LAYOUT_AREA = 'area-v1'
+const CHECKPOINT_AREA_SHARD_STRIDE = 1000000000
+const CHECKPOINT_AREA_NAMESPACES = Object.freeze({queue: 0, completed: 1, runs: 2})
 // Declared once, in storageKeys.js (it sets the stored checkpoint shard keys).
 const {CHECKPOINT_SHARD_DEFAULT_COUNT} = require('./storageKeys')
 
@@ -197,6 +204,89 @@ function getCheckpointShardIndex(key = '', shardCount = CHECKPOINT_SHARD_DEFAULT
     return Number.parseInt(hashString(`${key}`), 16) % shardCount
 }
 
+// The shard id of one area's local shard id (area-v1). Throws for an area with no namespace or a local id out of range, so a bad id
+// cannot reach a manifest.
+function checkpointAreaShardId(area = '', localId = 0) {
+    const namespace = CHECKPOINT_AREA_NAMESPACES[area]
+    if (!Number.isInteger(namespace)) throw new Error(`checkpointAreaShardId: area ${area} has no shard namespace`)
+    const local = Number.parseInt(localId, 10)
+    if (!Number.isInteger(local) || local < 0 || local >= CHECKPOINT_AREA_SHARD_STRIDE) {
+        throw new Error(`checkpointAreaShardId: local shard id ${localId} is out of range for ${area}`)
+    }
+    return namespace * CHECKPOINT_AREA_SHARD_STRIDE + local
+}
+
+function checkpointShardNamespace(shardId = 0) {
+    return Math.floor(Number.parseInt(shardId, 10) / CHECKPOINT_AREA_SHARD_STRIDE)
+}
+
+// The areas a shard state holds: its map areas with at least one entry. A value area (a list or a scalar) is not an area of a shard.
+function checkpointShardStateAreas(shardState = {}) {
+    return Object.keys(shardState || {}).filter(area => isCheckpointMapArea(shardState[area]) && Object.keys(shardState[area]).length > 0)
+}
+
+// The exact input of one area's hash (area-v1): the area's name, then its shard ids in ascending order, each with its shard's content
+// hash. The hash of an area is hashString of this text. A shard that holds no entries of the area is not in its input.
+function checkpointAreaHashInput(area = '', shards = []) {
+    const ordered = (shards || [])
+        .map(shard => [Number.parseInt(shard.index, 10), `${shard.shardStateHash}`])
+        .sort((left, right) => left[0] - right[0])
+    return stableStringify({area: `${area}`, shards: ordered})
+}
+
+function hashCheckpointArea(area = '', shards = []) {
+    return hashString(checkpointAreaHashInput(area, shards))
+}
+
+// The per-area record of a sharded checkpoint, from its shards: one entry per area that has entries, with the area's shard ids and its
+// hash. entries are {index, shardStateHash, state}. A shard that holds one area is listed under that area only.
+function buildCheckpointAreaShards(entries = []) {
+    const byArea = new Map()
+    for (const entry of entries || []) {
+        for (const area of checkpointShardStateAreas(entry?.state)) {
+            if (!byArea.has(area)) byArea.set(area, [])
+            byArea.get(area).push({index: Number.parseInt(entry.index, 10), shardStateHash: entry.shardStateHash})
+        }
+    }
+    const areaShards = {}
+    for (const [area, shards] of byArea) {
+        shards.sort((left, right) => left.index - right.index)
+        areaShards[area] = {
+            shardIds: shards.map(shard => shard.index),
+            hash: hashCheckpointArea(area, shards)
+        }
+    }
+    return areaShards
+}
+
+// The shard ids a checkpoint slot holds, as the metadata records them. A slot with the default range (0 to count - 1), or one written
+// before the ids were recorded, reads as that range.
+function getMetaCheckpointShardIds(meta = {}, checkpointId = CHECKPOINT_A) {
+    const record = meta?.checkpoints?.[normalizeCheckpointId(checkpointId)] || null
+    const count = normalizeCheckpointShardCount(record?.shardCount)
+    if (Array.isArray(record?.shardIds) && record.shardIds.length === count) {
+        return record.shardIds.map(id => Number.parseInt(id, 10))
+    }
+    return Array.from({length: count}, (_, index) => index)
+}
+
+function getSegmentedWalCheckpointShardKeysForMeta(meta = {}, baseKey = 'wal', checkpointId = CHECKPOINT_A) {
+    return getMetaCheckpointShardIds(meta, checkpointId)
+        .map(index => getSegmentedWalCheckpointShardKey(baseKey, checkpointId, index))
+}
+
+// The shard keys a read may name before any manifest is read: the range 0 to count - 1 in each area's namespace. A shard outside
+// the range is named by the manifest, and the hydrate read fetches it then (getArrivalShardKeysMissingFromStored).
+function getAreaShardSupersetKeys(baseKey = 'wal', checkpointId = CHECKPOINT_A, count = CHECKPOINT_SHARD_DEFAULT_COUNT) {
+    const keys = []
+    for (const area of Object.keys(CHECKPOINT_AREA_NAMESPACES)) {
+        for (let local = 0; local < normalizeCheckpointShardCount(count); local += 1) {
+            keys.push(getSegmentedWalCheckpointShardKey(baseKey, checkpointId, checkpointAreaShardId(area, local)))
+        }
+    }
+    return keys
+}
+
 function isCheckpointMapArea(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value)
 }
@@ -226,6 +316,7 @@ function partitionCheckpointState(state = {}, shardCount = CHECKPOINT_SHARD_DEFA
 // area lives in the first shard, as the hash partition does. A state with no map entries still gets one shard, so the checkpoint is sharded.
 function partitionCheckpointStateByShard(state = {}, shardOf) {
     const byId = new Map()
+    const areaOfId = new Map()
     const mapAreas = []
     const valueAreas = []
     for (const [area, value] of Object.entries(state || {})) {
@@ -234,6 +325,14 @@ function partitionCheckpointStateByShard(state = {}, shardOf) {
             for (const [key, entry] of Object.entries(value)) {
                 const id = Number.parseInt(shardOf(area, key, entry), 10)
                 if (!Number.isFinite(id) || id < 0) throw new Error(`shardOf returned ${id} for ${area}/${key}`)
+                // area-v1: a shard holds one area, and an area's shard ids lie in its namespace (when it has one).
+                if (areaOfId.has(id) && areaOfId.get(id) !== area) {
+                    throw new Error(`shardOf put areas ${areaOfId.get(id)} and ${area} in shard ${id}`)
+                }
+                if (Number.isInteger(CHECKPOINT_AREA_NAMESPACES[area]) && checkpointShardNamespace(id) !== CHECKPOINT_AREA_NAMESPACES[area]) {
+                    throw new Error(`shard ${id} is outside the ${area} namespace`)
+                }
+                areaOfId.set(id, area)
                 if (!byId.has(id)) byId.set(id, {})
                 const shardState = byId.get(id)
                 if (!shardState[area]) shardState[area] = {}
@@ -303,6 +402,7 @@ function makeShardedCheckpoint(state = {}, options = {}) {
         })
     }))
 
+    const arrival = typeof options.shardOf === 'function'
     return {
         version: WAL_SCHEMA_VERSION,
         id: normalizeCheckpointId(options.id),
@@ -312,7 +412,16 @@ function makeShardedCheckpoint(state = {}, options = {}) {
         stateHash: hashState(snapshotState),
         format: CHECKPOINT_SHARD_FORMAT,
         shardCount,
-        ...(typeof options.shardOf === 'function' ? {partition: CHECKPOINT_PARTITION_ARRIVAL} : {}),
+        ...(arrival ? {partition: CHECKPOINT_PARTITION_ARRIVAL} : {}),
+        // The per-area hashes (area-v1). Only the arrival partition writes them; the hash partition's manifests stay as they were.
+        ...(arrival ? {
+            shardLayout: CHECKPOINT_SHARD_LAYOUT_AREA,
+            areaShards: buildCheckpointAreaShards(shards.map((shard, position) => ({
+                index: shard.index,
+                shardStateHash: shard.shardStateHash,
+                state: shardStates[position]
+            })))
+        } : {}),
         // Written only when the ids are not 0 to shardCount - 1, so the hash partition's manifests are byte-for-byte what they were.
         ...(shards.every((shard, position) => shard.index === position) ? {} : {shardIds: shards.map(shard => shard.index)}),
         areas,
@@ -329,6 +438,7 @@ function decodeShardedCheckpointState(checkpoint = null, options = {}) {
     }
 
     const shardStates = []
+    const verifiedEntries = []
     for(let position = 0; position < shardCount; position += 1) {
         const index = shardIds[position]
         const shard = shards[position]
@@ -344,6 +454,14 @@ function decodeShardedCheckpointState(checkpoint = null, options = {}) {
             return {ok: false, reason: 'checkpoint-shard-hash-mismatch', shardIndex: index, state: null}
         }
         shardStates.push(decoded.state || {})
+        verifiedEntries.push({index, shardStateHash: actualHash, state: decoded.state || {}})
+    }
+
+    // area-v1: the manifest's per-area record must be the one its verified shards give. A manifest without the layout field is a
+    // shared-layout checkpoint, read as before, with no per-area record to check.
+    if(checkpoint.shardLayout === CHECKPOINT_SHARD_LAYOUT_AREA &&
+        stableStringify(buildCheckpointAreaShards(verifiedEntries)) !== stableStringify(checkpoint.areaShards || {})) {
+        return {ok: false, reason: 'checkpoint-area-hash-mismatch', state: null}
     }
 
     const state = mergeCheckpointShardStates(shardStates, checkpoint.areas)
@@ -450,7 +568,7 @@ function getKeyedRowReadKeys(meta = null, key = '', options = {}) {
     const shardCount = normalizeCheckpointShardCount(activeCheckpoint?.shardCount)
     if(shardCount && getCheckpointPartition(activeCheckpoint) === CHECKPOINT_PARTITION_ARRIVAL) {
         // No key-to-shard rule, so one shard cannot be named. The read takes every shard; the projection then refuses by name.
-        keys.push(...getSegmentedWalCheckpointShardKeys(baseKey, active, shardCount))
+        keys.push(...getSegmentedWalCheckpointShardKeysForMeta(meta, baseKey, active))
     }
     else if(shardCount) {
         keys.push(getSegmentedWalCheckpointShardKey(baseKey, active, getCheckpointShardIndex(key, shardCount)))
@@ -726,25 +844,142 @@ function projectKeyedRowFromResidentStore(resident = null, diskMeta = null, opti
     }
 }
 
-// Phase 2 of the mirror plan: the keys a session mirror holds. It is the active
-// slot's manifest, its shard records, the active generation's segments, and the meta,
-// under the same keys storage uses, so the mirror needs no translation. A keyed read
-// against the mirror is the same projection as a keyed read against storage. The
-// mirror is only a cache: the disk meta decides whether it may be used.
-function getQueueMirrorKeys(meta = null, options = {}) {
-    const baseKey = options.baseKey || 'wal'
-    if(!isSegmentedWalStorageMeta(meta)) return [getSegmentedWalMetaKey(baseKey)]
+// Phase 2 of the mirror plan: the keys a session mirror holds for a meta. It is the meta, the active slot's manifest, every committed
+// segment of the active generation (verbatim: the WAL is small, because it is cleared at each checkpoint), and the active slot's shard
+// records that belong to the queue. Keys are the storage keys, so a keyed read against the mirror is the same projection as one against
+// storage, and the mirror needs no translation. The mirror is only a cache: the disk meta decides whether it may be used.
+//
+// Which shards: an area-v1 manifest (shardLayout 'area-v1') names each area's shards in areaShards, and the session copy takes the queue's
+// only. Completed and runs shards are not mirrored; hydrate reads them from disk. A manifest with no area record (the shared layout) cannot
+// be split by area, so its mirror keeps every shard the meta names, as it always did. A manifest that is not given returns null: a mirror
+// written without its manifest would be missing its shards, so the caller must supply the active manifest.
+function getQueueMirrorShardIds(manifest = null) {
+    if(manifest?.shardLayout !== CHECKPOINT_SHARD_LAYOUT_AREA) return null
+    return (manifest.areaShards?.queue?.shardIds || []).map(id => Number.parseInt(id, 10))
+}
+
+// The active slot's manifest from a stored object, or null. Used when a caller does not pass the manifest it has.
+function getStoredActiveManifest(stored = {}, meta = null, baseKey = 'wal') {
+    if(!isSegmentedWalStorageMeta(meta)) return null
+    return stored?.[getSegmentedWalCheckpointKey(baseKey, normalizeCheckpointId(meta.activeCheckpoint))] || null
+}
+
+// The meta, the active slot's manifest, the given shard keys (null: every shard the meta names), and the committed segments.
+function getQueueMirrorSlotKeys(meta, baseKey, shardIds = null) {
     const active = normalizeCheckpointId(meta.activeCheckpoint)
     const keys = [getSegmentedWalMetaKey(baseKey), getSegmentedWalCheckpointKey(baseKey, active)]
-    const shardCount = normalizeCheckpointShardCount(meta.checkpoints?.[active]?.shardCount)
-    for(let index = 0; index < shardCount; index += 1) {
-        keys.push(getSegmentedWalCheckpointShardKey(baseKey, active, index))
-    }
+    keys.push(...(shardIds
+        ? shardIds.map(id => getSegmentedWalCheckpointShardKey(baseKey, active, id))
+        : getSegmentedWalCheckpointShardKeysForMeta(meta, baseKey, active)))
     const committedSegments = getSegmentedWalCommittedSegmentCount(meta, active)
     for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
         keys.push(getSegmentedWalSegmentKey(baseKey, active, segmentNo))
     }
     return keys
+}
+
+// The keys a session mirror of this meta holds (see above). Null when the manifest is not given.
+function getQueueMirrorKeys(meta = null, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    if(!isSegmentedWalStorageMeta(meta)) return [getSegmentedWalMetaKey(baseKey)]
+    const manifest = options.manifest
+    if(!manifest || typeof manifest !== 'object') return null
+    return getQueueMirrorSlotKeys(meta, baseKey, getQueueMirrorShardIds(manifest))
+}
+
+// Every key a mirror of this meta could hold: the same as getQueueMirrorKeys for a shared-layout manifest, and a superset of it otherwise.
+// It is for reads that come before the manifest is known (a rebuild's disk read) and for retiring an earlier copy. It is never a write set:
+// a mirror written from it would hold completed and runs shards, which the session copy does not take.
+function getQueueMirrorSupersetKeys(meta = null, options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    if(!isSegmentedWalStorageMeta(meta)) return [getSegmentedWalMetaKey(baseKey)]
+    return getQueueMirrorSlotKeys(meta, baseKey, null)
+}
+
+// How many of the keys are shard keys of a namespace other than the queue's (the completed log's and the runs'). Counts the disk reads a
+// mirror hydrate makes for them. A shard id with no namespace (a shared-layout checkpoint) is in the queue namespace, so it is not counted.
+function countNonQueueShardKeys(keys = [], options = {}) {
+    const baseKey = options.baseKey || 'wal'
+    let count = 0
+    for(const key of keys || []) {
+        for(const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+            const prefix = `${getSegmentedWalCheckpointKey(baseKey, checkpointId)}.s`
+            if(`${key}`.startsWith(prefix) && checkpointShardNamespace(`${key}`.slice(prefix.length)) !== CHECKPOINT_AREA_NAMESPACES.queue) count += 1
+        }
+    }
+    return count
+}
+
+// The area namespace of a checkpoint shard key ("<base>.checkpoint.<slot>.sNN"), or null when the key is not a shard key of either slot.
+// The namespace is the one checkpointShardNamespace reads from the shard id the key carries.
+function getCheckpointShardKeyNamespace(key = '', baseKey = 'wal') {
+    for (const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+        const prefix = `${getSegmentedWalCheckpointKey(baseKey, checkpointId)}.s`
+        if (`${key}`.startsWith(prefix)) return checkpointShardNamespace(`${key}`.slice(prefix.length))
+    }
+    return null
+}
+
+// Whether a checkpoint manifest names completed or runs shards (any shard outside the queue's namespace). An area-v1 manifest names them
+// through areaShards: an area other than queue that has at least one shard. A hash-layout manifest does not split its shards by area, so an
+// area it lists stands for its shards (conservative: it can refuse a manifest that holds no such entries). A null manifest names nothing.
+function checkpointManifestNamesNonQueueShards(manifest = null) {
+    if (!manifest || typeof manifest !== 'object') return false
+    if (manifest.shardLayout === CHECKPOINT_SHARD_LAYOUT_AREA) {
+        return Object.entries(manifest.areaShards || {}).some(([area, entry]) => area !== 'queue' && (entry?.shardIds || []).length > 0)
+    }
+    const areas = manifest.areas || {}
+    return [...(areas.map || []), ...(areas.value || [])].some(area => area !== 'queue')
+}
+
+// Whether a stored object (a disk read, or a copy of one) names a completed or runs shard of either checkpoint slot: a slot's manifest does
+// (checkpointManifestNamesNonQueueShards), or a non-queue shard key of a slot holds a value. A key read as null names nothing, because the
+// reads ask for keys that may be absent.
+function storedNamesNonQueueCheckpointShards(stored = {}, baseKey = 'wal') {
+    const values = stored || {}
+    for (const checkpointId of [CHECKPOINT_A, CHECKPOINT_B]) {
+        if (checkpointManifestNamesNonQueueShards(values[getSegmentedWalCheckpointKey(baseKey, checkpointId)])) return true
+    }
+    return Object.keys(values).some(key => {
+        if (values[key] == null) return false
+        const namespace = getCheckpointShardKeyNamespace(key, baseKey)
+        return namespace !== null && namespace !== CHECKPOINT_AREA_NAMESPACES.queue
+    })
+}
+
+// The superset keys of the completed and runs areas of one slot: the same names getAreaShardSupersetKeys gives for those areas, with no
+// queue key. The session restart reads these from disk, because the session copy holds the queue's shards only.
+function getNonQueueAreaShardSupersetKeys(baseKey = 'wal', checkpointId = CHECKPOINT_A, count = CHECKPOINT_SHARD_DEFAULT_COUNT) {
+    const keys = []
+    for (const area of Object.keys(CHECKPOINT_AREA_NAMESPACES)) {
+        if (area === 'queue') continue
+        for (let local = 0; local < normalizeCheckpointShardCount(count); local += 1) {
+            keys.push(getSegmentedWalCheckpointShardKey(baseKey, checkpointId, checkpointAreaShardId(area, local)))
+        }
+    }
+    return keys
+}
+
+// Whether a session copy's active manifest and the disk's agree on the queue area (the session restart rule). Both must be area-v1. The
+// queue area's hash and its shard ids must be the same, and so must the hash of every queue shard. A checkpoint with no queue area (an
+// empty queue) agrees with another such checkpoint. Returns '' when they agree, else the reason they do not.
+function getQueueAreaDisagreement(sessionManifest = null, diskManifest = null) {
+    if (sessionManifest?.shardLayout !== CHECKPOINT_SHARD_LAYOUT_AREA || diskManifest?.shardLayout !== CHECKPOINT_SHARD_LAYOUT_AREA) {
+        return 'layout-not-area-v1'
+    }
+    const sessionQueue = sessionManifest.areaShards?.queue || null
+    const diskQueue = diskManifest.areaShards?.queue || null
+    if (!sessionQueue && !diskQueue) return ''
+    if (!sessionQueue || !diskQueue) return 'queue-area-differs'
+    if (sessionQueue.hash !== diskQueue.hash) return 'queue-area-hash-differs'
+    const ids = getQueueMirrorShardIds(diskManifest)
+    if (stableStringify(getQueueMirrorShardIds(sessionManifest)) !== stableStringify(ids)) return 'queue-shard-ids-differ'
+    const sessionHashes = new Map((sessionManifest.shards || []).map(shard => [Number.parseInt(shard.index, 10), shard.shardStateHash]))
+    const diskHashes = new Map((diskManifest.shards || []).map(shard => [Number.parseInt(shard.index, 10), shard.shardStateHash]))
+    for (const id of ids) {
+        if (!sessionHashes.has(id) || sessionHashes.get(id) !== diskHashes.get(id)) return 'queue-shard-hash-differs'
+    }
+    return ''
 }
 
 // The non-WAL keys of the queue namespace that the session mirror also holds
@@ -754,8 +989,7 @@ function getQueueMirrorKeys(meta = null, options = {}) {
 // layout, not one shard per href. Pure: the caller supplies the key names and the progress defaults.
 function queueNamespaceMirrorKeys(options = {}) {
     const progressKeys = Object.keys(options.progressDefaults || {})
-    const keys = options.runsKey ? [options.runsKey] : []
-    if(options.outliersKey && !keys.includes(options.outliersKey)) keys.push(options.outliersKey)
+    const keys = options.outliersKey ? [options.outliersKey] : []
     for(const key of progressKeys) {
         if(!keys.includes(key)) keys.push(key)
     }
@@ -778,8 +1012,9 @@ function queueNamespaceStampKeys(keys = [], prefix = '') {
 
 // The part of a storage payload (or stored snapshot) that the mirror holds, as an object.
 function selectQueueMirrorRecords(stored = {}, meta = null, options = {}) {
+    const manifest = options.manifest || getStoredActiveManifest(stored, meta, options.baseKey)
     const mirror = {}
-    for(const key of getQueueMirrorKeys(meta, options)) {
+    for(const key of getQueueMirrorKeys(meta, {...options, manifest}) || []) {
         if(stored && Object.prototype.hasOwnProperty.call(stored, key)) mirror[key] = stored[key]
     }
     return mirror
@@ -836,13 +1071,15 @@ function planQueueMirrorAppend(mirrorMeta = null, payload = {}, options = {}) {
     return {records, meta}
 }
 
-// A full mirror, built from a stored snapshot. Returns ok: false if any key the mirror needs
-// is absent, because a partial mirror would answer wrongly.
+// A full mirror, built from a stored snapshot. The manifest is the active slot's, from options or from stored. Returns ok: false when that
+// manifest is absent, or when any key the mirror needs is absent, because a partial mirror would answer wrongly.
 function planQueueMirrorRebuild(stored = {}, meta = null, options = {}) {
-    const keys = getQueueMirrorKeys(meta, options)
+    const manifest = options.manifest || getStoredActiveManifest(stored, meta, options.baseKey)
+    const keys = getQueueMirrorKeys(meta, {...options, manifest})
+    if(!keys) return {ok: false, reason: 'mirror-manifest-missing', missingKeys: [], records: {}}
     const missingKeys = keys.filter(key => !(stored && Object.prototype.hasOwnProperty.call(stored, key)))
     if(missingKeys.length) return {ok: false, reason: 'mirror-keys-missing', missingKeys, records: {}}
-    return {ok: true, reason: '', records: selectQueueMirrorRecords(stored, meta, options), meta}
+    return {ok: true, reason: '', records: selectQueueMirrorRecords(stored, meta, {...options, manifest}), meta}
 }
 
 function makePairedCheckpointStore(initialState = {}, options = {}) {
@@ -977,6 +1214,11 @@ function verifyCheckpoint(checkpoint = null, options = {}) {
 }
 
 function setCheckpointMeta(store, checkpoint) {
+    const shardCount = normalizeCheckpointShardCount(checkpoint.shardCount)
+    // The shard ids go into the meta only when they are not the default range, so a meta for the default layout is as it was. The keyed
+    // reads and the storage defaults take their keys from these ids (getMetaCheckpointShardIds).
+    const shardIds = checkpoint.format === CHECKPOINT_SHARD_FORMAT ? getCheckpointShardIds(checkpoint) : []
+    const defaultRange = shardIds.every((id, position) => id === position)
     store.meta.checkpoints = {
         ...(store.meta.checkpoints || {}),
         [checkpoint.id]: {
@@ -984,8 +1226,9 @@ function setCheckpointMeta(store, checkpoint) {
             snapshotEpoch: checkpoint.snapshotEpoch,
             createdAt: checkpoint.createdAt,
             stateHash: checkpoint.stateHash,
-            shardCount: normalizeCheckpointShardCount(checkpoint.shardCount),
-            ...(getCheckpointPartition(checkpoint) === CHECKPOINT_PARTITION_ARRIVAL ? {partition: CHECKPOINT_PARTITION_ARRIVAL} : {})
+            shardCount,
+            ...(getCheckpointPartition(checkpoint) === CHECKPOINT_PARTITION_ARRIVAL ? {partition: CHECKPOINT_PARTITION_ARRIVAL} : {}),
+            ...(shardIds.length && !defaultRange ? {shardIds} : {})
         }
     }
 }
@@ -1126,8 +1369,7 @@ function buildSegmentedWalStorageDefaults(meta = null, options = {}) {
 
     const activeCheckpoint = normalizeCheckpointId(meta.activeCheckpoint)
     defaults[getSegmentedWalCheckpointKey(baseKey, activeCheckpoint)] = null
-    const activeShardCount = normalizeCheckpointShardCount(meta.checkpoints?.[activeCheckpoint]?.shardCount)
-    for(const key of getSegmentedWalCheckpointShardKeys(baseKey, activeCheckpoint, activeShardCount)) defaults[key] = null
+    for(const key of getSegmentedWalCheckpointShardKeysForMeta(meta, baseKey, activeCheckpoint)) defaults[key] = null
     const committedSegments = getSegmentedWalCommittedSegmentCount(meta, activeCheckpoint)
     for(let segmentNo = 0; segmentNo < committedSegments; segmentNo += 1) {
         defaults[getSegmentedWalSegmentKey(baseKey, activeCheckpoint, segmentNo)] = null
@@ -1375,6 +1617,16 @@ function writeInactiveCheckpoint(store = {}, state = {}, options = {}) {
             if (!listedIndexes.has(shard.index)) removeShardIndexes.push(shard.index)
         }
     }
+    // The shards a drop removed from the state (options.dropShardIds, the completed log's pruned shards). Each one is one delete of its
+    // key in this slot, whether or not the slot's contents are remembered. A dropped shard the manifest still lists is not deleted.
+    if (checkpoint.format === CHECKPOINT_SHARD_FORMAT && Array.isArray(options.dropShardIds)) {
+        const listedIndexes = new Set(checkpoint.shards.map(shard => shard.index))
+        for (const raw of options.dropShardIds) {
+            const id = Number.parseInt(raw, 10)
+            if (!Number.isInteger(id) || id < 0 || listedIndexes.has(id) || removeShardIndexes.includes(id)) continue
+            removeShardIndexes.push(id)
+        }
+    }
     const writePlan = {generationId: inactive, skipShardIndexes, removeShardIndexes}
     nextStore.checkpoints[inactive] = checkpoint
     nextStore.wal = {
@@ -1471,6 +1723,12 @@ function validateWalRecord(record = {}) {
     }
     else if(record.kind === 'list.append') {
         if(!record.area) return {ok: false, reason: 'missing-area'}
+    }
+    else if(record.kind === 'map.dropShard') {
+        // One record drops a whole shard of an area: every entry whose shardField holds `shard` (a missing field is shard 0).
+        if(!record.area) return {ok: false, reason: 'missing-area'}
+        if(!record.shardField) return {ok: false, reason: 'missing-shard-field'}
+        if(!Number.isInteger(record.shard) || record.shard < 0) return {ok: false, reason: 'missing-shard'}
     }
     else if(record.kind === 'map.appendUnique') {
         if(!record.area) return {ok: false, reason: 'missing-area'}
@@ -1599,6 +1857,16 @@ function applyWalRecord(state = {}, rawRecord = {}, context = {}) {
         map[record.key] = {
             ...previous,
             ...patch
+        }
+        nextState[area] = map
+    }
+    else if(record.kind === 'map.dropShard') {
+        // The entries of one shard leave the area. Entries are read in place, so the copy taken for the area is the one written.
+        const map = takeAreaForWrite(nextState, area, context)
+        for(const key of Object.keys(map)) {
+            const entryShard = Number.parseInt(map[key]?.[record.shardField], 10)
+            const shardOfEntry = Number.isInteger(entryShard) && entryShard >= 0 ? entryShard : 0
+            if(shardOfEntry === record.shard) delete map[key]
         }
         nextState[area] = map
     }
@@ -1765,6 +2033,17 @@ module.exports = {
     CHECKPOINT_B,
     CHECKPOINT_SHARD_DEFAULT_COUNT,
     CHECKPOINT_SHARD_FORMAT,
+    CHECKPOINT_SHARD_LAYOUT_AREA,
+    CHECKPOINT_AREA_NAMESPACES,
+    CHECKPOINT_AREA_SHARD_STRIDE,
+    checkpointAreaShardId,
+    checkpointShardNamespace,
+    checkpointAreaHashInput,
+    hashCheckpointArea,
+    buildCheckpointAreaShards,
+    getMetaCheckpointShardIds,
+    getSegmentedWalCheckpointShardKeysForMeta,
+    getAreaShardSupersetKeys,
     normalizeCheckpointId,
     normalizeCheckpointShardCount,
     DEFAULT_RECOVERY_CRITICAL_AREAS,
@@ -1783,6 +2062,13 @@ module.exports = {
     readStoredCheckpoint,
     getKeyedRowReadKeys,
     getQueueMirrorKeys,
+    getQueueMirrorShardIds,
+    getQueueMirrorSupersetKeys,
+    getStoredActiveManifest,
+    countNonQueueShardKeys,
+    getCheckpointShardKeyNamespace,
+    getNonQueueAreaShardSupersetKeys,
+    getQueueAreaDisagreement,
     queueNamespaceMirrorKeys,
     queueNamespaceStampKey,
     queueNamespaceStampKeys,
@@ -1813,6 +2099,8 @@ module.exports = {
     getActiveCheckpoint,
     getInactiveCheckpointId,
     getSegmentedWalCheckpointKey,
+    checkpointManifestNamesNonQueueShards,
+    storedNamesNonQueueCheckpointShards,
     getSegmentedWalCommittedSegmentCount,
     getSegmentedWalMetaKey,
     getSegmentedWalSegmentKey,

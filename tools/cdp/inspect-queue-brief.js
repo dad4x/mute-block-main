@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     evaluate,
     getCdpConfig,
@@ -9,7 +11,8 @@ const {
     runMain
 } = require('./lib/cdp')
 
-const QUEUE_KEY = 'mbCoordinatorQueue'
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
 
 function normalizeHref(value = '') {
     try {
@@ -111,7 +114,7 @@ runMain(async () => {
                 progress: progressEntries
             }
         })
-    }})( ${JSON.stringify(QUEUE_KEY)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
+    }})( ${JSON.stringify(QUEUE_STORED_KEY)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
 
     const output = {
         target: {

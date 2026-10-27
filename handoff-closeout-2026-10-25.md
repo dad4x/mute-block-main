@@ -145,3 +145,69 @@ Build: 1.6.1635 is built (Chrome dev only, no zips). Everything since 62a67ea is
 
 ### Parked
 18. nits7 item 17 (poster memory in asset spaces): planning item. Owner has parked it.
+
+## Review before commit (26 Oct, build 1.6.1646)
+
+Status of the items above, as of this review. Git: last tag v1.6.1636 (8e146cc). Everything after that is uncommitted: builds 1.6.1637 to 1.6.1646.
+
+### Resolved since the list was written
+- **Item 1 (dashboard and page flicker, options a/b):** the Terminal and Avg item time cards now read a completed-log summary since the last Clear All Stats (owner decision: only officially completed rows count). The hot-path population mismatch no longer reaches those cards, so options (a) and (b) are not needed for them. Still to confirm live: the cards hold steady.
+- **Item 2 (timing cache ratchet):** moot. The finished-duration pair was removed from the queue view, and the cards read the completed summary.
+- **Item 12 (lane count):** the runner now lists 51 lanes. The drop from 53 came from removing the two space-map test files.
+- **Item 14, codex-review-2 item 3 (shadow machinery):** removed.
+- **Search "Not Match" pill and the query-match gate:** removed. Quora's search does the matching, so the extension no longer checks it.
+- **Search Nuke 'Em count (100 showing after queuing):** fixed in 1646. The count is a batch cap. The queueable check was counting pending rows from an earlier run of the same search. Owner says it looks good.
+- **Collect N More dropdown:** choosing a count no longer starts the collect. Owner confirmed.
+- **Nuke 'Em label stuck or flashing during a batch (1641 to 1642):** fixed in 1642. Not yet confirmed live after the final build.
+
+### Still open
+- **Item 3 (sourcePostKey redundant):** open. Rows already carry evidence[].postKey, so the field duplicates it. Decision still needed.
+- **Item 4 (runs older than 90 days dropped on write):** open, owner to confirm.
+- **Item 5 (pending depends on the queue copy):** partly addressed. Space pages hold in-memory marks for a batch. Search pages do not use marks, so the gap is still there for them.
+- **Item 6 (resolver-only posts):** open.
+- **Item 8 (other checkpoint writers that pass only the queue could drop runs in fallback paths):** open. This is the one with data-loss risk, so it should be checked before the next release.
+- **Item 13 (architecture.md enumeration):** open. The doc is 484 lines, with the overview and state map. Still to do: every stored key with its writer, reader and whether it is still needed; the data structures; and the session storage size against the quota.
+- **Item 10 (tools/cdp scripts reading removed keys):** open, unchanged.
+- **Item 11 (shadow-removal leftovers):** open, unchanged.
+- **Item 15 (outliers Phase 3 and Phase 4):** open, unchanged.
+- **Item 16 (live checks):** still open, and the list has grown. Check on a live build: outlier highlight; save flight recorder file and folder; Avg item time card holding steady; space-page Nuke 'Em count after queuing; queueing label staying put during a batch; manual block and pardon; the Stop collecting button on space and search pages (its alignment with Collect N More on space pages is unmeasured, and the "Next notification" pill is not in the DOM, so its clearance is estimated); the History filter, count and Remove duplicates; the search collect with no Not Match pill.
+- **Item 17 (save flight recorder folder):** open, unchanged.
+- **Item 18:** parked, unchanged.
+
+### New since the list was written
+- **Commit and tag:** pending the owner's go. Use the next tag after v1.6.1636.
+- **experiments/worker-host (about 940 MB, including two browser profiles):** untracked and deliberately left out of the commit. Add it to .gitignore, or move it out of the repo.
+- **.nits-8.md.swp:** an editor swap file, left out of the commit. Delete it.
+- **Search collect Stop button:** placed above the "Next notification" pill, left-aligned with Collect N More on search pages. Space pages use the same offset, unverified.
+- **History page:** filter (free text, every word must appear, case-insensitive), "Showing F of T" count, and Remove duplicates (newest row per profile). Not yet checked in the browser.
+- **Browser checks:** the probe scripts are in the scratchpad, outside the repo. They are read-only except for the two button presses the owner approved (Stop collecting: not pressed because it was hidden; Nuke 'Em 100: pressed once).
+
+## Autonomous pass (26 Oct, build 1.6.1647)
+
+Done without further input, each with its test run (lanes: 51 PASS, 0 FAIL):
+- **Item 8 (runs across checkpoints):** the checkpoint switch was already correct. One latent path dropped runs: the queue-only checkpoint (swCoordinatorContentQueueIndex makeCoordinatorQueueWalCheckpoint, reached from addContentPageStateProjectionPayload). It now includes the persisted runs. Regression test runs-switch case 3 added. Still open, owner decision: that same path also drops the completed map.
+- **Item 10 (tools/cdp reads of removed or unprefixed keys):** the five scripts that read removed space-map keys are updated, and 24 tools now use prefixed stored names from storageKeys.js. Still unverified: nothing was run against the live browser. The p1 pins now check the constant names.
+- **Item 11 (shadow leftovers):** the disk-guard test is renamed "single-row". Two synthetic URL strings renamed. Eleven unused sw.js imports removed, and the harness import of the flight-recorder reset now comes from its own module. The spaceMapStorage references in the tests are removed.
+- **Item 13 (architecture enumeration):** architecture.md is 695 lines, with the stored-key enumeration (34 names, 5 key families), data structures, quotas (local and session 10,485,760 bytes each, fetched 26 Oct), and corrections. The stale space-map text is removed. Still unverified: live sizes, Firefox quota, outlier and metrics caps.
+- **Git hygiene:** experiments/worker-host/ added to .gitignore.
+
+Newly found, not changed:
+- mbCoordinatorIdleRetryEnabled has no constant and no writer in shared/. The doc lists it as having no writer. Decide whether to remove it.
+- No live writer: mbCoordinatorEvents, mbCoordinatorQueue, mbCoordinatorQueueView, mbCoordinatorContentQueueIndex, mbProfileNukeProgress. No reader: mbPauseDiagnosticSnapshot, mbEraseBlockHistoryGeneration. Decide whether to delete them.
+
+Still needs you: items 3, 4, 5 (search marks), 6, 8 (completed-map gap), 15, 16 (live checks), 17. Commit and tag: pending. Build 1.6.1647 is built, not committed.
+
+## Requests after the audit (27 Oct), not yet built
+
+Owner asked for two changes. No code changed yet; the owner then said "no changes, add to notes", so these are recorded only.
+
+1. **Remove the soft-fail retry state line from the dashboard.** The toggle was removed in 99c90bf, but the status line remains:
+   - `shared/coordinator.html:106` (`#retryFailedState`, text "Soft-fail retry is off").
+   - `shared/js/coordinator.js:1775-1806` (`syncRetryFailedControls`, writes that line; the on/off branches depend on `retryFailedActive`, which is still read from storage at lines 615 and 1117 and written at 2058 and 2067).
+   - Related: `coordinator.js:1756-1773` (retry counts for that line), the `retryFailedLastResult` writes, `tools/cdp/dashboard-state.js:49`, and the tests at `test/p1-contract.test.js:2000-2022` that assert the line's text.
+   - Open choice: the Current Work header ("N soft-fail, N hard-fail", `coordinator.js:1680`, `coordinator.html:98`) is fed by the same retry counts. Removing only the state line keeps the header counts. Owner to confirm whether the header counts go too.
+   - Worker side (`sw.js` `summarizeSoftFailRetryCounts`, `SOFT_FAIL_RETRY_LIMIT`) is not part of the dashboard line and is left alone unless the owner says otherwise.
+
+2. **Carry 1.5 space classifications into 1.6 on upgrade.** Not yet investigated. Open questions for the owner: which 1.5 keys hold the classifications (space post maps, nuked and pending records), whether they should be read at hydrate or migrated once and removed, and what to do with records that already have a 1.6 equivalent. The closeout item 9 said old unprefixed data was not migrated (erase policy); this request reverses that for space classifications.
+
+Build rule for either change: bump all four version files first, then `npm run prod` and `npm run build:chrome-dev` (Chrome dev only, per the owner's standing rule). Read `entropy-reduction-action-plan-2026-09-09.md` before touching `sw.js` for item 2.

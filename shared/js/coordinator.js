@@ -14,7 +14,7 @@ const {
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
 } = require('./timeouts')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS, HISTOGRAM_DURATION_EDGES_SEC} = require('./tunables')
 const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
@@ -61,6 +61,8 @@ const COORDINATOR_HISTORY_HASH = '#history'
 const DASHBOARD_COMPACT_REFRESH_INTERVAL_MS = 2000
 const DASHBOARD_COMPACT_REFRESH_PUSH_DELAY_MS = 100
 const RETRY_FAILED_LIMIT = SOFT_FAIL_RETRY_LIMIT
+// The failure text a list or header shows when its first load failed (owner, 27 Oct). It is the same text the refresh pill uses.
+const DASHBOARD_LOAD_FAILED_TEXT = 'History load failed'
 const CURRENT_WORK_MUTATION_TIMEOUT_MS = 70000
 // The dashboard's outlier list is computed by the worker (swCoordinatorOutliers.js) and served with each dashboard refresh.
 
@@ -71,7 +73,8 @@ const state = {
     queueTotal: 0,
     queueTruncated: false,
     // {count, durationCount, durationTotalMs} from the worker's completed summary (sw.js summarizeCompletedWorkDurationsSince), carried by the
-    // queue view on both the refresh and the pushed path. Null until a view carries it.
+    // queue view on both the refresh and the pushed path. Null until a view carries it. The duration histograms (realBlockHistogram,
+    // alreadyBlockedHistogram) are added when the worker sends them.
     completedSummary: null,
     runs: {},
     events: [],
@@ -81,6 +84,8 @@ const state = {
     paused: false,
     loading: true,
     loadError: '',
+    // False until the worker first answers a dashboard load (owner, 27 Oct). Until then the Current Work header and list show a spinner.
+    firstStateReceived: false,
     requiresQuoraVisit: false,
     requiresQuoraVisitAt: 0,
     quoraActivationCounterBaseline: 0,
@@ -143,7 +148,13 @@ let historyRows = new Map()
 // before this time stay off the page, and rows completed after it show.
 let historyClearedAt = 0
 let historySince = 0
+// The History page's first load (owner, 27 Oct): 'pending' until the worker first answers, 'failed' if that first answer never came, then 'loaded'.
+let historyFirstLoadState = 'pending'
 let historyTickCount = 0
+// The text in the History filter box. It lives here, not in the box, so a refresh re-renders the rows with the same filter.
+let historyFilterText = ''
+// Whether Remove duplicates is checked: when on, only the newest row for each profile shows. Kept here for the same reason.
+let historyDedupeEnabled = false
 
 // The completion status as a word: Succeeded, Failed, Skipped or Canceled.
 function historyStatusLabel(row = {}) {
@@ -163,7 +174,16 @@ function historyRowAt(row = {}) {
 // Asks the worker for the rows. A full query replaces the rows the page has; an incremental one adds the rows it does not have yet.
 async function refreshHistoryRows(full = false) {
     const result = await sendRuntimeMessageWithTimeout({action: 'get-recent-history', since: full ? 0 : historySince}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
-    if(!result || !Array.isArray(result.rows)) return
+    if(!result || !Array.isArray(result.rows)) {
+        // A first fetch that never answers ends the spinner with the failure text (owner, 27 Oct). Later failures keep the rows shown.
+        if(historyFirstLoadState === 'pending') {
+            historyFirstLoadState = 'failed'
+            renderHistoryRows()
+        }
+        return
+    }
+    const firstAnswer = historyFirstLoadState !== 'loaded'
+    historyFirstLoadState = 'loaded'
     const before = historyRows.size
     if(full) historyRows = new Map()
     let added = false
@@ -174,7 +194,7 @@ async function refreshHistoryRows(full = false) {
         historyRows.set(key, row)
     }
     historySince = Math.max(historySince, Number(result.latest) || 0)
-    if(full || added || historyRows.size !== before) renderHistoryRows()
+    if(full || added || historyRows.size !== before || firstAnswer) renderHistoryRows()
 }
 
 // The order of the status groups: errors first, so they group together.
@@ -183,6 +203,57 @@ const HISTORY_STATUS_ORDER = ['failed', 'skipped', 'canceled', 'succeeded']
 function historyStatusRank(row = {}) {
     const rank = HISTORY_STATUS_ORDER.indexOf(`${row.status || ''}`)
     return rank === -1 ? HISTORY_STATUS_ORDER.length : rank
+}
+
+// The filter's words: split on spaces, lowercased. An empty filter has none.
+function historyFilterWords(text = '') {
+    return `${text || ''}`.trim().toLowerCase().split(/\s+/).filter(Boolean)
+}
+
+// The visible text a row's filter words are matched against: the profile, status, outcome, source and error. Lowercased.
+function historyRowFilterFields(row = {}) {
+    const outcome = `${row.outcome || ''}`
+    const fields = [
+        `${row.targetProfileHref || row.coordinatorKey || ''}`,
+        historyStatusLabel(row),
+        outcome,
+        outcome.replace(/-/g, ' '),
+        row.origin === 'manual' ? 'Manual' : 'Space',
+        `${row.origin || ''}`,
+        `${row.actionKind || ''}`,
+        `${row.error || row.finalError || ''}`
+    ]
+    return fields.map(field => field.toLowerCase())
+}
+
+// The profile a row belongs to, for Remove duplicates. A row with no profile key has none.
+function historyRowProfileKey(row = {}) {
+    return `${row.targetProfileHref || row.coordinatorKey || ''}`
+}
+
+// With Remove duplicates on, only the newest row for each profile stays (by completion time). A row with no profile key is always kept.
+// The rows keep the order they came in.
+function historyDedupeRows(rows = [], enabled = false) {
+    if(!enabled) return rows
+    const newestByKey = new Map()
+    for(const row of rows) {
+        const key = historyRowProfileKey(row)
+        if(!key) continue
+        const current = newestByKey.get(key)
+        if(!current || historyRowAt(row) > historyRowAt(current)) newestByKey.set(key, row)
+    }
+    return rows.filter(row => {
+        const key = historyRowProfileKey(row)
+        return !key || newestByKey.get(key) === row
+    })
+}
+
+// A row shows when every typed word appears in at least one of its fields (case-insensitive, in any order). An empty filter shows every row.
+function historyRowMatchesFilter(row = {}, text = '') {
+    const words = historyFilterWords(text)
+    if(!words.length) return true
+    const fields = historyRowFilterFields(row)
+    return words.every(word => fields.some(field => field.includes(word)))
 }
 
 // The rows in the order the History page's sort control asks for. Newest first is the default.
@@ -198,9 +269,11 @@ function sortHistoryRows(rows = []) {
 }
 
 function renderHistoryRows() {
-    const rows = sortHistoryRows([...historyRows.values()])
+    const allRows = [...historyRows.values()]
+    // Remove duplicates is applied first, then the text filter; the count shows what is left, out of every row the page holds.
+    const rows = sortHistoryRows(historyDedupeRows(allRows, historyDedupeEnabled).filter(row => historyRowMatchesFilter(row, historyFilterText)))
     const countEl = document.getElementById('historyCount')
-    if(countEl) countEl.textContent = `${rows.length} ${rows.length === 1 ? 'entry' : 'entries'}`
+    if(countEl) countEl.textContent = `Showing ${rows.length} of ${allRows.length}`
 
     const list = document.getElementById('historyList')
     if(!list) return
@@ -221,7 +294,7 @@ function renderHistoryRows() {
         element.className = historyRowHasError(row) ? 'row row--history-error' : 'row'
         element.append(buildTitleCell(titleLabel, subtitle, {titleHref: profileHref, subtitleHref: row.postUrl || ''}))
         return element
-    }), 'No history yet.')
+    }), allRows.length ? 'No history rows match the filter.' : 'No history yet.', historyFirstLoadState)
 }
 
 async function renderHistoryList() {
@@ -287,6 +360,15 @@ async function initHistoryPage() {
     document.getElementById('historyPreferencesButton')?.addEventListener('click', () => {
         void openPreferences()
     })
+    document.getElementById('historyFilter')?.addEventListener('input', event => {
+        historyFilterText = `${event?.target?.value || ''}`
+        renderHistoryRows()
+    })
+    document.getElementById('historyDedupe')?.addEventListener('change', event => {
+        historyDedupeEnabled = !!event?.target?.checked
+        renderHistoryRows()
+    })
+    showLoadingIndicator('historyList')
     await renderHistoryList()
     document.getElementById('historySort')?.addEventListener('change', () => renderHistoryRows())
     setInterval(() => {
@@ -345,6 +427,9 @@ async function init() {
 
     const manifest = browser.runtime.getManifest()
     document.getElementById('appVersion').textContent = `v${manifest.version}`
+    // The spinner shows from the first paint; the first render replaces it (owner, 27 Oct).
+    showLoadingIndicator('currentWorkReadyCount')
+    showLoadingIndicator('queueList')
     document.getElementById('clearEventsButton')?.addEventListener('click', () => {
         void clearEvents()
     })
@@ -404,7 +489,8 @@ async function init() {
     try {
         await loadState()
         captureQuoraActivationMetricBaseline()
-        state.loadError = ''
+        // loadState() sets loadError itself when the worker has not answered the first load, so only a state that has arrived clears it.
+        if(state.firstStateReceived) state.loadError = ''
     }
     catch(error) {
         state.loadError = error?.message || `${error || ''}` || 'Dashboard storage load failed'
@@ -591,7 +677,7 @@ async function refreshDashboardStateFromCompactStorage() {
 
     dashboardCompactRefreshPromise = loadState()
         .then(() => {
-            state.loadError = ''
+            if(state.firstStateReceived) state.loadError = ''
             render()
             return true
         })
@@ -943,21 +1029,24 @@ async function clearCoordinatorTerminalStats() {
 
 // One button for the dev-mode panels' individually-scattered clear buttons
 // (Metrics, Scan cost, Recent event counts,
-// Outliers) plus the Current Work summary row's Terminal/Events tiles --
+// Outliers) plus the Current Work summary row's Terminal/Events tiles.
+// Owner rule (27 Oct): Clear empties what the dashboard shows and records a
+// cutoff; storage is not touched for history, completed rows or runs (space
+// management and Erase shrink storage). Outliers are the exception: their
+// list is cleared in memory and in storage.
 // resetMetrics covers the first two (all backed by the same
-// queue-wakeup-metrics storage), clearEventHistogram is tab-local only,
-// clearCoordinatorTerminalStats (the worker) stamps the dashboard-side
-// cutoff Terminal reads against (see COORDINATOR_STATS_CLEARED_AT_KEY in
-// sw.js -- nothing is deleted, queued/active rows are never affected) and
-// resets the worker's outlier list, and
-// clearEvents wipes the durable mbCoordinatorEvents log itself, not just its
-// display, so "Clear All Stats" is an unambiguous zeroing of everything
-// shown in that row.
+// queue-wakeup-metrics storage); clearEventHistogram is tab-local only;
+// clearCoordinatorTerminalStats (the worker) stamps the cutoff Terminal reads
+// against (COORDINATOR_STATS_CLEARED_AT_KEY in sw.js; queued and active rows
+// are never affected) and clears the worker's outlier list; clearEvents only
+// empties the flight recorder's in-memory events (sw.js
+// clearCoordinatorEventsRequested). A failed events clear does not stop the
+// refresh below, so the display never keeps the cleared rows on a failure.
 async function clearAllStats() {
     await resetMetrics()
     await clearCoordinatorTerminalStats()
     clearEventHistogram()
-    await clearEvents()
+    await clearEvents().catch(error => console.warn('Failed to clear events', error))
     await loadState()
     render()
 }
@@ -996,7 +1085,6 @@ async function loadEventsFromFlightRecorder() {
 async function loadState() {
     const stored = await namespaceArea(browser.storage.local).get({
         [COORDINATOR_RUNS_KEY]: {},
-        [QUEUE_WAKEUP_METRICS_VIEW_KEY]: {},
         [SPACE_REGISTRY_KEY]: {},
         [HIDDEN_RUNS_KEY]: [],
         [COORDINATOR_RETRY_FAILED_ENABLED_KEY]: false,
@@ -1025,6 +1113,10 @@ async function loadState() {
     // re-reading that same stale snapshot forever instead of ever
     // correcting it.
     const refreshed = await refreshCompactDashboardViews()
+    // The worker's first answer is the dashboard's first state (owner, 27 Oct): the spinner stops there. A first load the worker
+    // never answers records a failure instead, so the spinner cannot run forever. A later unanswered refresh keeps the last view.
+    if(refreshed.answered) state.firstStateReceived = true
+    else if(!state.firstStateReceived) state.loadError = 'Coordinator worker did not answer the dashboard load'
     // Same reasoning as the queue view above, for the same underlying reason:
     // mbCoordinatorRuns[runId]'s itemCount/targetProfileHrefs/targetWorkKeys/
     // activeCount/terminalCount/status are maintained as a mutated running
@@ -1039,8 +1131,10 @@ async function loadState() {
         state.runs = normalizeObject(stored[COORDINATOR_RUNS_KEY])
     }
     state.events = await loadEventsFromFlightRecorder()
-    if(hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
-        state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])
+    // The metrics view is held in session storage, never on disk (owner decision 26 Oct).
+    const storedMetrics = await namespaceArea(browser.storage.session)?.get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}}).catch(() => null)
+    if(hasQueueWakeupMetricsView(storedMetrics?.[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
+        state.metrics = normalizeMetrics(storedMetrics[QUEUE_WAKEUP_METRICS_VIEW_KEY])
     }
     else {
         await refreshCompactMetricsView()
@@ -1090,7 +1184,7 @@ async function refreshCompactDashboardViews() {
     const runsRefreshed = !!result?.runs && typeof result.runs === 'object' && !Array.isArray(result.runs)
     if(runsRefreshed) state.runs = result.runs
     if(Array.isArray(result?.outliers)) state.outliers = result.outliers
-    return {queueRefreshed, runsRefreshed}
+    return {queueRefreshed, runsRefreshed, answered: queueRefreshed || runsRefreshed}
 }
 
 
@@ -1131,8 +1225,8 @@ async function refreshCompactMetricsView() {
         return true
     }
 
-    const stored = await namespaceArea(browser.storage.local).get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}})
-    if(hasQueueWakeupMetricsView(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
+    const stored = await namespaceArea(browser.storage.session)?.get({[QUEUE_WAKEUP_METRICS_VIEW_KEY]: {}}).catch(() => null)
+    if(hasQueueWakeupMetricsView(stored?.[QUEUE_WAKEUP_METRICS_VIEW_KEY])) {
         state.metrics = normalizeMetrics(stored[QUEUE_WAKEUP_METRICS_VIEW_KEY])
         return true
     }
@@ -1176,10 +1270,22 @@ function applyCoordinatorQueueView(value = {}) {
 function readCompletedSummary(view = null) {
     const summary = view?.completedSummary
     if(!summary || typeof summary !== 'object') return null
-    return {
+    const result = {
         count: Number.parseInt(summary.count, 10) || 0,
         durationCount: Number.parseInt(summary.durationCount, 10) || 0,
         durationTotalMs: Number(summary.durationTotalMs) || 0
+    }
+    // The duration histograms (owner, 26 Oct) are added only when the worker sent them, so a summary without them keeps the three fields alone.
+    if(summary.realBlockHistogram) result.realBlockHistogram = readCompletedDurationHistogram(summary.realBlockHistogram)
+    if(summary.alreadyBlockedHistogram) result.alreadyBlockedHistogram = readCompletedDurationHistogram(summary.alreadyBlockedHistogram)
+    return result
+}
+
+function readCompletedDurationHistogram(histogram = {}) {
+    return {
+        counts: Array.isArray(histogram.counts) ? histogram.counts.map(count => Number.parseInt(count, 10) || 0) : [],
+        sampleCount: Number.parseInt(histogram.sampleCount, 10) || 0,
+        totalMs: Number(histogram.totalMs) || 0
     }
 }
 
@@ -1268,6 +1374,58 @@ function getCompletedItemAverageMs() {
     const summary = state.completedSummary
     if(!summary || summary.durationCount <= 0) return null
     return summary.durationTotalMs / summary.durationCount
+}
+
+// Bucket labels for the duration histograms (owner, 26 Oct), one per edge in HISTOGRAM_DURATION_EDGES_SEC: "0-0.75 s", "0.75-1 s", ..., "8-10 s",
+// and the last bucket "over 10 s". The counts come from the worker (makeCompletedDurationHistogram), in the same order.
+function getDurationBucketLabels() {
+    return HISTOGRAM_DURATION_EDGES_SEC.map((lowerSec, index) => {
+        const upperSec = HISTOGRAM_DURATION_EDGES_SEC[index + 1]
+        return upperSec === undefined ? `over ${lowerSec} s` : `${lowerSec}-${upperSec} s`
+    })
+}
+
+// Draws one duration histogram: a column per bucket, its count, and a bar whose height is its share of the largest bucket. A class with
+// no samples reads "no samples" and its bars are empty.
+function renderDurationHistogram(barsId = '', totalId = '', histogram = null) {
+    const labels = getDurationBucketLabels()
+    const counts = labels.map((_, index) => Number(histogram?.counts?.[index]) || 0)
+    const sampleCount = Number(histogram?.sampleCount) || 0
+    setText(totalId, sampleCount ? `${sampleCount} sample${sampleCount === 1 ? '' : 's'}` : 'no samples')
+
+    const bars = document.getElementById(barsId)
+    if(!bars) return
+    const largest = Math.max(1, ...counts)
+    bars.replaceChildren(...labels.map((label, index) => {
+        const column = document.createElement('div')
+        column.className = 'duration-histogram-column'
+        column.title = muteBlockHelpText(`${label}: ${counts[index]} ${counts[index] === 1 ? 'row' : 'rows'} with an active-to-terminal time in this range.`)
+
+        const count = document.createElement('div')
+        count.className = 'duration-histogram-count'
+        count.textContent = `${counts[index]}`
+
+        const track = document.createElement('div')
+        track.className = 'duration-histogram-track'
+        const bar = document.createElement('div')
+        bar.className = 'duration-histogram-bar'
+        bar.style.height = `${(counts[index] / largest) * 100}%`
+        track.append(bar)
+
+        const name = document.createElement('div')
+        name.className = 'duration-histogram-label'
+        name.textContent = label
+
+        column.append(count, track, name)
+        return column
+    }))
+}
+
+// The two duration histograms beside the block timing cards (owner, 26 Oct), from the completed summary the page holds.
+function renderDurationHistograms() {
+    const summary = state.completedSummary || {}
+    renderDurationHistogram('realBlockDurationBars', 'realBlockDurationTotal', summary.realBlockHistogram || null)
+    renderDurationHistogram('alreadyBlockedDurationBars', 'alreadyBlockedDurationTotal', summary.alreadyBlockedHistogram || null)
 }
 
 // The worker window's minimal "idiot light" status bar -- deliberately not
@@ -1388,18 +1546,19 @@ function render() {
     const secondsPerBlock = rememberTimingTile('secondsPerBlock', timingEpochStartedAt, getSecondsPerActualBlock(timingEpochStartedAt))
     const secondsPerAlreadyBlocked = rememberTimingTile('secondsPerAlreadyBlocked', timingEpochStartedAt, getSecondsPerAlreadyBlocked(timingEpochStartedAt))
     const activationHandoff = rememberTimingTile('activationHandoff', timingEpochStartedAt, getActivationHandoffSeconds(timingEpochStartedAt))
-    const failedCount = getQueueStatusCount('failed', queueItems)
     const succeededCount = getQueueStatusCount('succeeded', queueItems)
-    const {eligible: retryableFailedCount, exhausted: exhaustedRetryableFailedCount} = getSoftFailRetryCounts(queueItems)
-    const hardFailedCount = Math.max(0, failedCount - retryableFailedCount)
 
     setText('queuedCount', queuedCount)
-    setText('currentWorkReadyCount', getCurrentWorkSummaryText(queueItems, {
-        queuedCount,
-        succeededCount,
-        retryableFailedCount,
-        hardFailedCount
-    }))
+    // Until the first state arrives the header shows the spinner, and a failed first load shows the failure text (owner, 27 Oct).
+    const firstLoad = getDashboardFirstLoadState()
+    if(firstLoad === 'loaded') {
+        setText('currentWorkReadyCount', getCurrentWorkSummaryText(queueItems, {
+            queuedCount,
+            succeededCount
+        }))
+    }
+    else if(firstLoad === 'pending') showLoadingIndicator('currentWorkReadyCount')
+    else setText('currentWorkReadyCount', DASHBOARD_LOAD_FAILED_TEXT)
     setText('activeCount', activeCount)
     setText('secondsPerBlock', formatSecondsPerBlock(secondsPerBlock))
     setText('secondsPerAlreadyBlocked', formatSecondsPerBlock(secondsPerAlreadyBlocked))
@@ -1443,6 +1602,7 @@ function render() {
     // Average over every completed row since the stats cutoff (see getCompletedItemAverageMs), not just the listed live rows.
     const completedItemAverageMs = getCompletedItemAverageMs()
     setText('avgItemTimeValue', completedItemAverageMs === null ? '--' : formatPhaseTimingDurationMs(completedItemAverageMs))
+    renderDurationHistograms()
     // The Load phase (navigation start to content script open) of this metrics epoch, averaged over its samples.
     const pageLoadCounters = ((state.metrics || {}).currentEpoch || state.metrics || {}).counters || {}
     const pageLoadSamples = getMetricCounter(pageLoadCounters, 'profileAction.phase.load.sampleCount')
@@ -1466,7 +1626,6 @@ function render() {
     renderQueue(queueItems)
     renderOutliers()
     renderDashboardBottomBar(queueItems)
-    syncRetryFailedControls(queueItems, retryableFailedCount, exhaustedRetryableFailedCount)
     syncCurrentWorkPauseControls(queueItems)
     syncStartCoordinatorControls()
     syncLastEnqueueSummary()
@@ -1545,10 +1704,8 @@ function getCurrentWorkSummaryText(queueItems = [], counts = {}) {
         : `Showing ${listedCount}`
     const queuedCount = Number.parseInt(counts.queuedCount, 10) || 0
     const succeededCount = Number.parseInt(counts.succeededCount, 10) || 0
-    const softFailedCount = Number.parseInt(counts.retryableFailedCount, 10) || 0
-    const hardFailedCount = Number.parseInt(counts.hardFailedCount, 10) || 0
 
-    return `${showingText}, ${queuedCount} queued, ${succeededCount} succeeded, ${softFailedCount} soft-fail, ${hardFailedCount} hard-fail`
+    return `${showingText}, ${queuedCount} queued, ${succeededCount} succeeded`
 }
 
 async function clearEvents() {
@@ -1573,41 +1730,6 @@ async function clearCompletedRuns() {
     render()
 }
 
-function hasPendingCoordinatorQueueWork(queueItems = []) {
-    return queueItems.some(item => {
-        const status = `${item?.status || ''}`.trim()
-        return isPendingQueueStatus(status)
-    })
-}
-
-function hasRawPendingCoordinatorQueueWork() {
-    if(hasCoordinatorQueueView()) {
-        return getQueueStatusCount('queued') > 0 ||
-            getQueueStatusCount('opening') > 0 ||
-            getQueueStatusCount('active') > 0 ||
-            getQueueStatusCount('acting') > 0 ||
-            getQueueStatusCount('settling') > 0
-    }
-    return Object.values(state.queue || {}).some(item => {
-        const status = `${item?.status || ''}`.trim()
-        return isPendingQueueStatus(status)
-    })
-}
-
-function hasActiveCoordinatorQueueWork(queueItems = []) {
-    return queueItems.some(isActiveQueueItem)
-}
-
-function hasRawActiveCoordinatorQueueWork() {
-    if(hasCoordinatorQueueView()) {
-        return getQueueStatusCount('opening') > 0 ||
-            getQueueStatusCount('active') > 0 ||
-            getQueueStatusCount('acting') > 0 ||
-            getQueueStatusCount('settling') > 0
-    }
-    return Object.values(state.queue || {}).some(isActiveQueueItem)
-}
-
 function getQueuedCoordinatorQueueCount() {
     if(hasCoordinatorQueueView()) return getQueueStatusCount('queued')
     return Object.values(state.queue || {}).filter(item => `${item?.status || ''}`.trim() === 'queued').length
@@ -1625,54 +1747,6 @@ function isEligibleRetryFailedQueueItem(item = null) {
     return isRetryableFailedQueueItem(item) && getRetryFailedCount(item) < RETRY_FAILED_LIMIT
 }
 
-// The worker counts the soft-fail retry figures over every compact row (view.softFailRetry): a finished soft-fail at the retry limit is
-// not in the list, so counting the list would drop the "retry limit reached" figure. Without a view, the list is counted, as before.
-function getSoftFailRetryCounts(queueItems = []) {
-    const fromView = hasCoordinatorQueueView() ? state.queueView?.softFailRetry : null
-    if(fromView && typeof fromView === 'object') {
-        return {
-            eligible: Number.parseInt(fromView.eligible, 10) || 0,
-            exhausted: Number.parseInt(fromView.exhausted, 10) || 0
-        }
-    }
-    const eligible = queueItems.filter(isEligibleRetryFailedQueueItem).length
-    const shape = queueItems.filter(isRetryableFailedQueueItem).length
-    return {eligible, exhausted: Math.max(0, shape - eligible)}
-}
-
-function syncRetryFailedControls(queueItems = [], retryableFailedCount = 0, exhaustedRetryableFailedCount = 0) {
-    const hasPendingWork = hasPendingCoordinatorQueueWork(queueItems) || hasRawPendingCoordinatorQueueWork()
-    const hasActiveWork = hasActiveCoordinatorQueueWork(queueItems) || hasRawActiveCoordinatorQueueWork()
-    const waitText = getRetryFailedWorkWaitText({hasPendingWork, hasActiveWork})
-    const lastReason = retryFailedLastResult?.reason || ''
-    let stateText = ''
-    if(retryFailedActive && waitText) {
-        stateText = `Soft-fail retry on; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(retryFailedActive && retryableFailedCount <= 0 && exhaustedRetryableFailedCount > 0) {
-        stateText = `Soft-fail retry on; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(retryFailedActive && retryableFailedCount <= 0) {
-        stateText = `Soft-fail retry on; no soft-failures${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(retryFailedActive) {
-        stateText = `Soft-fail retry on${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(waitText) {
-        stateText = `Soft-fail retry off; ${waitText}${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(retryableFailedCount <= 0 && exhaustedRetryableFailedCount > 0) {
-        stateText = `Soft-fail retry off; retry limit reached for ${exhaustedRetryableFailedCount} failure${exhaustedRetryableFailedCount === 1 ? '' : 's'}${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else if(retryableFailedCount <= 0) {
-        stateText = `Soft-fail retry off; no soft-failures${lastReason ? ` (${lastReason})` : ''}`
-    }
-    else {
-        stateText = `Soft-fail retry off${lastReason ? ` (${lastReason})` : ''}`
-    }
-    setText('retryFailedState', stateText)
-}
-
 function syncStartCoordinatorControls() {
     const button = document.getElementById('startCoordinatorButton')
     if(!button) return
@@ -1682,13 +1756,6 @@ function syncStartCoordinatorControls() {
     setMuteBlockHelp(button, state.requiresQuoraVisit
         ? 'Start Current Work without waiting for a Quora page'
         : 'Quora runtime is available')
-}
-
-function getRetryFailedWorkWaitText({hasPendingWork = false, hasActiveWork = false} = {}) {
-    if(!hasPendingWork) return ''
-    if(state.requiresQuoraVisit) return 'waiting for first Quora page'
-    if(hasActiveWork) return 'waiting for current work to idle'
-    return 'queued work is waiting to start'
 }
 
 async function cancelCurrentWorkItem(item = {}) {
@@ -2122,7 +2189,7 @@ function hasFreshActiveQueueWork(queueItems = []) {
 }
 
 // The finished rows are not in the list (view.items holds the live rows only), so the gate reads the worker's count over the full compact
-// population (view.finishedWork), as getSoftFailRetryCounts reads view.softFailRetry. Without that summary the list is read, as before.
+// population (view.finishedWork). Without that summary the list is read, as before.
 function hasFreshTerminalQueueWork(queueItems = []) {
     const epochStartedAt = getCurrentMetricsEpochStartedAt()
     const finishedWork = hasCoordinatorQueueView() ? state.queueView?.finishedWork : null
@@ -2238,7 +2305,7 @@ function setText(id, value) {
 
 function getRefreshStateText() {
     if(state.loading) return 'Loading history...'
-    if(state.loadError) return 'History load failed'
+    if(state.loadError) return DASHBOARD_LOAD_FAILED_TEXT
     if(state.requiresQuoraVisit) {
         const queuedCount = getQueuedCoordinatorQueueCount()
         return queuedCount > 0
@@ -2932,7 +2999,7 @@ function renderQueue(items) {
             buildQueueTimingCell(item)
         )
         return row
-    }), state.loading ? 'Loading history...' : 'No current work yet.')
+    }), 'No current work yet.', getDashboardFirstLoadState())
 }
 
 function isResolutionQueueItem(item = {}) {
@@ -3425,7 +3492,11 @@ function formatEventDetails(event = {}) {
     return parts.join(', ')
 }
 
-function replaceChildren(container, children, emptyText) {
+// firstLoad is 'loaded' unless the caller has a first load to show: 'pending' puts the spinner where the empty text would go,
+// and 'failed' puts the failure text there (owner, 27 Oct). Rows always win over either.
+function replaceChildren(container, children, emptyText, firstLoad = 'loaded') {
+    // A spinner already on screen stays: replacing it would restart the spin on every render while the first load is pending.
+    if(firstLoad === 'pending' && !children.length && isLoadingIndicatorShown(container)) return
     container.replaceChildren()
 
     if(children.length) {
@@ -3433,10 +3504,39 @@ function replaceChildren(container, children, emptyText) {
         return
     }
 
+    if(firstLoad === 'pending') {
+        container.append(buildLoadingIndicator())
+        return
+    }
+
     const empty = document.createElement('div')
     empty.className = 'empty'
-    empty.textContent = emptyText
+    empty.textContent = firstLoad === 'failed' ? DASHBOARD_LOAD_FAILED_TEXT : emptyText
     container.append(empty)
+}
+
+// The dashboard's first-load state (owner, 27 Oct): 'pending' until the worker first answers a load, 'failed' when the first load
+// failed (loadState sets loadError), and 'loaded' from the first answer on. Later refreshes never bring the spinner back.
+function getDashboardFirstLoadState() {
+    if(state.firstStateReceived) return 'loaded'
+    return state.loadError ? 'failed' : 'pending'
+}
+
+// A copy of the static loading indicator in coordinator.html (role="status", aria-live="polite").
+function buildLoadingIndicator() {
+    return document.getElementById('loadingIndicatorTemplate').content.firstElementChild.cloneNode(true)
+}
+
+// True when the element's only content is a spinner already on screen (its first child is the indicator).
+function isLoadingIndicatorShown(element) {
+    return !!element?.firstElementChild?.classList.contains('loading-indicator') && element.childElementCount === 1
+}
+
+// Shows the spinner in an element, unless one is already there (see replaceChildren).
+function showLoadingIndicator(id) {
+    const element = document.getElementById(id)
+    if(!element || isLoadingIndicatorShown(element)) return
+    element.replaceChildren(buildLoadingIndicator())
 }
 
 function buildTitleCell(title, subtitle, options = {}) {

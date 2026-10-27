@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const {SPACE_MAP_BUCKET_COUNT} = require("../../shared/js/storageKeys")
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require("../../shared/js/storageKeys")
 const zlib = require('node:zlib')
 const {
     evaluate,
@@ -139,30 +139,23 @@ async function readLiveStorage(config) {
     }
 }
 
-// Space maps and the run list are stored in 32 buckets each once their layout marker is 2 (1437+). Rebuild the whole map.
-function readBucketedMap(storage = {}, baseKey = '', layoutKey = '') {
-    if (storage[layoutKey] !== 2) return storage[baseKey] || {}
-    const merged = {}
-    for (let i = 0; i < SPACE_MAP_BUCKET_COUNT; i += 1) Object.assign(merged, storage[`${baseKey}.b${i.toString(16).padStart(2, '0')}`] || {})
-    return merged
+// A stored map by its plain key name: the layout prefix plus the plain name (storageNamespace.js). The run list is one key.
+function storedMap(storage = {}, key = '') {
+    return storage[`${STORAGE_LAYOUT_PREFIX}${key}`] || {}
 }
 
 function buildDatasets(storage = {}, progressRecords = {}) {
     const recoveryCritical = {
-        queue: storage.mbCoordinatorQueue || {},
-        runs: readBucketedMap(storage, 'mbCoordinatorRuns', 'mbCoordinatorRunsLayoutVersion'),
+        queue: storedMap(storage, COORDINATOR_QUEUE_KEY),
+        runs: storedMap(storage, COORDINATOR_RUNS_KEY),
         progressView: {records: progressRecords, total: Object.keys(progressRecords).length},
         // Coordinator events are no longer stored (1442); they live in the flight recorder, so this set is empty.
         events: []
-    }
-    const userMemory = {
-        mbSpaceNukedPosts: readBucketedMap(storage, 'mbSpaceNukedPosts', 'mbSpaceMapLayoutVersion')
     }
     const full = storage
 
     return [
         {name: 'recoveryCritical', state: recoveryCritical},
-        {name: 'userMemory', state: userMemory},
         {name: 'fullStorage', state: full}
     ]
 }

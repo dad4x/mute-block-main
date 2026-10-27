@@ -1,6 +1,18 @@
 #!/usr/bin/env node
 
 const {
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_KEY,
+    COORDINATOR_QUEUE_VIEW_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY,
+    COORDINATOR_RUNS_KEY,
+    OWNED_TAB_STATE_KEY,
+    PROFILE_NUKE_PROGRESS_VIEW_KEY,
+    QUEUE_WAKEUP_METRICS_KEY,
+    SPACE_REGISTRY_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
+const {
     evaluate,
     getCdpConfig,
     getOption,
@@ -8,18 +20,17 @@ const {
     runMain
 } = require('./lib/cdp')
 
+// Plain key names. The page reads each one under its stored name, the layout prefix plus the plain name (storageNamespace.js).
 const DEFAULT_KEYS = [
-    'mbCoordinatorQueueView',
-    'mbCoordinatorQueue',
-    'mbProfileNukeProgressView',
-    'mbCoordinatorRuns',
-    'mbQueueWakeupMetrics',
-    'mbSpaceRegistry',
-    'mbSpacePendingNukedPosts',
-    'mbSpaceNukedPosts',
-    'mbOwnedTabState',
-    'mbCoordinatorPaused',
-    'mbCoordinatorRetryFailedEnabled'
+    COORDINATOR_QUEUE_VIEW_KEY,
+    COORDINATOR_QUEUE_KEY,
+    PROFILE_NUKE_PROGRESS_VIEW_KEY,
+    COORDINATOR_RUNS_KEY,
+    QUEUE_WAKEUP_METRICS_KEY,
+    SPACE_REGISTRY_KEY,
+    OWNED_TAB_STATE_KEY,
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY
 ]
 
 function parseKeys() {
@@ -52,7 +63,7 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function profileStorageReads(keysToRead, includeFullRead) {
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${async function profileStorageReads(keysToRead, includeFullRead, layoutPrefix) {
         function byteSize(value) {
             try {
                 return new TextEncoder().encode(JSON.stringify(value)).length
@@ -75,27 +86,19 @@ runMain(async () => {
             return {label, value, durationMs}
         }
 
-        // Space maps and the run list are stored in 32 buckets each once their layout marker is 2 (1437+). Rebuild the whole map.
-        const BUCKETED_MAP_LAYOUT = {
-            mbSpacePendingNukedPosts: 'mbSpaceMapLayoutVersion',
-            mbSpaceNukedPosts: 'mbSpaceMapLayoutVersion',
-            mbCoordinatorRuns: 'mbCoordinatorRunsLayoutVersion'
+        function storedName(key) {
+            return `${layoutPrefix}${key}`
         }
+
         async function readLogical(key) {
-            const layoutKey = BUCKETED_MAP_LAYOUT[key]
-            if (!layoutKey) return (await chrome.storage.local.get(key))[key]
-            const bucketKeys = Array.from({length: 32}, (_, i) => `${key}.b${i.toString(16).padStart(2, '0')}`)
-            const stored = await chrome.storage.local.get([layoutKey, key, ...bucketKeys])
-            if (stored[layoutKey] !== 2) return stored[key]
-            const merged = {}
-            for (const bucketKey of bucketKeys) Object.assign(merged, stored[bucketKey] || {})
-            return merged
+            const stored = storedName(key)
+            return (await chrome.storage.local.get(stored))[stored]
         }
 
         const bytesInUse = {}
         if(chrome.storage.local.getBytesInUse) {
             for(const key of keysToRead) {
-                const measured = await timed(`bytes:${key}`, () => chrome.storage.local.getBytesInUse(key))
+                const measured = await timed(`bytes:${key}`, () => chrome.storage.local.getBytesInUse(storedName(key)))
                 bytesInUse[key] = {
                     bytes: measured.value,
                     durationMs: Math.round(measured.durationMs * 10) / 10
@@ -132,7 +135,7 @@ runMain(async () => {
             reads: reads.sort((left, right) => right.durationMs - left.durationMs || right.bytes - left.bytes),
             fullRead
         }
-    }})( ${JSON.stringify(keys)}, ${JSON.stringify(includeFull)} )`, 45000)
+    }})( ${JSON.stringify(keys)}, ${JSON.stringify(includeFull)}, ${JSON.stringify(STORAGE_LAYOUT_PREFIX)} )`, 45000)
 
     console.log(JSON.stringify({
         extensionTarget: true,

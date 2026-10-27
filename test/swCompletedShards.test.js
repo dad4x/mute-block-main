@@ -98,16 +98,17 @@ async function main() {
 
     await test('a pruned checkpoint nulls the dropped shards in the slot it overwrites, and reads back as exactly the kept rows', async () => {
         const full = merge(shardRows(0, 3, NOW - 100 * DAY), shardRows(1, 3, NOW - 2 * DAY), shardRows(2, 3, NOW - DAY))
-        const shardOf = (area, key, entry) => completedShards.completedAreaShardOf(area, key, entry)
+        // area-v1: the completed log's shard ids sit in the completed namespace (the switch's rule in sw.js does the same).
+        const shardOf = (area, key, entry) => wal.checkpointAreaShardId(area, completedShards.completedAreaShardOf(area, key, entry))
         const identities = (store, id) => {
             const checkpoint = store.checkpoints?.[id]
             return checkpoint?.format === wal.CHECKPOINT_SHARD_FORMAT
                 ? checkpoint.shards.map(shard => ({index: shard.index, shardStateHash: shard.shardStateHash}))
                 : null
         }
-        const write = (store, state, seq, rememberedSlots) => {
+        const write = (store, state, seq, rememberedSlots, dropShardIds = []) => {
             const written = wal.writeInactiveCheckpoint(store, {queue: {}, completed: state}, {
-                snapshotSeq: seq, snapshotEpoch: 1, createdAt: seq, codec, codecName: codec.name, shardOf, rememberedSlots
+                snapshotSeq: seq, snapshotEpoch: 1, createdAt: seq, codec, codecName: codec.name, shardOf, rememberedSlots, dropShardIds
             })
             const payload = wal.buildSegmentedWalStoragePayload(written.store, {
                 baseKey: BASE, writeCheckpoints: true, generationsToWrite: [written.checkpointId], writePlan: written.writePlan
@@ -120,11 +121,15 @@ async function main() {
         const two = write(one.store, full, 2, {A: identities(one.store, 'A'), B: identities(one.store, 'B')})
         const {drop} = completedShards.selectCompletedShardsToPrune(full, {nowMs: NOW, retentionMs: 90 * DAY, maxRows: 10000})
         const pruned = completedShards.withoutShards(full, drop)
-        const three = write(two.store, pruned, 3, {A: identities(two.store, 'A'), B: identities(two.store, 'B')})
+        const dropShardIds = completedShards.completedDropShardIds(drop)
+        const three = write(two.store, pruned, 3, {A: identities(two.store, 'A'), B: identities(two.store, 'B')}, dropShardIds)
 
         assert.equal(three.id, one.id, 'the prune writes the slot the first checkpoint wrote')
-        const droppedKey = wal.getSegmentedWalCheckpointShardKey(BASE, three.id, 0)
+        const droppedKey = wal.getSegmentedWalCheckpointShardKey(BASE, three.id, wal.checkpointAreaShardId('completed', 0))
         assert.equal(three.payload[droppedKey], null, 'the dropped shard is cleared in that slot')
+        // One delete: the slot's only shard key in this payload is the dropped shard's, so no kept shard is rewritten.
+        const shardKeysInPayload = Object.keys(three.payload).filter(key => /\.s\d+$/.test(key))
+        assert.deepEqual(shardKeysInPayload, [droppedKey], 'the drop writes one shard key and no kept shard')
         const storage = {...one.payload, ...two.payload, ...three.payload}
         const read = wal.readStoredCheckpoint(storage, BASE, three.id)
         assert.equal(read.ok, true, read.reason)
