@@ -452,7 +452,7 @@ The erase is not for routine use. After it the queue has no record of any profil
 
 - Clear Current Work: section 3.5. No pending space-feed records are stored, so none are kept or removed.
 - Clear All Stats (owner rule, 27 Oct; built): completed rows and runs stay in storage. The cutoff (`mbCoordinatorStatsClearedAt`) hides finished rows from the display and from the Terminal and Avg item time cards. The runs display was not checked in full; no runs cutoff was found (section 8).
-- Clear Outliers (dashboard, built): the listed attempts are dismissed, and the stored list and its events are emptied in memory and on disk. The baseline is kept (`applyCoordinatorOutlierClearEntries`). Clear All Stats also resets the outlier baseline to zero and clears its dismissals (`applyCoordinatorOutlierReset`). The owner's 27 Oct note says the stored key keeps its baseline counters; that matches Clear Outliers, not Clear All Stats. Open (section 8).
+- Clear Outliers (dashboard, built): the listed attempts are dismissed, and the stored list and its events are emptied in memory and on disk. The baseline is kept (`applyCoordinatorOutlierClearEntries`). Clear All Stats also resets the outlier baseline to zero and clears its dismissals (`applyCoordinatorOutlierReset`). Decided (owner, 27 Oct): Clear All Stats clears the persistent baseline for now, because outlier detection has problems that are not being solved, and resetting it eases the long-tail effect of big outliers. Clear Outliers keeps the baseline.
 - Clear events: `clear-coordinator-events` is in the authority set of `swBootstrap.js`; `clearCoordinatorEventsRequested` (`sw.js`, about line 22698) is the worker function. The dispatch branch was not traced.
 - Clear terminal stats: `clear-coordinator-terminal-stats` is in the authority set of `swBootstrap.js`. Its handler was not traced.
 - Clear profile state: `clear-profile-nuke-state` (section 3.3).
@@ -490,7 +490,7 @@ Known and accepted: progress is lost on browser restart (session-only, section 2
 - Torn queue shard fallback (`recoverQueueShardFromSession`): built and left in place. It runs only when the disk read names a missing or identity-mismatched queue shard of the active slot, and uses the session copy's record if it verifies. Nothing is written back. Other torn-shard handling is ignored (owner decision; section 4.8).
 - Queue-only checkpoint refused (`refuseQueueOnlyCheckpointFallback`, counter `queueOnlyCheckpointRefused`): built. A queue-only checkpoint, the fallback when the store is missing, is refused when the disk holds completed or runs shards, because it would orphan them. This closes audit item 1 (`audit-2026-10-27.md`).
 - Space classification import (section 5.2): built, one time, in the background, guarded by a marker.
-- Clear rule (section 5.4): built for completed rows and the outlier list. The outlier baseline question is open (section 8).
+- Clear rule (section 5.4): built for completed rows and the outlier list. The outlier baseline reset under Clear All Stats is decided (section 8).
 - Soft-fail retry: the visible line and the header counts are removed from the Dashboard. Built. The stored flag (`COORDINATOR_RETRY_FAILED_ENABLED_KEY`), the worker side (`summarizeSoftFailRetryCounts`, `SOFT_FAIL_RETRY_LIMIT`) and the toggle plumbing stay.
 - Dashboard first load: a spinner ("Loading…", role status) shows until the first state arrives. A first load that fails or gets no answer shows "History load failed". Built; not checked in a browser.
 - Session mirror reduced to the queue (section 4.7), session restart (section 4.8, slice 5) and Recovery A (section 4.8, slice 4): built.
@@ -550,7 +550,7 @@ New test files must be listed in `npm test` and in the parallel runner (`tools/r
 - The queue-bar summary and the outlier write cadence are not described here.
 - Items 8 to 12 of section 6.1 were carried from earlier notes and were not re-read here, except item 12, which was checked in code.
 - The number of run-list and progress writer sites (section 6.1, item 10).
-- Clear All Stats and the outlier baseline: the code resets the baseline to zero (`applyCoordinatorOutlierReset`); the owner's 27 Oct note says the stored key keeps its baseline counters. Owner to decide (section 5.4).
+- Clear All Stats and the outlier baseline: decided (owner, 27 Oct). The persistent baseline is cleared for now (`applyCoordinatorOutlierReset`); outlier detection problems are not being solved now. Section 5.4.
 - The runs display after Clear All Stats: not checked in full; no runs cutoff was found in the code.
 - The dashboard spinner and failed-load text, the removal of the soft-fail display, and the 1.5 space import: checked by reading the code only. Not checked in a browser or on a 1.5 profile (27 Oct).
 
@@ -798,4 +798,4 @@ These are new findings. Earlier text is not rewritten here; each item names the 
 4. Section 1.4 listed space-feed routes that `swBootstrap.js` no longer routes. Corrected.
 5. Section 5.3 step 7 said only the marker is kept. The keep set now holds one more key (section 5.3).
 6. Section 2.5 had no row for the 1.5 import marker. Added.
-7. Open conflict: Clear All Stats resets the outlier baseline to zero (`applyCoordinatorOutlierReset`). The owner's 27 Oct note says the stored key keeps its baseline counters. See section 5.4 and section 8.
+7. Decided: Clear All Stats resets the outlier baseline to zero (`applyCoordinatorOutlierReset`), for now (owner, 27 Oct). See section 5.4.

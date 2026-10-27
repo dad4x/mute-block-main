@@ -73,7 +73,7 @@ Entries marked **parked** are not dead. The owner has set them aside until a sta
 
 - **Recovery B**: not parked. It is Recovery A, built. See the parked section above.
 - **Runs (S3, S10)**: the bucket layout is excised (commit `8d08054`), with no import. Built.
-- **Clear**: completed rows and runs are not deleted from storage by Clear All Stats; the outlier rows are cleared on disk and in session. Open: the code resets the outlier baseline to zero under Clear All Stats, and the owner's note says the stored key keeps its baseline (architecture.md section 8).
+- **Clear**: completed rows and runs are not deleted from storage by Clear All Stats; the outlier rows are cleared on disk and in session. Decided (owner, 27 Oct): Clear All Stats resets the outlier baseline to zero for now (architecture.md section 8).
 - **Soft-fail**: the retry line and the header counts are removed from the Dashboard (built). The stored flag, the worker side and the toggle plumbing stay.
 - **Shadow removal (S8)**: built (commit `8e146cc`).
 - **Keep mechanism (S12)**: the keep set holds one key, the 1.5 import marker (27 Oct).
