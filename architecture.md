@@ -6,6 +6,45 @@ Review of current gaps: [codex-mb-review-1.md](codex-mb-review-1.md). Its items 
 
 How to read the references: function names are the anchors. Line numbers are given where they are stable enough to help, and they are as of HEAD `0209f52`. They drift with edits, so search by name if a line is off.
 
+Terminology: "checkpoint" and "snapshot" are used interchangeably in this document, in the code and in the dashboard for the same thing: the durable state folded from the WAL into one of the two checkpoint slots (A and B), written as per-area shards. A few point-in-time reads (for example the dashboard's own snapshot of the queue) are also called snapshots. We use the two words interchangeably, and we mildly regret it; the choice to settle on one is open (see section 8). Where a name matters, the code identifier is the authority.
+
+Terms (27 Oct; one line each, as the code and the planning note use them):
+- **Coordinator:** the role that decides queue state. Minimal form: it runs the scheduling state machine. Current thinking (owner, 27 Oct): it also holds the authoritative in-memory copies it needs, and it calls out for browser interaction (the background window and tabs) and for persistent storage. Those three are co-located today, in the service worker. The historic name for the queue Worker (planning.md, Terms).
+- **Service worker:** Chrome's background script, `shared/js/sw.js`, where the Coordinator runs today. The browser can stop it at any time. "Service worker" names only that script; do not write "the service worker owns the queue".
+- **Queue Worker:** the planned host for the Coordinator, outside the service worker. Not built and not decided. Nothing may move queue work out of the service worker until worker-host failover is designed (section 6.2, item 16).
+- **Dashboard:** the extension page `coordinator.html` (with `coordinator.js`). It is a page, not the Coordinator. Also the names of the pages the user sees: Dashboard and Preferences.
+- **Browser side / storage side:** the two parts the Coordinator calls out to: the browser (open, focus and close the window and tabs, and run actions in them) and storage (queue log, checkpoints, stored settings). Both run in the service worker today.
+- **Authoritative state:** state the Coordinator decides from (queue rows, completed rows, runs; section 2.1). **Other state:** settings, the space list, the outlier list, and session copies or caches (sections 2.2 and 2.3); owned by the module that writes them, not the Coordinator.
+- **Content script:** runs on each Quora page, holds page-local state, and reports to the Coordinator. It holds no authoritative queue state.
+- **Background window, background tab, background work:** the browser window and tabs the extension uses to run queued actions, and the work done in them. This is the user-facing name, chosen by the owner (27 Oct): plain words for a user. "Work" alone is overloaded and is not used for these; "hidden" is not used either, because it means something else to the browser. The code name is still "worker window" (`worker` in the code and settings); the docs use "background window". Not the Queue Worker.
+- **Naming rule (owner, 27 Oct):** user-facing names describe what the user sees, not which part of the code or which browser context does it. Tooltips and labels do not say "service worker", "Coordinator", "queue Worker", "storage" or "host", so that the Coordinator, the browser side and the storage side can later run in different places without changing the words the user reads. The reason for the vocabulary work is that decomposition.
+- **Profile:** a Quora profile, identified by its URL.
+- **Target:** the thing being acted against: a space, a profile found in a post, or something identified by something in a post (for example Instant Block, where a post's poster is the target profile).
+- **Candidate:** a profile that might be queued for later action.
+- **Post:** a post in a space that may identify several targets; or the queueing of a profile for action.
+- **Row:** an item in the queue, the history, or a run listing.
+- **Result:** the completion status of a profile the extension has acted upon.
+- **Item:** usually what is in a row, whatever it may be.
+- **Skipped:** an error result: the desired action could not be taken, for one reason or another.
+- **Unblock:** unblock and unmute together. Also called a **pardon**.
+- **Host:** a machine, VM or address. The owner does not use "host" for the Queue Worker; do not write "queue host" in docs. The worker-host experiments (`experiments/worker-host/`) keep their folder name only.
+- **Queue:** the durable set of queued and active rows, stored in the WAL (section 4). **Row:** one queued profile action in the queue, with its status and attempt.
+- **Attempt:** one try at a row, identified by `attemptId`. A retried row has a new attempt.
+- **Run:** one batch the user started from a page, identified by `runId` (a Nuke 'Em batch, a Collect run, or a space feed run). **Runs** (the runs area): the record of those batches, capped at 700 (section 4.6).
+- **Enqueue:** sending rows to the queue. **Enqueue mark:** the in-memory note on the page that a profile has just been sent (queueing) or is being nuked (nuking). Marks are not stored.
+- **Pending:** a profile that the queue or a settled batch still holds. Derived from the queue, not stored.
+- **Completed (row, area, count):** a finished row, kept in the completed area of the WAL. "Completed" replaces "terminal" in user-visible text (27 Oct).
+- **Space feed / space page:** a Quora space's posts, and the page that lists them. **Search page:** a Quora people search (`type=profile`), and the page that lists its profile rows.
+- **Profile:** a Quora profile page, identified by its normalised URL (the href).
+- **Collect:** the page action that scrolls and stages more candidates; **Nuke 'Em:** the action that sends the staged candidates to the queue.
+- **Block:** the action of blocking (muting) a profile on Quora; a **manual block** is one the user makes on a profile page.
+- **Outlier:** a finished row whose time is far above the running average; kept with its recorder events (section 10.7).
+- **WAL:** the write-ahead log of queue changes (section 4.1). **Shard:** one stored piece of a checkpoint. **Segment:** one WAL append. **Manifest:** the record of which shards and segments a checkpoint holds.
+- **Session storage:** browser memory for the extension, cleared when the browser restarts (section 2.3). **Local storage:** the disk copy. Erase clears it; Clear changes it only for outlier entries (section 5.4).
+- **Flight recorder:** the in-memory diagnostic log of recent events, with a session copy (section 2.3).
+- **Erase:** the destructive reset of all stored history (section 5.3). **Clear:** resets what the dashboard shows (the cutoff for history, completed rows and runs; section 5.4), and it also deletes the stored outlier entries, on disk and in the session copy. It does not delete completed rows or runs from storage; space management and Erase do that.
+- **Namespace prefix:** the `v1.6.` prefix on stored keys (section 5.1). **Unprefixed key:** a key written by an older version, which 1.6 does not read.
+
 Contents: Overview; 1 Layers and rules; 2 State map; 3 Write paths; 4 Checkpoint and shard layout; 5 Storage namespace and erase rules; 6 Known exceptions and planned work; 7 Metrics and tests; 8 Not verified in this pass; 9 Every stored key; 10 Data structures; 11 Session storage against its quota; 12 Corrections found in the 26 Oct enumeration. Sections 9 to 12 were added on 2026-10-26 against the working tree at package version 1.6.1650 (working tree ahead of HEAD `8e146cc`). Sections 9 to 12 were checked by reading code, not by running the extension.
 
 ## Overview
@@ -703,11 +742,17 @@ Built 27 Oct (decided 26 Oct): one manifest indexes the shard sets, one per area
 
 ### 10.7 Outlier record, entry and recorder events
 
-- Record, `mbCoordinatorOutliers`: `entries` (at most 50, newest kept; `keepNewestCoordinatorOutlierEntries`), `dismissedKeys`, `baseline` (`n`, mean, `M2`, from `IncrementalStats`). `normalizeCoordinatorOutliersRecord` (`swCoordinatorOutliers.js` 154).
-- Entry, `normalizeOutlierEntry` (130): `rowKey`, `targetUrl`, `runId`, `attemptId`, `attemptNumber`, `actionKind`, `status`, `outcome`, `activeAt`, `terminalAt`, `final` (true for listed entries), `thresholdReason`, `meanDurationMsAtCapture`, `stdDevMsAtCapture`, `capturedAt`, `events` (array).
+- Index, `mbCoordinatorOutliers` (`layout: 2`, 27 Oct): `entries` (summaries only, at most 50, newest last, each with its `slot`; no events), `dismissedKeys`, `baseline` (`n`, mean, `M2`, from `IncrementalStats`). The index is the only outlier key in the session mirror. `normalizeCoordinatorOutliersRecord` (`swCoordinatorOutliers.js`).
+- Entry bodies, one key per outlier (27 Oct): `mbCoordinatorOutlierEntry.00` to `.49`, named by slot, not by a hash. Each body holds `rowKey`, `attemptId`, `slot`, `events` (newest 100) and `eventsDropped`. A new outlier takes the slot of the one it displaces in the same write, so no key is removed and at most 50 body keys exist. Bodies are not in the session mirror.
+- Archive write (27 Oct): `issueCoordinatorOutliersWrite` (`sw.js`) sends the index and only the bodies whose slot content changed, with `null` for each slot no longer listed, in one `persistCoordinator` stored part. `diffCoordinatorOutlierBodies` computes the changed bodies. Settled through `settleCoordinatorOutliersWrite`. This replaces the whole-record rewrite that made each archive write up to about 15 MB (live, 649 writes, 9.9 GB, queue waits up to 9.8 s).
+- Event cap (27 Oct): at most 100 events per outlier (`OUTLIER_MAX_EVENTS_PER_ENTRY`, `tunables.js`). When an outlier would exceed 100, the newest 100 are kept and `eventsDropped` counts the rest (`capCoordinatorOutlierEvents`, `swCoordinatorOutliers.js`).
+- Migration (27 Oct): an index without `layout: 2` is the old single-record layout. Load sets an owed full write, which writes every body once; the first saved full write clears the flag and counts `outlier.migrated`. A failed migration leaves the old record on disk and retries on the next write or start (`outlier.migrationFailed`). The migration runs once; a second start migrates nothing.
+- Load and serve (27 Oct): the worker reads the bodies from disk in one read per worker start and keeps them in memory. Refresh reads no disk. The dashboard's expand is served from memory. A body whose slot, `rowKey` or `attemptId` does not match the index is served with no events and counted as `outlier.bodyMissing`.
+- Known edge (27 Oct): a failed write followed by a saved one can list an attempt whose body is not yet on disk until the correcting write. The read marks it missing and serves no events. Not verified in a browser.
+- Entry (the body and the index summary), `normalizeOutlierEntry`: `rowKey`, `targetUrl`, `runId`, `attemptId`, `attemptNumber`, `actionKind`, `status`, `outcome`, `activeAt`, `terminalAt`, `final` (true for listed entries), `thresholdReason`, `meanDurationMsAtCapture`, `stdDevMsAtCapture`, `capturedAt`, `events` (array).
 - Built: `makeCoordinatorOutlierEntry` (175) from a finished row. `applyCoordinatorOutlierFinishedRows` (238) judges each finished row. Thresholds in `tunables.js`: `OUTLIER_FLOOR_MS` 45,000 (line 47); `OUTLIER_STDDEV_MULTIPLIER` 2.5; `OUTLIER_MIN_SAMPLES_FOR_STDDEV` 5; `OUTLIER_MIN_RECORD_MS` 3,500 (line 50).
-- Recorder events: `collectCoordinatorOutlierRecorderEvents` (223) takes flight recorder events that fall in the row's scope (`makeCoordinatorOutlierScope`, 202; `isCoordinatorOutlierRecorderEventInScope`, 212) and stores them in `entry.events`. Span event kinds: `OUTLIER_SPAN_EVENT_KINDS` (line 29). No per-entry event cap found in code (unverified).
-- Read: `readCoordinatorOutliersRecordFromStorage` (sw.js 6630) and the dashboard.
+- Recorder events: `collectCoordinatorOutlierRecorderEvents` takes flight recorder events that fall in the row's scope (`makeCoordinatorOutlierScope`; `isCoordinatorOutlierRecorderEventInScope`) and stores them in `entry.events`, newest 100 (27 Oct). Span event kinds: `OUTLIER_SPAN_EVENT_KINDS`.
+- Read: `readCoordinatorOutliersRecordFromStorage` (`sw.js`, index then bodies once per start) and the dashboard.
 
 ### 10.8 Flight recorder entry
 
@@ -758,7 +803,7 @@ Session-only by owner decision (26 Oct); see section 9.3. The code writes these 
 | Profile progress view                                                                         | At most 1,200 records                                                                                            | sw.js 738                                     |
 | Profile progress shards (256 names)                                                           | Full records, one per profile href. No count cap in code. Grows with the profiles processed.                     | `swProfileNukeProgress.js`                    |
 | WAL session mirror (meta, active manifest, the queue's shards, committed segments of the active slot) | Built 27 Oct: queue shards and WAL only, for area-v1 manifests (a shared-layout manifest keeps every shard). Completed and runs shards are not mirrored. Queue rows have no count cap, so the mirror follows the queue. | `sw.js` ~7550-7642; `walSnapshotStore.js` (`getQueueMirrorKeys`) |
-| Outlier session copy | At most 50 outlier entries (outlier events not capped in code). Runs are not in session (27 Oct). | `sw.js` ~7386 |
+| Outlier session copy | Index only: at most 50 outlier summaries. Bodies stay on disk (27 Oct); events capped at 100 per outlier. Runs are not in session (27 Oct). | `sw.js` ~7386 |
 | Flight recorder snapshot                                                                      | At most 2,000 entries; strings at most 240 characters, URLs at most 500                                          | `tunables.js` 16; `swflightRecorder.js` 30-31 |
 | Markers, stamps, pending marker, surface state, timing cache, erase generation, legacy marker | One object each (timing cache size not traced)                                                                   | Section 9.3                                   |
 

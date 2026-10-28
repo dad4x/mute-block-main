@@ -10,19 +10,32 @@
 //   - a flagged row is recorded only at OUTLIER_MIN_RECORD_MS or more (owner, 24 Oct). Every finished row is still pushed;
 //   - a recorded entry keeps the flight recorder events that belong to it: every event of its profile or row, and every storage
 //     operation (write, update, checkpoint switch) inside its span, whatever its profile. Nothing else. They are copied once, when the
-//     row is terminal, and kept until the entry leaves the list;
+//     row is terminal, and kept until the entry leaves the list. At most OUTLIER_MAX_EVENTS_PER_ENTRY are kept: the newest (27 Oct);
 //   - the stored list keeps its newest OUTLIER_MAX_ENTRIES entries;
 //   - Clear Outliers dismisses the listed attempts and keeps the baseline; Clear All Stats resets the baseline and the dismissals.
-// The stored record is {entries, baseline: {n, mean, M2}, dismissedKeys}. sw.js persists it under its own namespace key, in the same
-// door write as the archive that pushes the row, so it survives a worker restart. This module does no storage I/O and reads no clock:
-// the caller passes the times, the recorder events and the scan of the recorder.
+//
+// Storage layout (27 Oct). The index, under COORDINATOR_OUTLIERS_KEY, is {layout: 2, entries, baseline: {n, mean, M2}, dismissedKeys}.
+// Each index entry is the entry's fields without its events, with its slot. Each listed entry's body (its fields, its slot and its events)
+// is under COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX plus its two-digit slot. A slot holds at most one listed entry. A new entry takes a free
+// slot, so the write that adds an entry and drops the oldest one writes the new body into the dropped entry's slot: no key is removed by
+// a write. Clear and Clear All Stats write null into the slots they empty, in the same write as the index. The 1.6 single-record layout
+// (no layout marker, events inside the entries) is read by readCoordinatorOutlierIndex and migrated by the worker (sw.js).
+//
+// This module does no storage I/O and reads no clock: the caller passes the times, the recorder events and the scan of the recorder.
 const {
     OUTLIER_FLOOR_MS,
     OUTLIER_MAX_ENTRIES,
+    OUTLIER_MAX_EVENTS_PER_ENTRY,
     OUTLIER_MIN_RECORD_MS,
     OUTLIER_MIN_SAMPLES_FOR_STDDEV,
     OUTLIER_STDDEV_MULTIPLIER
 } = require('./tunables')
+const {COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX} = require('./storageKeys')
+
+// The layout marker of the index this build writes. An index without it is the 1.6 single-record layout.
+const OUTLIER_INDEX_LAYOUT = 2
+// The entry slots: one per listed entry at most.
+const OUTLIER_ENTRY_SLOT_COUNT = OUTLIER_MAX_ENTRIES
 
 // The storage kinds of the flight recorder: every disk write, every storage update (its settle record and its timeout), and every queue
 // checkpoint switch. A storage kind belongs to an outlier by its span, whatever its profile, because it can perturb the row. These are
@@ -130,9 +143,23 @@ function getCoordinatorOutlierThresholdReason(stats, durationMs) {
     return exceedsAbsolute && exceedsStdDev ? 'both' : exceedsAbsolute ? 'absolute' : 'stddev'
 }
 
-// The persisted fields of one entry, in a fixed order. durationMs is not persisted: it is computed when the list is served.
+// The stored key of an entry slot: the entry prefix and the slot as two digits.
+function getCoordinatorOutlierEntryKey(slot = 0) {
+    return `${COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX}${String(toInteger(slot)).padStart(2, '0')}`
+}
+
+// The newest OUTLIER_MAX_EVENTS_PER_ENTRY events of an entry (its events are oldest first), and how many older ones the cap dropped.
+function capCoordinatorOutlierEvents(events = []) {
+    const kept = events.length > OUTLIER_MAX_EVENTS_PER_ENTRY ? events.slice(-OUTLIER_MAX_EVENTS_PER_ENTRY) : events
+    return {events: kept, dropped: events.length - kept.length}
+}
+
+// The persisted fields of one entry, in a fixed order. durationMs is not persisted: it is computed when the list is served. slot is -1
+// until the entry is given one (assignCoordinatorOutlierSlots). eventsDropped counts the events the cap has dropped from this entry.
 function normalizeOutlierEntry(entry = {}) {
+    const capped = capCoordinatorOutlierEvents(Array.isArray(entry.events) ? entry.events.filter(event => event && typeof event === 'object') : [])
     return {
+        slot: Number.isInteger(entry.slot) ? entry.slot : -1,
         rowKey: toText(entry.rowKey),
         targetUrl: toText(entry.targetUrl),
         runId: toText(entry.runId),
@@ -148,21 +175,42 @@ function normalizeOutlierEntry(entry = {}) {
         meanDurationMsAtCapture: toNumber(entry.meanDurationMsAtCapture),
         stdDevMsAtCapture: toNumber(entry.stdDevMsAtCapture),
         capturedAt: toInteger(entry.capturedAt),
-        events: Array.isArray(entry.events) ? entry.events.filter(event => event && typeof event === 'object') : []
+        eventsDropped: toInteger(entry.eventsDropped) + capped.dropped,
+        events: capped.events
     }
 }
 
+// Gives each entry a slot: an entry keeps its slot when it has a valid one no earlier entry has; every other entry takes the lowest free
+// slot, in list order. Pure: the input is not changed.
+function assignCoordinatorOutlierSlots(entries = []) {
+    const used = new Set()
+    const kept = entries.map(entry => {
+        const slot = Number.isInteger(entry.slot) ? entry.slot : -1
+        if(slot >= 0 && slot < OUTLIER_ENTRY_SLOT_COUNT && !used.has(slot)) {
+            used.add(slot)
+            return entry
+        }
+        return {...entry, slot: -1}
+    })
+    let next = 0
+    return kept.map(entry => {
+        if(entry.slot >= 0) return entry
+        while(used.has(next)) next += 1
+        used.add(next)
+        return {...entry, slot: next}
+    })
+}
+
 // Any stored value becomes a well-formed record: a missing or malformed value is an empty list with an empty baseline. A record written
-// before the accumulator has no n, mean or M2, so its baseline starts at zero. A record written before the recorder events existed has
-// no events, so its entries read as empty.
+// before the accumulator has no n, mean or M2, so its baseline starts at zero. An entry with no events reads as empty. Every entry has a slot.
 function normalizeCoordinatorOutliersRecord(value = null) {
     const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
     const entries = Array.isArray(source.entries) ? source.entries : []
     const dismissedKeys = Array.isArray(source.dismissedKeys) ? source.dismissedKeys : []
     return {
-        entries: entries
+        entries: assignCoordinatorOutlierSlots(entries
             .filter(entry => entry && typeof entry === 'object')
-            .map(entry => normalizeOutlierEntry(entry)),
+            .map(entry => normalizeOutlierEntry(entry))),
         baseline: new IncrementalStats(source.baseline).state(),
         dismissedKeys: dismissedKeys.map(key => toText(key)).filter(Boolean)
     }
@@ -175,7 +223,77 @@ function toCoordinatorOutlierBaseRecord(value = null) {
     return {...record, entries: record.entries.filter(entry => entry.final)}
 }
 
-// The stored entry for a row, from the row's fields. thresholdReason and the baseline the row was judged against are given by the caller.
+// Reads the stored index. An index of this layout (the layout marker) has its entries without events: attachCoordinatorOutlierBodies adds
+// them from the entry keys. Any other stored value with content is the 1.6 single-record layout: legacy is true, its entries carry their
+// events, and droppedEvents counts the events its entries lose to the cap. A missing value is an empty list, not legacy.
+function readCoordinatorOutlierIndex(value = null) {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : null
+    const legacy = source !== null && source.layout !== OUTLIER_INDEX_LAYOUT
+    const record = toCoordinatorOutlierBaseRecord(source)
+    return {
+        record,
+        legacy,
+        droppedEvents: legacy ? record.entries.reduce((sum, entry) => sum + entry.eventsDropped, 0) : 0
+    }
+}
+
+// The index as written: the entries without their events (their slot stays), the baseline and the dismissals. Pure.
+function makeCoordinatorOutlierIndex(record = null) {
+    const next = toCoordinatorOutlierBaseRecord(record)
+    return {
+        layout: OUTLIER_INDEX_LAYOUT,
+        entries: next.entries.map(({events, eventsDropped, ...summary}) => summary),
+        baseline: next.baseline,
+        dismissedKeys: next.dismissedKeys
+    }
+}
+
+// The entries of a record with their events, from the bodies read under their slot keys (bodies: the stored value of each key, or null). A
+// body is used only when its slot, row and attempt are those of the entry, so a body another write has replaced is never attached. An entry
+// without a usable body is kept with no events, and missing counts those entries. Pure.
+function attachCoordinatorOutlierBodies(record = null, bodies = {}) {
+    const next = toCoordinatorOutlierBaseRecord(record)
+    let missing = 0
+    const entries = next.entries.map(entry => {
+        const body = bodies?.[getCoordinatorOutlierEntryKey(entry.slot)]
+        const usable = Boolean(body) && typeof body === 'object' &&
+            body.slot === entry.slot && body.attemptId === entry.attemptId && body.rowKey === entry.rowKey
+        if(!usable) {
+            missing += 1
+            return entry
+        }
+        return normalizeOutlierEntry({...entry, events: body.events, eventsDropped: body.eventsDropped})
+    })
+    return {record: {...next, entries}, missing}
+}
+
+// The entry keys one door write changes, given the record before it and after it. A listed entry whose body is new or differs from its body
+// before is written under its slot key; with options.all, every listed entry's body is written (a write made while the disk still holds the
+// single-record layout needs all of them). A slot the after-record no longer lists is cleared (null). eventsDropped counts the events the
+// cap dropped from the bodies that changed. Returns {writes, clears, entryWrites, bytes, droppedEvents}. Pure.
+function diffCoordinatorOutlierBodies(before = null, after = null, options = {}) {
+    const beforeEntries = toCoordinatorOutlierBaseRecord(before).entries
+    const afterEntries = toCoordinatorOutlierBaseRecord(after).entries
+    const beforeTextBySlot = new Map(beforeEntries.map(entry => [entry.slot, JSON.stringify(entry)]))
+    const afterSlots = new Set(afterEntries.map(entry => entry.slot))
+    const writes = {}
+    let bytes = 0
+    let droppedEvents = 0
+    for(const entry of afterEntries) {
+        const text = JSON.stringify(entry)
+        const changed = beforeTextBySlot.get(entry.slot) !== text
+        if(!changed && !options.all) continue
+        writes[getCoordinatorOutlierEntryKey(entry.slot)] = entry
+        bytes += text.length
+        if(changed) droppedEvents += entry.eventsDropped
+    }
+    const clears = beforeEntries
+        .filter(entry => !afterSlots.has(entry.slot))
+        .map(entry => getCoordinatorOutlierEntryKey(entry.slot))
+    return {writes, clears, entryWrites: Object.keys(writes).length, bytes, droppedEvents}
+}
+
+// The entry stored for a row, from the row's fields. thresholdReason and the baseline the row was judged against are given by the caller.
 function makeCoordinatorOutlierEntry(item = {}, fields = {}) {
     return normalizeOutlierEntry({
         rowKey: getCoordinatorOutlierRowKey(item),
@@ -254,15 +372,16 @@ function collectCoordinatorOutlierRecorderEvents(rows = [], scanRecorder = () =>
 }
 
 // Judges and pushes finished rows, in the order given. Each row is judged against the baseline before its own push; a flagged row is
-// stored as a final entry (a row already stored under its attempt is updated in place); then its duration is pushed. A row without a
-// positive duration is neither judged nor pushed. A dismissed attempt is pushed but not listed. recorderEvents is the Map from
-// collectCoordinatorOutlierRecorderEvents: a recorded entry takes the events of its row. Returns the next record; the input is not changed.
+// stored as a final entry (a row already stored under its attempt is updated in place, and keeps its slot); then its duration is pushed. A
+// row without a positive duration is neither judged nor pushed. A dismissed attempt is pushed but not listed. recorderEvents is the Map from
+// collectCoordinatorOutlierRecorderEvents: a recorded entry takes the events of its row. The entries past OUTLIER_MAX_ENTRIES are dropped
+// from the oldest end, and the new entries take free slots. Returns the next record; the input is not changed.
 function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0, recorderEvents = new Map()) {
     const now = toInteger(nowMs)
     const next = normalizeCoordinatorOutliersRecord(record)
     const stats = new IncrementalStats(next.baseline)
     const dismissed = new Set(next.dismissedKeys)
-    const entries = next.entries
+    const entries = [...next.entries]
     for(const item of rows) {
         const durationMs = getCoordinatorOutlierFinishedDuration(item)
         if(durationMs <= 0) continue
@@ -277,14 +396,24 @@ function applyCoordinatorOutlierFinishedRows(record = null, rows = [], nowMs = 0
                 capturedAt: now,
                 events: recorderEvents.get(key) || []
             })
-            const existing = entries.find(candidate => makeCoordinatorOutlierDismissalKey(candidate.rowKey, candidate.attemptId) === key)
-            if(existing) Object.assign(existing, {...entry, capturedAt: existing.capturedAt, events: entry.events.length ? entry.events : existing.events})
+            const index = entries.findIndex(candidate => makeCoordinatorOutlierDismissalKey(candidate.rowKey, candidate.attemptId) === key)
+            if(index >= 0) {
+                const existing = entries[index]
+                const hasEvents = entry.events.length > 0
+                entries[index] = {
+                    ...entry,
+                    slot: existing.slot,
+                    capturedAt: existing.capturedAt,
+                    events: hasEvents ? entry.events : existing.events,
+                    eventsDropped: hasEvents ? entry.eventsDropped : existing.eventsDropped
+                }
+            }
             else entries.push(entry)
         }
         stats.push(durationMs)
     }
     return {
-        entries: keepNewestCoordinatorOutlierEntries(entries),
+        entries: assignCoordinatorOutlierSlots(keepNewestCoordinatorOutlierEntries(entries)),
         baseline: stats.state(),
         dismissedKeys: [...dismissed]
     }
@@ -296,7 +425,7 @@ function serveCoordinatorOutliers(record = null) {
     const normalized = normalizeCoordinatorOutliersRecord(record)
     return normalized.entries
         .filter(entry => entry.final)
-        .map(({events, ...entry}) => ({...entry, durationMs: entry.terminalAt - entry.activeAt, eventCount: events.length}))
+        .map(({events, eventsDropped, slot, ...entry}) => ({...entry, durationMs: entry.terminalAt - entry.activeAt, eventCount: events.length}))
 }
 
 // The recorder events kept with one listed outlier, by its row key and attempt. An unknown attempt has none.
@@ -334,20 +463,28 @@ function getCoordinatorOutliersRecordSignature(value = null) {
 
 module.exports = {
     IncrementalStats,
+    OUTLIER_ENTRY_SLOT_COUNT,
+    OUTLIER_INDEX_LAYOUT,
     OUTLIER_SPAN_EVENT_KINDS,
     applyCoordinatorOutlierClearEntries,
     applyCoordinatorOutlierFinishedRows,
     applyCoordinatorOutlierReset,
+    attachCoordinatorOutlierBodies,
+    capCoordinatorOutlierEvents,
     collectCoordinatorOutlierRecorderEvents,
+    diffCoordinatorOutlierBodies,
     getCoordinatorOutlierDismissalKey,
+    getCoordinatorOutlierEntryKey,
     getCoordinatorOutlierEvents,
     getCoordinatorOutlierFinishedDuration,
     getCoordinatorOutlierTargetUrl,
     getCoordinatorOutliersRecordSignature,
     isCoordinatorOutlierRecorderEventInScope,
     makeCoordinatorOutlierDismissalKey,
+    makeCoordinatorOutlierIndex,
     normalizeCoordinatorOutliersRecord,
     pruneCoordinatorOutlierDismissals,
+    readCoordinatorOutlierIndex,
     serveCoordinatorOutliers,
     toCoordinatorOutlierBaseRecord
 }

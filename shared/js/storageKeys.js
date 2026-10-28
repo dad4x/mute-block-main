@@ -47,7 +47,10 @@ module.exports = {
     FLIGHT_RECORDER_SESSION_KEY: 'mbFlightRecorderSnapshot',
     QUEUED_ACTION_SURFACE_STATE_KEY: 'mbQueuedActionSurfaceState',
     COORDINATOR_STATS_CLEARED_AT_KEY: 'mbCoordinatorStatsClearedAt',
+    // The outlier index (the list, the baseline and the dismissals). Its entry bodies are under COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX plus a
+    // two-digit slot number (27 Oct; swCoordinatorOutliers.js). The index keeps this name, so the 1.6 single-record layout is read from it.
     COORDINATOR_OUTLIERS_KEY: 'mbCoordinatorOutliers',
+    COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX: 'mbCoordinatorOutlierEntry.',
     COORDINATOR_TAB_KEY: 'mbCoordinatorTabId',
     COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX: 'mbCoordinatorContentQueueIndexShard.',
     PAUSE_DIAGNOSTIC_SNAPSHOT_KEY: 'mbPauseDiagnosticSnapshot',

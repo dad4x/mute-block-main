@@ -64,6 +64,8 @@ const lanes = [
     commandTimeoutMs: 30000,
     commands: [
       ['node', 'test/p1-contract.test.js'],
+      ['node', 'test/candidateMarks.test.js'],
+      ['node', 'test/candidateCollect.test.js'],
       ['node', 'test/colorTokens.test.js'],
       ['node', 'test/terminalOwnedTabScope.test.js'],
       ['node', 'test/swStorageLane.test.js'],

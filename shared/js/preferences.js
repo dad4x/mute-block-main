@@ -312,7 +312,7 @@ eraseBlockHistoryButton?.addEventListener('click', async () => {
     if(eraseStatus) {
         eraseStatus.hidden = false
         eraseStatus.textContent = result?.scheduled
-            ? 'Erase scheduled. The extension is reloading, which stops its worker; the erase runs as it starts.'
+            ? 'Erase scheduled. The extension is reloading, which stops its background work; the erase runs as it starts.'
             : `Not erased. ${ERASE_REFUSAL_MESSAGES[result?.reason] || 'Something went wrong. Nothing was erased.'}`
     }
     if(!result?.scheduled) eraseBlockHistoryButton.disabled = false

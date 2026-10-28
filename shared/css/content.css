@@ -237,7 +237,9 @@
     right: 18px;
     z-index: 2147483646;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     gap: 8px;
     pointer-events: auto;
 }
@@ -435,6 +437,16 @@
     color: #374151;
     white-space: nowrap;
     align-self: center;
+}
+
+/* The Considered line and its cause under the Collect N More button (owner, 27 Oct). Each takes its own row of the toolbar, right-aligned under the button. */
+.mb-ext_profile-search-considered,
+.mb-ext_profile-search-considered-cause {
+    flex-basis: 100%;
+    text-align: right;
+    font-size: 12px;
+    color: var(--mb-grey-600);
+    white-space: nowrap;
 }
 
 .mb-ext_space-feed-status-host {

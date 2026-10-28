@@ -1,19 +1,12 @@
 #!/usr/bin/env node
 
-const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
-
-// The stored names of the queue and the run list: the layout prefix plus the plain key name (storageNamespace.js).
-const STORED_NAMES = {
-    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
-    runs: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RUNS_KEY}`
-}
-
+// A summary of the queue and runs as the dashboard shows them. The queue and run list are not under plain keys any more (WAL and worker
+// memory), so this reads the dashboard page's rendered counts and its open profile tabs. It sends no message and writes nothing.
 const {
     evaluate,
     getCdpConfig,
     getOption,
     getTargets,
-    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     runMain
 } = require('./lib/cdp')
@@ -22,125 +15,40 @@ runMain(async () => {
     const config = await resolveCdpConfig(getCdpConfig())
     const needle = getOption('needle', process.env.MB_QUEUE_NEEDLE || '').toLowerCase()
     const targets = await getTargets(config)
-    const serviceWorker = targets.find(target => target.type === 'service_worker' && target.url.includes(config.extensionId))
-    if(!serviceWorker) {
-        console.log(JSON.stringify({serviceWorker: false}, null, 2))
+    const dashboardUrl = `chrome-extension://${config.extensionId}/coordinator.html`
+    const extensionTarget = targets.find(target => target.type === 'page' && target.url === dashboardUrl) ||
+        targets.find(target => target.type === 'page' && (target.url || '').startsWith(`chrome-extension://${config.extensionId}/`))
+    const profileTabs = targets
+        .filter(target => target.type === 'page' && /^https:\/\/www\.quora\.com\/profile\//i.test(target.url || ''))
+        .map(target => ({title: target.title || '', url: target.url || ''}))
+
+    if(!extensionTarget) {
+        console.log(JSON.stringify({extensionTarget: false}, null, 2))
         process.exitCode = 1
         return
     }
 
-    const progressRecords = await readProfileNukeProgressFromWorker(config)
-    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function inspectQueue(needle, progressRecords, names) {
-        const storage = await chrome.storage.local.get({
-            [names.queue]: {},
-            [names.runs]: {}
-        })
-        const queue = storage[names.queue] || {}
-        const runs = storage[names.runs] || {}
-        const tabs = await chrome.tabs.query({})
-        const profileTabs = tabs.filter(tab => /^https:\/\/www\.quora\.com\/profile\//i.test(tab.url || ''))
-        const runtimeQueuedActions = typeof queuedTabActions !== 'undefined'
-            ? queuedTabActions.map(action => ({
-                url: action.url || action.profileHref || action.requestedUrl || '',
-                targetUrl: action.targetUrl || '',
-                requestedUrl: action.requestedUrl || '',
-                ownerTabId: action.ownerTabId || 0,
-                tabAction: action.tabAction || '',
-                action: action.action || '',
-                runId: action.runId || '',
-                sourceType: action.sourceType || action?.source?.type || '',
-                sourcePage: action?.source?.pageUrl || ''
-            }))
-            : []
-        const runtimeActiveTabs = typeof activeQueuedTabs !== 'undefined'
-            ? Array.from(activeQueuedTabs)
-            : []
-        const runtimeOwned = typeof ownedTabIdsByParent !== 'undefined'
-            ? Array.from(ownedTabIdsByParent.entries()).map(([parentTabId, childIds]) => ({
-                parentTabId,
-                childIds: Array.from(childIds || [])
-            }))
-            : []
-        const matchesNeedle = item => {
-            if(!needle) return true
-            return [
-                item?.source?.pageUrl || '',
-                item?.source?.spaceKey || '',
-                item?.source?.label || '',
-                item?.sourceType || '',
-                item?.source?.type || '',
-                item?.runId || '',
-                item?.targetProfileHref || '',
-                item?.requestedUrl || ''
-            ].join('\n').toLowerCase().includes(needle)
-        }
-        const rows = Object.entries(queue)
-            .filter(([, item]) => matchesNeedle(item))
-            .map(([key, item]) => ({
-                key,
-                status: item.status || '',
-                sourceType: item.sourceType || item?.source?.type || '',
-                sourcePage: item?.source?.pageUrl || '',
-                sourceLabel: item?.source?.label || '',
-                runId: item.runId || '',
-                target: item.targetProfileHref || item.requestedUrl || '',
-                activeTabId: item.activeTabId || item.tabId || 0,
-                updatedAt: item.updatedAt || item.lastUpdatedAt || 0,
-                event: item.event || ''
-            }))
-        const counts = {}
-        for(const row of rows) counts[row.status || ''] = (counts[row.status || ''] || 0) + 1
-
-        const runRows = Object.entries(runs)
-            .filter(([, run]) => {
-                if(!needle) return true
-                return [
-                    run?.source?.pageUrl || '',
-                    run?.source?.spaceKey || '',
-                    run?.source?.label || '',
-                    run?.sourceType || '',
-                    run?.id || '',
-                    run?.event || ''
-                ].join('\n').toLowerCase().includes(needle)
-            })
-            .map(([id, run]) => ({
-                id,
-                sourceType: run.sourceType || run?.source?.type || '',
-                sourcePage: run?.source?.pageUrl || '',
-                sourceLabel: run?.source?.label || '',
-                status: run.status || '',
-                total: run.total || 0,
-                queued: run.queued || 0,
-                active: run.active || 0,
-                succeeded: run.succeeded || 0,
-                failed: run.failed || 0,
-                canceled: run.canceled || 0,
-                event: run.event || ''
-            }))
+    const result = await evaluate(extensionTarget.webSocketDebuggerUrl, `(${function readQueueSummary(needle) {
+        const text = id => (document.getElementById(id)?.textContent || '').trim()
+        const rowsOf = id => [...document.querySelectorAll(`#${id} > *`)]
+            .filter(node => node.nodeType === 1 && !node.classList.contains('loading-indicator'))
+        const queueRows = rowsOf('queueList')
+        const shown = needle ? queueRows.filter(node => (node.textContent || '').toLowerCase().includes(needle)) : queueRows
         return {
             needle,
-            rowCount: rows.length,
-            counts,
-            rows: rows.slice(0, 40),
-            runs: runRows.slice(0, 20),
-            totalQueue: Object.keys(queue).length,
-            totalRuns: Object.keys(runs).length,
-            totalProgress: Object.keys(progressRecords).length,
-            runtime: {
-                queuedActions: runtimeQueuedActions.length,
-                queuedActionSamples: runtimeQueuedActions.slice(0, 20),
-                activeQueuedTabs: runtimeActiveTabs,
-                owned: runtimeOwned
-            },
-            profileTabs: profileTabs.map(tab => ({
-                id: tab.id,
-                active: tab.active,
-                title: tab.title || '',
-                url: tab.url || ''
-            })).slice(0, 60),
-            profileTabCount: profileTabs.length
+            queuedCount: text('queuedCount'),
+            activeCount: text('activeCount'),
+            terminalCount: text('terminalCount'),
+            queueCount: text('queueCount'),
+            runCount: text('runCount'),
+            currentWorkReadyCount: text('currentWorkReadyCount'),
+            shownQueueRows: shown.length,
+            shownRunRows: rowsOf('runList').length,
+            source: 'dashboard-page-rendered'
         }
-    }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)} )`, 30000)
+    }})( ${JSON.stringify(needle)} )`, 10000)
 
+    result.profileTabCount = profileTabs.length
+    result.profileTabs = profileTabs
     console.log(JSON.stringify(result, null, 2))
 })

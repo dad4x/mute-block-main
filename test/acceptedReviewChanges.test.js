@@ -428,7 +428,12 @@ register('the space Collect N More stops after N more are collected, and its cho
         PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
         PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
         location,
-        syncSpaceFeedCollectButton: () => { syncs += 1 }
+        syncSpaceFeedCollectButton: () => { syncs += 1 },
+        // A space with no registry record: the count starts at the default and is not written anywhere.
+        normalizeSpaceCollectCount: require('../shared/js/spaceRegistry.js').normalizeSpaceCollectCount,
+        getStoredSpaceRecord: () => null,
+        resolveCurrentSpaceDescriptor: () => null,
+        persistSpaceFeedCollectCount: () => {}
     })
     vm.runInContext([
         'let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
@@ -459,7 +464,7 @@ register('the space Collect N More stops after N more are collected, and its cho
     assert.equal(run('spaceFeedCollectLimit'), 100, 'another space starts at the default')
 
     const collectBody = extractFunction(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
-    assert.match(collectBody, /!isSpaceFeedCollectDone\(startCount, peakCount, limit\)/)
+    assert.match(collectBody, /isDone: \(\) => isSpaceFeedCollectDone\(startCount, peakCount, limit\)/)
     assert.match(collectBody, /window\.scrollBy\(/)
     // The copy above the feed's buttons sits on its own row, first in the feed toolbar.
     assert.match(readRepoFile('shared/css/content.css'), /\.mb-ext_space-feed-toolbar > \.mb-ext_space-collect-feed-host \{\n    order: -1;/)

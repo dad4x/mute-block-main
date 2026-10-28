@@ -14,7 +14,8 @@ const {
     SPACE_SORT_CATEGORY,
     SPACE_SORT_KEY,
     SPACE_SORT_NAME,
-    normalizeSpaceCategory
+    normalizeSpaceCategory,
+    normalizeSpaceCollectCount
 } = require('./spaceRegistry')
 const {
     PROFILE_NUKE_PROGRESS_VIEW_KEY,
@@ -767,14 +768,18 @@ const {
     applyCoordinatorOutlierClearEntries,
     applyCoordinatorOutlierFinishedRows,
     applyCoordinatorOutlierReset,
+    attachCoordinatorOutlierBodies,
     collectCoordinatorOutlierRecorderEvents,
+    diffCoordinatorOutlierBodies,
     getCoordinatorOutlierDismissalKey,
+    getCoordinatorOutlierEntryKey,
     getCoordinatorOutlierEvents,
     getCoordinatorOutlierFinishedDuration,
     getCoordinatorOutliersRecordSignature,
+    makeCoordinatorOutlierIndex,
     pruneCoordinatorOutlierDismissals,
-    serveCoordinatorOutliers,
-    toCoordinatorOutlierBaseRecord
+    readCoordinatorOutlierIndex,
+    serveCoordinatorOutliers
 } = require('./swCoordinatorOutliers')
 
 const MAX_QUEUE_WAKEUP_METRIC_PHASES = 64
@@ -6030,7 +6035,8 @@ const PROFILE_NUKE_PROGRESS_STORAGE_KEYS = Object.keys(getProfileNukeProgressPro
 // the outlier list key only. Runs are log records, not a namespace key, so they are not mirrored (owner, 26 Oct).
 // Every disk write of the outlier list key goes through the write door (persistCoordinator).
 // Its stamp and session copy come from the same door. The dashboard path reads it
-// (readCoordinatorOutliersRecordFromStorage), not hydrate.
+// (readCoordinatorOutliersRecordFromStorage), not hydrate. Only the index is mirrored: the entry keys (COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX)
+// are not, and their bodies are read from disk once per worker start (27 Oct).
 const QUEUE_NAMESPACE_MIRROR_KEYS = queueNamespaceMirrorKeys({
     outliersKey: COORDINATOR_OUTLIERS_KEY,
     progressDefaults: {}
@@ -6653,14 +6659,20 @@ async function clearCoordinatorTerminalStats() {
 // to that read: a session copy is used only when its stamp is the disk stamp of the key.
 //
 // The stored record is a fold of the outlier writes (ops). coordinatorOutliersBase is the record with every saved write applied, and
-// coordinatorOutliersOps are the writes not yet settled, oldest first. A write stores the base with every op that has not failed applied,
-// its own op included. A failed op is dropped from the fold. A write issued after an op that then fails already carries that op's effect,
+// coordinatorOutliersOps are the writes not yet settled, oldest first. A write stores the index of the base with every op that has not failed
+// applied, its own op included, and the entry bodies that op changed (issueCoordinatorOutliersWrite). A failed op is dropped from the fold. A write issued after an op that then fails already carries that op's effect,
 // so the failure is followed by a correcting write of the record without it. The door applies writes in the order they are issued.
 let coordinatorOutliersBase = null
 let coordinatorOutliersLoad = null
 let coordinatorOutliersOps = []
 let coordinatorOutliersIssuedSeq = 0
+// True while the disk may still hold the 1.6 single-record layout (set when the load finds it). Every write issued while it is true writes
+// every entry body, so the first write that is saved leaves the disk whole in the new layout; the flag is cleared by that saved write.
+let coordinatorOutliersFullWriteOwed = false
 
+// The index (the list, the baseline and the dismissals) from the session copy when its stamp is the disk stamp, else from disk. Then the
+// entry bodies of the listed entries, from disk, in one read: the dashboard's expand needs them, and they are kept in memory after this
+// read. A single read per worker start; a refresh, a clear and a write read no body from disk. Legacy is the 1.6 single-record layout.
 async function readCoordinatorOutliersRecordFromStorage() {
     const stampKey = getCoordinatorNamespaceStampKey(COORDINATOR_OUTLIERS_KEY)
     const session = getCoordinatorQueueMirrorSessionArea()
@@ -6673,23 +6685,44 @@ async function readCoordinatorOutliersRecordFromStorage() {
         [stampKey]: null,
         ...(hasSessionCopy ? {} : {[COORDINATOR_OUTLIERS_KEY]: null})
     }, {metricPath: 'outliers.read'})
+    let indexValue = null
     if(hasSessionCopy && diskRead?.[stampKey] === sessionStamp) {
         incrementQueueWakeupMetric('queueNamespace.outliersFromMirror')
-        return toCoordinatorOutlierBaseRecord(sessionValue)
+        indexValue = sessionValue
     }
-    if(hasSessionCopy) incrementQueueWakeupMetric('queueNamespace.outliersStampRejected')
-    const valueRead = hasSessionCopy
-        ? await metricStorageGet({[COORDINATOR_OUTLIERS_KEY]: null}, {metricPath: 'outliers.read.value'})
-        : diskRead
-    return toCoordinatorOutlierBaseRecord(valueRead?.[COORDINATOR_OUTLIERS_KEY])
+    else {
+        if(hasSessionCopy) incrementQueueWakeupMetric('queueNamespace.outliersStampRejected')
+        const valueRead = hasSessionCopy
+            ? await metricStorageGet({[COORDINATOR_OUTLIERS_KEY]: null}, {metricPath: 'outliers.read.value'})
+            : diskRead
+        indexValue = valueRead?.[COORDINATOR_OUTLIERS_KEY] ?? null
+    }
+    const read = readCoordinatorOutlierIndex(indexValue)
+    if(read.legacy || !read.record.entries.length) return read
+    const bodyKeys = Object.fromEntries(read.record.entries.map(entry => [getCoordinatorOutlierEntryKey(entry.slot), null]))
+    const bodies = await metricStorageGet(bodyKeys, {metricPath: 'outliers.read.bodies'})
+    const attached = attachCoordinatorOutlierBodies(read.record, bodies)
+    if(attached.missing) incrementQueueWakeupMetric('outlier.bodyMissing', attached.missing)
+    return {...read, record: attached.record}
 }
 
 // The record, read once per worker start. Concurrent first callers share the one read. A failed read is not kept, so the next caller reads again.
+// A record in the 1.6 single-record layout is migrated here: a full write puts it in the new layout, and the write is retried on each later
+// start while it fails (the old record stays on disk until a write is saved).
+// REMOVE LATER: this one-time conversion (owner, 27 Oct 2026) is non-destructive. It clears nothing on load. Remove the legacy branch
+// below, and the legacy read in readCoordinatorOutliersRecordFromStorage, once every install has written layout 2.
 function loadCoordinatorOutliersRecord() {
     if(!coordinatorOutliersLoad) {
         coordinatorOutliersLoad = readCoordinatorOutliersRecordFromStorage()
-            .then(record => {
-                coordinatorOutliersBase = coordinatorOutliersBase || record
+            .then(read => {
+                if(!coordinatorOutliersBase) {
+                    coordinatorOutliersBase = read.record
+                    if(read.legacy) {
+                        coordinatorOutliersFullWriteOwed = true
+                        issueCoordinatorOutliersWrite(record => record, {}, {}, {metricPath: 'outliers.migrate'},
+                            {migration: true, droppedEvents: read.droppedEvents}).catch(() => null)
+                    }
+                }
                 flushCoordinatorOutliersAwaiting()
                 return coordinatorOutliersBase
             }, error => {
@@ -6733,14 +6766,29 @@ function getCoordinatorOutliersPendingRecord() {
     return record
 }
 
-// Issues one write of the outlier record, riding in the door write given by change (the queue part, or none). The stored part is the pending
-// record, so the write carries this op. The op settles when the door reports the write (settleCoordinatorOutliersWrite). The caller gets the
-// door's promise, unchanged.
-function issueCoordinatorOutliersWrite(apply, change = {}, options = {}, storageOptions = {}) {
+// Issues one write of the outlier record, riding in the door write given by change (the queue part, or none). The stored part is the index
+// of the pending record and the entry keys that changed (diffCoordinatorOutlierBodies): the new body of an added entry, and null for a slot
+// the record no longer lists. It is all one set of keys in one door write, so the index and its bodies are saved together or not at all.
+// The op settles when the door reports the write (settleCoordinatorOutliersWrite). The caller gets the door's promise, unchanged. flags:
+// migration (the 1.6 layout is being replaced) and droppedEvents (events the cap dropped when the record was read).
+function issueCoordinatorOutliersWrite(apply, change = {}, options = {}, storageOptions = {}, flags = {}) {
     coordinatorOutliersIssuedSeq += 1
-    const op = {seq: coordinatorOutliersIssuedSeq, state: 'pending', apply}
+    const op = {
+        seq: coordinatorOutliersIssuedSeq,
+        state: 'pending',
+        apply,
+        migration: flags.migration === true,
+        full: coordinatorOutliersFullWriteOwed || flags.migration === true
+    }
+    const before = getCoordinatorOutliersPendingRecord()
     coordinatorOutliersOps.push(op)
-    const stored = {[COORDINATOR_OUTLIERS_KEY]: getCoordinatorOutliersPendingRecord()}
+    const after = getCoordinatorOutliersPendingRecord()
+    const bodies = diffCoordinatorOutlierBodies(before, after, {all: op.full})
+    op.entryWrites = bodies.entryWrites
+    op.entryWriteBytes = bodies.bytes
+    op.droppedEvents = bodies.droppedEvents + (flags.droppedEvents || 0)
+    const stored = {[COORDINATOR_OUTLIERS_KEY]: makeCoordinatorOutlierIndex(after), ...bodies.writes}
+    for(const key of bodies.clears) stored[key] = null
     const pending = coordinatorAuthority.persistCoordinator({...change, stored, storageOptions}, options)
     pending.then(
         persistence => settleCoordinatorOutliersWrite(op, persistence),
@@ -6754,14 +6802,25 @@ function issueCoordinatorOutliersWrite(apply, change = {}, options = {}, storage
 
 // A saved write (the queue part and the stored part both saved) makes its op part of the base, in order. A failed one is dropped. When a
 // failed write has a later write already issued, that later write carries the dropped op's effect: a correcting write of the record without
-// it is issued behind it.
+// it is issued behind it. Counts (outlier.*): the entry bodies written and their bytes, the events the cap dropped, and the migration. The
+// first saved full write ends the owed full write (the disk now holds every body in the new layout).
 function settleCoordinatorOutliersWrite(op, persistence) {
     const saved = persistence?.saved === true && persistence?.storedSaved !== false
     op.state = saved ? 'saved' : 'failed'
     if(!saved && persistence) recordCoordinatorDiagnosticEvent('outliers-write-not-saved', `${persistence.reason || persistence.storedReason || 'unknown'}`)
     while(coordinatorOutliersOps.length && coordinatorOutliersOps[0].state !== 'pending') {
         const settled = coordinatorOutliersOps.shift()
-        if(settled.state === 'saved') coordinatorOutliersBase = settled.apply(coordinatorOutliersBase)
+        if(settled.state === 'saved') {
+            coordinatorOutliersBase = settled.apply(coordinatorOutliersBase)
+            incrementQueueWakeupMetric('outlier.entryWrites', settled.entryWrites || 0)
+            incrementQueueWakeupMetric('outlier.entryWriteBytes', settled.entryWriteBytes || 0)
+            incrementQueueWakeupMetric('outlier.eventsDropped', settled.droppedEvents || 0)
+            if(settled.full && coordinatorOutliersFullWriteOwed) {
+                coordinatorOutliersFullWriteOwed = false
+                incrementQueueWakeupMetric('outlier.migrated', coordinatorOutliersBase?.entries?.length || 0)
+            }
+        }
+        else if(settled.migration) incrementQueueWakeupMetric('outlier.migrationFailed')
     }
     if(!saved && coordinatorOutliersIssuedSeq > op.seq) {
         issueCoordinatorOutliersWrite(record => record, {}, {}, {metricPath: 'outliers.correction'}).catch(() => null)
@@ -16850,6 +16909,18 @@ function classifyNoResponseTabUrl(url = '') {
     return 'other'
 }
 
+// The active transitions still in flight for one row (queuedTabActiveTransitionPromises keys are
+// 'active-transition|<row key>|<attempt id>|<attempt number>|<tab id>'). The blocked-live-tab probe must not decide anything about a
+// row while one of them is pending: 27 Oct incident, where the probe's terminal record landed under an in-flight transition.
+function getPendingActiveTransitionsForRow(itemKey = '') {
+    const rowKey = normalizeQuoraProfileUrl(itemKey) || `${itemKey || ''}`.trim()
+    if(!rowKey) return []
+    const prefix = `active-transition|${rowKey}|`
+    return [...queuedTabActiveTransitionPromises.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([, promise]) => promise)
+}
+
 async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', expectedItem = null, expectedRecord = null, liveProfileTabsByHref = new Map(), reason = 'active-blocked-live-tab') {
     if(!expectedItem || typeof expectedItem !== 'object') return {changed: false, reason: 'invalid-item'}
     if(!isActiveCoordinatorStatus(expectedItem.status)) return {changed: false, reason: 'inactive-item'}
@@ -16877,6 +16948,27 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         ? [{id: persistedTabId}, ...liveCandidates]
         : liveCandidates
     if(!candidates.length) return {changed: false, reason: 'no-live-profile-tab'}
+
+    // 27 Oct incident: the probe does not decide anything about a row whose active transition is still in flight. Wait for the
+    // transition to settle, then re-read the row. A row that is no longer this active attempt is left alone. Otherwise the probe answer
+    // decides, as before. A "not-blocked" answer writes nothing and leaves the row for its action.
+    const pendingActiveTransitions = getPendingActiveTransitionsForRow(itemKey)
+    if(pendingActiveTransitions.length) {
+        incrementQueueWakeupMetric('blockedLiveTab.waitedForActiveTransition')
+        await Promise.allSettled(pendingActiveTransitions)
+        const settledItem = await readCoordinatorQueueItemByKey(itemKey, {metricPath: 'blockedLiveTab.settledRow'}).catch(() => null)
+        const settledAttemptId = getAttemptIdFromValue(expectedItem) || getAttemptIdFromValue(expectedRecord)
+        const settledAttemptNumber = getAttemptNumberFromValue(expectedItem) || getAttemptNumberFromValue(expectedRecord)
+        const settledSameAttempt = !!settledItem &&
+            (!settledAttemptId || getAttemptIdFromValue(settledItem) === settledAttemptId) &&
+            (!settledAttemptNumber || getAttemptNumberFromValue(settledItem) === settledAttemptNumber)
+        // A row that was rolled back or changed under the transition is left to its own rollback path. A row that is still this
+        // attempt, or has become terminal under it, takes the normal path below, which closes the tab (see the 30 Sep note).
+        if(!settledSameAttempt ||
+            !(isActiveCoordinatorStatus(settledItem.status) || isTerminalCoordinatorStatus(settledItem.status))) {
+            return {changed: false, reason: 'active-transition-settled-row-changed'}
+        }
+    }
 
     const orderedCandidates = persistedTabId
         ? [
@@ -16979,6 +17071,13 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
     const attemptId = getAttemptIdFromValue(expectedItem) || getAttemptIdFromValue(expectedRecord)
     const attemptNumber = getAttemptNumberFromValue(expectedItem) || getAttemptNumberFromValue(expectedRecord)
     if(!tabId || !attemptId) return {changed: false, reason: 'missing-terminal-identity'}
+    // A transition that started while the probe was out must settle before this terminal record is written (27 Oct incident). The record
+    // below checks the settled row's own state and attempt, so waiting here does not skip the tab close.
+    const pendingAtWrite = getPendingActiveTransitionsForRow(itemKey)
+    if(pendingAtWrite.length) {
+        incrementQueueWakeupMetric('blockedLiveTab.waitedForActiveTransitionAtWrite')
+        await Promise.allSettled(pendingAtWrite)
+    }
 
     return await withBlockedLiveTabTerminalization(tabId, reason, async () => {
         recordFlightRecorderEvent({
@@ -21674,7 +21773,15 @@ async function setSpaceSortRequested(sortBy = '') {
 }
 
 async function setSpaceRegistryRequested(spaceRegistry = {}) {
-    const value = spaceRegistry && typeof spaceRegistry === 'object' ? spaceRegistry : {}
+    const input = spaceRegistry && typeof spaceRegistry === 'object' ? spaceRegistry : {}
+    // A record that carries a collect count stores one the dropdown offers; any other value is stored as the default. A record with no
+    // count field is stored as it is.
+    const value = {}
+    for(const [key, record] of Object.entries(input)) {
+        value[key] = record && typeof record === 'object' && 'collectCount' in record
+            ? {...record, collectCount: normalizeSpaceCollectCount(record.collectCount)}
+            : record
+    }
     await metricStorageSet({[SPACE_REGISTRY_KEY]: value}, {metricPath: 'pageRequest.setSpaceRegistry'})
     return {ok: true}
 }
@@ -25805,9 +25912,11 @@ async function mutateCoordinatorQueuedTabOpenRollback(operation = {}) {
                     }
                 )
             }
+            // 27 Oct: an activation that could not proceed is not a timeout. 'action-error' is the outcome the dashboard labels for a
+            // failed action (same retryability class as timeout), and the reason below keeps 'active-transition-failed' visible.
             return buildTerminalCoordinatorQueueItem(currentItem, {
                 status: 'failed',
-                outcome: 'timeout',
+                outcome: 'action-error',
                 error: getExhaustedRolledBackQueuedTabTerminalError({
                     ...currentItem,
                     actionLeaseReleaseReason: 'active-transition-failed'

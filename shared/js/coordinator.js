@@ -303,7 +303,7 @@ async function renderHistoryList() {
 
 // Clear empties the rows this page shows. It deletes nothing from storage, and the page keeps asking for rows that arrive later.
 async function clearHistory() {
-    if(!window.confirm('Clear the rows on this page? Nothing is deleted from storage.')) return
+    if(!window.confirm('Clear the rows on this page? Nothing is deleted.')) return
     historyClearedAt = Date.now()
     historyRows = new Map()
     renderHistoryRows()
@@ -493,7 +493,7 @@ async function init() {
         if(state.firstStateReceived) state.loadError = ''
     }
     catch(error) {
-        state.loadError = error?.message || `${error || ''}` || 'Dashboard storage load failed'
+        state.loadError = error?.message || `${error || ''}` || 'Dashboard load failed'
     }
     state.loading = false
     if(retryFailedActive && !retryFailedLastResult) {
@@ -682,7 +682,7 @@ async function refreshDashboardStateFromCompactStorage() {
             return true
         })
         .catch(error => {
-            state.loadError = error?.message || `${error || ''}` || 'Dashboard storage refresh failed'
+            state.loadError = error?.message || `${error || ''}` || 'Dashboard refresh failed'
             render()
             return false
         })
@@ -1116,7 +1116,7 @@ async function loadState() {
     // The worker's first answer is the dashboard's first state (owner, 27 Oct): the spinner stops there. A first load the worker
     // never answers records a failure instead, so the spinner cannot run forever. A later unanswered refresh keeps the last view.
     if(refreshed.answered) state.firstStateReceived = true
-    else if(!state.firstStateReceived) state.loadError = 'Coordinator worker did not answer the dashboard load'
+    else if(!state.firstStateReceived) state.loadError = 'The extension did not answer the dashboard load'
     // Same reasoning as the queue view above, for the same underlying reason:
     // mbCoordinatorRuns[runId]'s itemCount/targetProfileHrefs/targetWorkKeys/
     // activeCount/terminalCount/status are maintained as a mutated running
@@ -1399,7 +1399,7 @@ function renderDurationHistogram(barsId = '', totalId = '', histogram = null) {
     bars.replaceChildren(...labels.map((label, index) => {
         const column = document.createElement('div')
         column.className = 'duration-histogram-column'
-        column.title = muteBlockHelpText(`${label}: ${counts[index]} ${counts[index] === 1 ? 'row' : 'rows'} with an active-to-terminal time in this range.`)
+        column.title = muteBlockHelpText(`${label}: ${counts[index]} ${counts[index] === 1 ? 'row' : 'rows'} with an active-to-completed time in this range.`)
 
         const count = document.createElement('div')
         count.className = 'duration-histogram-count'
@@ -1524,7 +1524,7 @@ function formatBlockOutcomeCount(count = 0, total = 0) {
 
 function formatBlockOutcomeDuration(count = 0, totalDurationMs = 0, maxDurationMs = 0) {
     if(!count) return 'no completions yet this epoch'
-    return `avg ${formatDuration(totalDurationMs / count)}, max ${formatDuration(maxDurationMs)} active-to-terminal`
+    return `avg ${formatDuration(totalDurationMs / count)}, max ${formatDuration(maxDurationMs)} active-to-completed`
 }
 
 function render() {
@@ -1577,7 +1577,7 @@ function render() {
     setText('skippedCount', finishedOutcomes ? skippedTotal : '--')
     setText('skippedDetail', finishedOutcomes
         ? Object.entries(skippedByOutcome).map(([outcome, n]) => outcome + ' ' + n).join(', ') || 'none'
-        : 'no finished rows yet')
+        : 'no completed rows yet')
     setText('failedCount', finishedOutcomes ? (Number.parseInt(finishedOutcomes.failed, 10) || 0) : '--')
     const finishedDurations = state.queueView?.finishedWork?.durations || null
     const averageSeconds = bucket => {
@@ -2592,7 +2592,7 @@ function renderWakeupMetrics(queueItems = []) {
                 title: 'Whether the scheduler is deliberately backing off queued-tab activity (e.g. after slow/unscriptable tabs or Cloudflare challenges). Concerning if this stays "active" for more than a couple of QUEUE_LOAD_THROTTLE_MAX_MS windows (120s each, escalating) -- that means whatever tripped it keeps recurring rather than clearing.'
             }),
             buildMetricCard('Wakeups/job', jobs ? formatRatio(wakeups / jobs) : '--', `${wakeups} wakeups / ${jobs} enqueued`, {
-                title: 'Nudges + pump requests + reconciles per enqueued job -- how many scheduler wakeups it takes to move work through the queue. Concerning if this trends well above 2-3x enqueued jobs; that suggests the scheduler is being woken repeatedly without making proportional progress.'
+                title: 'Nudges + pump requests + reconciles per enqueued job -- how many scheduler wakeups it takes to move rows through the queue. Concerning if this trends well above 2-3x enqueued jobs; that suggests the scheduler is being woken repeatedly without making proportional progress.'
             }),
             buildMetricCard('Nudge accept', nudgeDispatched ? formatPercent(nudgeAccepted / nudgeDispatched) : '--', `${nudgeAccepted} / ${nudgeDispatched} dispatched (${nudgeCoalesced} coalesced, not counted)`, {
                 // 2026-09-29: traced live -- essentially every rejected nudge
@@ -2613,13 +2613,13 @@ function renderWakeupMetrics(queueItems = []) {
                 title: 'Pump cycles that no-opped because there was nothing pending, the executor was already running, or the queue is paused. Concerning if this is high AND Pump yield is low AND the queue is not paused -- that combination means pumps are being requested faster than there is new work to justify them.'
             }),
             buildMetricCard('Reconciles/job', jobs ? formatRatio(reconcileRequested / jobs) : '--', `${reconcileChanged} reconcile changes`, {
-                title: 'Reconcile passes (the periodic sweep that repairs drifted/stuck rows) per enqueued job. Concerning if this climbs steadily -- COORDINATOR_RECONCILE_BACKOFF_MAX_MS (60s) is the ceiling between reconciles once backed off, so a high rate here means something keeps re-triggering reconcile at its minimum interval instead of backing off.'
+                title: 'Reconcile passes (the periodic sweep that repairs drifted/stuck rows) per enqueued job. Concerning if this climbs steadily -- 60s is the ceiling between reconciles once backed off, so a high rate here means something keeps re-triggering reconcile at its minimum interval instead of backing off.'
             }),
-            buildMetricCard('Terminal jobs', `${terminalJobs}`, `${stalledQueued} currently queued`, {
-                title: 'Total jobs that reached a terminal state (succeeded/failed/skipped/canceled) this epoch, plus how many are still queued right now. Not concerning on its own -- cross-check against Really/Already blocked and the failed-row badges for what those terminal jobs actually were.'
+            buildMetricCard('Completed jobs', `${terminalJobs}`, `${stalledQueued} currently queued`, {
+                title: 'Total jobs that reached a completed state (succeeded/failed/skipped/canceled) this epoch, plus how many are still queued right now. Not concerning on its own -- cross-check against Really/Already blocked and the failed-row badges for what those completed jobs actually were.'
             }),
             buildMetricCard('Queued self-heal', `${queuedTerminalProgressMatched}`, `${queuedTerminalProgressSettled} settled`, {
-                title: 'How often a queued row\'s own durable progress record already showed terminal (the row\'s live queue status just hadn\'t caught up yet), checked on every executor-apply tick. Purely observational for now -- this decides whether it\'s worth moving off the hot per-tick loop onto a slower periodic sweep instead. A near-zero count here means that move would buy little; a high, steadily climbing count means it would.'
+                title: 'How often a queued row\'s own durable progress record already showed completed (the row\'s live queue status just hadn\'t caught up yet), checked on every executor-apply tick. Purely observational for now -- this decides whether it\'s worth moving off the hot per-tick loop onto a slower periodic sweep instead. A near-zero count here means that move would buy little; a high, steadily climbing count means it would.'
             }),
             buildMetricCard('Cloudflare challenges', `${cloudflareChallenges}`, jobs
                 ? `${formatPercent(cloudflareChallenges / jobs)} of ${jobs} enqueued jobs hit a bot-challenge interstitial`
@@ -2633,68 +2633,68 @@ function renderWakeupMetrics(queueItems = []) {
                 alert: getPhaseAverageMs(phases.claimAcceptedToActionStart) >= 15000,
                 title: 'Time from claim accepted to the mute/block action actually starting. Concerning if the average approaches STALE_ACTIVE_ACTION_QUEUED_TAB_MS (30s) -- that\'s this project\'s threshold for treating an active-action tab as stalled.'
             }),
-            buildMetricCard('Action -> terminal', formatPhaseAverage(phases.actionStartToTerminal), formatPhaseDetail(phases.actionStartToTerminal), {
+            buildMetricCard('Action -> completed', formatPhaseAverage(phases.actionStartToTerminal), formatPhaseDetail(phases.actionStartToTerminal), {
                 // Half of the tighter of COORDINATOR_ACTIVE_JOB_MAX_MS (45s) / COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS (60s).
                 alert: getPhaseAverageMs(phases.actionStartToTerminal) >= 22500,
-                title: 'Time from the action starting to the row reaching a terminal state. Concerning if the average approaches COORDINATOR_ACTIVE_JOB_MAX_MS (45s) or COORDINATOR_ACTIVE_ACTION_JOB_MAX_MS (60s) -- both bound how long this project lets a job stay active before treating it as stuck.'
+                title: 'Time from the action starting to the row reaching a completed state. Concerning if the average approaches 45s or 60s -- both bound how long this project lets a job stay active before treating it as stuck.'
             }),
-            buildMetricCard('Terminal -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease), {
-                // Half of TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s).
+            buildMetricCard('Completed -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease), {
+                // The alert fires at 1250 ms. TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (sw.js) is now 250 ms, so the old "half of 2.5 s" note no longer applies.
                 alert: getPhaseAverageMs(phases.terminalToSlotRelease) >= 1250,
-                title: 'Time from a row going terminal to its worker slot actually being released for reuse. Concerning if the average approaches TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (2.5s) -- slow releases here are the direct cause of a rising "secs / handoff" summary tile above.'
+                title: 'Time from a row completing to its worker slot actually being released for reuse. Concerning if the average approaches 1.25 s (the alert threshold) -- slow releases here are the direct cause of a rising "secs / handoff" summary tile above.'
             }),
-            buildMetricCard('Storage timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : `${storageTimedOut}`, `${storageTimedOut} / ${storageStarted}; ${storageFallbackReturned} fallback returned`, {
+            buildMetricCard('Save timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : `${storageTimedOut}`, `${storageTimedOut} / ${storageStarted}; ${storageFallbackReturned} fallback returned`, {
                 alert: storageTimedOut > 0,
-                title: 'Share of durable storage updates that timed out before completing. Concerning at any sustained nonzero rate -- a timed-out update falls back to a stale read/no-op rather than the intended mutation, which is exactly the class of bug behind this week\'s WAL hydrate fixes.'
+                title: 'Share of durable saves that timed out before completing. Concerning at any sustained nonzero rate -- a timed-out update falls back to a stale read/no-op rather than the intended mutation, which is exactly the class of bug behind this week\'s WAL hydrate fixes.'
             }),
-            buildMetricCard('Storage deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : `${storageDeadlineMissed}`, `${storageDeadlineMissed} missed; ${getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed')} late suppressed`, {
+            buildMetricCard('Save deadlines', storageStarted ? formatPercent(storageDeadlineMissed / storageStarted) : `${storageDeadlineMissed}`, `${storageDeadlineMissed} missed; ${getMetricCounter(counters, 'storageUpdate.lateWriteSuppressed')} late suppressed`, {
                 alert: storageDeadlineMissed > 0,
-                title: 'Storage updates that missed their intended deadline (whether or not they eventually timed out outright). Concerning if this is nonzero and growing -- it is an early symptom of the same write-queue backlog the "Write queue backlog" card below alerts on directly.'
+                title: 'Saves that missed their intended deadline (whether or not they eventually timed out outright). Concerning if this is nonzero and growing -- it is an early symptom of the same write-queue backlog the "Write queue backlog" card below alerts on directly.'
             }),
             buildMetricCard('Write queue backlog', storageQueueStallWarnings ? `${storageQueueStallWarnings} alert${storageQueueStallWarnings === 1 ? '' : 's'}` : 'clear',
                 storageQueueStallWarnings
                     ? `Oldest pending write waited up to ${formatDuration(storageQueueStallMaxWaitMs)} this epoch`
-                    : 'No sustained storage-update backlog this epoch',
+                    : 'No sustained save backlog this epoch',
                 {
                     alert: storageQueueStallWarnings > 0,
-                    title: 'Fires once the oldest pending durable write has waited at least COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s), checked every COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_CHECK_INTERVAL_MS (15s). Any alert here is concerning by definition -- it is this project\'s own self-imposed threshold for "the serialized storage-update queue is backing up," added after a live incident where a runaway reconcile loop backed it up for minutes.'
+                    title: 'Fires once the oldest pending durable write has waited at least 30s, checked every 15s. Any alert here is concerning by definition -- it is this project\'s own self-imposed threshold for "the serialized save queue is backing up," added after a live incident where a runaway reconcile loop backed it up for minutes.'
                 }),
             buildMetricCard('Timeout buckets', `${storageTimeoutGet}`, `get ${storageTimeoutGet}, set ${storageTimeoutSet}, unknown ${storageTimeoutUnknown}`, {
                 alert: (storageTimeoutGet + storageTimeoutSet + storageTimeoutUnknown) > 0 &&
                     storageTimeoutUnknown / (storageTimeoutGet + storageTimeoutSet + storageTimeoutUnknown) > 0.5,
-                title: 'Breaks Storage timeouts down by where in the read/write cycle they happened. Concerning if "unknown" is a large share -- that means a timeout is happening somewhere this breakdown can\'t attribute, which is itself worth investigating.'
+                title: 'Breaks save timeouts down by where in the read/write cycle they happened. Concerning if "unknown" is a large share -- that means a timeout is happening somewhere this breakdown can\'t attribute, which is itself worth investigating.'
             }),
             buildMetricCard('No-work writes', `${storageNoDurableWork}`, `${storageNoRuntimeWork} no runtime; ${storageNoDurableWork} no durable`, {
-                title: 'Storage updates that ran and found nothing durable to persist. Expect a high share of these whenever the queue is paused or has nothing pending -- that alone drives this up with no problem behind it. Concerning only while the queue is actually running and this still dominates total storage updates, since each one still pays the full serialized-queue cost for no benefit.'
+                title: 'Saves that ran and found nothing durable to persist. Expect a high share of these whenever the queue is paused or has nothing pending -- that alone drives this up with no problem behind it. Concerning only while the queue is actually running and this still dominates total saves, since each one still pays the full serialized-queue cost for no benefit.'
             }),
-            buildMetricCard('Storage queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait), {
+            buildMetricCard('Save queue wait', formatPhaseAverage(phases.storageQueueWait), formatPhaseDetail(phases.storageQueueWait), {
                 // Half of COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s).
                 alert: getPhaseAverageMs(phases.storageQueueWait) >= 15000,
-                title: 'Average time a storage update spent waiting in the serialized queue before it got to run. Concerning if this rises toward COORDINATOR_STORAGE_UPDATE_QUEUE_STALL_WARN_MS (30s) -- that\'s the same threshold "Write queue backlog" alerts on for the single oldest pending write.'
+                title: 'Average time a save spent waiting in the serialized queue before it got to run. Concerning if this rises toward 30s -- that\'s the same threshold "Write queue backlog" alerts on for the single oldest pending write.'
             }),
-            buildMetricCard('Storage get', formatPhaseAverage(phases.storageGet), `${storageGetCalls} calls`, {
-                title: 'Average latency of a chrome.storage.local.get call, and how many were made this epoch. Concerning if the call count keeps climbing well past startup with the queue otherwise idle -- see the Queue cache hit rate card, which answers exactly that "are we still re-reading needlessly" question directly.'
+            buildMetricCard('Read time', formatPhaseAverage(phases.storageGet), `${storageGetCalls} calls`, {
+                title: 'Average time of each read of saved data, and how many were made this epoch. Concerning if the call count keeps climbing well past startup with the queue otherwise idle -- see the Queue cache hit rate card, which answers exactly that "are we still re-reading needlessly" question directly.'
             }),
-            buildMetricCard('Storage set', formatPhaseAverage(phases.storageSet), `${getMetricCounter(counters, 'storageSetCalls')} calls`, {
-                title: 'Average latency of a chrome.storage.local.set call, and how many were made this epoch. Concerning if the average latency climbs alongside growing write payload sizes (see Payload avg) -- that\'s consistent with the queue snapshot itself getting large enough to slow every write.'
+            buildMetricCard('Write time', formatPhaseAverage(phases.storageSet), `${getMetricCounter(counters, 'storageSetCalls')} calls`, {
+                title: 'Average time of each write, and how many were made this epoch. Concerning if the average latency climbs alongside growing write payload sizes (see Payload avg) -- that\'s consistent with the queue snapshot itself getting large enough to slow every write.'
             }),
             buildMetricCard('Queue cache hit rate', walCacheAttempts ? formatPercent(walResidentStoreUsed / walCacheAttempts) : '--',
-                `${walResidentStoreUsed} resident-store hits / ${walSegmentedHydrated} genuine storage reads (${storageGetCalls} storage.get calls total)`, {
+                `${walResidentStoreUsed} resident-store hits / ${walSegmentedHydrated} genuine reads (${storageGetCalls} read calls total)`, {
                 alert: walCacheAttempts > 5 && (walResidentStoreUsed / walCacheAttempts) < 0.5,
-                title: 'Of the segmented WAL\'s hydrate attempts, the share served from the in-memory resident-store cache (residentStoreUsed) rather than a real chrome.storage.local read (segmentedHydrated). This week\'s fix chain found this cache dead (residentStoreUsed sat at 0) -- concerning if this rate is low or falling after startup, since reads should be rare once the queue is warm and resident.'
+                title: 'Of the segmented WAL\'s hydrate attempts, the share served from the in-memory resident-store cache (residentStoreUsed) rather than a real read of saved data (segmentedHydrated). This week\'s fix chain found this cache dead (residentStoreUsed sat at 0) -- concerning if this rate is low or falling after startup, since reads should be rare once the queue is warm and resident.'
             }),
             buildMetricCard('WAL writes', `${walAppended}`,
                 `${formatBytes(walAppendBytes)} appended; ${walCheckpointed} checkpoint switch${walCheckpointed === 1 ? '' : 'es'} folding in ${walCheckpointedRecords} record${walCheckpointedRecords === 1 ? '' : 's'}${walCheckpointFailed ? `; ${walCheckpointFailed} checkpoint failure${walCheckpointFailed === 1 ? '' : 's'}` : ''}`, {
                 alert: walCheckpointFailed > 0,
-                title: 'How often the coordinator queue\'s write-ahead log is appended to, and how often it checkpoint-switches (folds accumulated segments back into one snapshot). A checkpoint switch is expected roughly every COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT (128) committed segments; concerning if switches are far less frequent than that under heavy write volume (segments piling up toward the COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT of 1024, which blocks further appends) or if any checkpoint failures show up at all.'
+                title: 'How often the queue\'s write-ahead log is appended to, and how often it checkpoint-switches (folds accumulated segments back into one snapshot). A checkpoint switch is expected roughly every 128 committed segments; concerning if switches are far less frequent than that under heavy write volume (segments piling up toward the limit of 1024, which blocks further appends) or if any checkpoint failures show up at all.'
             }),
             buildMetricCard('WAL segment writes', `${walSegmentWrites}`,
                 `${formatBytes(walSegmentBytes)} written; max ${formatBytes(walSegmentMaxBytes)}`, {
-                title: 'Physical chrome.storage.local writes to WAL segment keys (mbCoordinatorQueueWal.segment.*) -- the incremental append-side storage cost, separate from the logical "WAL writes" append count above. Concerning if the per-write size trends upward over a session; segments should stay small individually until a checkpoint switch folds them back down.'
+                title: 'Physical saves to WAL segment keys -- the incremental append-side save cost, separate from the logical "WAL writes" append count above. Concerning if the per-write size trends upward over a session; segments should stay small individually until a checkpoint switch folds them back down.'
             }),
             buildMetricCard('Checkpoint writes', `${walCheckpointWrites}`,
                 `${formatBytes(walCheckpointBytes)} written; max ${formatBytes(walCheckpointMaxBytes)}`, {
-                title: 'Physical chrome.storage.local writes for a checkpoint switch (folding accumulated segments back into one snapshot) -- the actual byte cost of that fold, separate from the "WAL writes" card\'s checkpoint switch count. Concerning if this grows large enough to make Storage set latency spike during a switch, since a checkpoint write blocks the same serialized write queue as everything else.'
+                title: 'Physical saves for a checkpoint switch (folding accumulated segments back into one snapshot) -- the actual byte cost of that fold, separate from the "WAL writes" card\'s checkpoint switch count. Concerning if this grows large enough to make Write time spike during a switch, since a checkpoint write blocks the same serialized write queue as everything else.'
             }),
             buildMetricCard('Queue view writes', `${viewProjectionSaved}`,
                 `${formatBytes(payloadQueueViewBytes)} written; avg ${queueViewWriteCalls ? formatDuration(queueViewWriteLatencyMsSum / queueViewWriteCalls) : '--'}, max ${formatDuration(queueViewWriteMaxLatencyMs)}; ${viewProjectionFailed} failure${viewProjectionFailed === 1 ? '' : 's'} this epoch`, {
@@ -2704,28 +2704,28 @@ function renderWakeupMetrics(queueItems = []) {
                 // off-critical-path and only its own completion is timed
                 // here, so "avg"/"max" reflect the write's own cost, not
                 // added latency on whatever triggered it.
-                title: 'The durable mbCoordinatorQueueView snapshot -- what the dashboard, worker bar, popup, and CDP tools actually read -- is written by a separate, non-blocking storage.set from the WAL append it mirrors, and can fail independently under load. Any failure here means the view can show stale status (e.g. "queued") for a row the WAL already has as terminal, with only a best-effort reconcile as catch-up and no guaranteed deadline. Concerning if failures are ever nonzero, or if avg/max latency climbs -- this write is not on any other operation\'s critical path, but it still competes for the same serialized storage queue.'
+                title: 'The durable queue view snapshot -- what the dashboard, worker bar, popup, and CDP tools actually read -- is written by a separate, non-blocking save from the WAL append it mirrors, and can fail independently under load. Any failure here means the view can show stale status (e.g. "queued") for a row the WAL already has as completed, with only a best-effort reconcile as catch-up and no guaranteed deadline. Concerning if failures are ever nonzero, or if avg/max latency climbs -- this write is not on any other operation\'s critical path, but it still competes for the same serialized save queue.'
             }),
             buildMetricCard('Read payload avg', readCalls ? formatBytes(readBytes / readCalls) : '--', `${formatBytes(readBytes)} total; max ${formatBytes(readMaxBytes)}`, {
-                title: 'Average and largest single-read payload size across all storage reads this epoch. Concerning if this grows steadily over a long-running session -- it usually tracks queue/progress size, and a large max next to a much smaller average flags one unusually expensive read worth finding via Read hot path.'
+                title: 'Average and largest single-read payload size across all reads of saved data this epoch. Concerning if this grows steadily over a long-running session -- it usually tracks queue/progress size, and a large max next to a much smaller average flags one unusually expensive read worth finding via Read hot path.'
             }),
             buildMetricCard('Read payload keys', formatBytes(readQueueBytes), `queue ${formatBytes(readQueueBytes)}, view ${formatBytes(readQueueViewBytes)}, progress ${formatBytes(readProgressBytes)}`, {
-                title: 'Read bytes broken down by which storage key they came from. Concerning if "queue" (the raw authoritative queue, as opposed to the cheaper "view" projection) dominates read volume long after startup -- that\'s a sign something is bypassing the queue-view/resident-cache path and reading the full queue directly.'
+                title: 'Read bytes broken down by which saved item they came from. Concerning if "queue" (the raw authoritative queue, as opposed to the cheaper "view" projection) dominates read volume long after startup -- that\'s a sign something is bypassing the queue-view/resident-cache path and reading the full queue directly.'
             }),
             buildMetricCard('Read hot path', topReadPath.path || '--', formatStoragePayloadPathDetail(topReadPath), {
                 title: 'Which named code path (metricPath, e.g. "reconcile.load") is responsible for the most read bytes this epoch. Concerning if a path you would not expect to read often (anything outside startup/reconcile) shows up here with a high call count -- that usually means a cache that should be short-circuiting it is not.'
             }),
             buildMetricCard('Write payload avg', physicalCalls ? formatBytes(physicalBytes / physicalCalls) : '--', `${formatBytes(physicalBytes)} on disk over ${physicalCalls} writes; max ${formatBytes(physicalMaxBytes)}. Logical payload avg ${payloadCalls ? formatBytes(payloadBytes / payloadCalls) : '--'} (${formatBytes(payloadBytes)} before the bucket split)`, {
-                title: 'Average and largest size of each write that reached storage this epoch, after the bucket split. The logical figure is what the callers built before the split (a whole map), kept for comparison. Concerning if the physical average trends upward over a long session.'
+                title: 'Average and largest size of each write that was saved this epoch, after the bucket split. The logical figure is what the callers built before the split (a whole map), kept for comparison. Concerning if the physical average trends upward over a long session.'
             }),
             buildMetricCard('Payload sources', formatBytes(payloadQueueBytes), `queue ${formatBytes(payloadQueueBytes)}, view ${formatBytes(payloadQueueViewBytes)}, runs ${formatBytes(payloadRunsBytes)}, progress ${formatBytes(payloadProgressBytes)}`, {
-                title: 'Write bytes broken down by which storage key they went to. Not concerning by itself -- "queue" naturally dominates on a large batch -- but useful alongside Write hot path to see which code path is driving that volume.'
+                title: 'Write bytes broken down by which saved item they went to. Not concerning by itself -- "queue" naturally dominates on a large batch -- but useful alongside Write hot path to see which code path is driving that volume.'
             }),
             buildMetricCard('Write hot path', topWritePath.path || '--', formatStoragePayloadPathDetail(topWritePath), {
-                title: 'Which named code path is responsible for the most write bytes this epoch -- the write-side equivalent of Read hot path. Concerning if a path outside normal enqueue/reconcile/terminal-settlement activity dominates, or if its average latency (shown in the detail line) is high relative to its byte size.'
+                title: 'Which named code path is responsible for the most write bytes this epoch -- the write-side equivalent of Read hot path. Concerning if a path outside normal enqueue/reconcile/completed-row settlement activity dominates, or if its average latency (shown in the detail line) is high relative to its byte size.'
             }),
             buildMetricCard('Milestone batch', milestoneFlushes ? formatRatio(milestoneReceived / milestoneFlushes) : '--', `${milestoneReceived} records / ${milestoneFlushes} flushes`, {
-                title: 'How many milestone records get batched into each flush (flushed at most once every COORDINATOR_JOB_MILESTONE_FLUSH_MS, 3s). Concerning only if flushes are happening far more often than every 3s with a low records-per-flush ratio -- that would mean batching isn\'t actually coalescing anything.'
+                title: 'How many milestone records get batched into each flush (flushed at most once every 3s). Concerning only if flushes are happening far more often than every 3s with a low records-per-flush ratio -- that would mean batching isn\'t actually coalescing anything.'
             }),
             buildMetricCard('Progress events', `${progressReceived}`, `pending max ${progressPendingMax}`, {
                 trend: progressPendingMaxTrend,
@@ -2883,7 +2883,7 @@ function formatPreviousEpochSummary(epoch = null) {
     const writeBytes = Number(epoch.storagePayload?.writeBytes) || 0
     const writeCalls = Number(epoch.storagePayload?.writeCalls) || 0
     const jobsTerminal = Number(epoch.jobs?.terminal) || 0
-    return `${epoch.resetReason || 'epoch'}: ${timeoutRate} storage timeouts, ${formatBytes(writeBytes)} / ${writeCalls} writes, ${jobsTerminal} terminal jobs`
+    return `${epoch.resetReason || 'epoch'}: ${timeoutRate} save timeouts, ${formatBytes(writeBytes)} / ${writeCalls} writes, ${jobsTerminal} completed jobs`
 }
 
 function formatPhaseAverage(phase = null) {
@@ -2999,7 +2999,7 @@ function renderQueue(items) {
             buildQueueTimingCell(item)
         )
         return row
-    }), 'No current work yet.', getDashboardFirstLoadState())
+    }), 'No Current Work yet.', getDashboardFirstLoadState())
 }
 
 function isResolutionQueueItem(item = {}) {
@@ -3014,7 +3014,7 @@ function getQueueItemTitleLabel(item = {}, profileLabel = '') {
         const sourceLabel = getSourceLabelFromUrl(item.requestedUrl || '')
         return sourceLabel ? `Resolve ${sourceLabel} post` : 'Resolve source post'
     }
-    return item.targetProfileHref || item.requestedUrl || item.id || 'Current work item'
+    return item.targetProfileHref || item.requestedUrl || item.id || 'Current Work row'
 }
 
 function clearEventHistogram() {
@@ -3137,7 +3137,7 @@ function buildOutlierEventsPanel(outlier = {}) {
         panel.append(note)
     }
     else {
-        note.textContent = `${events.length} recorder event${events.length === 1 ? '' : 's'}, oldest first: this profile's events, and the storage and checkpoint writes inside its span. Gaps above ${OUTLIER_EVENT_GAP_ABNORMAL_MS} ms are highlighted.`
+        note.textContent = `${events.length} recorder event${events.length === 1 ? '' : 's'}, oldest first: this profile's events, and the saves and checkpoint writes inside its span. Gaps above ${OUTLIER_EVENT_GAP_ABNORMAL_MS} ms are highlighted.`
         const gaps = getOutlierEventGaps(events)
         panel.append(note, ...events.map((entry, index) => buildOutlierEventRow(entry, gaps[index])))
     }
@@ -3238,9 +3238,9 @@ function buildQueueTimingCell(item = {}) {
     cell.title = [
         queuedAt ? `queued ${formatDateTime(queuedAt)}` : '',
         activeAt ? `active ${formatDateTime(activeAt)}` : '',
-        terminalAt ? `terminal ${formatDateTime(terminalAt)}` : '',
+        terminalAt ? `completed ${formatDateTime(terminalAt)}` : '',
         activeDurationMs > 0
-            ? `${terminalAt ? 'active to terminal' : 'active elapsed'} ${formatDuration(activeDurationMs)}`
+            ? `${terminalAt ? 'active to completed' : 'active elapsed'} ${formatDuration(activeDurationMs)}`
             : ''
     ].filter(Boolean).join('\n')
     return cell
@@ -3306,7 +3306,7 @@ function getCurrentWorkSortRank(item = {}) {
 function getQueueActionLabel(item = {}) {
     if(isResolutionQueueItem(item)) return 'Resolve Profile'
     const actionKind = `${item?.actionKind || item?.executorTabAction || item?.tabAction || ''}`.trim()
-    if(actionKind === 'unblock-unmute') return 'Unblock Unmute'
+    if(actionKind === 'unblock-unmute') return 'Unblock'
     if(actionKind === 'mute-block' || actionKind === 'nuke') return 'Mute Block'
     return actionKind || 'Mute Block'
 }
@@ -3601,16 +3601,16 @@ function getStatusHelp(status = '') {
     const normalized = `${status || ''}`.trim()
     const descriptions = {
         queued: 'Ready to run: waiting for a worker slot.',
-        opening: 'Opening: a worker tab is being created or navigated.',
-        active: 'Active: a worker tab is claimed and preparing the profile action.',
+        opening: 'Opening: a background tab is being created or navigated.',
+        active: 'Active: a background tab is claimed and preparing the profile action.',
         acting: 'Acting: a mute, block, unblock, or unmute action is in progress.',
-        settling: 'Settling: terminal action finished and cleanup or source-page settlement is pending.',
+        settling: 'Settling: the action has completed, and cleanup or source-page settlement is pending.',
         succeeded: 'Succeeded: target is blocked, unblocked, or already in the desired state.',
-        failed: 'Failed: work ended without success. Outcome/error explains retryability.',
-        skipped: 'Skipped: no destructive work was possible or needed.',
-        canceled: 'Canceled: work was stopped by an operator action.',
+        failed: 'Failed: the row ended without success. Outcome/error explains retryability.',
+        skipped: 'Skipped: the desired action could not be taken, for one reason or another.',
+        canceled: 'Canceled: the row was stopped by an operator action.',
         running: 'Running: the run has queued or in-progress items.',
-        empty: 'Empty: every target in the run has reached a terminal state, or the run has no items.',
+        empty: 'Empty: every target in the run has completed, or the run has no items.',
         retry: 'Retry: failed-row retry action.',
         enqueued: 'Enqueued: new queue work was submitted.',
         paused: 'Paused: pending work was stopped.'
@@ -3624,9 +3624,9 @@ function getOutcomeHelp(outcome = '') {
     const descriptions = {
         blocked: 'Blocked: the profile was blocked during this run.',
         'already-blocked': 'Already blocked: the profile was already in the desired blocked state.',
-        unblocked: 'Unblocked: the reverse action removed the block.',
+        unblocked: 'Unblocked: the profile was unblocked and unmuted, also called a pardon.',
         'already-unblocked': 'Already unblocked: the profile was already in the desired unblocked state.',
-        timeout: 'Timeout: retryable failure from a missing, stale, or over-deadline worker.',
+        timeout: 'Timeout: retryable failure from a missing, stale, or over-deadline background tab.',
         'action-error': 'Action error: retryable failure while finding or applying the profile action.',
         'security-verification': 'Security verification: non-retryable Quora challenge or verification state.',
         'profile-unavailable': 'Profile unavailable: the target could not be acted on.',
@@ -3757,8 +3757,8 @@ const COORDINATOR_PROFILE_ACTION_PHASE_LABELS = [
     ['claim', 'Claim (content opened → action claimed)'],
     ['inspect', 'Inspect (claimed → profile ready)'],
     ['action', 'Action (ready → mute/block attempted)'],
-    ['detect', 'Detect (attempted → terminal)'],
-    ['close', 'Close (terminal → tab closed)']
+    ['detect', 'Detect (attempted → completed)'],
+    ['close', 'Close (completed → tab closed)']
 ]
 
 function formatPhaseTimingDurationMs(value) {

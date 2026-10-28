@@ -43,12 +43,14 @@ module.exports = {
     // threshold, the baseline mean plus OUTLIER_STDDEV_MULTIPLIER times its sample stddev. The stddev test needs
     // OUTLIER_MIN_SAMPLES_FOR_STDDEV pushed samples. A flagged row is recorded only at OUTLIER_MIN_RECORD_MS or more (owner, 24 Oct);
     // every finished row still counts toward the baseline. Only finished rows are listed; the stored list keeps its newest
-    // OUTLIER_MAX_ENTRIES entries.
+    // OUTLIER_MAX_ENTRIES entries (one stored entry key per listed outlier, so OUTLIER_MAX_ENTRIES is also the number of entry slots).
+    // An entry keeps at most OUTLIER_MAX_EVENTS_PER_ENTRY recorder events, the newest (27 Oct).
     OUTLIER_FLOOR_MS: 45000,
     OUTLIER_STDDEV_MULTIPLIER: 2.5,
     OUTLIER_MIN_SAMPLES_FOR_STDDEV: 5,
     OUTLIER_MIN_RECORD_MS: 3500,
     OUTLIER_MAX_ENTRIES: 50,
+    OUTLIER_MAX_EVENTS_PER_ENTRY: 100,
 
     // Limits that more than one module used to declare (historical/14-oct-review-1.md finding 8). Each is declared here only.
     // The most records the profile-nuke progress view keeps. sw.js and content.js both prune to it.
@@ -132,6 +134,17 @@ module.exports = {
     COLLECT_SCROLL_PASS_WAIT_MS: 500,
     COLLECT_END_CONFIRM_MS: 3000,
     MODAL_PROFILE_NUKE_SCROLL_WAIT_MS: 900,
+    // Collect loops (content.js): a collect that stops moving for this long gives up. The space page checks this only away from the bottom
+    // (at the bottom the feed ends after COLLECT_END_CONFIRM_MS instead); profile search checks it at any position. (Moved from content.js as
+    // PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS; same value, no behaviour change.)
+    COLLECT_STALLED_TIMEOUT_MS: 30000,
+    // The Stop collecting label (content.js, both pages) re-reads its count, passes and elapsed time once per tick while a run is active.
+    COLLECT_STOP_LABEL_TICK_MS: 1000,
+
+    // Candidate batches (space page and profile search, content.js): the most profiles one nuke batch works on at once. The profile
+    // search batch is also capped by the profilesPerBatch preference, and never raised above this; the space page batch ignores the preference.
+    // (Replaces the two per-page copies SPACE_FEED_PROFILES_PER_BATCH and PROFILE_SEARCH_PROFILES_PER_BATCH, both 3.)
+    CANDIDATE_BATCH_PROFILES_PER_BATCH: 3,
 
     // Dashboard duration histograms (owner, 26 Oct; semi-log scale changed 26 Oct): the real-block and already-blocked completed rows, bucketed by
     // active-to-terminal time. Each entry is the lower bound of a bucket in seconds, inclusive; a bucket runs up to the next entry, exclusive, and

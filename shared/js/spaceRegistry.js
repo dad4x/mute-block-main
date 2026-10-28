@@ -1,5 +1,6 @@
 const {SPACE_SORT_KEY} = require('./storageKeys')
 const {SPACE_REGISTRY_KEY} = require('./storageKeys')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES} = require('./tunables')
 const SPACE_SORT_NAME = 'name'
 const SPACE_SORT_CATEGORY = 'category'
 const SPACE_CATEGORY_ASSET = 'asset'
@@ -14,6 +15,11 @@ const SPACE_CATEGORY_ORDER = {
 
 function normalizeSpaceCategory(category) {
     return SPACE_CATEGORIES.includes(category) ? category : ''
+}
+
+// The space's Collect N More count, kept on its registry record. Only a count the dropdown offers is kept; anything else is the default.
+function normalizeSpaceCollectCount(count) {
+    return PROFILE_SEARCH_COLLECT_CHOICES.includes(count) ? count : PROFILE_SEARCH_COLLECT_LIMIT
 }
 
 function getSpaceCategoryShortLabel(category) {
@@ -108,6 +114,18 @@ function buildSpaceRecord(space, category, existingRecord = null) {
         slug: `${space?.slug || existingRecord?.slug || extractSpaceSlug(url)}`.trim(),
         name: normalizeLabel(space?.name || existingRecord?.name || extractSpaceSlug(url) || url),
         category: nextCategory,
+        collectCount: normalizeSpaceCollectCount(existingRecord?.collectCount),
+        updatedAt: Date.now()
+    }
+}
+
+// The record with a new collect count, or null when the space has no record (an uncategorised space has none, so its count stays in memory).
+function withSpaceRecordCollectCount(record, count) {
+    if(!record || typeof record !== 'object') return null
+
+    return {
+        ...record,
+        collectCount: normalizeSpaceCollectCount(count),
         updatedAt: Date.now()
     }
 }
@@ -151,6 +169,8 @@ module.exports = {
     getSpaceCategoryShortLabel,
     getSpaceName,
     normalizeSpaceCategory,
+    normalizeSpaceCollectCount,
     normalizeSpaceUrl,
-    sortSpaceRecords
+    sortSpaceRecords,
+    withSpaceRecordCollectCount
 }

@@ -3,7 +3,7 @@ const path = require('path')
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 9222
-const DEFAULT_EXTENSION_ID = 'ajcjckiafbnhioeafaejlaehkmdcdeha'
+const DEFAULT_EXTENSION_ID = 'kmnnjpcadjhphekdimhpihnaghbbpbhe'
 const DEFAULT_CHROME_DEV_PATH = path.resolve(__dirname, '..', '..', '..', 'chrome-dev')
 
 function getOption(name, fallback = '') {

@@ -31,7 +31,9 @@ const {
     getSpaceCategoryLongLabel,
     getSpaceName,
     normalizeSpaceCategory,
-    normalizeSpaceUrl
+    normalizeSpaceCollectCount,
+    normalizeSpaceUrl,
+    withSpaceRecordCollectCount
 } = require('./spaceRegistry')
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
@@ -52,7 +54,7 @@ const {
 } = require('./storageKeys')
 const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 const {MAX_PROFILE_NUKE_PROGRESS_ENTRIES, CLAIM_RETRY_HIT_DIAGNOSTIC_PASSES, PROFILE_MENU_POLL_INTERVAL_MS, SPACE_FEED_STATE_RETRY_MS, CONTENT_PROGRESS_BAR_POLL_MS, SPACE_FEED_STATE_POLL_MS, OWNED_NUKE_STATUS_TTL_MS, OWNED_NUKE_STATUS_WAIT_MS, SPACE_FEED_RENDER_MIN_GAP_MS, SPACE_FEED_PROFILE_LINK_CARD_CACHE_MS, SPACE_FEED_PROFILE_LINK_FULL_SCAN_MS, SPACE_FEED_CONTENT_ROOT_MEMO_MS, SPACE_FEED_SCAN_REUSE_MS, SPACE_FEED_SCAN_BAND_DOWN_PX, SPACE_FEED_SCAN_BAND_UP_PX, SPACE_FEED_RENDER_MODEL_MEMO_MS} = require('./tunables')
-const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS} = require('./tunables')
+const {PROFILE_SEARCH_COLLECT_LIMIT, PROFILE_SEARCH_COLLECT_CHOICES, COLLECT_SCROLL_PASS_WAIT_MS, COLLECT_END_CONFIRM_MS, MODAL_PROFILE_NUKE_SCROLL_WAIT_MS, COLLECT_STALLED_TIMEOUT_MS, COLLECT_STOP_LABEL_TICK_MS, CANDIDATE_BATCH_PROFILES_PER_BATCH} = require('./tunables')
 const {
     WAIT_FOR_ACTION_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_ACTION_DEFAULT_INTERVAL_MS,
@@ -88,11 +90,11 @@ const {
 const {
     COORDINATOR_ENQUEUE_CHUNK_SIZE
 } = require('./coordinatorEnqueueChunking')
+const {createEnqueueMarkStore} = require('./candidateMarks')
+const {formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT} = require('./candidateCollect')
+const {collectPassMadeProgress, runCollectLoop} = require('./candidateCollect')
 
-const SPACE_FEED_PROFILES_PER_BATCH = 3
 const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
-const PROFILE_SEARCH_PROFILES_PER_BATCH = 3
-const PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000
 const CONTENT_SCRIPT_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const QUEUED_PROGRESS_MESSAGE_TIMEOUT_MS = 2500
 const QUEUED_TERMINAL_PROGRESS_MESSAGE_TIMEOUT_MS = 5000
@@ -228,6 +230,14 @@ let profileSearchControlsTimeout
 let profileSearchControlsPending = false
 let profileSearchCollecting = false
 let profileSearchCollectStopRequested = false
+// The run's counters for the Stop collecting label: its start time, passes through the loop, and the count collected since the press.
+let profileSearchCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}
+// The Considered line under the Collect N More button (owner, 27 Oct). Set when a collect run ends, cleared when the next run starts. It is kept
+// in memory, so a toolbar rebuilt by a sync gets the same line back.
+let profileSearchConsideredText = ''
+// The cause line under it: why the last run ended (owner, 27 Oct). Cleared with the line at run start.
+let profileSearchConsideredCause = ''
+let profileSearchStopLabelTimer = 0
 let profileSearchCollectionKey = ''
 // The Collect N More count, for this search page only. It is kept in memory: it is not saved, and it resets when the search changes or the page reloads.
 let profileSearchCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
@@ -245,7 +255,7 @@ let profileSearchLastQueuedAt = 0
 let profileSearchQueueingBatch = false
 // In-memory marks of the batches the search page has just sent to the queue (owner, 26 Oct: as the space page's marks). Keyed by profile href.
 // Never stored: a reload clears them, and the worker's rows take over. See beginProfileSearchEnqueueMarks.
-let profileSearchEnqueueMarkBatches = []
+const profileSearchEnqueueMarks = createEnqueueMarkStore({keyOf: profileSearchEnqueueMarkKeyOf, matchOf: profileSearchEnqueueMarkMatchOf})
 let profileSearchLastQueuedCount = 0
 let spacePageFollowUpTimeouts = []
 let spaceClassificationTimeout
@@ -265,6 +275,9 @@ let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
 let spaceFeedCollectKey = ''
 let spaceFeedCollecting = false
 let spaceFeedCollectStopRequested = false
+// The run's counters for the Stop collecting label: its start time, passes through the loop, and the count collected since the press.
+let spaceFeedCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}
+let spaceFeedStopLabelTimer = 0
 let discoveredSpaceFeedEntries = new Map()
 let spaceFeedEntryCache = new Map()
 let spaceFeedRootCache = new WeakMap()
@@ -287,7 +300,7 @@ let spaceFeedScopedStateSignature = ''
 let storageChangeListenerInstalled = false
 let spaceFeedNukingPostKeys = new Set()
 // In-memory marks of the batches this page has just sent to the queue (see beginSpaceFeedEnqueueMarks). Never stored.
-let spaceFeedEnqueueMarkBatches = []
+const spaceFeedEnqueueMarks = createEnqueueMarkStore({keyOf: spaceFeedEnqueueMarkKeyOf, matchOf: spaceFeedEnqueueMarkMatchOf, onChange: touchSpaceFeedEnqueueMarks})
 let activeSpaceFeedNukeMode = ''
 let activeSpaceFeedNukeRunId = ''
 let activeSpaceFeedNukeSpaceKey = ''
@@ -733,6 +746,7 @@ function onStorageChanged(changes, areaName) {
         else if(key === SPACE_REGISTRY_KEY) {
             spaceRegistry = change.newValue || {}
             if(getPageType() === 'space') {
+                syncSpaceFeedCollectLimitFromRecord()
                 scheduleSpaceClassificationControls(0)
                 scheduleSpaceAssetNukeControls(0)
             }
@@ -1472,6 +1486,15 @@ function reportPageEvent(event, detail = '') {
         detail: `${detail || ''}`.slice(0, 80),
         clientAt: Date.now()
     }).catch(() => null)
+}
+
+// Owner, 27 Oct: every collect run ends with one flight recorder event saying why. reason is 'captured' (the count was reached),
+// 'end-of-feed' (or end-of-results on search), 'stalled' (the page stopped growing), or 'stopped' (Stop was pressed).
+// considered (search only, owner 27 Oct) is the count of distinct result rows the run read; it is added as "seen N" when given.
+function reportCollectEnd(page, {reason, collected, limit, passes, startedAt, considered = null}) {
+    const seconds = Math.round((Date.now() - (startedAt || Date.now())) / 1000)
+    const seen = Number.isFinite(considered) ? ` seen ${considered}` : ''
+    reportPageEvent(`${page}-collect-end`, `${reason} ${collected}/${limit} p${passes} ${seconds}s${seen}`)
 }
 
 let lastReportedProfileBlocked = null
@@ -5206,9 +5229,9 @@ function toggleUnblockUnmuteBtn() {
         existingBtn?.remove()
 
         let btn = document.createElement('button')
-        btn.innerText = 'Unblock Unmute'
+        btn.innerText = 'Unblock'
         btn.classList.add('mb-ext_unblock-unmute-btn')
-        setMuteBlockHelp(btn, 'Unblock and unmute this profile')
+        setMuteBlockHelp(btn, 'Unblock and unmute this profile. This is also called a pardon.')
 
         bindSinglePressAction(btn, () => handleUnblockUnmuteClick(btn))
         insertProfileActionButton(btn, target, 'unblock-unmute')
@@ -5310,7 +5333,7 @@ async function handleMuteBlockClick(button, closeAfterSuccess = false) {
         if(unblockBtn && document.body.contains(unblockBtn)) {
             unblockBtn.disabled = false
             if(unblockBtn.innerText === 'Working...') {
-                unblockBtn.innerText = originalUnblockText || 'Unblock Unmute'
+                unblockBtn.innerText = originalUnblockText || 'Unblock'
             }
         }
         if(muteBtn && document.body.contains(muteBtn)) {
@@ -5365,12 +5388,12 @@ async function handleUnblockUnmuteClick(button) {
         if(result?.ok) void recordManualProfileAction('pardon')
     }
     catch(error) {
-        const message = `${error?.message || error || 'Unblock Unmute failed'}`
+        const message = `${error?.message || error || 'Pardon failed'}`
         console.error(error)
         await recordCurrentProfileNukeProgress({
             status: 'error',
             finalError: message,
-            event: `Unblock Unmute action failed: ${message}`
+            event: `Pardon action failed: ${message}`
         })
         button.innerText = 'Retry'
     }
@@ -5386,7 +5409,7 @@ async function handleUnblockUnmuteClick(button) {
         if(unblockBtn && document.body.contains(unblockBtn)) {
             unblockBtn.disabled = false
             if(unblockBtn.innerText === 'Working...') {
-                unblockBtn.innerText = originalUnblockText || 'Unblock Unmute'
+                unblockBtn.innerText = originalUnblockText || 'Unblock'
             }
         }
         if(muteBtn && document.body.contains(muteBtn)) {
@@ -6610,19 +6633,49 @@ function getSpaceFeedCollectKey() {
     return `${location.origin}${location.pathname}`
 }
 
+// A space page starts with the count on its registry record, or the default when the space has no record (no category yet).
 function ensureSpaceFeedCollectStateForCurrentSpace() {
     const key = getSpaceFeedCollectKey()
     if(spaceFeedCollectKey === key) return
 
     spaceFeedCollectKey = key
-    spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT
+    spaceFeedCollectLimit = normalizeSpaceCollectCount(getStoredSpaceRecord(resolveCurrentSpaceDescriptor())?.collectCount)
 }
 
-// Only a count the dropdown offers is taken. It applies to this space page only.
+// The registry can load after the page starts, and another tab can change the count. A space with no record keeps its in-memory count.
+function syncSpaceFeedCollectLimitFromRecord() {
+    const record = getStoredSpaceRecord(resolveCurrentSpaceDescriptor())
+    if(!record) return
+
+    spaceFeedCollectLimit = normalizeSpaceCollectCount(record.collectCount)
+    if(!spaceFeedCollecting) syncSpaceFeedCollectButton()
+}
+
+// Only a count the dropdown offers is taken. It applies to this space page, and to the space's record when it has one.
 function setSpaceFeedCollectLimit(value) {
     if(!PROFILE_SEARCH_COLLECT_CHOICES.includes(value)) return
     spaceFeedCollectLimit = value
     syncSpaceFeedCollectButton()
+    void persistSpaceFeedCollectCount(value)
+}
+
+// The count is written into the space's registry record through the same message the category buttons use. A space with no record
+// (no category) has nowhere to keep it, so nothing is written and the count stays in memory.
+async function persistSpaceFeedCollectCount(value) {
+    const record = getStoredSpaceRecord(resolveCurrentSpaceDescriptor())
+    if(!record || record.collectCount === value) return
+
+    const recordKey = Object.keys(spaceRegistry).find(key => spaceRegistry[key] === record)
+    if(!recordKey) return
+
+    const nextRecord = withSpaceRecordCollectCount(record, value)
+    if(!nextRecord) return
+
+    spaceRegistry = {
+        ...spaceRegistry,
+        [recordKey]: nextRecord
+    }
+    await safeSendRuntimeMessage({action: 'set-space-registry', spaceRegistry}, null)
 }
 
 // The stop rule, kept pure so it can be tested. A collect is done once `limit` more were collected since the press. The peak count is
@@ -6653,7 +6706,27 @@ function requestSpaceFeedCollectStop() {
 // The Stop collecting button sits at the bottom of the page, left of Quora's "Next notification" pill, as on search pages (owner, 26 Oct).
 // It is one element on the body, not in the right column, so a re-render of the column or the feed cannot remove it mid-run. It is created
 // only while a collect runs, and it is hidden again when the run ends. Its click stops that run.
+// The Stop collecting label, read from the run's counters (formatCollectStopLabel in candidateCollect.js). It is written only when the text
+// changes, so the page's observers are not woken for the same label.
+function refreshSpaceFeedStopLabel() {
+    const stopButton = document.querySelector('.mb-ext_space-collect-stop-btn')
+    if(!stopButton || !spaceFeedCollecting) return
+    const label = formatCollectStopLabel({
+        collected: spaceFeedCollectProgress.collected,
+        target: spaceFeedCollectProgress.target,
+        passes: spaceFeedCollectProgress.passes,
+        elapsedMs: Date.now() - spaceFeedCollectProgress.startedAt
+    })
+    if(stopButton.textContent !== label) stopButton.textContent = label
+}
+
 function syncSpaceFeedStopButtons() {
+    // The label is re-read once per tick while a run is active (owner, 27 Oct). The tick ends with the run.
+    if(spaceFeedCollecting && !spaceFeedStopLabelTimer) spaceFeedStopLabelTimer = setInterval(refreshSpaceFeedStopLabel, COLLECT_STOP_LABEL_TICK_MS)
+    if(!spaceFeedCollecting && spaceFeedStopLabelTimer) {
+        clearInterval(spaceFeedStopLabelTimer)
+        spaceFeedStopLabelTimer = 0
+    }
     let stopButton = document.querySelector('.mb-ext_space-collect-stop-btn')
     if(!stopButton) {
         if(!spaceFeedCollecting) return
@@ -6664,6 +6737,7 @@ function syncSpaceFeedStopButtons() {
         requestSpaceFeedCollectStop()
     })
     if(button) button.hidden = !spaceFeedCollecting
+    refreshSpaceFeedStopLabel()
 }
 
 async function collectMoreSpaceFeedPosts(button) {
@@ -6676,8 +6750,8 @@ async function collectMoreSpaceFeedPosts(button) {
     // Each run starts with its own stop flag cleared, so a stop from an earlier run cannot end this one.
     spaceFeedCollecting = true
     spaceFeedCollectStopRequested = false
+    spaceFeedCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: limit}
     syncSpaceFeedStopButtons()
-    let stalledStartedAt = 0
     let endReached = false
     try {
         await animateNukeButtonPress(button)
@@ -6689,35 +6763,41 @@ async function collectMoreSpaceFeedPosts(button) {
         // A stop pressed during the animation skips it.
         if(!spaceFeedCollectStopRequested) window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'auto'})
 
-        while(!spaceFeedCollectStopRequested && !isSpaceFeedCollectDone(startCount, peakCount, limit)) {
-            const beforeCount = peakCount
-            const beforeY = window.scrollY || 0
-            const beforeHeight = document.documentElement.scrollHeight
-            window.scrollBy({top: Math.round(window.innerHeight * 0.8), behavior: 'auto'})
-            await sleep(COLLECT_SCROLL_PASS_WAIT_MS)
-
-            peakCount = Math.max(peakCount, readSpaceFeedCollectedCount())
-            setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting ${getSpaceFeedCollectedSince(startCount, peakCount)} / ${limit}`))
-
-            const madeProgress = peakCount > beforeCount ||
-                (window.scrollY || 0) > beforeY ||
-                document.documentElement.scrollHeight > beforeHeight
-            if(madeProgress) {
-                stalledStartedAt = 0
-                continue
-            }
-            // Nothing moved. At the bottom, Quora may still be loading, so the feed counts as ended only after COLLECT_END_CONFIRM_MS
-            // without growth. Away from the bottom, a page that does not move for the stall timeout is stuck, not finished.
-            const atBottom = window.innerHeight + (window.scrollY || 0) >= document.documentElement.scrollHeight - 4
-            stalledStartedAt = stalledStartedAt || Date.now()
-            if(atBottom && Date.now() - stalledStartedAt >= COLLECT_END_CONFIRM_MS) {
-                endReached = true
-                break
-            }
-            if(!atBottom && Date.now() - stalledStartedAt >= PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS) break
-        }
+        // The shared loop (runCollectLoop in candidateCollect.js) makes the passes. This page scrolls down one screen and waits
+        // COLLECT_SCROLL_PASS_WAIT_MS. At the bottom, Quora may still be loading, so the feed ends only after COLLECT_END_CONFIRM_MS without
+        // growth. Away from the bottom, a stall of COLLECT_STALLED_TIMEOUT_MS is stuck, not finished.
+        const atFeedBottom = () => window.innerHeight + (window.scrollY || 0) >= document.documentElement.scrollHeight - 4
+        const outcome = await runCollectLoop({
+            isStopRequested: () => spaceFeedCollectStopRequested,
+            isDone: () => isSpaceFeedCollectDone(startCount, peakCount, limit),
+            snapshot: () => ({count: peakCount, scrollY: window.scrollY || 0, scrollHeight: document.documentElement.scrollHeight}),
+            pass: () => {
+                window.scrollBy({top: Math.round(window.innerHeight * 0.8), behavior: 'auto'})
+            },
+            sleep,
+            waitMs: COLLECT_SCROLL_PASS_WAIT_MS,
+            readProgress: () => {
+                peakCount = Math.max(peakCount, readSpaceFeedCollectedCount())
+                // A pass counts once its read has run, so the label's count and passes always describe the same reads.
+                spaceFeedCollectProgress.collected = getSpaceFeedCollectedSince(startCount, peakCount)
+                spaceFeedCollectProgress.passes += 1
+                setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting ${getSpaceFeedCollectedSince(startCount, peakCount)} / ${limit}`))
+            },
+            madeProgress: collectPassMadeProgress,
+            endCheck: stalledMs => atFeedBottom() && stalledMs >= COLLECT_END_CONFIRM_MS,
+            stallTimeoutApplies: () => !atFeedBottom(),
+            stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS
+        })
+        endReached = outcome === 'end'
 
         const collected = getSpaceFeedCollectedSince(startCount, peakCount)
+        reportCollectEnd('space', {
+            reason: spaceFeedCollectStopRequested ? 'stopped' : collected >= limit ? 'captured' : endReached ? 'end-of-feed' : 'stalled',
+            collected,
+            limit,
+            passes: spaceFeedCollectProgress.passes,
+            startedAt: spaceFeedCollectProgress.startedAt
+        })
         if(spaceFeedCollectStopRequested) {
             setSpaceFeedCollectButtons(collectButton => setNukeButtonNotice(collectButton, 'Stopped', `Collect ${limit} More`))
             return false
@@ -6759,7 +6839,7 @@ function createSpaceCollectStopButton() {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'mb-ext_nuke-profiles-btn mb-ext_space-collect-stop-btn'
-    button.textContent = 'Stop collecting'
+    button.textContent = STOP_COLLECT_LABEL_TEXT
     button.hidden = true
     setMuteBlockHelp(button, 'Stop this collect at its next pass. Posts already collected stay, and the page goes back to the top')
     return button
@@ -8035,7 +8115,7 @@ function clearStaleLocalSpaceFeedBusyState() {
     if(!spaceFeedNukingPostKeys.size && !queueingButtons.length) return false
     // While a batch is still running its sends, the queueing state is not stale (owner, 26 Oct). A resolver-only batch has no profile href,
     // so hasActivePendingSpaceFeedWork below would not count it. A batch that has finished no longer holds this.
-    if(spaceFeedEnqueueMarkBatches.some(batch => batch.running)) return false
+    if(spaceFeedEnqueueMarks.batches().some(batch => batch.running)) return false
     if(hasActivePendingSpaceFeedWork(getLatestSpaceFeedEntries())) return false
 
     spaceFeedNukingPostKeys.clear()
@@ -8260,6 +8340,17 @@ function touchSpaceFeedEnqueueMarks() {
     spaceFeedRenderModelMemo = null
 }
 
+// The store (spaceFeedEnqueueMarks) keys a post mark by its post key, which carries the 'space-post' prefix (getSpaceFeedPostKey), so it
+// never equals a profile href in askedHrefs. A profile mark is keyed by its profile href.
+function spaceFeedEnqueueMarkKeyOf(mark) {
+    return mark?.profileHref || mark?.postKey || ''
+}
+
+// A profile mark is matched by the profile href of a row. A post mark (no profile yet) is matched by a post key in the row's evidence.
+function spaceFeedEnqueueMarkMatchOf(row, mark) {
+    return mark?.profileHref ? row.href === mark.profileHref : row.postKeys.has(mark.postKey)
+}
+
 function beginSpaceFeedEnqueueMarks(associations = []) {
     const items = []
     for(const association of Array.isArray(associations) ? associations : []) {
@@ -8269,68 +8360,21 @@ function beginSpaceFeedEnqueueMarks(associations = []) {
             if(key) items.push({postKey: key, profileHref})
         }
     }
-    // running: the batch's sends have not all returned yet (see finishSpaceFeedEnqueueMarks).
-    const batch = {items, settledAt: 0, running: true}
-    if(items.length) spaceFeedEnqueueMarkBatches.push(batch)
-    touchSpaceFeedEnqueueMarks()
-    return batch
-}
-
-// settled true: the enqueue is durable, so the marks wait for a state reply asked from now on. settled false: the enqueue failed, so the marks go.
-function settleSpaceFeedEnqueueMarks(batch = null, settled = false) {
-    if(!batch) return
-    if(settled) batch.settledAt = Date.now()
-    else spaceFeedEnqueueMarkBatches = spaceFeedEnqueueMarkBatches.filter(item => item !== batch)
-    touchSpaceFeedEnqueueMarks()
-}
-
-// Called once every send of the batch has returned, success or failure (the finally of nukeSpaceFeedEntries). The batch is no longer running,
-// so a render may clear a stale queueing state. A batch that no durable enqueue settled goes at once. A settled one keeps its marks until the
-// worker's reply to the post-enqueue state refresh has answered (releaseSpaceFeedEnqueueMarks), so the posts stay pending until the worker
-// confirms them, and the marks cannot outlive the batch.
-function finishSpaceFeedEnqueueMarks(batch = null) {
-    if(!batch) return
-    batch.running = false
-    if(!batch.settledAt) settleSpaceFeedEnqueueMarks(batch, false)
-    else touchSpaceFeedEnqueueMarks()
-}
-
-// Drops whatever marks of the batch are left once the post-enqueue refresh has answered (or failed to). The reply has already cleared the
-// marks whose rows it shows, so only the rows it does not show are dropped here.
-function releaseSpaceFeedEnqueueMarks(batch = null) {
-    if(!batch) return
-    spaceFeedEnqueueMarkBatches = spaceFeedEnqueueMarkBatches.filter(item => item !== batch)
-    touchSpaceFeedEnqueueMarks()
+    return spaceFeedEnqueueMarks.begin(items)
 }
 
 // requestedAt is when the reply's request was sent. queueRows is the page's copy after the reply was merged, askedHrefs the profiles asked.
 // A settled batch's items are trimmed in place, so the batch reference its enqueue holds still matches the array when it is released
-// (releaseSpaceFeedEnqueueMarks looks the batch up by identity). A copied batch would miss that release.
+// (spaceFeedEnqueueMarks.release looks the batch up by identity). A copied batch would miss that release.
 function applySpaceFeedEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {}) {
-    if(!spaceFeedEnqueueMarkBatches.length) return
-
-    const asked = new Set(askedHrefs)
-    const rowHrefs = new Set()
-    const rowPostKeys = new Set()
-    for(const [itemKey, item] of Object.entries(queueRows || {})) {
-        const href = getCoordinatorItemProfileHref(itemKey, item)
-        if(href) rowHrefs.add(href)
-        for(const evidence of Array.isArray(item?.evidence) ? item.evidence : []) {
-            const postKey = `${evidence?.postKey || ''}`.trim()
-            if(postKey) rowPostKeys.add(postKey)
-        }
-    }
-    for(const batch of spaceFeedEnqueueMarkBatches) {
-        // A batch still queueing is kept whole: its enqueue has not settled, so its rows are not due in any reply yet. A reply that
-        // arrives meanwhile must not drop its marks, or the Nuke 'Em label falls back to idle and flips to queueing again per chunk (owner, 26 Oct).
-        if(!(batch.settledAt > 0)) continue
-        const askedAfterSettle = requestedAt >= batch.settledAt
-        batch.items = batch.items.filter(item => item.profileHref
-            ? !(rowHrefs.has(item.profileHref) || (askedAfterSettle && asked.has(item.profileHref)))
-            : !rowPostKeys.has(item.postKey))
-    }
-    spaceFeedEnqueueMarkBatches = spaceFeedEnqueueMarkBatches.filter(batch => batch.items.length)
-    touchSpaceFeedEnqueueMarks()
+    if(!spaceFeedEnqueueMarks.hasBatches()) return
+    const rows = Object.entries(queueRows || {}).map(([itemKey, item]) => ({
+        href: getCoordinatorItemProfileHref(itemKey, item) || '',
+        postKeys: new Set((Array.isArray(item?.evidence) ? item.evidence : [])
+            .map(evidence => `${evidence?.postKey || ''}`.trim())
+            .filter(Boolean))
+    }))
+    spaceFeedEnqueueMarks.applyToStateReply(requestedAt, askedHrefs, rows)
 }
 
 function getPendingSpaceFeedIndex() {
@@ -8354,7 +8398,7 @@ function getPendingSpaceFeedIndex() {
         }
     }
     // The posts this page has just sent (owner, 26 Oct; see beginSpaceFeedEnqueueMarks), counted the same as a pending row.
-    for(const batch of spaceFeedEnqueueMarkBatches) {
+    for(const batch of spaceFeedEnqueueMarks.batches()) {
         for(const {postKey, profileHref} of batch.items) {
             if(!profileHref) {
                 resolverPostKeys.add(postKey)
@@ -8538,7 +8582,7 @@ function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor()) {
     }
 
     // A profile sent in this page's batch is pending for every post that names it, as a queued row is (see beginSpaceFeedEnqueueMarks).
-    for(const batch of spaceFeedEnqueueMarkBatches) {
+    for(const batch of spaceFeedEnqueueMarks.batches()) {
         for(const {profileHref} of batch.items) {
             if(!profileHref) continue
             pendingCoordinatorProfileHrefs.add(profileHref)
@@ -9739,7 +9783,7 @@ function syncSpaceFeedStatusButton(entries = null) {
         button.className = 'mb-ext_space-feed-status-btn'
         button.addEventListener('click', () => {
             scheduleSpaceAssetNukeControls(0)
-            void showCopyableText('Mute-Block Extension Info:', formatSpaceFeedStatusDetails(getSpaceFeedDetectionSnapshot()))
+            void showCopyableText('Mute Block Extension Info:',formatSpaceFeedStatusDetails(getSpaceFeedDetectionSnapshot()))
         })
         host.appendChild(button)
     }
@@ -10392,7 +10436,9 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
         maxConcurrent = getProfilesPerBatch(),
         noForegroundFallback = false,
         maxRetries = null,
-        sourceExtra = {}
+        sourceExtra = {},
+        // onProgress(queuedSoFar, mergedSoFar, totalItems), as the space page's enqueue takes it: fires after each chunk settles.
+        onProgress = null
     } = options
     const profileHrefs = getNormalizedProfileHrefList(urls)
     if(!profileHrefs.length) return {queued: 0, merged: 0, executionQueued: 0}
@@ -10426,7 +10472,7 @@ async function enqueueCoordinatorProfileUrls(options = {}) {
             requestedUrl: profileHref,
             source
         }))
-    })
+    }, onProgress)
 }
 
 async function nukeSpaceFeedEntries(button, entries) {
@@ -10526,14 +10572,14 @@ async function nukeSpaceFeedEntries(button, entries) {
         const enqueueMergedCount = Number.parseInt(result?.merged, 10) || 0
         // The enqueue reply carries counts, not rows, so the marks stay until a state reply asked after the enqueue settles shows the rows.
         if(result?.durable && !result?.storageTimedOut && enqueueQueuedCount + enqueueMergedCount > 0) {
-            settleSpaceFeedEnqueueMarks(enqueueMarkBatch, true)
-            // The marks of this batch go once the worker has answered the refresh, whatever it showed (see releaseSpaceFeedEnqueueMarks).
+            spaceFeedEnqueueMarks.settle(enqueueMarkBatch, true)
+            // The marks of this batch go once the worker has answered the refresh, whatever it showed (see spaceFeedEnqueueMarks.release).
             void refreshSpaceFeedStateAfterEnqueue()
                 .catch(() => false)
-                .finally(() => releaseSpaceFeedEnqueueMarks(enqueueMarkBatch))
+                .finally(() => spaceFeedEnqueueMarks.release(enqueueMarkBatch))
         }
         else {
-            settleSpaceFeedEnqueueMarks(enqueueMarkBatch, false)
+            spaceFeedEnqueueMarks.settle(enqueueMarkBatch, false)
         }
         if((result?.executionQueued || enqueueQueuedCount || enqueueMergedCount || 0) > 0) {
             syncSpaceFeedNukeControls()
@@ -10573,7 +10619,7 @@ async function nukeSpaceFeedEntries(button, entries) {
     finally {
         delete button.dataset.mbQueueing
         // A thrown enqueue never settled its marks: they go with it, as a failed enqueue does.
-        finishSpaceFeedEnqueueMarks(enqueueMarkBatch)
+        spaceFeedEnqueueMarks.finish(enqueueMarkBatch)
         for(const entry of unfinishedEntries) {
             if(entry?.postKey) {
                 spaceFeedNukingPostKeys.delete(entry.postKey)
@@ -10703,7 +10749,7 @@ function syncSpaceFeedTopNukeButton(renderModel) {
     if(activeSpaceWork) {
         setSpaceFeedButtonSelection(button, queueableEntries)
         setMuteBlockHelp(button, queueableEntries.length
-            ? 'Queue the candidates on visible posts that are not queued yet. Work already queued keeps running.'
+            ? 'Queue the candidates on visible posts that are not queued yet. Rows already queued keep running.'
             : 'This space has queued work. Nothing new to queue yet.')
     }
     if(model?.singleNukeActive && queueableEntries.length) {
@@ -11045,7 +11091,7 @@ function syncSpaceFeedPostButtons(renderModel) {
         singleButton.dataset.mbPostUrl = entry.postUrl || ''
         setSpaceFeedButtonUrls(singleButton, liveUrls)
         setMuteBlockHelp(singleButton, postLabel + (hasResolver
-            ? 'Queue this post for author profile resolution and mute-block'
+            ? 'Queue this post for author profile resolution, then mute and block'
             : buildNukeTargetsHelpText('Queue only this post profile for mute and block', getSpaceFeedButtonUrls(singleButton))))
         // Diagnostic, 23 Oct: shown on hover after the help text, and kept on the button as data-mb-diag.
         const diagnostic = getSpaceFeedPostCandidateDiagnostic(entry)
@@ -11060,7 +11106,7 @@ function syncSpaceFeedPostButtons(renderModel) {
             singleButton.disabled = true
         }
         else if(hasCandidates) {
-            setNukeButtonIdle(singleButton, 'Mute-Block')
+            setNukeButtonIdle(singleButton, 'Mute Block')
             singleButton.disabled = false
         }
         else if(postBusy) {
@@ -11073,7 +11119,7 @@ function syncSpaceFeedPostButtons(renderModel) {
             setMuteBlockHelp(singleButton, `${postLabel}Bad Links: nothing here can be queued. Failed: ${badLinkNames.join(', ')}`)
         }
         else {
-            setNukeButtonIdle(singleButton, 'Mute-Block')
+            setNukeButtonIdle(singleButton, 'Mute Block')
             singleButton.disabled = true
         }
         // Owner, 23 Oct: the red button is there only while a profile in the post is in the queue, so a post with none gets no button.
@@ -11514,70 +11560,41 @@ function getProfileSearchRows(options = {}) {
 // 'queueing' on its row and in the toolbar from the start of the enqueue, and 'nuking' once the batch has settled with the worker, until the
 // worker's rows show it. Keyed by profile href, the key the search row uses. A mark is dropped when a state reply shows the profile's row (or,
 // for a settled batch, a reply asked after the settle has no row for it), and at once when the enqueue fails. Marks are never stored.
+// The store (profileSearchEnqueueMarks) keys a mark by its profile href, the key the search row uses.
+function profileSearchEnqueueMarkKeyOf(mark) {
+    return mark?.profileHref || ''
+}
+
+// A mark is matched by the profile href of a row.
+function profileSearchEnqueueMarkMatchOf(row, mark) {
+    return !!row?.href && row.href === mark?.profileHref
+}
+
 function beginProfileSearchEnqueueMarks(profileHrefs = []) {
-    const items = getNormalizedProfileHrefList(profileHrefs).map(profileHref => ({profileHref}))
-    // running: the batch's enqueue has not returned yet (see finishProfileSearchEnqueueMarks).
-    const batch = {items, settledAt: 0, running: true}
-    if(items.length) profileSearchEnqueueMarkBatches.push(batch)
-    return batch
-}
-
-// settled true: the enqueue is durable, so the marks now show as nuking and wait for a state reply asked from now on. settled false: the
-// enqueue failed, so the marks go.
-function settleProfileSearchEnqueueMarks(batch = null, settled = false) {
-    if(!batch) return
-    if(settled) batch.settledAt = Date.now()
-    else profileSearchEnqueueMarkBatches = profileSearchEnqueueMarkBatches.filter(item => item !== batch)
-}
-
-// Called once the enqueue has returned, success or failure. A batch that no durable enqueue settled goes at once, so a throw cannot leave marks.
-// A settled batch keeps its marks until the post-enqueue state refresh has answered (releaseProfileSearchEnqueueMarks).
-function finishProfileSearchEnqueueMarks(batch = null) {
-    if(!batch) return
-    batch.running = false
-    if(!batch.settledAt) settleProfileSearchEnqueueMarks(batch, false)
-}
-
-// Drops whatever marks of the batch are left once the post-enqueue refresh has answered (or failed to).
-function releaseProfileSearchEnqueueMarks(batch = null) {
-    if(!batch) return
-    profileSearchEnqueueMarkBatches = profileSearchEnqueueMarkBatches.filter(item => item !== batch)
+    return profileSearchEnqueueMarks.begin(getNormalizedProfileHrefList(profileHrefs).map(profileHref => ({profileHref})))
 }
 
 // requestedAt is when the reply's request was sent. queueRows is the page's copy after the reply was merged, askedHrefs the profiles asked.
-// A settled batch's items are trimmed in place, so the batch reference its enqueue holds still matches the array when it is released.
+// A settled batch's items are trimmed in place, so the batch reference its enqueue holds still matches the array when it is released
+// (profileSearchEnqueueMarks.release looks the batch up by identity).
 function applyProfileSearchEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {}) {
-    if(!profileSearchEnqueueMarkBatches.length) return
-
-    const asked = new Set(askedHrefs)
-    const rowHrefs = new Set()
-    for(const [itemKey, item] of Object.entries(queueRows || {})) {
-        const href = getCoordinatorItemProfileHref(itemKey, item)
-        if(href) rowHrefs.add(href)
-    }
-    for(const batch of profileSearchEnqueueMarkBatches) {
-        // A batch still queueing is kept whole: its enqueue has not settled, so its rows are not due in any reply yet.
-        if(!(batch.settledAt > 0)) continue
-        const askedAfterSettle = requestedAt >= batch.settledAt
-        batch.items = batch.items.filter(item => !(rowHrefs.has(item.profileHref) || (askedAfterSettle && asked.has(item.profileHref))))
-    }
-    profileSearchEnqueueMarkBatches = profileSearchEnqueueMarkBatches.filter(batch => batch.items.length)
+    if(!profileSearchEnqueueMarks.hasBatches()) return
+    const rows = Object.entries(queueRows || {}).map(([itemKey, item]) => ({href: getCoordinatorItemProfileHref(itemKey, item) || ''}))
+    profileSearchEnqueueMarks.applyToStateReply(requestedAt, askedHrefs, rows)
 }
 
 // 'nuking' when a settled batch holds the profile, 'queueing' when only an enqueue in flight does, '' when it is not marked.
 function getProfileSearchEnqueueMarkState(profileHref = '') {
     const href = normalizeQuoraProfileHref(profileHref)
     if(!href) return ''
-    const batches = profileSearchEnqueueMarkBatches.filter(batch => batch.items.some(item => item.profileHref === href))
-    if(batches.some(batch => batch.settledAt > 0)) return 'nuking'
-    return batches.length ? 'queueing' : ''
+    return profileSearchEnqueueMarks.stateOf(href)
 }
 
 // The marked profiles that have no row in the queue copy yet, counted per state. A profile with a pending row is the queue's to count.
 function getProfileSearchEnqueueMarkCounts() {
     const nuking = new Set()
     const queueing = new Set()
-    for(const batch of profileSearchEnqueueMarkBatches) {
+    for(const batch of profileSearchEnqueueMarks.batches()) {
         for(const {profileHref} of batch.items) {
             if(batch.settledAt > 0) nuking.add(profileHref)
             else queueing.add(profileHref)
@@ -11653,9 +11670,9 @@ function createProfileSearchStopButton() {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'mb-ext_nuke-profiles-btn mb-ext_profile-search-stop-btn'
-    button.textContent = 'Stop collecting'
+    button.textContent = STOP_COLLECT_LABEL_TEXT
     button.hidden = true
-    setMuteBlockHelp(button, 'Stop this collect at its next pass. Results already collected stay, and the page goes back to the top')
+    setMuteBlockHelp(button, 'Stop this collect at its next pass. Profiles already collected stay, and the page goes back to the top')
     return button
 }
 
@@ -11668,7 +11685,27 @@ function requestProfileSearchCollectStop() {
 }
 
 // The Stop collecting button shows only while a collect runs. It is added to the page body on first use.
+// The Stop collecting label, read from the run's counters (formatCollectStopLabel in candidateCollect.js). It is written only when the text
+// changes, so the page's observers are not woken for the same label.
+function refreshProfileSearchStopLabel() {
+    const stopButton = document.querySelector('.mb-ext_profile-search-stop-btn')
+    if(!stopButton || !profileSearchCollecting) return
+    const label = formatCollectStopLabel({
+        collected: profileSearchCollectProgress.collected,
+        target: profileSearchCollectProgress.target,
+        passes: profileSearchCollectProgress.passes,
+        elapsedMs: Date.now() - profileSearchCollectProgress.startedAt
+    })
+    if(stopButton.textContent !== label) stopButton.textContent = label
+}
+
 function syncProfileSearchStopButton() {
+    // The label is re-read once per tick while a run is active (owner, 27 Oct). The tick ends with the run.
+    if(profileSearchCollecting && !profileSearchStopLabelTimer) profileSearchStopLabelTimer = setInterval(refreshProfileSearchStopLabel, COLLECT_STOP_LABEL_TICK_MS)
+    if(!profileSearchCollecting && profileSearchStopLabelTimer) {
+        clearInterval(profileSearchStopLabelTimer)
+        profileSearchStopLabelTimer = 0
+    }
     let stopButton = document.querySelector('.mb-ext_profile-search-stop-btn')
     if(!stopButton) {
         if(!profileSearchCollecting) return
@@ -11679,6 +11716,7 @@ function syncProfileSearchStopButton() {
         requestProfileSearchCollectStop()
     })
     if(button) button.hidden = !profileSearchCollecting
+    refreshProfileSearchStopLabel()
 }
 
 // The queue's count of this search's work, beside the batch button (owner, 25 Oct). Nothing is shown when nothing is pending.
@@ -11699,6 +11737,55 @@ function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0) {
     status.className = 'mb-ext_profile-search-nuking-status'
     status.textContent = parts.join(' · ')
     if(!existing) toolbar.querySelector('.mb-ext_profile-search-batch-btn')?.insertAdjacentElement('afterend', status)
+}
+
+// Owner, 27 Oct: "Considered X displayed matches", X = the distinct result rows the last collect read. Commas only from 1000 up.
+function formatProfileSearchConsideredText(count) {
+    const rows = Number.parseInt(count, 10) || 0
+    const shown = rows >= 1000 ? rows.toLocaleString() : String(rows)
+    return `Considered ${shown} displayed matches`
+}
+
+// Owner, 27 Oct: the cause under the considered line is the reason the collect-end event records, in plain words. A run with no pass
+// (no scan and no scroll) shows Page load instead of the recorded reason.
+const PROFILE_SEARCH_CAUSE_LABELS = {
+    captured: 'Count reached',
+    'end-of-results': 'End of results',
+    'end-of-feed': 'End of results',
+    stalled: 'Stalled',
+    stopped: 'Stopped'
+}
+
+function formatProfileSearchCollectCause(reason, passes) {
+    if(!(Number(passes) > 0)) return 'Page load'
+    return PROFILE_SEARCH_CAUSE_LABELS[reason] || ''
+}
+
+// Each line sits directly after the one above it: the considered line after the Collect N More wrapper, the cause after the considered line.
+// The toolbar wraps each onto its own row, so both show under the button. A line with no text is removed.
+function renderProfileSearchTextLine(toolbar, className, text, anchorSelector) {
+    const existing = toolbar.querySelector(`.${className}`)
+    if(!text) {
+        existing?.remove()
+        return
+    }
+    const line = existing || document.createElement('span')
+    line.className = className
+    if(line.textContent !== text) line.textContent = text
+    if(!existing) toolbar.querySelector(anchorSelector)?.insertAdjacentElement('afterend', line)
+}
+
+function renderProfileSearchConsideredLine(toolbar) {
+    if(!toolbar) return
+    renderProfileSearchTextLine(toolbar, 'mb-ext_profile-search-considered', profileSearchConsideredText, '.mb-ext_profile-search-collect-wrap')
+    renderProfileSearchTextLine(toolbar, 'mb-ext_profile-search-considered-cause', profileSearchConsideredCause, '.mb-ext_profile-search-considered')
+}
+
+// Sets both lines and draws them. Called with no arguments, it clears both (the run start).
+function setProfileSearchConsideredText(text = '', cause = '') {
+    profileSearchConsideredText = text
+    profileSearchConsideredCause = cause
+    renderProfileSearchConsideredLine(document.querySelector('.mb-ext_profile-search-toolbar'))
 }
 
 function getProfileSearchToolbarButtons() {
@@ -11802,7 +11889,7 @@ function syncProfileSearchRowButtons(rows = getProfileSearchRows()) {
             }
         }
         else {
-            setNukeButtonIdle(button, 'Mute-Block')
+            setNukeButtonIdle(button, 'Mute Block')
             button.disabled = false
             setMuteBlockHelp(button, `Queue ${href} for mute and block`)
         }
@@ -11893,13 +11980,14 @@ function syncProfileSearchControls() {
     }
     // The nuking count is a status beside the batch button (owner, 25 Oct). The button keeps its own label while earlier batches run.
     setProfileSearchNukingStatus(buttons.toolbar, pendingSearchCount, enqueueMarks.queueing)
+    renderProfileSearchConsideredLine(buttons.toolbar)
     const hasStagedHrefs = getProfileSearchStagedHrefs().length > 0
     setMuteBlockHelp(buttons.batch, batchHrefs.length
         ? buildNukeTargetsHelpText(hasStagedHrefs
-            ? 'Queue collected profile-search results'
-            : 'Queue currently loaded profile-search results with Follow buttons', batchHrefs)
-        : 'No currently loaded profile-search results with Follow buttons are queueable')
-    setMuteBlockHelp(buttons.collect, `Scroll this search page and collect up to ${limit} more Follow-button profile results`)
+            ? 'Queue collected search profiles'
+            : 'Queue currently loaded search profiles with Follow buttons', batchHrefs)
+        : 'No currently loaded search profiles with Follow buttons are queueable')
+    setMuteBlockHelp(buttons.collect, `Scroll this search page and collect up to ${limit} more Follow-button profiles`)
 
     return true
 }
@@ -11953,8 +12041,9 @@ async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
     try {
         syncProfileSearchControls()
         await animateNukeButtonPress(button)
-        setNukeButtonWorking(button, `Queueing ${profileHrefs.length}...`)
+        setNukeButtonWorking(button, 'Queueing...')
 
+        // Each chunk settles as its own message, so the remaining count drops chunk by chunk, as on the space page.
         const result = await enqueueCoordinatorProfileUrls({
             urls: profileHrefs,
             sourceType: 'profile-search',
@@ -11965,6 +12054,10 @@ async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
             sourceExtra: {
                 searchQuery: new URLSearchParams(location.search).get('q') || '',
                 sourceLabel: getProfileSearchQueryLabel()
+            },
+            onProgress: (queuedSoFar, mergedSoFar, totalItems) => {
+                const remaining = Math.max(0, totalItems - Math.min(totalItems, queuedSoFar + mergedSoFar))
+                setNukeButtonWorking(button, remaining > 0 ? `Queueing... ${remaining} of ${totalItems}` : 'Queueing...')
             }
         })
         let queued = Number.parseInt(result?.executionQueued || result?.queued || result?.merged || 0, 10) || 0
@@ -11974,11 +12067,11 @@ async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
         }
         if(queued > 0) {
             // The enqueue is durable, so the marks now show as nuking. They go once the worker has answered the refresh, whatever it showed.
-            settleProfileSearchEnqueueMarks(enqueueMarkBatch, true)
+            profileSearchEnqueueMarks.settle(enqueueMarkBatch, true)
             void refreshProfileSearchStateAfterEnqueue(profileHrefs)
                 .catch(() => false)
                 .finally(() => {
-                    releaseProfileSearchEnqueueMarks(enqueueMarkBatch)
+                    profileSearchEnqueueMarks.release(enqueueMarkBatch)
                     syncProfileSearchControls()
                 })
             profileSearchLastRunId = result?.runId || profileSearchLastRunId
@@ -11993,14 +12086,14 @@ async function nukeProfileSearchHrefsOnce(button, hrefs = [], options = {}) {
         }
 
         // The enqueue failed or queued nothing: its marks go at once, so the profiles are queueable again.
-        settleProfileSearchEnqueueMarks(enqueueMarkBatch, false)
+        profileSearchEnqueueMarks.settle(enqueueMarkBatch, false)
         setNukeButtonNotice(button, 'Nothing queued', `Nuke 'Em`)
         scheduleProfileSearchControls(250)
         clearProfileSearchPendingRefresh()
         return false
     }
     finally {
-        finishProfileSearchEnqueueMarks(enqueueMarkBatch)
+        profileSearchEnqueueMarks.finish(enqueueMarkBatch)
         syncProfileSearchControls()
     }
 }
@@ -12025,11 +12118,15 @@ async function collectMoreProfileSearchResults(button) {
     // Each run starts with its own stop flag cleared, so a stop from an earlier run cannot end this one.
     profileSearchCollecting = true
     profileSearchCollectStopRequested = false
+    profileSearchCollectProgress = {startedAt: Date.now(), passes: 0, collected: 0, target: limit}
+    // A new run clears the Considered line from the last run (owner, 27 Oct).
+    setProfileSearchConsideredText('')
+    // The distinct result row elements this run has read, over all its passes (owner, 27 Oct: rows, not unique profiles).
+    const consideredRows = new Set()
     syncProfileSearchStopButton()
     const initialStagedCount = getProfileSearchStagedHrefs().length
     const targetStagedCount = initialStagedCount + limit
     let collectedCount = 0
-    let stalledStartedAt = 0
     let endReached = false
 
     profileSearchProcessedFollowButtons = new WeakSet()
@@ -12039,44 +12136,57 @@ async function collectMoreProfileSearchResults(button) {
     if(!profileSearchCollectStopRequested) window.scrollTo({top: document.documentElement.scrollHeight, behavior: 'auto'})
 
     try {
-        while(!profileSearchCollectStopRequested && collectedCount < limit) {
-            const beforeCount = collectedCount
-            const beforeY = getProfileSearchScrollY()
-            const beforeHeight = getProfileSearchScrollHeight()
-            const rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})
-            for(const row of getProfileSearchQueueableRows(rows, {allowRetry: false})) {
-                if(collectedCount >= limit) break
-                collectedCount += stageProfileSearchHrefs([row.href])
-            }
+        // The shared loop (runCollectLoop in candidateCollect.js) makes the passes. This page's pass reads and stages the rows in view, and
+        // checks for the end of the results before it nudges the lazy load; the wait is COLLECT_SCROLL_PASS_WAIT_MS. The end check stays in
+        // the pass, so the page is checked at the end before the nudge and the wait, as before. Stall: COLLECT_STALLED_TIMEOUT_MS at any position.
+        const outcome = await runCollectLoop({
+            isStopRequested: () => profileSearchCollectStopRequested,
+            isDone: () => collectedCount >= limit,
+            snapshot: () => ({count: collectedCount, scrollY: getProfileSearchScrollY(), scrollHeight: getProfileSearchScrollHeight()}),
+            pass: () => {
+                const rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})
+                for(const row of rows) consideredRows.add(row.row)
+                for(const row of getProfileSearchQueueableRows(rows, {allowRetry: false})) {
+                    if(collectedCount >= limit) break
+                    collectedCount += stageProfileSearchHrefs([row.href])
+                }
 
-            for(const row of rows) profileSearchProcessedFollowButtons.add(row.followButton)
-            saveProfileSearchCollectCursor(rows)
-            setNukeButtonWorking(button, `Collecting ${getProfileSearchStagedHrefs().length} / ${targetStagedCount}`)
-            syncProfileSearchControls()
+                for(const row of rows) profileSearchProcessedFollowButtons.add(row.followButton)
+                saveProfileSearchCollectCursor(rows)
+                // A pass counts once its read has run, so the label's count and passes always describe the same reads.
+                profileSearchCollectProgress.collected = collectedCount
+                profileSearchCollectProgress.passes += 1
+                setNukeButtonWorking(button, `Collecting ${getProfileSearchStagedHrefs().length} / ${targetStagedCount}`)
+                syncProfileSearchControls()
 
-            if(collectedCount >= limit) break
+                if(collectedCount >= limit) return 'done'
+                if(isProfileSearchEndOfResultsVisible() && !hasUnstagedProfileSearchQueueableRow() && !hasProfileSearchLoadingIndicator()) return 'end'
 
-            if(isProfileSearchEndOfResultsVisible() && !hasUnstagedProfileSearchQueueableRow() && !hasProfileSearchLoadingIndicator()) {
-                endReached = true
-                break
-            }
+                nudgeProfileSearchLazyLoad()
+            },
+            sleep,
+            waitMs: COLLECT_SCROLL_PASS_WAIT_MS,
+            readProgress: () => {
+                profileSearchCollectCursorScrollY = Math.max(profileSearchCollectCursorScrollY, getProfileSearchScrollY())
+            },
+            madeProgress: collectPassMadeProgress,
+            stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS
+        })
+        endReached = outcome === 'end'
 
-            nudgeProfileSearchLazyLoad()
-            await sleep(COLLECT_SCROLL_PASS_WAIT_MS)
-
-            const afterY = getProfileSearchScrollY()
-            const afterHeight = getProfileSearchScrollHeight()
-            profileSearchCollectCursorScrollY = Math.max(profileSearchCollectCursorScrollY, afterY)
-            const madeProgress = collectedCount > beforeCount || afterY > beforeY || afterHeight > beforeHeight
-            if(madeProgress) {
-                stalledStartedAt = 0
-            }
-            else {
-                stalledStartedAt = stalledStartedAt || Date.now()
-                if(Date.now() - stalledStartedAt >= PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS) break
-            }
-        }
-
+        const endReason = profileSearchCollectStopRequested ? 'stopped' : collectedCount >= limit ? 'captured' : endReached ? 'end-of-results' : 'stalled'
+        reportCollectEnd('search', {
+            reason: endReason,
+            collected: collectedCount,
+            limit,
+            passes: profileSearchCollectProgress.passes,
+            startedAt: profileSearchCollectProgress.startedAt,
+            considered: consideredRows.size
+        })
+        setProfileSearchConsideredText(
+            formatProfileSearchConsideredText(consideredRows.size),
+            formatProfileSearchCollectCause(endReason, profileSearchCollectProgress.passes)
+        )
         if(profileSearchCollectStopRequested) {
             // Owner: a stopped collect takes the page back to the top. The collected results stay.
             window.scrollTo({top: 0, behavior: 'auto'})
@@ -12179,13 +12289,13 @@ function getProfilesPerBatch() {
 }
 
 function getSpaceFeedProfilesPerBatch() {
-    return SPACE_FEED_PROFILES_PER_BATCH
+    return CANDIDATE_BATCH_PROFILES_PER_BATCH
 }
 
 function getProfileSearchProfilesPerBatch() {
     const value = Number.parseInt(settings.profilesPerBatch, 10)
-    if(!Number.isFinite(value) || value < 1) return PROFILE_SEARCH_PROFILES_PER_BATCH
-    return Math.min(value, PROFILE_SEARCH_PROFILES_PER_BATCH)
+    if(!Number.isFinite(value) || value < 1) return CANDIDATE_BATCH_PROFILES_PER_BATCH
+    return Math.min(value, CANDIDATE_BATCH_PROFILES_PER_BATCH)
 }
 
 function getModalProfileNukeProfilesPerBatch() {
@@ -12862,7 +12972,7 @@ async function maybeRunAutoProfileAction() {
                     foregroundPromotedAt: response?.foregroundPromotedAt || 0,
                     foregroundPromotionReason: `${reason || ''}`.trim(),
                     event: response?.workerWindowActionGate
-                        ? 'Queued tab proceeded locally using worker-window action surface'
+                        ? 'Queued tab proceeded locally using the background window'
                         : response?.localNoForegroundGate
                         ? 'Queued tab proceeded locally without foreground action gate'
                         : response?.localActionGateFallback
@@ -13118,7 +13228,7 @@ async function maybeRunAutoProfileAction() {
             let ready = await waitForCondition(() => !!getProfileMenuButton() || !!getProfileUnavailableReason(), initialReadyTimeoutMs, 250)
             if(!ready && document.visibilityState !== 'visible' && allowForegroundFallback) {
                 await recordQueuedProfileProgress({
-                    event: 'Unblock Unmute actions stalled in a background tab; waiting for durable profile action gate'
+                    event: 'Pardon actions stalled in a background tab; waiting for durable profile action gate'
                 })
             }
 
@@ -13134,7 +13244,7 @@ async function maybeRunAutoProfileAction() {
             )
             if(!profileActionReady) {
                 const reason = queuedActionLeaseDeniedReason ? `: ${queuedActionLeaseDeniedReason}` : ''
-                await abandonQueuedTab(`Queued Unblock Unmute did not receive profile action gate${reason}`)
+                await abandonQueuedTab(`Queued Pardon did not receive profile action gate${reason}`)
                 return
             }
 
@@ -13149,19 +13259,19 @@ async function maybeRunAutoProfileAction() {
                     status: 'page-ready',
                     openedViablePage: true,
                     actionReadyAt: Date.now(),
-                    event: 'Unblock Unmute profile actions became available'
+                    event: 'Pardon profile actions became available'
                 })
 
                 const wasBlocked = isProfileBlocked()
                 await recordQueuedProfileProgress({
                     status: wasBlocked ? 'unblocking' : 'unmuting',
                     openedViablePage: true,
-                    event: wasBlocked ? 'Queued Unblock Unmute action started' : 'Queued Unmute action started'
+                    event: wasBlocked ? 'Queued Pardon action started' : 'Queued Unmute action started'
                 })
                 const stopHeartbeat = startQueuedActionHeartbeat(() => ({
                     status: wasBlocked ? 'unblocking' : 'unmuting',
                     openedViablePage: true,
-                    event: wasBlocked ? 'Queued Unblock Unmute action still running' : 'Queued Unmute action still running'
+                    event: wasBlocked ? 'Queued Pardon action still running' : 'Queued Unmute action still running'
                 }))
                 let result = null
                 try {
@@ -13175,8 +13285,8 @@ async function maybeRunAutoProfileAction() {
                     await recordQueuedProfileProgress({
                         status: 'error',
                         openedViablePage: true,
-                        finalError: result?.reason || 'Queued Unblock Unmute did not complete',
-                        event: result?.reason || 'Queued Unblock Unmute did not complete'
+                        finalError: result?.reason || 'Queued Pardon did not complete',
+                        event: result?.reason || 'Queued Pardon did not complete'
                     })
                     await failCurrentQueuedProfile(getResolvedSpaceFeedProfileHrefs(queuedProfileHref || location.href))
                     await releaseQueuedTabSlot()
@@ -13190,7 +13300,7 @@ async function maybeRunAutoProfileAction() {
                     unblockSucceeded: true,
                     unblockedAt: Date.now(),
                     finalError: '',
-                    event: wasBlocked ? 'Queued Unblock Unmute completed' : 'Queued profile was already unblocked'
+                    event: wasBlocked ? 'Queued Pardon completed' : 'Queued profile was already unblocked'
                 })
                 if(progress?.serviceWorkerOnly && !progress.runtimeRecorded) {
                     markQueuedTabFinishing()
@@ -13855,8 +13965,8 @@ async function ensureForegroundForConfirmation(confirmationKind = '') {
         }
         noteCurrentProfileNukeProgress({
             event: timedOut
-                ? `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface after foreground timeout`
-                : `${formatConfirmationKind(confirmationKind)} confirmation using worker-window action surface`,
+                ? `${formatConfirmationKind(confirmationKind)} confirmation using the background window after foreground timeout`
+                : `${formatConfirmationKind(confirmationKind)} confirmation using the background window`,
             confirmationForegroundRequired: true,
             confirmationForegroundPromoted: promoted,
             confirmationWorkerWindowActionSurface: true,
@@ -14343,7 +14453,7 @@ async function unblockUnmuteProfile(options = {}) {
             return {ok: false, reason: unmute.reason, unblock, unmute}
         }
         if(clearNukeState) {
-            await clearProfileNukeState(profileHref, 'Unblock Unmute action unblocked the profile')
+            await clearProfileNukeState(profileHref, 'Pardon action unblocked the profile')
         }
     }
     else {
@@ -14368,7 +14478,7 @@ async function unblockUnmuteProfile(options = {}) {
 
     rememberProfileUnblocked(profileHref)
     if(clearNukeState) {
-        await clearProfileNukeState(profileHref, 'Unblock Unmute action completed on a live unblocked profile')
+        await clearProfileNukeState(profileHref, 'Pardon action completed on a live unblocked profile')
     }
     scheduleProfileButtonsRefresh(150)
     return {

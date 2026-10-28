@@ -641,6 +641,7 @@ module.exports.__test = {
     buildQueuedTabOpenEffectPlan,
     applyQueuedTabOpenRuntimeEffect,
     confirmQueuedTabOpenDurableActiveEffect,
+    rollbackFailedQueuedTabOpen,
     kickCoordinatorQueueResume,
     metricStorageGet,
     metricStorageSet,

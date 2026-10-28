@@ -1265,7 +1265,7 @@ test('queue wakeup metrics expose storage pressure without conflating fields', (
     // swCoordinatorQueueView.js for why this floor only ever excludes rows
     // from a genuine reset, not a routine same-version restart.
     assert.match(readRepoFile('shared/js/swCoordinatorQueueView.js'), /terminalAt >= minimumTerminalAt/)
-    assert.match(dashboard, /Storage deadlines/)
+    assert.match(dashboard, /Save deadlines/)
     assert.match(dashboard, /Timeout buckets/)
     assert.match(dashboard, /No-work writes/)
     assert.match(dashboard, /Payload sources/)
@@ -1717,7 +1717,7 @@ test('the TERMINAL and AVG ITEM TIME cards read the worker completed summary, no
     const pageLoadIndex = html.indexOf('id="avgPageLoadValue"')
     assert.ok(itemTimeIndex >= 0, 'the card exists')
     assert.ok(itemTimeIndex < pageLoadIndex, 'the card is before the page-load card')
-    assert.match(html, /<div class="summary-label" title="Mute Block extension: The average over the finished items in this view, each measured from start \(activeAt\) to finish \(terminalAt\), same base as the developer dashboard\.">Avg item time<\/div>\s*<div class="summary-value" id="avgItemTimeValue">--<\/div>/)
+    assert.match(html, /<div class="summary-label" title="Mute Block extension: The average over the completed rows in this view, each measured from start to completion\.">Avg item time<\/div>\s*<div class="summary-value" id="avgItemTimeValue">--<\/div>/)
     assert.match(dashboard, /const terminalCount = getCompletedTerminalCount\(\)/)
     assert.match(dashboard, /setText\('terminalCount', terminalCount\)/)
     assert.match(dashboard, /const completedItemAverageMs = getCompletedItemAverageMs\(\)/)
@@ -2047,7 +2047,7 @@ test('dashboard drops the authority-state-reads panel and the Wakeups and No-wor
         return dashboard.slice(from, to)
     }
     const wakeupsCard = cardSource("buildMetricCard('Wakeups/job'", "buildMetricCard('Nudge accept'")
-    const noWorkCard = cardSource("buildMetricCard('No-work writes'", "buildMetricCard('Storage queue wait'")
+    const noWorkCard = cardSource("buildMetricCard('No-work writes'", "buildMetricCard('Save queue wait'")
     assert.doesNotMatch(wakeupsCard, /alert:/)
     assert.doesNotMatch(noWorkCard, /alert:/)
     // values and labels stay
@@ -2153,9 +2153,16 @@ test('coordinator authority ordinary mutations fail closed when not WAL backed',
     assert.doesNotMatch(applyLockedBody, /backend: 'snapshot'/)
 })
 
+test('queue-counts reads the dashboard rendered counts and sends no message and writes nothing', () => {
+    const source = readRepoFile('tools/cdp/queue-counts.js')
+    assert.match(source, /document\.getElementById/)
+    assert.match(source, /queuedCount/)
+    assert.doesNotMatch(source, /chrome\.storage/, 'queue-counts must not read storage: the queue view is not on disk')
+    assert.doesNotMatch(source, /sendMessage|refresh-coordinator-dashboard-views/, 'queue-counts must not start the outlier pass')
+})
+
 test('routine CDP queue status helpers use compact storage by default', () => {
     const compactHelpers = [
-        'tools/cdp/queue-counts.js',
         'tools/cdp/current-work-filter.js',
         'tools/cdp/active-queue-rows.js',
         'tools/cdp/queue-failures.js'
@@ -3299,8 +3306,9 @@ test('profile search collector stages a bounded batch without queueing', () => {
     const animationFrameBody = extractFunction(source, 'function waitForAnimationFramePair(options = {})')
 
     assert.match(readRepoFile('shared/js/tunables.js'), /PROFILE_SEARCH_COLLECT_LIMIT: 100/)
-    assert.match(source, /PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS = 30000/)
-    assert.match(source, /PROFILE_SEARCH_PROFILES_PER_BATCH = 3/)
+    assert.match(readRepoFile('shared/js/tunables.js'), /COLLECT_STALLED_TIMEOUT_MS: 30000/)
+    assert.match(readRepoFile('shared/js/tunables.js'), /CANDIDATE_BATCH_PROFILES_PER_BATCH: 3/)
+    assert.doesNotMatch(source, /(SPACE_FEED|PROFILE_SEARCH)_PROFILES_PER_BATCH|PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS/)
     assert.match(source, /function getProfileSearchProfilesPerBatch\(\)/)
     assert.doesNotMatch(source, /async function refreshProfileNukeProgressFromStorage\(\)/)
     assert.match(source, /refreshContentPageCoordinatorStateFromRuntime\(\{force: true\}\)[\s\S]*scheduleProfileSearchControls\(0\)/)
@@ -3319,7 +3327,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     assert.match(collectBody, /Collecting \$\{getProfileSearchStagedHrefs\(\)\.length\} \/ \$\{targetStagedCount\}/)
     assert.match(collectBody, /isProfileSearchEndOfResultsVisible\(\) && !hasUnstagedProfileSearchQueueableRow\(\) && !hasProfileSearchLoadingIndicator\(\)/)
     assert.match(collectBody, /nudgeProfileSearchLazyLoad\(\)/)
-    assert.match(collectBody, /Date\.now\(\) - stalledStartedAt >= PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS/)
+    assert.match(collectBody, /stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS/)
     assert.doesNotMatch(collectBody, /madeProgress \|\| hasUnstagedProfileSearchQueueableRow\(\)/)
     assert.match(collectBody, /Collected \$\{collectedCount\}/)
     assert.doesNotMatch(collectBody, /nukeProfileSearchHrefs\(/)
@@ -3367,7 +3375,7 @@ test('a search result whose slug lacks the query words is queueable and has no N
     assert.doesNotMatch(source, /isProfileSearchHrefMatchForCurrentQuery|isProfileSearchRowMatchForCurrentQuery|getProfileSearchQueryTokens|getProfileSearchHrefSlugTokens|normalizeProfileSearchMatchTokens|PROFILE_SEARCH_MATCH_IGNORED_TOKENS/)
     assert.doesNotMatch(rowButtonsBody, /Not Match|isProfileSearchRowMatch/)
     assert.match(rowButtonsBody, /if\(isPendingCoordinatorProfileHref\(href\)\) \{/)
-    assert.match(rowButtonsBody, /setNukeButtonIdle\(button, 'Mute-Block'\)/)
+    assert.match(rowButtonsBody, /setNukeButtonIdle\(button, 'Mute Block'\)/)
 
     // Run the queueable filter itself. Only the nuke-state check is stubbed: a row is kept or dropped by that check alone, never by its slug.
     const queueable = new Function('isProfileSearchProfileNukeable', `${queueableBody}\nreturn getProfileSearchQueueableRows`)(
@@ -4571,7 +4579,7 @@ test('visible worker-window queued tabs can proceed locally without a durable ac
 
     assert.match(actionBody, /claimedActionSurfaceMode === 'worker-window' && document\.visibilityState === 'visible'/)
     assert.match(actionBody, /workerWindowActionGate: claimedActionSurfaceMode === 'worker-window' && document\.visibilityState === 'visible'/)
-    assert.match(actionBody, /Queued tab proceeded locally using worker-window action surface/)
+    assert.match(actionBody, /Queued tab proceeded locally using the background window/)
 })
 
 test('a checkpoint switch forgets the remembered slots only when the save reports false', () => {
@@ -4744,7 +4752,7 @@ test('preferences expose browser-start auto-start as opt-in', () => {
     assert.match(defaults, /coordinatorAutoStartOnBrowserStart: false/)
     assert.match(preferences, /id="coordinatorAutoStartOnBrowserStart"/)
     assert.match(preferences, /Auto-Start Current Work/)
-    assert.match(preferences, /When on, resume work on browser start\. When off, do nothing until you navigate to a Quora page\./)
+    assert.match(preferences, /When on, resume Current Work on browser start\. When off, do nothing until you navigate to a Quora page\./)
     assert.match(preferencesJs, /coordinatorAutoStartOnBrowserStart\.checked = settings\.coordinatorAutoStartOnBrowserStart === true/)
     assert.match(preferencesJs, /coordinatorAutoStartOnBrowserStart: coordinatorAutoStartOnBrowserStart\.checked/)
     assert.match(prefs, /COORDINATOR_AUTO_START_ON_BROWSER_START_KEY = 'coordinatorAutoStartOnBrowserStart'/)
@@ -5017,6 +5025,29 @@ test('Stop collecting on space and search pages is fixed at the bottom, its left
     assert.match(toolbarBody, /toolbar\.appendChild\(collectWrap\)\s*document\.body\.appendChild\(toolbar\)/)
     assert.match(extractFunction(source, 'function syncProfileSearchStopButton()'), /document\.body\?\.appendChild\(stopButton\)/)
     assert.match(css, /\.mb-ext_profile-search-stop-btn\[hidden\]/)
+})
+
+test('the Stop collecting label on both pages comes from the shared candidateCollect helper, its timer runs only during a run, and both loops keep their counters', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const spaceSync = extractFunction(source, 'function syncSpaceFeedStopButtons()')
+    const searchSync = extractFunction(source, 'function syncProfileSearchStopButton()')
+
+    // Both pages call the same helper, and neither builds the label text by hand.
+    assert.match(source, /const \{formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT\} = require\('\.\/candidateCollect'\)/)
+    assert.match(extractFunction(source, 'function createSpaceCollectStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
+    assert.match(extractFunction(source, 'function createProfileSearchStopButton()'), /button\.textContent = STOP_COLLECT_LABEL_TEXT/)
+    assert.match(extractFunction(source, 'function refreshSpaceFeedStopLabel()'), /formatCollectStopLabel\(\{/)
+    assert.match(extractFunction(source, 'function refreshProfileSearchStopLabel()'), /formatCollectStopLabel\(\{/)
+    assert.doesNotMatch(source, /Stop collecting · /)
+    // The timer ticks once per COLLECT_STOP_LABEL_TICK_MS while a run is active, and is cleared when the run ends.
+    assert.match(spaceSync, /setInterval\(refreshSpaceFeedStopLabel, COLLECT_STOP_LABEL_TICK_MS\)/)
+    assert.match(spaceSync, /clearInterval\(spaceFeedStopLabelTimer\)/)
+    assert.match(searchSync, /setInterval\(refreshProfileSearchStopLabel, COLLECT_STOP_LABEL_TICK_MS\)/)
+    assert.match(searchSync, /clearInterval\(profileSearchStopLabelTimer\)/)
+    assert.match(readRepoFile('shared/js/tunables.js'), /COLLECT_STOP_LABEL_TICK_MS: 1000/)
+    // Each run starts its counters, and the start of the run goes to the shared sync before the loop runs.
+    assert.match(extractFunction(source, 'async function collectMoreSpaceFeedPosts(button)'), /spaceFeedCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: limit\}\s*syncSpaceFeedStopButtons\(\)/)
+    assert.match(extractFunction(source, 'async function collectMoreProfileSearchResults(button)'), /profileSearchCollectProgress = \{startedAt: Date\.now\(\), passes: 0, collected: 0, target: limit\}[\s\S]*?syncProfileSearchStopButton\(\)/)
 })
 
 test('choosing a collect count only sets it; the collect starts from the Collect button, on both pages', () => {
@@ -6693,7 +6724,7 @@ test('dashboard first-load spinner stops on the first state and shows the failur
     assert.match(refreshBody, /return \{queueRefreshed, runsRefreshed, answered: queueRefreshed \|\| runsRefreshed\}/)
     const loadStateBody = extractFunction(source, 'async function loadState()')
     assert.match(loadStateBody, /if\(refreshed\.answered\) state\.firstStateReceived = true/)
-    assert.match(loadStateBody, /else if\(!state\.firstStateReceived\) state\.loadError = 'Coordinator worker did not answer the dashboard load'/)
+    assert.match(loadStateBody, /else if\(!state\.firstStateReceived\) state\.loadError = 'The extension did not answer the dashboard load'/)
 
     // A later load (init's, or the poll's) clears the error only once the first state has arrived, so a failed first load stays failed.
     assert.equal((source.match(/if\(state\.firstStateReceived\) state\.loadError = ''/g) || []).length, 2)
@@ -6708,7 +6739,7 @@ test('dashboard first-load spinner stops on the first state and shows the failur
     const renderBody = extractFunction(source, 'function render()')
     assert.match(renderBody, /else if\(firstLoad === 'pending'\) showLoadingIndicator\('currentWorkReadyCount'\)/)
     assert.match(renderBody, /else setText\('currentWorkReadyCount', DASHBOARD_LOAD_FAILED_TEXT\)/)
-    assert.match(extractFunction(source, 'function renderQueue('), /'No current work yet\.', getDashboardFirstLoadState\(\)\)/)
+    assert.match(extractFunction(source, 'function renderQueue('), /'No Current Work yet\.', getDashboardFirstLoadState\(\)\)/)
     assert.match(extractFunction(source, 'async function init()'), /showLoadingIndicator\('currentWorkReadyCount'\)[\s\S]*showLoadingIndicator\('queueList'\)/)
 
     // The History page: its first fetch ends the spinner, and a first fetch that never answers ends it with the failure text.
@@ -6791,4 +6822,252 @@ test('erase keeps the one-time space import marker, and removes the 1.5 space re
         assert.doesNotMatch(body, /browser\.storage\.local\./)
     }
     assert.doesNotMatch(source, /browser\.storage\.local\.remove/)
+})
+
+// 27 Oct. A space's Collect N More count is kept on its registry record, next to its category. A new record starts at the default, a
+// category change keeps the count, and a value the dropdown does not offer is the default. Space pages only; the search page is unchanged.
+test('a new space record starts with the default collect count, and a category change keeps a chosen count (27 Oct)', () => {
+    const {buildSpaceRecord, normalizeSpaceCollectCount, withSpaceRecordCollectCount} = require('../shared/js/spaceRegistry.js')
+    const tunables = require('../shared/js/tunables.js')
+    const space = {key: 'quora-space:https://www.quora.com/space/A', url: 'https://www.quora.com/space/A', name: 'A'}
+
+    const created = buildSpaceRecord(space, 'asset')
+    assert.equal(created.collectCount, tunables.PROFILE_SEARCH_COLLECT_LIMIT)
+    assert.equal(created.collectCount, 100)
+
+    const counted = withSpaceRecordCollectCount(created, 500)
+    assert.equal(counted.collectCount, 500)
+    assert.equal(counted.category, 'asset')
+    assert.equal(counted.url, created.url)
+    const changed = buildSpaceRecord(space, 'target', counted)
+    assert.equal(changed.category, 'target')
+    assert.equal(changed.collectCount, 500, 'a category change keeps the chosen count')
+
+    for(const bad of [7, '500', 0, NaN, null, undefined, 1001]) {
+        assert.equal(normalizeSpaceCollectCount(bad), 100, `${String(bad)} is replaced by the default`)
+    }
+    assert.equal(normalizeSpaceCollectCount(1000), 1000)
+    assert.equal(buildSpaceRecord(space, 'asset', {collectCount: 7}).collectCount, 100, 'an invalid stored count is replaced by the default')
+    assert.equal(withSpaceRecordCollectCount(null, 500), null, 'a space with no record has no record to change')
+})
+
+// The space page's Collect count tests. The functions come from content.js; the registry helpers come from spaceRegistry.js.
+function loadSpaceCollectCountHarness(options) {
+    const registryModule = require('../shared/js/spaceRegistry.js')
+    const tunables = require('../shared/js/tunables.js')
+    const source = readRepoFile('shared/js/content.js')
+    const sent = []
+    const state = {
+        descriptor: options.descriptor,
+        location: {origin: 'https://www.quora.com', pathname: options.pathname},
+        syncs: 0
+    }
+    const context = vm.createContext({
+        PROFILE_SEARCH_COLLECT_LIMIT: tunables.PROFILE_SEARCH_COLLECT_LIMIT,
+        PROFILE_SEARCH_COLLECT_CHOICES: tunables.PROFILE_SEARCH_COLLECT_CHOICES,
+        normalizeSpaceUrl: registryModule.normalizeSpaceUrl,
+        extractSpaceSlug: registryModule.extractSpaceSlug,
+        normalizeSpaceCollectCount: registryModule.normalizeSpaceCollectCount,
+        withSpaceRecordCollectCount: registryModule.withSpaceRecordCollectCount,
+        location: state.location,
+        resolveCurrentSpaceDescriptor: () => state.descriptor,
+        syncSpaceFeedCollectButton: () => { state.syncs += 1 },
+        safeSendRuntimeMessage: message => {
+            sent.push(message)
+            return Promise.resolve(null)
+        }
+    })
+    vm.runInContext([
+        'let spaceFeedCollectLimit = PROFILE_SEARCH_COLLECT_LIMIT',
+        "let spaceFeedCollectKey = ''",
+        'let spaceFeedCollecting = false',
+        'let spaceRegistry = {}',
+        extractFunction(source, 'function getSpaceFeedCollectKey()'),
+        extractFunction(source, 'function ensureSpaceFeedCollectStateForCurrentSpace()'),
+        extractFunction(source, 'function syncSpaceFeedCollectLimitFromRecord()'),
+        extractFunction(source, 'function setSpaceFeedCollectLimit(value)'),
+        extractFunction(source, 'async function persistSpaceFeedCollectCount(value)'),
+        extractFunction(source, 'function getStoredSpaceRecord(space)')
+    ].join('\n'), context)
+    const run = code => vm.runInContext(code, context)
+    run(`spaceRegistry = ${JSON.stringify(options.registry || {})}`)
+    return {run, state, sent}
+}
+
+const SPACE_A_KEY = 'quora-space:https://www.quora.com/space/A'
+const SPACE_A_DESCRIPTOR = {key: SPACE_A_KEY, url: 'https://www.quora.com/space/A', slug: 'A', name: 'A'}
+const SPACE_A_RECORD = {key: SPACE_A_KEY, url: 'https://www.quora.com/space/A', slug: 'A', name: 'A', category: 'asset', collectCount: 100, updatedAt: 1}
+
+test('a space page starts with the collect count on its registry record, and the default when it has none (27 Oct)', () => {
+    const h = loadSpaceCollectCountHarness({pathname: '/space/A', descriptor: SPACE_A_DESCRIPTOR, registry: {[SPACE_A_KEY]: {...SPACE_A_RECORD, collectCount: 500}}})
+    h.run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    assert.equal(h.run('spaceFeedCollectLimit'), 500)
+
+    // The registry can arrive after the page started: the count follows the record when it does.
+    h.run(`spaceRegistry = ${JSON.stringify({[SPACE_A_KEY]: {...SPACE_A_RECORD, collectCount: 1000}})}`)
+    h.run('syncSpaceFeedCollectLimitFromRecord()')
+    assert.equal(h.run('spaceFeedCollectLimit'), 1000)
+    assert.equal(h.state.syncs, 1, 'the dropdown is redrawn with the new count')
+
+    // A space with no record starts at the default.
+    h.state.location.pathname = '/space/B'
+    h.state.descriptor = {key: 'quora-space:https://www.quora.com/space/B', url: 'https://www.quora.com/space/B', slug: 'B', name: 'B'}
+    h.run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    assert.equal(h.run('spaceFeedCollectLimit'), 100)
+})
+
+test('choosing a count on a categorised space writes it into that space record, and an unchanged count writes nothing (27 Oct)', () => {
+    const h = loadSpaceCollectCountHarness({pathname: '/space/A', descriptor: SPACE_A_DESCRIPTOR, registry: {[SPACE_A_KEY]: SPACE_A_RECORD}})
+    h.run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    h.run('setSpaceFeedCollectLimit(500)')
+    assert.equal(h.run('spaceFeedCollectLimit'), 500)
+    assert.equal(h.sent.length, 1, 'one registry write')
+    assert.equal(h.sent[0].action, 'set-space-registry')
+    const stored = h.sent[0].spaceRegistry[SPACE_A_KEY]
+    assert.equal(stored.collectCount, 500)
+    assert.equal(stored.category, 'asset', 'the category is kept')
+    assert.equal(stored.url, SPACE_A_RECORD.url)
+    assert.equal(h.run(`spaceRegistry[${JSON.stringify(SPACE_A_KEY)}].collectCount`), 500, 'the page registry matches what was written')
+
+    h.run('setSpaceFeedCollectLimit(500)')
+    assert.equal(h.sent.length, 1, 'a count equal to the stored one writes nothing')
+})
+
+test('choosing a count on an uncategorised space keeps it in memory and writes nothing (27 Oct)', () => {
+    const h = loadSpaceCollectCountHarness({pathname: '/space/A', descriptor: SPACE_A_DESCRIPTOR, registry: {}})
+    h.run('ensureSpaceFeedCollectStateForCurrentSpace()')
+    h.run('setSpaceFeedCollectLimit(1000)')
+    assert.equal(h.run('spaceFeedCollectLimit'), 1000)
+    assert.equal(h.sent.length, 0, 'no registry write without a record')
+    assert.equal(h.run('Object.keys(spaceRegistry).length'), 0)
+})
+
+test('the registry write from the space page is the same message the category buttons send, with the count in the record (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    assert.match(extractFunction(source, 'async function persistSpaceFeedCollectCount(value)'), /safeSendRuntimeMessage\(\{action: 'set-space-registry', spaceRegistry\}, null\)/)
+    assert.match(extractFunction(source, 'async function setCurrentSpaceCategory(space, category)'), /safeSendRuntimeMessage\(\{action: 'set-space-registry', spaceRegistry\}, null\)/)
+    assert.doesNotMatch(extractFunction(source, 'function setSpaceFeedCollectLimit(value)'), /storage|browser\./)
+})
+
+test('setSpaceRegistryRequested keeps each record collect count, and stores an invalid one as the default (27 Oct)', () => {
+    const source = readRepoFile('shared/js/sw.js')
+    const body = extractFunction(source, 'async function setSpaceRegistryRequested(spaceRegistry = {})')
+    const {normalizeSpaceCollectCount} = require('../shared/js/spaceRegistry.js')
+    const written = []
+    const context = vm.createContext({
+        SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
+        normalizeSpaceCollectCount,
+        metricStorageSet: payload => {
+            written.push(payload)
+            return Promise.resolve()
+        },
+        input: {
+            a: {key: 'a', category: 'asset', collectCount: 500},
+            b: {key: 'b', category: 'target', collectCount: 7},
+            c: {key: 'c', category: 'neutral'}
+        }
+    })
+    vm.runInContext(body, context)
+    // The write happens before the function's first await, so the stored map is read straight after the call.
+    vm.runInContext('setSpaceRegistryRequested(input)', context)
+    assert.equal(written.length, 1)
+    const stored = written[0].mbSpaceRegistry
+    assert.equal(stored.a.collectCount, 500)
+    assert.equal(stored.b.collectCount, 100, 'an invalid count is stored as the default')
+    assert.equal(stored.c.collectCount, undefined, 'a record with no count field is stored as it is')
+    assert.equal(stored.a.category, 'asset')
+})
+
+test('the search batch counts its queueing down per chunk, as the space page does', () => {
+    const source = readRepoFile('shared/js/content.js')
+    assert.match(source, /async function enqueueCoordinatorProfileUrls\(options = \{\}\)[\s\S]*?onProgress = null/)
+    assert.match(source, /\}, onProgress\)\n\}\n\nasync function nukeSpaceFeedEntries/)
+    const searchBlock = source.slice(source.indexOf('async function nukeProfileSearchHrefsOnce'), source.indexOf('async function nukeProfileSearchHrefsOnce') + 4000)
+    assert.match(searchBlock, /onProgress: \(queuedSoFar, mergedSoFar, totalItems\) =>/)
+    assert.match(searchBlock, /Queueing\.\.\. \$\{remaining\} of \$\{totalItems\}/)
+    assert.doesNotMatch(searchBlock, /Queueing \$\{profileHrefs\.length\}\.\.\./)
+})
+
+test('every collect run ends with a flight recorder event that says why: captured, end, stalled or stopped', () => {
+    const source = readRepoFile('shared/js/content.js')
+    assert.match(source, /function reportCollectEnd\(page, \{reason, collected, limit, passes, startedAt, considered = null\}\)/)
+    assert.match(source, /reportPageEvent\(`\$\{page\}-collect-end`/)
+    for (const reason of ['captured', 'stopped', 'stalled']) {
+        assert.match(source, new RegExp(`'${reason}'`), `the ${reason} reason is set`)
+    }
+    assert.match(source, /'end-of-feed' : 'stalled'/)
+    assert.match(source, /'end-of-results' : 'stalled'/)
+    assert.match(source, /reportCollectEnd\('space'/)
+    assert.match(source, /reportCollectEnd\('search'/)
+})
+
+test('the search Considered line: its class is in content.js and content.css, and it is kept as a toolbar element (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const css = readRepoFile('shared/css/content.css')
+    assert.match(source, /renderProfileSearchTextLine\(toolbar, 'mb-ext_profile-search-considered', profileSearchConsideredText, '\.mb-ext_profile-search-collect-wrap'\)/)
+    assert.match(css, /\.mb-ext_profile-search-considered,\s*\n\.mb-ext_profile-search-considered-cause \{[^}]*color:\s*var\(--mb-grey-600\)/)
+    assert.doesNotMatch(css.match(/\.mb-ext_profile-search-considered,\s*\n\.mb-ext_profile-search-considered-cause \{[^}]*\}/)[0], /#[0-9a-fA-F]{3,8}\b|rgba?\(\s*\d/)
+    const helperBody = extractFunction(source, 'function renderProfileSearchTextLine(toolbar, className, text, anchorSelector)')
+    assert.match(helperBody, /insertAdjacentElement\('afterend', line\)/)
+    assert.match(helperBody, /toolbar\.querySelector\(`\.\$\{className\}`\)/)
+    // The sync re-attaches it from the stored text, so a rebuilt toolbar keeps the line.
+    const syncBody = extractFunction(source, 'function syncProfileSearchControls()')
+    assert.match(syncBody, /renderProfileSearchConsideredLine\(buttons\.toolbar\)/)
+})
+
+test('the Considered text reads "Considered X displayed matches" and adds commas only from 1000 up (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const body = extractFunction(source, 'function formatProfileSearchConsideredText(count)')
+    const format = new vm.Script(`${body}; formatProfileSearchConsideredText`).runInNewContext({})
+    assert.equal(format(0), 'Considered 0 displayed matches')
+    assert.equal(format(2), 'Considered 2 displayed matches')
+    assert.equal(format(999), 'Considered 999 displayed matches')
+    assert.equal(format(1000), 'Considered 1,000 displayed matches')
+    assert.equal(format(6088), 'Considered 6,088 displayed matches')
+    assert.equal(format(undefined), 'Considered 0 displayed matches')
+})
+
+test('a new Collect run clears the Considered line before its first read, and the run ends by setting it (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const body = extractFunction(source, 'async function collectMoreProfileSearchResults(button)')
+    const clearAt = body.indexOf("setProfileSearchConsideredText('')")
+    const firstReadAt = body.indexOf('const rows = getProfileSearchRows({fromCurrentViewport: true, skipProcessed: true})')
+    assert.ok(clearAt > 0, 'the run start clears the line')
+    assert.ok(clearAt < firstReadAt, 'the clear comes before the loop reads the rows')
+    assert.match(body, /const consideredRows = new Set\(\)/)
+    assert.match(body, /for\(const row of rows\) consideredRows\.add\(row\.row\)/)
+    assert.match(body, /setProfileSearchConsideredText\(\s*formatProfileSearchConsideredText\(consideredRows\.size\),\s*formatProfileSearchCollectCause\(endReason, profileSearchCollectProgress\.passes\)\s*\)/)
+    // The lines are set after the end event, in the same place as the loop's end notice.
+    assert.ok(body.indexOf('reportCollectEnd(\'search\'') < body.indexOf('setProfileSearchConsideredText(\n'))
+})
+
+test('the cause line under Considered: the four recorded reasons and Page load are the labels, and a run with no pass shows Page load (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const css = readRepoFile('shared/css/content.css')
+    for (const label of ['Count reached', 'End of results', 'Stalled', 'Stopped', 'Page load']) {
+        assert.ok(source.includes(`'${label}'`), `the ${label} label is in content.js`)
+    }
+    assert.match(source, /renderProfileSearchTextLine\(toolbar, 'mb-ext_profile-search-considered-cause', profileSearchConsideredCause, '\.mb-ext_profile-search-considered'\)/)
+    assert.match(css, /\.mb-ext_profile-search-considered-cause/)
+    const causeBody = extractFunction(source, 'function formatProfileSearchCollectCause(reason, passes)')
+    const cause = new vm.Script(`const PROFILE_SEARCH_CAUSE_LABELS = ${source.slice(source.indexOf('PROFILE_SEARCH_CAUSE_LABELS = ') + 'PROFILE_SEARCH_CAUSE_LABELS = '.length, source.indexOf('\n}', source.indexOf('PROFILE_SEARCH_CAUSE_LABELS = ')) + 2)}; ${causeBody}; formatProfileSearchCollectCause`).runInNewContext({})
+    assert.equal(cause('captured', 3), 'Count reached')
+    assert.equal(cause('end-of-results', 3), 'End of results')
+    assert.equal(cause('end-of-feed', 3), 'End of results')
+    assert.equal(cause('stalled', 3), 'Stalled')
+    assert.equal(cause('stopped', 3), 'Stopped')
+    assert.equal(cause('stopped', 0), 'Page load', 'a run with no pass shows Page load, not the recorded reason')
+    assert.equal(cause('captured', 0), 'Page load')
+})
+
+test('the search collect-end event detail carries seen, the distinct result rows the run read (27 Oct)', () => {
+    const source = readRepoFile('shared/js/content.js')
+    const reportBody = extractFunction(source, 'function reportCollectEnd(page, {reason, collected, limit, passes, startedAt, considered = null})')
+    assert.match(reportBody, /const seen = Number\.isFinite\(considered\) \? ` seen \$\{considered\}` : ''/)
+    assert.match(reportBody, /\$\{passes\} \$\{seconds\}s\$\{seen\}`/)
+    const searchCall = source.slice(source.indexOf("reportCollectEnd('search'"), source.indexOf("reportCollectEnd('search'") + 400)
+    assert.match(searchCall, /considered: consideredRows\.size/)
+    // The space page's call passes no count, so its event keeps the old detail.
+    const spaceCall = source.slice(source.indexOf("reportCollectEnd('space'"), source.indexOf("reportCollectEnd('space'") + 400)
+    assert.doesNotMatch(spaceCall, /considered/)
 })

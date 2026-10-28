@@ -19,10 +19,10 @@
         <div class="worker-bar-progress" id="workerBarProgress">
             <div class="worker-bar-fill" id="workerBarFill"></div>
         </div>
-        <div class="worker-bar-count" id="workerBarCount" title="Terminal (handled) out of total items in Current Work">0 / 0</div>
+        <div class="worker-bar-count" id="workerBarCount" title="Completed rows out of all rows in Current Work">0 / 0</div>
         <div class="worker-bar-actions">
             <button class="worker-bar-button" id="workerBarPauseResume" type="button" title="Mute Block extension: Pause the queue, or resume it">Pause</button>
-            <button class="worker-bar-button worker-bar-button--danger" id="workerBarCancel" type="button" title="Mute Block extension: Cancel the current work in the queue">Cancel</button>
+            <button class="worker-bar-button worker-bar-button--danger" id="workerBarCancel" type="button" title="Mute Block extension: Cancel the Current Work in the queue">Cancel</button>
             <button class="worker-bar-button" id="workerBarDashboard" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
             <button class="worker-bar-button" id="workerBarHistory" type="button" title="Mute Block extension: Open the history page">History</button>
             <button class="worker-bar-button" id="workerBarPreferences" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
@@ -50,7 +50,7 @@
                 </div>
             </div>
             <div class="header-status">
-                <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button" title="Mute Block extension: Delete the block history">Clear</button>
+                <button class="clear-button clear-button--danger" id="clearHistoryButton" type="button" title="Mute Block extension: Clear the rows on this page. Nothing is deleted.">Clear</button>
                 <button class="clear-button" id="historyDashboardButton" type="button" title="Mute Block extension: Open the dashboard">Dashboard</button>
                 <button class="clear-button" id="historyPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
             </div>
@@ -83,7 +83,7 @@
                     <span class="dev-mode-toggle-track"><span class="dev-mode-toggle-thumb"></span></span>
                     <span class="dev-mode-toggle-label">Dev mode</span>
                 </label>
-                <button class="clear-button" id="clearAllStatsButton" type="button" title="Mute Block extension: Clears Metrics, Scan cost, Recent event counts, and Outliers in one action">Clear All Stats</button>
+                <button class="clear-button" id="clearAllStatsButton" type="button" title="Mute Block extension: Clear Metrics, Scan cost, Recent event counts and Outliers in one action, including the stored outlier entries. Completed rows and runs are not deleted.">Clear All Stats</button>
                 <button class="clear-button" id="openHistoryButton" type="button" title="Mute Block extension: Open the history page">History</button>
                 <button class="clear-button" id="openPreferencesButton" type="button" title="Mute Block extension: Open the preferences page">Preferences</button>
                 <div class="status-pill" id="refreshState">Loading</div>
@@ -95,7 +95,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="queueList" aria-expanded="true" aria-controls="queueList" aria-label="Collapse Current Work" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="Current Work is the durable operational job set. Status shows execution state; outcome shows terminal result or current error.">Current Work</h2>
+                        <h2 title="Current Work Queue is the list of rows that are waiting, running or completed. Status shows where each row is; Outcome shows its result or current error.">Current Work</h2>
                     </div>
                     <div class="panel-actions panel-actions--queue">
                         <div class="panel-actions-row">
@@ -104,14 +104,14 @@
                             <span id="currentWorkReadyCount">Showing 0, 0 queued, 0 succeeded</span>
                             <span class="queue-count" id="queueCount" hidden>0 jobs</span>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its stored work">Start</button>
+                                <button class="clear-button" id="startCoordinatorButton" type="button" hidden title="Mute Block extension: Start the queue with its saved rows">Start</button>
                                 <button class="clear-button" id="pauseCurrentWorkButton" type="button" disabled title="Mute Block extension: Pause the current work, or resume it">Loading...</button>
                                 <button class="clear-button clear-button--danger" id="clearCurrentWorkButton" type="button" title="Mute Block extension: Cancel and remove all Current Work rows">Clear</button>
                             </div>
                         </div>
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
-                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the service worker's flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
+                                <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
                                 <label class="dev-mode-select">Run for
                                     <select id="debugResumeMinutesSelect">
                                         <option value="0">No time limit</option>
@@ -142,7 +142,7 @@
 
             <section class="summary-grid" aria-label="Dashboard summary">
                 <div class="summary-tile">
-                    <div class="summary-label" title="Current Work jobs ready for a worker slot. Concerning if this climbs steadily while Active stays flat or zero -- that means work is arriving faster than it's being drained (check Queue throttle and Write queue backlog in Metrics below for why).">Queued</div>
+                    <div class="summary-label" title="Current Work jobs ready for a worker slot. Concerning if this climbs steadily while Active stays flat or zero -- that means rows are arriving faster than they're being drained (check Queue throttle and Write queue backlog in Metrics below for why).">Queued</div>
                     <div class="summary-value" id="queuedCount">0</div>
                 </div>
                 <div class="summary-tile">
@@ -150,15 +150,15 @@
                     <div class="summary-value" id="activeCount">0</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Jobs that finished as succeeded, failed, skipped, or canceled.">Terminal</div>
+                    <div class="summary-label" title="Jobs that completed as succeeded, failed, skipped, or canceled.">Completed</div>
                     <div class="summary-value" id="terminalCount">0</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Mute Block extension: The average over the finished items in this view, each measured from start (activeAt) to finish (terminalAt), same base as the developer dashboard.">Avg item time</div>
+                    <div class="summary-label" title="Mute Block extension: The average over the completed rows in this view, each measured from start to completion.">Avg item time</div>
                     <div class="summary-value" id="avgItemTimeValue">--</div>
                 </div>
                 <div class="summary-tile">
-                    <div class="summary-label" title="Average page load per profile action this metrics epoch: from navigation start to the content script opening (the Load phase of Phase timing). Shows -- until finished rows carry those milestones.">Avg page load</div>
+                    <div class="summary-label" title="Average page load per profile action this metrics epoch: from navigation start to the content script opening (the Load phase of Phase timing). Shows -- until completed rows carry those milestones.">Avg page load</div>
                     <div class="summary-value" id="avgPageLoadValue">--</div>
                 </div>
             </section>
@@ -177,33 +177,33 @@
                 <div class="metrics-panel" id="metricsList">
                     <div class="summary-grid summary-row" aria-label="Outcome counts">
                         <div class="summary-tile">
-                            <div class="summary-label" title="Mute-block jobs that performed a genuine new block action this metrics epoch, with their share of all block outcomes.">Really blocked</div>
+                            <div class="summary-label" title="Jobs that performed a genuine new block action this metrics epoch, with their share of all block outcomes.">Really blocked</div>
                             <div class="summary-value" id="reallyBlockedCount">0</div>
                             
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Mute-block jobs that found the profile already blocked this metrics epoch, with their share of all block outcomes. This is always confirmed by actually loading the profile page (or messaging a live tab for a fresh DOM check) and observing the blocked state -- this codebase has no shortcut that marks a row already-blocked from cached/prior knowledge without a fresh page read.">Already blocked</div>
+                            <div class="summary-label" title="Jobs that found the profile already blocked this metrics epoch, with their share of all block outcomes. This is always confirmed by actually loading the profile page (or messaging a live tab for a fresh DOM check) and observing the blocked state -- this codebase has no shortcut that marks a row already-blocked from cached/prior knowledge without a fresh page read.">Already blocked</div>
                             <div class="summary-value" id="alreadyBlockedCount">0</div>
                             
                         </div>
-                        <div class="summary-tile" title="Skipped: the profile was unavailable, was redirected to another profile, or was not a profile page. These rows are finished but are not blocks. The breakdown is under the number.">
-                            <div class="summary-label" title="Skipped: the profile was unavailable, was redirected to another profile, or was not a profile page. These rows are finished but are not blocks. The breakdown is under the number.">Skipped</div>
+                        <div class="summary-tile" title="Skipped: the desired action could not be taken, for one reason or another. Here the profile was unavailable, was redirected to another profile, or was not a profile page. These rows are completed but are not blocks. The breakdown is under the number.">
+                            <div class="summary-label" title="Skipped: the desired action could not be taken, for one reason or another. Here the profile was unavailable, was redirected to another profile, or was not a profile page. These rows are completed but are not blocks. The breakdown is under the number.">Skipped</div>
                             <div class="summary-value" id="skippedCount">0</div>
                             <div class="summary-detail" id="skippedDetail">none</div>
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Finished rows that failed (for example a timeout).">Failed</div>
+                            <div class="summary-label" title="Completed rows that failed (for example a timeout).">Failed</div>
                             <div class="summary-value" id="failedCount">0</div>
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Mute-block jobs skipped this metrics epoch because the profile page showed the current user already following it -- checked on the profile's own page at the moment of action (no maintained followers list), so a candidate that was miscategorized (e.g. a real contributor's profile swept up from a post as if it were a target) doesn't get blocked. Counted separately, not silently dropped, so a run where this fires a lot is visible.">Block attempt on following</div>
+                            <div class="summary-label" title="Jobs skipped this metrics epoch because the block could not be taken: the profile page showed the current user already following it -- checked on the profile's own page at the moment of action (no maintained followers list), so a candidate that was miscategorized (e.g. a real contributor's profile swept up from a post as if it were a target) doesn't get blocked. Counted separately, not silently dropped, so a run where this fires a lot is visible.">Block attempt on following</div>
                             <div class="summary-value" id="blockAttemptOnFollowingCount">0</div>
                         </div>
                         </div>
                     </div>
                     <div class="summary-grid summary-row" aria-label="Seconds per outcome">
                         <div class="summary-tile">
-                            <div class="summary-label" title="Average active seconds per successful block completed in the current metrics epoch, restricted to genuine new block actions -- already-blocked rows are excluded (see secs / already blocked for those). Concerning if this creeps well past your normal per-profile time (most runs land in the single digits to ~10-12s) -- single implausible samples above COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS (30 minutes, e.g. from an outage) are excluded automatically, so a rising average here reflects a real, sustained slowdown.">secs / real block</div>
+                            <div class="summary-label" title="Average active seconds per successful block completed in the current metrics epoch, restricted to genuine new block actions -- already-blocked rows are excluded (see secs / already blocked for those). Concerning if this creeps well past your normal per-profile time (most runs land in the single digits to ~10-12s) -- single implausible samples above 30 minutes (e.g. from an outage) are excluded automatically, so a rising average here reflects a real, sustained slowdown.">secs / real block</div>
                             <div class="summary-value" id="secondsPerBlock">--</div>
                         </div>
                         <div class="summary-tile">
@@ -211,27 +211,27 @@
                             <div class="summary-value" id="secondsPerAlreadyBlocked">--</div>
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Average active seconds per skipped row (unavailable, redirected, or not a profile page) in the finished rows.">secs / skipped</div>
+                            <div class="summary-label" title="Average active seconds per skipped row: the desired action could not be taken, for one reason or another (the profile was unavailable, redirected, or not a profile page), across the completed rows.">secs / skipped</div>
                             <div class="summary-value" id="secondsPerSkipped">--</div>
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Average active seconds per failed row (for example a timeout) in the finished rows.">secs / error</div>
+                            <div class="summary-label" title="Average active seconds per failed row (for example a timeout) in the completed rows.">secs / error</div>
                             <div class="summary-value" id="secondsPerError">--</div>
                         </div>
                         <div class="summary-tile">
-                            <div class="summary-label" title="Average seconds from one terminal Current Work row to the next row activation in the current metrics epoch, excluding any time the queue spent paused in between. Concerning if this is large relative to secs/real block -- it means worker slots are sitting idle between jobs instead of picking up queued work immediately (check for queue throttling or a backed-up write queue).">secs / handoff</div>
+                            <div class="summary-label" title="Average seconds from one completed Current Work row to the next row activation in the current metrics epoch, excluding any time the queue spent paused in between. Concerning if this is large relative to secs/real block -- it means worker slots are sitting idle between jobs instead of picking up queued work immediately (check for queue throttling or a backed-up write queue).">secs / handoff</div>
                             <div class="summary-value" id="activationHandoffSeconds">--</div>
                         </div>
                     </div>
                     <div class="duration-histograms" aria-label="Block duration histograms">
-                        <section class="duration-histogram" id="realBlockDurationHistogram" title="Mute Block extension: Completed real-block rows since the last Clear All Stats, bucketed by active-to-terminal time (the same rows and duration as Avg item time). Each column is the number of rows in that time range; the count is above it.">
+                        <section class="duration-histogram" id="realBlockDurationHistogram" title="Mute Block extension: Completed real-block rows since the last Clear All Stats, bucketed by active-to-completed time (the same rows and duration as Avg item time). Each column is the number of rows in that time range; the count is above it.">
                             <div class="duration-histogram-head">
                                 <div class="summary-label">Real block</div>
                                 <div class="duration-histogram-total" id="realBlockDurationTotal">no samples</div>
                             </div>
                             <div class="duration-histogram-bars" id="realBlockDurationBars"></div>
                         </section>
-                        <section class="duration-histogram" id="alreadyBlockedDurationHistogram" title="Mute Block extension: Completed already-blocked rows since the last Clear All Stats, bucketed by active-to-terminal time. These rows confirmed the profile was already blocked and performed no block action. Each column is the number of rows in that time range; the count is above it.">
+                        <section class="duration-histogram" id="alreadyBlockedDurationHistogram" title="Mute Block extension: Completed already-blocked rows since the last Clear All Stats, bucketed by active-to-completed time. These rows confirmed the profile was already blocked and performed no block action. Each column is the number of rows in that time range; the count is above it.">
                             <div class="duration-histogram-head">
                                 <div class="summary-label">Already blocked</div>
                                 <div class="duration-histogram-total" id="alreadyBlockedDurationTotal">no samples</div>
@@ -267,7 +267,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="flightRecorderList" aria-expanded="false" aria-controls="flightRecorderList" aria-label="Expand Flight recorder" title="Mute Block extension: Show or hide this panel">></button>
-                        <h2 title="The service worker's flight recorder: every channel, newest first. Polled only while this card is open, and only in dev mode.">Flight recorder</h2>
+                        <h2 title="The flight recorder: every channel, newest first. Polled only while this card is open, and only in dev mode.">Flight recorder</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="flightRecorderCount">0 events</span>
@@ -293,7 +293,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="writeSizeHistogram" aria-expanded="true" aria-controls="writeSizeHistogram" aria-label="Collapse Write sizes" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="How many storage writes that reached disk fell in each size band this epoch, after the bucket split. Same counters as Reset metrics, so a metrics reset clears it too.">Write sizes (physical)</h2>
+                        <h2 title="How many saves that reached disk fell in each size band this epoch, after the bucket split. Same counters as Reset metrics, so a metrics reset clears it too.">Write sizes (physical)</h2>
                     </div>
                     <div class="panel-actions">
                         <button class="clear-button" id="clearWriteSizeHistogramButton" type="button" title="Mute Block extension: Write sizes are backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
@@ -319,7 +319,7 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="phaseTimingHistogram" aria-expanded="true" aria-controls="phaseTimingHistogram" aria-label="Collapse Phase timing" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="Average time spent in each phase of a mute-block action's notice-select-open-load-inspect-action-detect-close cycle this metrics epoch, computed from each terminal row's own milestone timestamps. 'Notice/select' (previous terminal row to this row's own activation) is covered separately by secs/handoff above, not here. Bars are sized relative to the slowest phase -- the phase with the longest bar is where the most time is actually going.">Phase timing</h2>
+                        <h2 title="Average time spent in each phase of a mute and block action's notice-select-open-load-inspect-action-detect-close cycle this metrics epoch, computed from each completed row's own milestone timestamps. 'Notice/select' (previous completed row to this row's own activation) is covered separately by secs/handoff above, not here. Bars are sized relative to the slowest phase -- the phase with the longest bar is where the most time is actually going.">Phase timing</h2>
                     </div>
                     <div class="panel-actions">
                         <button class="clear-button" id="resetPhaseTimingButton" type="button" title="Mute Block extension: Phase timing is backed by the same queue-wakeup metrics as Reset metrics -- this resets them too">Clear</button>
@@ -332,11 +332,11 @@
                 <div class="panel-head">
                     <div class="panel-title">
                         <button class="panel-toggle" type="button" data-panel-toggle data-panel-target="outlierList" aria-expanded="true" aria-controls="outlierList" aria-label="Collapse Outliers" title="Mute Block extension: Show or hide this panel">v</button>
-                        <h2 title="Finished rows only. A row is listed when it took 45s or more, or 2.5 standard deviations above the average of finished rows, and it took 3.5s or more. Events expands the flight recorder events kept with each outlier. Kept by the worker across reloads until Clear here or Clear All Stats.">Outliers</h2>
+                        <h2 title="Completed rows only. A row is listed when it took 45s or more, or 2.5 standard deviations above the average of completed rows, and it took 3.5s or more. Events expands the flight recorder events kept with each outlier. Kept across reloads until Clear here or Clear All Stats.">Outliers</h2>
                     </div>
                     <div class="panel-actions">
                         <span id="outlierCount">0 outliers</span>
-                        <button class="clear-button" id="clearOutliersButton" type="button" title="Mute Block extension: Clear the outlier list">Clear</button>
+                        <button class="clear-button" id="clearOutliersButton" type="button" title="Mute Block extension: Clear the outlier list and its stored entries">Clear</button>
                     </div>
                 </div>
                 <div class="list list--compact" id="outlierList"></div>

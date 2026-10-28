@@ -97,8 +97,8 @@ test('close-after click helper falls back to close-tab button for already blocke
         aria: 'Mute Block extension: Close this tab'
     })
     const unblock = makeButton({
-        text: 'Unblock Unmute',
-        aria: 'Mute Block extension: Unblock and unmute this profile'
+        text: 'Unblock',
+        aria: 'Mute Block extension: Unblock and unmute this profile. This is also called a pardon.'
     })
 
     const result = withFakePage([unblock, closeTab], () =>

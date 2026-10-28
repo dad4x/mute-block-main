@@ -54,12 +54,12 @@
             </section>
 
             <section class="section">
-                <div class="row" title="When on, resume work on browser start. When off, do nothing until you navigate to a Quora page.">
+                <div class="row" title="When on, resume Current Work on browser start. When off, do nothing until you navigate to a Quora page.">
                     <div>
                         <div class="label">Auto-Start Current Work</div>
-                        <div class="hint">Resume work on browser start. Leave off to wait until you navigate to Quora.</div>
+                        <div class="hint">Resume Current Work on browser start. Leave off to wait until you navigate to Quora.</div>
                     </div>
-                    <input class="checkbox" id="coordinatorAutoStartOnBrowserStart" type="checkbox" title="When on, resume work on browser start. When off, do nothing until you navigate to a Quora page.">
+                    <input class="checkbox" id="coordinatorAutoStartOnBrowserStart" type="checkbox" title="When on, resume Current Work on browser start. When off, do nothing until you navigate to a Quora page.">
                 </div>
             </section>
 
@@ -76,8 +76,8 @@
             <section class="section">
                 <div class="row">
                     <div>
-                        <div class="label">Worker Window Focus</div>
-                        <div class="hint">What a queued action does to its tab in the worker window. Focus brings the tab forward and takes OS focus on each action. Activate brings it forward without taking focus. None keeps it in the background and takes no focus, so steps that need the page visible wait, then fail. Applies from the next action.</div>
+                        <div class="label">Background Window Policy</div>
+                        <div class="hint">What a queued action does to its tab in the background window. Focus brings the tab forward and takes OS focus on each action. Activate brings it forward without taking focus. None keeps it in the background and takes no focus, so steps that need the page visible wait, then fail. Applies from the next action.</div>
                     </div>
                     <select class="select" id="workerWindowForegroundMode">
                         <option value="focus">Focus</option>
@@ -138,13 +138,13 @@
             <div class="hint danger-warning">
                 This permanently deletes everything the extension has stored: the record of every profile blocked, the queue, the run history, the statistics, the outlier list, your preferences and your categorized spaces. The extension then starts as a fresh install, and it will act on every profile it has blocked before. Do not use this routinely. Use it only before a clean reinstall or to start over.
             </div>
-            <div class="hint">Pause the Queue on the Dashboard first. The erase is refused while any work is running. The extension reloads, which stops its background worker, once the erase is scheduled.</div>
+            <div class="hint">Pause Current Work on the Dashboard first. The erase is refused while any Current Work is running. The extension reloads, which stops its background work, once the erase is scheduled.</div>
             <div class="field">
                 <label class="label" for="eraseConfirm">Type ERASE to confirm</label>
                 <input class="input" id="eraseConfirm" type="text" autocomplete="off">
             </div>
             <div class="actions">
-                <button class="button button-danger" id="eraseBlockHistoryButton" type="button" title="Mute Block extension: Erase all block history. Refused while work is still running; the extension then reloads.">Erase everything</button>
+                <button class="button button-danger" id="eraseBlockHistoryButton" type="button" title="Mute Block extension: Erase all stored history. Refused while Current Work is still running; the extension then reloads.">Erase everything</button>
             </div>
             <div class="status" id="eraseStatus" hidden></div>
         </section>

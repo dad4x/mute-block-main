@@ -34399,6 +34399,253 @@ test('queued tab active transition does not carry executor authority state acros
     assert.ok(getStoredCoordinatorQueueWal(storage))
 })
 
+// 27 Oct incident (Should-stereotypes-burn-for-eternity-1, an Instant Block row): the executor saw a queued row with a live profile tab, started
+// the active transition, and in the same moment a blocked-live-tab probe ran against the same row. The row was made terminal under the
+// transition, the transition then failed on the terminal row, and the row was left failed. The probe must wait for the pending transition
+// to settle, and only then decide.
+// transitionResultOverride keeps the held transition's durable write (the row is active, as in the incident) and then reports the given
+// result to its caller (for example a missing-or-terminal-row rejection). exhausted gives the row a spent retry budget, so a rollback of
+// the failed transition takes its exhausted branch.
+async function runBlockedProbeDuringPendingActiveTransition({probeAnswer, label, transitionResultOverride = null, exhausted = false}) {
+    const href = `https://www.quora.com/profile/Synthetic-Blocked-Probe-During-Transition-${label}`
+    const runId = `run-blocked-probe-during-transition-${label}`
+    const attemptId = `attempt-blocked-probe-during-transition-${label}`
+    const tabId = label === 'blocked' ? 6410 : 6411
+    const now = 432000
+    const budgetFields = exhausted ? {retryAttempt: 2, maxRetries: 2} : {}
+    const {browser, storage, sw, timers} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: {...makeQueuedCoordinatorRow({href, runId, attemptId, now}), ...budgetFields}
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const action = {
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1
+    }
+    const tab = {id: tabId, windowId: 1, url: href, active: false}
+    browser.__tabs.set(tabId, tab)
+    const plan = sw.buildQueuedTabOpenEffectPlan(action, tab, now + 20)
+    sw.applyQueuedTabOpenRuntimeEffect(plan)
+    assert.notEqual(sw.__testClaimQueuedActivationGuard(action, tab, `synthetic-blocked-probe-${label}`), '')
+
+    // The transition's durable step is held until the probe has run, so the transition is still pending when the probe starts.
+    // Other authority writes (including the probe's own terminal record) go straight through.
+    const authority = sw.coordinatorAuthority
+    const originalApply = authority.applyWithinStorageUpdate
+    let releaseWrites = () => {}
+    const writesHeld = new Promise(resolve => {
+        releaseWrites = resolve
+    })
+    authority.applyWithinStorageUpdate = function (operation = {}) {
+        if(operation?.operationKind === 'active-transition') {
+            if(transitionResultOverride) {
+                return writesHeld.then(async () => {
+                    await originalApply.call(this, operation)
+                    return transitionResultOverride
+                })
+            }
+            return writesHeld.then(() => originalApply.call(this, operation))
+        }
+        return originalApply.call(this, operation)
+    }
+    let probes = 0
+    browser.tabs.sendMessage = async (tabIdArg, message) => {
+        if(message?.action === 'close-if-blocked') {
+            probes += 1
+            return probeAnswer(href)
+        }
+        return {}
+    }
+    const activeSnapshot = {
+        ...makeQueuedCoordinatorRow({href, runId, attemptId, now}),
+        ...budgetFields,
+        status: 'active',
+        tabId,
+        activeAt: now + 20
+    }
+    let transitionResult = null
+    let probeResult = null
+    try {
+        const transition = sw.confirmQueuedTabOpenDurableActiveEffect(action, tab, plan)
+        const probe = sw.terminalizeActiveCoordinatorItemFromBlockedLiveTab(
+            href,
+            activeSnapshot,
+            null,
+            new Map([[href, [tab]]]),
+            'profile-tabs-active-authority-blocked-live-tab'
+        )
+        await flushAsync(40)
+        releaseWrites()
+        probeResult = await probe
+        transitionResult = await transition
+    }
+    finally {
+        authority.applyWithinStorageUpdate = originalApply
+    }
+    await flushAsync(40)
+    const recorder = await browser.runtime.sendMessage({action: 'get-flight-recorder', limit: 2000})
+    return {sw, browser, storage, tab, action, href, tabId, probes, probeResult, transitionResult, recorder, timers}
+}
+
+test('blocked-live-tab probe during a pending active transition waits for the transition, then its own answer decides (27 Oct incident)', async () => {
+    const run = await runBlockedProbeDuringPendingActiveTransition({
+        label: 'blocked',
+        probeAnswer: href => ({willClose: true, resolvedProfileHref: href, lastUrl: href})
+    })
+    const {sw, probes, probeResult, transitionResult, recorder, href, tabId, browser} = run
+    assert.ok(probes >= 1)
+    // The probe ran while the transition was pending, so it went through the wait.
+    assert.ok((sw.state().queueWakeupCounters['blockedLiveTab.waitedForActiveTransition'] || 0) >= 1)
+    // The transition is not made to fail by a terminal row written under it.
+    assert.equal(transitionResult.activeTransitionAccepted, true)
+    assert.equal(transitionResult.rolledBack, false)
+    const transitionEvent = recorder.entries.find(entry => entry.kind === 'active-transition' &&
+        entry.targetUrl === href && entry.accepted === true && entry.statusAfter === 'active')
+    assert.ok(transitionEvent, 'the active transition must be accepted before the probe records anything')
+    const terminalEvent = recorder.entries.find(entry => entry.kind === 'blocked-live-tab-terminal-result' &&
+        entry.rowKey === href)
+    assert.ok(terminalEvent, 'the blocked probe must still be able to terminalize the row once the transition has landed')
+    assert.equal(terminalEvent.accepted, true)
+    assert.equal(probeResult.changed, true)
+    // The row is terminal from the probe's own confirmation, never from a timeout.
+    const completed = await sw.findCompletedWorkRowByKey(href)
+    assert.equal(completed?.status, 'succeeded')
+    assert.notEqual(completed?.outcome, 'timeout')
+    assert.equal(browser.__tabs.has(tabId), false)
+})
+
+test('not-blocked probe during a pending active transition leaves the row active, so the action proceeds (27 Oct incident)', async () => {
+    const run = await runBlockedProbeDuringPendingActiveTransition({
+        label: 'not-blocked',
+        probeAnswer: () => ({willClose: false, reason: 'not-blocked'})
+    })
+    const {sw, probeResult, transitionResult, href, tabId, browser, recorder} = run
+    assert.equal(probeResult.changed, false)
+    assert.equal(transitionResult.activeTransitionAccepted, true)
+    assert.equal(transitionResult.rolledBack, false)
+    assert.equal(sw.coordinatorAuthority.current().queue[href].status, 'active')
+    assert.equal(sw.coordinatorAuthority.current().queue[href].tabId, tabId)
+    assert.equal(browser.__tabs.has(tabId), true)
+    assert.equal(recorder.entries.some(entry => entry.kind === 'blocked-live-tab-terminal-result' && entry.rowKey === href), false)
+    assert.equal(await sw.findCompletedWorkRowByKey(href), null)
+})
+
+// 27 Oct incident ordering, forced: the active transition reports missing-or-terminal-row, the blocked-live-tab probe answers not-blocked
+// while the failed transition is being rolled back, and the row has no retry budget left. The probe must not terminalize the row, and the
+// row must not end as a timeout with no recorded reason.
+test('failed active transition, then a not-blocked probe: the probe does not terminalize, and the row is not left failed as a timeout (27 Oct incident)', async () => {
+    const run = await runBlockedProbeDuringPendingActiveTransition({
+        label: 'failed-transition',
+        probeAnswer: () => ({willClose: false, reason: 'not-blocked'}),
+        transitionResultOverride: {accepted: false, changed: false, durable: false, reason: 'missing-or-terminal-row', nextRow: null},
+        exhausted: true
+    })
+    const {sw, browser, probes, probeResult, href, tab, action, timers} = run
+    assert.ok(probes >= 1, 'the blocked-live-tab probe must run')
+    // The held transition is reported as failed, but its durable write landed, so the row is still active with its tab. The rollback of
+    // that failed transition is then invoked directly. In this ordering the confirm check confirms the durable row, so the rollback is not
+    // reached from it, and the harness has to call it.
+    await settleWithFakeTimers(sw.rollbackFailedQueuedTabOpen(action, tab, {
+        activeTransitionError: 'missing-or-terminal-row',
+        attemptId: action.attemptId,
+        attemptNumber: action.attemptNumber
+    }), timers)
+    const recorder = await browser.runtime.sendMessage({action: 'get-flight-recorder', limit: 2000})
+    // (c) The not-blocked probe writes nothing, so it does not terminalize the row.
+    assert.equal(probeResult.changed, false)
+    assert.equal(recorder.entries.some(entry => entry.kind === 'blocked-live-tab-terminal-result' && entry.rowKey === href), false)
+    const finalRow = (await sw.findCompletedWorkRowByKey(href)) || sw.coordinatorAuthority.current().queue[href] || null
+    assert.ok(finalRow, 'the row must still exist after the sequence')
+    // (a) The final row is not a timeout, and a failed row records a reason.
+    assert.notEqual(finalRow.outcome, 'timeout', `final status ${finalRow.status}, outcome ${finalRow.outcome}, reason ${finalRow.actionLeaseReleaseReason || ''}`)
+    assert.ok(!(finalRow.status === 'failed' && !`${finalRow.actionLeaseReleaseReason || ''}`.trim()), 'a failed row must record a reason')
+    // (b) The rollback that wrote the row records a real reason and error text.
+    const rollbackEvent = recorder.entries.find(entry => entry.kind === 'authority-mutation' &&
+        entry.operationKind === 'rollback-active-transition' && entry.rowKey === href)
+    assert.ok(rollbackEvent, 'the rollback of the failed transition must write the row')
+    assert.ok(`${rollbackEvent.error || ''}`.trim(), 'the rollback must record an error text')
+    assert.ok(`${finalRow.actionLeaseReleaseReason || ''}`.trim(), 'the rollback must record a release reason on the row')
+})
+
+// 27 Oct: a failed active transition's rollback must not write a terminal failure over a row that another path has already settled.
+// The row here is already succeeded with the same attempt, and the budget is spent, so the exhausted branch would otherwise run.
+test('rollback of a failed active transition is a no-op when another path already settled the row (27 Oct incident)', async () => {
+    const href = 'https://www.quora.com/profile/Synthetic-Rollback-Already-Settled'
+    const runId = 'run-rollback-already-settled'
+    const attemptId = 'attempt-rollback-already-settled'
+    const tabId = 6412
+    const now = 432000
+    const settledRow = {
+        ...makeQueuedCoordinatorRow({href, runId, attemptId, now}),
+        retryAttempt: 2,
+        maxRetries: 2,
+        status: 'succeeded',
+        outcome: 'blocked',
+        error: '',
+        terminalAt: now,
+        tabId: null,
+        actionLease: null
+    }
+    const {browser, sw, timers} = loadServiceWorkerHarness({
+        now,
+        storage: {
+            mbCoordinatorPaused: false,
+            mbCoordinatorQueue: {
+                [href]: settledRow
+            },
+            mbCoordinatorRuns: {
+                [runId]: makeCoordinatorRun({href, runId})
+            },
+            mbCoordinatorEvents: [],
+            [LEGACY_PROFILE_PROGRESS_KEY]: {}
+        }
+    })
+    const action = {
+        profileHref: href,
+        url: href,
+        coordinatorKey: href,
+        runId,
+        actionKind: 'mute-block',
+        tabAction: 'nuke',
+        attemptId,
+        attemptNumber: 1
+    }
+    const tab = {id: tabId, windowId: 1, url: href, active: false}
+    browser.__tabs.set(tabId, tab)
+    await sw.coordinatorAuthority.hydrate()
+    await settleWithFakeTimers(sw.rollbackFailedQueuedTabOpen(action, tab, {
+        activeTransitionError: 'missing-or-terminal-row',
+        attemptId,
+        attemptNumber: 1
+    }), timers)
+    const recorder = await browser.runtime.sendMessage({action: 'get-flight-recorder', limit: 2000})
+    // No rollback write for the row at all.
+    assert.equal(recorder.entries.some(entry => entry.kind === 'authority-mutation' &&
+        entry.operationKind === 'rollback-active-transition' && entry.rowKey === href), false)
+    // The settled row is unchanged: no terminal failure is written over it.
+    const after = sw.coordinatorAuthority.current().queue[href] || null
+    assert.ok(after, 'the settled row must still exist')
+    assert.equal(after.status, 'succeeded')
+    assert.equal(after.outcome, 'blocked')
+    assert.equal(after.terminalAt, now)
+    assert.equal(`${after.error || ''}`.trim(), '')
+})
+
 test('queued tab missing after durable active transition rolls back immediately', async () => {
     const href = 'https://www.quora.com/profile/Synthetic-Active-Transition-Missing-After-Durable'
     const runId = 'run-active-transition-missing-after-durable'
@@ -44388,7 +44635,7 @@ test('a recorded outlier keeps its profile events and the disk and checkpoint wr
     await archiveOutlierRows(sw, [sigmaHref])
 
     const expectedKept = ['profile-before-span', 'profile-in-span', 'write-in-span', 'checkpoint-in-span', 'settle-in-span']
-    const kept = plainCopy(storage[OUTLIER_RECORD_KEY].entries.find(entry => entry.rowKey === sigmaHref).events)
+    const kept = readOutlierBody(storage, sigmaHref).events
     assert.deepEqual(
         kept.map(event => event.tag).filter(Boolean),
         expectedKept,
@@ -44412,8 +44659,10 @@ test('a recorded outlier keeps its profile events and the disk and checkpoint wr
         'the events are served on request, oldest first'
     )
 
+    const bodyKeyBeforeClear = outlierBodyKeyOf(storage, sigmaHref)
     await browser.runtime.sendMessage({action: 'clear-coordinator-outliers'})
     assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'Clear removes the outlier with its events')
+    assert.equal(storage[bodyKeyBeforeClear], null, 'Clear empties the outlier entry key too')
     const afterClear = await browser.runtime.sendMessage({action: 'get-coordinator-outlier-events', rowKey: sigmaHref, attemptId: `attempt-${sigmaHref}`})
     assert.deepEqual(plainCopy(afterClear.events), [], 'the cleared outlier has no events to serve')
 })
@@ -44438,13 +44687,339 @@ test('the recorder events of a recorded outlier survive a worker restart with it
     sw.recordFlightRecorderEvent({tag: 'write-in-span', kind: 'storage-write', at: activeAt + 1000})
     await archiveOutlierRows(sw, [sigmaHref])
 
-    const stored = plainCopy(storage[OUTLIER_RECORD_KEY].entries.find(entry => entry.rowKey === sigmaHref))
+    const stored = readOutlierBody(storage, sigmaHref)
     assert.deepEqual(stored.events.map(event => event.tag), ['write-in-span'], 'the stored outlier keeps its event on disk')
 
     const restarted = loadServiceWorkerHarness({now: OUTLIER_NOW_MS, browser})
     await restarted.sw.coordinatorAuthority.hydrate()
     const after = await restarted.sw.refreshCoordinatorDashboardViewsForDashboard('outlier-events-restart')
     assert.equal(plainCopy(after.outliers).find(entry => entry.rowKey === sigmaHref)?.eventCount, 1, 'the restarted worker lists the outlier with its event count')
+})
+
+// Outlier storage (27 Oct): the index under OUTLIER_RECORD_KEY, and one entry key per listed outlier, named by its slot. The helpers below
+// read the key of a listed outlier from its index entry, and record the local-storage writes the worker makes.
+const OUTLIER_ENTRY_PREFIX = 'mbCoordinatorOutlierEntry.'
+const OUTLIER_FLOOR_DURATION_MS = 50000
+
+function outlierBodyKeyOf(storage, rowKey) {
+    const indexed = plainCopy(storage[OUTLIER_RECORD_KEY].entries).find(entry => entry.rowKey === rowKey)
+    assert.ok(indexed, `${rowKey} is listed in the index`)
+    return require('../shared/js/swCoordinatorOutliers').getCoordinatorOutlierEntryKey(indexed.slot)
+}
+
+function readOutlierBody(storage, rowKey) {
+    return plainCopy(storage[outlierBodyKeyOf(storage, rowKey)] ?? null)
+}
+
+function recordLocalStorageWrites(browser) {
+    const writes = []
+    const area = browser.storage.local
+    const originalSet = area.set
+    area.set = async payload => {
+        writes.push(Object.keys(payload || {}))
+        return originalSet.call(area, payload)
+    }
+    return {writes, restore: () => { area.set = originalSet }}
+}
+
+// A record in the 1.6 single-record layout: the entries carry their events, and there is no layout marker.
+function makeLegacyOutlierRecord({sigmaHref, runId, activeAt}) {
+    return {
+        entries: [{
+            rowKey: sigmaHref,
+            targetUrl: sigmaHref,
+            runId,
+            attemptId: `attempt-${sigmaHref}`,
+            attemptNumber: 1,
+            actionKind: 'mute-block',
+            status: 'succeeded',
+            outcome: 'blocked',
+            activeAt,
+            terminalAt: activeAt + OUTLIER_FLOOR_DURATION_MS,
+            final: true,
+            thresholdReason: 'absolute',
+            meanDurationMsAtCapture: 5000,
+            stdDevMsAtCapture: 120,
+            capturedAt: OUTLIER_NOW_MS - 1000,
+            events: [
+                {tag: 'legacy-a', kind: 'action-visibility', targetUrl: sigmaHref, at: activeAt},
+                {tag: 'legacy-b', kind: 'storage-write', at: activeAt + 5}
+            ]
+        }],
+        baseline: {n: 9, mean: 7000, M2: 2500000},
+        dismissedKeys: []
+    }
+}
+
+test('an outlier archive writes its own entry key and the index, and no other entry key', async () => {
+    const runId = 'run-outlier-one-entry-write'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-One-Write-Normal-${index}`)
+    const firstHref = 'https://www.quora.com/profile/Synthetic-Outlier-One-Write-First'
+    const secondHref = 'https://www.quora.com/profile/Synthetic-Outlier-One-Write-Second'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [firstHref]: makeOutlierTerminalRow({href: firstHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS}),
+        [secondHref]: makeOutlierTerminalRow({href: secondHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS + 2000})
+    }
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, normalHrefs)
+    await archiveOutlierRows(sw, [firstHref])
+    const firstKey = outlierBodyKeyOf(storage, firstHref)
+    const firstBodyBefore = JSON.stringify(storage[firstKey])
+    const countersBefore = {...sw.state().queueWakeupCounters}
+    const writes = recordLocalStorageWrites(browser)
+    await archiveOutlierRows(sw, [secondHref])
+    writes.restore()
+    const written = writes.writes.flat()
+    assert.deepEqual(
+        written.filter(key => key.startsWith(OUTLIER_ENTRY_PREFIX)),
+        [outlierBodyKeyOf(storage, secondHref)],
+        'the archive writes the new entry key and no other entry key'
+    )
+    assert.ok(written.includes(OUTLIER_RECORD_KEY), 'the index is written in the same write')
+    assert.equal(JSON.stringify(storage[firstKey]), firstBodyBefore, 'the first entry body is not rewritten')
+    const counters = sw.state().queueWakeupCounters
+    assert.equal((counters['outlier.entryWrites'] || 0) - (countersBefore['outlier.entryWrites'] || 0), 1, 'one entry body is counted as written')
+    assert.ok((counters['outlier.entryWriteBytes'] || 0) > (countersBefore['outlier.entryWriteBytes'] || 0), 'its bytes are counted')
+    assert.equal(plainCopy(storage[OUTLIER_RECORD_KEY].entries).some(entry => 'events' in entry), false, 'the index carries no events')
+})
+
+test('an outlier keeps at most 100 recorder events, the newest, and the cap drops the oldest one and counts it', async () => {
+    const {applyCoordinatorOutlierFinishedRows, getCoordinatorOutlierDismissalKey, normalizeCoordinatorOutliersRecord} = require('../shared/js/swCoordinatorOutliers')
+    const {OUTLIER_MAX_EVENTS_PER_ENTRY} = require('../shared/js/tunables')
+    assert.equal(OUTLIER_MAX_EVENTS_PER_ENTRY, 100)
+    const row = {
+        runId: 'run-outlier-cap-pure',
+        status: 'succeeded',
+        outcome: 'blocked',
+        targetProfileHref: 'https://www.quora.com/profile/Synthetic-Outlier-Cap-Pure',
+        attemptId: 'attempt-cap-pure',
+        attemptNumber: 1,
+        activeAt: 1000,
+        terminalAt: 1000 + OUTLIER_FLOOR_DURATION_MS
+    }
+    const events = Array.from({length: 101}, (_, index) => ({tag: `event-${index}`, kind: 'action-visibility', at: 1000 + index}))
+    const next = applyCoordinatorOutlierFinishedRows(null, [row], OUTLIER_NOW_MS, new Map([[getCoordinatorOutlierDismissalKey(row), events]]))
+    const [entry] = next.entries
+    assert.equal(entry.events.length, 100)
+    assert.equal(entry.events[0].tag, 'event-1', 'the oldest event is the one dropped')
+    assert.equal(entry.events[99].tag, 'event-100', 'the newest event is kept')
+    assert.equal(entry.eventsDropped, 1)
+    assert.equal(normalizeCoordinatorOutliersRecord(next).entries[0].eventsDropped, 1, 'normalizing a capped entry does not count its drop again')
+})
+
+test('the worker counts the events the cap drops from a recorded outlier once it is saved', async () => {
+    const runId = 'run-outlier-cap-counted'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Cap-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Cap-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})
+    }
+    const {sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, normalHrefs)
+    for(let index = 0; index < 101; index += 1) {
+        sw.recordFlightRecorderEvent({tag: `profile-${index}`, kind: 'action-visibility', targetUrl: sigmaHref, at: activeAt + 1 + index})
+    }
+    await archiveOutlierRows(sw, [sigmaHref])
+    const kept = readOutlierBody(storage, sigmaHref).events
+    assert.equal(kept.length, 100, 'the stored outlier keeps 100 events')
+    assert.equal(kept[0].tag, 'profile-1', 'the oldest recorded event is the one dropped')
+    assert.equal(kept[99].tag, 'profile-100', 'the newest event is kept')
+    assert.equal(sw.state().queueWakeupCounters['outlier.eventsDropped'], 1, 'the one dropped event is counted')
+})
+
+test('a record in the 1.6 single-record layout is migrated once: the same list and events are served, and a later start migrates nothing', async () => {
+    const runId = 'run-outlier-migrate'
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Migrate-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {[sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})}
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    const legacy = makeLegacyOutlierRecord({sigmaHref, runId, activeAt})
+    storage[OUTLIER_RECORD_KEY] = legacy
+    await sw.loadCoordinatorOutliersRecord()
+    await waitFor(() => storage[OUTLIER_RECORD_KEY]?.layout === 2, 'the migration writes the index in the new layout')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].baseline), legacy.baseline, 'the baseline is kept')
+    assert.equal(storage[OUTLIER_RECORD_KEY].entries.length, 1)
+    assert.equal('events' in storage[OUTLIER_RECORD_KEY].entries[0], false, 'the index holds no events')
+    assert.deepEqual(readOutlierBody(storage, sigmaHref).events.map(event => event.tag), ['legacy-a', 'legacy-b'], 'the events move to the entry key')
+    // The count is taken when the write settles, a step after the disk write, so the test waits for the count itself.
+    await waitFor(() => sw.state().queueWakeupCounters['outlier.migrated'] === 1, 'the migrated entry is counted once the write settles')
+    const served = await browser.runtime.sendMessage({action: 'refresh-coordinator-dashboard-views', reason: 'outlier-migrate'})
+    assert.deepEqual(summarizeOutlierEntries(served.outliers), [{
+        rowKey: sigmaHref,
+        attemptId: `attempt-${sigmaHref}`,
+        durationMs: OUTLIER_FLOOR_DURATION_MS,
+        thresholdReason: 'absolute'
+    }], 'the served list is the list the record held')
+    const events = await browser.runtime.sendMessage({action: 'get-coordinator-outlier-events', rowKey: sigmaHref, attemptId: `attempt-${sigmaHref}`})
+    assert.deepEqual(plainCopy(events.events).map(event => event.tag), ['legacy-a', 'legacy-b'], 'the events are served as before')
+
+    const writes = recordLocalStorageWrites(browser)
+    const restarted = loadServiceWorkerHarness({now: OUTLIER_NOW_MS, browser})
+    await restarted.sw.loadCoordinatorOutliersRecord()
+    const again = await restarted.sw.refreshCoordinatorDashboardViewsForDashboard('outlier-migrate-again')
+    writes.restore()
+    assert.deepEqual(summarizeOutlierEntries(again.outliers), summarizeOutlierEntries(served.outliers), 'the restarted worker serves the same list')
+    assert.equal(writes.writes.flat().includes(OUTLIER_RECORD_KEY), false, 'a later start writes no index: there is nothing to migrate')
+    assert.equal(storage[OUTLIER_RECORD_KEY].layout, 2)
+})
+
+test('a failed migration keeps the 1.6 record on disk, counts the failure, and the next start migrates it', async () => {
+    const runId = 'run-outlier-migrate-failed'
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Migrate-Failed-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {[sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})}
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    const legacy = makeLegacyOutlierRecord({sigmaHref, runId, activeAt})
+    storage[OUTLIER_RECORD_KEY] = legacy
+    const area = browser.storage.local
+    const originalSet = area.set
+    area.set = async payload => {
+        if(payload?.[OUTLIER_RECORD_KEY]?.layout === 2) throw new Error('injected write failure for the new layout')
+        return originalSet.call(area, payload)
+    }
+    await sw.loadCoordinatorOutliersRecord()
+    await waitFor(() => (sw.state().queueWakeupCounters['outlier.migrationFailed'] || 0) === 1, 'the failed migration is counted')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY]), plainCopy(legacy), 'the 1.6 record is still on disk, unchanged')
+
+    area.set = originalSet
+    const restarted = loadServiceWorkerHarness({now: OUTLIER_NOW_MS, browser})
+    await restarted.sw.loadCoordinatorOutliersRecord()
+    await waitFor(() => storage[OUTLIER_RECORD_KEY]?.layout === 2, 'the next start migrates the record')
+    assert.deepEqual(readOutlierBody(storage, sigmaHref).events.map(event => event.tag), ['legacy-a', 'legacy-b'])
+})
+
+test('Clear Outliers empties the entry key of each cleared outlier and keeps the baseline', async () => {
+    const runId = 'run-outlier-clear-keys'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Clear-Keys-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Clear-Keys-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})
+    }
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, [...normalHrefs, sigmaHref])
+    const bodyKey = outlierBodyKeyOf(storage, sigmaHref)
+    assert.ok(storage[bodyKey], 'the outlier has its entry key before the clear')
+    const baselineBefore = plainCopy(storage[OUTLIER_RECORD_KEY].baseline)
+    await browser.runtime.sendMessage({action: 'clear-coordinator-outliers'})
+    assert.equal(storage[bodyKey], null, 'the entry key is emptied')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'the index lists nothing')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].baseline), baselineBefore, 'Clear Outliers keeps the baseline')
+})
+
+test('Clear All Stats zeroes the baseline and empties the entry key of each outlier', async () => {
+    const runId = 'run-outlier-clear-all-keys'
+    const normalHrefs = OUTLIER_NORMAL_DURATIONS_MS.map((_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Clear-All-Keys-Normal-${index}`)
+    const sigmaHref = 'https://www.quora.com/profile/Synthetic-Outlier-Clear-All-Keys-Sigma'
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = {
+        ...Object.fromEntries(normalHrefs.map((href, index) => [href, makeOutlierTerminalRow({
+            href,
+            runId,
+            activeAt,
+            durationMs: OUTLIER_NORMAL_DURATIONS_MS[index]
+        })])),
+        [sigmaHref]: makeOutlierTerminalRow({href: sigmaHref, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})
+    }
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, [...normalHrefs, sigmaHref])
+    const bodyKey = outlierBodyKeyOf(storage, sigmaHref)
+    assert.ok(storage[bodyKey], 'the outlier has its entry key before Clear All Stats')
+    await browser.runtime.sendMessage({action: 'clear-coordinator-terminal-stats'})
+    assert.equal(storage[bodyKey], null, 'the entry key is emptied')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].baseline), {n: 0, mean: 0, M2: 0}, 'the baseline is zeroed')
+    assert.deepEqual(plainCopy(storage[OUTLIER_RECORD_KEY].entries), [], 'the index lists nothing')
+})
+
+test('the 51st outlier drops the oldest entry from the list, and the new entry takes its slot in the same write', async () => {
+    const {OUTLIER_MAX_ENTRIES} = require('../shared/js/tunables')
+    const {getCoordinatorOutlierEntryKey} = require('../shared/js/swCoordinatorOutliers')
+    const runId = 'run-outlier-cap-fifty'
+    const hrefs = Array.from({length: OUTLIER_MAX_ENTRIES + 1}, (_, index) => `https://www.quora.com/profile/Synthetic-Outlier-Cap-Fifty-${index}`)
+    const activeAt = OUTLIER_NOW_MS - 100000
+    const queue = Object.fromEntries(hrefs.map(href => [href, makeOutlierTerminalRow({href, runId, activeAt, durationMs: OUTLIER_FLOOR_DURATION_MS})]))
+    const {browser, sw, storage} = await startOutlierHarness({queue, runId})
+    await sw.loadCoordinatorOutliersRecord()
+    await archiveOutlierRows(sw, hrefs.slice(0, OUTLIER_MAX_ENTRIES))
+    const oldestAttempt = `attempt-${hrefs[0]}`
+    const oldestSlot = plainCopy(storage[OUTLIER_RECORD_KEY].entries).find(entry => entry.attemptId === oldestAttempt).slot
+    const newest = hrefs[OUTLIER_MAX_ENTRIES]
+    const writes = recordLocalStorageWrites(browser)
+    await archiveOutlierRows(sw, [newest])
+    writes.restore()
+    const listed = plainCopy(storage[OUTLIER_RECORD_KEY].entries)
+    assert.equal(listed.length, OUTLIER_MAX_ENTRIES, 'the list keeps its cap')
+    assert.equal(listed.some(entry => entry.attemptId === oldestAttempt), false, 'the oldest outlier is dropped from the list')
+    assert.equal(outlierBodyKeyOf(storage, newest), getCoordinatorOutlierEntryKey(oldestSlot), 'the new entry takes the dropped entry slot')
+    assert.equal(plainCopy(storage[getCoordinatorOutlierEntryKey(oldestSlot)]).attemptId, `attempt-${newest}`, 'the slot now holds the new entry')
+    for(let slot = 0; slot < OUTLIER_MAX_ENTRIES; slot += 1) {
+        const body = storage[getCoordinatorOutlierEntryKey(slot)]
+        assert.ok(!body || body.attemptId !== oldestAttempt, `no entry key holds the dropped outlier (slot ${slot})`)
+    }
+    const entryKeysWritten = writes.writes.flat().filter(key => key.startsWith(OUTLIER_ENTRY_PREFIX))
+    assert.deepEqual(entryKeysWritten, [getCoordinatorOutlierEntryKey(oldestSlot)], 'the cap is applied in the one write that adds the entry')
+})
+
+test('an entry body that is not the entry (other slot, row or attempt) is not attached, and is counted as missing', () => {
+    const {
+        applyCoordinatorOutlierFinishedRows,
+        attachCoordinatorOutlierBodies,
+        getCoordinatorOutlierDismissalKey,
+        getCoordinatorOutlierEntryKey,
+        makeCoordinatorOutlierIndex,
+        readCoordinatorOutlierIndex
+    } = require('../shared/js/swCoordinatorOutliers')
+    const row = {
+        runId: 'run-outlier-attach',
+        status: 'succeeded',
+        outcome: 'blocked',
+        targetProfileHref: 'https://www.quora.com/profile/Synthetic-Outlier-Attach',
+        attemptId: 'attempt-attach',
+        attemptNumber: 1,
+        activeAt: 1000,
+        terminalAt: 1000 + OUTLIER_FLOOR_DURATION_MS
+    }
+    const events = [{tag: 'attach-a', kind: 'action-visibility', at: 1500}]
+    const record = applyCoordinatorOutlierFinishedRows(null, [row], OUTLIER_NOW_MS, new Map([[getCoordinatorOutlierDismissalKey(row), events]]))
+    const index = JSON.parse(JSON.stringify(makeCoordinatorOutlierIndex(record)))
+    const read = readCoordinatorOutlierIndex(index)
+    assert.equal(read.legacy, false, 'an index of this layout is not legacy')
+    assert.equal(read.record.entries[0].events.length, 0, 'the index alone has no events')
+    const bodyKey = getCoordinatorOutlierEntryKey(read.record.entries[0].slot)
+    const body = JSON.parse(JSON.stringify(record.entries[0]))
+    const attached = attachCoordinatorOutlierBodies(read.record, {[bodyKey]: body})
+    assert.equal(attached.missing, 0)
+    assert.deepEqual(attached.record.entries[0].events.map(event => event.tag), ['attach-a'])
+    const replaced = attachCoordinatorOutlierBodies(read.record, {[bodyKey]: {...body, attemptId: 'attempt-replaced'}})
+    assert.equal(replaced.missing, 1, 'a body of another attempt is counted as missing')
+    assert.equal(replaced.record.entries[0].events.length, 0, 'and attaches no events')
+    const legacy = readCoordinatorOutlierIndex({entries: [{...body, events: Array.from({length: 101}, (_, i) => ({tag: `l${i}`, at: i}))}], baseline: {}, dismissedKeys: []})
+    assert.equal(legacy.legacy, true, 'an index without the layout marker is the 1.6 layout')
+    assert.equal(legacy.droppedEvents, 1, 'the legacy entry drops one event to the cap')
 })
 
 // Clear Current Work (owner decision, 25 Oct): the pending space-feed records of the cleared work are deleted in the same write as the
@@ -44771,15 +45346,20 @@ const MARK_ALICE = 'https://www.quora.com/profile/Alice-Mark'
 const MARK_BOB = 'https://www.quora.com/profile/Bob-Mark'
 const MARK_CAROL = 'https://www.quora.com/profile/Carol-Mark'
 
+// The enqueue-mark store is shared/js/candidateMarks.js; content.js creates one per page with createEnqueueMarkStore.
+function markTestCandidateMarksStore() {
+    return require(path.join(LIST_REPO_ROOT, 'shared', 'js', 'candidateMarks')).createEnqueueMarkStore
+}
+
 function loadSpaceFeedEnqueueMarkHarness() {
     const source = markTestContentSource()
-    const context = {console, assert}
+    const context = {console, assert, createEnqueueMarkStore: markTestCandidateMarksStore()}
     vm.createContext(context)
     vm.runInContext([
         `let coordinatorQueue = {}`,
         `let pendingSpaceFeedIndexCache = {queue: null, index: null}`,
         `let spaceFeedRenderModelMemo = null`,
-        `let spaceFeedEnqueueMarkBatches = []`,
+        source.split('\n').find(line => line.startsWith('const spaceFeedEnqueueMarks = createEnqueueMarkStore(')),
         `let spaceFeedNukingPostKeys = new Set()`,
         `let queueingButtonsStub = []`,
         `let latestEntriesStub = []`,
@@ -44821,11 +45401,10 @@ function loadSpaceFeedEnqueueMarkHarness() {
         markTestExtract(source, 'function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null)'),
         markTestExtract(source, 'function buildSpaceFeedRenderContext(space = resolveCurrentSpaceDescriptor())'),
         markTestExtract(source, 'function touchSpaceFeedEnqueueMarks()'),
+        markTestExtract(source, 'function spaceFeedEnqueueMarkKeyOf(mark)'),
+        markTestExtract(source, 'function spaceFeedEnqueueMarkMatchOf(row, mark)'),
         markTestExtract(source, 'function beginSpaceFeedEnqueueMarks(associations = [])'),
-        markTestExtract(source, 'function settleSpaceFeedEnqueueMarks(batch = null, settled = false)'),
         markTestExtract(source, 'function applySpaceFeedEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {})'),
-        markTestExtract(source, 'function finishSpaceFeedEnqueueMarks(batch = null)'),
-        markTestExtract(source, 'function releaseSpaceFeedEnqueueMarks(batch = null)'),
         markTestExtract(source, 'function hasActivePendingSpaceFeedWork(entries = null)'),
         markTestExtract(source, 'function clearStaleLocalSpaceFeedBusyState()'),
         `globalThis.markHarness = {
@@ -44834,13 +45413,13 @@ function loadSpaceFeedEnqueueMarkHarness() {
             setQueueingButtons: buttons => { queueingButtonsStub = buttons },
             nukingKeys: () => spaceFeedNukingPostKeys,
             clearStale: () => clearStaleLocalSpaceFeedBusyState(),
-            batches: () => spaceFeedEnqueueMarkBatches,
+            batches: () => spaceFeedEnqueueMarks.batches(),
             hasPending: postKey => hasPendingCoordinatorSpaceFeedPost(postKey),
             begin: beginSpaceFeedEnqueueMarks,
-            settle: settleSpaceFeedEnqueueMarks,
+            settle: (batch, settled) => spaceFeedEnqueueMarks.settle(batch, settled),
             apply: applySpaceFeedEnqueueMarksToStateReply,
-            finish: finishSpaceFeedEnqueueMarks,
-            release: releaseSpaceFeedEnqueueMarks,
+            finish: batch => spaceFeedEnqueueMarks.finish(batch),
+            release: batch => spaceFeedEnqueueMarks.release(batch),
             queueableCount: entries => {
                 const context = buildSpaceFeedRenderContext()
                 return getSpaceFeedUniqueQueueableProfileCount(entries.map(entry => ({
@@ -44940,10 +45519,10 @@ test('the space page marks a batch before it enqueues, and settles it from the e
     const enqueue = body.indexOf('enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations')
 
     assert.ok(begin > 0 && enqueue > begin, 'the mark is set before the enqueue is sent')
-    assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, true\)[\s\S]*refreshSpaceFeedStateAfterEnqueue\(\)/)
-    assert.match(body, /settleSpaceFeedEnqueueMarks\(enqueueMarkBatch, false\)/)
-    assert.match(body, /finishSpaceFeedEnqueueMarks\(enqueueMarkBatch\)/)
-    assert.match(body, /refreshSpaceFeedStateAfterEnqueue\(\)[\s\S]*\.finally\(\(\) => releaseSpaceFeedEnqueueMarks\(enqueueMarkBatch\)\)/)
+    assert.match(body, /spaceFeedEnqueueMarks\.settle\(enqueueMarkBatch, true\)[\s\S]*refreshSpaceFeedStateAfterEnqueue\(\)/)
+    assert.match(body, /spaceFeedEnqueueMarks\.settle\(enqueueMarkBatch, false\)/)
+    assert.match(body, /spaceFeedEnqueueMarks\.finish\(enqueueMarkBatch\)/)
+    assert.match(body, /refreshSpaceFeedStateAfterEnqueue\(\)[\s\S]*\.finally\(\(\) => spaceFeedEnqueueMarks\.release\(enqueueMarkBatch\)\)/)
     // The try starts before the press animation, so every path after the marks are set reaches the finally.
     assert.ok(body.indexOf('try {') < body.indexOf('await animateNukeButtonPress(button)'), 'the try wraps the press animation')
 })
@@ -45109,9 +45688,18 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
     const scrolls = []
     const handlers = {}
     const notices = []
-    const stopButton = {hidden: true, remove() { stopButton.removed = true }}
+    // The label is recorded each time it changes, so a test can read what the button said during the run.
+    const labels = []
+    let stopLabel = 'Stop collecting'
+    const stopButton = {
+        hidden: true,
+        get textContent() { return stopLabel },
+        set textContent(value) { stopLabel = value; labels.push(value) },
+        remove() { stopButton.removed = true }
+    }
     const collectButton = {}
-    const state = {queueable: 0, pass: 0, stopOnPass, hiddenDuringRun: []}
+    // The label timer is one tick: the sleep stub calls it once a pass, as a one-second tick would during the wait.
+    const state = {queueable: 0, pass: 0, stopOnPass, hiddenDuringRun: [], tick: null, timersStarted: 0, timersCleared: 0}
     const context = vm.createContext({
         window: {
             scrollY: 0,
@@ -45140,29 +45728,43 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         setNukeButtonNotice: (element, label) => { notices.push(label) },
         syncSpaceFeedCollectButton: () => {},
         COLLECT_SCROLL_PASS_WAIT_MS: require('../shared/js/tunables').COLLECT_SCROLL_PASS_WAIT_MS,
+        COLLECT_END_CONFIRM_MS: require('../shared/js/tunables').COLLECT_END_CONFIRM_MS,
+        COLLECT_STALLED_TIMEOUT_MS: require('../shared/js/tunables').COLLECT_STALLED_TIMEOUT_MS,
+        runCollectLoop: require('../shared/js/candidateCollect').runCollectLoop,
+        collectPassMadeProgress: require('../shared/js/candidateCollect').collectPassMadeProgress,
+        reportCollectEnd: () => {},
+        formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        STOP_COLLECT_LABEL_TEXT: require('../shared/js/candidateCollect').STOP_COLLECT_LABEL_TEXT,
+        COLLECT_STOP_LABEL_TICK_MS: require('../shared/js/tunables').COLLECT_STOP_LABEL_TICK_MS,
+        setInterval: fn => { state.tick = fn; state.timersStarted += 1; return state.timersStarted },
+        clearInterval: () => { state.tick = null; state.timersCleared += 1 },
         readSpaceFeedCollectedCount: () => state.queueable,
         sleep: async() => {
             state.pass += 1
             state.hiddenDuringRun.push(stopButton.hidden)
             state.queueable += 1
             if(state.pass === state.stopOnPass) handlers['space-feed-stop']()
+            state.tick?.()
         }
     })
     vm.runInContext([
         'let spaceFeedCollecting = false',
         'let spaceFeedCollectStopRequested = false',
         'let spaceFeedCollectLimit = 10',
+        'let spaceFeedCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
+        'let spaceFeedStopLabelTimer = 0',
         contentFunctionSource(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
         contentFunctionSource(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)'),
         contentFunctionSource(contentSource, 'function setSpaceFeedCollectButtons(setLabel)'),
         contentFunctionSource(contentSource, 'function createSpaceCollectStopButton()'),
         contentFunctionSource(contentSource, 'function requestSpaceFeedCollectStop()'),
+        contentFunctionSource(contentSource, 'function refreshSpaceFeedStopLabel()'),
         contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'),
         contentFunctionSource(contentSource, 'function removeSpaceCollectButtons()'),
         contentFunctionSource(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
     ].join('\n'), context)
     const run = code => vm.runInContext(code, context)
-    return {run, scrolls, handlers, notices, stopButton, state}
+    return {run, scrolls, handlers, notices, stopButton, state, labels}
 }
 
 function makeSearchCollectHarness(stopOnPass = 0) {
@@ -45171,8 +45773,17 @@ function makeSearchCollectHarness(stopOnPass = 0) {
     const scrolls = []
     const handlers = {}
     const notices = []
-    const stopButton = {hidden: true}
-    const state = {seq: 0, pass: 0, limit: 5, stopOnPass, hiddenDuringRun: []}
+    const labels = []
+    let stopLabel = 'Stop collecting'
+    const stopButton = {
+        hidden: true,
+        get textContent() { return stopLabel },
+        set textContent(value) { stopLabel = value; labels.push(value) }
+    }
+    // rowsByRead[pass] is the list getProfileSearchRows returns on that read (pass = the passes completed so far). Null uses the stub list.
+    // stopDuringAnimate stops the run before its first pass (the animation is the last step before the loop).
+    const reports = []
+    const state = {seq: 0, pass: 0, limit: 5, stopOnPass, hiddenDuringRun: [], tick: null, timersStarted: 0, timersCleared: 0, rowsByRead: null, stopDuringAnimate: false, readTexts: [], peekText: () => ''}
     const context = vm.createContext({
         window: {
             scrollY: 0,
@@ -45189,13 +45800,27 @@ function makeSearchCollectHarness(stopOnPass = 0) {
             return element
         },
         setMuteBlockHelp,
-        PROFILE_SEARCH_COLLECT_STALLED_TIMEOUT_MS: Number.POSITIVE_INFINITY,
+        COLLECT_STALLED_TIMEOUT_MS: Number.POSITIVE_INFINITY,
         COLLECT_SCROLL_PASS_WAIT_MS: require('../shared/js/tunables').COLLECT_SCROLL_PASS_WAIT_MS,
+        runCollectLoop: require('../shared/js/candidateCollect').runCollectLoop,
+        collectPassMadeProgress: require('../shared/js/candidateCollect').collectPassMadeProgress,
+        // The end event is recorded so a test can read the detail (considered, the count of distinct result rows).
+        reportCollectEnd: (page, detail) => { reports.push({page, ...detail}) },
+        formatCollectStopLabel: require('../shared/js/candidateCollect').formatCollectStopLabel,
+        STOP_COLLECT_LABEL_TEXT: require('../shared/js/candidateCollect').STOP_COLLECT_LABEL_TEXT,
+        COLLECT_STOP_LABEL_TICK_MS: require('../shared/js/tunables').COLLECT_STOP_LABEL_TICK_MS,
+        setInterval: fn => { state.tick = fn; state.timersStarted += 1; return state.timersStarted },
+        clearInterval: () => { state.tick = null; state.timersCleared += 1 },
         getProfileSearchCollectLimit: () => state.limit,
         ensureProfileSearchCollectionStateForCurrentSearch: () => {},
-        animateNukeButtonPress: async() => {},
+        animateNukeButtonPress: async() => {
+            if(state.stopDuringAnimate) handlers['profile-search-stop']()
+        },
         getProfileSearchStagedHrefs: () => [],
-        getProfileSearchRows: () => [],
+        getProfileSearchRows: () => {
+            state.readTexts.push(state.peekText())
+            return state.rowsByRead ? state.rowsByRead[state.pass] || [] : []
+        },
         getProfileSearchQueueableRows: () => [{href: `row-${++state.seq}`}],
         stageProfileSearchHrefs: hrefs => hrefs.length,
         saveProfileSearchCollectCursor: () => {},
@@ -45213,6 +45838,7 @@ function makeSearchCollectHarness(stopOnPass = 0) {
             state.pass += 1
             state.hiddenDuringRun.push(stopButton.hidden)
             if(state.pass === state.stopOnPass) handlers['profile-search-stop']()
+            state.tick?.()
         }
     })
     vm.runInContext([
@@ -45220,13 +45846,26 @@ function makeSearchCollectHarness(stopOnPass = 0) {
         'let profileSearchCollectStopRequested = false',
         'let profileSearchProcessedFollowButtons = new WeakSet()',
         'let profileSearchCollectCursorScrollY = 0',
+        'let profileSearchCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
+        'let profileSearchStopLabelTimer = 0',
+        // The Considered line and its cause (27 Oct). The label table is a const, so its declaration is sliced out of content.js.
+        'let profileSearchConsideredText = \'\'',
+        'let profileSearchConsideredCause = \'\'',
+        contentSource.slice(contentSource.indexOf('const PROFILE_SEARCH_CAUSE_LABELS = '), contentSource.indexOf('\n}', contentSource.indexOf('const PROFILE_SEARCH_CAUSE_LABELS = ')) + 2),
+        contentFunctionSource(contentSource, 'function formatProfileSearchConsideredText(count)'),
+        contentFunctionSource(contentSource, 'function formatProfileSearchCollectCause(reason, passes)'),
+        contentFunctionSource(contentSource, 'function renderProfileSearchTextLine(toolbar, className, text, anchorSelector)'),
+        contentFunctionSource(contentSource, 'function renderProfileSearchConsideredLine(toolbar)'),
+        contentFunctionSource(contentSource, 'function setProfileSearchConsideredText(text = \'\', cause = \'\')'),
         contentFunctionSource(contentSource, 'function createProfileSearchStopButton()'),
         contentFunctionSource(contentSource, 'function requestProfileSearchCollectStop()'),
+        contentFunctionSource(contentSource, 'function refreshProfileSearchStopLabel()'),
         contentFunctionSource(contentSource, 'function syncProfileSearchStopButton()'),
         contentFunctionSource(contentSource, 'async function collectMoreProfileSearchResults(button)')
     ].join('\n'), context)
     const run = code => vm.runInContext(code, context)
-    return {run, scrolls, handlers, notices, stopButton, state}
+    state.peekText = () => vm.runInContext('profileSearchConsideredText', context)
+    return {run, scrolls, handlers, notices, stopButton, state, labels, reports}
 }
 
 test('space Stop collecting stops at the next pass, scrolls to the top, keeps the collected count, and hides again', async() => {
@@ -45351,6 +45990,92 @@ test('search Stop collecting stops at the next pass, scrolls to the top, keeps t
     assert.equal(h.state.seq, 7, 'the earlier 2 stay, and the new run adds 5')
 })
 
+// The Stop collecting label (owner, 27 Oct): N / M Stop collecting · S · m:ss, read once a tick while a run is active. The harness calls the
+// tick from its sleep stub, so each pass's view of the run is what the label shows. The label is written only when its text changes.
+test('space Stop collecting label shows collected, target, passes and elapsed time during the run, and its timer is cleared at the end', async() => {
+    const h = makeSpaceCollectHarness(2)
+    h.run('syncSpaceFeedStopButtons()')
+    await h.run('collectMoreSpaceFeedPosts({})')
+    const shown = h.labels.map(label => label.replace(/\d+:\d\d$/, 'm:ss'))
+    // The first pass's tick still shows the start; the second pass's tick shows the first pass's read (1 collected, 1 pass).
+    assert.deepEqual(shown, ['0 / 10 Stop collecting · 0 · m:ss', '1 / 10 Stop collecting · 1 · m:ss'])
+    assert.ok(h.labels.every(label => !/scroll/i.test(label)), 'no label says scrolls')
+    assert.equal(h.state.timersStarted, 1, 'one timer for the run')
+    assert.equal(h.state.timersCleared, 1, 'the timer is cleared when the run ends')
+    assert.equal(h.state.tick, null)
+    assert.equal(h.run('spaceFeedCollectProgress.passes'), 2, 'the run counted its two completed passes')
+    assert.equal(h.run('spaceFeedCollectProgress.collected'), 2)
+    assert.equal(h.run('spaceFeedCollectProgress.target'), 10)
+})
+
+test('search Stop collecting label shows collected, target, passes and elapsed time during the run, and its timer is cleared at the end', async() => {
+    const h = makeSearchCollectHarness(2)
+    h.run('syncProfileSearchStopButton()')
+    await h.run('collectMoreProfileSearchResults({})')
+    const shown = h.labels.map(label => label.replace(/\d+:\d\d$/, 'm:ss'))
+    assert.deepEqual(shown, ['0 / 5 Stop collecting · 0 · m:ss', '1 / 5 Stop collecting · 1 · m:ss', '2 / 5 Stop collecting · 2 · m:ss'])
+    assert.ok(h.labels.every(label => !/scroll/i.test(label)), 'no label says scrolls')
+    assert.equal(h.state.timersStarted, 1, 'one timer for the run')
+    assert.equal(h.state.timersCleared, 1, 'the timer is cleared when the run ends')
+    assert.equal(h.state.tick, null)
+    assert.equal(h.run('profileSearchCollectProgress.passes'), 2)
+    assert.equal(h.run('profileSearchCollectProgress.target'), 5, 'the target is the count the run started with')
+})
+
+// Owner, 27 Oct: Considered counts the distinct result row elements the run read, once per element, not per profile. Pass 1 reads profile A's row;
+// pass 2 reads a second row element for A and a row for C. Three row elements, so the line says 3, and the end event carries seen 3.
+test('search Collect N More: Considered counts distinct result row elements over the passes (A twice counts twice), and the end event says seen 3 (27 Oct)', async() => {
+    const h = makeSearchCollectHarness(0)
+    h.state.limit = 2
+    const rowA1 = {row: {id: 'A-first'}, href: 'https://www.quora.com/profile/A', followButton: {}}
+    const rowA2 = {row: {id: 'A-second'}, href: 'https://www.quora.com/profile/A', followButton: {}}
+    const rowC = {row: {id: 'C'}, href: 'https://www.quora.com/profile/C', followButton: {}}
+    h.state.rowsByRead = [[rowA1], [rowA2, rowC]]
+    const result = await h.run('collectMoreProfileSearchResults({})')
+    assert.equal(result, true, 'the run collected its 2')
+    assert.equal(h.state.pass, 1, 'two reads, one pass between them')
+    assert.equal(h.reports.length, 1)
+    assert.equal(h.reports[0].considered, 3, 'three row elements were read')
+    assert.equal(h.reports[0].reason, 'captured')
+    assert.equal(h.run('profileSearchConsideredText'), 'Considered 3 displayed matches')
+    assert.equal(h.run('profileSearchConsideredCause'), 'Count reached')
+})
+
+test('search Collect N More: a new run clears the Considered line and its cause before its first read (27 Oct)', async() => {
+    const h = makeSearchCollectHarness(0)
+    h.state.limit = 2
+    const rowA = {row: {id: 'A'}, href: 'https://www.quora.com/profile/A', followButton: {}}
+    const rowC = {row: {id: 'C'}, href: 'https://www.quora.com/profile/C', followButton: {}}
+    h.state.rowsByRead = [[rowA], [rowC]]
+    await h.run('collectMoreProfileSearchResults({})')
+    assert.equal(h.run('profileSearchConsideredText'), 'Considered 2 displayed matches', 'the first run leaves its line')
+    assert.equal(h.run('profileSearchConsideredCause'), 'Count reached')
+
+    const rowD = {row: {id: 'D'}, href: 'https://www.quora.com/profile/D', followButton: {}}
+    h.state.pass = 0
+    h.state.rowsByRead = [[rowD], []]
+    h.state.readTexts = []
+    await h.run('collectMoreProfileSearchResults({})')
+    assert.deepEqual(h.state.readTexts, ['', ''], 'the line is empty at every read of the new run, so the old text is gone before it starts')
+    assert.equal(h.run('profileSearchConsideredText'), 'Considered 1 displayed matches', 'the new run sets its own count')
+    assert.equal(h.run('profileSearchConsideredCause'), 'Count reached')
+})
+
+// Owner, 27 Oct: a run that never made a pass (no scan, no scroll) shows Page load as its cause, not the recorded reason.
+test('search Collect N More: a run with zero passes shows Page load as its cause (27 Oct)', async() => {
+    const h = makeSearchCollectHarness(0)
+    h.run('syncProfileSearchStopButton()')
+    h.state.stopDuringAnimate = true
+    const result = await h.run('collectMoreProfileSearchResults({})')
+    assert.equal(result, false, 'a stopped run reports no success')
+    assert.equal(h.state.pass, 0, 'no pass ran')
+    assert.equal(h.reports.length, 1)
+    assert.equal(h.reports[0].passes, 0)
+    assert.equal(h.reports[0].reason, 'stopped', 'the recorded reason is still the event one')
+    assert.equal(h.run('profileSearchConsideredCause'), 'Page load')
+    assert.equal(h.run('profileSearchConsideredText'), 'Considered 0 displayed matches')
+})
+
 // Owner, 26 Oct: the nuking count on a space page is this space's in-progress work. The page's copy of the queue holds other spaces' rows too.
 test('the space page nuking count counts only this space\'s rows in progress, not another space\'s row for a profile on the page (26 Oct)', () => {
     const source = fs.readFileSync(path.join(LIST_REPO_ROOT, 'shared', 'js', 'content.js'), 'utf8')
@@ -45369,7 +46094,7 @@ test('the space page nuking count counts only this space\'s rows in progress, no
         throw new Error(`unterminated ${signature}`)
     }
     const statusSetLine = source.slice(source.indexOf('const PENDING_COORDINATOR_STATUSES'), source.indexOf('\n', source.indexOf('const PENDING_COORDINATOR_STATUSES')))
-    const context = {progressByHref: {}, console}
+    const context = {progressByHref: {}, console, createEnqueueMarkStore: markTestCandidateMarksStore()}
     vm.createContext(context)
     vm.runInContext([
         // Stubs for lookups these functions call. The real ones live in the progress and subject code.
@@ -45395,7 +46120,7 @@ test('the space page nuking count counts only this space\'s rows in progress, no
             return result
         }`,
         `let coordinatorQueue = {}`,
-        `let spaceFeedEnqueueMarkBatches = []`,
+        source.split('\n').find(line => line.startsWith('const spaceFeedEnqueueMarks = createEnqueueMarkStore(')),
         `let pendingSpaceFeedIndexCache = {queue: null, index: null}`,
         `const spaceFeedKnownNukedProfileKeys = new Set()`,
         statusSetLine,
@@ -45408,6 +46133,9 @@ test('the space page nuking count counts only this space\'s rows in progress, no
         extract("function isPendingCoordinatorStatus(status = '')"),
         extract("function getCoordinatorItemProfileHref(itemKey = '', item = null)"),
         extract('function getPendingSpaceFeedIndex()'),
+        extract('function touchSpaceFeedEnqueueMarks()'),
+        extract('function spaceFeedEnqueueMarkKeyOf(mark)'),
+        extract('function spaceFeedEnqueueMarkMatchOf(row, mark)'),
         extract('function getActivePendingSpaceFeedUrls(postKey)'),
         extract('function getCoordinatorItemSources(item = {})'),
         extract('function isCoordinatorSourceForSpace(source = null, space = null)'),
@@ -45489,7 +46217,7 @@ test('the search page Nuke \'Em count excludes profiles already queued or nuking
     }
     const statusSetLine = source.slice(source.indexOf('const PENDING_COORDINATOR_STATUSES'), source.indexOf('\n', source.indexOf('const PENDING_COORDINATOR_STATUSES')))
     const SEARCH_URL = 'https://www.quora.com/search?q=elon%20musk&type=profile'
-    const context = {progressByHref: {}, console, URL, URLSearchParams, location: {href: SEARCH_URL, search: '?q=elon%20musk&type=profile'}}
+    const context = {progressByHref: {}, console, URL, URLSearchParams, location: {href: SEARCH_URL, search: '?q=elon%20musk&type=profile'}, createEnqueueMarkStore: markTestCandidateMarksStore()}
     vm.createContext(context)
     vm.runInContext([
         // Stubs for lookups these functions call. The real ones live in the progress, search and subject code.
@@ -45518,7 +46246,9 @@ test('the search page Nuke \'Em count excludes profiles already queued or nuking
         extract('function isStaleCurrentProfileSearchCoordinatorItem(item = null)'),
         extract("function getPendingCoordinatorProfileHrefEntries(profileHref = '')"),
         extract("function isPendingCoordinatorProfileHref(profileHref = '', options = {})"),
-        `let profileSearchEnqueueMarkBatches = []`,
+        source.split('\n').find(line => line.startsWith('const profileSearchEnqueueMarks = createEnqueueMarkStore(')),
+        extract('function profileSearchEnqueueMarkKeyOf(mark)'),
+        extract('function profileSearchEnqueueMarkMatchOf(row, mark)'),
         extract("function getProfileSearchEnqueueMarkState(profileHref = '')"),
         extract('function isProfileSearchProfileNukeable(href, options = {})'),
         extract('function getProfileSearchQueueableRows(rows = getProfileSearchRows(), options = {})'),
@@ -45585,11 +46315,11 @@ function searchMarkCounts(harness) {
 
 function loadSearchEnqueueMarkHarness() {
     const source = markTestContentSource()
-    const context = {console, assert}
+    const context = {console, assert, createEnqueueMarkStore: markTestCandidateMarksStore()}
     vm.createContext(context)
     vm.runInContext([
         `let coordinatorQueue = {}`,
-        `let profileSearchEnqueueMarkBatches = []`,
+        source.split('\n').find(line => line.startsWith('const profileSearchEnqueueMarks = createEnqueueMarkStore(')),
         `let profileSearchLastRunId = ''`,
         `let profileNukeRecords = {}`,
         source.split('\n').find(line => line.startsWith('const PENDING_COORDINATOR_STATUSES')),
@@ -45624,10 +46354,9 @@ function loadSearchEnqueueMarkHarness() {
         markTestExtract(source, 'function isStaleCurrentProfileSearchCoordinatorItem(item = null)'),
         markTestExtract(source, 'function getPendingCoordinatorProfileHrefEntries(profileHref = \'\')'),
         markTestExtract(source, 'function isPendingCoordinatorProfileHref(profileHref = \'\', options = {})'),
+        markTestExtract(source, 'function profileSearchEnqueueMarkKeyOf(mark)'),
+        markTestExtract(source, 'function profileSearchEnqueueMarkMatchOf(row, mark)'),
         markTestExtract(source, 'function beginProfileSearchEnqueueMarks(profileHrefs = [])'),
-        markTestExtract(source, 'function settleProfileSearchEnqueueMarks(batch = null, settled = false)'),
-        markTestExtract(source, 'function finishProfileSearchEnqueueMarks(batch = null)'),
-        markTestExtract(source, 'function releaseProfileSearchEnqueueMarks(batch = null)'),
         markTestExtract(source, 'function applyProfileSearchEnqueueMarksToStateReply(requestedAt = 0, askedHrefs = [], queueRows = {})'),
         markTestExtract(source, 'function getProfileSearchEnqueueMarkState(profileHref = \'\')'),
         markTestExtract(source, 'function getProfileSearchEnqueueMarkCounts()'),
@@ -45635,11 +46364,11 @@ function loadSearchEnqueueMarkHarness() {
         `globalThis.searchMarkHarness = {
             setQueue: rows => { coordinatorQueue = rows },
             setNukeRecords: records => { profileNukeRecords = records },
-            batches: () => profileSearchEnqueueMarkBatches,
+            batches: () => profileSearchEnqueueMarks.batches(),
             begin: beginProfileSearchEnqueueMarks,
-            settle: settleProfileSearchEnqueueMarks,
-            finish: finishProfileSearchEnqueueMarks,
-            release: releaseProfileSearchEnqueueMarks,
+            settle: (batch, settled) => profileSearchEnqueueMarks.settle(batch, settled),
+            finish: batch => profileSearchEnqueueMarks.finish(batch),
+            release: batch => profileSearchEnqueueMarks.release(batch),
             apply: applyProfileSearchEnqueueMarksToStateReply,
             state: getProfileSearchEnqueueMarkState,
             counts: getProfileSearchEnqueueMarkCounts,
@@ -45748,10 +46477,10 @@ test('search page enqueue marks: the batch marks before it enqueues, settles onl
 
     assert.ok(begin > 0 && enqueue > begin, 'the marks are set before the enqueue is sent')
     assert.ok(body.indexOf('try {') < body.indexOf('await animateNukeButtonPress(button)'), 'the try wraps the press animation')
-    assert.match(body, /settleProfileSearchEnqueueMarks\(enqueueMarkBatch, true\)[\s\S]*refreshProfileSearchStateAfterEnqueue\(profileHrefs\)/)
-    assert.match(body, /settleProfileSearchEnqueueMarks\(enqueueMarkBatch, false\)/)
-    assert.match(body, /finally \{\s*finishProfileSearchEnqueueMarks\(enqueueMarkBatch\)/)
-    assert.match(body, /releaseProfileSearchEnqueueMarks\(enqueueMarkBatch\)/)
+    assert.match(body, /profileSearchEnqueueMarks\.settle\(enqueueMarkBatch, true\)[\s\S]*refreshProfileSearchStateAfterEnqueue\(profileHrefs\)/)
+    assert.match(body, /profileSearchEnqueueMarks\.settle\(enqueueMarkBatch, false\)/)
+    assert.match(body, /finally \{\s*profileSearchEnqueueMarks\.finish\(enqueueMarkBatch\)/)
+    assert.match(body, /profileSearchEnqueueMarks\.release\(enqueueMarkBatch\)/)
     // The batch and row paths both reach the nukeable check, so a marked profile never gets a second enqueue.
     const nukeable = markTestExtract(markTestContentSource(), 'function isProfileSearchProfileNukeable(href, options = {})')
     assert.match(nukeable, /getProfileSearchEnqueueMarkState\(normalizedHref\)\) return false/)
