@@ -194,10 +194,12 @@ function showStatus(element, message) {
     }, 1200)
 }
 
+// The change goes to the worker as one record, with the time the user acted, so a page's older copy of the registry is never written back.
 async function updateSpaceCategory(spaceKey, category, container) {
     const existingRecord = popupState.spaceRegistry?.[spaceKey]
     if(!existingRecord) return
 
+    const at = Date.now()
     const nextRecord = buildSpaceRecord(existingRecord, category, existingRecord)
     if(!nextRecord) return
 
@@ -207,7 +209,20 @@ async function updateSpaceCategory(spaceKey, category, container) {
     }
 
     renderSpaceList(container)
-    await browser.runtime.sendMessage({action: 'set-space-registry', spaceRegistry: popupState.spaceRegistry})
+    const reply = await browser.runtime.sendMessage({
+        action: 'set-space-record',
+        key: spaceKey,
+        change: {category, url: existingRecord.url, slug: existingRecord.slug, name: existingRecord.name},
+        at
+    })
+    // A refused change leaves the stored record in place; the list shows that record.
+    if(reply?.refused) {
+        const next = {...popupState.spaceRegistry}
+        if(reply.record) next[spaceKey] = reply.record
+        else delete next[spaceKey]
+        popupState.spaceRegistry = next
+        renderSpaceList(container)
+    }
 }
 
 function renderSpaceList(container) {

@@ -1,7 +1,7 @@
 {
   "name": "Mute Block",
   "description": "Silence unwanted noise on Quora profiles instantly with this Firefox extension.",
-  "version": "1.6.1662",
+  "version": "1.6.1675",
   "manifest_version": 3,
   "author": "https://mohsinali.dev",
   "background": {
@@ -10,7 +10,7 @@
     ]
   },
   "action": {
-    "default_title": "Mute Block"
+    "default_title": "Mute Block extension"
   },
   "icons": {
     "32": "icons/32.png",

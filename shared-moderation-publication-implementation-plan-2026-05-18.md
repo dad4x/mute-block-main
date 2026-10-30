@@ -481,8 +481,7 @@ Smoke cases:
 
 ### Local Mock Browser Development
 
-We should not make every browser-facing change depend on the tunneled,
-logged-in remote browser. Local mock development can cover most extension
+We should not make every browser-facing change depend on the logged-in remote browser. Local mock development can cover most extension
 plumbing even when local Quora access is blocked by firewall/proxy/Cloudflare.
 
 Available local baseline:

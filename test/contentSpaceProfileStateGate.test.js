@@ -79,7 +79,7 @@ function loadProfileStateHarness() {
         extractFunction(source, 'function isSpaceFeedProfileStateReady(href)'),
         extractFunction(source, 'function getSpaceFeedUniqueQueueableProfileCount(queueableEntries = [])'),
         extractFunction(source, 'function isSpaceFeedPostNuked(candidateUrls = null)'),
-        extractFunction(source, 'function getSpacePendingProfileCount(entries = [], pendingCoordinatorProfileHrefs = new Set())'),
+        extractFunction(source, 'function getSpacePendingProfileCount(entries = [], pendingCoordinatorProfileHrefs = new Set(), excludeKeys = new Set())'),
         extractFunction(source, 'function getQueueableSpaceFeedEntryUrlsForRender(entry = null, context = null)'),
         `globalThis.harness = {
             answered: spaceFeedAnsweredProfileKeys,
@@ -89,6 +89,7 @@ function loadProfileStateHarness() {
             postNuked: isSpaceFeedPostNuked,
             count: getSpaceFeedUniqueQueueableProfileCount,
             pendingCount: getSpacePendingProfileCount,
+            key: getSpaceFeedProfileStateKey,
             queueable: getQueueableSpaceFeedEntryUrlsForRender
         }`
     ].join('\n\n'), context, {filename: 'content-space-profile-state-gate-harness.js'})
@@ -475,7 +476,7 @@ test('a collapsed post with no candidate is expanded once by a click on its body
     assert.match(content, /const scannedEntries = timedSpaceQuery\('phase\.scan', \(\) => getSpaceFeedPostEntriesForRender\(\)\)\n    timedSpaceQuery\('phase\.expand', \(\) => expandCollapsedSpaceFeedPosts\(scannedEntries\)\)/)
 })
 
-test('a post with errors and nothing to queue shows a white Bad Links button, after Nuked, red and Nuking', () => {
+test('a post with errors and nothing to queue shows a white Bad Links button, after Done, red and Nuking', () => {
     const content = readRepoFile('shared/js/content.js')
     const css = readRepoFile('shared/css/content.css')
 
@@ -508,6 +509,18 @@ test('the busy count is the distinct queued profiles, counted once across posts,
         {postKey: 'post-d', activePendingUrls: [], candidateUrls: [], resolverPending: true}
     ], new Set([BOB])), 3)
     assert.equal(harness.pendingCount([], new Set()), 0)
+})
+
+// E1 (28 Oct): the profiles of an in-flight batch are the Queueing count, so the Nuking count leaves them out and nothing is counted twice.
+test('E1: an in-flight batch profile, or an in-flight resolver post, is left out of the Nuking count (28 Oct)', () => {
+    const {harness} = loadProfileStateHarness()
+    const entries = [
+        {postKey: 'post-a', activePendingUrls: [ALICE], candidateUrls: [ALICE, BOB]},
+        {postKey: 'post-d', activePendingUrls: [], candidateUrls: [], resolverPending: true}
+    ]
+    assert.equal(harness.pendingCount(entries, new Set([BOB])), 3)
+    assert.equal(harness.pendingCount(entries, new Set([BOB]), new Set([harness.key(ALICE)])), 2)
+    assert.equal(harness.pendingCount(entries, new Set([BOB]), new Set(['post:post-d'])), 2)
 })
 
 test('the count is the unique profiles still to be queued, so a profile linked from two red posts counts once', () => {

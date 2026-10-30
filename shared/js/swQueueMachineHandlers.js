@@ -55,6 +55,7 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
     const mutateCoordinatorStaleRetryQueuedTabAdvance = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStaleRetryQueuedTabAdvance')
     const mutateCoordinatorStoredWorkCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkCancel')
     const mutateCoordinatorStoredWorkClear = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkClear')
+    const mutateCoordinatorStoredWorkFailedItemRemove = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkFailedItemRemove')
     const mutateCoordinatorStoredWorkItemCancel = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkItemCancel')
     const mutateCoordinatorStoredWorkPause = requireQueueMachineCapability('durable', durable, 'mutateCoordinatorStoredWorkPause')
     const terminateDurableActiveCoordinatorItemFromTerminalProgress = requireQueueMachineCapability('durable', durable, 'terminateDurableActiveCoordinatorItemFromTerminalProgress')
@@ -232,6 +233,12 @@ function createCoordinatorQueueMachineEventHandlers(capabilities = {}) {
             return mutateCoordinatorStoredWorkCancel({
                 reason: operation.reason || 'ordinaryMutation',
                 cancelReason: event.cancelReason || event.reason || 'coordinator-pause-request'
+            })
+        },
+        [QUEUE_MACHINE_EVENT_TYPES.REMOVE_FAILED_STORED_WORK_ITEM]: async (event = {}, operation = {}) => {
+            return mutateCoordinatorStoredWorkFailedItemRemove({
+                reason: operation.reason || 'ordinaryMutation',
+                rowKey: event.rowKey || ''
             })
         },
         [QUEUE_MACHINE_EVENT_TYPES.CANCEL_STORED_WORK_ITEM]: async (event = {}, operation = {}) => {

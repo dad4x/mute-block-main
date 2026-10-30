@@ -76,7 +76,9 @@ function registerServiceWorkerListeners(deps = {}) {
         'resume-paused-coordinator-nukes',
         'cancel-coordinator-current-work',
         'cancel-coordinator-current-work-item',
+        'remove-coordinator-failed-work-item',
         'clear-coordinator-current-work',
+        'clear-completed-history',
         'reconcile-coordinator-storage',
         'refresh-coordinator-queue-view',
         'refresh-coordinator-runs-view',
@@ -153,8 +155,10 @@ function registerServiceWorkerListeners(deps = {}) {
         beginCoordinatorProfileAction,
         cancelCoordinatorCurrentWork,
         cancelCoordinatorCurrentWorkItem,
+        removeCoordinatorFailedWorkItem,
         cancelQueuedOwnerActions,
         claimPendingTabAction,
+        clearCoordinatorCompletedHistory,
         clearCoordinatorCurrentWork,
         clearCoordinatorReconcileAlarms,
         clearCoordinatorTerminalStats,
@@ -220,7 +224,7 @@ function registerServiceWorkerListeners(deps = {}) {
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
         setSpaceSortRequested,
-        setSpaceRegistryRequested,
+        setSpaceRecordRequested,
         setDevModeEnabledRequested,
         setHiddenRunIdsRequested,
         claimDebugRunAutosaveRequested,
@@ -728,8 +732,8 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'set-space-sort') {
             return setSpaceSortRequested(request.sortBy)
         }
-        else if(request.action === 'set-space-registry') {
-            return setSpaceRegistryRequested(request.spaceRegistry)
+        else if(request.action === 'set-space-record') {
+            return setSpaceRecordRequested(request)
         }
         else if(request.action === 'set-dev-mode-enabled') {
             return setDevModeEnabledRequested(request.enabled === true)
@@ -751,6 +755,9 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'cancel-coordinator-current-work-item') {
             return cancelCoordinatorCurrentWorkItem(request)
+        }
+        else if(request.action === 'remove-coordinator-failed-work-item') {
+            return removeCoordinatorFailedWorkItem(request)
         }
         else if(request.action === QUEUE_BAR_GET_ACTION) {
             // The queue bar's summary, as the worker holds it (decisions 9 and 11). Null until a queue view has been recorded. The asking
@@ -889,6 +896,10 @@ function registerServiceWorkerListeners(deps = {}) {
         }
         else if(request.action === 'clear-coordinator-terminal-stats') {
             return clearCoordinatorTerminalStats()
+        }
+        else if(request.action === 'clear-completed-history') {
+            // The History page's Clear (28 Oct). The page is an extension page opened in a tab, so the sender's tab is not a test here.
+            return clearCoordinatorCompletedHistory()
         }
         else if(request.action === 'get-content-page-coordinator-state') {
             return timeContentRequest('get-content-page-coordinator-state', () => getContentPageCoordinatorState(request, sender))

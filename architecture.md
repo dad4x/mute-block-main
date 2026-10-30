@@ -1,6 +1,10 @@
 # Mute Block Architecture
 
-Date: 2026-10-25, revised 2026-10-26 and 2026-10-27. Verified against package version 1.6.1655 in the working tree, which is ahead of HEAD `8e146cc` (tag `v1.6.1636`; commits after `8e146cc` are not listed here). The 27 Oct pass was checked by reading code and by grep, not by running the extension. `shared/js` has working-tree changes, so line numbers may have moved. This note replaces the 24 Oct state map. The previous text is in git history (`git show HEAD:architecture.md`).
+Date: 2026-10-25, revised 2026-10-26, 2026-10-27, 2026-10-28 and 2026-10-29. Verified against package version 1.6.1665 in the working tree (29 Oct), which is ahead of the tagged build `v1.6.1636` (`8e146cc`). HEAD is `d9a35c2`; commits after `8e146cc` are not all listed here. The 27 Oct pass was checked by reading code and by grep, not by running the extension. `shared/js` has working-tree changes, so line numbers may have moved. This note replaces the 24 Oct state map. The previous text is in git history (`git show HEAD:architecture.md`).
+
+29 Oct pass: verified against package version 1.6.1665 in the working tree (`package.json` and both manifests). On 29 Oct only the header (version, date, HEAD) and section 12.2 item 1 (version) changed. The rest is as the 28 Oct pass left it.
+
+28 Oct pass: verified against package version 1.6.1664 in the working tree (`package.json` and both manifests). The sections changed on 28 Oct are Terms (four entries added at the end), 1.4, 1.5, 2 (one note), 3.1, 3.5, 3.6, 6.1b, 6.2 (items 17 to 20), 7, 8 and 12.2; the rest is as before. Checked by reading code and by grep only: no tests, build or live browser run. Git: the last commit before the WIP snapshot is `3ab637d`; the snapshot is `7abdfea` (working tree at 1.6.1662); HEAD is `d9a35c2`, a join commit with no content change. Nothing from 28 Oct is committed.
 
 Review of current gaps: [codex-mb-review-1.md](codex-mb-review-1.md). Its items 1-5 are tracked there. Its headings repeat number 4, so the file holds six findings. Items marked "(review N)" below point to it. Planning and status: [planning.md](planning.md) and [docs/notes-register.md](docs/notes-register.md). The iPhone plan is separate: [mute-block-ios-safari-plan.md](mute-block-ios-safari-plan.md).
 
@@ -27,6 +31,7 @@ Terms (27 Oct; one line each, as the code and the planning note use them):
 - **Item:** usually what is in a row, whatever it may be.
 - **Skipped:** an error result: the desired action could not be taken, for one reason or another.
 - **Unblock:** unblock and unmute together. Also called a **pardon**.
+- **Working tab:** a background tab in the background window that is running a block or unblock action for a row. The number that can run at once is the user setting `targetQueuedTabConcurrency` (default 4, minimum 1; no Preferences control found). Replaces "worker slot" in user-facing text (27 Oct).
 - **Host:** a machine, VM or address. The owner does not use "host" for the Queue Worker; do not write "queue host" in docs. The worker-host experiments (`experiments/worker-host/`) keep their folder name only.
 - **Queue:** the durable set of queued and active rows, stored in the WAL (section 4). **Row:** one queued profile action in the queue, with its status and attempt.
 - **Attempt:** one try at a row, identified by `attemptId`. A retried row has a new attempt.
@@ -44,6 +49,11 @@ Terms (27 Oct; one line each, as the code and the planning note use them):
 - **Flight recorder:** the in-memory diagnostic log of recent events, with a session copy (section 2.3).
 - **Erase:** the destructive reset of all stored history (section 5.3). **Clear:** resets what the dashboard shows (the cutoff for history, completed rows and runs; section 5.4), and it also deletes the stored outlier entries, on disk and in the session copy. It does not delete completed rows or runs from storage; space management and Erase do that.
 - **Namespace prefix:** the `v1.6.` prefix on stored keys (section 5.1). **Unprefixed key:** a key written by an older version, which 1.6 does not read.
+- **Nuke error (28 Oct):** the Dashboard's label for the stored outcome `action-error`, a row whose activation failed. The stored value does not change; `timeout` keeps its own label and is used only when the release reason names a timeout (section 6.1b).
+- **Nuking drop-down (28 Oct):** the small Pause and Resume menu beside a "Nuking" status on the space page and the search page. It sends the Dashboard's pause or resume message, so it pauses the whole queue (section 1.5).
+- **Considered line and cause line (28 Oct):** the two lines under Collect N More on the search page: "Considered X displayed matches", and the reason the last run ended.
+- **Stop collecting label (28 Oct):** the button text during a collect run on the space and search pages: "N / M Stop collecting · S · m:ss".
+- **Remove (failed row) (28 Oct):** the Dashboard control on a row whose status is `failed`. It removes that one row from Current Work; nothing is sent to Quora (section 3.5).
 
 Contents: Overview; 1 Layers and rules; 2 State map; 3 Write paths; 4 Checkpoint and shard layout; 5 Storage namespace and erase rules; 6 Known exceptions and planned work; 7 Metrics and tests; 8 Not verified in this pass; 9 Every stored key; 10 Data structures; 11 Session storage against its quota; 12 Corrections found in the 26 Oct enumeration. Sections 9 to 12 were added on 2026-10-26 against the working tree at package version 1.6.1650 (working tree ahead of HEAD `8e146cc`). Sections 9 to 12 were checked by reading code, not by running the extension.
 
@@ -158,7 +168,7 @@ DAVE PASS STOPS HERE
 
 The worker's runtime message dispatch is in `shared/js/swBootstrap.js`. The actions named below are the ones this note refers to.
 
-- Queue intake: `enqueue-coordinator-items`, `open-coordinator`, `pause-coordinator-nukes`, `resume-coordinator-queue`, `retry-coordinator-failed`.
+- Queue intake: `enqueue-coordinator-items`, `open-coordinator`, `pause-coordinator-nukes`, `resume-coordinator-queue`, `resume-paused-coordinator-nukes`, `retry-coordinator-failed`, `remove-coordinator-failed-work-item` (one failed row, 28 Oct; section 3.5).
 - Tab and attempt: `claim-tab-action`, `promote-queued-tab`, `begin-profile-action`, `record-job-milestone`, `record-job-terminal`, `release-job-tab`, `close-tab`.
 - Manual and profile state: `record-direct-profile-progress`, `record-manual-profile-action`, `clear-profile-nuke-state`, `get-recent-history`.
 - Space feed: no space-feed routes remain (section 3.4; checked 27 Oct). `settle-terminal-coordinator-items` is still routed for queue rows.
@@ -166,9 +176,25 @@ The worker's runtime message dispatch is in `shared/js/swBootstrap.js`. The acti
 
 Actions in the authority set wait for the queue authority to load before they run (`RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY`, `swBootstrap.js`). An action missing from that set runs ungated.
 
+### 1.5 Page-side shared modules (28 Oct)
+
+The space page and the profile search page in `content.js` share the batch, collect, status and drop-down code below (refactor steps 1 to 6). Each module is a pure helper or a driver with its DOM work passed in as hooks; the DOM work itself stays in `content.js`. None of them stores anything or calls the browser, so they add no state (section 2).
+
+| Module                           | Role                                                                                                                                                                                                  |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `shared/js/candidateMarks.js`    | `createEnqueueMarkStore`: the in-memory enqueue marks (queueing and nuking) that a page keeps for its own rows. One store per page; no state is shared between the two pages.                          |
+| `shared/js/candidateCollect.js`  | Collect controls and labels: `formatCollectStopLabel` and `STOP_COLLECT_LABEL_TEXT` (the Stop collecting label), `formatElapsed`, `collectPassMadeProgress`, and `runCollectLoop` (the shared skeleton: a pass, a wait, a read and a stall clock). |
+| `shared/js/candidateNuke.js`     | `runBatchNuke`: the batch driver for Nuke 'Em. Marks the batch, presses, sends it, settles the marks from the reply, refreshes the page, and finishes the marks on every path.                       |
+| `shared/js/candidateStatus.js`   | Status and label text: `formatQueueingLabel`, `formatNukingLabel`, `formatNukingStatus`, `formatProfileRowState`, `NOTHING_QUEUED_LABEL`, `NUKED_LABEL`. Both pages build their words here; the presence rules stay on each page. |
+| `shared/js/nukingControl.js`     | The Nuking drop-down: its items, help text and label (`nukingControlView`, `nukingControlMessage`). Pause sends `pause-coordinator-nukes`; Resume sends `resume-paused-coordinator-nukes`. Both are the Dashboard's Pause Current Work messages, so the pause is queue-wide. |
+
+Constants that moved to `shared/js/tunables.js`: `CANDIDATE_BATCH_PROFILES_PER_BATCH` (the batch size cap) and `COLLECT_STALLED_TIMEOUT_MS` (the collect stall timeout). The search page's enqueue reports progress per chunk ("Queueing... R of T"), as the space page does. The paused label is "Nuking Paused" on both pages and in the drop-down. The space page's toolbar status passes no queueing count, so it has no queueing part. Both pages pass the stored pause flag to the status; the code does not match the note that the search page does not show Paused (planning.md, open item (f)).
+
 Build and process rules are in `AGENTS.md`.
 
 ## 2. State map
+
+28 Oct: the changes add no stored key and no session key. The enqueue marks and the drop-down are in memory only. The failed-row remove writes through the existing queue WAL (section 3.5).
 
 ### 2.1 Authoritative (durable)
 
@@ -280,6 +306,8 @@ Queue wakeup metrics (`mbQueueWakeupMetrics`, `mbQueueWakeupMetricsView`) are se
 4. `recordCoordinatorJobProgress` decides the outcome with `reduceJobEvent`.
 5. After a terminal result, the worker schedules queued work (`scheduleQueuedWorkContinuation`) and cleans up the owned tab (`scheduleCompletedJobOwnedTabCleanup`, about line 31372).
 
+**Blocked-live-tab probe and rollback (27 Oct fix).** `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (`sw.js`) does not decide anything about a row whose active transition is still in flight. It waits for that row's pending transitions (`getPendingActiveTransitionsForRow`), re-reads the row, and returns `active-transition-settled-row-changed` if the row is no longer the same attempt or is neither active nor terminal. A not-blocked answer writes nothing and leaves the row for its action. The rollback of a failed active transition (`mutateCoordinatorQueuedTabOpenRollback`, `sw.js`) returns without writing when the row is missing or already terminal, so it cannot write a failure over a row another path has settled. The tests for this are in `test/swSynthetic.test.js` (the "failed active transition, then a not-blocked probe" test and the "rollback ... is a no-op" test); they were not run in the 28 Oct pass (section 8).
+
 **Archive.** A finished row is archived by `archiveTerminalCoordinatorRow` (`sw.js`, about line 9719). It writes a `completed`-area record (`makeCoordinatorCompletedWorkWalRecord`, about line 7326). How the active row's removal is recorded alongside it was not traced in this pass (section 8).
 
 **Stored-work clear.** See section 3.5.
@@ -321,6 +349,7 @@ The space post maps were removed on 25 Oct (`nukedPosts.js` header; commits `62a
 - Write: `mutateCoordinatorStoredWorkClear` (`sw.js`, about line 26886) re-reads the planned rows before saving. If a row's attempt moved, the plan is rebuilt. The loop runs at most `STORED_WORK_CLEAR_REREAD_ATTEMPTS` times (`tunables.js`, value 2).
 - Removes: active queue rows and archived completed rows, through the WAL. Owned tabs are listed in the plan for closing (the closing step was not traced).
 - Space feed: no pending space-feed records exist to keep or remove (section 3.4).
+- **Remove one failed row (28 Oct).** The Dashboard's Remove control is shown only on a row whose status is `failed`; queued and active rows keep Cancel. It calls `removeFailedCurrentWorkItem` (`coordinator.js`), which sends `remove-coordinator-failed-work-item` with the row's key. `removeCoordinatorFailedWorkItem` (`sw.js`) runs the queue-machine event `REMOVE_FAILED_STORED_WORK_ITEM` through the same storage update slot as the other Current Work mutations. `mutateCoordinatorStoredWorkFailedItemRemove` (`sw.js`) reads the row, refuses it unless it is still `failed`, and saves the removal through `persistCoordinator` with `guardRemovedRows: true` (operation `current-work-failed-item-remove`). Nothing is sent to Quora, and the row is not requeued. Metric paths for the load and the two saves: `currentWork.failedRemove.load`, `currentWork.failedRemove.save.queueWal`, `currentWork.failedRemove.save.projection`.
 
 Open: a late write from an attempt that moved after the last read. A write to a row that no longer exists is rejected on the milestone path (`missing-coordinator-item`). The other writers have not been checked (carried from the 14 Oct note; unverified now).
 
@@ -334,7 +363,7 @@ Every queued-work change is an event type named in `shared/js/swQueueMachineEven
 | Attempt and claim     | `RECOVER_PENDING_TAB_ACTION`, `RESTORE_ACTIVE_RUNTIME_FOR_SENDER`, `RELEASE_RUNTIME_IF_AUTHORITY_NOT_ACTIVE`, `ACTION_LEASE_REQUEST`, `ACTION_LEASE_HEARTBEAT`, `ACTION_LEASE_RELEASE`, `ACTION_LEASE_TAB_RELEASE`, `PROFILE_TARGET_RESOLVE`, `PROFILE_RESOLUTION_UNRESOLVED`              |
 | Progress and terminal | `PROGRESS_PATCH_RECORD`, `ROW_EVENTS_APPLY`, `ACTIVE_TERMINAL_PROGRESS`, `ACTIVE_MISSING_TAB`, `ACTIVE_NON_PROFILE_LANDING`, `ACTIVE_PROFILE_REDIRECT_MISMATCH`, `BLOCKED_LIVE_TAB_TERMINAL_RECORD`, `BLOCKED_SWEEP_TERMINAL_RECORD`, `INITIAL_BLOCKED_STATE_RECORD`, `KEY_ONLY_TERMINATE` |
 | Retry and rollback    | `STALE_RETRY_ADVANCE`, `RETRY_FAILED_ITEMS`, `EXHAUSTED_ROLLBACK_RECOVER`, `EXHAUSTED_ROLLBACK_SETTLE`, `EXHAUSTED_ROLLBACK_TERMINATE`, `QUEUED_MATERIALIZATION_FAILURE`                                                                                                                   |
-| Stored work           | `CLEAR_STORED_WORK`, `CANCEL_STORED_WORK`, `CANCEL_STORED_WORK_ITEM`, `PAUSE_STORED_WORK`, `TERMINAL_COORDINATOR_ITEMS_SETTLE`                                                                                                                                                             |
+| Stored work           | `CLEAR_STORED_WORK`, `CANCEL_STORED_WORK`, `CANCEL_STORED_WORK_ITEM`, `REMOVE_FAILED_STORED_WORK_ITEM` (28 Oct), `PAUSE_STORED_WORK`, `TERMINAL_COORDINATOR_ITEMS_SETTLE`                                                                                                                                                             |
 | Pause                 | `PAUSE_STATE_SET`, `RUNS_PAUSED_SET`                                                                                                                                                                                                                                                       |
 | Profile state         | `PROFILE_STATE_CLEAR` (the clear-profile-nuke-state message, section 3.3)                                                                                                                                                                                                                  |
 | Space feed            | None. The space-feed events were removed with the space post maps (section 3.4).                                                                                                                                                                                                           |
@@ -534,6 +563,14 @@ Known and accepted: progress is lost on browser restart (session-only, section 2
 - Dashboard first load: a spinner ("Loading…", role status) shows until the first state arrives. A first load that fails or gets no answer shows "History load failed". Built; not checked in a browser.
 - Session mirror reduced to the queue (section 4.7), session restart (section 4.8, slice 5) and Recovery A (section 4.8, slice 4): built.
 
+### 6.1b Built or changed 28 Oct (not in the table above)
+
+- Failed-activation outcome: an exhausted activation that could not proceed is stored as `action-error` and shown as "Nuke error". `timeout` is kept only when the release reason names a timeout (`getExhaustedRolledBackQueuedTabTerminalOutcome`, `sw.js`). The sibling paths follow the same rule: `terminalizeExhaustedRolledBackQueuedCoordinatorItem` and the batch version, `terminalizeExhaustedRolledBackQueuedCoordinatorItems`. The active-transition-failed terminal path in `mutateCoordinatorQueuedTabOpenRollback` writes `action-error` directly. The rule applies to `fast-executor-preflight` and to the exhausted "runtime disappeared" case (its error text, `swRolledBackQueuedTabRetryClassification.js`), which are treated as activation failures. The owner has not confirmed that (planning.md, open item (a)).
+- Failed-row Remove control: built (section 3.5). Live check open.
+- Pause from the Nuking drop-down on the space and search pages: built (section 1.5). Live check open.
+- Blocked-live-tab probe and rollback: fixed on 27 Oct (section 3.1). Not confirmed live.
+- Page-side shared modules: built (section 1.5).
+
 ### 6.2 Planned work, with status
 
 Owner decisions of 25 Oct from `dead-ends-review-2026-10-24.md` ("Decided, next"), plus items from `planning.md` and the completed-log plan. Status is as of 27 Oct, checked against the code. Several items are now built; each row says which.
@@ -556,6 +593,10 @@ Owner decisions of 25 Oct from `dead-ends-review-2026-10-24.md` ("Decided, next"
 | 14  | Recovery A (torn-checkpoint recovery from the session copy). Built, disk first.                                                                                                                                                                                                                                                                                                                                | Slice 4 owner rule: the session copy is used only when the disk checkpoint is torn. Built. Recovery B is the same item (owner, 27 Oct).                                                    | Section 4.8.                                                                                            |
 | 15  | Session queue copy: queue shards and WAL records only, verified against the disk manifest's queue-area hash. Completed and runs out of session. Pages hydrate their own copy. | Agreed 26 Oct. Built for the worker restart (slice 5, 27 Oct; section 4.8). The page-level copy is not built and waits on item 16.                                                                                            | Section 4.7; section 11.3.                                                                              |
 | 16  | Worker-host failover: how a queue host that dies (tab discard, freeze, crash) is replaced, with fenced writes and a rehydrate from storage. | Gate, not built. Owner: must be designed before any queue work leaves the service worker. The service worker becomes a shim over browser APIs, not a shipper (27 Oct). Probes done (Chrome P1 to P5, Firefox F1 to F6); no design yet. | `experiments/worker-host/NOTE.md`; `experiments/worker-host/firefox/NOTE.md`.                             |
+| 17  | Page-side refactor of the space and search pages: shared modules for marks, collect, batch nuke, status text and the drop-down (refactor steps 1 to 6). | Done (28 Oct). Modules in section 1.5. Two constants moved to `tunables.js`. Not checked live. | `planning.md`, "Decisions of 28 Oct, with status". |
+| 18  | Retries and requeue for rolled-back rows, as a Dashboard control. | Closed 28 Oct (owner): not added, and not until a case merits it. Internal requeue of stale rows stays. | `docs/dead-ends.md`, Q7. |
+| 19  | Blocked-live-tab probe racing an in-flight activation (27 Oct incident). | Fixed 27 Oct: the probe waits for the pending transition, and the rollback does nothing to a settled row (section 3.1). Tests exist; not run in the 28 Oct pass. Not confirmed live. | `test/swSynthetic.test.js`. |
+| 20  | Remove control on a failed Current Work row. | Built 28 Oct (section 3.5). Live check open. | `planning.md`, "Live checks not yet run". |
 
 ## 7. Metrics and tests
 
@@ -567,6 +608,7 @@ Counters are written with `incrementQueueWakeupMetric` (`sw.js`). Names below we
 - Storage: `storageRemoveCalls`, `storageUpdate.lateWriteSuppressed`.
 - Reconcile and pump: `reconcile.requested`, `reconcile.deferredBeforeQuora`, `pump.noop.activeRuntimeFillSuppressed`.
 - Checkpoint, restart and mirror (27 Oct): `coordinatorAuthority.queueWal.queueOnlyCheckpointRefused`, `queueShardRecoveredFromSession`, `queueShardFromSessionRefused`, `hydrateFromMirror`, `hydrateMirrorIncomplete`, `hydrateMirrorFailed`, and the restart counters written by `recordRestartSourceMetrics` (`restartUsedSessionQueue`, `restartTailRecordsRead`, `restartTailRecordsApplied`, `restartQueueShardsReadFromDisk`, `restartSessionRefused`). Space import: `spaceRegistryImport.*`. Erase: `eraseBlockHistory.plainRemoveFailed`.
+- Active transition and failed rows (27-28 Oct, names from the code): `blockedLiveTab.waitedForActiveTransition` (the probe waited for a pending transition), `blockedLiveTab.waitedForActiveTransitionAtWrite` (it waited again at the write), and `blockedLiveTab.settledRow` (metric path of the re-read after the wait). The failed-row remove uses the metric paths in section 3.5. The rollback no-op, the outcome change and the drop-down add no counter.
 
 Tests (Node scripts; `npm test` runs an explicit sequence, and `test/` holds the files):
 
@@ -592,6 +634,12 @@ New test files must be listed in `npm test` and in the parallel runner (`tools/r
 - Clear All Stats and the outlier baseline: decided (owner, 27 Oct). The persistent baseline is cleared for now (`applyCoordinatorOutlierReset`); outlier detection problems are not being solved now. Section 5.4.
 - The runs display after Clear All Stats: not checked in full; no runs cutoff was found in the code.
 - The dashboard spinner and failed-load text, the removal of the soft-fail display, and the 1.5 space import: checked by reading the code only. Not checked in a browser or on a 1.5 profile (27 Oct).
+- 28 Oct: no tests, build or live browser run. Everything from 28 Oct was checked by reading code and by grep only.
+- 28 Oct: the owner's note names a "Terminal (handled)" tooltip, "Completed (handled)" after the change. No "(handled)" string is in the code. The card reads "Completed" (`terminalCount`), with the tooltip "Jobs that completed as succeeded, failed, skipped, or canceled."
+- 28 Oct: the note that the search page does not show Paused (planning.md, open item (f)) is not borne out by the code, which passes the paused flag to the search status too. Live check needed.
+- 28 Oct: the Preferences label is now "Background Window Policy". Code comments still say "Worker Window Focus" (in `createOwnedTabInQueuedWorkerActionSurface`, `sw.js`, and in `swprefs.js`). Stale comments only; the stored key is unchanged.
+- 28 Oct: `enqueueSpaceFeedStorageUpdate` is the storage update slot the failed-row remove and other Current Work mutations use. The name still says "space feed"; it is not renamed here.
+- 28 Oct owner decisions still open are listed in planning.md, "Owner decisions still open (28 Oct)", items (a) to (o). None is decided here.
 
 ## 9. Every stored key
 
@@ -844,3 +892,12 @@ These are new findings. Earlier text is not rewritten here; each item names the 
 5. Section 5.3 step 7 said only the marker is kept. The keep set now holds one more key (section 5.3).
 6. Section 2.5 had no row for the 1.5 import marker. Added.
 7. Decided: Clear All Stats resets the outlier baseline to zero (`applyCoordinatorOutlierReset`), for now (owner, 27 Oct). See section 5.4.
+
+### 12.2 Corrections and changes on 28 Oct
+
+1. Version: the working tree is at 1.6.1665 (`package.json` and both manifests, checked 29 Oct). The header of this file says so.
+2. HEAD: the owner's note gives `3ab637d` as the last commit. The log shows `3ab637d`, then the WIP snapshot `7abdfea` (working tree at 1.6.1662), then `d9a35c2` (a join commit with no content change). HEAD is `d9a35c2`. Nothing from 28 Oct is committed.
+3. Section 1.4 now lists `resume-paused-coordinator-nukes` and `remove-coordinator-failed-work-item`, which the route table lacked.
+4. Section 3.6 lists `REMOVE_FAILED_STORED_WORK_ITEM` under stored work.
+5. The failed-activation outcome is `action-error` where a timeout-named release reason is absent. Section 6.1b says which paths; the 27 Oct text in section 6.1a is unchanged.
+6. The blocked-live-tab probe's wait and the rollback no-op are in section 3.1. The 27 Oct text did not describe them.

@@ -26,7 +26,7 @@ Nine of the notes here are cited by name in code comments: `LEGACY_QUEUE_VIEW_RE
 
 ## Removed on 24 Oct
 
-Scratch, junk, probe copies and 32 retired CDP helpers were removed on the same day. The list and the restore instructions are in [removed-2026-10-24.md](removed-2026-10-24.md).
+Scratch, junk, probe copies and 32 retired CDP helpers were removed on the same day. The list and the restore instructions are in removed-2026-10-24.md.
 
 ## How the move was made
 

@@ -147,6 +147,20 @@ async function main() {
         assert.equal(noCap.drop.size, 0, 'no shard is dropped by the cap')
     })
 
+    await test('dropAll (History clear, 28 Oct) drops every shard that holds a row, whatever its age, and keeps no row', async () => {
+        const mixed = merge(shardRows(0, 3, NOW - DAY), shardRows(1, 3, NOW - 500 * DAY), shardRows(2, 2, NOW - 2 * DAY))
+        const all = completedShards.selectCompletedShardsToPrune(mixed, {nowMs: NOW, retentionMs: 0, maxRows: 0, dropAll: true})
+        assert.deepEqual([...all.drop].sort(), [0, 1, 2], 'every shard with a row is dropped')
+        assert.equal(all.keptRows, 0, 'no row is kept')
+        assert.deepEqual(
+            completedShards.completedDropShardIds(all.drop),
+            [0, 1, 2].map(id => wal.checkpointAreaShardId('completed', id)),
+            'one drop key per shard'
+        )
+        const none = completedShards.selectCompletedShardsToPrune({}, {nowMs: NOW, dropAll: true})
+        assert.equal(none.drop.size, 0, 'an empty log drops nothing')
+    })
+
     console.log('completed shards: all tests ran')
 }
 

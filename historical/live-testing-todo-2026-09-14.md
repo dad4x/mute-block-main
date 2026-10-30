@@ -128,7 +128,7 @@ time.
 The large-enqueue batching plan (chunking 500+ item enqueues into smaller
 sub-batches so a checkpoint-switch threshold crossing can't land mid-batch)
 is written up in
-[queue-wal-segmented-record-followup-2026-05-27.md](../queue-wal-segmented-record-followup-2026-05-27.md)'s
+queue-wal-segmented-record-followup-2026-05-27.md's
 "TODO (2026-09-13)" section -- still not implemented, still the leading
 theory for the corruption's root cause even though tonight's repro attempt
 came back clean.
@@ -149,7 +149,7 @@ before the session ended:
 - The display-order bug (section 1) was fixed via the `queueSequence`
   tiebreak in `buildCoordinatorQueueView` -- shipped 1.6.1253.
 - The large-enqueue chunking plan was implemented, tested, and shipped --
-  see [queue-wal-segmented-record-followup-2026-05-27.md](../queue-wal-segmented-record-followup-2026-05-27.md)'s
+  see queue-wal-segmented-record-followup-2026-05-27.md's
   "Implemented 2026-09-14" section for the full writeup.
 - The corruption class this doc was investigating recurred at least twice
   more after this doc was written, leading to the checkpoint-switch-always-immediate

@@ -47,7 +47,7 @@ function createQueueProgressBar(options = {}) {
     if(typeof options.onLogoClick === 'function') {
         const logoButton = document.createElement('button')
         logoButton.type = 'button'
-        setMuteBlockHelp(logoButton, options.logoTitle || 'Open dashboard')
+        setMuteBlockHelp(logoButton, options.logoTitle || 'Open the dashboard')
         logoButton.style.background = 'none'
         logoButton.style.border = 'none'
         logoButton.style.padding = '0'

@@ -142,6 +142,8 @@ async function runContentRefresh({reply = null, paused = false, pushedSummary = 
         getQueueBarDisplay,
         getOrCreateContentProgressBar: () => { calls.bar += 1; return bar },
         removeContentProgressBar: () => { calls.removed += 1 },
+        // The Nuking drop-down takes the stored pause flag from the same read (28 Oct); this harness only checks the bar.
+        setNukingQueuePaused: () => {},
         browser: {
             runtime: {
                 sendMessage: async () => {

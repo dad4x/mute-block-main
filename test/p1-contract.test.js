@@ -467,6 +467,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'claim-debug-run-autosave',
         'claim-tab-action',
         'cleanup-owned-nuke-status',
+        'clear-completed-history',
         'clear-coordinator-current-work',
         'clear-coordinator-events',
         'clear-coordinator-outliers',
@@ -509,6 +510,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'register-queued-worker-action-surface',
         'release-action-lease',
         'release-job-tab',
+        'remove-coordinator-failed-work-item',
         'request-action-lease',
         'reset-queue-wakeup-metrics',
         'resolve-queued-profile-target',
@@ -520,7 +522,7 @@ test('runtime action contract enumerates current accepted actions and rejects ol
         'set-dev-mode-enabled',
         'set-extension-settings',
         'set-hidden-run-ids',
-        'set-space-registry',
+        'set-space-record',
         'set-space-sort',
         'settle-terminal-coordinator-items',
         'sweep-owned-blocked-profile-tabs',
@@ -1635,6 +1637,34 @@ test('phase timing breaks the notice-select-open-load-inspect-action-detect-clos
     assert.match(reducer, /recordCoordinatorProfileActionPhaseDurations\(sampledItem, nowMs, \{incrementQueueWakeupMetric, recordQueueWakeupMetricMax\}\)/)
 })
 
+test('History clear: the confirmation says Delete all completed history, the worker call comes first, and Clear Current Work refers to no completed row', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const sw = readRepoFile('shared/js/sw.js')
+
+    assert.match(html, /id="clearHistoryButton"[^>]*title="Mute Block extension: Delete all completed history\./)
+
+    const clearHistoryBody = extractFunction(dashboard, 'async function clearHistory()')
+    assert.match(clearHistoryBody, /window\.confirm\('Delete all completed history\? This cannot be undone\.'\)/)
+    assert.doesNotMatch(clearHistoryBody, /Nothing is deleted/)
+    assert.match(clearHistoryBody, /action: 'clear-completed-history'/)
+    // The page empties its rows only after the worker reports success, and a failure keeps them.
+    const sentAt = clearHistoryBody.indexOf("action: 'clear-completed-history'")
+    const emptiedAt = clearHistoryBody.indexOf('historyRows = new Map()')
+    assert.ok(sentAt >= 0 && emptiedAt > sentAt, 'the worker is asked before the rows are emptied')
+    assert.match(clearHistoryBody, /if\(result\?\.error \|\| result\?\.saved !== true\) \{[\s\S]*return/)
+
+    assert.match(bootstrap, /request\.action === 'clear-completed-history'/)
+    assert.match(bootstrap, /'clear-completed-history',/)
+
+    // Clear Current Work: the page function and the worker's clear mutation refer to no completed row (comments and the removedCompletedRows
+    // name are set aside, so only code is checked).
+    const codeOnly = body => body.replace(/\/\/[^\n]*/g, '').replace(/removedCompletedRows/g, '')
+    assert.doesNotMatch(codeOnly(extractFunction(dashboard, 'async function clearCurrentWork()')), /completed/i)
+    assert.doesNotMatch(codeOnly(extractFunction(sw, 'async function mutateCoordinatorStoredWorkClear(operation = {})')), /completed/i)
+})
+
 test('current work clear button cancels and removes every row, and the epoch stat tiles moved into the Metrics panel', () => {
     const html = readRepoFile('shared/coordinator.html')
     const dashboard = readRepoFile('shared/js/coordinator.js')
@@ -1655,12 +1685,12 @@ test('current work clear button cancels and removes every row, and the epoch sta
     assert.match(handlers, /QUEUE_MACHINE_EVENT_TYPES\.CLEAR_STORED_WORK\]: async \(event = \{\}, operation = \{\}\) => \{[\s\S]*mutateCoordinatorStoredWorkClear/)
 
     const clearMutationBody = extractFunction(sw, 'async function mutateCoordinatorStoredWorkClear(operation = {})')
-    // Clear must remove rows outright (removedRows / removedCompletedRows),
-    // not archive them the way cancel does (completedRows) -- otherwise the
-    // cleared rows would just reappear via refreshCoordinatorQueueViewForDashboard's
-    // recent-completed-rows merge.
-    assert.match(clearMutationBody, /removedCompletedRows/)
+    // Clear must remove the queued rows outright (removedRows), not archive them the way cancel does (completedRows) -- otherwise the
+    // cleared rows would just reappear via refreshCoordinatorQueueViewForDashboard's recent-completed-rows merge. Owner, 28 Oct: Clear
+    // Current Work does not touch completed history, so the clear body refers to no completed row (see the History clear contract test).
+    assert.match(clearMutationBody, /removedRows/)
     assert.doesNotMatch(clearMutationBody, /\bcompletedRows,/)
+    assert.doesNotMatch(clearMutationBody.replace(/\/\/[^\n]*/g, '').replace(/removedCompletedRows/g, ''), /completed/i)
 
     // The 5 epoch-derived stat tiles (backed by queueWakeupMetrics, reset by
     // the existing "Reset metrics" button) now live inside the Metrics
@@ -2099,6 +2129,48 @@ test('dashboard queued rows expose per-item cancel before status', () => {
     assert.match(css, /\.row-cancel-button/)
 })
 
+test('a failed Current Work row shows only a Remove control with owner hover help, and the worker removes only that row', () => {
+    const dashboard = readRepoFile('shared/js/coordinator.js')
+    const sw = readRepoFile('shared/js/sw.js')
+    const bootstrap = readRepoFile('shared/js/swBootstrap.js')
+    const events = readRepoFile('shared/js/swQueueMachineEvents.js')
+    const handlers = readRepoFile('shared/js/swQueueMachineHandlers.js')
+    const helpSource = readRepoFile('shared/js/muteBlockHelp.js')
+    const cellBody = extractFunction(dashboard, 'function buildQueueCancelCell(item = {})')
+    const removeClientBody = extractFunction(dashboard, 'async function removeFailedCurrentWorkItem(item = {})')
+    const removeWrapperBody = extractFunction(sw, 'async function removeCoordinatorFailedWorkItem(request = {})')
+    const removeMutationBody = extractFunction(sw, 'async function mutateCoordinatorStoredWorkFailedItemRemove(operation = {})')
+
+    // Shown on failed rows only: the failed branch returns before the pending-row Cancel branch, which is unchanged.
+    assert.match(cellBody, /=== 'failed'\) \{[\s\S]*textContent = 'Remove'[\s\S]*return cell\s*\}\s*if\(!isPendingQueueStatus/)
+    assert.match(cellBody, /button\.textContent = 'Cancel'/)
+    assert.match(cellBody, /cancelCurrentWorkItem\(item\)/)
+    assert.match(cellBody, /setMuteBlockHelp\(removeButton, 'Remove this failed row from the queue\. Nothing is sent to Quora\.'\)/)
+    assert.match(cellBody, /removeFailedCurrentWorkItem\(item\)/)
+    assert.match(helpSource, /const MUTE_BLOCK_HELP_PREFIX = 'Mute Block extension: '/)
+
+    // No confirmation, and the client sends the new action, not the cancel action.
+    assert.match(removeClientBody, /!== 'failed'\) return/)
+    assert.match(removeClientBody, /action: 'remove-coordinator-failed-work-item'/)
+    assert.doesNotMatch(removeClientBody, /cancel-coordinator-current-work|confirm\(/)
+
+    // The worker removes one failed live row, guarded, through the door, and reads or writes no completed-work row.
+    assert.match(removeWrapperBody, /type: 'REMOVE_FAILED_STORED_WORK_ITEM'/)
+    assert.match(removeWrapperBody, /timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS/)
+    assert.match(removeMutationBody, /coordinatorQueueReader\.runsEvents\(\{[\s\S]*metricPath: 'currentWork\.failedRemove\.load'/)
+    assert.match(removeMutationBody, /!== 'failed'\) return \{removed: false, reason: 'not-failed-current-work-item'\}/)
+    assert.match(removeMutationBody, /coordinatorAuthority\.persistCoordinator\(\{[\s\S]*guardRemovedRows: true/)
+    assert.match(removeMutationBody, /operationKind: 'current-work-failed-item-remove'/)
+    assert.doesNotMatch(removeMutationBody, /completedRows|completedRecent|removedCompletedRows|applyCoordinatorRunsUpdate|loadCoordinatorState\(/)
+    assert.doesNotMatch(removeMutationBody, /status: 'canceled'|buildTerminalCoordinatorQueueItem|requeue/)
+
+    // Wiring: the event type, its handler, the bootstrap dispatch, and the authority gate that the new action must join.
+    assert.match(events, /REMOVE_FAILED_STORED_WORK_ITEM: 'REMOVE_FAILED_STORED_WORK_ITEM'/)
+    assert.match(handlers, /\[QUEUE_MACHINE_EVENT_TYPES\.REMOVE_FAILED_STORED_WORK_ITEM\]: async[\s\S]*mutateCoordinatorStoredWorkFailedItemRemove\(\{/)
+    assert.match(bootstrap, /request\.action === 'remove-coordinator-failed-work-item'\) \{\s*return removeCoordinatorFailedWorkItem\(request\)/)
+    assert.match(bootstrap, /'remove-coordinator-failed-work-item',/)
+})
+
 test('WAL derived mutation saves do not write raw queue mirrors', () => {
     const source = readRepoFile('shared/js/sw.js')
     // 2026-09-29: some formerly-direct saveCoordinatorState({runs, ...})
@@ -2244,7 +2316,7 @@ test('profile-search content uses scoped runtime state instead of full storage c
     assert.match(pendingRefreshBody, /refreshContentPageCoordinatorStateFromRuntime\(\{force: true\}\)/)
     assert.match(pendingRefreshBody, /syncProfileSearchControls\(\)/)
     assert.match(syncBody, /pendingSearchCount > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
-    assert.match(nukeBody, /queued > 0[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
+    assert.match(nukeBody, /outcome\.settled[\s\S]*scheduleProfileSearchPendingRefresh\(\)/)
     assert.match(spaceSyncBody, /const entries = timedSpaceQuery\('phase\.latestRead', \(\) => getLatestSpaceFeedEntries\(\)\)[\s\S]*scheduleSpaceFeedScopedStateRefresh\(entries\)[\s\S]*buildSpaceFeedRenderModel/)
     assert.match(spaceScopedRefreshBody, /refreshContentPageCoordinatorStateFromRuntime\(\{[\s\S]*force: true,[\s\S]*entries: scopedEntries/)
     assert.match(spaceScopedRefreshBody, /syncSpaceFeedNukeControls\(\)/)
@@ -3359,7 +3431,7 @@ test('profile search collector stages a bounded batch without queueing', () => {
     // The collect button is always offered while nukes are pending (owner, 21 Oct): it stays enabled under the pending branch.
     assert.match(syncBody, /pendingSearchCount > 0[\s\S]*buttons\.collect\.disabled = false/)
     assert.doesNotMatch(pendingCountBody, /filter\(isCurrentProfileSearchRuntimeCoordinatorItem\)/)
-    assert.match(queueableBody, /ignoreStaleCurrentProfileSearchPending: true/)
+    assert.doesNotMatch(queueableBody, /ignoreStaleCurrentProfileSearchPending/)
     assert.doesNotMatch(queueableBody, /isProfileSearchRowMatchForCurrentQuery/)
     assert.doesNotMatch(queueableBody, /allowSearchQueryMismatch/)
 })
@@ -5061,6 +5133,37 @@ test('choosing a collect count only sets it; the collect starts from the Collect
     assert.doesNotMatch(searchBody, /void collectMoreProfileSearchResults\(collectButton\)/)
 })
 
+test('every hover the extension adds starts with "Mute Block extension: " (28 Oct)', () => {
+    const prefix = 'Mute Block extension: '
+    // Not checked, and why: the toolbar icon tooltip set with browser.action.setTitle in shared/js/sw.js ("Mute Block: write-queue backlog
+    // detected"), because sw.js is outside this change; the tab titles set with document.title in shared/js/coordinator.js, which are not
+    // hovers; and the build copies under chrome/ and firefox/ (coordinator and preferences pages, js), which the build regenerates from shared/.
+    // The hand-kept popup pages chrome/popup.html and firefox/popup.html are checked. No title on the checked pages is excluded.
+    const htmlFiles = ['shared/coordinator.html', 'shared/preferences.html', 'chrome/popup.html', 'firefox/popup.html']
+    for (const file of htmlFiles) {
+        const html = readRepoFile(file)
+        assert.doesNotMatch(html, /Mute Block extension: Mute Block extension/, `${file} does not double the prefix`)
+        const titles = [...html.matchAll(/\stitle="([^"]*)"/g)].map(match => match[1])
+        assert.ok(titles.length > 0, `${file} has hover titles to check`)
+        for (const title of titles) assert.ok(title.startsWith(prefix), `${file} hover without the prefix: ${title}`)
+    }
+    // The title options (buildTitleCell, buildMetricCard) reach the page through the assignments checked here.
+    const jsFiles = ['shared/js/coordinator.js', 'shared/js/content.js', 'shared/js/queueProgressBar.js', 'shared/js/nukingControl.js', 'shared/js/preferences.js']
+    for (const file of jsFiles) {
+        const source = readRepoFile(file)
+        assert.doesNotMatch(source, /muteBlockHelpText\(\s*muteBlockHelpText|setMuteBlockHelp\([^,]+,\s*muteBlockHelpText\(/, `${file} does not add the prefix twice`)
+        // An assignment of a hover (x.title = ...). document.title is the tab title, not a hover.
+        const assignments = source.split('\n').map(line => line.trim()).filter(line => /\.title\s*=[^=]/.test(line) && !/document\.title\s*=/.test(line))
+        for (const line of assignments) {
+            const prefixed = /muteBlockHelpText\(/.test(line) ||
+                /^singleButton\.title = `\$\{singleButton\.title\}/.test(line) ||
+                /^(card|detailNode)\.title = fullTitle$/.test(line)
+            assert.ok(prefixed, `${file} sets a hover without the prefix: ${line}`)
+        }
+    }
+    assert.match(readRepoFile('shared/js/coordinator.js'), /const fullTitle = muteBlockHelpText\(options\.title \|\| detail\)/)
+})
+
 test('every extension button has hover help that starts with "Mute Block extension: "', () => {
     const pageHtml = readRepoFile('shared/coordinator.html') + readRepoFile('shared/preferences.html')
     const buttonTags = pageHtml.match(/<button\b[^>]*>/g) || []
@@ -5080,18 +5183,112 @@ test('space feed action buttons keep Nuke Em labels', () => {
     const source = readRepoFile('shared/js/content.js')
     const topBody = extractFunction(source, 'function syncSpaceFeedTopNukeButton(renderModel)')
     const postBody = extractFunction(source, 'function syncSpaceFeedPostButtons(renderModel)')
-    const globalWorkLabelBody = extractFunction(source, 'function formatSpaceFeedGlobalWorkLabel(count = 0)')
+    const statusBody = extractFunction(source, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)')
     const postWorkLabelBody = extractFunction(source, 'function formatSpaceFeedPostWorkLabel()')
 
     assert.match(topBody, /Nuke 'Em/)
     assert.match(postBody, /Nuke 'Em/)
-    assert.match(globalWorkLabelBody, /Nuking\.\.\./)
+    assert.match(statusBody, /formatToolbarNukingStatus\(\{/)
+    assert.match(readRepoFile('shared/js/candidateStatus.js'), /Nuking\.\.\./)
     assert.match(postWorkLabelBody, /Nuking this/)
     assert.doesNotMatch(topBody, /Queue visible/)
     assert.doesNotMatch(postBody, /Queue visible/)
-    assert.doesNotMatch(globalWorkLabelBody, /Space jobs/)
+    assert.doesNotMatch(statusBody, /Space jobs/)
     assert.doesNotMatch(postWorkLabelBody, /This post:/)
     assert.doesNotMatch(postWorkLabelBody, /left/)
+})
+
+test('the status and batch text on the space page and the search page come from the shared candidateStatus helper, and the old inline strings are gone from content.js', () => {
+    const content = readRepoFile('shared/js/content.js')
+    assert.match(content, /const \{NOTHING_QUEUED_LABEL, NUKED_LABEL, formatToolbarNukingStatus, formatProfileRowState\} = require\('\.\/candidateStatus'\)/)
+    // Each page builds its toolbar status with the one presence rule (formatToolbarNukingStatus), from its own facts (28 Oct).
+    // Both pages read the paused flag from the stored pause (nukingQueuePaused), not from the space model's ownerPaused.
+    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /formatToolbarNukingStatus\(\{\s*queueing: model\?\.queueingProfileCount \|\| 0,\s*left,\s*workActive: !!activeWork,\s*paused: nukingQueuePaused\s*\}\)/)
+    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /formatToolbarNukingStatus\(\{queueing, left: remaining, workActive: false, paused: nukingQueuePaused\}\)/)
+    // The search rows take their words from the shared row-state builder, and the batch driver takes its Queueing words from the shared builder.
+    assert.match(content, /setNukeButtonWorking\(button, formatProfileRowState\('queueing'\)\)/)
+    assert.match(content, /setNukeButtonWorking\(button, formatProfileRowState\('nuking'\)\)/)
+    assert.match(content, /setNukeButtonDone\(button, formatProfileRowState\('nuked'\)\)/)
+    assert.match(readRepoFile('shared/js/candidateNuke.js'), /require\('\.\/candidateStatus'\)/)
+    // The old inline copies are gone from content.js.
+    for (const oldText of [
+        '`Nuking... ${remaining} left`',
+        '`Queueing... ${queueing}`',
+        '`Paused · ${working}`',
+        '\'Paused\'',
+        '\'Nothing queued\'',
+        '\'Queueing...\'',
+        '\'Nuked\''
+    ]) {
+        assert.equal(content.includes(oldText), false, `content.js still has the inline ${oldText}`)
+    }
+})
+
+test('the Nuking drop-down is one shared builder for the space page and the search page, and no page builds its own pause menu (28 Oct)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const sharedControl = readRepoFile('shared/js/nukingControl.js')
+    // content.js takes the drop-down's words, items and messages from the shared module.
+    assert.match(content, /const \{nukingControlView, nukingStatusShowsControl\} = require\('\.\/nukingControl'\)/)
+    assert.match(extractFunction(content, 'function buildNukingControl()'), /nukingControlView\(nukingQueuePaused, left\)/)
+    // Both pages: the working Nuking button and the toolbar status get the drop-down through the same two placement helpers.
+    assert.match(extractFunction(content, 'function setNukeButtonWorking(button, label = formatProfileRowState(\'nuking\'))'), /syncNukingControlForButton\(button, label\)/)
+    assert.match(extractFunction(content, 'function syncNukingControlForButton(button, label)'), /nukingControlPageAllowed\(\)[\s\S]*attachNukingControl\(button, 0\)/)
+    assert.match(extractFunction(content, 'function nukingControlPageAllowed()'), /'space'[\s\S]*'profile-search'/)
+    // Changed 28 Oct: both toolbars place their status through syncNukingToolbarStatus, which attaches the drop-down through syncNukingStatusControl.
+    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0)'), /syncNukingStatusControl\(status, text, left\)/)
+    assert.match(extractFunction(content, 'function syncNukingStatusControl(status, text, left = 0)'), /nukingStatusShowsControl\(text\)/)
+    // The drop-down is built in one place, and its clicks stop there.
+    assert.equal(content.split("className = 'mb-ext_nuking-control'").length - 1, 1)
+    assert.match(extractFunction(content, 'function buildNukingControl()'), /event\.stopPropagation\(\)[\s\S]*event\.preventDefault\(\)/)
+    // The messages come from nukingControl.js only: content.js never names the worker actions, and the shared module names both.
+    assert.equal(content.includes('pause-coordinator-nukes'), false)
+    assert.equal(content.includes('resume-paused-coordinator-nukes'), false)
+    assert.match(sharedControl, /'pause-coordinator-nukes'/)
+    assert.match(sharedControl, /'resume-paused-coordinator-nukes'/)
+    // No other shared file builds the drop-down or its menu.
+    for (const other of ['shared/js/candidateNuke.js', 'shared/js/candidateStatus.js', 'shared/js/coordinator.js', 'shared/js/swBootstrap.js', 'shared/js/muteBlockHelp.js']) {
+        assert.equal(readRepoFile(other).includes('mb-ext_nuking-control'), false, `${other} builds no drop-down`)
+    }
+    // The paused flag comes from the stored pause, read where the progress bar already reads it.
+    assert.match(extractFunction(content, 'async function refreshContentProgressBar(pushedSummary = undefined)'), /const paused = !!stored\?\.\[COORDINATOR_PAUSED_KEY\][\s\S]*setNukingQueuePaused\(paused\)/)
+})
+
+test('the Current Work queue table has a Queue label directly above it, and the heading stays Current Work (28 Oct)', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const css = readRepoFile('shared/css/coordinator.css')
+    assert.match(html, /<h2[^>]*>Current Work<\/h2>/)
+    assert.match(html, /<div class="queue-table-label" id="queueTableLabel">Queue<\/div>\s*<div class="list" id="queueList"><\/div>/)
+    assert.match(css, /\.queue-table-label \{/)
+})
+
+test('both batch toolbars call one builder and use one class set and one style rule for the nuking status (28 Oct)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const css = readRepoFile('shared/css/content.css')
+    assert.match(content, /const NUKING_TOOLBAR_STATUS_CLASS = 'mb-ext_nuking-status'/)
+    // The one builder. Both toolbars call it, and it is the only place the status element is built.
+    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0)'), /status\.className = NUKING_TOOLBAR_STATUS_CLASS/)
+    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /syncNukingToolbarStatus\(host, host\.querySelector\('\.mb-ext_space-feed-nuke-btn'\), text, left\)/)
+    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /syncNukingToolbarStatus\(toolbar, toolbar\.querySelector\('\.mb-ext_profile-search-batch-btn'\), text, remaining\)/)
+    assert.equal(content.split("className = 'mb-ext_nuking-status'").length - 1, 0, 'no page sets its own class on the status')
+    assert.equal(content.includes('mb-ext_space-feed-nuking-status'), false)
+    assert.equal(content.includes('mb-ext_profile-search-nuking-status'), false)
+    // One style rule, and the old per-page selectors are gone.
+    assert.match(css, /\.mb-ext_nuking-status \{/)
+    assert.equal(css.includes('mb-ext_space-feed-nuking-status'), false)
+    assert.equal(css.includes('mb-ext_profile-search-nuking-status'), false)
+})
+
+test('E4 and the wording: the per-post button reads Nuking... with no count, and the end-of-results text is end of search results (28 Oct)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    assert.equal(content.includes('`Nuking ${aggregateCount}`'), false)
+    assert.match(content, /setNukeButtonWorking\(queueButton, formatProfileRowState\('nuking'\)\)/)
+    assert.match(content, /'end-of-results': 'End of search results'/)
+    assert.match(content, /'end-of-feed': 'End of search results'/)
+    assert.match(content, /end of search results`/)
+    assert.equal(content.includes("'End of results'"), false)
+    assert.equal(content.includes('· end of results`'), false)
+    // The internal reason string stays as it was: it is an identifier in the flight recorder.
+    assert.match(content, /'end-of-results' : 'stalled'/)
 })
 
 test('dashboard has reversible pause and explicit current work cancel', () => {
@@ -5985,7 +6182,7 @@ test('terminal settlement separates authority stamping from derived materializat
 
 test('space-feed enqueue does not create progress before durable enqueue', () => {
     const body = extractFunction(readRepoFile('shared/js/content.js'), 'async function nukeSpaceFeedEntries(button, entries)')
-    const enqueueIndex = body.indexOf('const result = await enqueueCoordinatorSpaceFeedItems(space, runId, workAssociations, preFilter, (queuedSoFar, mergedSoFar, totalItems)')
+    const enqueueIndex = body.indexOf('sendBatch: (work, onProgress) => enqueueCoordinatorSpaceFeedItems(space, runId, work, preFilter, onProgress)')
     const progressIndex = body.indexOf('recordProfileNukeProgressBatch(profileAssociations')
 
     assert.notEqual(enqueueIndex, -1)
@@ -6700,7 +6897,7 @@ test('history page has a filter box, a remove-duplicates checkbox and a count, b
 
     const source = readRepoFile('shared/js/coordinator.js')
     const renderBody = extractFunction(source, 'function renderHistoryRows()')
-    assert.match(renderBody, /countEl\.textContent = `Showing \$\{rows\.length\} of \$\{allRows\.length\}`/, 'the count shows filtered of total')
+    assert.match(renderBody, /countEl\.textContent = \[`Showing \$\{rows\.length\} of \$\{allRows\.length\}`, historyClearNotice\]/, 'the count shows filtered of total, then the clear notice')
     assert.match(source, /historyFilterText = `\$\{event\?\.target\?\.value \|\| ''\}`/)
     assert.match(source, /historyDedupeEnabled = !!event\?\.target\?\.checked/)
     assert.match(source, /addEventListener\('input', event => \{[\s\S]*renderHistoryRows\(\)/)
@@ -6872,6 +7069,8 @@ function loadSpaceCollectCountHarness(options) {
         location: state.location,
         resolveCurrentSpaceDescriptor: () => state.descriptor,
         syncSpaceFeedCollectButton: () => { state.syncs += 1 },
+        syncSpaceClassificationControls: () => {},
+        scheduleSpaceAssetNukeControls: () => {},
         safeSendRuntimeMessage: message => {
             sent.push(message)
             return Promise.resolve(null)
@@ -6887,6 +7086,7 @@ function loadSpaceCollectCountHarness(options) {
         extractFunction(source, 'function syncSpaceFeedCollectLimitFromRecord()'),
         extractFunction(source, 'function setSpaceFeedCollectLimit(value)'),
         extractFunction(source, 'async function persistSpaceFeedCollectCount(value)'),
+        extractFunction(source, 'function applySpaceRecordReply(key, reply)'),
         extractFunction(source, 'function getStoredSpaceRecord(space)')
     ].join('\n'), context)
     const run = code => vm.runInContext(code, context)
@@ -6922,12 +7122,13 @@ test('choosing a count on a categorised space writes it into that space record, 
     h.run('setSpaceFeedCollectLimit(500)')
     assert.equal(h.run('spaceFeedCollectLimit'), 500)
     assert.equal(h.sent.length, 1, 'one registry write')
-    assert.equal(h.sent[0].action, 'set-space-registry')
-    const stored = h.sent[0].spaceRegistry[SPACE_A_KEY]
-    assert.equal(stored.collectCount, 500)
-    assert.equal(stored.category, 'asset', 'the category is kept')
-    assert.equal(stored.url, SPACE_A_RECORD.url)
+    assert.equal(h.sent[0].action, 'set-space-record')
+    assert.equal(h.sent[0].key, SPACE_A_KEY)
+    assert.equal(h.sent[0].change.collectCount, 500)
+    assert.deepEqual(Object.keys(h.sent[0].change), ['collectCount'], 'the write carries the count only, so the stored category is not sent (29 Oct)')
+    assert.equal(typeof h.sent[0].at, 'number', 'the write carries the time the user acted')
     assert.equal(h.run(`spaceRegistry[${JSON.stringify(SPACE_A_KEY)}].collectCount`), 500, 'the page registry matches what was written')
+    assert.equal(h.run(`spaceRegistry[${JSON.stringify(SPACE_A_KEY)}].category`), 'asset', 'the category is kept on the page copy')
 
     h.run('setSpaceFeedCollectLimit(500)')
     assert.equal(h.sent.length, 1, 'a count equal to the stored one writes nothing')
@@ -6942,40 +7143,35 @@ test('choosing a count on an uncategorised space keeps it in memory and writes n
     assert.equal(h.run('Object.keys(spaceRegistry).length'), 0)
 })
 
-test('the registry write from the space page is the same message the category buttons send, with the count in the record (27 Oct)', () => {
+test('the space page writes one record per change, through the same message the category buttons and the collect count use (29 Oct)', () => {
     const source = readRepoFile('shared/js/content.js')
-    assert.match(extractFunction(source, 'async function persistSpaceFeedCollectCount(value)'), /safeSendRuntimeMessage\(\{action: 'set-space-registry', spaceRegistry\}, null\)/)
-    assert.match(extractFunction(source, 'async function setCurrentSpaceCategory(space, category)'), /safeSendRuntimeMessage\(\{action: 'set-space-registry', spaceRegistry\}, null\)/)
+    assert.match(extractFunction(source, 'async function persistSpaceFeedCollectCount(value)'), /action: 'set-space-record', key: recordKey, change: \{collectCount: value\}, at: Date\.now\(\)/)
+    assert.match(extractFunction(source, 'async function setCurrentSpaceCategory(space, category)'), /action: 'set-space-record',[\s\S]*?change: \{category, url: space\.url, slug: space\.slug, name: space\.name\}/)
+    assert.doesNotMatch(source, /set-space-registry/, 'no page sends the whole registry any more (29 Oct)')
     assert.doesNotMatch(extractFunction(source, 'function setSpaceFeedCollectLimit(value)'), /storage|browser\./)
 })
 
-test('setSpaceRegistryRequested keeps each record collect count, and stores an invalid one as the default (27 Oct)', () => {
+test('setSpaceRecordRequested changes one record, keeps its count on a category change, and refuses a stale change (29 Oct)', () => {
     const source = readRepoFile('shared/js/sw.js')
-    const body = extractFunction(source, 'async function setSpaceRegistryRequested(spaceRegistry = {})')
-    const {normalizeSpaceCollectCount} = require('../shared/js/spaceRegistry.js')
-    const written = []
-    const context = vm.createContext({
-        SPACE_REGISTRY_KEY: 'mbSpaceRegistry',
-        normalizeSpaceCollectCount,
-        metricStorageSet: payload => {
-            written.push(payload)
-            return Promise.resolve()
-        },
-        input: {
-            a: {key: 'a', category: 'asset', collectCount: 500},
-            b: {key: 'b', category: 'target', collectCount: 7},
-            c: {key: 'c', category: 'neutral'}
-        }
-    })
-    vm.runInContext(body, context)
-    // The write happens before the function's first await, so the stored map is read straight after the call.
-    vm.runInContext('setSpaceRegistryRequested(input)', context)
-    assert.equal(written.length, 1)
-    const stored = written[0].mbSpaceRegistry
-    assert.equal(stored.a.collectCount, 500)
-    assert.equal(stored.b.collectCount, 100, 'an invalid count is stored as the default')
-    assert.equal(stored.c.collectCount, undefined, 'a record with no count field is stored as it is')
-    assert.equal(stored.a.category, 'asset')
+    const body = extractFunction(source, 'async function setSpaceRecordRequested(input = {})')
+    assert.match(body, /runSpaceRegistryExclusive\(async \(\) => \{/, 'the read and the write are one task')
+    assert.match(body, /\{\.\.\.map, \[key\]: next\}/, 'only this record is written; the other records are kept from the stored map')
+
+    const {applySpaceRecordChange, normalizeSpaceCollectCount} = require('../shared/js/spaceRegistry.js')
+    const record = {key: 'a', url: 'https://www.quora.com/space/a', slug: 'a', name: 'A', category: 'asset', collectCount: 500, updatedAt: 1000}
+    const category = applySpaceRecordChange(record, 'a', {category: 'target', url: record.url, slug: 'a', name: 'A'}, 2000)
+    assert.equal(category.category, 'target')
+    assert.equal(category.collectCount, 500, 'a category change keeps the stored count')
+    assert.equal(category.updatedAt, 2000, 'the record is stamped with the time the user acted, not the time the worker applied it')
+
+    const counted = applySpaceRecordChange(record, 'a', {collectCount: 25}, 2000)
+    assert.equal(counted.collectCount, 25)
+    assert.equal(counted.category, 'asset', 'a count change keeps the stored category')
+
+    assert.equal(applySpaceRecordChange(record, 'a', {collectCount: 25}, 999), null, 'a change made before the last update is refused')
+    assert.equal(applySpaceRecordChange(null, 'a', {collectCount: 25}, 2000), null, 'a count with no record to change is refused')
+    assert.equal(applySpaceRecordChange(null, 'a', {category: 'asset'}, 2000), null, 'a category with no url is refused')
+    assert.equal(applySpaceRecordChange(record, 'a', {collectCount: 7}, 2000).collectCount, normalizeSpaceCollectCount(7), 'an invalid count is stored as the default')
 })
 
 test('the search batch counts its queueing down per chunk, as the space page does', () => {
@@ -6983,8 +7179,10 @@ test('the search batch counts its queueing down per chunk, as the space page doe
     assert.match(source, /async function enqueueCoordinatorProfileUrls\(options = \{\}\)[\s\S]*?onProgress = null/)
     assert.match(source, /\}, onProgress\)\n\}\n\nasync function nukeSpaceFeedEntries/)
     const searchBlock = source.slice(source.indexOf('async function nukeProfileSearchHrefsOnce'), source.indexOf('async function nukeProfileSearchHrefsOnce') + 4000)
-    assert.match(searchBlock, /onProgress: \(queuedSoFar, mergedSoFar, totalItems\) =>/)
-    assert.match(searchBlock, /Queueing\.\.\. \$\{remaining\} of \$\{totalItems\}/)
+    assert.match(searchBlock, /sendBatch: \(profileHrefs, onProgress\) => enqueueCoordinatorProfileUrls\(\{/)
+    assert.match(searchBlock, /onProgress\n\s*\}\)/)
+    // The progress label is written by the shared driver that both pages use (candidateNuke.js), not by the page.
+    assert.match(readRepoFile('shared/js/candidateNuke.js'), /setWorking\(formatQueueingLabel\(remaining, totalItems\)\)/)
     assert.doesNotMatch(searchBlock, /Queueing \$\{profileHrefs\.length\}\.\.\./)
 })
 
@@ -7044,7 +7242,7 @@ test('a new Collect run clears the Considered line before its first read, and th
 test('the cause line under Considered: the four recorded reasons and Page load are the labels, and a run with no pass shows Page load (27 Oct)', () => {
     const source = readRepoFile('shared/js/content.js')
     const css = readRepoFile('shared/css/content.css')
-    for (const label of ['Count reached', 'End of results', 'Stalled', 'Stopped', 'Page load']) {
+    for (const label of ['Count reached', 'End of search results', 'Stalled', 'Stopped', 'Page load']) {
         assert.ok(source.includes(`'${label}'`), `the ${label} label is in content.js`)
     }
     assert.match(source, /renderProfileSearchTextLine\(toolbar, 'mb-ext_profile-search-considered-cause', profileSearchConsideredCause, '\.mb-ext_profile-search-considered'\)/)
@@ -7052,8 +7250,8 @@ test('the cause line under Considered: the four recorded reasons and Page load a
     const causeBody = extractFunction(source, 'function formatProfileSearchCollectCause(reason, passes)')
     const cause = new vm.Script(`const PROFILE_SEARCH_CAUSE_LABELS = ${source.slice(source.indexOf('PROFILE_SEARCH_CAUSE_LABELS = ') + 'PROFILE_SEARCH_CAUSE_LABELS = '.length, source.indexOf('\n}', source.indexOf('PROFILE_SEARCH_CAUSE_LABELS = ')) + 2)}; ${causeBody}; formatProfileSearchCollectCause`).runInNewContext({})
     assert.equal(cause('captured', 3), 'Count reached')
-    assert.equal(cause('end-of-results', 3), 'End of results')
-    assert.equal(cause('end-of-feed', 3), 'End of results')
+    assert.equal(cause('end-of-results', 3), 'End of search results')
+    assert.equal(cause('end-of-feed', 3), 'End of search results')
     assert.equal(cause('stalled', 3), 'Stalled')
     assert.equal(cause('stopped', 3), 'Stopped')
     assert.equal(cause('stopped', 0), 'Page load', 'a run with no pass shows Page load, not the recorded reason')

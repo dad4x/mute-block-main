@@ -73,7 +73,8 @@ function completedAreaShardOf(area = '', key = '', entry = null) {
 
 // Chooses the shards to drop. Returns the shard ids to drop, and the row count that is left. `completed` is not changed.
 // `nowMs` is the time the retention is measured from, passed in so the rule is testable.
-function selectCompletedShardsToPrune(completed = {}, {nowMs = 0, retentionMs = 0, maxRows = 0} = {}) {
+// `dropAll` (the History page's Clear, 28 Oct) drops every shard that holds a row, and keeps no row: the same shard drop as the prune.
+function selectCompletedShardsToPrune(completed = {}, {nowMs = 0, retentionMs = 0, maxRows = 0, dropAll = false} = {}) {
     const rowsByShard = new Map()
     const newestByShard = new Map()
     for (const row of Object.values(completed || {})) {
@@ -81,6 +82,8 @@ function selectCompletedShardsToPrune(completed = {}, {nowMs = 0, retentionMs = 
         rowsByShard.set(id, (rowsByShard.get(id) || 0) + 1)
         newestByShard.set(id, Math.max(newestByShard.get(id) || 0, completionTimeOf(row)))
     }
+
+    if (dropAll === true) return {drop: new Set(rowsByShard.keys()), keptRows: 0}
 
     // A retention of 0 turns the age limit off, and a cap of 0 turns the row cap off.
     const drop = new Set()

@@ -144,8 +144,7 @@ async function openCoordinatorViewFromHere(action = 'open-coordinator') {
 const HISTORY_REFRESH_INTERVAL_MS = 2000
 const HISTORY_FULL_REFRESH_EVERY_TICKS = 30
 let historyRows = new Map()
-// When the page was last cleared. Clear deletes nothing from storage, so a query can return older rows again; rows completed at or
-// before this time stay off the page, and rows completed after it show.
+// When the page was last cleared. Rows completed at or before this time stay off the page, and rows completed after it show.
 let historyClearedAt = 0
 let historySince = 0
 // The History page's first load (owner, 27 Oct): 'pending' until the worker first answers, 'failed' if that first answer never came, then 'loaded'.
@@ -273,7 +272,7 @@ function renderHistoryRows() {
     // Remove duplicates is applied first, then the text filter; the count shows what is left, out of every row the page holds.
     const rows = sortHistoryRows(historyDedupeRows(allRows, historyDedupeEnabled).filter(row => historyRowMatchesFilter(row, historyFilterText)))
     const countEl = document.getElementById('historyCount')
-    if(countEl) countEl.textContent = `Showing ${rows.length} of ${allRows.length}`
+    if(countEl) countEl.textContent = [`Showing ${rows.length} of ${allRows.length}`, historyClearNotice].filter(Boolean).join('. ')
 
     const list = document.getElementById('historyList')
     if(!list) return
@@ -301,10 +300,30 @@ async function renderHistoryList() {
     await refreshHistoryRows(true)
 }
 
-// Clear empties the rows this page shows. It deletes nothing from storage, and the page keeps asking for rows that arrive later.
+// Clear deletes all the completed history (owner, 28 Oct). The worker removes the completed shards from storage first, and only when it
+// reports success does this page empty its rows. A failed clear keeps the rows and says why in the count line (historyClearNotice).
+// Queued and active rows are not touched; Clear Current Work and Clear All Stats are separate buttons.
+let historyClearNotice = ''
+
 async function clearHistory() {
-    if(!window.confirm('Clear the rows on this page? Nothing is deleted.')) return
+    if(!window.confirm('Delete all completed history? This cannot be undone.')) return
+    historyClearNotice = 'Clearing history...'
+    renderHistoryRows()
+
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'clear-completed-history'
+    }, {error: 'clear-history-timeout'}, CURRENT_WORK_MUTATION_TIMEOUT_MS).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+
+    if(result?.error || result?.saved !== true) {
+        historyClearNotice = `Clear failed (${result?.error || result?.reason || 'not saved'}). The rows are kept.`
+        renderHistoryRows()
+        return
+    }
+    // Rows completed at or before this time stay off the page, so a refresh that was already in flight cannot bring them back.
     historyClearedAt = Date.now()
+    historyClearNotice = ''
     historyRows = new Map()
     renderHistoryRows()
 }
@@ -324,7 +343,7 @@ function installDashboardBottomBar() {
         barId: 'dashboardBottomBar',
         iconSrc: 'icons/32.png',
         interactive: true,
-        logoTitle: 'Open dashboard',
+        logoTitle: 'Open the dashboard',
         onLogoClick: () => { void openDashboardFromBottomBar() }
     })
     // The bar sets its own display style, which would override the hidden attribute, so it is shown and hidden through that style.
@@ -1784,6 +1803,34 @@ async function cancelCurrentWorkItem(item = {}) {
     render()
 }
 
+// Removes one failed Current Work row from the queue (owner, 27 Oct). No confirmation, as for the queued-row cancel. Nothing is sent to
+// Quora, and the row is not requeued.
+async function removeFailedCurrentWorkItem(item = {}) {
+    if(`${item?.status || ''}`.trim() !== 'failed') return
+
+    const storageKey = `${item.storageKey || ''}`.trim()
+    retryFailedLastResult = {reason: 'removing-failed-current-work'}
+    render()
+
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'remove-coordinator-failed-work-item',
+        storageKey,
+        coordinatorKey: storageKey
+    }, {error: 'remove-failed-current-work-timeout'}, CURRENT_WORK_MUTATION_TIMEOUT_MS).catch(error => ({
+        error: error?.message || `${error || ''}`
+    }))
+
+    retryFailedLastResult = {
+        reason: result?.error
+            ? 'remove-failed-current-work-failed'
+            : result?.removed === true
+                ? 'removed-failed-current-work'
+                : `remove-failed-current-work-${result?.reason || 'not-removed'}`
+    }
+    await loadState()
+    render()
+}
+
 function getPendingCurrentWorkItems() {
     return getDisplayQueueItems().filter(item => isPendingQueueStatus(`${item?.status || ''}`.trim()))
 }
@@ -1829,8 +1876,8 @@ function syncCurrentWorkPauseControls(queueItems = []) {
 
     const clearButton = document.getElementById('clearCurrentWorkButton')
     if(clearButton) {
-        // Clear removes finished rows too (mutateCoordinatorStoredWorkClear in sw.js), so the view total decides, not the listed rows.
-        const totalCount = getQueueTotalCount(queueItems)
+        // Clear Current Work removes the listed queue rows only (owner, 28 Oct). Completed history is not in the queue, so it does not count.
+        const totalCount = queueItems.length
         clearButton.disabled = totalCount <= 0
         setMuteBlockHelp(clearButton, totalCount > 0
             ? `Cancel and remove all ${totalCount} Current Work row${totalCount === 1 ? '' : 's'}`
@@ -2641,7 +2688,7 @@ function renderWakeupMetrics(queueItems = []) {
             buildMetricCard('Completed -> release', formatPhaseAverage(phases.terminalToSlotRelease), formatPhaseDetail(phases.terminalToSlotRelease), {
                 // The alert fires at 1250 ms. TERMINAL_PROGRESS_SETTLEMENT_DEFER_MS (sw.js) is now 250 ms, so the old "half of 2.5 s" note no longer applies.
                 alert: getPhaseAverageMs(phases.terminalToSlotRelease) >= 1250,
-                title: 'Time from a row completing to its worker slot actually being released for reuse. Concerning if the average approaches 1.25 s (the alert threshold) -- slow releases here are the direct cause of a rising "secs / handoff" summary tile above.'
+                title: 'Time from a row completing to its working tab actually being released for reuse. Concerning if the average approaches 1.25 s (the alert threshold) -- slow releases here are the direct cause of a rising "secs / handoff" summary tile above.'
             }),
             buildMetricCard('Save timeouts', storageStarted ? formatPercent(storageTimedOut / storageStarted) : `${storageTimedOut}`, `${storageTimedOut} / ${storageStarted}; ${storageFallbackReturned} fallback returned`, {
                 alert: storageTimedOut > 0,
@@ -2796,7 +2843,7 @@ function buildMetricCard(label = '', value = '', detail = '', options = {}) {
     // a rough "this is concerning if..." threshold) than the one-line
     // detail text has room for. Falls back to detail alone when a card
     // hasn't been given one yet, same as before this option existed.
-    const fullTitle = options.title || detail
+    const fullTitle = muteBlockHelpText(options.title || detail)
     card.title = fullTitle
 
     const labelNode = document.createElement('div')
@@ -3235,7 +3282,7 @@ function buildQueueTimingCell(item = {}) {
                 : ''
 
     cell.append(primary, secondary)
-    cell.title = [
+    const cellHover = [
         queuedAt ? `queued ${formatDateTime(queuedAt)}` : '',
         activeAt ? `active ${formatDateTime(activeAt)}` : '',
         terminalAt ? `completed ${formatDateTime(terminalAt)}` : '',
@@ -3243,12 +3290,29 @@ function buildQueueTimingCell(item = {}) {
             ? `${terminalAt ? 'active to completed' : 'active elapsed'} ${formatDuration(activeDurationMs)}`
             : ''
     ].filter(Boolean).join('\n')
+    cell.title = cellHover ? muteBlockHelpText(cellHover) : ''
     return cell
 }
 
 function buildQueueCancelCell(item = {}) {
     const cell = document.createElement('div')
     cell.className = 'row-cancel-cell'
+
+    // A failed row has nothing to cancel. Its Remove control takes the row out of the queue (owner, 27 Oct); nothing is sent to Quora.
+    if(`${item?.status || ''}`.trim() === 'failed') {
+        const removeButton = document.createElement('button')
+        removeButton.type = 'button'
+        removeButton.className = 'clear-button row-action-button row-remove-button'
+        removeButton.textContent = 'Remove'
+        setMuteBlockHelp(removeButton, 'Remove this failed row from the queue. Nothing is sent to Quora.')
+        removeButton.addEventListener('click', event => {
+            event.preventDefault()
+            removeButton.disabled = true
+            void removeFailedCurrentWorkItem(item)
+        })
+        cell.appendChild(removeButton)
+        return cell
+    }
 
     if(!isPendingQueueStatus(`${item?.status || ''}`.trim())) return cell
 
@@ -3547,7 +3611,7 @@ function buildTitleCell(title, subtitle, options = {}) {
     subtitleNode.className = 'row-subtitle'
     titleNode.textContent = title || ''
     subtitleNode.textContent = subtitle || ''
-    if(options.title) cell.title = options.title
+    if(options.title) cell.title = muteBlockHelpText(options.title)
     cell.append(titleNode, subtitleNode)
     return cell
 }
@@ -3585,7 +3649,7 @@ function buildBadge(value, detail = '') {
     badge.className = `badge badge--${normalized.replace(/[^a-z0-9_-]/g, '-')}`
     badge.textContent = normalized
     const trimmedDetail = `${detail || ''}`.trim()
-    badge.title = trimmedDetail ? `${getStatusHelp(normalized)} ${trimmedDetail}` : getStatusHelp(normalized)
+    badge.title = muteBlockHelpText(trimmedDetail ? `${getStatusHelp(normalized)} ${trimmedDetail}` : getStatusHelp(normalized))
     return badge
 }
 
@@ -3593,14 +3657,14 @@ function buildTextCell(value, title = '') {
     const cell = document.createElement('div')
     cell.className = 'row-subtitle'
     cell.textContent = `${value || ''}`
-    if(title) cell.title = title
+    if(title) cell.title = muteBlockHelpText(title)
     return cell
 }
 
 function getStatusHelp(status = '') {
     const normalized = `${status || ''}`.trim()
     const descriptions = {
-        queued: 'Ready to run: waiting for a worker slot.',
+        queued: 'Ready to run: waiting for a working tab.',
         opening: 'Opening: a background tab is being created or navigated.',
         active: 'Active: a background tab is claimed and preparing the profile action.',
         acting: 'Acting: a mute, block, unblock, or unmute action is in progress.',
@@ -3627,7 +3691,7 @@ function getOutcomeHelp(outcome = '') {
         unblocked: 'Unblocked: the profile was unblocked and unmuted, also called a pardon.',
         'already-unblocked': 'Already unblocked: the profile was already in the desired unblocked state.',
         timeout: 'Timeout: retryable failure from a missing, stale, or over-deadline background tab.',
-        'action-error': 'Action error: retryable failure while finding or applying the profile action.',
+        'action-error': 'Nuke error: the profile action failed while finding or applying it.',
         'security-verification': 'Security verification: non-retryable Quora challenge or verification state.',
         'profile-unavailable': 'Profile unavailable: the target could not be acted on.',
         'unresolved-target': 'Unresolved target: source evidence did not identify one profile target.',
@@ -3839,7 +3903,7 @@ function renderHorizontalHistogram(container, data = []) {
         const label = document.createElement('div')
         label.className = 'histogram-label'
         label.textContent = item.label
-        label.title = item.label
+        label.title = muteBlockHelpText(item.label)
 
         // Bar container
         const barContainer = document.createElement('div')
@@ -3850,13 +3914,13 @@ function renderHorizontalHistogram(container, data = []) {
         bar.className = 'histogram-bar'
         const barWidth = (item.value / maxValue) * barMaxWidth
         bar.style.width = `${barWidth}px`
-        bar.title = item.detail
+        bar.title = muteBlockHelpText(item.detail)
 
         // Detail label
         const detail = document.createElement('div')
         detail.className = 'histogram-bar-label'
         detail.textContent = item.detail
-        detail.title = item.detail
+        detail.title = muteBlockHelpText(item.detail)
 
         barContainer.append(bar, detail)
         row.append(label, barContainer)

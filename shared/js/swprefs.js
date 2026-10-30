@@ -13,7 +13,7 @@ const {
 } = require('./storageKeys')
 const COORDINATOR_AUTO_START_ON_BROWSER_START_KEY = 'coordinatorAutoStartOnBrowserStart'
 const TARGET_QUEUED_TAB_CONCURRENCY_KEY = 'targetQueuedTabConcurrency'
-// What a queued action does to its tab in the worker window (Preferences page, "Worker Window Focus"):
+// What a queued action does to its tab in the worker window (Preferences page, the background window policy setting):
 //   focus    : bring the tab forward and take OS focus on each open (the behaviour before this preference).
 //   activate : bring the tab forward in its window; the window does not take OS focus.
 //   none     : the tab stays in the background, nothing is focused, and a request to bring it forward is refused.

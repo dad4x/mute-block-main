@@ -476,6 +476,15 @@ h2 {
     padding: 8px 14px;
 }
 
+/* The small "Queue" label directly above the Current Work queue table (owner, 28 Oct). The heading stays Current Work. */
+.queue-table-label {
+    flex: 0 0 auto;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--mb-grey-600);
+    padding: 6px 14px 2px;
+}
+
 .list {
     display: flex;
     flex-direction: column;

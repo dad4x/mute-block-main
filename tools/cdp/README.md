@@ -1,8 +1,7 @@
 # CDP Helper Dictionary
 
 Use these helpers for live Chrome validation against a Chrome instance running
-directly on this machine, over its local remote-debugging port. There is no
-tunnel and no separate regression host in this mode: source, browser, and
+directly on this machine, over its local remote-debugging port. Source, browser, and
 CDP endpoint are all local. Do not regenerate one-off versions in `/tmp`
 unless a probe is truly experimental and not worth preserving.
 

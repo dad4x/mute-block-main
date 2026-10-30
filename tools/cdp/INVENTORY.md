@@ -29,10 +29,6 @@ Status as of 24 Oct 2026. This is the list of helpers in this folder that stay f
 - `flight-recorder.js`: reads the recorder for the live checks.
 - `check-checkpoint-codec.js`: checks the checkpoint codec.
 
-## Kept: Windows launch and reset
-
-`start-windows-debug-browser.js`, `windows-chrome-profile.js`, `reload-windows-extension.js`, `reset-windows-tabs.js`. These run on the Windows machine this project is developed on.
-
 ## Kept: changed in October 2026
 
 `check-pause-button.js`, `clear-all-stats-dashboard.js`, `click-pause-current-work.js`, `click-resume-current-work.js`, `dashboard-metrics-read.js`, `dashboard-state.js`, `find-stale-profile-links-evidence.js`, `inspect-queue-item-live.js`, `progress-status-count.js`, `search-dashboard-text.js`, `target-breakdown.js`, `nine-dom-check.js`, `nine-position-check.js`, `nine-progress-check.js`.
@@ -64,4 +60,4 @@ These helpers mention storage keys that the 1.6 work has retired: `active-queue-
 - **UI drivers for flows of the earlier line:** `click-profile-mute-block-close.js`, `click-space-nuke.js`, `collect-profile-search.js`, `profile-controls.js`, `profile-page-state.js`, `profile-search-controls.js`.
 - **Reads a retired structure:** `queue-view-timing.js` (the queue view was retired).
 
-The root-level CDP copies (`mute-block-*.js` and one file with a mangled name) were also removed. They are recorded in [historical/removed-2026-10-24.md](../../historical/removed-2026-10-24.md).
+The root-level CDP copies (`mute-block-*.js` and one file with a mangled name) were also removed. They are recorded in historical/removed-2026-10-24.md.

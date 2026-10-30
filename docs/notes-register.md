@@ -10,19 +10,19 @@ Status as of 24 Oct 2026. Every note in this repository, with one status each. S
 - **DEAD-END**: tried and rejected, withdrawn, or declined. The reasons are in [dead-ends.md](dead-ends.md). Do not reopen without an owner decision.
 - **HISTORICAL**: superseded, finished, or a point-in-time record. Kept as a record, in [historical/](../historical/README.md) unless the table says otherwise. Do not implement from it.
 - **REFERENCE**: generated data, probe results, or reference documents. Dated. Check before relying on their numbers.
-- **SCRATCH**: not a note. Stray, junk, or build-leftover files that were kept on purpose. Junk removed on 24 Oct is listed in [removed-2026-10-24.md](../historical/removed-2026-10-24.md).
+- **SCRATCH**: not a note. Stray, junk, or build-leftover files that were kept on purpose. Junk removed on 24 Oct is listed in removed-2026-10-24.md.
 
 ## How this was applied
 
 - Notes that are not current carry a status banner at the top, added on 24 Oct. Current documents carry their own status line. Scratch files and generated data have no banner, so this table is their only record.
-- HISTORICAL notes were moved into [historical/](../historical/README.md) on 24 Oct, at the owner's request (decision 7 and Appendix A of [dead-ends-review-2026-10-24.md](../dead-ends-review-2026-10-24.md)). The nine that code comments cite were moved too, and those comments now name the new paths. What was removed on 24 Oct is listed in [removed-2026-10-24.md](../historical/removed-2026-10-24.md). Each row says where a note is.
+- HISTORICAL notes were moved into [historical/](../historical/README.md) on 24 Oct, at the owner's request (decision 7 and Appendix A of [dead-ends-review-2026-10-24.md](../dead-ends-review-2026-10-24.md)). The nine that code comments cite were moved too, and those comments now name the new paths. What was removed on 24 Oct is listed in removed-2026-10-24.md. Each row says where a note is.
 - Dates are the ones written in each note, or the file date where a note has none. Where a note's text and its file time differ by a day (for example the 25 Oct review, file time 24 Oct), both are kept as written.
 - No code, test, or tool file was changed by this pass.
 
 ## Folders that are not notes
 
 - `docs/`: design and inventory files. Listed in the table below.
-- `experiments/`: probe code, results, and short notes from 10 to 21 Oct. The Chrome profile copies (`.profile-*` folders) and the two probe `node_modules` folders were quarantined on 24 Oct; see [removed-2026-10-24.md](../historical/removed-2026-10-24.md).
+- `experiments/`: probe code, results, and short notes from 10 to 21 Oct. The Chrome profile copies (`.profile-*` folders) and the two probe `node_modules` folders were quarantined on 24 Oct; see removed-2026-10-24.md.
 - `tmp/`: keeps two tracked files. Its build logs and key dumps were quarantined on 24 Oct.
 - `chrome/`, `firefox/`, `chrome-dev/`, `manifests/`: build output and manifests. Do not hand-edit. Regenerate with the build.
 - `firefox.rebuild.*` and `firefox.stale.*` folders: build leftovers from April, quarantined on 24 Oct.
@@ -128,28 +128,19 @@ Status as of 24 Oct 2026. Every note in this repository, with one status each. S
 | [`historical/flight-recorder-plan-2026-06-04.md`](../historical/flight-recorder-plan-2026-06-04.md) | Plan for the flight recorder (4 Jun). Shipped; see events-to-flight-recorder-design.md and architecture.md. |
 | [`historical/storage-wal-overlay-design-2026-05-20.md`](../historical/storage-wal-overlay-design-2026-05-20.md) | WAL and checkpoint design (20 May, updated 27 May). The lineage of the current engine. Its plans are superseded by queue-storage-layering.md and the 25 Oct plan. |
 | [`historical/storage-authority-refactor-plan-for-review-2026-05-20.md`](../historical/storage-authority-refactor-plan-for-review-2026-05-20.md) | Storage authority plan (20 May). Superseded by docs/queue-storage-layering.md. |
-| [`historical/storage-observability-baseline-2026-05-22.md`](../historical/storage-observability-baseline-2026-05-22.md) | Storage observability baseline (22 May). Snapshot. |
 | [`historical/storage-refactor-start-checkpoint-2026-05-20.md`](../historical/storage-refactor-start-checkpoint-2026-05-20.md) | Start checkpoint of the storage refactor (20 May). Snapshot. |
-| [`historical/storage-row-event-baseline-1.6.487-2026-05-23.md`](../historical/storage-row-event-baseline-1.6.487-2026-05-23.md) | Row-event baseline at 1.6.487 (23 May). Snapshot. |
 | [`historical/queue-wal-segmented-record-followup-2026-05-27.md`](../historical/queue-wal-segmented-record-followup-2026-05-27.md) | Follow-up on segmented queue WAL records (27 May). Segmented storage has landed; see architecture.md. |
-| [`historical/wal-overnight-slice-notes-2026-05-25.md`](../historical/wal-overnight-slice-notes-2026-05-25.md) | Slice log for the WAL migration (25 to 28 May, 115 KB). Paused after slice 17 and superseded. |
 | [`historical/batching-metrics.md`](../historical/batching-metrics.md) | Storage batching metrics model (20 May). Superseded by the flight recorder and the storage counters. |
 | [`historical/reconciler-first-fallback-architecture-2026-05-20.md`](../historical/reconciler-first-fallback-architecture-2026-05-20.md) | Rationale and pivot criteria for the reconciler (20 May). architecture.md is the current statement. |
-| [`historical/coordinator-page-refactor-plan-2026-05-08.md`](../historical/coordinator-page-refactor-plan-2026-05-08.md) | Coordinator page split plan (8 May). Mostly absorbed by the 1.6 scheduler and dashboard work. |
 | [`historical/top-level-rethink-1.5.md`](../historical/top-level-rethink-1.5.md) | Design history of the durable job model (20 May). Provenance only. |
-| [`historical/top-level-rethink-1.5-execution-plan.md`](../historical/top-level-rethink-1.5-execution-plan.md) | Checklist for the 1.6 reset (24 May). Provenance only; current status must be rechecked. |
 | [`historical/refactor-1.5-plan.md`](../historical/refactor-1.5-plan.md) | Closed plan for the 1.5 series. |
 | [`historical/refactor-1.6-plan.md`](../historical/refactor-1.6-plan.md) | Prior canonical plan for the 1.6 line. Superseded by planning.md; kept as detail. |
-| [`historical/refactor-1.6-handoff-2026-05-14.md`](../historical/refactor-1.6-handoff-2026-05-14.md) | Handoff (14 May). Superseded for current priorities. |
-| [`historical/refactor-1.6-handoff-2026-05-17.md`](../historical/refactor-1.6-handoff-2026-05-17.md) | Handoff (17 May). Superseded for current priorities. |
 | [`historical/refactor-redux-precheck-2026-06-24.md`](../historical/refactor-redux-precheck-2026-06-24.md) | Precheck for the refactor branch (24 Jun, updated 1 Jul). Snapshot. |
-| [`historical/retrospective-history.md`](../historical/retrospective-history.md) | Narrative history of the 1.x to 1.6 series (24 May). Use for context only. |
 | [`historical/notes-1.5`](../historical/notes-1.5) | Notes from the 1.5 series (10 May). |
 | [`historical/todo-1.5`](../historical/todo-1.5) | Closed 1.5 to-do note. |
 | [`historical/review-1.md`](../historical/review-1.md) | Review note (30 Jun). |
 | [`historical/review-findings.md`](../historical/review-findings.md) | Review findings (24 May). Themes folded into the canonical notes. |
 | [`historical/review-findings-cruft-cleanup-2026-05-17.md`](../historical/review-findings-cruft-cleanup-2026-05-17.md) | Cruft review (17 May). Partly obsolete. |
-| [`historical/review-findings-resolver-queue-2026-05-17.md`](../historical/review-findings-resolver-queue-2026-05-17.md) | Resolver queue review (17 May). Resolved. |
 | [`historical/review-executor-tab-lifecycle-2026-05-19.md`](../historical/review-executor-tab-lifecycle-2026-05-19.md) | Executor and tab lifecycle review (19 May). Resolved. |
 | [`historical/review-pause-resume-cancel-ordering-2026-05-19.md`](../historical/review-pause-resume-cancel-ordering-2026-05-19.md) | Pause, resume and cancel ordering review (19 May). Resolved. |
 | [`historical/review-progress-vs-queue-authority-2026-05-19.md`](../historical/review-progress-vs-queue-authority-2026-05-19.md) | Progress against queue authority review (19 May). Progress now lives in session memory (decision 31). |
@@ -189,19 +180,14 @@ Status as of 24 Oct 2026. Every note in this repository, with one status each. S
 | [`historical/live-batch-fixes-worklist-2026-09-19.md`](../historical/live-batch-fixes-worklist-2026-09-19.md) | Worklist from the 19 Sep live batch. Fixes shipped in e2e5c65. Open items were not carried forward. |
 | [`historical/live-testing-todo-2026-09-08.md`](../historical/live-testing-todo-2026-09-08.md) | Live testing to-do list (8 Sep). Open items were not carried forward. |
 | [`historical/live-testing-todo-2026-09-14.md`](../historical/live-testing-todo-2026-09-14.md) | Live testing findings (14 Sep, overnight). Open items were not carried forward. |
-| [`historical/handoff-2026-09-08-decomposition-and-live-test.md`](../historical/handoff-2026-09-08-decomposition-and-live-test.md) | Handoff (8 Sep). Point in time. |
 | [`historical/handoff-2026-09-19.md`](../historical/handoff-2026-09-19.md) | Handoff (19 Sep). Live batch fixes; point in time. |
 | [`historical/handoff-2026-09-20.md`](../historical/handoff-2026-09-20.md) | Handoff (20 Sep). Queue-scan root cause; point in time. |
 | [`historical/handoff-2026-10-08.md`](../historical/handoff-2026-10-08.md) | Handoff (8 Oct). Handoff latency work, 1.6.1377 to 1.6.1383; point in time. |
 | [`historical/handoff-queue-validation-2026-06-17.md`](../historical/handoff-queue-validation-2026-06-17.md) | Handoff (17 Jun). Point in time. |
 | [`historical/handoff-queue-validation-2026-06-17-coordinator.md`](../historical/handoff-queue-validation-2026-06-17-coordinator.md) | Coordinator handoff (17 Jun). Point in time. |
 | [`historical/handoff-storage-authority-refactor-2026-05-20.md`](../historical/handoff-storage-authority-refactor-2026-05-20.md) | Handoff (20 May). Point in time. |
-| [`historical/other-codex-ordered-handoff-2026-05-19.md`](../historical/other-codex-ordered-handoff-2026-05-19.md) | Ordered handoff (19 May). Snapshot. |
 | [`historical/space-nuke-handoff-2026-05-03.md`](../historical/space-nuke-handoff-2026-05-03.md) | Handoff (3 May). Older 1.4 context. |
-| [`historical/space-nuke-bidi-debugging-2026-05-07.md`](../historical/space-nuke-bidi-debugging-2026-05-07.md) | Live debugging log for the Firefox BiDi setup (7 May, 104 KB). Setup context only. |
 | [`historical/codebase-familiarization-notes-2026-08-28.md`](../historical/codebase-familiarization-notes-2026-08-28.md) | Orientation notes on queue states (28 Aug). Partly out of date; use architecture.md. |
-| [`historical/claude-notes.md`](../historical/claude-notes.md) | Working notes (25 Aug). Live findings belong in the current notes, not in these. |
-| [`historical/consul-investigation-session.md`](../historical/consul-investigation-session.md) | Session transcript (24 Apr). Not part of the current line. |
 | [`historical/de-novo-product-and-harness-review-2026-06-12.md`](../historical/de-novo-product-and-harness-review-2026-06-12.md) | Product and harness review at 1.6.955 (12 Jun). A snapshot. |
 | [`historical/observations-554.txt`](../historical/observations-554.txt) | Dashboard observations (28 May). |
 | [`historical/progress.txt`](../historical/progress.txt) | Scratch notes (27 May). |
@@ -213,7 +199,6 @@ Status as of 24 Oct 2026. Every note in this repository, with one status each. S
 | [`historical/nits4.md`](../historical/nits4.md) | Short checklist (29 Sep). |
 | [`historical/nits5.md`](../historical/nits5.md) | Short checklist (30 Sep). |
 | [`historical/nits6.md`](../historical/nits6.md) | Short checklist (3 Oct). |
-| [`historical/removed-2026-10-24.md`](../historical/removed-2026-10-24.md) | Record of what was removed on 24 Oct, and how to restore it. |
 
 ## REFERENCE
 

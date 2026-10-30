@@ -20,7 +20,7 @@ Its purpose is to examine the practical management questions around using atprot
 - whether to run one labeler or several
 - how this interacts with Quora spaces we control ourselves
 
-This note is intentionally more operational than [quora-labeler-bridge.md](/scratch/dbrower/home/src/mute-block-main/quora-labeler-bridge.md).
+This note is intentionally more operational than quora-labeler-bridge.md.
 
 ## Current Status
 

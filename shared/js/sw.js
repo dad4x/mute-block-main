@@ -14,6 +14,7 @@ const {
     SPACE_SORT_CATEGORY,
     SPACE_SORT_KEY,
     SPACE_SORT_NAME,
+    applySpaceRecordChange,
     normalizeSpaceCategory,
     normalizeSpaceCollectCount
 } = require('./spaceRegistry')
@@ -148,8 +149,7 @@ const {
     findCheckpointManifestDisagreements,
     payloadHasCheckpointKeys,
     isSegmentedWalStorageMeta,
-    makePairedCheckpointStore,
-    recoverProjectedState
+    makePairedCheckpointStore
 } = require('./swstorage')
 const {
     createCoordinatorQueueWalStore
@@ -7935,7 +7935,7 @@ function setCoordinatorWriteQueueBacklogAlertBadge(active = false) {
     if(active) {
         void browser.action.setBadgeText({text: '!'}).catch(() => null)
         void browser.action.setBadgeBackgroundColor?.({color: '#dc2626'}).catch(() => null)
-        void browser.action.setTitle?.({title: 'Mute Block: write-queue backlog detected'}).catch(() => null)
+        void browser.action.setTitle?.({title: 'Mute Block extension: write-queue backlog detected'}).catch(() => null)
     }
     else {
         void browser.action.setBadgeText({text: ''}).catch(() => null)
@@ -8724,10 +8724,12 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         const checkpointedRecords = activeRecords.filter(record => (Number.parseInt(record?.seq, 10) || 0) <= maxAppliedSeq).length
         // Step 5: the completed log drops its expired shards and the oldest shards over the row cap. The checkpoint is written without
         // them, and the resident map drops them only once that save succeeds.
+        // dropAllCompleted (History page Clear, 28 Oct): every completed shard goes, through the same drop as the prune.
         const completedPrune = selectCompletedShardsToPrune(recoveredCompleted, {
             nowMs: Date.now(),
             retentionMs: recentHistoryRetentionDays * 24 * 60 * 60 * 1000,
-            maxRows: recentHistoryMaxEntries
+            maxRows: recentHistoryMaxEntries,
+            dropAll: options.dropAllCompleted === true
         })
         const completedForCheckpoint = completedPrune.drop.size ? withoutShards(recoveredCompleted, completedPrune.drop) : recoveredCompleted
         const prepared = queueWalStore.prepareCheckpointWrite(storedWal, {queue: recoveredQueue, completed: completedForCheckpoint, runs: recoveredRuns}, {
@@ -8846,6 +8848,7 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
         // Step 5: the save went through, so the pruned shards leave the resident completed map too.
         const completedDropped = coordinatorAuthority.dropResidentCompletedShards(completedPrune.drop)
         if(completedDropped) incrementQueueWakeupMetric('coordinatorAuthority.queueWal.completedShardsPruned', completedPrune.drop.size)
+        const completedRowsDropped = Number.parseInt(completedDropped, 10) || 0
         cacheCoordinatorQueueWalResidentStoreFromWrite(activated.store, checkpointWal?.payload || {})
         // The authority's resident WAL is the store just written (the observer no longer absorbs a door write's WAL, so the
         // switch installs its own result). The queue does not change in a switch; the completed map changes only by the prune above.
@@ -8894,7 +8897,9 @@ async function performCoordinatorQueueWalCheckpointSwitch(options = {}) {
             walStore: activated.store,
             physicalCleanup,
             preSegmentedWalMonolithCleanup,
-            queue: recoveredQueue
+            queue: recoveredQueue,
+            completedRowsDropped,
+            completedShardsDropped: completedPrune.drop.size
         }
 }
 
@@ -8918,6 +8923,43 @@ async function switchCoordinatorAuthorityQueueWalCheckpoint(options = {}) {
         timeoutMs: options.timeoutMs,
         failureValue: failureResult
     })
+}
+
+// The History page's Clear (owner, 28 Oct): removes every completed row from the completed-work log and from storage. It does not touch
+// the queue (queued and active rows stay) and it does not touch Clear Current Work or Clear All Stats. The removal is the checkpoint
+// switch with dropAllCompleted: each completed shard's key is deleted once in the new checkpoint slot (the same drop the age and cap
+// prune use), no kept shard is rewritten, and the switch saves under the apply tail, so it is durable and fenced like the other writes.
+// The resident map drops the rows only after that save succeeds. A failed save returns saved: false and leaves the log as it was.
+async function clearCoordinatorCompletedHistory() {
+    let switched = null
+    try {
+        // A null map is a log that is not loaded: it is not an empty log, so it is not reported as cleared.
+        const residentCompleted = await getResidentCompletedForReads()
+        if(!residentCompleted) return {cleared: 0, shardsRemoved: 0, saved: false, reason: 'completed-log-unavailable'}
+        if(!Object.keys(residentCompleted).length) return {cleared: 0, shardsRemoved: 0, saved: true, reason: 'no-completed-history'}
+        switched = await switchCoordinatorAuthorityQueueWalCheckpoint({
+            switchReason: 'completed-history-clear',
+            dropAllCompleted: true
+        })
+    }
+    catch(error) {
+        recordCoordinatorDiagnosticEvent('clear-completed-history-failed', error?.message || 'Clear completed history failed')
+        return {
+            cleared: 0,
+            shardsRemoved: 0,
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
+        }
+    }
+    if(switched?.checkpointSwitched !== true) {
+        return {cleared: 0, shardsRemoved: 0, saved: false, reason: switched?.reason || 'persistence-failed'}
+    }
+    const cleared = Number.parseInt(switched.completedRowsDropped, 10) || 0
+    const shardsRemoved = Number.parseInt(switched.completedShardsDropped, 10) || 0
+    incrementQueueWakeupMetric('completedHistory.cleared', cleared)
+    incrementQueueWakeupMetric('completedHistory.shardsRemoved', shardsRemoved)
+    return {cleared, shardsRemoved, saved: true, reason: 'cleared'}
 }
 
 function isCoordinatorAuthorityRejectResult(value = null) {
@@ -12990,6 +13032,13 @@ async function reprimeFreshQueuedTabActionsForCurrentPendingItems(allPendingItem
     }
 }
 
+// 27 Oct: an exhausted rolled-back row whose tab could not be opened or made active is a failed activation, recorded as
+// 'action-error' (the dashboard's "Nuke error"), not 'timeout'. Only a release reason that names a timeout (for example
+// queued-tab-final-open-decision-timeout) is a real timeout and keeps 'timeout'.
+function getExhaustedRolledBackQueuedTabTerminalOutcome(item = null) {
+    return /timeout/i.test(`${item?.actionLeaseReleaseReason || ''}`) ? 'timeout' : 'action-error'
+}
+
 async function terminalizeExhaustedRolledBackQueuedCoordinatorItem(itemKey = '', expectedItem = null, options = {}) {
     if(!itemKey || !isExhaustedRolledBackQueuedTabRetry(expectedItem)) {
         return {changed: false, reason: 'not-exhausted-rolled-back-row'}
@@ -13007,7 +13056,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItem(itemKey = '',
     const reason = options.reason || 'active-transition-retry-budget-exhausted'
     const terminalizeCurrentItem = currentItem => buildTerminalCoordinatorQueueItem(currentItem, {
         status: 'failed',
-        outcome: 'timeout',
+        outcome: getExhaustedRolledBackQueuedTabTerminalOutcome(currentItem),
         error: getExhaustedRolledBackQueuedTabTerminalError(currentItem),
         reason,
         eventType: JOB_EVENT_TAB_REMOVED,
@@ -13508,7 +13557,7 @@ async function terminalizeExhaustedRolledBackQueuedCoordinatorItems(items = [], 
 
             const nextRow = buildTerminalCoordinatorQueueItem(currentItem, {
                 status: 'failed',
-                outcome: 'timeout',
+                outcome: getExhaustedRolledBackQueuedTabTerminalOutcome(currentItem),
                 error: getExhaustedRolledBackQueuedTabTerminalError(currentItem),
                 reason,
                 eventType: JOB_EVENT_TAB_REMOVED,
@@ -15128,6 +15177,7 @@ const coordinatorQueueMachineEventDispatcher = createQueueMachineEventDispatcher
             mutateCoordinatorStaleRetryQueuedTabAdvance,
             mutateCoordinatorStoredWorkCancel,
             mutateCoordinatorStoredWorkClear,
+            mutateCoordinatorStoredWorkFailedItemRemove,
             mutateCoordinatorStoredWorkItemCancel,
             mutateCoordinatorStoredWorkPause,
             requeueDurableActiveCoordinatorItemWithoutActor,
@@ -21772,18 +21822,33 @@ async function setSpaceSortRequested(sortBy = '') {
     return {ok: true}
 }
 
-async function setSpaceRegistryRequested(spaceRegistry = {}) {
-    const input = spaceRegistry && typeof spaceRegistry === 'object' ? spaceRegistry : {}
-    // A record that carries a collect count stores one the dropdown offers; any other value is stored as the default. A record with no
-    // count field is stored as it is.
-    const value = {}
-    for(const [key, record] of Object.entries(input)) {
-        value[key] = record && typeof record === 'object' && 'collectCount' in record
-            ? {...record, collectCount: normalizeSpaceCollectCount(record.collectCount)}
-            : record
-    }
-    await metricStorageSet({[SPACE_REGISTRY_KEY]: value}, {metricPath: 'pageRequest.setSpaceRegistry'})
-    return {ok: true}
+// The space registry is read, changed and written by one task at a time (29 Oct). A write reads the stored map, changes one record and
+// writes the map back, so a second write, or the 1.5 import, must not read between another write's read and its write.
+let spaceRegistryWriteTail = Promise.resolve()
+function runSpaceRegistryExclusive(task) {
+    const run = spaceRegistryWriteTail.then(task)
+    spaceRegistryWriteTail = run.catch(() => null)
+    return run
+}
+
+// One write to one space's record (29 Oct). The page sends the change (a category with the space's identity fields, or a collect count)
+// and the time the user acted. It is applied to the record as the worker stores it now, so a page's older copy of the registry is never
+// written back over other spaces or over a newer category. A stale change is refused; the reply carries the stored record, so the page
+// can show it.
+async function setSpaceRecordRequested(input = {}) {
+    const key = typeof input?.key === 'string' ? input.key.trim() : ''
+    if(!key) return {ok: false, refused: true, record: null}
+
+    return runSpaceRegistryExclusive(async () => {
+        const stored = (await metricStorageGet({[SPACE_REGISTRY_KEY]: {}}, {metricPath: 'pageRequest.setSpaceRecord.read'}))?.[SPACE_REGISTRY_KEY]
+        const map = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}
+        const existing = map[key] || null
+        const next = applySpaceRecordChange(existing, key, input.change, input.at)
+        if(!next) return {ok: true, refused: true, record: existing}
+
+        await metricStorageSet({[SPACE_REGISTRY_KEY]: {...map, [key]: next}}, {metricPath: 'pageRequest.setSpaceRecord'})
+        return {ok: true, refused: false, record: next}
+    })
 }
 
 async function setDevModeEnabledRequested(enabled = false) {
@@ -22260,6 +22325,21 @@ async function cancelCoordinatorCurrentWorkItem(request = {}) {
         ownedTabIds,
         reason: storedResult.reason || ''
     }
+}
+
+// Remove button on a failed Current Work row (owner, 27 Oct). It runs as a queue-machine event, so it takes the same storage update slot
+// and the same door as the other Current Work mutations (mutateCoordinatorStoredWorkFailedItemRemove).
+async function removeCoordinatorFailedWorkItem(request = {}) {
+    const rowKey = `${request.storageKey || request.coordinatorKey || ''}`.trim()
+    return enqueueSpaceFeedStorageUpdate(() => {
+        return applyCoordinatorQueueMachineEvent({
+            type: 'REMOVE_FAILED_STORED_WORK_ITEM',
+            rowKey
+        })
+    }, {
+        reason: 'remove-failed-stored-work-item',
+        timeoutMs: QUEUE_CRITICAL_STORAGE_UPDATE_TIMEOUT_MS
+    })
 }
 
 async function terminalizeCoordinatorKeyOnlyItem(coordinatorKey = '', options = {}) {
@@ -25227,6 +25307,54 @@ async function mutateCoordinatorStoredWorkPause(operation = {}) {
     }
 }
 
+// Remove of one failed Current Work row (owner, 27 Oct). Only the row named by rowKey is taken out of the live queue, and only when its
+// status is failed. No terminal record is written and nothing is sent to Quora. The completed-work log is not read or changed, and no
+// other row is touched. The same guarded door write as the queued-row cancel (persistCoordinatorQueueChange, guardRemovedRows): it
+// applies only while the row is still the failed row this read saw.
+async function mutateCoordinatorStoredWorkFailedItemRemove(operation = {}) {
+    const snapshotReason = normalizeSnapshotWriteReason(operation.reason || 'ordinaryMutation')
+    if(snapshotReason !== 'ordinaryMutation') return {removed: false, reason: 'invalid-remove-reason'}
+
+    const rowKey = `${operation.rowKey || ''}`.trim()
+    if(!rowKey) return {removed: false, reason: 'missing-current-work-item-identity'}
+    const state = await coordinatorQueueReader.runsEvents({
+        metricPath: 'currentWork.failedRemove.load'
+    })
+    const item = normalizeCoordinatorAuthorityStateInput(state).queue?.[rowKey]
+    if(!item || typeof item !== 'object') return {removed: false, reason: 'row-not-found'}
+    if(`${item.status || ''}`.trim() !== 'failed') return {removed: false, reason: 'not-failed-current-work-item'}
+
+    let persistence = null
+    try {
+        persistence = await coordinatorAuthority.persistCoordinator({
+            results: [],
+            removedRows: [{
+                rowKey,
+                previousRow: item,
+                operationKind: 'current-work-failed-item-remove',
+                reason: 'ordinaryMutation'
+            }],
+            guardRemovedRows: true
+        }, {
+            operationKind: 'current-work-failed-item-remove',
+            reason: 'ordinaryMutation',
+            metricPath: 'currentWork.failedRemove.save.queueWal',
+            projectionMetricPath: 'currentWork.failedRemove.save.projection'
+        })
+    }
+    catch(error) {
+        persistence = {
+            saved: false,
+            reason: 'persistence-error',
+            error: `${error?.message || error || 'storage error'}`.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
+        }
+    }
+    if(persistence?.saved !== true) {
+        return {removed: false, reason: persistence?.reason || 'persistence-failed', persistence}
+    }
+    return {removed: true, rowKey, reason: 'removed-failed-current-work-item'}
+}
+
 // Cancel of a queued row (owner, 17 Oct). The row is removed from the live queue and is never saved as a terminal row, so it does
 // not reach the completed log, and a normal requeue can queue the profile again. The removal is guarded: it applies only while the
 // row is still the one this cancel read (persistCoordinatorQueueChange, guardRemovedRows).
@@ -25702,20 +25830,10 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
     }
     const {clearedUrls, clearedWorkKeys, ownedTabIds, removedRows} = plan
 
-    const completedRows = await coordinatorQueueReader.completedRecent(Number.MAX_SAFE_INTEGER)
+    // Owner, 28 Oct: Clear Current Work clears the queue only. Completed history is never removed here; the History page clears it.
     const removedCompletedRows = []
-    for(const completedRow of completedRows) {
-        const rowKey = completedRow?.coordinatorKey || completedRow?.dedupeKey || completedRow?.targetProfileHref || ''
-        if(!rowKey) continue
-        removedCompletedRows.push({
-            rowKey,
-            previousRow: completedRow,
-            operationKind: 'stored-work-clear',
-            reason: 'ordinaryMutation'
-        })
-    }
 
-    if(!removedRows.length && !removedCompletedRows.length) {
+    if(!removedRows.length) {
         return {clearedUrls: [], clearedWorkKeys: [], ownedTabIds: []}
     }
 
@@ -25758,7 +25876,7 @@ async function mutateCoordinatorStoredWorkClear(operation = {}) {
         runId: '',
         itemId: '',
         type: 'cleared',
-        message: `Cleared ${totalCleared} current-work row${totalCleared === 1 ? '' : 's'} and ${completedRows.length} completed row${completedRows.length === 1 ? '' : 's'}`,
+        message: `Cleared ${totalCleared} current-work row${totalCleared === 1 ? '' : 's'}`,
         at: now,
         details: {
             reason,
@@ -27980,7 +28098,7 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         }
         // 'focus' asks for OS focus on the worker window at each open, so the action tab's timers are not throttled and the window
         // stays in front until the queue run ends. It can take focus from the user while they type (the 2026-10-08 trade-off). 'activate'
-        // and 'none' leave OS focus alone (the Worker Window Focus preference).
+        // and 'none' leave OS focus alone (the background window policy preference).
         if(workerWindowForegroundMode ==='focus') {
             await browser.windows.update(surface.windowId, {focused: true}).catch(() => null)
             recordFlightRecorderEvent({
@@ -35504,8 +35622,10 @@ registerServiceWorkerListeners({
         beginCoordinatorProfileAction,
         cancelCoordinatorCurrentWork,
         cancelCoordinatorCurrentWorkItem,
+        removeCoordinatorFailedWorkItem,
         cancelQueuedOwnerActions,
         claimPendingTabAction,
+        clearCoordinatorCompletedHistory,
         clearCoordinatorCurrentWork,
         clearCoordinatorReconcileAlarms,
         clearCoordinatorTerminalStats,
@@ -35574,7 +35694,7 @@ registerServiceWorkerListeners({
         setCoordinatorRetryFailedEnabledRequested,
         setExtensionSettingsRequested,
         setSpaceSortRequested,
-        setSpaceRegistryRequested,
+        setSpaceRecordRequested,
         setDevModeEnabledRequested,
         setHiddenRunIdsRequested,
         claimDebugRunAutosaveRequested,
@@ -35698,53 +35818,57 @@ async function importSpaceRegistryFromVersion15() {
     }
     // An absent or non-object 1.5 value holds no spaces: the marker is still written, and nothing else is.
     const legacyEntries = legacy && typeof legacy === 'object' && !Array.isArray(legacy) ? legacy : {}
-    let current = {}
-    const imported = {}
-    let kept = 0
-    let invalid = 0
-    if(Object.keys(legacyEntries).length) {
+    // The read of the 1.6 registry and the write of the merged map are one task (29 Oct). A space record written in between would
+    // otherwise be read as absent and then written back as the 1.5 value.
+    return runSpaceRegistryExclusive(async () => {
+        let current = {}
+        const imported = {}
+        let kept = 0
+        let invalid = 0
+        if(Object.keys(legacyEntries).length) {
+            try {
+                const value = (await metricStorageGet({[SPACE_REGISTRY_KEY]: {}}, {metricPath: 'spaceRegistryImport.read'}))?.[SPACE_REGISTRY_KEY]
+                current = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+            }
+            catch {
+                incrementQueueWakeupMetric('spaceRegistryImport.readFailed')
+                return {outcome: 'registry-read-failed'}
+            }
+            for(const [spaceKey, record] of Object.entries(legacyEntries)) {
+                const valid = Boolean(spaceKey) && Boolean(record) && typeof record === 'object' &&
+                    Boolean(normalizeSpaceCategory(record.category)) && typeof record.url === 'string'
+                if(!valid) {
+                    invalid += 1
+                    continue
+                }
+                if(Object.prototype.hasOwnProperty.call(current, spaceKey)) {
+                    kept += 1
+                    continue
+                }
+                imported[spaceKey] = record
+            }
+        }
+        const importedCount = Object.keys(imported).length
+        const markerValue = {version: 1, completedAt: Date.now(), imported: importedCount, kept, invalid}
+        const payload = importedCount
+            ? {[SPACE_REGISTRY_KEY]: {...current, ...imported}, [SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
+            : {[SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
         try {
-            const value = (await metricStorageGet({[SPACE_REGISTRY_KEY]: {}}, {metricPath: 'spaceRegistryImport.read'}))?.[SPACE_REGISTRY_KEY]
-            current = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+            const written = await metricStorageSet(payload, {metricPath: 'spaceRegistryImport.write', phase: 'spaceRegistryImport.write'})
+            if(written === false) {
+                incrementQueueWakeupMetric('spaceRegistryImport.writeRefused')
+                return {outcome: 'write-refused'}
+            }
         }
         catch {
-            incrementQueueWakeupMetric('spaceRegistryImport.readFailed')
-            return {outcome: 'registry-read-failed'}
+            incrementQueueWakeupMetric('spaceRegistryImport.writeFailed')
+            return {outcome: 'write-failed'}
         }
-        for(const [spaceKey, record] of Object.entries(legacyEntries)) {
-            const valid = Boolean(spaceKey) && Boolean(record) && typeof record === 'object' &&
-                Boolean(normalizeSpaceCategory(record.category)) && typeof record.url === 'string'
-            if(!valid) {
-                invalid += 1
-                continue
-            }
-            if(Object.prototype.hasOwnProperty.call(current, spaceKey)) {
-                kept += 1
-                continue
-            }
-            imported[spaceKey] = record
-        }
-    }
-    const importedCount = Object.keys(imported).length
-    const markerValue = {version: 1, completedAt: Date.now(), imported: importedCount, kept, invalid}
-    const payload = importedCount
-        ? {[SPACE_REGISTRY_KEY]: {...current, ...imported}, [SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
-        : {[SPACE_REGISTRY_IMPORT_MARKER_KEY]: markerValue}
-    try {
-        const written = await metricStorageSet(payload, {metricPath: 'spaceRegistryImport.write', phase: 'spaceRegistryImport.write'})
-        if(written === false) {
-            incrementQueueWakeupMetric('spaceRegistryImport.writeRefused')
-            return {outcome: 'write-refused'}
-        }
-    }
-    catch {
-        incrementQueueWakeupMetric('spaceRegistryImport.writeFailed')
-        return {outcome: 'write-failed'}
-    }
-    if(importedCount) incrementQueueWakeupMetric('spaceRegistryImport.spacesImported', importedCount)
-    if(kept) incrementQueueWakeupMetric('spaceRegistryImport.spacesKeptFrom16', kept)
-    if(invalid) incrementQueueWakeupMetric('spaceRegistryImport.invalidSkipped', invalid)
-    return {outcome: 'imported', imported: importedCount, kept, invalid}
+        if(importedCount) incrementQueueWakeupMetric('spaceRegistryImport.spacesImported', importedCount)
+        if(kept) incrementQueueWakeupMetric('spaceRegistryImport.spacesKeptFrom16', kept)
+        if(invalid) incrementQueueWakeupMetric('spaceRegistryImport.invalidSkipped', invalid)
+        return {outcome: 'imported', imported: importedCount, kept, invalid}
+    })
 }
 
 // The build that last ran against this storage (STORAGE_BUILD_KEY, the running manifest version, e.g. 1.6.1626). It is read at

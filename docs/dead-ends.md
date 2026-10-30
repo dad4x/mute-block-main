@@ -1,6 +1,6 @@
 # Dead ends
 
-Status as of 27 Oct 2026 (checked against the code). Approaches that were tried, proposed, rejected, withdrawn, or declined.
+Status as of 28 Oct 2026 (checked against the code; the 28 Oct changes are in "Status changes (28 Oct)" at the end). Approaches that were tried, proposed, rejected, withdrawn, or declined.
 Each entry says what was decided, the reason the notes give, where the detail is, and what would
 have to change before it is reopened. Read this before proposing a change in one of these areas.
 Reopening an entry needs an owner decision. Other notes: [notes-register.md](notes-register.md).
@@ -37,6 +37,7 @@ Entries marked **parked** are not dead. The owner has set them aside until a sta
 | Q4 | Escalating wait for the menu | Replaced by a fixed 500 ms. | The measured value is recorded in the tunables file. | [dead-ends-review-2026-10-24.md](../dead-ends-review-2026-10-24.md), "Clean" | A measurement shows the fixed wait fails. |
 | Q5 | Promise-hop helpers that wrap awaited calls inside the worker | Not used. Measure waits with a time check around the await. | An extra promise hop changes the order of concurrent work. | [coder-instructions-2026-10-20.md](../coder-instructions-2026-10-20.md) section 1; [architecture.md](../architecture.md), "Module Extraction" | Not applicable. |
 | Q6 | Freeze and lock patterns for defensive isolation | Not used. Narrow the contract and fix the call sites instead. | Owner preference, recorded as a rule in the coder instructions. | [coder-instructions-2026-10-20.md](../coder-instructions-2026-10-20.md) section 1 | The owner asks for it. |
+| Q7 | A Dashboard retry or requeue control for rolled-back rows (28 Oct) | Closed. Not added. Internal requeue of stale or lost rows stays. | Owner (28 Oct): not until a case merits it. The 1.6 build already removed requeue of failed and cancelled rows (25 Oct, `0209f52`). | [planning.md](../planning.md), "Decisions of 28 Oct, with status" | A case the owner judges merits a control. |
 
 ## Identity and resolution
 
@@ -77,3 +78,12 @@ Entries marked **parked** are not dead. The owner has set them aside until a sta
 - **Soft-fail**: the retry line and the header counts are removed from the Dashboard (built). The stored flag, the worker side and the toggle plumbing stay.
 - **Shadow removal (S8)**: built (commit `8e146cc`).
 - **Keep mechanism (S12)**: the keep set holds one key, the 1.5 import marker (27 Oct).
+
+## Status changes (28 Oct)
+
+- **Retry and requeue for rolled-back rows (Q7)**: closed. Not added, and not until a case merits it (owner, 28 Oct).
+- **Rollback of a failed active transition (27 Oct incident)**: a rollback does nothing when the row is missing or already terminal, so it cannot write a failure over a row another path has settled. The blocked-live-tab probe waits for the row's pending transition before it decides (architecture.md 3.1). Built; not confirmed live. Tests exist in `test/swSynthetic.test.js`; not run in the 28 Oct pass.
+- **Outcome of an exhausted activation**: `action-error` for the single-row terminalizer, the batch terminalizer and the active-transition-failed path, unless the release reason names a timeout (architecture.md 6.1b). Built. The owner has not confirmed that `fast-executor-preflight` and the "runtime disappeared" case count as activation failures (planning.md, open item (a)).
+- **Nuke error label**: the Dashboard shows "Nuke error" for `action-error` (it was "timeout"). The stored value is unchanged. Built. The label is recorded as accepted (planning.md, open item (d)).
+- **Remove control on a failed row**: built. It removes one failed row through the guarded save. Nothing is sent to Quora, and the row is not requeued. Queued and active rows keep Cancel. Live check open.
+- **Page-side refactor (space and search pages)**: steps 1 to 6 done; shared modules listed in architecture.md section 1.5. No approach is rejected by this; it is recorded so the duplicated code is not reintroduced on one page only.

@@ -2,7 +2,7 @@
 
 > **Status: HISTORICAL** (24 Oct 2026). Deeper review of sw.js and content.js (14 Oct, review 2). Owner accepted the suggestions; status per item is in the reply. Kept as a record. Do not implement from it. planning.md is the front door. Register: [notes register](../docs/notes-register.md).
 
-Companion to [14-oct-review-1.md](../14-oct-review-1.md), which covered the WAL, storage, and dashboard change set. This review covers the rest of the two largest files, slice by slice. Branch `review/shared-wip`, HEAD `abc2307`, with the uncommitted working-tree changes. No repo files were changed. No build, version bump, or commit was made.
+Companion to 14-oct-review-1.md, which covered the WAL, storage, and dashboard change set. This review covers the rest of the two largest files, slice by slice. Branch `review/shared-wip`, HEAD `abc2307`, with the uncommitted working-tree changes. No repo files were changed. No build, version bump, or commit was made.
 
 Method: each slice was read against the named defect patterns in [entropy-reduction-action-plan-2026-09-09.md](../entropy-reduction-action-plan-2026-09-09.md) (patterns 0 to 8), plus concurrency, error handling, and unbounded growth. Findings are tagged with a confidence level: **confirmed** (verified in code or by a test run), **likely** (read in code, not reproduced), or **question** (needs the owner's intent).
 

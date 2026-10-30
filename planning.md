@@ -1,6 +1,6 @@
 # Mute Block Planning
 
-Date: 2026-10-27. Rewritten on this date and checked against the code the same day; it replaces the 24 Oct version, which is in git history. This is the front door for the 1.6 line. Read this file first, then follow the links for detail. The status of every note is in [docs/notes-register.md](docs/notes-register.md). Dead ends are in [docs/dead-ends.md](docs/dead-ends.md).
+Date: 2026-10-27, updated 2026-10-28 (sections "Decisions of 28 Oct, with status", "Owner decisions still open (28 Oct)" and "Live checks not yet run"). Rewritten on 27 Oct and checked against the code the same day; it replaces the 24 Oct version, which is in git history. This is the front door for the 1.6 line. Read this file first, then follow the links for detail. The status of every note is in [docs/notes-register.md](docs/notes-register.md). Dead ends are in [docs/dead-ends.md](docs/dead-ends.md).
 
 > **Written as if the 1.6 closeout is complete.** Here, closeout means the items in the [closeout handoff](handoff-closeout-2026-10-25.md) are finished, or moved to "Carried into 2.0" below. Nothing under "Carried into 2.0" is treated as verified. Nothing in this rewrite is committed, tagged, built or run live, and the closing commit and tag do not exist yet.
 
@@ -44,7 +44,8 @@ When notes disagree, the higher item wins:
 
 ## Where 1.6 stands
 
-- **Closing build:** 1.6.1655 (`package.json` and both manifests, 27 Oct). **Last commit on this branch:** `8e146cc` (v1.6.1636, 26 Oct). Everything after it is uncommitted: 84 entries in `git status` (27 Oct). No zip and no tag exists for 1.6.1651 to 1.6.1655 (dev build only); the closing commit awaits the owner's approval.
+- **Release candidate:** 1.6.1665 (`package.json` and both manifests, 29 Oct). A 1.6 release candidate is being committed, with no zips and no tag yet. Live checks are still to be done by the owner in a browser before the candidate is accepted (see "Live checks not yet run").
+- **Git state:** the last tagged build is `v1.6.1636` on `8e146cc` (26 Oct). The last commit before the WIP snapshot is `3ab637d` (27 Oct); HEAD is `d9a35c2`, a join commit with no content change. The working tree at 1.6.1665 is uncommitted until the owner accepts the release candidate. The candidate is committed without a tag. No zip and no tag exists for 1.6.1651 to 1.6.1665 (dev builds only).
 - **Release:** Chrome dev build only. No store zips. Firefox is parked, and its store listing stays on 1.2.
 - **Storage:** every key carries the prefix `v1.6.`. The queue is a write-ahead log with arrival-order shards. Completed work is Recent History (90 days, 10,000 entries). Runs are capped at 700 by count only, with no age rule (26 Oct). The checkpoint has one manifest and one shard set per area (built 27 Oct).
 - **Upgrade from 1.5.** The 1.6 layout never reads the unprefixed 1.5 keys, except once for the space classification registry, which transfers on upgrade (built 27 Oct). Everything else (queue, History, progress, remembered posts) starts clean. The old data stays in storage, unread, and Erase does not touch it. The public notes must say so.
@@ -117,7 +118,7 @@ Baseline: `../mute-block-1.5`, branch `refactor/1.5`, snapshot `5188a99` (10 May
 - Recent History is the completed-work log. Manual blocks and unblocks are completed rows.
 - Limits: 90 days and 10,000 rows, whichever is hit first. Pruning is by shard, so the limits are approximate.
 - Run cap: 700, hard-coded.
-- Clear on History empties the page only. Storage is untouched. A disk clear would be destructive and is not built.
+- Clear on History empties the page only. Storage is untouched. A disk clear would be destructive and is not built. (Superseded 29 Oct: History Clear removes the completed shards; see "Owner decisions of 28 and 29 Oct".)
 - Only officially completed rows count toward the Terminal and Avg item time cards, since the last Clear All Stats.
 - Identity is case-exact, with the trailing tokens above removed.
 - Old unprefixed data is not migrated, except the space classification registry (decided 27 Oct; built).
@@ -146,6 +147,17 @@ Baseline: `../mute-block-1.5`, branch `refactor/1.5`, snapshot `5188a99` (10 May
 - Session quota: the 26 Oct measurement stays. The session mirror reduction is built (see "Where 1.6 stands").
 - Outlier recording limit at 3.5 s: built (earlier, commit `5a41c99`).
 
+## Decisions of 28 Oct, with status
+
+- Page-side refactor: steps 1 to 6 done. The space page and the search page share the enqueue marks, the collect controls and loop, the batch driver, the status text and the Nuking drop-down (architecture.md section 1.5). Built; not committed; not checked live.
+- Failed activation: an exhausted activation that could not proceed is recorded as `action-error` and shown as "Nuke error". `timeout` is kept only when the release reason names a timeout. Applied to the three exhausted paths. Two judgement calls are open: item (a) below.
+- Blocked-live-tab race (27 Oct incident): the probe waits for the row's pending transition before it decides, and a rollback on a row another path has already settled does nothing. Built 27 Oct; not confirmed live.
+- Remove control on a failed row: built. It removes one failed row through the guarded save. Nothing is sent to Quora, and the row is not requeued. Queued and active rows keep Cancel.
+- Pause from the Nuking drop-down on the space and search pages: built. It sends the Dashboard's own pause or resume message, so it pauses the whole queue.
+- Retries and requeue for rolled-back rows: **closed**. Not added (owner, 28 Oct), and not until a case merits it. Dead-end Q7 in docs/dead-ends.md.
+- Working tab concurrency: `targetQueuedTabConcurrency` keeps its default of 4 (minimum 1). No Preferences control was found. Not decided.
+- Wording (28 Oct): "Completed" replaces "Terminal" on the Dashboard card. The alert tooltip is 1.25 s, not 2.5 s. Preferences reads "Background Window Policy" (was "Background Window Focus"). "Skipped" is an error result. "Pardon" names unblock and unmute in flight-recorder text.
+
 ## Carried into 2.0
 
 These were open at closeout. Each stays open until it is checked.
@@ -164,23 +176,55 @@ These were open at closeout. Each stays open until it is checked.
 - Session storage against the 10 MB quota. Measured once by hand on 26 Oct, before the mirror was reduced to the queue (27 Oct). Nothing in the code checks it.
 - Reload the dev extension and confirm the version it shows.
 - Dashboard first-load spinner and the "History load failed" text, and the 1.5 space import on a copy of a 1.5 profile (27 Oct: not checked in a browser or on a profile).
+- 28 Oct additions, to check on the dev build (no live run was made on 28 Oct):
+  - The Nuking drop-down: its clipping and z-index on the space and search pages.
+  - The "Considered" line and the cause line under Collect N More on the search page.
+  - The "Stop collecting" label during a collect run on both pages.
+  - The collect end: the "space-collect-end" and "search-collect-end" flight recorder events, with their reasons.
+  - A failed row's Remove control on the Dashboard, and the row leaving the list.
+  - The rollback outcome: a failed activation shows "Nuke error", not "Timeout".
+  - The drop-down pause from the page: it pauses the whole queue and the Dashboard shows it.
 
-**Owner decisions still open**
+**Owner decisions of 28 and 29 Oct**
+
+Items (a) to (o) were added on 28 Oct from the page-side work. The owner decided the items below on 28 and 29 Oct. Each line gives the decision and the code check made on 29 Oct (grep only; no live run).
+
+Closed (decided):
+- (a) and (d) Nuke errors: accepted. An exhausted activation is stored as `action-error` and shown as "Nuke error" (status text in `shared/js/coordinator.js`). The stored value stays `action-error`. Built.
+- (b) Queue heading: "Current Work" is kept, with a "Queue" label over the table (`queueTableLabel` in `shared/coordinator.html`). Built.
+- (c) Search end wording: "end of search results" (`shared/js/content.js`, the collect notice). Built.
+- (e) Toolbar and drop-down repeat the same words ("Nuking..." and "Nuking Paused"): kept. Built as is.
+- (f) Status gaps, fixed: the space status shows its Queueing part; the search status shows Paused; 0 left hides the Nuking part (`formatToolbarNukingStatus`, `shared/js/candidateStatus.js`); the per-post row reads "Nuking..." (`formatProfileRowState`). Built in code; not checked live. Note: the comment above `formatToolbarNukingStatus` still says the Nuking part shows at 0 left while work is active. The code does not do that. The comment is stale, not the decision.
+- (g) Queue pause is "Pause Current Work" (`shared/js/coordinator.js`, and `shared/js/nukingControl.js`). Built.
+- (h) Collect hover wording: one shared sentence, decided. Not yet built. The code still has two sentences, one for posts and one for profiles (`shared/js/content.js`, around lines 7135 and 12185; the stop text at 7034 and 11878). Build when the owner says so.
+- (i) "Done" is the finished state (`NUKED_LABEL` in `shared/js/candidateStatus.js`). Built.
+- (j) "Open the dashboard" (`shared/js/coordinator.js` and `shared/coordinator.html`). Built.
+- (k) The "Mute Block extension: " prefix on all hover text: applied by the shared helper `setMuteBlockHelp` (`shared/js/muteBlockHelp.js`). Built.
+- Clear Current Work removes queue rows only, and is disabled when no queue rows exist (`clearButton.disabled` in `shared/js/coordinator.js`). Built.
+- History Clear removes the completed shards, through `clearCoordinatorCompletedHistory` with `dropAllCompleted` (`shared/js/sw.js`; route `clear-completed-history` in `shared/js/swBootstrap.js`). Built in code; not checked live.
+
+Still open (decided later, or not decided):
+- (l) Time-bound wording. "This metrics epoch" appears in Dashboard hover text; "for now" appears in one Dashboard hover text (coordinator.js, the progress-record counter); "this week's" appears only in a code comment. Not decided.
+- (m) The "Will nuke:" label. Plain explanation: the hover text of a Nuke 'Em button (the post, space feed, search batch, or modal buttons) lists the profiles it will queue, under the heading "Will nuke:". The button only queues the work, so the word "nuke" may be wrong here. The current text is "Will nuke:" (`buildNukeTargetsHelpText`, `shared/js/content.js`). Owner to decide the wording.
+- (n) The dev-mode panel list. Plain explanation: the Dashboard's dev-mode switch shows nine panels that are hidden until it is on: the metrics journal, the run list, the flight recorder, scan cost, write sizes, event counts, phase timing, outliers, and the event list. The switch's hover text names only six of them (internal metrics, scan cost, event counts, outliers, runs, and events). Also hidden until dev mode is on: the "Run for" and "Until" controls. The owner needs this explained before deciding which panels are listed and in what order.
+- (o) The live checks under "Live checks not yet run" (28 Oct additions). Not run. Owner's browser checks.
+
+Older open items:
 - Should the worker close tabs it skips as "profile unavailable"? Four such tabs were left open on the dev profile.
 - Should manual blocks count in the Dashboard's blocked totals? Decide whether to exclude manual rows.
 - Keep or remove the nuked-post memory written on space confirms. Nothing reads it for History now.
 - `sourcePostKey`: remove it, or keep it as a copy. Queue rows already carry the post key in their evidence.
 - Resolver-only posts (no profile yet) get no nuked judgement.
-- Search pages do not use the in-memory marks, so pending state there has a gap. Space pages hold marks for a batch.
+- Search pages do not use the in-memory marks, so pending state there has a gap. Space pages hold marks for a batch. **Closed 28 Oct (code check, not live):** the search page keeps its own enqueue marks in the shared store (`createEnqueueMarkStore`, architecture.md 1.5), and its batch runs through the shared driver.
 - Closed 27 Oct: the queue-only checkpoint path drops the completed map, so it is refused when disk holds completed or runs shards (`queueOnlyCheckpointRefused`). Audit item 1 (`audit-2026-10-27.md`).
-- Whether to build a disk clear for the completed log. It would be destructive, and it is not built.
-- Worker Window Focus setting (owner, 27 Oct: Activate works; Focus is intrusive; None needs a manual raise). Options: (a) remove the setting from Preferences, hardcode Activate, and keep Focus and None only behind dev mode (recommended; a code change); (b) keep the setting as it is. Related: architecture.md 6.1 item 11, open since 25 Sep.
-- Clear Current Work and queued rows: the 27 Oct Clear rule does not cover queued work. Clear Current Work still removes queued rows through the WAL. Owner decision open.
+- Closed 28 Oct (owner: completed clear by removing shards): History Clear removes the completed shards. Built in code (see "Owner decisions of 28 and 29 Oct"); not checked live.
+- Worker Window Focus setting (owner, 27 Oct: Activate works; Focus is intrusive; None needs a manual raise). Options: (a) remove the setting from Preferences, hardcode Activate, and keep Focus and None only behind dev mode (recommended; a code change); (b) keep the setting as it is. Related: architecture.md 6.1 item 11, open since 25 Sep. (28 Oct: the Preferences label is now "Background Window Policy"; the options are unchanged.)
+- Closed 28 Oct: Clear Current Work is queue only, and is disabled when no queue rows exist (`shared/js/coordinator.js`). Built.
 - Clear All Stats and the outlier baseline: decided (owner, 27 Oct). Clear All Stats resets the persistent outlier baseline to zero (`applyCoordinatorOutlierReset`). Clear Outliers keeps it. Architecture section 5.4.
 - Startup spinner timeout: a first load that gets no answer from the worker shows "History load failed". The owner kept the timeout as a failure (27 Oct). Listed for confirmation.
 - Import race: the background 1.5 import can race a concurrent write to the registry. Accepted (27 Oct). Listed for confirmation.
 - Firefox and `build:chrome` zips: not built (owner: Chrome dev only for now).
-- Commit and tag for the closing build.
+- Tag for 1.6.1665: open. The candidate is committed without a tag; the tag waits for the owner to accept the release candidate and finish the live checks.
 
 **Storage follow-up (WAL and checkpoint)**
 - Steps 4 and 5 of the completed-log plan are built and switched on: queue row shards with tail moves, and completed shards with limits applied to whole shards. Runs are time-sharded.
@@ -191,7 +235,8 @@ These were open at closeout. Each stays open until it is checked.
 
 **Outliers**
 - Built per commit `5a41c99`: the 3.5 s recording limit, the terminal-only list, and recorder events kept with the outlier. Not checked live.
-- Not built: Phase 3 (row timeout). The baseline is cumulative. Phase 4 (full-field view) is hover text only.
+- Status 29 Oct (`docs/outliers-plan-2026-10-24.md` section 6): Phase 1 and Phase 2 are built. Phase 3 (row timeout) is closed for now, not built (owner, 29 Oct). Phase 4 (click view) is not started and is parked until the owner's live check of the Events button shows whether hover text is enough. The baseline is cumulative.
+- Closed 29 Oct: the outlier keys stay as they are (one key per outlier entry, not a WAL area). The owner declined the WAL-area move on 28 Oct.
 
 **Cleanup**
 - [architecture.md](architecture.md): corrected against the code on 27 Oct. The run excise (`8d08054`) and the shadow removal (`8e146cc`) are built, and sections 6.1 and 6.2 now say so.

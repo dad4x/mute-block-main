@@ -130,6 +130,26 @@ function withSpaceRecordCollectCount(record, count) {
     }
 }
 
+// One write to one space's record, applied to the record the worker holds now (29 Oct). The change is a category, with the space's identity
+// fields, or a collect count. `at` is when the user acted, and it becomes the record's updatedAt, so the order of writes is the order of
+// the user's actions (not the order the worker happened to apply them). A change made before the record's last update is stale: it
+// returns null, and the stored record stays. A change with no record to apply it to returns null too.
+function applySpaceRecordChange(existingRecord, key, change, at) {
+    const actedAt = Number(at) || 0
+    if(existingRecord && actedAt < (Number(existingRecord.updatedAt) || 0)) return null
+    if(!change || typeof change !== 'object') return null
+
+    let next = null
+    if(change.category !== undefined) {
+        next = buildSpaceRecord({key, url: change.url, slug: change.slug, name: change.name}, change.category, existingRecord)
+    }
+    else if(change.collectCount !== undefined) {
+        next = withSpaceRecordCollectCount(existingRecord, change.collectCount)
+    }
+    if(!next) return null
+    return actedAt ? {...next, updatedAt: actedAt} : next
+}
+
 function sortSpaceRecords(records, sortBy = SPACE_SORT_NAME) {
     const list = Array.isArray(records) ? records.slice() : []
 
@@ -162,6 +182,7 @@ module.exports = {
     SPACE_SORT_CATEGORY,
     SPACE_SORT_KEY,
     SPACE_SORT_NAME,
+    applySpaceRecordChange,
     buildSpaceRecord,
     extractSpaceSlug,
     getDocumentCanonicalUrl,

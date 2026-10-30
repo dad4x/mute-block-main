@@ -47,11 +47,11 @@ Important characteristics of the current implementation:
 
 Relevant code areas:
 
-- page typing in [shared/js/content.js](/scratch/dbrower/home/src/mute-block-main/shared/js/content.js#L587)
-- space-post `Nuke 'Em` injection in [shared/js/content.js](/scratch/dbrower/home/src/mute-block-main/shared/js/content.js#L2621)
-- modal `Nuke 'Em` flow in [shared/js/content.js](/scratch/dbrower/home/src/mute-block-main/shared/js/content.js#L2915)
-- queued tab execution in [shared/js/content.js](/scratch/dbrower/home/src/mute-block-main/shared/js/content.js#L2994)
-- persistent extension state in [shared/js/popup.js](/scratch/dbrower/home/src/mute-block-main/shared/js/popup.js) and [shared/js/sw.js](/scratch/dbrower/home/src/mute-block-main/shared/js/sw.js)
+- page typing in shared/js/content.js
+- space-post `Nuke 'Em` injection in shared/js/content.js
+- modal `Nuke 'Em` flow in shared/js/content.js
+- queued tab execution in shared/js/content.js
+- persistent extension state in shared/js/popup.js and shared/js/sw.js
 
 ## Main Design Shift
 
@@ -167,7 +167,7 @@ This is the `InstantBlock`-style case:
 
 ## Why `InstantBlock.html` Matters
 
-The saved page [InstantBlock.html](/home/dbrower/InstantBlock.html) is more informative than the `_files` directory because it contains the actual page snapshot and embedded app state.
+The saved page InstantBlock.html is more informative than the `_files` directory because it contains the actual page snapshot and embedded app state.
 
 Useful observations from that file:
 
@@ -325,8 +325,8 @@ Even if the final queue still consumes profile URLs, an intermediate descriptor 
 
 The repo already contains two useful moderation notes:
 
-- [quora-labeler-bridge.md](/scratch/dbrower/home/src/mute-block-main/quora-labeler-bridge.md)
-- [atproto-moderation-model.md](/scratch/dbrower/home/src/mute-block-main/atproto-moderation-model.md)
+- quora-labeler-bridge.md
+- atproto-moderation-model.md
 
 Those notes mostly examine labelers as an inbound publication source.
 

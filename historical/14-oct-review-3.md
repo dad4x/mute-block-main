@@ -2,7 +2,7 @@
 
 > **Status: HISTORICAL** (24 Oct 2026). De novo review 3 (14 Oct). Its identity findings were built. Sender-role choice R3-3 is still open in planning.md. Kept as a record. Do not implement from it. planning.md is the front door. Register: [notes register](../docs/notes-register.md).
 
-Scope: the `shared/` tree on branch `review/shared-wip`, HEAD `abc2307`, with the uncommitted working tree, including the round-3 changes described in [14-oct-review-2-reply.md](14-oct-review-2-reply.md) and the artifact WSv8wCDa6h1aKcBVxq3y97. The earlier reviews are [14-oct-review-1.md](../14-oct-review-1.md) (WAL, storage, dashboard) and [14-oct-review-2.md](14-oct-review-2.md) (the executor and content script). This review looks at areas those reviews did not reach, at trust boundaries, and at code added in round 3.
+Scope: the `shared/` tree on branch `review/shared-wip`, HEAD `abc2307`, with the uncommitted working tree, including the round-3 changes described in [14-oct-review-2-reply.md](14-oct-review-2-reply.md) and the artifact WSv8wCDa6h1aKcBVxq3y97. The earlier reviews are 14-oct-review-1.md (WAL, storage, dashboard) and [14-oct-review-2.md](14-oct-review-2.md) (the executor and content script). This review looks at areas those reviews did not reach, at trust boundaries, and at code added in round 3.
 
 No repo files were changed by this review. No build, version bump, commit, or live browser run was done.
 

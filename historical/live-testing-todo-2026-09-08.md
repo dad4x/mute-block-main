@@ -356,7 +356,7 @@ flagged earlier. Three distinct findings:
      more trustworthy than resume at this point.
 
 Running list of findings from manual live-testing on the new Windows machine,
-following [handoff-2026-09-08-decomposition-and-live-test.md](handoff-2026-09-08-decomposition-and-live-test.md).
+following handoff-2026-09-08-decomposition-and-live-test.md.
 Environment: dedicated dev Chrome profile at
 `~/.local/share/mute-block-chrome-dev-profile`, `chrome-dev` unpacked
 extension, currently built at `1.6.1216`.
@@ -596,7 +596,7 @@ one additional branch.
   or an in-memory array/Set scan over the full queue on each decision. This
   project's own prior notes
   ([storage-authority-refactor-plan-for-review-2026-05-20.md](storage-authority-refactor-plan-for-review-2026-05-20.md),
-  [storage-observability-baseline-2026-05-22.md](storage-observability-baseline-2026-05-22.md))
+  storage-observability-baseline-2026-05-22.md)
   already flagged storage overhead as a concern area, so this may be a known
   or half-addressed issue rather than a new regression.
 - **User decision**: let the batch run to completion (rather than stopping

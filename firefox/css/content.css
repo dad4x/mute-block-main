@@ -431,12 +431,74 @@
 }
 
 /* The queue's status beside the Nuke 'Em button and the batch button (owner, 25 Oct): a display only, so it does not hold either button. */
-.mb-ext_space-feed-nuking-status,
-.mb-ext_profile-search-nuking-status {
+/* One rule for both batch toolbars (28 Oct): the space page and the search page use the same class (NUKING_TOOLBAR_STATUS_CLASS in content.js). */
+.mb-ext_nuking-status {
     font-size: 12px;
     color: #374151;
     white-space: nowrap;
     align-self: center;
+}
+
+/* The Nuking drop-down (owner, 28 Oct): a caret toggle beside a Nuking button or the toolbar status, with Pause and Resume in a small menu. */
+.mb-ext_nuking-control {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+.mb-ext_nuking-control-toggle {
+    font-size: 12px;
+    line-height: 1.2;
+    padding: 2px 8px;
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 4px;
+    background: var(--mb-white);
+    color: var(--mb-grey-700);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mb-ext_nuking-control-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    min-width: 120px;
+    padding: 4px;
+    background: var(--mb-white);
+    border: 1px solid var(--mb-grey-300);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.mb-ext_nuking-control-menu[hidden] {
+    display: none;
+}
+
+.mb-ext_nuking-control-item {
+    text-align: left;
+    font-size: 12px;
+    padding: 4px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--mb-grey-800);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mb-ext_nuking-control-item:hover:not(:disabled) {
+    background: var(--mb-grey-100);
+}
+
+.mb-ext_nuking-control-item:disabled {
+    color: var(--mb-grey-500);
+    cursor: default;
 }
 
 /* The Considered line and its cause under the Collect N More button (owner, 27 Oct). Each takes its own row of the toolbar, right-aligned under the button. */
@@ -589,6 +651,49 @@
     background-color: #ffffff;
     color: #111827;
     box-shadow: inset 0 0 0 1px #9ca3af;
+}
+
+/* Owner, 29 Oct: the list beside a Bad Links button, one line per failed profile. It sits under the button, inside the post's controls. */
+.mb-ext_space-feed-bad-links {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 260px;
+    max-width: 360px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: var(--mb-white);
+    color: var(--mb-grey-900);
+    box-shadow: inset 0 0 0 1px var(--mb-grey-300);
+    font-size: 13px;
+    line-height: 1.4;
+    text-align: left;
+}
+
+.mb-ext_space-feed-bad-links[hidden] {
+    display: none;
+}
+
+.mb-ext_space-feed-bad-links-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+}
+
+.mb-ext_space-feed-bad-links-link {
+    color: var(--mb-blue-600);
+    font-weight: 600;
+    text-decoration: underline;
+    word-break: break-all;
+}
+
+.mb-ext_space-feed-bad-links-reason {
+    color: var(--mb-grey-600);
 }
 
 .mb-ext_space-feed-post-queue-btn {
