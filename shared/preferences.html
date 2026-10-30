@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Preferences</title>
+        <link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/popup.css">
+</head>
+<body>
+    <main class="popup">
+        <header class="header">
+            <div class="header-main">
+                <span class="header-title" id="appName">Mute Block</span>
+                <span class="header-version" id="appVersion">v0.0.0</span>
+            </div>
+            <button class="header-close" id="closePopup" type="button" aria-label="Close popup" title="Mute Block extension: Close this page">X</button>
+        </header>
+
+        <div class="top-actions">
+            <button class="button button-primary" id="openCoordinator" type="button" title="Mute Block extension: Open the dashboard">Open Dashboard</button>
+            <button class="button button-secondary" id="openHistory" type="button" title="Mute Block extension: Open the history page">Open History</button>
+        </div>
+
+        <form class="form" id="settingsForm">
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Auto Switch To Answers</div>
+                        <div class="hint">Flip All Related to Answers before adding the FOP button.</div>
+                    </div>
+                    <input class="checkbox" id="flipToAnswers" type="checkbox">
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">FOP Button Delay (ms)</div>
+                        <div class="hint">Delay before showing the Original Poster button.</div>
+                    </div>
+                    <input class="input" id="fopDelay" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Answers Only Flip Delay (ms)</div>
+                        <div class="hint">Delay after switching to Answers before showing the OP button.</div>
+                    </div>
+                    <input class="input" id="fopFlipDelay" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row" title="Mute Block extension: When on, resume Current Work on browser start. When off, do nothing until you navigate to a Quora page.">
+                    <div>
+                        <div class="label">Auto-Start Current Work</div>
+                        <div class="hint">Resume Current Work on browser start. Leave off to wait until you navigate to Quora.</div>
+                    </div>
+                    <input class="checkbox" id="coordinatorAutoStartOnBrowserStart" type="checkbox" title="Mute Block extension: When on, resume Current Work on browser start. When off, do nothing until you navigate to a Quora page.">
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Profiles Per Batch</div>
+                        <div class="hint">How many profiles to open or nuke at one time from profile lists. Space-feed nukes use an internal safety cap.</div>
+                    </div>
+                    <input class="input" id="profilesPerBatch" type="number" min="1" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Background Window Policy</div>
+                        <div class="hint">What a queued action does to its tab in the background window. Focus brings the tab forward and takes OS focus on each action. Activate brings it forward without taking focus. None keeps it in the background and takes no focus, so steps that need the page visible wait, then fail. Applies from the next action.</div>
+                    </div>
+                    <select class="select" id="workerWindowForegroundMode">
+                        <option value="focus">Focus</option>
+                        <option value="activate">Activate</option>
+                        <option value="none">None</option>
+                    </select>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Recent History Retention (days)</div>
+                        <div class="hint">Recent history older than this is pruned. Whichever limit is hit first prunes. Use `0` to disable age pruning.</div>
+                    </div>
+                    <input class="input" id="nukedPostRetentionDays" type="number" min="0" required>
+                </div>
+            </section>
+
+            <section class="section">
+                <div class="row">
+                    <div>
+                        <div class="label">Recent History Entry Cap</div>
+                        <div class="hint">Keep at most this many recent history entries, trimming the oldest first. Whichever limit is hit first prunes. Use `0` to disable the cap.</div>
+                    </div>
+                    <input class="input" id="maxRememberedNukedPosts" type="number" min="0" required>
+                </div>
+            </section>
+
+            <div class="actions">
+                <button class="button button-primary" type="submit" title="Mute Block extension: Save these preferences">Save Preferences</button>
+                <button class="button button-secondary" type="reset" title="Mute Block extension: Reset every setting to its default and save it">Reset to Defaults</button>
+            </div>
+
+            <div class="status" id="status" hidden></div>
+        </form>
+
+        <section class="section section-spaces">
+            <div class="section-head">
+                <div>
+                    <div class="label">Categorized Spaces</div>
+                    <div class="hint">Saved space classifications can be resorted and changed here.</div>
+                </div>
+                <label class="sort-control" for="spaceSortBy">
+                    <span class="sort-label">Sort</span>
+                    <select class="select" id="spaceSortBy">
+                        <option value="name">Name</option>
+                        <option value="category">Category</option>
+                    </select>
+                </label>
+            </div>
+
+            <div class="space-list" id="spaceList"></div>
+        </section>
+
+        <section class="section section-danger">
+            <div class="label">Erase Everything</div>
+            <div class="hint danger-warning">
+                This permanently deletes everything the extension has stored: the record of every profile blocked, the queue, the run history, the statistics, the outlier list, your preferences and your categorized spaces. The extension then starts as a fresh install, and it will act on every profile it has blocked before. Do not use this routinely. Use it only before a clean reinstall or to start over.
+            </div>
+            <div class="hint">Pause Current Work on the Dashboard first. The erase is refused while any Current Work is running. The extension reloads, which stops its background work, once the erase is scheduled.</div>
+            <div class="field">
+                <label class="label" for="eraseConfirm">Type ERASE to confirm</label>
+                <input class="input" id="eraseConfirm" type="text" autocomplete="off">
+            </div>
+            <div class="actions">
+                <button class="button button-danger" id="eraseBlockHistoryButton" type="button" title="Mute Block extension: Erase all stored history. Refused while Current Work is still running; the extension then reloads.">Erase everything</button>
+            </div>
+            <div class="status" id="eraseStatus" hidden></div>
+        </section>
+    </main>
+
+    <script src="js/preferences.js"></script>
+</body>
+</html>

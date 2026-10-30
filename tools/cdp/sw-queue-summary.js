@@ -1,10 +1,25 @@
 #!/usr/bin/env node
 
 const {
+    COORDINATOR_PAUSED_KEY,
+    COORDINATOR_QUEUE_KEY,
+    COORDINATOR_RETRY_FAILED_ENABLED_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
+
+// The stored names this tool reads: the layout prefix plus the plain key name (storageNamespace.js).
+const STORED_NAMES = {
+    queue: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`,
+    paused: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_PAUSED_KEY}`,
+    retryFailed: `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_RETRY_FAILED_ENABLED_KEY}`
+}
+
+const {
     evaluate,
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -22,16 +37,15 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function readQueueSummary(needle) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(serviceWorker.webSocketDebuggerUrl, `(${async function readQueueSummary(needle, progress, names) {
         const storage = await chrome.storage.local.get({
-            mbCoordinatorQueue: {},
-            mbProfileNukeProgressView: {},
-            mbCoordinatorPaused: false,
-            mbCoordinatorRetryFailedEnabled: false
+            [names.queue]: {},
+            [names.paused]: false,
+            [names.retryFailed]: false
         })
         const tabs = await chrome.tabs.query({})
-        const queue = storage.mbCoordinatorQueue || {}
-        const progress = storage.mbProfileNukeProgressView?.records || {}
+        const queue = storage[names.queue] || {}
         const normalize = value => {
             try {
                 const url = new URL(`${value || ''}`)
@@ -109,13 +123,13 @@ runMain(async () => {
             needle,
             rowCount: rows.length,
             counts,
-            paused: storage.mbCoordinatorPaused === true,
-            idleRetryEnabled: storage.mbCoordinatorRetryFailedEnabled === true,
+            paused: storage[names.paused] === true,
+            idleRetryEnabled: storage[names.retryFailed] === true,
             activeRows: rows.filter(row => row.status === 'active'),
             queuedRows: rows.filter(row => row.status === 'queued').slice(0, 20),
             failedRows: rows.filter(row => row.status === 'failed').slice(0, 20)
         }
-    }})( ${JSON.stringify(needle)} )`, 20000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(STORED_NAMES)} )`, 20000)
 
     console.log(JSON.stringify(result, null, 2))
 })

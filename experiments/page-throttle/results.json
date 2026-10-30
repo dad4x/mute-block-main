@@ -1,0 +1,27 @@
+{
+  "phaseSeconds": 15,
+  "firstForeground": {
+    "windowSeconds": 15,
+    "visibilityAtEnd": "visible",
+    "pageTicksPerSecond": 10,
+    "workerTicksPerSecond": 10.01
+  },
+  "secondBackground": {
+    "windowSeconds": 15,
+    "visibilityAtEnd": "hidden",
+    "pageTicksPerSecond": 1.07,
+    "workerTicksPerSecond": 10
+  },
+  "secondForeground": {
+    "windowSeconds": 15,
+    "visibilityAtEnd": "visible",
+    "pageTicksPerSecond": 9.99,
+    "workerTicksPerSecond": 10
+  },
+  "firstBackground": {
+    "windowSeconds": 15,
+    "visibilityAtEnd": "hidden",
+    "pageTicksPerSecond": 1,
+    "workerTicksPerSecond": 10
+  }
+}

@@ -1,5 +1,7 @@
 # Timeout Inventory for 1.6
 
+> **Status: REFERENCE** (24 Oct 2026). Timeout inventory (20 May). Stale; refresh after the timeouts registry merge. Reference or dated data. Check before relying on its numbers. Register: [notes register](docs/notes-register.md).
+
 Status: current-source inventory after the 2026-05-19 recovery/repair review.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

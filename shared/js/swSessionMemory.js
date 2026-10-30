@@ -1,3 +1,5 @@
+const {namespaceArea} = require('./storageNamespace')
+
 // Thin abstraction over chrome.storage.session, used as this extension's
 // non-volatile-across-service-worker-restarts shared memory: in-memory (no
 // disk cost), survives exactly the restarts a plain module-level `let`
@@ -18,7 +20,7 @@ function createSessionMemoryStore(deps = {}) {
     async function loadSessionValue(key, defaults = null) {
         if(typeof browser?.storage?.session?.get !== 'function') return defaults
         try {
-            const stored = await browser.storage.session.get({[key]: defaults})
+            const stored = await namespaceArea(browser.storage.session).get({[key]: defaults})
             return stored?.[key] !== undefined ? stored[key] : defaults
         }
         catch {
@@ -28,7 +30,7 @@ function createSessionMemoryStore(deps = {}) {
 
     function setSessionValue(key, value) {
         if(typeof browser?.storage?.session?.set !== 'function') return Promise.resolve(false)
-        return browser.storage.session.set({[key]: value}).then(() => true).catch(() => false)
+        return namespaceArea(browser.storage.session).set({[key]: value}).then(() => true).catch(() => false)
     }
 
     // A resident cell: synchronous reads of a value loaded once from

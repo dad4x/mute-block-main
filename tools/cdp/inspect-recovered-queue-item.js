@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_QUEUE_WAL_KEY} = require('../../shared/js/storageKeys')
+const {plainName} = require('../../shared/js/storageNamespace')
+
 const {gzipSync, gunzipSync} = require('fflate')
 const {
     hydrateSegmentedWalStore,
@@ -12,6 +15,7 @@ const {
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
@@ -27,11 +31,14 @@ const QUEUE_WAL_SNAPSHOT_CODEC_OPTIONS = {
     }
 }
 
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
-const PROFILE_NUKE_PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
-const PROFILE_NUKE_PROGRESS_SHARD_PREFIX = 'mbProfileNukeProgressShard.'
+
+// The plain names of this layout's stored keys (storageNamespace.js). Stored keys of other layouts are left out.
+function plainStored(storage = {}) {
+    return Object.fromEntries(Object.entries(storage || {})
+        .map(([storedName, value]) => [plainName(storedName), value])
+        .filter(([key]) => key !== null))
+}
 
 function normalize(value) {
     try {
@@ -83,17 +90,6 @@ function recoverQueue(stored = {}) {
     }
 }
 
-function getProgressRecords(stored = {}) {
-    const progress = {}
-    const viewRecords = stored[PROFILE_NUKE_PROGRESS_VIEW_KEY]?.records || {}
-    Object.assign(progress, viewRecords)
-    for(const [key, value] of Object.entries(stored || {})) {
-        if(!key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) continue
-        Object.assign(progress, value?.records || {})
-    }
-    return progress
-}
-
 runMain(async () => {
     const config = getCdpConfig()
     const needle = `${getOption('needle', process.env.MB_QUEUE_NEEDLE || '')}`.toLowerCase()
@@ -110,11 +106,12 @@ runMain(async () => {
         return
     }
 
-    const stored = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
+    const storedRaw = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
         return chrome.storage.local.get(null)
     }})()`, 60000)
-    const {queue, recovered, reason, wal} = recoverQueue(stored || {})
-    const progress = getProgressRecords(stored || {})
+    const stored = plainStored(storedRaw)
+    const {queue, recovered, reason, wal} = recoverQueue(stored)
+    const progress = await readProfileNukeProgressFromWorker(config)
     const tabs = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readTabs() {
         return chrome.tabs.query({})
     }})()`, 30000)

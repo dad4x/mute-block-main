@@ -1,0 +1,44 @@
+[
+  {
+    "t": 0.4,
+    "event": "Page.lifecycleEvent",
+    "name": "commit",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 0.4,
+    "event": "Page.lifecycleEvent",
+    "name": "DOMContentLoaded",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 0.4,
+    "event": "Page.lifecycleEvent",
+    "name": "load",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 0.4,
+    "event": "Page.lifecycleEvent",
+    "name": "networkAlmostIdle",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 0.4,
+    "event": "Page.lifecycleEvent",
+    "name": "networkIdle",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 1.1,
+    "event": "Page.lifecycleEvent",
+    "name": "networkAlmostIdle",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  },
+  {
+    "t": 1.1,
+    "event": "Page.lifecycleEvent",
+    "name": "networkIdle",
+    "sessionId": "CA78106B8B41EDB455DE2C932C62C29B"
+  }
+]

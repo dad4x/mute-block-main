@@ -53,7 +53,7 @@ mix.options({
 
 .js('./shared/js/content.js', 'tmp/mix-shared/js')
 
-.js('./shared/js/popup.js', 'tmp/mix-shared/js')
+.js('./shared/js/preferences.js', 'tmp/mix-shared/js')
 
 .js('./shared/js/coordinator.js', 'tmp/mix-shared/js')
 
@@ -69,8 +69,8 @@ mix.options({
 .copy('./shared/css', 'chrome/css')
 .copy('./shared/css', 'firefox/css')
 
-.copy('./shared/popup.html', 'chrome/popup.html')
-.copy('./shared/popup.html', 'firefox/popup.html')
+.copy('./shared/preferences.html', 'chrome/preferences.html')
+.copy('./shared/preferences.html', 'firefox/preferences.html')
 
 .copy('./shared/coordinator.html', 'chrome/coordinator.html')
 .copy('./shared/coordinator.html', 'firefox/coordinator.html')

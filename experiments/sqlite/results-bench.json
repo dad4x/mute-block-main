@@ -1,0 +1,37 @@
+{
+  "open": {
+    "ok": true,
+    "libVersion": "3.53.4",
+    "hasOpfsVfs": true,
+    "hasSahpoolVfs": true,
+    "vfs": "opfs-sahpool",
+    "filename": "/spike-sahpool.sqlite3",
+    "journalMode": "delete"
+  },
+  "seeded": {
+    "committed": true,
+    "seq": 1
+  },
+  "bench": {
+    "keyedRead2KbRow": {
+      "medianMs": 0,
+      "p95Ms": 0.1
+    },
+    "fullScanRows": {
+      "medianMs": 6.3,
+      "p95Ms": 7.7
+    },
+    "singleRowAutocommitWrite": {
+      "medianMs": 5.5,
+      "p95Ms": 6.4
+    }
+  },
+  "state": {
+    "markerSeq": 1,
+    "rowCount": 2001,
+    "distinctRowSeqs": [
+      1,
+      299
+    ]
+  }
+}

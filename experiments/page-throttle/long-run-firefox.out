@@ -1,0 +1,70 @@
+{
+  "mode": "long",
+  "addonId": "throttle-probe@mute-block.local",
+  "extensionUuid": "45c263d7-0952-4cf8-9ba0-5e2036e75540",
+  "durationSeconds": 1800,
+  "sampleSeconds": 10,
+  "samples": 181,
+  "segments": [
+    {
+      "fromSeconds": 0,
+      "toSeconds": 300.333,
+      "fgPageTicksPerSecond": 9.92,
+      "fgWorkerTicksPerSecond": 9.91,
+      "bgPageTicksPerSecond": 0.99,
+      "bgWorkerTicksPerSecond": 9.91,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    },
+    {
+      "fromSeconds": 300.333,
+      "toSeconds": 600.715,
+      "fgPageTicksPerSecond": 9.93,
+      "fgWorkerTicksPerSecond": 9.94,
+      "bgPageTicksPerSecond": 1,
+      "bgWorkerTicksPerSecond": 9.94,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    },
+    {
+      "fromSeconds": 600.715,
+      "toSeconds": 901.08,
+      "fgPageTicksPerSecond": 9.94,
+      "fgWorkerTicksPerSecond": 9.94,
+      "bgPageTicksPerSecond": 0.99,
+      "bgWorkerTicksPerSecond": 9.94,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    },
+    {
+      "fromSeconds": 901.08,
+      "toSeconds": 1201.447,
+      "fgPageTicksPerSecond": 9.93,
+      "fgWorkerTicksPerSecond": 9.94,
+      "bgPageTicksPerSecond": 1,
+      "bgWorkerTicksPerSecond": 9.94,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    },
+    {
+      "fromSeconds": 1201.447,
+      "toSeconds": 1501.837,
+      "fgPageTicksPerSecond": 9.94,
+      "fgWorkerTicksPerSecond": 9.94,
+      "bgPageTicksPerSecond": 0.99,
+      "bgWorkerTicksPerSecond": 9.94,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    },
+    {
+      "fromSeconds": 1501.837,
+      "toSeconds": 1802.207,
+      "fgPageTicksPerSecond": 9.93,
+      "fgWorkerTicksPerSecond": 9.94,
+      "bgPageTicksPerSecond": 1,
+      "bgWorkerTicksPerSecond": 9.94,
+      "fgVisibility": "visible",
+      "bgVisibility": "hidden"
+    }
+  ]
+}

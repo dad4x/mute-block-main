@@ -73,11 +73,11 @@ function withFakePage(buttons, fn) {
 test('close-after click helper matches aria-label text', () => {
     const closeAfter = makeButton({
         text: 'Mute Block Close',
-        aria: 'Mute-Block Extension: Mute and block this profile, then close the tab'
+        aria: 'Mute Block extension: Mute and block this profile, then close the tab'
     })
     const plain = makeButton({
         text: 'Mute Block',
-        aria: 'Mute-Block Extension: Mute and block this profile'
+        aria: 'Mute Block extension: Mute and block this profile'
     })
 
     const result = withFakePage([plain, closeAfter], () =>
@@ -88,17 +88,17 @@ test('close-after click helper matches aria-label text', () => {
     assert.equal(result.button.index, 1)
     assert.equal(closeAfter.clicked, true)
     assert.equal(plain.clicked, false)
-    assert.equal(result.button.aria, 'Mute-Block Extension: Mute and block this profile, then close the tab')
+    assert.equal(result.button.aria, 'Mute Block extension: Mute and block this profile, then close the tab')
 })
 
 test('close-after click helper falls back to close-tab button for already blocked profile', () => {
     const closeTab = makeButton({
         text: 'Close tab',
-        aria: 'Mute-Block Extension: Close this tab'
+        aria: 'Mute Block extension: Close this tab'
     })
     const unblock = makeButton({
-        text: 'Unblock Unmute',
-        aria: 'Mute-Block Extension: Unblock and unmute this profile'
+        text: 'Unblock',
+        aria: 'Mute Block extension: Unblock and unmute this profile. This is also called a pardon.'
     })
 
     const result = withFakePage([unblock, closeTab], () =>
@@ -109,5 +109,5 @@ test('close-after click helper falls back to close-tab button for already blocke
     assert.equal(result.button.index, 1)
     assert.equal(closeTab.clicked, true)
     assert.equal(unblock.clicked, false)
-    assert.equal(result.button.aria, 'Mute-Block Extension: Close this tab')
+    assert.equal(result.button.aria, 'Mute Block extension: Close this tab')
 })

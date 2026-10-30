@@ -23,12 +23,30 @@ const lanes = [
       ['node', 'test/contentActionSelectors.test.js'],
       ['node', 'test/contentUnmuteVerification.test.js'],
       ['node', 'test/contentSpaceScopedState.test.js'],
+      ['node', 'test/contentSpaceProfileStateGate.test.js'],
+      ['node', 'test/spaceFeedBadLinkList.test.js'],
       ['node', 'test/contentSourcePostResolution.test.js'],
+      ['node', 'test/contentQueueRowDrop.test.js'],
+      ['node', 'test/walShardIds.test.js'],
+      ['node', 'test/walArrivalShards.test.js'],
+      ['node', 'test/walChangedShards.test.js'],
+      ['node', 'test/walShardGc.test.js'],
+      ['node', 'test/walAreaShardLayout.test.js'],
+      ['node', 'test/swQueueWalRowShard.test.js'],
+      ['node', 'test/walQueueRowShards.test.js'],
+      ['node', 'test/swCompletedShards.test.js'],
+      ['node', 'test/runShards.test.js'],
+      ['node', 'test/manualHistory.test.js'],
       ['node', 'test/contentEnqueueChunkRetry.test.js'],
       ['node', 'test/contentInlineResolution.test.js'],
+      ['node', 'test/contentQueuedClaimHold.test.js'],
+      ['node', 'test/acceptedReviewChanges.test.js'],
       ['node', 'test/cdpClickProfileExtensionAction.test.js'],
-      ['node', 'test/requeueFailures.test.js'],
-      ['node', 'test/swStorageMetrics.test.js']
+      ['node', 'test/swStorageMetrics.test.js'],
+      ['node', 'test/swQueueWal.test.js'],
+      ['node', 'test/swQueueWalRecovery.test.js'],
+      ['node', 'test/swQueueWalStore.test.js'],
+      ['node', 'test/swQueueWalDurableReads.test.js']
     ]
   },
   {
@@ -47,7 +65,23 @@ const lanes = [
     commandTimeoutMs: 30000,
     commands: [
       ['node', 'test/p1-contract.test.js'],
-      ['node', 'test/terminalOwnedTabScope.test.js']
+      ['node', 'test/spaceClassificationSticks.test.js'],
+      ['node', 'test/candidateMarks.test.js'],
+      ['node', 'test/candidateCollect.test.js'],
+      ['node', 'test/candidateNuke.test.js'],
+      ['node', 'test/candidateStatus.test.js'],
+      ['node', 'test/nukingControl.test.js'],
+      ['node', 'test/colorTokens.test.js'],
+      ['node', 'test/terminalOwnedTabScope.test.js'],
+      ['node', 'test/swStorageLane.test.js'],
+      ['node', 'test/swQueueBarSummary.test.js'],
+      ['node', 'test/candidateListEvidence.test.js'],
+      ['node', 'test/swResumeExemption.test.js'],
+      ['node', 'test/swProfileNukeProgressPush.test.js'],
+      ['node', 'test/coordinatorEventRecord.test.js'],
+      ['node', 'test/runsWal.test.js'],
+      ['node', 'test/walUsersSynthetic.test.js'],
+      ['node', 'test/walAppendUnique.test.js']
     ]
   },
   {

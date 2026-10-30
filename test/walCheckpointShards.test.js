@@ -116,7 +116,7 @@ register('a sharded write lays out a manifest plus one record per shard, and hyd
     assert.equal(wal.hashState(recovered.projected.state), wal.hashState(state))
 })
 
-register('hydrate rejects a shard record from a different snapshot sequence', () => {
+register('hydrate accepts a shard written under an earlier snapshot sequence when its content hash matches (step 2)', () => {
     const state = makeState()
     const written = wal.writeInactiveCheckpoint(storeWithActiveLegacyAndEmptyInactive(), state, {
         snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec, codecName: codec.name, shardCount: 10
@@ -125,6 +125,19 @@ register('hydrate rejects a shard record from a different snapshot sequence', ()
     const payload = wal.buildSegmentedWalStoragePayload(activated.store, {baseKey: 'mbT', writeCheckpoints: true})
     const key = wal.getSegmentedWalCheckpointShardKey('mbT', written.checkpointId, 4)
     payload[key] = {...payload[key], snapshotSeq: 99}
+    const hydrated = wal.hydrateSegmentedWalStore(payload, {baseKey: 'mbT', fallbackStore: null})
+    assert.equal(hydrated.ok, true, hydrated.reason)
+})
+
+register('hydrate rejects a shard record whose content hash does not match its manifest', () => {
+    const state = makeState()
+    const written = wal.writeInactiveCheckpoint(storeWithActiveLegacyAndEmptyInactive(), state, {
+        snapshotSeq: 5, snapshotEpoch: 1, createdAt: 1, codec, codecName: codec.name, shardCount: 10
+    })
+    const activated = wal.activateCheckpoint(written.store, written.checkpointId, opts)
+    const payload = wal.buildSegmentedWalStoragePayload(activated.store, {baseKey: 'mbT', writeCheckpoints: true})
+    const key = wal.getSegmentedWalCheckpointShardKey('mbT', written.checkpointId, 4)
+    payload[key] = {...payload[key], shardStateHash: 'not-the-hash'}
     const hydrated = wal.hydrateSegmentedWalStore(payload, {baseKey: 'mbT', fallbackStore: null})
     assert.equal(hydrated.ok, false)
     assert.equal(hydrated.reason, 'checkpoint-shard-identity-mismatch')

@@ -66,9 +66,56 @@ test('preserves title-case direct profile slugs beginning with The', () => {
     assert.equal(getLikelyQuoraProfileSlug('/The-Studious-Contemplator'), 'The-Studious-Contemplator')
 })
 
-test('strips known URL artifact tails from slugs', () => {
-    assert.equal(sanitizeProfileHrefSlug('Some-User-42-answers'), 'Some-User-42')
-    assert.equal(sanitizeProfileHrefSlug('Some-User-42-His-bio'), 'Some-User-42')
+test('keeps URL-looking tails as written until a live example proves they must go (owner, 15 Oct)', () => {
+    assert.equal(sanitizeProfileHrefSlug('Some-User-42-answers'), 'Some-User-42-answers')
+    assert.equal(sanitizeProfileHrefSlug('Some-User-42-his-bio'), 'Some-User-42-his-bio')
+    assert.equal(sanitizeProfileHrefSlug('Quert-5-followers'), 'Quert-5-followers')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-share-56'), 'Cesc-Fabregas-share-56')
+})
+
+test('case-shifted tokens and other suffixes are kept as written (owner, 14 and 15 Oct)', () => {
+    // Cesc-Fabregas-SHARE-56 and Cesc-Fabregas are different profiles, so the upper-case SHARE is kept.
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-SHARE-56'), 'Cesc-Fabregas-SHARE-56')
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Cesc-Fabregas-SHARE-56'),
+        'https://www.quora.com/profile/Cesc-Fabregas-SHARE-56'
+    )
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56-SHARE-Bio'), 'Cesc-Fabregas-56-SHARE-Bio')
+    assert.equal(sanitizeProfileHrefSlug('Some-User-42-His-Bio'), 'Some-User-42-His-Bio')
+    // Suffixes are kept as written, so no tail or lower-case artifact is cut (owner, 15 Oct).
+    assert.equal(sanitizeProfileHrefSlug('Some-User-42-His-bio'), 'Some-User-42-His-bio')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56-SHARE-x'), 'Cesc-Fabregas-56-SHARE-x')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56-SHARE-bio'), 'Cesc-Fabregas-56-SHARE-bio')
+    assert.equal(sanitizeProfileHrefSlug('Name-12-bio-details'), 'Name-12-bio-details')
+    // The query and fragment are still dropped.
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56?share=abc#top'), 'Cesc-Fabregas-56')
+})
+
+test('a fullwidth lookalike is a different profile, not folded onto the real one (review-4 R4-1)', () => {
+    const lookalike = 'Ｃｅｓｃ-Fabregas-56'
+    assert.equal(normalizeQuoraProfileHref('https://www.quora.com/profile/Cesc-Fabregas-56'), 'https://www.quora.com/profile/Cesc-Fabregas-56')
+    assert.notEqual(
+        normalizeQuoraProfileHref(`https://www.quora.com/profile/${lookalike}`),
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Cesc-Fabregas-56')
+    )
+    assert.equal(sanitizeProfileHrefSlug(lookalike), lookalike)
+})
+
+test('accents are composed (NFC), so a decomposed spelling is the same profile as the composed one (review-4 R4-1)', () => {
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Jose%CC%81-Garcia-1'),
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Jos%C3%A9-Garcia-1')
+    )
+})
+
+test('a trailing separator or space is part of the identity, not trimmed (review-4 R4-3)', () => {
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56-'), 'Cesc-Fabregas-56-')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56_'), 'Cesc-Fabregas-56_')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56 '), 'Cesc-Fabregas-56 ')
+    assert.notEqual(
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Cesc-Fabregas-56-'),
+        normalizeQuoraProfileHref('https://www.quora.com/profile/Cesc-Fabregas-56')
+    )
 })
 
 test('rejects prose-contaminated explicit profile target slugs', () => {

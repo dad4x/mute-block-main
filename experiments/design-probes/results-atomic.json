@@ -1,0 +1,8 @@
+{
+  "command": "atomic",
+  "result": {
+    "iterations": 200,
+    "reads": 200,
+    "mixedReads": 0
+  }
+}

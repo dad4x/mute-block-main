@@ -1,5 +1,7 @@
 # External atproto Discussion Research Note
 
+> **Status: ROADMAP** (24 Oct 2026). External research context on atproto. No decision. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: research context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

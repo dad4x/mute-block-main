@@ -1,5 +1,7 @@
 # Queue Wakeup Metrics Model
 
+> **Status: REFERENCE** (24 Oct 2026). Queue wake-up metrics model (20 May). Counter names need a refresh. Reference or dated data. Check before relying on its numbers. Register: [notes register](docs/notes-register.md).
+
 Date: 2026-05-20
 
 Status: supporting metrics model.

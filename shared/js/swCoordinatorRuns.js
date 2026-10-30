@@ -45,6 +45,7 @@ function createCoordinatorRuns(deps = {}) {
         makeEmptyJobMilestones,
         isRetryableCoordinatorFailureFromProgress,
         isTerminalCoordinatorStatus,
+        isArchivableCoordinatorRow,
         isActiveCoordinatorStatus,
         isPendingCoordinatorStatus,
         isTransientProfileNukeStatus,
@@ -73,7 +74,14 @@ function createCoordinatorRuns(deps = {}) {
         return recordUpdatedAt > 0 && itemTerminalAt > 0 && recordUpdatedAt >= itemTerminalAt
     }
 
-    function getCoordinatorRunStatus(runItems = [], paused = false) {
+    // An archived item (a member of archivedItems, a completed-work-log row) is finished for good. A live item is finished
+    // when it is archivable (isArchivableCoordinatorRow). Callers that pass no archivedItems treat every item as live.
+    function isFinishedCoordinatorRunItem(item = null, archivedItems = null) {
+        if(archivedItems && archivedItems.has(item)) return isTerminalCoordinatorStatus(item?.status)
+        return isArchivableCoordinatorRow(item)
+    }
+
+    function getCoordinatorRunStatus(runItems = [], paused = false, archivedItems = null) {
         // Run-level status is a deliberately small 3-state rollup --
         // 'running' / 'paused' / 'empty' -- distinct from the much larger
         // per-item status vocabulary (queued/opening/active/acting/settling/
@@ -85,10 +93,13 @@ function createCoordinatorRuns(deps = {}) {
         //
         // `paused` is the caller's own current-paused decision, not a stored
         // per-run flag -- see each call site for where that comes from.
+        //
+        // 2026-10-13: a live soft error that still has automatic retries left is not finished, so the run stays unfinished
+        // while it is live (isFinishedCoordinatorRunItem). Archived items are finished, whatever their retry count.
         if(!runItems.length) return paused ? 'paused' : 'empty'
 
-        const terminalCount = runItems.filter(item => isTerminalCoordinatorStatus(item?.status)).length
-        if(terminalCount === runItems.length) return 'empty'
+        const finishedCount = runItems.filter(item => isFinishedCoordinatorRunItem(item, archivedItems)).length
+        if(finishedCount === runItems.length) return 'empty'
         if(paused) return 'paused'
         return 'running'
     }
@@ -170,7 +181,7 @@ function createCoordinatorRuns(deps = {}) {
             .filter(Boolean)
     }
 
-    function recomputeCoordinatorRuns(queue = {}, runs = {}, runIds = null) {
+    function recomputeCoordinatorRuns(queue = {}, runs = {}, runIds = null, archivedItems = null) {
         return runQueueWakeupMetricPhase('recomputeRuns', () => {
             const nextRuns = {
                 ...runs
@@ -220,7 +231,7 @@ function createCoordinatorRuns(deps = {}) {
                     itemCount: targetProfileHrefs.length || runItems.length || targetWorkKeyList.length || 0,
                     activeCount,
                     terminalCount,
-                    status: getCoordinatorRunStatus(runItems, existing?.paused === true),
+                    status: getCoordinatorRunStatus(runItems, existing?.paused === true, archivedItems),
                     updatedAt: Math.max(Number.parseInt(existing.updatedAt, 10) || 0, latestItemUpdatedAt)
                 }
             }
@@ -242,7 +253,7 @@ function createCoordinatorRuns(deps = {}) {
     // is nothing to race because there is nothing mutated: two concurrent
     // callers computing this from the same inputs get the same answer, and
     // neither one's answer depends on what the other wrote.
-    function summarizeCoordinatorRunFromItems(runId = '', run = {}, items = [], globalPaused = false) {
+    function summarizeCoordinatorRunFromItems(runId = '', run = {}, items = [], globalPaused = false, archivedItems = null) {
         const targetHrefs = new Set()
         const targetWorkKeys = new Set()
         const sourcePages = new Set(Array.isArray(run?.sourcePages) ? run.sourcePages : [])
@@ -284,7 +295,7 @@ function createCoordinatorRuns(deps = {}) {
             // ran would keep a stale flag forever otherwise. Confirmed live:
             // runs created after the last pause toggle showed 'running'
             // while the queue was actually paused.
-            status: getCoordinatorRunStatus(items, globalPaused === true),
+            status: getCoordinatorRunStatus(items, globalPaused === true, archivedItems),
             updatedAt: Math.max(Number.parseInt(run?.updatedAt, 10) || 0, latestItemUpdatedAt)
         }
     }
@@ -312,11 +323,13 @@ function createCoordinatorRuns(deps = {}) {
             ...Object.keys(itemsByRunId)
         ])
         const summary = {}
+        // The completed-work-log rows are archived, so the rollup treats them as finished (see isFinishedCoordinatorRunItem).
+        const archivedItems = new Set(Array.isArray(completedRows) ? completedRows : [])
         for(const runId of runIds) {
             const items = itemsByRunId[runId] || []
             const run = runs?.[runId] || null
             if(!items.length && !run) continue
-            summary[runId] = summarizeCoordinatorRunFromItems(runId, run || {id: runId}, items, globalPaused === true)
+            summary[runId] = summarizeCoordinatorRunFromItems(runId, run || {id: runId}, items, globalPaused === true, archivedItems)
         }
         return summary
     }

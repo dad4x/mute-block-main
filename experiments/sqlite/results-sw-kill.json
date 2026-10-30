@@ -1,0 +1,11 @@
+{
+  "offscreenTargetsBefore": 1,
+  "offscreenTargetsAfterSwStopped": 1,
+  "stateReadWithoutReopen": {
+    "markerSeq": 7,
+    "rowCount": 2000,
+    "distinctRowSeqs": [
+      7
+    ]
+  }
+}

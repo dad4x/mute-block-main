@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
+const {STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     DEFAULT_CHROME_DEV_PATH,
     cdpCommand,
+    clearProfileNukeProgressThroughWorker,
     evaluate,
     getJson,
     getOption,
@@ -12,7 +15,10 @@ const {
     sleep
 } = require('./lib/cdp')
 
-function shouldRemoveStorageKey(key = '') {
+// A stored name is removed when it carries this layout's prefix and its plain name starts with one of these prefixes.
+function shouldRemoveStorageKey(key = '', layoutPrefix = '') {
+    if(!key.startsWith(layoutPrefix)) return false
+    const plainKey = key.slice(layoutPrefix.length)
     return [
         'mbCoordinator',
         'mbProfileNukeProgressView',
@@ -20,7 +26,7 @@ function shouldRemoveStorageKey(key = '') {
         'mbQueuedActionSurface',
         'mbQueueWakeup',
         'mbFlightRecorder'
-    ].some(prefix => key.startsWith(prefix))
+    ].some(prefix => plainKey.startsWith(prefix))
 }
 
 runMain(async () => {
@@ -59,7 +65,7 @@ runMain(async () => {
                 resolve({ok: false, error: lastError})
                 return
             }
-            const keys = Object.keys(stored || {}).filter(shouldRemoveStorageKey)
+            const keys = Object.keys(stored || {}).filter(key => shouldRemoveStorageKey(key, ${JSON.stringify(STORAGE_LAYOUT_PREFIX)}))
             chrome.storage.local.remove(keys, () => {
                 const removeError = chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
                 resolve({
@@ -72,8 +78,9 @@ runMain(async () => {
         })
     })`, 20000)
 
+    const progressClear = await clearProfileNukeProgressThroughWorker(config)
     console.log(JSON.stringify({
-        ok: result?.ok === true,
+        ok: result?.ok === true && progressClear.saved !== false,
         extensionId: config.extensionId,
         extensionPath: config.extensionPath,
         target: {
@@ -82,7 +89,9 @@ runMain(async () => {
         },
         removedCount: result?.removedCount || 0,
         removedKeys: result?.removedKeys || [],
-        error: result?.error || ''
+        error: result?.error || '',
+        progressCleared: progressClear.cleared || 0,
+        progressReason: progressClear.reason || ''
     }, null, 2))
-    if(result?.ok !== true) process.exitCode = 1
+    if(result?.ok !== true || progressClear.saved === false) process.exitCode = 1
 })

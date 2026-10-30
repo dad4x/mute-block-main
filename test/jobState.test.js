@@ -284,6 +284,46 @@ test('reduces legacy progress milestone from queued directly to active', () => {
     assert.equal(result.item.milestones.contentOpenedAt, 1000)
 })
 
+test('a row activated again after a requeue starts a new active clock, not the earlier one', () => {
+    const result = reduceJobEvent({
+        status: 'queued',
+        attemptId: 'attempt-2',
+        attemptNumber: 2,
+        activeAt: 1000,
+        updatedAt: 1000
+    }, {
+        type: JOB_EVENT_MILESTONE,
+        status: 'active',
+        attemptId: 'attempt-2',
+        tabId: 42,
+        contentOpenedAt: 5000
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.status, 'active')
+    assert.notEqual(result.item.activeAt, 1000)
+    assert.equal(result.item.activeAt, result.item.updatedAt)
+})
+
+test('a row that is already active keeps its activation time through another active milestone', () => {
+    const result = reduceJobEvent({
+        status: 'active',
+        attemptId: 'attempt-1',
+        attemptNumber: 1,
+        activeAt: 1000,
+        updatedAt: 1000
+    }, {
+        type: JOB_EVENT_MILESTONE,
+        status: 'active',
+        attemptId: 'attempt-1',
+        tabId: 42,
+        contentOpenedAt: 5000
+    })
+
+    assert.equal(result.accepted, true)
+    assert.equal(result.item.activeAt, 1000)
+})
+
 test('milestone updates preserve existing values when progress patch is sparse', () => {
     const result = reduceJobEvent({
         status: 'active',

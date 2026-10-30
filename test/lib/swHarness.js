@@ -93,9 +93,77 @@ function makeEvent() {
     }
 }
 
-function createFakeBrowser(initialStorage = {}) {
-    const storage = clone(initialStorage) || {}
+const {
+    PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
+    PROFILE_NUKE_PROGRESS_VIEW_KEY,
+    QUEUE_WAKEUP_METRICS_KEY,
+    QUEUE_WAKEUP_METRICS_VIEW_KEY,
+    STORAGE_LAYOUT_PREFIX
+} = require('../../shared/js/storageKeys')
+const {WORKER_WINDOW_FOREGROUND_MODES} = require('../../shared/js/swprefs')
+
+// Decision 31: profile progress (the view and the shards) is held in session storage, never on disk. A progress key in a seed goes to
+// the session copy, unless options.progressOnDisk is set (the legacy-copy cleanup test seeds the old disk copy that way).
+function isProfileProgressStorageKey(key = '') {
+    return key === PROFILE_NUKE_PROGRESS_VIEW_KEY || key.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)
+}
+
+// Owner decision 26 Oct: the queue-wakeup metrics record and its dashboard view are held in session storage, never on disk.
+function isQueueWakeupMetricsStorageKey(key = '') {
+    return key === QUEUE_WAKEUP_METRICS_KEY || key === QUEUE_WAKEUP_METRICS_VIEW_KEY
+}
+
+// Every key that lives in session storage, as opposed to the disk copy.
+function isSessionOnlyStorageKey(key = '') {
+    return isProfileProgressStorageKey(key) || isQueueWakeupMetricsStorageKey(key)
+}
+
+// The storage a test reads for the worker, under plain names: a test reads and writes `storage.mbCoordinatorRuns`, and the raw areas
+// hold `v1.6.mbCoordinatorRuns`. Disk keys come from the local copy and progress and metrics keys from the session copy. Reads, writes
+// and deletes of those keys go to the session copy. Stored names outside this layout are not shown.
+function makeWorkerStorageView(localStorage, sessionStorage, layoutPrefix = '') {
+    const toStored = key => typeof key === 'string' ? `${layoutPrefix}${key}` : key
+    const toPlain = name => typeof name === 'string' && name.startsWith(layoutPrefix) ? name.slice(layoutPrefix.length) : null
+    const isProgressKey = key => typeof key === 'string' && isSessionOnlyStorageKey(key)
+    return new Proxy(localStorage, {
+        get: (target, key) => isProgressKey(key) ? sessionStorage[toStored(key)] : target[toStored(key)],
+        set(target, key, value) {
+            if(isProgressKey(key)) sessionStorage[toStored(key)] = value
+            else target[toStored(key)] = value
+            return true
+        },
+        has: (target, key) => isProgressKey(key) ? toStored(key) in sessionStorage : toStored(key) in target,
+        deleteProperty(target, key) {
+            if(isProgressKey(key)) delete sessionStorage[toStored(key)]
+            else delete target[toStored(key)]
+            return true
+        },
+        ownKeys: target => [
+            ...Object.keys(target).map(toPlain).filter(key => key !== null && !isProgressKey(key)),
+            ...Object.keys(sessionStorage).map(toPlain).filter(key => key !== null && isSessionOnlyStorageKey(key))
+        ],
+        getOwnPropertyDescriptor(target, key) {
+            if(!isProgressKey(key)) return Object.getOwnPropertyDescriptor(target, toStored(key))
+            const descriptor = Object.getOwnPropertyDescriptor(sessionStorage, toStored(key))
+            return descriptor ? {...descriptor, configurable: true} : undefined
+        }
+    })
+}
+
+function createFakeBrowser(initialStorage = {}, options = {}) {
+    // The raw areas hold stored names (the layout prefix plus the plain name, storageNamespace.js). A seed is written under plain names,
+    // so the seed is stored under the prefix here; progress keys go to the session copy unless options.progressOnDisk is set.
+    const layoutPrefix = options.layoutPrefix ?? ''
+    const storage = {}
     const sessionStorage = {}
+    for(const [key, value] of Object.entries(clone(initialStorage) || {})) {
+        const storedName = `${layoutPrefix}${key}`
+        const onSession = isQueueWakeupMetricsStorageKey(key) || (options.progressOnDisk !== true && isProfileProgressStorageKey(key))
+        if(onSession) sessionStorage[storedName] = value
+        else storage[storedName] = value
+    }
+    // Stored names as they are (a copy of an earlier run's raw storage, or keys another layout wrote): not prefixed here.
+    for(const [storedName, value] of Object.entries(clone(options.rawStorage) || {})) storage[storedName] = value
     const runtimeOnMessage = makeEvent()
     const storageOnChanged = makeEvent()
     const alarmsOnAlarm = makeEvent()
@@ -122,6 +190,8 @@ function createFakeBrowser(initialStorage = {}) {
     function makeStorageArea(targetStorage, areaName = 'local') {
         return {
             async get(defaults = {}) {
+                // get(null) reads every key, as chrome.storage does.
+                if(defaults === null) return clone(targetStorage)
                 if(typeof defaults === 'string') {
                     return {[defaults]: clone(targetStorage[defaults])}
                 }
@@ -145,6 +215,9 @@ function createFakeBrowser(initialStorage = {}) {
                     await storageOnChanged.emit(changes, areaName)
                 }
             },
+            async clear() {
+                for(const key of Object.keys(targetStorage)) delete targetStorage[key]
+            },
             async remove(keys) {
                 const list = Array.isArray(keys) ? keys : [keys]
                 const changes = {}
@@ -155,7 +228,8 @@ function createFakeBrowser(initialStorage = {}) {
                     }
                     delete targetStorage[key]
                 }
-                await storageOnChanged.emit(changes, areaName)
+                // As in the browser, a remove resolves without waiting for the change listeners.
+                void storageOnChanged.emit(changes, areaName)
             }
         }
     }
@@ -170,6 +244,8 @@ function createFakeBrowser(initialStorage = {}) {
             onInstalled: makeEvent(),
             onStartup: makeEvent(),
             onSuspend: makeEvent(),
+            // The erase reloads the extension. The harness does not restart; a test that wants to see the reload replaces this.
+            reload() {},
             onMessage: runtimeOnMessage,
             getURL(relativePath = '') {
                 return `moz-extension://mute-block/${relativePath}`
@@ -422,8 +498,11 @@ function matchUrlPattern(url = '', pattern = '') {
 // context to produce fresh, isolated state per harness instantiation.
 const compiledModuleScripts = new Map() // absolutePath -> vm.Script
 
-function createSharedRealmRequire(context, browser, baseRequire) {
+function createSharedRealmRequire(context, browser, baseRequire, layoutPrefix = '') {
     const moduleCache = new Map() // absolutePath -> {exports}
+    // The storage key names are the real module, with this harness's layout prefix (storageNamespace.js reads the prefix from here).
+    const storageKeysPath = path.resolve(__dirname, '../../shared/js/storageKeys.js')
+    const storageKeysForLayout = {...require('../../shared/js/storageKeys'), STORAGE_LAYOUT_PREFIX: layoutPrefix}
 
     function requireFrom(callerDir) {
         return function localRequire(request) {
@@ -432,6 +511,7 @@ function createSharedRealmRequire(context, browser, baseRequire) {
 
             let resolvedPath = path.resolve(callerDir, request)
             if(!resolvedPath.endsWith('.js')) resolvedPath += '.js'
+            if(resolvedPath === storageKeysPath) return storageKeysForLayout
 
             if(moduleCache.has(resolvedPath)) {
                 return moduleCache.get(resolvedPath).exports
@@ -463,14 +543,17 @@ function loadServiceWorkerHarness(options = {}) {
     const repoRoot = path.resolve(__dirname, '..', '..')
     const swPath = path.join(repoRoot, 'shared/js/sw.js')
     const timers = options.timers || createFakeTimers(options.now || 0)
-    const browser = options.browser || createFakeBrowser(options.storage || {})
+    // The layout prefix of this harness's stored keys. The default is no prefix: the behavioural suite runs on plain names. A test
+    // that checks the layout passes layoutPrefix (storageKeys STORAGE_LAYOUT_PREFIX), and then the worker writes prefixed keys only.
+    const layoutPrefix = options.layoutPrefix ?? ''
+    const browser = options.browser || createFakeBrowser(options.storage || {}, {progressOnDisk: options.progressOnDisk, layoutPrefix, rawStorage: options.rawStorage})
     const baseRequire = createRequire(swPath)
-    let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\n${fs.readFileSync(swPath, 'utf8')}`
+    let source = `let __testHarnessDeactivated = false;\nlet __testCoordinatorExecutorStartThrow = null;\nlet __testCoordinatorExecutorStartResult = null;\n${fs.readFileSync(swPath, 'utf8')}`
 
     if(!options.runStartupWork) {
         source = source
             .replace(/\nvoid startQueueWakeupMetricsBackedStartupWork\(\)/, '\n')
-            .replace(/\nscheduleStoredWorkRearmAfterServiceWorkerReload\(\)/, '\n')
+            .replace(/\nvoid scheduleStoredWorkRearmAfterStartupHydrate\(\)/, '\n')
     }
     if(options.disableQueueWakeupMetricsFlush === true) {
         source = source.replace(
@@ -479,13 +562,13 @@ function loadServiceWorkerHarness(options = {}) {
         )
     }
     if(options.disableQueueWalCheckpointSwitch === true) {
-        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
+        const needle = "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n"
         if(!source.includes(needle)) {
             throw new Error('disableQueueWalCheckpointSwitch patch target not found in sw.js -- signature drifted, update swHarness.js')
         }
         source = source.replace(
             needle,
-            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n    const normalizedReason = `${reason || 'segment-soft-threshold'}`.trim() || 'segment-soft-threshold'"
+            "function scheduleCoordinatorQueueWalCheckpointSwitch(reason = 'segment-soft-threshold', committedSegments = 0) {\n    return null\n"
         )
     }
     if(options.fastExecutorResumeTimeoutMs) {
@@ -495,21 +578,9 @@ function loadServiceWorkerHarness(options = {}) {
             `const COORDINATOR_FAST_EXECUTOR_RESUME_TIMEOUT_MS = ${timeoutMs}`
         )
     }
-    if(options.shadowWalRecordLimit) {
-        const recordLimit = Math.max(2, Number.parseInt(options.shadowWalRecordLimit, 10) || 0)
-        source = source
-            .replace(
-                'const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = 128',
-                `const MAX_COORDINATOR_AUTHORITY_SHADOW_WAL_RECORDS = ${recordLimit}`
-            )
-            .replace(
-                'const MAX_PROGRESS_SHADOW_WAL_RECORDS = 128',
-                `const MAX_PROGRESS_SHADOW_WAL_RECORDS = ${recordLimit}`
-            )
-    }
     source = source.replace(
         'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    clearStaleCoordinatorExecutorStartPromise',
-        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    clearStaleCoordinatorExecutorStartPromise'
+        'async function enqueueExistingExecutorForCoordinator(items = [], coordinator = {}, options = {}) {\n    if(__testCoordinatorExecutorStartThrow) {\n        const error = __testCoordinatorExecutorStartThrow\n        __testCoordinatorExecutorStartThrow = null\n        throw error\n    }\n    if(__testCoordinatorExecutorStartResult) {\n        const result = __testCoordinatorExecutorStartResult\n        __testCoordinatorExecutorStartResult = null\n        return result\n    }\n    clearStaleCoordinatorExecutorStartPromise'
     )
     source = source.replace(
         'async function metricStorageGet(defaults = {}, options = {}) {\n    incrementQueueWakeupMetric',
@@ -523,26 +594,26 @@ function loadServiceWorkerHarness(options = {}) {
         'async function metricStorageRemove(keys = [], options = {}) {\n    const normalizedKeys',
         'async function metricStorageRemove(keys = [], options = {}) {\n    if(__testHarnessDeactivated) return false\n    const normalizedKeys'
     )
-    source = source.replace(
-        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot',
-        'function recoverCoordinatorQueueFromWal(snapshotQueue = {}, walStore = null, options = {}) {\n    const normalizedSnapshot'
-    )
-    source = source.replace(
-        '    if(!walStore || typeof walStore !== \'object\') {\n        return {',
-        '    if(__testHarnessDeactivated) {\n        return {\n            queue: normalizedSnapshot,\n            recovered: false,\n            reason: \'test-harness-deactivated\'\n        }\n    }\n\n    if(!walStore || typeof walStore !== \'object\') {\n        return {'
-    )
     source += `
 
 module.exports.__test = {
     archiveTerminalCoordinatorRow,
+    startDebugResumeLimit,
+    enforceDebugResumeLimit,
+    handleDebugResumeLimitAlarm,
+    getDebugResumeLimitStatus,
+    orderQueuedItemsForDrain,
+    noteDebugResumeTargetFinished,
     applyCoordinatorRowEvent,
     applyCoordinatorRowEvents,
     buildCoordinatorQueueView,
+    buildCoordinatorQueueViewFromDashboardSnapshot,
     mergeCoordinatorQueueViewTimingCache,
     setCoordinatorQueueWalResidentStoreCache,
     getResidentCoordinatorQueueWalPhysicalStoredSupplement,
     buildCoordinatorContentQueueIndex,
     coordinatorRawQueueNormalizationChangedRows,
+    coordinatorStorageAdapter,
     normalizeRawCoordinatorQueueForReconcileFallback,
     getOwnedNukeStatus,
     buildQueueWakeupMetricsView,
@@ -550,19 +621,39 @@ module.exports.__test = {
     coordinatorAuthority,
     enqueueSpaceFeedStorageUpdate,
     enqueueExistingExecutorForCoordinator,
+    enqueueExistingExecutorForCoordinatorOnce,
+    fillQueuedTabsOnce,
+    readResidentDerivedQueueIndex,
+    getLegacyContentIndexCleanupNames,
+    retireLegacyContentIndexKeys,
+    getContentPageCoordinatorState,
+    recordDirectProfileProgressFromRequest,
+    cancelCoordinatorCurrentWork,
+    pauseCoordinatorNukes,
+    // Test-only hooks for the executor-start token and the pause guard (review-2 S2-1, S2-2, S3-1). Getters read the live binding.
+    resetCoordinatorExecutorStartPromiseAfterTimeout: reason => persistentRetryExecutorTimers.resetCoordinatorExecutorStartPromiseAfterTimeout(reason),
+    getCoordinatorExecutorStartTokenForTest: () => coordinatorExecutorStartToken,
+    getQueuedTabConcurrencyForTest: () => queuedTabConcurrency,
+    getCoordinatorPauseRequestedForTest: () => coordinatorPauseRequested,
+    getCoordinatorQueueViewTimingCacheForTest: () => coordinatorQueueViewTimingCache,
+    clearCoordinatorTerminalStats,
+    runCoordinatorExecutorApplyPhase,
     buildQueuedTabOpenEffectPlan,
     applyQueuedTabOpenRuntimeEffect,
     confirmQueuedTabOpenDurableActiveEffect,
+    rollbackFailedQueuedTabOpen,
     kickCoordinatorQueueResume,
     metricStorageGet,
     metricStorageSet,
-    mutateCoordinatorFailedItemsRequeue,
     recoverStoredCoordinatorWork,
     ensureQueuedTabContentScript,
     handleQueuedTabContentScriptEnsureResult,
     nudgeQueuedTabActionClaim,
     nudgeQueuedTabActionClaimWithRetries,
     ensureProfileNukeProgressReady,
+    saveProfileNukeProgressRowProjection,
+    rebuildContentPageStateProjectionFromCurrentState,
+    deleteProfileNukeProgressRowProjection,
     reconcileCoordinatorStorage,
     recordCoordinatorJobProgress,
     recordCoordinatorJobProgressRecords,
@@ -571,13 +662,17 @@ module.exports.__test = {
     getFlightRecorderSnapshot,
     createOwnedTabInQueuedWorkerActionSurface,
     getOrCreateQueuedWorkerActionSurface,
-    restoreFocusIfQueuedWorkerActionSurfaceIdle,
     getCoordinatorWhyNotRunning,
     getStorageUpdateQueueSnapshot,
     getRuntimeSurfaceForCoordinatorItem,
     buildRuntimeSurfaceIndex,
     getCoordinatorResumeMaxConcurrent,
     setTargetQueuedTabConcurrency,
+    setWorkerWindowForegroundMode,
+    startCoordinatorWorkSession,
+    endCoordinatorWorkSession,
+    isCoordinatorPausedInStorage,
+    readResidentCoordinatorStored,
     getTargetQueuedTabConcurrency: () => targetQueuedTabConcurrency,
     summarizeCoordinatorActualBlockTiming,
     summarizeCoordinatorAlreadyBlockedTiming,
@@ -599,6 +694,8 @@ module.exports.__test = {
     refreshCoordinatorQueueViewForDashboard,
     refreshCoordinatorRunsViewForDashboard,
     refreshCoordinatorDashboardViewsForDashboard,
+    loadCoordinatorOutliersRecord,
+    loadCoordinatorDashboardAuthoritySnapshot,
     loadCoordinatorQueueRowFromStorage,
     loadCoordinatorQueueRowsFromStorage,
     rebuildCoordinatorQueueMirrorFromDisk,
@@ -651,7 +748,7 @@ module.exports.__test = {
     terminalizeActiveCoordinatorItemFromBlockedLiveTab,
     terminalizeExhaustedRolledBackQueuedCoordinatorItem,
     terminalizeExhaustedRolledBackQueuedCoordinatorItems,
-    __testResetFlightRecorder,
+    __testResetFlightRecorder: require('./swflightRecorder').__testResetFlightRecorder,
     __testDeactivateHarness() {
         __testHarnessDeactivated = true
         if(storageUpdateState.getActiveRawToken()) {
@@ -710,12 +807,6 @@ module.exports.__test = {
     __testClaimQueuedActivationGuard(action = {}, tab = null, reason = 'test') {
         return claimQueuedActivationGuard(action, tab, reason)
     },
-    __testSetCoordinatorAuthorityShadowWalStore(value) {
-        coordinatorAuthorityShadowWalStore = value
-    },
-    __testSetProgressShadowWalStore(value) {
-        progressShadowWalStore = value
-    },
     __testPauseQueuedOwner(ownerTabId) {
         queueRuntime.pauseQueuedOwner(ownerTabId)
     },
@@ -733,6 +824,9 @@ module.exports.__test = {
     },
     __testSetCoordinatorExecutorStartThrow(error) {
         __testCoordinatorExecutorStartThrow = error
+    },
+    __testSetCoordinatorExecutorStartResult(result) {
+        __testCoordinatorExecutorStartResult = result
     },
     __testSetCoordinatorReconcilePromise(promise, startedAt = Date.now()) {
         coordinatorReconcilePromise = promise
@@ -756,9 +850,8 @@ module.exports.__test = {
             pauseWindows: [...(getQueueWakeupMetricEpoch().pauseWindows || [])],
             queueLoadThrottleWindows: [...(getQueueWakeupMetricEpoch().queueLoadThrottleWindows || [])],
             profileNukeProgress: {...profileNukeProgress},
-            coordinatorAuthorityShadowWalStore: JSON.parse(JSON.stringify(coordinatorAuthorityShadowWalStore)),
-            progressShadowWalStore: JSON.parse(JSON.stringify(progressShadowWalStore)),
-            coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.current().stored?.mbCoordinatorQueueWal || null)),
+            // The resident stored copy, not current(): a counters snapshot must still read after a failed hydrate (D4 guard).
+            coordinatorQueueWal: JSON.parse(JSON.stringify(coordinatorAuthority.residentStored()?.mbCoordinatorQueueWal || null)),
             spaceFeedStorageUpdateDepth: storageUpdateState.getDepth(),
             abandonedSpaceFeedStorageUpdates: storageUpdateState.getAbandonedCount(),
             queuedTabFillPromise: hasVisibleQueuedTabFillPromise(),
@@ -851,18 +944,29 @@ module.exports.__test = {
         Math
     }
     vm.createContext(context)
-    const localRequire = createSharedRealmRequire(context, browser, baseRequire)(path.dirname(swPath))
+    const localRequire = createSharedRealmRequire(context, browser, baseRequire, layoutPrefix)(path.dirname(swPath))
     context.require = localRequire
 
     const wrapper = `(function(exports, require, module, __filename, __dirname) {\n${source}\n})`
     const compiled = new vm.Script(wrapper, {filename: swPath}).runInContext(context)
     compiled(module.exports, localRequire, module, swPath, path.dirname(swPath))
 
+    // The worker-window foreground mode is the worker's stored preference. A test passes workerWindowForegroundMode to choose one.
+    // Otherwise, when the test stores no mode, the synthetic focus assertions run in 'focus', the mode they were written against.
+    const pinnedWorkerWindowForegroundMode = options.workerWindowForegroundMode ||
+        (options.storage?.workerWindowForegroundMode === undefined ? 'focus' : null)
+    if(pinnedWorkerWindowForegroundMode) {
+        if(!WORKER_WINDOW_FOREGROUND_MODES.includes(pinnedWorkerWindowForegroundMode)) {
+            throw new Error(`unknown workerWindowForegroundMode: ${pinnedWorkerWindowForegroundMode}`)
+        }
+        module.exports.__test.setWorkerWindowForegroundMode(pinnedWorkerWindowForegroundMode)
+    }
+
     return {
         browser,
         timers,
         sw: module.exports.__test,
-        storage: browser.__storage
+        storage: makeWorkerStorageView(browser.__storage, browser.__sessionStorage, layoutPrefix)
     }
 }
 

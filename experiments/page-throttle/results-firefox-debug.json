@@ -1,0 +1,38 @@
+{
+  "mode": "short",
+  "addonId": "throttle-probe@mute-block.local",
+  "extensionUuid": "f0cb764b-dad4-4be6-9ed7-fb41c6714de3",
+  "phaseSeconds": 5,
+  "firstForeground": {
+    "windowSeconds": 5,
+    "visibilityAtEnd": "visible",
+    "pageTicksPerSecond": 9.99,
+    "workerTicksPerSecond": 9.99,
+    "workerTicksAtEnd": 59,
+    "workerError": null
+  },
+  "secondBackground": {
+    "windowSeconds": 5,
+    "visibilityAtEnd": "hidden",
+    "pageTicksPerSecond": 1,
+    "workerTicksPerSecond": 9.99,
+    "workerTicksAtEnd": 109,
+    "workerError": null
+  },
+  "secondForeground": {
+    "windowSeconds": 5,
+    "visibilityAtEnd": "visible",
+    "pageTicksPerSecond": 9.98,
+    "workerTicksPerSecond": 9.97,
+    "workerTicksAtEnd": 169,
+    "workerError": null
+  },
+  "firstBackground": {
+    "windowSeconds": 5,
+    "visibilityAtEnd": "hidden",
+    "pageTicksPerSecond": 1,
+    "workerTicksPerSecond": 9.96,
+    "workerTicksAtEnd": 219,
+    "workerError": null
+  }
+}

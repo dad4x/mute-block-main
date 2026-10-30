@@ -73,7 +73,7 @@
 // synchronous data-in/data-out wrappers, predicates, and builders.
 //
 // cloneCoordinatorAuthorityValue and the createCoordinatorAuthority-adjacent
-// region, plus the queue-WAL/shadow-WAL async cluster, are explicitly out of
+// region, plus the queue-WAL async cluster, are explicitly out of
 // scope for this decomposition effort (see the plan's "Boundary after
 // Slice 17" section) and are untouched here.
 

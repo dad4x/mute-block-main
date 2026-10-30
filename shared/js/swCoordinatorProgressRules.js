@@ -35,7 +35,7 @@ function createCoordinatorProgressRules(deps = {}) {
         isTerminalCoordinatorStatus,
         isCoordinatorQueueAuthoritativeItem,
         isPendingCoordinatorStatus,
-        isRetryableCoordinatorFailure,
+        isArchivableCoordinatorRow,
         getCoordinatorItemHref,
         normalizeQuoraProfileUrl,
         normalizeCoordinatorActionLease,
@@ -80,7 +80,7 @@ function createCoordinatorProgressRules(deps = {}) {
     }
 
     function mergeCoordinatorEvidence(existingEvidence = [], incomingEvidence = []) {
-        const seen = new Set()
+        const mergedByKey = new Map()
         const merged = []
 
         for(const evidence of [...existingEvidence, ...incomingEvidence]) {
@@ -91,9 +91,17 @@ function createCoordinatorProgressRules(deps = {}) {
                 evidence.collector || '',
                 evidence.sourcePageUrl || ''
             ].join('|')
-            if(seen.has(key)) continue
-            seen.add(key)
-            merged.push({
+            // Decision 12 (18 Oct): a post's full candidate list rides on its evidence records. Records that merge into one keep the
+            // union of their lists. A record with no list gets no candidateUrls key, so older records keep their shape.
+            const candidateUrls = Array.isArray(evidence.candidateUrls)
+                ? evidence.candidateUrls.filter(url => typeof url === 'string' && url)
+                : []
+            if(mergedByKey.has(key)) {
+                const record = mergedByKey.get(key)
+                if(candidateUrls.length) record.candidateUrls = [...new Set([...(record.candidateUrls || []), ...candidateUrls])]
+                continue
+            }
+            const record = {
                 postKey: evidence.postKey || '',
                 postUrl: evidence.postUrl || '',
                 collector: evidence.collector || '',
@@ -102,7 +110,10 @@ function createCoordinatorProgressRules(deps = {}) {
                 rawSlug: evidence.rawSlug || '',
                 resolutionReason: evidence.resolutionReason || '',
                 sourcePageUrl: evidence.sourcePageUrl || ''
-            })
+            }
+            if(candidateUrls.length) record.candidateUrls = [...new Set(candidateUrls)]
+            mergedByKey.set(key, record)
+            merged.push(record)
         }
 
         return merged
@@ -252,7 +263,8 @@ function createCoordinatorProgressRules(deps = {}) {
     function shouldKeepCoordinatorCurrentWorkItem(item = null, nowMs = now()) {
         if(!item || typeof item !== 'object') return false
         if(isPendingCoordinatorStatus(item.status)) return true
-        if(isRetryableCoordinatorFailure(item)) return true
+        // A soft failure with automatic retries left is not archivable (isArchivableCoordinatorRow), so it stays live.
+        if(!isArchivableCoordinatorRow(item)) return true
         if(!isTerminalCoordinatorStatus(item.status)) return true
         if(hasUnsettledCoordinatorSource(item)) return true
 
@@ -260,11 +272,16 @@ function createCoordinatorProgressRules(deps = {}) {
         return !anchor || nowMs - anchor <= CURRENT_WORK_RETENTION_MS
     }
 
-    function pruneCoordinatorCurrentWork(queue = {}, nowMs = now()) {
+    // Removes the rows that are past retention and settled. Since 2026-10-13 a removed row is archived, not discarded: the
+    // caller writes it to the completed-work log in the same door write as the removal (sw.js
+    // persistCoordinatorReconcileQueueAuthorityMutation). Each removed key is pushed onto prunedRowKeys when that array is
+    // given. Only archivable rows are ever removed (see shouldKeepCoordinatorCurrentWorkItem).
+    function pruneCoordinatorCurrentWork(queue = {}, nowMs = now(), prunedRowKeys = null) {
         let changed = false
 
         for(const [key, item] of Object.entries(queue || {})) {
             if(shouldKeepCoordinatorCurrentWorkItem(item, nowMs)) continue
+            if(Array.isArray(prunedRowKeys)) prunedRowKeys.push(key)
             delete queue[key]
             changed = true
         }

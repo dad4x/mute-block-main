@@ -16,14 +16,6 @@
 // onto bare names in sw.js, same as every other still-ambient sw.js
 // function this module depends on (getActiveStorageContext).
 //
-// notifyCoordinatorAuthorityPersistedSnapshot reads coordinatorAuthoritySnapshotObserver,
-// a module-level `let` in sw.js assigned once well after this module is
-// constructed (coordinatorAuthority.absorbPersistedSnapshot is wired up
-// later in sw.js's initialization order). It's threaded through as a live
-// getSnapshotObserver() accessor, following the same get/set-accessor
-// convention swQueueWakeupMetricsShape.js uses for state it doesn't own,
-// so this module always sees the current value at call time rather than
-// whatever was assigned (or not yet assigned) at construction time.
 
 function createStorageMetrics(deps = {}) {
     const {
@@ -37,8 +29,7 @@ function createStorageMetrics(deps = {}) {
         QUEUE_WAKEUP_METRICS_VIEW_KEY,
         PROFILE_NUKE_PROGRESS_VIEW_KEY,
         PROFILE_NUKE_PROGRESS_SHARD_PREFIX,
-        SPACE_PENDING_NUKED_POSTS_KEY,
-        SPACE_NUKED_POSTS_KEY,
+        COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX,
         OWNED_TAB_STATE_KEY,
         COORDINATOR_PAUSED_KEY,
         COORDINATOR_PAUSE_GENERATION_KEY,
@@ -52,9 +43,6 @@ function createStorageMetrics(deps = {}) {
         setActiveStorageMetricDetail,
         getActiveStorageContext
     } = deps.handlers || {}
-    const {
-        getSnapshotObserver = () => null
-    } = deps.state || {}
 
     const SNAPSHOT_WRITE_REASONS = new Set([
         'ordinaryMutation',
@@ -77,8 +65,7 @@ function createStorageMetrics(deps = {}) {
         if(key === QUEUE_WAKEUP_METRICS_VIEW_KEY) return 'metricsView'
         if(key === PROFILE_NUKE_PROGRESS_VIEW_KEY) return 'progressView'
         if(`${key || ''}`.startsWith(PROFILE_NUKE_PROGRESS_SHARD_PREFIX)) return 'progressShard'
-        if(key === SPACE_PENDING_NUKED_POSTS_KEY) return 'pendingPosts'
-        if(key === SPACE_NUKED_POSTS_KEY) return 'rememberedNukes'
+        if(`${key || ''}`.startsWith(COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX)) return 'namespaceStamp'
         if(key === OWNED_TAB_STATE_KEY) return 'ownedTabs'
         if(key === COORDINATOR_PAUSED_KEY) return 'paused'
         if(key === COORDINATOR_PAUSE_GENERATION_KEY) return 'pauseGeneration'
@@ -270,9 +257,32 @@ function createStorageMetrics(deps = {}) {
         incrementActiveStorageMetricDetail('queueWriteChangedRows', changedRows)
     }
 
+    // The physical write: the bytes that reached storage after any bucket split, so the write card and the histogram show disk
+    // size, not the whole-map payload the caller built. One count per successful write, in the bucket its size falls in.
+    const PHYSICAL_WRITE_SIZE_BUCKETS = [
+        [1024, 'lt1k'],
+        [4096, '1k_4k'],
+        [16384, '4k_16k'],
+        [65536, '16k_64k'],
+        [262144, '64k_256k'],
+        [1048576, '256k_1m'],
+        [4194304, '1m_4m'],
+        [Infinity, 'ge4m']
+    ]
+    function recordPhysicalWriteMetrics(bytes = 0) {
+        const size = Math.max(0, Number(bytes) || 0)
+        if(!size) return
+        incrementQueueWakeupMetric('storagePhysical.write.total.bytes', size)
+        incrementQueueWakeupMetric('storagePhysical.write.total.calls')
+        recordQueueWakeupMetricMax('storagePhysical.write.total.maxBytes', size)
+        const [, bucketName] = PHYSICAL_WRITE_SIZE_BUCKETS.find(([limit]) => size < limit)
+        incrementQueueWakeupMetric(`storagePhysical.write.size.${bucketName}`)
+    }
+
+    // Returns the bytes, rows and key names it counted, so the write path can log the same numbers per write (owner 18 Oct).
     function recordStoragePayloadMetrics(payload = {}, pathName = '') {
         const entries = Object.entries(payload && typeof payload === 'object' ? payload : {})
-        if(!entries.length) return
+        if(!entries.length) return {bytes: 0, rows: 0, keys: []}
 
         let totalBytes = 0
         let totalRows = 0
@@ -292,7 +302,7 @@ function createStorageMetrics(deps = {}) {
             recordQueueWakeupMetricMax(`storagePayload.write.${metricKey}.maxRows`, rows)
         }
 
-        if(!totalBytes) return
+        if(!totalBytes) return {bytes: 0, rows: totalRows, keys: keyNames}
         incrementQueueWakeupMetric('storagePayload.write.total.bytes', totalBytes)
         incrementQueueWakeupMetric('storagePayload.write.total.calls')
         incrementQueueWakeupMetric('storagePayload.write.total.rows', totalRows)
@@ -301,6 +311,7 @@ function createStorageMetrics(deps = {}) {
         incrementActiveStorageMetricDetail('payloadBytes', totalBytes)
         setActiveStorageMetricDetail('payloadKeys', keyNames.slice(0, 12).join(','))
         setActiveStorageMetricDetail('payloadPath', normalizeStorageMetricPathName(pathName))
+        return {bytes: totalBytes, rows: totalRows, keys: keyNames}
     }
 
     function recordStorageReadPayloadMetrics(payload = {}, pathName = '') {
@@ -336,23 +347,6 @@ function createStorageMetrics(deps = {}) {
         setActiveStorageMetricDetail('readPayloadPath', normalizeStorageMetricPathName(pathName))
     }
 
-    function notifyCoordinatorAuthorityPersistedSnapshot(payload = {}) {
-        const snapshotObserver = getSnapshotObserver()
-        if(typeof snapshotObserver !== 'function') return
-        if(payload &&
-            typeof payload === 'object' &&
-            Object.prototype.hasOwnProperty.call(payload, COORDINATOR_QUEUE_KEY)) {
-            incrementQueueWakeupMetric('coordinatorAuthority.rawQueueSnapshotObserverIgnored')
-            return
-        }
-        try {
-            snapshotObserver(payload)
-        }
-        catch(error) {
-            incrementQueueWakeupMetric('coordinatorAuthority.snapshotObserverFailed')
-        }
-    }
-
     return {
         getStorageMetricKeyName,
         getJsonByteSize,
@@ -370,7 +364,7 @@ function createStorageMetrics(deps = {}) {
         recordQueueWriteOperationMetrics,
         recordStoragePayloadMetrics,
         recordStorageReadPayloadMetrics,
-        notifyCoordinatorAuthorityPersistedSnapshot
+        recordPhysicalWriteMetrics
     }
 }
 

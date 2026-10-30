@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_QUEUE_WAL_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+const {plainName} = require('../../shared/js/storageNamespace')
+
 const {
     buildSegmentedWalStoragePayload,
     hydrateSegmentedWalStore,
@@ -16,9 +19,19 @@ const {
     runMain
 } = require('./lib/cdp')
 
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
+
+// The plain names of this layout's stored keys (storageNamespace.js). Stored keys of other layouts are left out.
+function plainStored(storage = {}) {
+    return Object.fromEntries(Object.entries(storage || {})
+        .map(([storedName, value]) => [plainName(storedName), value])
+        .filter(([key]) => key !== null))
+}
+
+// A plain-keyed map as the stored names it is written under (storageNamespace.js).
+function prefixedPayload(plain = {}) {
+    return Object.fromEntries(Object.entries(plain).map(([key, value]) => [`${STORAGE_LAYOUT_PREFIX}${key}`, value]))
+}
 
 function getWalPhysicalKeys(stored = {}) {
     return Object.keys(stored || {})
@@ -80,10 +93,11 @@ runMain(async () => {
         return
     }
 
-    const stored = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
+    const storedRaw = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function readStorage() {
         return chrome.storage.local.get(null)
     }})()`, 60000)
-    const existing = readExistingRecovery(stored || {})
+    const stored = plainStored(storedRaw)
+    const existing = readExistingRecovery(stored)
     const rawQueue = stored?.[COORDINATOR_QUEUE_KEY] || {}
     const rawRowCount = Object.keys(rawQueue).length
     const previousMeta = existing.meta || stored?.[COORDINATOR_QUEUE_WAL_META_KEY] || stored?.[COORDINATOR_QUEUE_WAL_KEY]?.meta || null
@@ -106,6 +120,8 @@ runMain(async () => {
         .filter(key => !payloadKeys.includes(key))
     const shouldApply = apply && (force || existing.recovered !== true)
 
+    const payloadToWrite = prefixedPayload(payload)
+    const retiredToRemove = retiredKeys.map(key => `${STORAGE_LAYOUT_PREFIX}${key}`)
     let writeResult = null
     if(shouldApply) {
         writeResult = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function recover(payload, retiredKeys) {
@@ -116,7 +132,7 @@ runMain(async () => {
                 payloadKeys: Object.keys(payload).length,
                 retiredKeys: retiredKeys.length
             }
-        }})(${JSON.stringify(payload)}, ${JSON.stringify(retiredKeys)})`, 60000)
+        }})(${JSON.stringify(payloadToWrite)}, ${JSON.stringify(retiredToRemove)})`, 60000)
     }
 
     console.log(JSON.stringify({

@@ -181,7 +181,7 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
             reason: `${reason || ''}`.trim()
         }
         const errorText = `${error || ''}`.trim()
-        if(errorText) result.error = errorText.slice(0, 240)
+        if(errorText) result.error = errorText.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         for(const field of [
             'terminalizationPolicy',
             'enqueueResultReason',
@@ -189,7 +189,7 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
             'fillError'
         ]) {
             const value = `${diagnostics?.[field] || ''}`.trim()
-            if(value) result[field] = value.slice(0, 240)
+            if(value) result[field] = value.slice(0, STORED_ERROR_TEXT_MAX_CHARS)
         }
         for(const field of [
             'enqueueQueued',
@@ -359,3 +359,4 @@ function createExecutorEnqueueFailureClassification(deps = {}) {
 module.exports = {
     createExecutorEnqueueFailureClassification
 }
+const {STORED_ERROR_TEXT_MAX_CHARS} = require('./tunables')

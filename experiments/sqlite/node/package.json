@@ -1,0 +1,1 @@
+{"name":"sqlite-spike-node","private":true,"version":"0.0.0","dependencies":{"@sqlite.org/sqlite-wasm":"^3.53.4-build2"}}

@@ -56,7 +56,7 @@
 // sites.
 //
 // 2026-09-17 design correction (P3-5/P3-6, see
-// sw-state-machine-decomposition-plan-2026-09-01.md): isQueuedTabRetryBudgetReleaseReason,
+// historical/sw-state-machine-decomposition-plan-2026-09-01.md): isQueuedTabRetryBudgetReleaseReason,
 // shouldAdvanceRolledBackQueuedTabBeforeOpen, getRolledBackQueuedTabRetryAttempt,
 // isExhaustedRolledBackQueuedTabRetry, isActiveTransitionRolledBackQueuedTabRetry,
 // isRuntimeDisappearedRolledBackQueuedTabRetry, and isTransientOpenRolledBackQueuedTabRetry
@@ -209,7 +209,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
     }
 
     // Converged onto jobState.js's reduceJobEvent per P3-5/P3-6
-    // (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3 dispatch
+    // (historical/sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3 dispatch
     // plan", corrected design 2026-09-17): the three approval paths this
     // function used to branch on by hand -- queueOnlyAuthority's shortcut,
     // the recoverActiveTransitionFailures reason-match, and the
@@ -289,7 +289,7 @@ function createRolledBackQueuedTabRetryClassification(deps = {}) {
         }
     }
 
-    // P3-6 (sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3
+    // P3-6 (historical/sw-state-machine-decomposition-plan-2026-09-01.md, "Part 3
     // dispatch plan") originally left this function bumping
     // exhaustedRolledBackRecoveryCount by hand instead of letting the
     // reducer own the increment, blocked on two things: (1) this function

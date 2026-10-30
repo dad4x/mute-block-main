@@ -1,3 +1,5 @@
+> **Status: ROADMAP** (24 Oct 2026). Discussion draft on the shared-moderation buttons (20 May). Not a plan. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: discussion draft.
 
 Canonical planning now starts at planning.md. Canonical architecture starts at

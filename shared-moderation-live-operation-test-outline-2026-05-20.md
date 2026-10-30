@@ -1,5 +1,7 @@
 # Shared Moderation Live Operation Test Outline, 2026-05-20
 
+> **Status: ROADMAP** (24 Oct 2026). Future live-test outline. Not current. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: future live-test plan.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

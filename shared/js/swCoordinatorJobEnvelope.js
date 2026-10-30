@@ -47,6 +47,8 @@
 // through as get/set state accessors here, matching the
 // swQueueWakeupMetricsShape.js convention, rather than moved.
 
+const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
+
 function createCoordinatorJobEnvelope(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const {
@@ -75,6 +77,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
         getAttemptNumberFromValue,
         incrementQueueWakeupMetric,
         recordQueueWakeupMetricMax,
+        recordFlightRecorderEvent,
         getStorageUpdateDepth,
         getQueueRuntimeCounts
     } = deps.handlers || {}
@@ -186,6 +189,11 @@ function createCoordinatorJobEnvelope(deps = {}) {
     }
 
     function getFailedItemProfileResolutionRetryUrl(item = {}, fallbackKey = '') {
+        // Review 5 (R5-4), owner rule: a row that is not a resolution and has its own link is never retried as a resolution from
+        // its source post, because the post would choose the profile. A "did not land" error carries the post URL, so without this
+        // a canonical row could block a profile picked from its post.
+        if(!isProfileResolutionItem(item) && getCoordinatorItemHref(item)) return ''
+
         const fallbackResolutionUrl = getFailedItemQuestionResolutionUrl(item)
         if(fallbackResolutionUrl) return fallbackResolutionUrl
 
@@ -266,41 +274,6 @@ function createCoordinatorJobEnvelope(deps = {}) {
         }
     }
 
-    function getStoredSpaceFeedRecordUrls(record, key = 'remainingUrls') {
-        if(!record || typeof record !== 'object') return []
-
-        const urls = key && Array.isArray(record[key])
-            ? record[key]
-            : key === 'remainingUrls'
-                ? Array.isArray(record.remainingUrls)
-                    ? record.remainingUrls
-                    : Array.isArray(record.allUrls)
-                        ? record.allUrls
-                        : Array.isArray(record.urls)
-                            ? record.urls
-                            : []
-                : []
-
-        return getNormalizedProfileHrefList(urls)
-    }
-
-    function getPendingSpaceFeedJobKeyPatch(record = {}, remainingUrls = []) {
-        const remaining = getNormalizedProfileHrefList(remainingUrls)
-        const existingByHref = record?.jobKeysByProfileHref && typeof record.jobKeysByProfileHref === 'object'
-            ? record.jobKeysByProfileHref
-            : {}
-        const jobKeysByProfileHref = {}
-
-        for(const href of remaining) {
-            jobKeysByProfileHref[href] = normalizeQuoraProfileUrl(existingByHref[href] || href) || href
-        }
-
-        return {
-            jobKeys: getNormalizedProfileHrefList(Object.values(jobKeysByProfileHref)),
-            jobKeysByProfileHref
-        }
-    }
-
     function makeStaleAttemptDiagnosticEvent(details = {}) {
         return {
             id: makeId('event'),
@@ -320,10 +293,9 @@ function createCoordinatorJobEnvelope(deps = {}) {
 
     function recordCoordinatorDiagnosticEvent(type = 'coordinator-diagnostic', message = '', details = {}) {
         const event = {
-            id: makeId('event'),
+            type: `${type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic',
             runId: details?.runId || '',
             itemId: details?.itemId || '',
-            type: `${type || 'coordinator-diagnostic'}`.trim() || 'coordinator-diagnostic',
             message: `${message || 'Coordinator diagnostic event'}`.slice(0, 500),
             at: now(),
             details: details && typeof details === 'object'
@@ -331,17 +303,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
                 : {}
         }
         incrementQueueWakeupMetric('diagnosticEvent.received')
-        let pending = getPendingCoordinatorDiagnosticEvents()
-        pending.push(event)
-        if(pending.length > MAX_COORDINATOR_EVENTS) {
-            pending = pending.slice(-MAX_COORDINATOR_EVENTS)
-            setPendingCoordinatorDiagnosticEvents(pending)
-            incrementQueueWakeupMetric('diagnosticEvent.pendingPruned')
-        }
-        recordQueueWakeupMetricMax('diagnosticEvent.pendingMax', pending.length)
-        if(getStorageUpdateDepth() <= 0 && getCoordinatorDiagnosticBatchDepth() <= 0) {
-            incrementQueueWakeupMetric('diagnosticEvent.persistDeferred')
-        }
+        recordFlightRecorderEvent(coordinatorEventToFlightRecorderEntry(event))
         return true
     }
 
@@ -370,8 +332,6 @@ function createCoordinatorJobEnvelope(deps = {}) {
         getFailedItemQuestionResolutionUrl,
         getFailedItemProfileResolutionRetryUrl,
         buildQueuedCoordinatorProgressResetPatch,
-        getStoredSpaceFeedRecordUrls,
-        getPendingSpaceFeedJobKeyPatch,
         makeStaleAttemptDiagnosticEvent,
         recordCoordinatorDiagnosticEvent,
         drainPendingCoordinatorDiagnosticEvents,

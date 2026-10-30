@@ -1,5 +1,7 @@
 # Shared Moderation Runtime Boundary Handoff, 2026-05-20
 
+> **Status: ROADMAP** (24 Oct 2026). Boundary handoff (20 May). The rule that moderation data is advisory, not a command channel, is in architecture.md. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: supporting handoff, runtime integration deferred.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

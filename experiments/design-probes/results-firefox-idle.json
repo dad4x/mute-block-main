@@ -1,0 +1,6 @@
+{
+  "idleSeconds": 90,
+  "bootIdBefore": "b1d2dd5c-1536-4f03-815f-564d25c88194",
+  "bootIdAfterIdle": "bfca65b0-c312-4625-9677-ca80f21ba1ed",
+  "restartedWhileIdle": true
+}

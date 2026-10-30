@@ -1,6 +1,11 @@
 const {
     normalizeQuoraProfileHref
 } = require('./subject')
+const {
+    EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
+    QUEUE_LOAD_THROTTLE_MAX_MS,
+    STALE_QUEUED_TAB_MAX_RETRIES
+} = require('./tunables')
 
 const JOB_SCHEMA_VERSION = 2
 const DEFAULT_ACTION_KIND = 'mute-block'
@@ -414,8 +419,10 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
         error: terminal ? normalizeString(event.error || '') : '',
         updatedAt: Math.max(Number.parseInt(item.updatedAt, 10) || 0, now),
         queuedAt: nextStatus === 'queued' ? now : item.queuedAt || 0,
+        // A new activation starts a new clock. The earlier start is kept only while the row is already active, so a row that was
+        // queued again does not inherit the start of the attempt before it (that start gave 3.5 s averages on the dashboard).
         activeAt: nextStatus === 'active' || nextStatus === 'acting' || nextStatus === 'settling'
-            ? item.activeAt || now
+            ? (['active', 'acting', 'settling'].includes(item.status) && item.activeAt ? item.activeAt : now)
             : nextStatus === 'queued' ? 0 : item.activeAt || 0,
         terminalAt: terminal
             ? Number.parseInt(event.terminalAt || event.tabClosedAt, 10) || now
@@ -437,7 +444,7 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
 // --- Rolled-back queued tab retry classification -------------------------
 // Promoted from swRolledBackQueuedTabRetryClassification.js into the reducer
 // core (P3-5/P3-6 design correction, 2026-09-17, see
-// sw-state-machine-decomposition-plan-2026-09-01.md): every predicate below
+// historical/sw-state-machine-decomposition-plan-2026-09-01.md): every predicate below
 // is a pure, single-argument function of a queue item alone, so
 // reduceJobEvent computes them itself instead of trusting a caller-built
 // copy that could go stale (a caller reads the item at one point in time,
@@ -457,9 +464,6 @@ function applyJobStatusTransition(item = {}, status = '', event = {}) {
 // cheaper, lower-risk way to let the reducer compute it itself. See the
 // decomposition plan for the fuller rationale.
 const ACTIVE_JOB_STATUSES = new Set(['opening', 'active', 'acting', 'settling'])
-const DEFAULT_QUEUED_TAB_MAX_RETRIES = 1 // mirrors sw.js's STALE_QUEUED_TAB_MAX_RETRIES
-const EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = 3 // mirrors sw.js's COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT
-const QUEUE_LOAD_PRESSURE_RECOVERY_WINDOW_MS = 120000 // mirrors sw.js's QUEUE_LOAD_THROTTLE_MAX_MS
 const QUEUE_LOAD_PRESSURE_REASON_PATTERN = /(?:content-script|claim-nudge|storage|loading|unscriptable|queue-load)/i
 
 function isActiveJobStatus(status = '') {
@@ -503,7 +507,7 @@ function getRolledBackQueuedTabRetryAttempt(item = {}) {
 
 function getJobQueuedTabMaxRetries(item = null) {
     const configured = Number.parseInt(item?.maxRetries, 10)
-    return Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_QUEUED_TAB_MAX_RETRIES
+    return Number.isFinite(configured) && configured >= 0 ? configured : STALE_QUEUED_TAB_MAX_RETRIES
 }
 
 function isExhaustedRolledBackQueuedTabRetry(item = null) {
@@ -550,7 +554,7 @@ function isRecentQueueLoadPressureReading(pressure = null, now = Date.now()) {
 
     const lastPressureAt = Number.parseInt(pressure?.lastPressureAt, 10) || 0
     if(!lastPressureAt) return false
-    const windowMs = Number.parseInt(pressure?.windowMs, 10) || QUEUE_LOAD_PRESSURE_RECOVERY_WINDOW_MS
+    const windowMs = Number.parseInt(pressure?.windowMs, 10) || QUEUE_LOAD_THROTTLE_MAX_MS
     return (Number.parseInt(now, 10) || Date.now()) - lastPressureAt <= windowMs
 }
 
@@ -579,7 +583,7 @@ function isRecentQueueLoadPressureReading(pressure = null, now = Date.now()) {
 // shouldRecoverExhaustedRolledBackQueuedTabRetry and
 // buildForcedRolledBackQueuedTabRetryItem for the two call sites that now
 // build this same narrow intent from the same caller options
-// (P3-5/P3-6, sw-state-machine-decomposition-plan-2026-09-01.md).
+// (P3-5/P3-6, historical/sw-state-machine-decomposition-plan-2026-09-01.md).
 function isExhaustedRollbackRecoveryApproved(item = {}, intent = {}, now = Date.now()) {
     if(!isExhaustedRolledBackQueuedTabRetry(item)) return false
 
@@ -684,6 +688,8 @@ function isRetryableJobFailure(item = null) {
     if(normalizeString(item?.status) !== 'failed') return false
     const outcome = normalizeString(item?.outcome)
     if(outcome === 'security-verification') return false
+    // Owner, 15 Oct: a queued tab that did not land on a profile page is not retried. The same link lands the same way again.
+    if(/\bdid not land on a profile page\b/i.test(`${item?.error || ''}`)) return false
     if(outcome === 'timeout' || outcome === 'action-error') return true
 
     return /timeout|timed out|stale|interrupted/i.test(`${item?.error || ''}`)

@@ -4,24 +4,20 @@
 // mergeStoredProfileProgressRecord, normalizeStoredProfileNukeProgress,
 // preserveTerminalProfileProgress, shouldPreserveTerminalProfileProgress,
 // normalizeProgressPatch, addSenderTabIdToProgressPatch,
-// ensureProfileNukeProgressReady, removeProfileHrefFromPendingSpaceRecords,
-// removeProfileHrefFromRememberedNukedPosts, and
-// removeProfileHrefFromCoordinatorRuns. This is the per-record progress
-// merge/precedence rulebook (which of two progress records for the same
-// profile "wins" a given field), the incoming-patch normalizer that applies
-// that rulebook to a single mutation, and the three href-removal sweepers
-// used when a profile is cleared from tracked state.
+// ensureProfileNukeProgressReady, and removeProfileHrefFromCoordinatorRuns.
+// This is the per-record progress merge/precedence rulebook (which of two
+// progress records for the same profile "wins" a given field), the
+// incoming-patch normalizer that applies that rulebook to a single mutation,
+// and the run href-removal sweeper used when a profile is cleared from tracked
+// state. (The pending and remembered-nuked space-post removers were removed, 25 Oct.)
 //
 // Construction-order finding: this module needs to be hoisted well ahead of
 // this cluster's former source-text position. coordinatorTerminalSettlement
 // (constructed near the top of sw.js, decomposition Slice 20) eagerly
-// references bare `removeProfileHrefFromPendingSpaceRecords` and
-// `normalizeStoredProfileNukeProgress` in its own construction-call
+// references bare `normalizeStoredProfileNukeProgress` in its own construction-call
 // `handlers` object literal; coordinatorProgressReducer (Slice 17) eagerly
 // references bare `normalizeProgressPatch`; coordinatorSourceProvenance
-// (Slice 18) eagerly references bare `removeProfileHrefFromCoordinatorRuns`,
-// `removeProfileHrefFromPendingSpaceRecords`, and
-// `removeProfileHrefFromRememberedNukedPosts`; profileNukeProgressShape
+// (Slice 18) eagerly references bare `removeProfileHrefFromCoordinatorRuns`; profileNukeProgressShape
 // (Slice 15) eagerly references bare `normalizeStoredProfileNukeProgress`.
 // A hoisted `function` declaration is visible throughout its enclosing
 // scope; a `const` destructured from a factory call is in the temporal dead
@@ -39,19 +35,12 @@
 // isTransientProfileNukeStatus/isSuccessfulProfileNukeRecord (still plain
 // hoisted function declarations far below, work from any point in this
 // scope either way) -- are all already available by that point.
-// getStoredSpaceFeedRecordUrls and getPendingSpaceFeedJobKeyPatch
-// (coordinatorJobEnvelope, Slice 11, constructed well after this point)
-// aren't available as bare consts yet, so each is threaded through as a
-// thunk, matching the coordinatorTerminalSettlement/
-// queuedTabOpenUrlCommitHelpers precedent for the same pair of functions.
 // getCoordinatorRunIdsForHref, getCoordinatorRunTargetHrefs,
 // isCoordinatorRunWorkKeyForProfileHref, and recomputeCoordinatorRuns
 // (coordinatorRuns) are already available bare consts by this point too.
 //
 // Clock/environment-global note: mergeStoredProfileProgressRecord,
-// normalizeProgressPatch, removeProfileHrefFromPendingSpaceRecords,
-// removeProfileHrefFromRememberedNukedPosts, and
-// removeProfileHrefFromCoordinatorRuns all read Date.now() directly (not
+// normalizeProgressPatch, and removeProfileHrefFromCoordinatorRuns all read Date.now() directly (not
 // via a default parameter) -- threaded through as a top-level
 // `now: () => Date.now()` dep, matching the established convention.
 // normalizeProgressPatch also builds an event-log entry with
@@ -62,13 +51,11 @@
 // needed this exact pattern yet, so this is a new but directly analogous
 // extension of the established `now` convention.
 //
-// State note: `profileNukeProgress` (the module-level mutable progress-by-
-// href map, still owned by sw.js -- far too widely used to move as part of
-// this slice) is read by normalizeProgressPatch as a fallback when no
-// `existing` record is passed in. Threaded through as
-// `state.getProfileNukeProgress: () => profileNukeProgress`, matching the
-// precedent already used for coordinatorReconcileLockedMaterialization's
-// identical getter. `profileNukeProgressReady` (the memoized load-promise
+// State note: normalizeProgressPatch reads a fallback base when no `existing`
+// record is passed in. That base is the stored progress record, read through
+// `state.getStoredProfileNukeProgressRecord` (20 Oct review). It used to be
+// the module-level progress map in sw.js, which some writers do not keep in
+// step with the stored copy. `profileNukeProgressReady` (the memoized load-promise
 // latch used only by ensureProfileNukeProgressReady) is *not* shared with
 // any other code, so it's relocated into this module's own closure state
 // instead of staying a bare sw.js `let` -- it's re-initialized fresh each
@@ -98,7 +85,7 @@
 // confirmation it stayed green.
 //
 // cloneCoordinatorAuthorityValue and the createCoordinatorAuthority-adjacent
-// region, plus the queue-WAL/shadow-WAL async cluster, are explicitly out
+// region, plus the queue-WAL async cluster, are explicitly out
 // of scope for this decomposition effort (see the plan's "Boundary after
 // Slice 17" section) and are untouched here.
 
@@ -116,8 +103,6 @@ function createProfileProgressMerge(deps = {}) {
         pruneProfileNukeProgress,
         normalizeTabId,
         getNormalizedProfileHrefList,
-        getStoredSpaceFeedRecordUrls,
-        getPendingSpaceFeedJobKeyPatch,
         getCoordinatorRunIdsForHref,
         getCoordinatorRunTargetHrefs,
         isCoordinatorRunWorkKeyForProfileHref,
@@ -127,7 +112,11 @@ function createProfileProgressMerge(deps = {}) {
     const {
         UNBLOCK_UNMUTE_ACTION_KIND
     } = deps.constants || {}
-    const {getProfileNukeProgress} = deps.state || {}
+    const {getStoredProfileNukeProgressRecord} = deps.state || {}
+    // The stored record of one profile, or null. Without the dependency (a caller that builds this module alone), there is no base.
+    const readStoredProfileProgressRecord = typeof getStoredProfileNukeProgressRecord === 'function'
+        ? getStoredProfileNukeProgressRecord
+        : () => null
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const nowIso = typeof deps.nowIso === 'function' ? deps.nowIso : () => new Date().toISOString()
 
@@ -321,7 +310,7 @@ function createProfileProgressMerge(deps = {}) {
         }
         delete cleanPatch.replaceProgressRecord
 
-        const previous = replaceProgressRecord ? {} : existing || getProfileNukeProgress()?.[normalizedHref] || {}
+        const previous = replaceProgressRecord ? {} : existing || readStoredProfileProgressRecord(normalizedHref) || {}
         const preserveTerminal = !replaceProgressRecord && shouldPreserveTerminalProfileProgress(previous, cleanPatch)
         const next = {
             ...previous,
@@ -447,7 +436,8 @@ function createProfileProgressMerge(deps = {}) {
     }
 
     function addSenderTabIdToProgressPatch(patch = {}, senderTabId = null) {
-        const normalizedTabId = normalizeTabId(patch?.tabId || senderTabId)
+        // The authenticated sender wins over a tab id in the patch body (review-2 S4-1).
+        const normalizedTabId = normalizeTabId(senderTabId || patch?.tabId)
         if(!normalizedTabId) return patch
 
         return {
@@ -458,76 +448,15 @@ function createProfileProgressMerge(deps = {}) {
 
     function ensureProfileNukeProgressReady() {
         if(!profileNukeProgressReady) {
-            profileNukeProgressReady = loadProfileNukeProgress()
+            const pending = loadProfileNukeProgress()
+            profileNukeProgressReady = pending
+            // A failed load (an authority that cannot be loaded, P4) must not stay latched. The next caller loads again. The
+            // callers await the load itself, so this handler adds no tick to a successful load.
+            pending.catch(() => {
+                if(profileNukeProgressReady === pending) profileNukeProgressReady = null
+            })
         }
         return profileNukeProgressReady
-    }
-
-    function removeProfileHrefFromPendingSpaceRecords(records = {}, profileHrefs = []) {
-        const hrefs = new Set(getNormalizedProfileHrefList(Array.isArray(profileHrefs) ? profileHrefs : [profileHrefs]))
-        if(!hrefs.size) return {records: {...records}, changed: false}
-
-        const nextRecords = {
-            ...records
-        }
-        let changed = false
-
-        for(const [postKey, record] of Object.entries(records || {})) {
-            const allUrls = getStoredSpaceFeedRecordUrls(record, 'allUrls')
-            const remainingUrls = getStoredSpaceFeedRecordUrls(record, 'remainingUrls')
-            const nextAllUrls = allUrls.filter(url => !hrefs.has(url))
-            const nextRemainingUrls = remainingUrls.filter(url => !hrefs.has(url))
-
-            if(nextAllUrls.length === allUrls.length && nextRemainingUrls.length === remainingUrls.length) {
-                continue
-            }
-
-            changed = true
-            if(nextAllUrls.length <= 0 && nextRemainingUrls.length <= 0) {
-                delete nextRecords[postKey]
-                continue
-            }
-
-            nextRecords[postKey] = {
-                ...record,
-                allUrls: nextAllUrls,
-                remainingUrls: nextRemainingUrls,
-                ...getPendingSpaceFeedJobKeyPatch(record, nextRemainingUrls),
-                updatedAt: now()
-            }
-        }
-
-        return {records: nextRecords, changed}
-    }
-
-    function removeProfileHrefFromRememberedNukedPosts(records = {}, profileHrefs = []) {
-        const hrefs = new Set(getNormalizedProfileHrefList(Array.isArray(profileHrefs) ? profileHrefs : [profileHrefs]))
-        if(!hrefs.size) return {records: {...records}, changed: false}
-
-        const nextRecords = {
-            ...records
-        }
-        let changed = false
-
-        for(const [postKey, record] of Object.entries(records || {})) {
-            const urls = getNormalizedProfileHrefList(record?.urls || [])
-            const nextUrls = urls.filter(url => !hrefs.has(url))
-            if(nextUrls.length === urls.length) continue
-
-            changed = true
-            if(nextUrls.length <= 0) {
-                delete nextRecords[postKey]
-                continue
-            }
-
-            nextRecords[postKey] = {
-                ...record,
-                urls: nextUrls,
-                updatedAt: now()
-            }
-        }
-
-        return {records: nextRecords, changed}
     }
 
     function removeProfileHrefFromCoordinatorRuns(runs = {}, queue = {}, normalizedHref = '') {
@@ -579,8 +508,6 @@ function createProfileProgressMerge(deps = {}) {
         normalizeProgressPatch,
         addSenderTabIdToProgressPatch,
         ensureProfileNukeProgressReady,
-        removeProfileHrefFromPendingSpaceRecords,
-        removeProfileHrefFromRememberedNukedPosts,
         removeProfileHrefFromCoordinatorRuns
     }
 }

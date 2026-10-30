@@ -1,0 +1,71 @@
+/* Shared color tokens for every extension surface that has CSS: the dashboard
+   (coordinator.css), the popup (popup.css), and the brand reds used by the
+   progress bar on Quora pages (content.css). Each color is defined once, here.
+   Surfaces reference these with var(--mb-...), never a raw hex literal.
+
+   Roles, as the dashboard uses them:
+     queued, resume, updated   -> indigo  (--mb-indigo-*)
+     running                   -> cyan    (--mb-cyan-*)
+     paused                    -> emerald (--mb-emerald-*)
+     cancel, clear, errors     -> red     (--mb-red-*, --mb-brand-red-*)
+     neutral, labels, borders  -> grey    (--mb-grey-*)
+     progress fill, brand      -> brand red (--mb-brand-red)
+
+   The JS side of the brand red lives in shared/js/colorTokens.js and must
+   match --mb-brand-red; test/colorTokens.test.js checks that they agree.
+
+   Names are prefixed --mb- so they cannot collide with the Quora page's own
+   custom properties, since content.css injects these onto every Quora page. */
+
+:root {
+    --mb-brand-red: #b92b27;
+    --mb-brand-red-dark: #a82723;
+    --mb-brand-red-darker: #8f201d;
+    --mb-brand-red-tint: #fce8e7;
+
+    --mb-indigo-50: #eef2ff;
+    --mb-indigo-400: #818cf8;
+    --mb-indigo-600: #4f46e5;
+    --mb-indigo-800: #3730a3;
+    --mb-blue-500: #3b82f6;
+    --mb-blue-600: #2563eb;
+    --mb-blue-700: #1d4ed8;
+    --mb-cyan-100: #cffafe;
+    --mb-cyan-300: #67e8f9;
+    --mb-cyan-800: #155e75;
+    --mb-emerald-50: #ecfdf5;
+    --mb-emerald-400: #34d399;
+    --mb-emerald-700: #047857;
+    --mb-green-50: #ecfdf3;
+    --mb-green-100: #dcfce7;
+    --mb-green-300: #86efac;
+    --mb-green-500: #22c55e;
+    --mb-green-800: #166534;
+    --mb-red-50: #fef2f2;
+    --mb-red-200: #fecaca;
+    --mb-red-800: #991b1b;
+    --mb-red-950: #450a0a;
+    --mb-amber-50: #fffbeb;
+    --mb-amber-500: #f59e0b;
+    --mb-amber-800: #92400e;
+    --mb-grey-40: #f7f7f8;
+    --mb-grey-50: #f9fafb;
+    --mb-grey-100: #f3f4f6;
+    --mb-grey-110: #f0f1f3;
+    --mb-grey-120: #eef0f3;
+    --mb-grey-200: #e5e7eb;
+    --mb-grey-300: #d1d5db;
+    --mb-grey-500: #6b7280;
+    --mb-grey-600: #4b5563;
+    --mb-grey-700: #374151;
+    --mb-grey-800: #1f2937;
+    --mb-grey-900: #111827;
+    --mb-grey-page: #f4f5f7;
+    --mb-white: #ffffff;
+    --mb-black: #000000;
+
+    /* RGB triplets for rgba() uses that need an alpha. */
+    --mb-blue-600-rgb: 37, 99, 235;
+    --mb-white-rgb: 255, 255, 255;
+    --mb-black-rgb: 0, 0, 0;
+}

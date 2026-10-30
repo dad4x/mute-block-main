@@ -1,3 +1,5 @@
+> **Status: ROADMAP** (24 Oct 2026). Wish list for splitting sw.js (27 Jun). Storage, dashboard and preferences modules exist. The rest is not scheduled. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Here are some housekeeping things I'd like done as some point.
 
 1.  Split sw.js into more pieces
