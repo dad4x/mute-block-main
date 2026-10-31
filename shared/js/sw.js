@@ -27922,9 +27922,7 @@ async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
         if(!tabId || tabId === anchorTabId) continue
         const href = normalizeQuoraProfileUrl(tab?.url || '')
         const entry = href ? (findCoordinatorQueueEntryForHref(queue, href) || (queue[href] ? {item: queue[href]} : null)) : null
-        // A tab that is not a queue profile page (a question, or a link the profile page opened) is orphaned too: the queue never
-        // claimed it, so it must not hold the worker window's surface.
-        const orphaned = !queueRuntime.hasActiveQueuedTab(tabId) && (!href || !(entry?.item && isActiveCoordinatorStatus(entry.item.status)))
+        const orphaned = !!href && !queueRuntime.hasActiveQueuedTab(tabId) && !(entry?.item && isActiveCoordinatorStatus(entry.item.status))
         if(!orphaned) {
             orphanSurfaceTabFirstSeenAt.delete(tabId)
             continue
@@ -28034,7 +28032,13 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         // never counts.
         const surfaceWindowId = Number.parseInt(surface.windowId, 10) || 0
         const anchorTabId = normalizeTabId(surface.anchorTabId)
-        const isSurfaceBusy = tabs => tabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)
+        // Only tabs this queue owns count. A tab the user opened in this window, or a tab the profile page opened, is not ours,
+        // so it is never looked at here.
+        const isOwnedSurfaceTab = tabId => !!tabId && (queueRuntime.hasQueuedTabMetadata(tabId) || queueRuntime.hasActiveQueuedTab(tabId) || queueRuntime.hasOwnedTabState(tabId))
+        const isSurfaceBusy = tabs => tabs.some(tab => {
+            const tabId = normalizeTabId(tab?.id)
+            return !!tabId && tabId !== anchorTabId && isOwnedSurfaceTab(tabId)
+        })
 
         let surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
         if(isSurfaceBusy(surfaceWindowTabs)) surfaceWindowTabs = await reapOrphanedWorkerSurfaceTabs(surface, surfaceWindowTabs)
