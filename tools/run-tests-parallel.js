@@ -15,6 +15,8 @@ const lanes = [
     commandTimeoutMs: 30000,
     commands: [
       ['node', 'test/subject.test.js'],
+      ['node', 'test/profileResolutionSubject.test.js'],
+      ['node', 'test/spaceFeedCitedLink.test.js'],
       ['node', 'test/jobState.test.js'],
       ['node', 'test/swQueueRuntime.test.js'],
       ['node', 'test/storageInvariants.test.js'],

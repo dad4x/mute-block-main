@@ -12,7 +12,8 @@ const {
     nukingControlMessage,
     nukingControlLabel,
     nukingStatusShowsControl,
-    nukingControlView
+    nukingControlView,
+    spaceFeedNukingToolbar
 } = require('../shared/js/nukingControl')
 const {MUTE_BLOCK_HELP_PREFIX, setMuteBlockHelp} = require('../shared/js/muteBlockHelp')
 
@@ -129,6 +130,14 @@ test('nukingStatusShowsControl is true only for a nuking or paused nuking text',
     assert.equal(nukingStatusShowsControl('Queueing... 3'), false)
     assert.equal(nukingStatusShowsControl(''), false)
     assert.equal(nukingStatusShowsControl(undefined), false)
+})
+
+test('space toolbar: the status keeps only the queueing count, and the drop-down shows for nuking work or a pause (30 Oct)', () => {
+    assert.deepEqual(spaceFeedNukingToolbar({queueing: 3, left: 2}), {statusText: 'Queueing... 3', showsControl: true})
+    assert.deepEqual(spaceFeedNukingToolbar({queueing: 0, left: 2}), {statusText: '', showsControl: true})
+    assert.deepEqual(spaceFeedNukingToolbar({queueing: 0, left: 0, paused: true}), {statusText: '', showsControl: true})
+    assert.deepEqual(spaceFeedNukingToolbar({queueing: 3, left: 0}), {statusText: 'Queueing... 3', showsControl: false})
+    assert.deepEqual(spaceFeedNukingToolbar({}), {statusText: '', showsControl: false})
 })
 
 console.log('nukingControl: all tests passed')

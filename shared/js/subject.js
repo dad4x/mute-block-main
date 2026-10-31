@@ -144,6 +144,14 @@ function isLikelyDirectProfileSlug(slug) {
 
     const isNameishToken = token => /^[A-Z][A-Za-z0-9]*$/.test(token) || /^[A-Z0-9]{2,}$/.test(token)
 
+    // 30 Oct: a question that starts with a question word and has a plain lowercase word ("What-made-the-2707-so-superior") is a question, even
+    // with a number in it. Without this, the number rule below made it a profile, so the question page got profile buttons. A profile with a
+    // question-word first name and a number ("Will-Fridolf-5") has no lowercase word, so it still passes.
+    if(/^(?:a|an|are|can|could|did|do|does|how|is|should|the|what|when|where|who|why|will|would)$/i.test(tokens[0] || '') &&
+        tokens.some(token => /^[a-z]+$/.test(token))) {
+        return false
+    }
+
     if(tokens.some(token => /^\d+$/.test(token))) return true
     if(tokens.some(token => /^[A-F0-9]{2}$/i.test(token))) return true
 

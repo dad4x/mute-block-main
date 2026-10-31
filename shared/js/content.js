@@ -95,7 +95,8 @@ const {formatCollectStopLabel, STOP_COLLECT_LABEL_TEXT} = require('./candidateCo
 const {collectPassMadeProgress, runCollectLoop} = require('./candidateCollect')
 const {runBatchNuke} = require('./candidateNuke')
 const {NOTHING_QUEUED_LABEL, NUKED_LABEL, formatToolbarNukingStatus, formatProfileRowState} = require('./candidateStatus')
-const {nukingControlView, nukingStatusShowsControl} = require('./nukingControl')
+const {nukingControlView, nukingStatusShowsControl, spaceFeedNukingToolbar} = require('./nukingControl')
+const {normalizeResolutionSubject, RESOLUTION_SUBJECT_NAMED_PROFILES, RESOLUTION_SUBJECT_POSTER} = require('./profileResolutionSubject')
 
 const MODAL_PROFILE_NUKE_PROFILES_PER_BATCH = 3
 const CONTENT_SCRIPT_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -2137,9 +2138,9 @@ function getSpaceFeedPostRootFromMutationNode(node) {
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement || null
     if(!element || isExtensionOwnedNode(element)) return null
 
-    const timestamp = element.matches?.('a.post_timestamp')
+    const timestamp = element.matches?.('a.post_timestamp, a.answer_timestamp')
         ? element
-        : element.querySelector?.('a.post_timestamp') || null
+        : element.querySelector?.('a.post_timestamp, a.answer_timestamp') || null
     if(timestamp) {
         return getSpaceFeedPostRoot(timestamp) || getSpaceFeedPreferredRoot(timestamp)
     }
@@ -2148,7 +2149,7 @@ function getSpaceFeedPostRootFromMutationNode(node) {
     if(markedRoot) return markedRoot
 
     const likelyRoot = element.closest?.(SPACE_FEED_ROOT_SELECTOR)
-    return likelyRoot?.querySelector?.('a.post_timestamp') ? likelyRoot : null
+    return likelyRoot?.querySelector?.('a.post_timestamp, a.answer_timestamp') ? likelyRoot : null
 }
 
 function invalidateSpaceFeedEntryCacheForMutations(mutations) {
@@ -2163,7 +2164,7 @@ function invalidateSpaceFeedEntryCacheForMutations(mutations) {
     for(const mutation of mutations || []) {
         for(const node of [...Array.from(mutation.addedNodes || []), ...Array.from(mutation.removedNodes || [])]) {
             const postRoot = getSpaceFeedPostRootFromMutationNode(node)
-            const timestamp = postRoot?.querySelector?.('a.post_timestamp')
+            const timestamp = postRoot?.querySelector?.('a.post_timestamp, a.answer_timestamp')
             if(!postRoot || !timestamp) continue
 
             const postKey = getSpaceFeedPostKey(postRoot, timestamp)
@@ -2178,8 +2179,8 @@ function isSpaceFeedMutationSignalNode(node) {
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement || null
     if(!element || isExtensionOwnedNode(element)) return false
 
-    if(element.matches?.('a.post_timestamp, a[href*="/profile/"]')) return true
-    return !!element.querySelector?.('a.post_timestamp, a[href*="/profile/"]')
+    if(element.matches?.('a.post_timestamp, a.answer_timestamp, a[href*="/profile/"]')) return true
+    return !!element.querySelector?.('a.post_timestamp, a.answer_timestamp, a[href*="/profile/"]')
 }
 
 // 24 Oct: a profile dialog can open only when a dialog element is added to the page.
@@ -2886,21 +2887,17 @@ function syncNukingControlForButton(button, label) {
     else detachNukingControl(button)
 }
 
-// The toolbar status gets the drop-down when it shows nuking work or a paused nuking queue (nukingStatusShowsControl).
-function syncNukingStatusControl(status, text, left = 0) {
-    if(nukingControlPageAllowed() && nukingStatusShowsControl(text)) attachNukingControl(status, left)
-    else detachNukingControl(status)
-}
-
 // The one toolbar status both batch pages use (28 Oct): the same class, placed directly after the page's batch button (Nuke 'Em), the same
 // words from formatToolbarNukingStatus, and the same drop-down. Both pages call this builder; the class and the style rule
 // (.mb-ext_nuking-status in content.css) are shared, so the two toolbars cannot drift apart.
+// The drop-down goes beside the status when showsControl is set: by default when the text shows nuking work or a paused queue
+// (nukingStatusShowsControl). The space page passes its own flag, since its drop-down carries the Nuking words (30 Oct).
 const NUKING_TOOLBAR_STATUS_CLASS = 'mb-ext_nuking-status'
 
-function syncNukingToolbarStatus(host, anchor, text, left = 0) {
+function syncNukingToolbarStatus(host, anchor, text, left = 0, showsControl = nukingStatusShowsControl(text)) {
     if(!host) return
     const existing = host.querySelector(`.${NUKING_TOOLBAR_STATUS_CLASS}`)
-    if(!text) {
+    if(!text && !showsControl) {
         detachNukingControl(existing)
         existing?.remove()
         return
@@ -2912,7 +2909,8 @@ function syncNukingToolbarStatus(host, anchor, text, left = 0) {
         if(anchor && host.contains(anchor)) anchor.insertAdjacentElement('afterend', status)
         else host.appendChild(status)
     }
-    syncNukingStatusControl(status, text, left)
+    if(nukingControlPageAllowed() && showsControl) attachNukingControl(status, left)
+    else detachNukingControl(status)
 }
 
 function setNukeButtonIdle(button, label = `Nuke 'Em`) {
@@ -3265,7 +3263,7 @@ function isQuoraSpaceSubdomainRootPage() {
     if(isSecurityVerificationPage()) return false
 
     return !!document.querySelector(
-        'a.post_timestamp, .post_timestamp, ' +
+        'a.post_timestamp, a.answer_timestamp, .post_timestamp, ' +
         'link[href*="page-TribeMainPageLoadable"], script[src*="page-TribeMainPageLoadable"]'
     )
 }
@@ -7221,7 +7219,7 @@ function removeSpaceCollectButtons() {
 }
 
 function injectSpaceCollectButton() {
-    if(getPageType() !== 'space' || !isNukableSpacePage() || !document.querySelector('a.post_timestamp')) {
+    if(getPageType() !== 'space' || !isNukableSpacePage() || !document.querySelector('a.post_timestamp, a.answer_timestamp')) {
         removeSpaceCollectButtons()
         return false
     }
@@ -7681,7 +7679,7 @@ function computeSpaceFeedContentRoot() {
         .map((candidate, index) => ({
             candidate,
             index,
-            timestampCount: candidate.querySelectorAll?.('a.post_timestamp').length || 0
+            timestampCount: candidate.querySelectorAll?.('a.post_timestamp, a.answer_timestamp').length || 0
         }))
         .sort((left, right) => right.timestampCount - left.timestampCount || left.index - right.index)[0]
         .candidate || document.body
@@ -7716,7 +7714,7 @@ function compareElementsByDocumentOrder(left, right) {
 
 function addSpaceFeedTimestampCandidate(timestamps, seen, candidate) {
     if(!(candidate instanceof Element)) return false
-    if(!candidate.matches('a.post_timestamp')) return false
+    if(!candidate.matches('a.post_timestamp, a.answer_timestamp')) return false
     if(seen.has(candidate)) return false
     if(!isSpaceFeedTimestampInScanWindow(candidate)) return false
 
@@ -7744,9 +7742,9 @@ function collectSampledSpaceFeedTimestampsFromElement(element, timestamps, seen,
         if(!root || visitedRoots.has(root) || !contentRoot.contains(root)) break
 
         visitedRoots.add(root)
-        const timestamp = root.matches?.('a.post_timestamp')
+        const timestamp = root.matches?.('a.post_timestamp, a.answer_timestamp')
             ? root
-            : root.querySelector?.('a.post_timestamp')
+            : root.querySelector?.('a.post_timestamp, a.answer_timestamp')
         addSpaceFeedTimestampCandidate(timestamps, seen, timestamp)
         current = root.parentElement
     }
@@ -7801,7 +7799,7 @@ function getBoundedVisibleSpaceFeedTimestamps() {
     const scanRoot = getSpaceFeedContentRoot() || document
     // 24 Oct: every post is measured. The near-post observer had posts on screen that it still reported as far away, so those posts were never
     // scanned. The position test below (isSpaceFeedTimestampInScanWindow) is what decides, and it is the same test the button check uses.
-    const nodes = timedSpaceQuery('allTimestamps', () => Array.from(scanRoot.querySelectorAll('a.post_timestamp')))
+    const nodes = timedSpaceQuery('allTimestamps', () => Array.from(scanRoot.querySelectorAll('a.post_timestamp, a.answer_timestamp')))
     const timestamps = nodes
         .map((timestamp, index) => {
             const rect = timestamp?.getBoundingClientRect?.() || null
@@ -7874,7 +7872,7 @@ function getVisibleSpaceFeedTimestamps() {
 function getSpaceFeedRootCandidateState(node, timestamp) {
     if(!node || node.nodeType !== Node.ELEMENT_NODE) return ''
 
-    const timestamps = timedSpaceQuery('nodeTimestamps', () => Array.from(node.querySelectorAll('a.post_timestamp')))
+    const timestamps = timedSpaceQuery('nodeTimestamps', () => Array.from(node.querySelectorAll('a.post_timestamp, a.answer_timestamp')))
     if(timestamps.length > 1) return 'crowded'
     return timestamps.length === 1 && timestamps[0] === timestamp ? 'candidate' : ''
 }
@@ -8034,7 +8032,7 @@ function computeSpaceFeedProfileLinkCardRoot(link) {
     // byline rendered as this same card shape, and he was queued for
     // mute-block with no further scrutiny as a result.
     if(root.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)) return null
-    if(timedSpaceQuery('linkCardTimestamp', () => root.querySelector('a.post_timestamp, .post_timestamp'))) return null
+    if(timedSpaceQuery('linkCardTimestamp', () => root.querySelector('a.post_timestamp, a.answer_timestamp, .post_timestamp'))) return null
     if(root.closest('.mb-ext_space-feed-post-nuke-host')) return null
     if(!root.classList.contains('q-box') && !root.classList.contains('puppeteer_test_link')) return null
 
@@ -8145,7 +8143,7 @@ function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
 function getSpaceFeedPostHeaderProfileHref(postRoot, timestamp) {
     if(!postRoot) return null
 
-    const timestampNode = timestamp || timedSpaceQuery('headerTimestamp', () => postRoot.querySelector('a.post_timestamp'))
+    const timestampNode = timestamp || timedSpaceQuery('headerTimestamp', () => postRoot.querySelector('a.post_timestamp, a.answer_timestamp'))
     const profileLinks = timedSpaceQuery('headerProfileLinks', () => getQuoraProfileLinks(postRoot)).filter(isVisible)
 
     let headerProfileHref = null
@@ -8188,7 +8186,7 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
         scopes.push(scope)
     }
     const addTimestamp = candidate => {
-        if(candidate instanceof Element && candidate.matches('a.post_timestamp') && !timestamps.includes(candidate)) {
+        if(candidate instanceof Element && candidate.matches('a.post_timestamp, a.answer_timestamp') && !timestamps.includes(candidate)) {
             timestamps.push(candidate)
         }
     }
@@ -8205,7 +8203,7 @@ function getSpaceFeedPosterProfileUrls(postRoot, timestamp) {
     // either branch sees the result. Skipping embedded timestamps here
     // fixes it at the source for both branches instead of re-patching each
     // caller.
-    for(const candidate of timedSpaceQuery('postTimestamps', () => Array.from(postRoot.querySelectorAll('a.post_timestamp')))) {
+    for(const candidate of timedSpaceQuery('postTimestamps', () => Array.from(postRoot.querySelectorAll('a.post_timestamp, a.answer_timestamp')))) {
         const embedAncestor = candidate.closest(SPACE_FEED_EMBED_SCOPE_SELECTOR)
         if(embedAncestor instanceof Element && embedAncestor !== postRoot && postRoot.contains(embedAncestor)) continue
 
@@ -8821,7 +8819,7 @@ function getSpaceFeedBadLinkDetail(href, record = null) {
 function isResolvableSpaceFeedEntry(entry) {
     return !!entry?.resolveProfileFromPage &&
         !!entry?.postKey &&
-        !!normalizeQuoraPostHref(entry?.postUrl || '')
+        !!normalizeQuoraPostHref(entry?.resolutionUrl || entry?.postUrl || '')
 }
 
 function getUnsuccessfulProfileNukeUrls(urls) {
@@ -9260,7 +9258,7 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
     if(!postRoot) return null
     if(isSpaceFeedDocumentLevelElement(postRoot)) return null
 
-    const timestamp = postRoot.querySelector('a.post_timestamp')
+    const timestamp = postRoot.querySelector('a.post_timestamp, a.answer_timestamp')
     const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
     const parent = getSpaceFeedPostAnchorContainer(postRoot) || postRoot
     if(isSpaceFeedDocumentLevelElement(parent)) return null
@@ -9297,7 +9295,7 @@ function getSpaceFeedPostButtonHost(postRoot, postKey = '') {
 function syncSpaceFeedPostHeaderReservedSpace(postRoot, host) {
     if(!postRoot || !host) return
 
-    const timestamp = postRoot.querySelector('a.post_timestamp')
+    const timestamp = postRoot.querySelector('a.post_timestamp, a.answer_timestamp')
     const headerContainer = timestamp?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
     if(!headerContainer || !postRoot.contains(headerContainer)) return
 
@@ -9418,6 +9416,85 @@ function isSpaceFeedScrollWithinBand(movedPx) {
     return movedPx >= 0 ? movedPx < SPACE_FEED_SCAN_BAND_DOWN_PX : -movedPx < SPACE_FEED_SCAN_BAND_UP_PX
 }
 
+// The short link a target-space post carries in its address (30 Oct). An Instant Block post's address is its title and then "-https-qr-ae-<code>",
+// which names the post it cites. The cited post's poster is the target, not the sharer, so the chase goes to that link.
+function getSpaceFeedCitedUrl(timestamp) {
+    const href = timestamp?.getAttribute?.('href') || ''
+    let pathname = ''
+    try {
+        pathname = new URL(href, location.origin).pathname
+    }
+    catch {
+        return ''
+    }
+    const shortLink = /-https-qr-ae-([A-Za-z0-9]+)$/.exec(pathname)
+    if (shortLink) return `https://qr.ae/${shortLink[1]}`
+    // A question addressed as its quora.com copy ("https-www-quora-com-unanswered-<title>-ch-17-amp-oid-<oid>"). The question's log page names
+    // the asker, so the chase goes there (30 Oct).
+    const question = /^\/https-www-quora-com-unanswered-(.+?)(?:-ch-\d+)?(?:-amp-oid-\d+|$)/.exec(pathname)
+    return question ? `https://www.quora.com/${question[1]}/log` : ''
+}
+
+// A question title in a question card: a link into this space that is not a post's timestamp (30 Oct).
+function isSpaceFeedQuestionTitleLink(link) {
+    if (!link || link.matches?.('a.post_timestamp, a.answer_timestamp')) return false
+    const href = link.getAttribute('href') || ''
+    if (!href.startsWith(`${location.origin}/`)) return false
+    return (link.textContent || '').trim().length >= 8
+}
+
+// The row of one question in a question card (30 Oct): the largest container that holds this title, no other question title, and no post
+// timestamp. The row carries the Answer button, which is how a row is told from a link in the page's chrome.
+function getSpaceFeedQuestionRow(link) {
+    // Quora wraps each question in its own question component, which holds the title, the counts and the Answer button (30 Oct).
+    const component = link.closest('[class*="puppeteer_test_question_component"]')
+    if (component && !component.querySelector('a.post_timestamp, a.answer_timestamp')) {
+        return /\bAnswer\b/.test(component.innerText || '') ? component : null
+    }
+
+    let row = null
+    let node = link.parentElement
+    for (let i = 0; i < 8 && node && node !== document.body; i++) {
+        if (node.querySelector('a.post_timestamp, a.answer_timestamp')) break
+        // A question's own count links ("4 answers") point at the same question, so they are not another title (30 Oct).
+        const linkHref = link.getAttribute('href')
+        const otherTitle = Array.from(node.querySelectorAll('a[href]')).some(other => other.getAttribute('href') !== linkHref && isSpaceFeedQuestionTitleLink(other))
+        if (otherTitle) break
+        row = node
+        node = node.parentElement
+    }
+    return row && /\bAnswer\b/.test(row.innerText || '') ? row : null
+}
+
+// Questions asked in this space (30 Oct). They have no timestamp, so they are not in the post scan. Each question's querent is read from the
+// question's own log page, in a worker-window resolution. The subject is the poster.
+function getSpaceFeedQuestionRowEntries() {
+    if (!isTargetSpacePage()) return []
+    const entries = []
+    const seen = new Set()
+    for (const link of Array.from(document.querySelectorAll('a[href]'))) {
+        if (!isSpaceFeedQuestionTitleLink(link)) continue
+        const submissionUrl = normalizeQuoraPostHref(link.getAttribute('href'))
+        if (!submissionUrl || seen.has(submissionUrl)) continue
+        const row = getSpaceFeedQuestionRow(link)
+        if (!row) continue
+        seen.add(submissionUrl)
+        entries.push({
+            postKey: `space-question:${submissionUrl}`,
+            postRoot: row,
+            postUrl: submissionUrl,
+            candidateUrls: [],
+            candidateEvidenceByHref: {},
+            needsSourceResolution: true,
+            resolveProfileFromPage: true,
+            resolutionUrl: `${submissionUrl}/log`,
+            resolutionSubject: RESOLUTION_SUBJECT_POSTER,
+            resolutionReason: 'question-card-needs-querent'
+        })
+    }
+    return entries
+}
+
 function getSpaceFeedPostEntries() {
     const entries = []
     const roots = getSpaceFeedCardRoots()
@@ -9426,7 +9503,7 @@ function getSpaceFeedPostEntries() {
     let newlyObservedRoots = 0
 
     for(const postRoot of roots) {
-        const timestamp = timedSpaceQuery('entryTimestamp', () => postRoot.querySelector('a.post_timestamp'))
+        const timestamp = timedSpaceQuery('entryTimestamp', () => postRoot.querySelector('a.post_timestamp, a.answer_timestamp'))
         if(!timestamp) continue
 
         const postKey = getSpaceFeedPostKey(postRoot, timestamp)
@@ -9484,18 +9561,26 @@ function getSpaceFeedPostEntries() {
         const diagValue = `${candidateUrls.length}|${(timestamp?.getAttribute('href') || '').slice(0, 40)}`
         if(postRoot.dataset.mbPostDiag !== diagValue) postRoot.dataset.mbPostDiag = diagValue
 
+        // 30 Oct: a post that cites a short link is chased to the cited post, and its poster is the candidate. On a target space the sharer's
+        // header is not the target, so the cited post replaces it. On an asset space the cited post is chased only when the post names no
+        // profile of its own (Instant Block: "more often an example post that has to be chased").
+        const citedFromAddress = isNukableSpacePage() ? getSpaceFeedCitedUrl(timestamp) : ''
+        const citedUrl = citedFromAddress && (isTargetSpacePage() || !candidateUrls.length) ? citedFromAddress : ''
         entries.push({
             postKey,
             postRoot,
             postUrl,
-            candidateUrls,
+            candidateUrls: citedUrl ? [] : candidateUrls,
             candidateEvidenceByHref,
-            resolveProfileFromPage: isAssetSpacePage() && !!postUrl && needsSourceResolution,
-            resolutionReason: needsSourceResolution ? 'low-confidence-profile-artifact' : ''
+            resolveProfileFromPage: (isAssetSpacePage() && !!postUrl && needsSourceResolution) || !!citedUrl,
+            resolutionUrl: citedUrl,
+            resolutionSubject: citedUrl ? RESOLUTION_SUBJECT_POSTER : '',
+            resolutionReason: citedUrl ? 'target-post-cites-source' : (needsSourceResolution ? 'low-confidence-profile-artifact' : '')
         })
     }
 
     entries.push(...getSpaceFeedProfileLinkCardEntries(activeKeys))
+    entries.push(...getSpaceFeedQuestionRowEntries())
 
     for(const [postKey, cached] of spaceFeedEntryCache) {
         if(!activeKeys.has(postKey) || !cached?.postRoot?.isConnected) {
@@ -9529,6 +9614,8 @@ function buildSpaceFeedEntrySnapshot(entry, previous = null) {
         ),
         resolveProfileFromPage: !!(entry?.resolveProfileFromPage || previous?.resolveProfileFromPage),
         resolutionReason: entry?.resolutionReason || previous?.resolutionReason || '',
+        resolutionUrl: entry?.resolutionUrl || previous?.resolutionUrl || '',
+        resolutionSubject: entry?.resolutionSubject || previous?.resolutionSubject || '',
         postRoot: entry?.postRoot?.isConnected
             ? entry.postRoot
             : previous?.postRoot?.isConnected
@@ -9559,6 +9646,8 @@ function getDiscoveredSpaceFeedEntries() {
         candidateEvidenceByHref: entry.candidateEvidenceByHref || {},
         resolveProfileFromPage: !!entry.resolveProfileFromPage,
         resolutionReason: entry.resolutionReason || '',
+        resolutionUrl: entry.resolutionUrl || '',
+        resolutionSubject: entry.resolutionSubject || '',
         postRoot: entry.postRoot || null
     }))
 }
@@ -9580,6 +9669,8 @@ function setLatestSpaceFeedEntries(entries) {
             candidateUrls: getNormalizedProfileHrefList(entry?.candidateUrls || []),
             resolveProfileFromPage: !!entry?.resolveProfileFromPage,
             resolutionReason: entry?.resolutionReason || '',
+            resolutionUrl: entry?.resolutionUrl || '',
+            resolutionSubject: entry?.resolutionSubject || '',
             postRoot: entry?.postRoot || null,
             viewportTop: viewport.viewportTop,
             viewportBottom: viewport.viewportBottom
@@ -9594,7 +9685,9 @@ function getLatestSpaceFeedEntries() {
         postUrl: entry.postUrl,
         candidateUrls: [...entry.candidateUrls],
         resolveProfileFromPage: !!entry.resolveProfileFromPage,
-        resolutionReason: entry.resolutionReason || ''
+        resolutionReason: entry.resolutionReason || '',
+        resolutionUrl: entry.resolutionUrl || '',
+        resolutionSubject: entry.resolutionSubject || ''
     }))
 }
 
@@ -9623,7 +9716,7 @@ function getSpaceFeedDetectionSnapshot(entries = null) {
     const space = resolveCurrentSpaceDescriptor()
     const category = getStoredSpaceCategory(space) || 'unset'
     const timestamps = getVisibleSpaceFeedTimestamps()
-    const documentTimestamps = document.querySelectorAll('a.post_timestamp').length
+    const documentTimestamps = document.querySelectorAll('a.post_timestamp, a.answer_timestamp').length
     const documentProfiles = document.querySelectorAll('a[href*="/profile/"]').length
     const cards = getSpaceFeedCardRoots()
     if(!Array.isArray(entries)) {
@@ -10135,6 +10228,13 @@ function syncSpaceFeedStatusButton(entries = null) {
     const host = getSpaceFeedStatusHost()
     if(!host) return false
 
+    // 30 Oct: no MB Info on a neutral space. Any copy left from before the category was known is removed.
+    const space = resolveCurrentSpaceDescriptor()
+    if(space && getStoredSpaceCategory(space) === 'neutral') {
+        host.querySelector('.mb-ext_space-feed-status-btn')?.remove()
+        return false
+    }
+
     let button = host.querySelector('.mb-ext_space-feed-status-btn')
 
     if(!button) {
@@ -10216,7 +10316,11 @@ function getQueuedPageResolvedProfileHref(claimedAction = {}, sink = null) {
             return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
         }
         if(isQueuedResolution) {
-            if(isAssetSpacePage()) return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
+            // 30 Oct: the queue item says what it is chasing. A named-profile item reads the profile the post names, and a poster item reads the
+            // poster from the page, whatever the category of the space the item came from.
+            const subject = normalizeResolutionSubject(claimedAction?.resolutionSubject)
+            if(subject === RESOLUTION_SUBJECT_NAMED_PROFILES) return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
+            if(subject !== RESOLUTION_SUBJECT_POSTER && isAssetSpacePage()) return noteQueuedResolution(sink, 'explicit', explicitProfileHref)
 
             const queuedHeaderHref = getSpacePostHeaderProfileHref()
             if(queuedHeaderHref) return noteQueuedResolution(sink, 'header', queuedHeaderHref)
@@ -10483,7 +10587,8 @@ function getResolvableSpaceFeedPostAssociations(entries) {
         if(getNormalizedProfileHrefList(entry.candidateUrls || []).length) continue
 
         const postKey = entry.postKey || ''
-        const postUrl = normalizeQuoraPostHref(entry.postUrl || '')
+        // The chase goes to the resolution URL when the entry has one (a cited post or a question's log), else to the post itself (30 Oct).
+        const postUrl = normalizeQuoraPostHref(entry.resolutionUrl || entry.postUrl || '')
         if(!postKey || !postUrl || associations.has(postKey)) continue
 
         associations.set(postKey, {
@@ -10495,6 +10600,8 @@ function getResolvableSpaceFeedPostAssociations(entries) {
             resolveProfileFromPage: true,
             resolutionMode: QUEUED_PROFILE_RESOLUTION_MODE,
             resolutionReason: entry.resolutionReason || 'source-post-needs-profile-resolution',
+            // An asset post's resolution reads the profile the post names in its own text (30 Oct).
+            resolutionSubject: entry.resolutionSubject || RESOLUTION_SUBJECT_NAMED_PROFILES,
             evidence: [{
                 postKey,
                 postUrl,
@@ -10769,6 +10876,7 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
                     resolutionMode: QUEUED_PROFILE_RESOLUTION_MODE,
                     resolveProfileFromPage: true,
                     resolutionReason: association.resolutionReason || '',
+                    resolutionSubject: association.resolutionSubject || '',
                     source,
                     evidence: association.evidence || []
                 }
@@ -11009,16 +11117,17 @@ async function nukeSpaceFeedEntries(button, entries) {
 
 // The queue's work for this space, as a status beside the Nuke 'Em button (owner, 25 Oct). It is a display only: the button keeps its own
 // label and stays usable while the work runs. A queue paused from the dashboard shows here too, since a space page has no pause button.
+// 30 Oct (owner): the drop-down carries the Nuking words and count, so the status text keeps only the queueing count. The drop-down stays
+// beside the status while nuking work is left or the queue is paused.
 function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false) {
     if(!host) return
     const left = model?.pendingProfileCount || 0
-    const text = formatToolbarNukingStatus({
+    const toolbar = spaceFeedNukingToolbar({
         queueing: model?.queueingProfileCount || 0,
         left,
-        workActive: !!activeWork,
         paused: nukingQueuePaused
     })
-    syncNukingToolbarStatus(host, host.querySelector('.mb-ext_space-feed-nuke-btn'), text, left)
+    syncNukingToolbarStatus(host, host.querySelector('.mb-ext_space-feed-nuke-btn'), toolbar.statusText, left, toolbar.showsControl)
 }
 
 function syncSpaceFeedTopNukeButton(renderModel) {
@@ -11035,7 +11144,7 @@ function syncSpaceFeedTopNukeButton(renderModel) {
     // a page actually has posts; require it here too before showing
     // anything, rather than only checking it indirectly via this
     // extension's own (slower) profile-href scan.
-    if(!document.querySelector('a.post_timestamp')) {
+    if(!document.querySelector('a.post_timestamp, a.answer_timestamp')) {
         host.querySelector('.mb-ext_space-feed-nuke-btn')?.remove()
         return false
     }
@@ -11444,7 +11553,10 @@ function syncSpaceFeedPostButtons(renderModel) {
                 postKey,
                 postUrl: liveEntry?.postUrl || activeButton.dataset.mbPostUrl || '',
                 candidateUrls: urls,
-                resolveProfileFromPage
+                resolveProfileFromPage,
+                // The chase goes to the cited post or the question's log, not the post's own address (30 Oct).
+                resolutionUrl: liveEntry?.resolutionUrl || '',
+                resolutionSubject: liveEntry?.resolutionSubject || ''
             }])
         })
 
@@ -11548,7 +11660,7 @@ const SPACE_FEED_EXPAND_CLICKS_PER_PASS = 3
 // The post body, found by its position under the author header: the element at a point just below the header. Anything that is a link,
 // a button, part of the header, or the Follow control is not used, so a click cannot open a profile or follow someone.
 function findSpaceFeedPostBodyElement(postRoot) {
-    const header = postRoot.querySelector('a.post_timestamp')?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
+    const header = postRoot.querySelector('a.post_timestamp, a.answer_timestamp')?.closest('.q-flex.qu-alignItems--flex-start, .q-flex') || null
     if(!header) return null
 
     const rect = postRoot.getBoundingClientRect()

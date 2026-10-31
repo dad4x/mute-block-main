@@ -8,7 +8,7 @@
 
 'use strict'
 
-const {formatNukingStatus} = require('./candidateStatus')
+const {formatNukingStatus, formatToolbarNukingStatus} = require('./candidateStatus')
 
 const PAUSE_COORDINATOR_NUKES_ACTION = 'pause-coordinator-nukes'
 const RESUME_PAUSED_COORDINATOR_NUKES_ACTION = 'resume-paused-coordinator-nukes'
@@ -33,6 +33,15 @@ function nukingControlLabel(paused = false, left = 0) {
 // Whether a status text shows nuking work or a paused nuking queue. The drop-down sits beside a status only when it does.
 function nukingStatusShowsControl(text = '') {
     return /\bNuking\b/.test(`${text || ''}`)
+}
+
+// The space page's toolbar beside the batch button (owner, 30 Oct): the drop-down carries the Nuking words and count, so the status text keeps only
+// the queueing count. The drop-down shows whenever nuking work is left or the queue is paused, the same rule as before.
+function spaceFeedNukingToolbar({queueing = 0, left = 0, paused = false} = {}) {
+    return {
+        statusText: formatNukingStatus({queueing}),
+        showsControl: !!formatToolbarNukingStatus({left, paused: !!paused})
+    }
 }
 
 // The drop-down for the current state. Both items are listed; the one that does not apply is disabled, so the state is always visible.
@@ -70,5 +79,6 @@ module.exports = {
     nukingControlMessage,
     nukingControlLabel,
     nukingStatusShowsControl,
-    nukingControlView
+    nukingControlView,
+    spaceFeedNukingToolbar
 }

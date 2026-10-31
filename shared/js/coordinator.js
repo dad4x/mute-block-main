@@ -170,6 +170,34 @@ function historyRowAt(row = {}) {
     return Number.parseInt(row.terminalAt || row.updatedAt, 10) || 0
 }
 
+// The space a completed row came from. A row with provenance may name its own space; a space row carries the space key (quora-space:<address>).
+function historyRowSpaceUrl(row = {}) {
+    const fromProvenance = `${row.provenance?.sourceSpaceUrl || ''}`
+    if(fromProvenance) return fromProvenance
+    const spaceKey = `${row.source?.spaceKey || ''}`
+    return spaceKey.startsWith('quora-space:') ? spaceKey.slice('quora-space:'.length) : ''
+}
+
+// The name a space shows as on the History page: its title when the row has one, otherwise its address host (spamdetectives.quora.com).
+function historyRowSpaceLabel(row = {}) {
+    const title = `${row.provenance?.sourceSpaceTitle || ''}`.trim()
+    if(title) return title
+    const url = historyRowSpaceUrl(row)
+    if(!url) return ''
+    try {
+        return new URL(url).hostname
+    }
+    catch {
+        return ''
+    }
+}
+
+// The post a completed row came from: the first evidence entry that names one, else the row's own post address.
+function historyRowPostUrl(row = {}) {
+    const evidence = (Array.isArray(row.evidence) ? row.evidence : []).find(entry => entry?.postUrl)
+    return `${evidence?.postUrl || row.postUrl || ''}`
+}
+
 // Asks the worker for the rows. A full query replaces the rows the page has; an incremental one adds the rows it does not have yet.
 async function refreshHistoryRows(full = false) {
     const result = await sendRuntimeMessageWithTimeout({action: 'get-recent-history', since: full ? 0 : historySince}, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
@@ -218,6 +246,7 @@ function historyRowFilterFields(row = {}) {
         outcome,
         outcome.replace(/-/g, ' '),
         row.origin === 'manual' ? 'Manual' : 'Space',
+        historyRowSpaceLabel(row),
         `${row.origin || ''}`,
         `${row.actionKind || ''}`,
         `${row.error || row.finalError || ''}`
@@ -284,14 +313,15 @@ function renderHistoryRows() {
         const status = historyStatusLabel(row)
         const outcome = `${row.outcome || ''}`.replace(/-/g, ' ')
         const attempt = Number.parseInt(row.attemptNumber, 10) > 1 ? `attempt ${row.attemptNumber}` : ''
-        const source = row.origin === 'manual' ? 'Manual' : 'Space'
+        const spaceLabel = historyRowSpaceLabel(row)
+        const source = row.origin === 'manual' ? 'Manual' : spaceLabel ? `Space ${spaceLabel}` : 'Space'
         const at = historyRowAt(row)
         const when = at ? formatDateTime(at) : ''
         const error = `${row.error || row.finalError || ''}`.trim().slice(0, 160)
         const subtitle = [status, outcome, attempt, source, when, error].filter(Boolean).join(' • ')
         const element = document.createElement('div')
         element.className = historyRowHasError(row) ? 'row row--history-error' : 'row'
-        element.append(buildTitleCell(titleLabel, subtitle, {titleHref: profileHref, subtitleHref: row.postUrl || ''}))
+        element.append(buildTitleCell(titleLabel, subtitle, {titleHref: profileHref, subtitleHref: historyRowPostUrl(row) || historyRowSpaceUrl(row)}))
         return element
     }), allRows.length ? 'No history rows match the filter.' : 'No history yet.', historyFirstLoadState)
 }

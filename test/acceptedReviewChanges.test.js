@@ -694,6 +694,10 @@ register('the resolver reports which step decided the profile: header, inline, s
     const state = {}
     const context = vm.createContext({
         QUEUED_PROFILE_RESOLUTION_MODE: 'author-profile',
+        // The queue item's subject (shared/js/profileResolutionSubject.js, 30 Oct), as the real module exports it.
+        normalizeResolutionSubject: require('../shared/js/profileResolutionSubject').normalizeResolutionSubject,
+        RESOLUTION_SUBJECT_POSTER: 'poster',
+        RESOLUTION_SUBJECT_NAMED_PROFILES: 'named-profiles',
         location: {href: 'https://www.quora.com/profile/Some-User-42'},
         normalizeQuoraProfileHref: href => (`${href || ''}`.includes('/profile/') ? `${href}` : null),
         getPageType: () => state.pageType,

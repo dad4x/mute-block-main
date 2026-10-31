@@ -39,6 +39,21 @@ test('rejects Quora space subdomain paths as profile aliases', () => {
     )
 })
 
+test('rejects question slugs that have a number in them (30 Oct)', () => {
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/What-made-the-2707-so-superior'),
+        null
+    )
+    assert.equal(getLikelyQuoraProfileSlug('/What-made-the-2707-so-superior'), '')
+})
+
+test('still accepts a profile with a question-word first name and a number (30 Oct)', () => {
+    assert.equal(
+        normalizeQuoraProfileHref('https://www.quora.com/Will-Fridolf-5'),
+        'https://www.quora.com/profile/Will-Fridolf-5'
+    )
+})
+
 test('allows explicit profile paths on Quora subdomains', () => {
     assert.equal(
         normalizeQuoraProfileHref('https://example.quora.com/profile/Some-User-42'),

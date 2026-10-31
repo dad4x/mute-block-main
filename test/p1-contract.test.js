@@ -162,6 +162,7 @@ function loadDashboardHarness() {
         clearInterval() {},
         clearTimeout() {},
         console,
+        URL,
         setInterval() {},
         setTimeout() {}
     }
@@ -210,7 +211,11 @@ function loadQueuedPageResolutionHarness() {
         },
         normalizeQuoraProfileHref(href = '') {
             return `${href || ''}`.includes('/profile/') ? `${href || ''}` : null
-        }
+        },
+        // The queue item's subject, as shared/js/profileResolutionSubject.js exports it (30 Oct).
+        normalizeResolutionSubject: require('../shared/js/profileResolutionSubject').normalizeResolutionSubject,
+        RESOLUTION_SUBJECT_POSTER: 'poster',
+        RESOLUTION_SUBJECT_NAMED_PROFILES: 'named-profiles'
     }
     vm.createContext(context)
     vm.runInContext([
@@ -4872,7 +4877,7 @@ test('space-feed scan root prefers the post-bearing main content node', () => {
     const syncBody = extractFunction(source, 'function syncSpaceFeedNukeControls()')
 
     assert.match(rootBody, /querySelectorAll\('#mainContent, main, \[role="main"\]'\)/)
-    assert.match(rootBody, /timestampCount: candidate\.querySelectorAll\?\.\('a\.post_timestamp'\)\.length \|\| 0/)
+    assert.match(rootBody, /timestampCount: candidate\.querySelectorAll\?\.\('a\.post_timestamp, a\.answer_timestamp'\)\.length \|\| 0/)
     assert.match(rootBody, /right\.timestampCount - left\.timestampCount/)
     assert.match(syncBody, /const main = getSpaceFeedContentRoot\(\)/)
 })
@@ -4921,11 +4926,12 @@ test('asset-space source-post resolver rows do not use the visible post author',
         resolutionReason: 'source-post-needs-profile-resolution'
     }
 
-    assert.match(entriesBody, /resolveProfileFromPage: isAssetSpacePage\(\) && !!postUrl && needsSourceResolution/)
+    assert.match(entriesBody, /resolveProfileFromPage: \(isAssetSpacePage\(\) && !!postUrl && needsSourceResolution\) \|\| !!citedUrl/)
     assert.doesNotMatch(entriesBody, /resolveProfileFromPage: isAssetSpacePage\(\) && !!postUrl && \(!candidateUrls\.length \|\| needsSourceResolution\)/)
     assert.match(body, /resolutionReason === 'low-confidence-profile-artifact'/)
     assert.match(reasonBody, /source-post-needs-profile-resolution/)
-    assert.match(body, /if\(isAssetSpacePage\(\)\) return noteQueuedResolution\(sink, 'explicit', explicitProfileHref\)/)
+    // 30 Oct: an asset-space item reads the named profile unless the queue item says it is chasing the poster.
+    assert.match(body, /if\(subject !== RESOLUTION_SUBJECT_POSTER && isAssetSpacePage\(\)\) return noteQueuedResolution\(sink, 'explicit', explicitProfileHref\)/)
     assert.match(singleBody, /candidate\.source === 'listed-profile-link'/)
     assert.match(textUrlBody, /isLikelyExplicitProfileTargetHref\(href\)/)
     assert.match(postArtifactBody, /isLikelyExplicitProfileTargetSlug\(cleanSlug\)/)
@@ -4963,8 +4969,8 @@ test('asset-space source-post scan only creates resolver rows for explicit sourc
     assert.match(entriesBody, /needsSourceResolution = candidateUrls\.needsSourceResolution === true/)
     assert.match(entriesBody, /while\(!candidateUrls\.length && node && node !== contentRoot\)/)
     assert.doesNotMatch(entriesBody, /while\(!candidateUrls\.length && !needsSourceResolution && node && node !== contentRoot\)/)
-    assert.match(entriesBody, /resolutionReason: needsSourceResolution \? 'low-confidence-profile-artifact' : ''/)
-    assert.match(entriesBody, /resolveProfileFromPage: isAssetSpacePage\(\) && !!postUrl && needsSourceResolution/)
+    assert.match(entriesBody, /resolutionReason: citedUrl \? 'target-post-cites-source' : \(needsSourceResolution \? 'low-confidence-profile-artifact' : ''\)/)
+    assert.match(entriesBody, /resolveProfileFromPage: \(isAssetSpacePage\(\) && !!postUrl && needsSourceResolution\) \|\| !!citedUrl/)
     assert.match(queueableResolverBody, /getQueueableSpaceFeedEntryUrls\(entry\)\.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES[\s\S]*return false/)
     assert.match(queueableResolverBody, /resolutionReason \|\| ''\}`\.trim\(\) === 'low-confidence-profile-artifact'[\s\S]*return false/)
     assert.match(queueableResolverRenderBody, /getQueueableSpaceFeedEntryUrlsForRender\(entry, context\)\.length >= SPACE_FEED_POST_NUKE_MIN_PROFILES[\s\S]*return false/)
@@ -5186,7 +5192,7 @@ test('space feed action buttons keep Nuke Em labels', () => {
 
     assert.match(topBody, /Nuke 'Em/)
     assert.match(postBody, /Nuke 'Em/)
-    assert.match(statusBody, /formatToolbarNukingStatus\(\{/)
+    assert.match(statusBody, /spaceFeedNukingToolbar\(\{/)
     assert.match(readRepoFile('shared/js/candidateStatus.js'), /Nuking\.\.\./)
     assert.match(postWorkLabelBody, /Nuking this/)
     assert.doesNotMatch(topBody, /Queue visible/)
@@ -5201,7 +5207,7 @@ test('the status and batch text on the space page and the search page come from 
     assert.match(content, /const \{NOTHING_QUEUED_LABEL, NUKED_LABEL, formatToolbarNukingStatus, formatProfileRowState\} = require\('\.\/candidateStatus'\)/)
     // Each page builds its toolbar status with the one presence rule (formatToolbarNukingStatus), from its own facts (28 Oct).
     // Both pages read the paused flag from the stored pause (nukingQueuePaused), not from the space model's ownerPaused.
-    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /formatToolbarNukingStatus\(\{\s*queueing: model\?\.queueingProfileCount \|\| 0,\s*left,\s*workActive: !!activeWork,\s*paused: nukingQueuePaused\s*\}\)/)
+    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /spaceFeedNukingToolbar\(\{\s*queueing: model\?\.queueingProfileCount \|\| 0,\s*left,\s*paused: nukingQueuePaused\s*\}\)/)
     assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /formatToolbarNukingStatus\(\{queueing, left: remaining, workActive: false, paused: nukingQueuePaused\}\)/)
     // The search rows take their words from the shared row-state builder, and the batch driver takes its Queueing words from the shared builder.
     assert.match(content, /setNukeButtonWorking\(button, formatProfileRowState\('queueing'\)\)/)
@@ -5226,15 +5232,15 @@ test('the Nuking drop-down is one shared builder for the space page and the sear
     const content = readRepoFile('shared/js/content.js')
     const sharedControl = readRepoFile('shared/js/nukingControl.js')
     // content.js takes the drop-down's words, items and messages from the shared module.
-    assert.match(content, /const \{nukingControlView, nukingStatusShowsControl\} = require\('\.\/nukingControl'\)/)
+    assert.match(content, /const \{nukingControlView, nukingStatusShowsControl, spaceFeedNukingToolbar\} = require\('\.\/nukingControl'\)/)
     assert.match(extractFunction(content, 'function buildNukingControl()'), /nukingControlView\(nukingQueuePaused, left\)/)
     // Both pages: the working Nuking button and the toolbar status get the drop-down through the same two placement helpers.
     assert.match(extractFunction(content, 'function setNukeButtonWorking(button, label = formatProfileRowState(\'nuking\'))'), /syncNukingControlForButton\(button, label\)/)
     assert.match(extractFunction(content, 'function syncNukingControlForButton(button, label)'), /nukingControlPageAllowed\(\)[\s\S]*attachNukingControl\(button, 0\)/)
     assert.match(extractFunction(content, 'function nukingControlPageAllowed()'), /'space'[\s\S]*'profile-search'/)
-    // Changed 28 Oct: both toolbars place their status through syncNukingToolbarStatus, which attaches the drop-down through syncNukingStatusControl.
-    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0)'), /syncNukingStatusControl\(status, text, left\)/)
-    assert.match(extractFunction(content, 'function syncNukingStatusControl(status, text, left = 0)'), /nukingStatusShowsControl\(text\)/)
+    // 30 Oct: both toolbars place their status through syncNukingToolbarStatus, which attaches the drop-down itself. The default flag is the
+    // text rule (nukingStatusShowsControl); the space page passes its own flag (spaceFeedNukingToolbar), since its drop-down carries the words.
+    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0, showsControl = nukingStatusShowsControl(text))'), /attachNukingControl\(status, left\)/)
     // The drop-down is built in one place, and its clicks stop there.
     assert.equal(content.split("className = 'mb-ext_nuking-control'").length - 1, 1)
     assert.match(extractFunction(content, 'function buildNukingControl()'), /event\.stopPropagation\(\)[\s\S]*event\.preventDefault\(\)/)
@@ -5264,8 +5270,8 @@ test('both batch toolbars call one builder and use one class set and one style r
     const css = readRepoFile('shared/css/content.css')
     assert.match(content, /const NUKING_TOOLBAR_STATUS_CLASS = 'mb-ext_nuking-status'/)
     // The one builder. Both toolbars call it, and it is the only place the status element is built.
-    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0)'), /status\.className = NUKING_TOOLBAR_STATUS_CLASS/)
-    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /syncNukingToolbarStatus\(host, host\.querySelector\('\.mb-ext_space-feed-nuke-btn'\), text, left\)/)
+    assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0, showsControl = nukingStatusShowsControl(text))'), /status\.className = NUKING_TOOLBAR_STATUS_CLASS/)
+    assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /syncNukingToolbarStatus\(host, host\.querySelector\('\.mb-ext_space-feed-nuke-btn'\), toolbar\.statusText, left, toolbar\.showsControl\)/)
     assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /syncNukingToolbarStatus\(toolbar, toolbar\.querySelector\('\.mb-ext_profile-search-batch-btn'\), text, remaining\)/)
     assert.equal(content.split("className = 'mb-ext_nuking-status'").length - 1, 0, 'no page sets its own class on the status')
     assert.equal(content.includes('mb-ext_space-feed-nuking-status'), false)
@@ -6855,6 +6861,29 @@ test('history filter matches every typed word in any visible field, case-insensi
     assert.doesNotMatch(filterBody, /document\./, 'the matching rule is pure')
 })
 
+test('history row shows the space and post a completed row was collected from', () => {
+    const evaluate = loadDashboardHarness()
+    // A completed space row: the space key and the post live on the row itself (as the worker returns them).
+    const spaceRow = {
+        source: {spaceKey: 'quora-space:https://spamdetectives.quora.com', pageUrl: 'https://spamdetectives.quora.com/?__filter__=all'},
+        provenance: null,
+        evidence: [{postUrl: 'https://spamdetectives.quora.com/Some-post-slug'}],
+        targetProfileHref: 'https://www.quora.com/profile/Jane-Doe'
+    }
+    assert.equal(evaluate(`historyRowSpaceLabel(${JSON.stringify(spaceRow)})`), 'spamdetectives.quora.com', 'the label is the space host')
+    assert.equal(evaluate(`historyRowSpaceUrl(${JSON.stringify(spaceRow)})`), 'https://spamdetectives.quora.com')
+    assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(spaceRow)})`), 'https://spamdetectives.quora.com/Some-post-slug')
+    assert.equal(evaluate(`historyRowMatchesFilter(${JSON.stringify(spaceRow)}, 'spamdetectives')`), true, 'the space is searchable')
+
+    const withProvenance = {...spaceRow, provenance: {sourceSpaceUrl: 'https://example-space.quora.com/', sourceSpaceTitle: 'Example Space'}}
+    assert.equal(evaluate(`historyRowSpaceLabel(${JSON.stringify(withProvenance)})`), 'Example Space', 'a provenance title wins')
+    assert.equal(evaluate(`historyRowSpaceUrl(${JSON.stringify(withProvenance)})`), 'https://example-space.quora.com/', 'a provenance address wins')
+
+    const searchRow = {source: {pageUrl: 'https://www.quora.com/search?q=x'}, evidence: [], targetProfileHref: 'https://www.quora.com/profile/Jane-Doe'}
+    assert.equal(evaluate(`historyRowSpaceLabel(${JSON.stringify(searchRow)})`), '', 'a row with no space shows no space')
+    assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(searchRow)})`), '', 'a row with no post shows no post')
+})
+
 test('history remove duplicates keeps only the newest row per profile when on, and every row when off', () => {
     const evaluate = loadDashboardHarness()
     const rows = [
@@ -7267,4 +7296,14 @@ test('the search collect-end event detail carries seen, the distinct result rows
     // The space page's call passes no count, so its event keeps the old detail.
     const spaceCall = source.slice(source.indexOf("reportCollectEnd('space'"), source.indexOf("reportCollectEnd('space'") + 400)
     assert.doesNotMatch(spaceCall, /considered/)
+})
+
+test('space feed reads answer timestamps as posts too, and single-post page detection still reads only post timestamps (30 Oct)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    // Posts that are answers are marked a.answer_timestamp, not a.post_timestamp. Without it, their poster is not a candidate and the
+    // post's controls go to the post above (SEO Rankings, 30 Oct).
+    assert.match(extractFunction(content, 'function getSpaceFeedPostEntries()'), /a\.post_timestamp, a\.answer_timestamp/)
+    assert.match(extractFunction(content, 'function getSpaceFeedPostRootFromMutationNode(node)'), /a\.answer_timestamp/)
+    // Page-type detection is shared with question and single-post pages, so it keeps the post-only selector.
+    assert.doesNotMatch(extractFunction(content, 'function isSpacePostPage()'), /answer_timestamp/)
 })
