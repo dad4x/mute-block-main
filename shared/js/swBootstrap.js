@@ -165,6 +165,7 @@ function registerServiceWorkerListeners(deps = {}) {
         clearPersistentFailedRetry,
         clearSchedulerAlarms,
         closeIdleQueuedWorkerActionSurfaceWindows,
+        closeQueuedTabAfterTerminal,
         closeQueuedWorkerActionSurfaceIfIdle,
         consumeCanceledOwnerUrls,
         createOwnedTab,
@@ -265,6 +266,7 @@ function registerServiceWorkerListeners(deps = {}) {
         scheduleQueuedWorkContinuation,
         scheduleQueuedWorkerActionSurfaceCleanup,
         scheduleStoredWorkRearmAfterExtensionReload,
+        noteTabRemoved,
         sendTabMessage,
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
@@ -361,6 +363,7 @@ function registerServiceWorkerListeners(deps = {}) {
         browser.alarms.onAlarm.addListener(alarm => runAfterCoordinatorAuthorityReady(() => handleAlarm(alarm)))
     }
     function handleTabRemoved(tabId) {
+        noteTabRemoved(tabId)
         recordFlightRecorderEvent({
             kind: 'tab-removed',
             source: 'tabs.onRemoved',
@@ -528,6 +531,20 @@ function registerServiceWorkerListeners(deps = {}) {
         }
     
         const metadata = getQueuedTabMetadata(tabId)
+        if(metadata && (changeInfo.url || changeInfo.status)) {
+            // Each URL or load-status change on a queued tab, with the path only, so the navigation just before a frame goes away is visible.
+            let changedPath = ''
+            if(changeInfo.url) {
+                try { changedPath = new URL(changeInfo.url).pathname } catch {}
+            }
+            recordFlightRecorderEvent({
+                kind: 'tab-navigation',
+                tabId,
+                status: changeInfo.status || '',
+                path: changedPath,
+                targetUrl: metadata.profileHref || ''
+            })
+        }
         if(metadata && changeInfo.status === 'complete') {
             // Marks the browser-level page-load boundary of a handoff, split
             // from 'tab-open-request' (swexecutor.js, fired when the tab is
@@ -962,6 +979,7 @@ function registerServiceWorkerListeners(deps = {}) {
             // tab, exponential backoff) is the right response here too, so a
             // run that starts tripping challenges backs off instead of
             // hammering straight into more of them.
+            recordFlightRecorderEvent({kind: 'queue-load-pressure', source: 'cloudflare-challenge', tabId: sender.tab?.id || null, targetUrl: `${request.href || ''}`})
             rememberQueueLoadPressure('cloudflare-challenge', {
                 href: `${request.href || ''}`,
                 tabId: sender.tab?.id || null
@@ -1085,24 +1103,18 @@ function registerServiceWorkerListeners(deps = {}) {
                             (getQueuedActionSurfaceWindowId() &&
                                 Number.parseInt(sender.tab?.windowId, 10) === Number.parseInt(getQueuedActionSurfaceWindowId(), 10))
                         if(!valid && !shouldCleanupWorkerSurface) return {closed: false, staleAttempt: true}
-                        markQueuedTabClosing(tabId, 'content-close-request')
-                        await releaseQueuedTab(tabId, {awaitFill: true})
+                        const closeResult = await closeQueuedTabAfterTerminal(tabId, 'content-close-request', {awaitFill: true})
+                        if(!closeResult.closed) return {closed: false}
                         if(shouldCleanupWorkerSurface) {
                             scheduleQueuedWorkerActionSurfaceCleanup('idle-after-release')
+                            await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
+                                windowId: sender.tab?.windowId || null
+                            }).catch(() => false)
                         }
-                        return browser.tabs.remove(tabId)
-                            .then(async () => {
-                                if(shouldCleanupWorkerSurface) {
-                                    await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
-                                        windowId: sender.tab?.windowId || null
-                                    }).catch(() => false)
-                                }
-                                else {
-                                    await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
-                                }
-                                return {closed: true}
-                            })
-                            .catch(() => ({closed: false}))
+                        else {
+                            await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
+                        }
+                        return {closed: true}
                     })
             }
     
@@ -1169,6 +1181,59 @@ function registerServiceWorkerListeners(deps = {}) {
             return sweepServiceWorkerBlockedProfileTabs()
         }
     }
+    // Every Quora main-frame and XHR response, with its HTTP status, so throttled or challenged requests show in the flight
+    // recorder. The listener below only watches a few GraphQL mutations. Only the URL path is kept, never the query string.
+    const quoraRequestStartedAt = new Map()
+    const quoraRequestFilter = {urls: ['https://*.quora.com/*'], types: ['main_frame', 'xmlhttprequest']}
+    browser.webRequest.onBeforeRequest.addListener(details => {
+        if(quoraRequestStartedAt.size > 500) quoraRequestStartedAt.clear()
+        quoraRequestStartedAt.set(details.requestId, details.timeStamp)
+    }, quoraRequestFilter)
+    browser.webRequest.onCompleted.addListener(details => {
+        const startedAt = quoraRequestStartedAt.get(details.requestId)
+        quoraRequestStartedAt.delete(details.requestId)
+        let path = ''
+        try { path = new URL(details.url).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-response',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            statusCode: details.statusCode,
+            fromCache: details.fromCache === true,
+            path,
+            durationMs: startedAt ? Math.round(details.timeStamp - startedAt) : -1
+        })
+    }, quoraRequestFilter)
+    // Redirects and failed requests on Quora's main and sub frames, so a navigation that removes a queued tab's frame shows in the recorder. Paths only.
+    const quoraNavigationFilter = {urls: ['https://*.quora.com/*'], types: ['main_frame', 'sub_frame']}
+    browser.webRequest.onBeforeRedirect.addListener(details => {
+        let path = ''
+        let redirectPath = ''
+        try { path = new URL(details.url).pathname } catch {}
+        try { redirectPath = new URL(details.redirectUrl).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-redirect',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            statusCode: details.statusCode,
+            path,
+            redirectPath
+        })
+    }, quoraNavigationFilter)
+    browser.webRequest.onErrorOccurred.addListener(details => {
+        let path = ''
+        try { path = new URL(details.url).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-request-error',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            error: details.error || '',
+            path
+        })
+    }, quoraNavigationFilter)
     browser.webRequest.onCompleted.addListener(details => {
         if(details.url.match(/TribePeopleModalQuery/i)) {
             sendTabMessage(details.tabId, {status: 'space-people-modal-loaded'})

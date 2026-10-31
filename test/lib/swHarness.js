@@ -456,7 +456,10 @@ function createFakeBrowser(initialStorage = {}, options = {}) {
             }
         },
         webRequest: {
-            onCompleted: makeEvent()
+            onBeforeRedirect: makeEvent(),
+            onBeforeRequest: makeEvent(),
+            onCompleted: makeEvent(),
+            onErrorOccurred: makeEvent()
         },
         scripting: {
             async executeScript() {
