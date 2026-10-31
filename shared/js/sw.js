@@ -257,7 +257,8 @@ const {
     createQueueWakeupMetricsShape
 } = require('./swQueueWakeupMetricsShape')
 const {
-    createStorageMetrics
+    createStorageMetrics,
+    startEventLoopLagSampler
 } = require('./swStorageMetrics')
 const {
     createActivationGuardRuntime
@@ -1622,6 +1623,7 @@ const {
 const queuedTabOpenUrlCommitHelpers = makeQueuedTabOpenUrlCommitHelpers({
     browser,
     getQueuedExecutorTabStatusWithTimeout,
+    recordFlightRecorderEvent,
     // getTabObservedUrls is threaded as a thunk (defers name resolution to
     // call time) because it's defined later, via coordinatorReconcileInputs
     // -- see the ordering note above that module's construction.
@@ -2395,8 +2397,10 @@ const {
     recordQueueWriteOperationMetrics,
     recordStoragePayloadMetrics,
     recordStorageReadPayloadMetrics,
-    recordPhysicalWriteMetrics
+    recordPhysicalWriteMetrics,
+    noteStorageWriteTiming
 } = storageMetrics
+startEventLoopLagSampler({recordFlightRecorderEvent})
 
 // Set by the erase once its clear is done (eraseBlockHistoryRequested). From then until the reload nothing may write, local or session:
 // the resident WAL and queue are still in memory, and would write themselves back over the cleared storage. Reads still work.
@@ -2430,6 +2434,10 @@ const sessionStorageAdapter = {
     set: payload => {
         const area = namespaceArea(browser.storage.session)
         return getStorageWriteRefusal() || (area ? area.set(payload) : Promise.reject(new Error('session storage is unavailable')))
+    },
+    remove: keys => {
+        const area = namespaceArea(browser.storage.session)
+        return getStorageWriteRefusal() || (area ? area.remove(keys) : Promise.reject(new Error('session storage is unavailable')))
     }
 }
 const storageUpdateState = createSerializedStorageUpdateState()
@@ -2584,6 +2592,9 @@ async function metricStorageGet(defaults = {}, options = {}) {
     return result
 }
 
+// Storage writes started and not yet finished. More than one at a time means writes overlapped, which the storage-write event shows.
+let storageSetsInFlight = 0
+
 async function metricStorageSet(payload = {}, options = {}) {
     const storageContext = getActiveStorageContext()
     // The raw legacy queue key is refused on every write, as persistCoordinator refuses it (the queue belongs to the WAL). Nothing
@@ -2620,6 +2631,8 @@ async function metricStorageSet(payload = {}, options = {}) {
     incrementActiveStorageMetricDetail('storageSetCalls')
     applyResumeExemptionToUpdate(storageContext, resumeWrite)
     const startedAt = Date.now()
+    storageSetsInFlight += 1
+    const inFlightAtStart = storageSetsInFlight
     let result = null
     let writeOutcome = 'error'
     try {
@@ -2627,19 +2640,21 @@ async function metricStorageSet(payload = {}, options = {}) {
         // A namespace write's stamps (writeCoordinatorStoredKeys) join the keys in this one adapter call. They are added here,
         // not to payload, so the metrics, the idle latch and the dashboard notify see exactly what the caller wrote.
         const diskPayload = options.namespaceStamps ? {...payload, ...options.namespaceStamps} : payload
-        // storageArea 'session' sends the write to session storage (the queue-wakeup metrics view, owner decision 26 Oct). Every other write is a disk write.
+        // storageArea 'session' sends the write to session storage (the queue-wakeup metrics view, owner decision 26 Oct; the owned-tab map). Every other write is a disk write.
         const writeAdapter = options.storageArea === 'session' ? sessionStorageAdapter : coordinatorStorageAdapter
         result = await runQueueWakeupMetricPhase(options.phase || 'storageSet', () => (Object.keys(diskPayload).length
             ? writeAdapter.set(diskPayload)
             : true))
-        if(result !== false) recordPhysicalWriteMetrics(payloadSummary.bytes)
+        if(result !== false && options.storageArea !== 'session') recordPhysicalWriteMetrics(payloadSummary.bytes, Date.now() - startedAt)
         writeOutcome = 'saved'
     }
     finally {
+        storageSetsInFlight -= 1
         if(isProfileProgressProjectionWrite) {
             profileNukeProgressProjectionWriteDepth = Math.max(0, profileNukeProgressProjectionWriteDepth - 1)
         }
         const writeElapsedMs = Date.now() - startedAt
+        const writeCluster = noteStorageWriteTiming(startedAt, writeElapsedMs)
         recordStoragePathLatencyMetrics('write', pathName, writeElapsedMs)
         // Per-key latency, alongside the existing per-path breakdown -- the
         // compact queue view alone gets written from several different
@@ -2650,16 +2665,22 @@ async function metricStorageSet(payload = {}, options = {}) {
             recordStorageKeyLatencyMetrics('write', key, writeElapsedMs)
         }
         // One flight-recorder entry per write (owner 18 Oct): the label, the size in bytes, the rows, the keys, the time, and the
-        // outcome. A write that throws is recorded as 'error' before the error reaches the caller.
+        // outcome. A write that throws is recorded as 'error' before the error reaches the caller. The start time, the writes in
+        // flight at its start, and its place in a slow-write cluster let a run be checked for bursts of slow writes.
         recordFlightRecorderEvent({
             kind: 'storage-write',
             source: 'metricStorageSet',
             label: pathName,
+            startedAt,
+            inFlight: inFlightAtStart,
+            storageArea: options.storageArea === 'session' ? 'session' : 'disk',
             bytes: payloadSummary?.bytes || 0,
             logicalBytes: payloadSummary?.bytes || 0,
             rows: payloadSummary?.rows || 0,
             keys: (payloadSummary?.keys || keys).slice(0, 12).join(','),
             elapsedMs: writeElapsedMs,
+            sinceLastSlowWriteMs: writeCluster.sinceLastSlowWriteMs,
+            slowWriteClusterSize: writeCluster.slowWriteClusterSize,
             outcome: writeOutcome,
             accepted: writeOutcome === 'saved',
             changed: writeOutcome === 'saved'
@@ -3168,7 +3189,8 @@ const ownedTabLifecycle = createOwnedTabLifecycle({
         normalizeOwnedParentId,
         persistOwnedTabIdsByParent,
         setTimeoutFn: setTimeout,
-        clearTimeoutFn: clearTimeout
+        clearTimeoutFn: clearTimeout,
+        recordFlightRecorderEvent
     },
     state: {
         getPersistOwnedTabIdsTimeout: () => persistOwnedTabIdsTimeout,
@@ -3181,6 +3203,7 @@ const {
     rebuildOwningParentByChild,
     schedulePersistOwnedTabIdsByParent,
     sendTabMessage,
+    noteTabRemoved,
     registerOwnedTab,
     unregisterOwnedTab
 } = ownedTabLifecycle
@@ -11889,8 +11912,10 @@ async function rememberCoordinatorTabId(tabId) {
     // Owner 18 Oct: the same id was written on every call (124 writes in one run). Write only when it changes, and do not hold the
     // caller on the write, so the write never adds to the time the caller spends on the authority lane.
     if(coordinatorTabIdSavedToStorage === normalizedTabId) return
+    // Session storage, not disk: the id is read back from session storage only (getStoredCoordinatorTabId).
     metricStorageSet({[COORDINATOR_TAB_KEY]: normalizedTabId}, {
-        snapshotWriteReason: 'userMemoryNonAuthority'
+        snapshotWriteReason: 'userMemoryNonAuthority',
+        storageArea: 'session'
     }).then(saved => {
         if(saved !== false) coordinatorTabIdSavedToStorage = normalizedTabId
     }, () => null)
@@ -11903,7 +11928,7 @@ async function forgetCoordinatorTabId(tabId = null) {
     coordinatorTabId = null
     coordinatorTabIdSavedToStorage = null
     try {
-        await coordinatorStorageAdapter.remove(COORDINATOR_TAB_KEY)
+        await sessionStorageAdapter.remove(COORDINATOR_TAB_KEY)
     }
     catch {}
 }
@@ -11918,7 +11943,7 @@ async function forgetRemovedCoordinatorTabId(tabId) {
     }
 
     try {
-        const stored = await metricStorageGet({[COORDINATOR_TAB_KEY]: null})
+        const stored = await sessionStorageAdapter.get({[COORDINATOR_TAB_KEY]: null})
         if(normalizeTabId(stored[COORDINATOR_TAB_KEY]) === normalizedTabId) {
             await forgetCoordinatorTabId(normalizedTabId)
         }
@@ -11930,7 +11955,7 @@ async function getStoredCoordinatorTabId() {
     if(coordinatorTabId) return coordinatorTabId
 
     try {
-        const stored = await metricStorageGet({[COORDINATOR_TAB_KEY]: null})
+        const stored = await sessionStorageAdapter.get({[COORDINATOR_TAB_KEY]: null})
         coordinatorTabId = normalizeTabId(stored[COORDINATOR_TAB_KEY])
     }
     catch {
@@ -16731,6 +16756,7 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
 
     let response = await sendTabMessage(normalizedTabId, {
         action: 'close-if-blocked',
+        probeSource: 'terminalizeAlreadyBlockedQueuedTab',
         actionKind: metadata?.actionKind || '',
         requestedProfileHref: metadata?.profileHref || '',
         attemptId: metadata?.attemptId || '',
@@ -16761,10 +16787,7 @@ async function terminalizeAlreadyBlockedQueuedTab(tabId, reason = 'already-block
     })
     if(!recorded?.terminal) return false
 
-    markQueuedTabClosing(normalizedTabId, reason)
-    // Removed before the release, for the same reason as the sweep above.
-    await browser.tabs.remove(normalizedTabId).catch(() => {})
-    await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: true})
+    await closeQueuedTabAfterTerminal(normalizedTabId, reason, {awaitFill: true})
     // Finishing the row should not wait for the next scheduled pass (22 Oct): the terminal continuation runs now.
     scheduleTerminalProgressContinuation('already-blocked-terminal-continuation', [metadata.profileHref])
     return true
@@ -17054,6 +17077,7 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
             })
             const response = await sendTabMessage(tabId, {
                 action: 'close-if-blocked',
+                probeSource: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
                 actionKind,
                 requestedProfileHref: href,
                 attemptId: pollAttemptId,
@@ -17124,10 +17148,12 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
     // A transition that started while the probe was out must settle before this terminal record is written (27 Oct incident). The record
     // below checks the settled row's own state and attempt, so waiting here does not skip the tab close.
     const pendingAtWrite = getPendingActiveTransitionsForRow(itemKey)
+    const pendingWaitStartedAt = Date.now()
     if(pendingAtWrite.length) {
         incrementQueueWakeupMetric('blockedLiveTab.waitedForActiveTransitionAtWrite')
         await Promise.allSettled(pendingAtWrite)
     }
+    const pendingWaitMs = Date.now() - pendingWaitStartedAt
 
     return await withBlockedLiveTabTerminalization(tabId, reason, async () => {
         recordFlightRecorderEvent({
@@ -17170,6 +17196,7 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
         // See recordActiveBlockedLiveTabTerminal's own comment for the full
         // history (P3-2/P3-3 finding in
         // historical/sw-state-machine-decomposition-plan-2026-09-01.md).
+        const recordStartedAt = Date.now()
         const recorded = await applyCoordinatorQueueMachineEvent({
             type: 'BLOCKED_LIVE_TAB_TERMINAL_RECORD',
             tabId,
@@ -17181,6 +17208,14 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
             reason: 'blocked-live-tab-terminal-record-error',
             error: error?.message || `${error}`
         }))
+        recordFlightRecorderEvent({
+            kind: 'blocked-live-tab-close-timing',
+            source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
+            tabId,
+            pendingTransitions: pendingAtWrite.length,
+            pendingWaitMs,
+            recordMs: Date.now() - recordStartedAt
+        })
         recordFlightRecorderEvent({
             kind: 'blocked-live-tab-terminal-result',
             source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
@@ -17239,19 +17274,10 @@ async function terminalizeActiveCoordinatorItemFromBlockedLiveTab(itemKey = '', 
             // cleanup that follow are storage writes that can wait behind the queue for seconds, and the
             // page used to stay open for all of that. Elapsed time is recorded from the start of this
             // close to the removal, so the delay stays measurable.
-            const closeStartedAt = Date.now()
-            markQueuedTabClosing(closeTabId, reason)
-            const hadOwnedQueuedTabState = hasOwnedQueuedTabState(closeTabId)
-            const removeError = await browser.tabs.remove(closeTabId).then(() => null, error => error)
-            const removedAfterMs = Date.now() - closeStartedAt
-            if(hadOwnedQueuedTabState) {
-                await releaseQueuedTabAndCleanup(closeTabId, {awaitFill: closeTabId === tabId}).catch(() => {
-                    cleanupQueuedTabMetadataOnly(closeTabId)
-                })
-            }
-            else {
-                cleanupQueuedTabMetadataOnly(closeTabId)
-            }
+            const {removeError, removedAfterMs} = await closeQueuedTabAfterTerminal(closeTabId, reason, {
+                awaitFill: closeTabId === tabId,
+                releaseOnlyIfOwned: true
+            })
             recordFlightRecorderEvent({
                 kind: 'terminal-tab-close-result',
                 source: 'terminalizeActiveCoordinatorItemFromBlockedLiveTab',
@@ -28577,9 +28603,11 @@ async function ensureQueuedTabContentScript(tabId, reason = '') {
             incrementQueueWakeupMetric('throttle.skipped.workerWindowContentScriptEnsureDeferred')
         }
         else {
-            rememberQueueLoadPressure(/timed out|frame|receiving end|could not establish/i.test(error?.message || '')
+            const pressureReason = /timed out|frame|receiving end|could not establish/i.test(error?.message || '')
                 ? 'content-script-unscriptable'
-                : 'content-script-ensure-failed', {
+                : 'content-script-ensure-failed'
+            recordFlightRecorderEvent({kind: 'queue-load-pressure', source: pressureReason, tabId: normalizedTabId, targetUrl: metadata?.profileHref || '', error: error?.message || ''})
+            rememberQueueLoadPressure(pressureReason, {
                 tabId: normalizedTabId,
                 profileHref: metadata?.profileHref || '',
                 coordinatorKey: metadata?.coordinatorKey || ''
@@ -29250,8 +29278,10 @@ async function persistOwnedTabIdsByParent() {
         return
     }
     try {
+        // Session storage, not disk: the map is cleared when the browser session ends, and is restored from session storage only.
         const saved = await metricStorageSet({[OWNED_TAB_STATE_KEY]: serialized}, {
-            snapshotWriteReason: 'userMemoryNonAuthority'
+            snapshotWriteReason: 'userMemoryNonAuthority',
+            storageArea: 'session'
         })
         if(saved !== false) ownedTabIdsByParentSavedJson = serializedJson
     }
@@ -29260,7 +29290,8 @@ async function persistOwnedTabIdsByParent() {
 
 async function loadOwnedTabIdsByParent() {
     try {
-        const stored = await metricStorageGet({[OWNED_TAB_STATE_KEY]: {}})
+        // Read from the same session area persistOwnedTabIdsByParent writes to.
+        const stored = await sessionStorageAdapter.get({[OWNED_TAB_STATE_KEY]: {}})
         const serialized = stored?.[OWNED_TAB_STATE_KEY] || {}
 
         const ownedTabParentEntries = []
@@ -29279,7 +29310,18 @@ async function loadOwnedTabIdsByParent() {
     catch {}
 }
 
+// Both keys moved to session storage. Their old disk copies are removed once at startup, and only if present, so a clean start writes nothing.
+async function removeStaleDiskCopiesOfSessionKeys() {
+    try {
+        const stored = await coordinatorStorageAdapter.get({[OWNED_TAB_STATE_KEY]: null, [COORDINATOR_TAB_KEY]: null})
+        const stale = [OWNED_TAB_STATE_KEY, COORDINATOR_TAB_KEY].filter(key => stored?.[key] !== null && stored?.[key] !== undefined)
+        if(stale.length) await coordinatorStorageAdapter.remove(stale)
+    }
+    catch {}
+}
+
 const ownedTabIdsReady = loadOwnedTabIdsByParent()
+void removeStaleDiskCopiesOfSessionKeys()
 
 async function getLiveOwnedTabIds(parentTabId) {
     await ownedTabIdsReady
@@ -29336,6 +29378,7 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
             if(`${metadata?.actionKind || metadata?.tabAction || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) continue
             let response = await sendTabMessage(tabId, {
                 action: 'close-if-blocked',
+                probeSource: 'sweepOwnedBlockedProfileTabs',
                 actionKind: metadata?.actionKind || '',
                 requestedProfileHref: metadata?.profileHref || '',
                 attemptId: metadata?.attemptId || '',
@@ -29354,11 +29397,7 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
                 if(!recorded?.terminal) continue
 
                 signaled += 1
-                markQueuedTabClosing(tabId, 'background-blocked-sweep')
-                // The tab is removed before the release. The release waits for the next fill, and that fill waits for this tab's
-                // worker surface, so releasing first kept the tab open for good (flight recorder, 20 Oct: 751 surface-busy decisions).
-                await browser.tabs.remove(tabId).catch(() => {})
-                await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})
+                await closeQueuedTabAfterTerminal(tabId, 'background-blocked-sweep', {awaitFill: true})
             }
         }
         catch {}
@@ -29883,6 +29922,7 @@ async function sweepTerminalBlockedProfileTabs(profileHrefs = [], expectedTabIds
             try {
                 const response = await sendTabMessage(tabId, {
                     action: 'close-if-blocked',
+                    probeSource: 'sweepTerminalBlockedProfileTabs',
                     requestedProfileHref: href
                 })
                 if(response?.willClose) {
@@ -30079,6 +30119,7 @@ async function closeSuccessfulSourceProfileTabs(terminalRowEntries = []) {
 
             const response = await sendTabMessage(tabId, {
                 action: 'close-if-blocked',
+                probeSource: 'closeSuccessfulSourceProfileTabs',
                 requestedProfileHref: href
             })
             if(response?.willClose) {
@@ -30236,12 +30277,7 @@ async function closeTerminalOwnedProfileTabsBody(profileHrefs = [], options = {}
             const href = normalizeQuoraProfileUrl(tab?.url || '')
             if(!href || !terminalHrefs.has(href)) continue
 
-            markQueuedTabClosing(tabId, 'terminal-coordinator-state')
-            await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})
-            try {
-                await browser.tabs.remove(tabId)
-            }
-            catch {}
+            await closeQueuedTabAfterTerminal(tabId, 'terminal-coordinator-state', {awaitFill: true})
             closedTabIds.add(normalizedTabId)
             closed += 1
         }
@@ -30658,6 +30694,31 @@ async function pruneDuplicateActiveQueuedRuntimeSurfaces(tabIds = [], options = 
         })
     }
     return pruned
+}
+
+// The one close path for a queued tab the worker has decided to end: blocked, terminal, or swept. The paths used to repeat this
+// sequence and drifted apart: some removed the tab before releasing its slot, one released first and removed after. The release
+// can wait on a queue fill, which waits on storage writes, so a tab released first stayed open for about 11 seconds (flight
+// recorder, 30 Oct). The tab is removed first here, and the slot is released after.
+async function closeQueuedTabAfterTerminal(tabId, reason, options = {}) {
+    const normalizedTabId = normalizeTabId(tabId)
+    if(!normalizedTabId) return {closed: false, removeError: null, removedAfterMs: 0, hadOwnedQueuedTabState: false}
+
+    const closeStartedAt = Date.now()
+    markQueuedTabClosing(normalizedTabId, reason)
+    const hadOwnedQueuedTabState = hasOwnedQueuedTabState(normalizedTabId)
+    const removeError = await browser.tabs.remove(normalizedTabId).then(() => null, error => error)
+    const removedAfterMs = Date.now() - closeStartedAt
+    // A caller with releaseOnlyIfOwned only releases a slot it actually held; every other caller always releases.
+    if(!options.releaseOnlyIfOwned || hadOwnedQueuedTabState) {
+        await releaseQueuedTabAndCleanup(normalizedTabId, {awaitFill: options.awaitFill === true}).catch(() => {
+            cleanupQueuedTabMetadataOnly(normalizedTabId)
+        })
+    }
+    else {
+        cleanupQueuedTabMetadataOnly(normalizedTabId)
+    }
+    return {closed: !removeError, removeError, removedAfterMs, hadOwnedQueuedTabState}
 }
 
 async function releaseQueuedTabAndCleanup(tabId, options = {}) {
@@ -31231,6 +31292,7 @@ async function sweepStaleQueuedTabs(parentTabId = null, options = {}) {
 
         const loadPressureRequeue = loadPressureCandidate
         if(loadPressureRequeue) {
+            recordFlightRecorderEvent({kind: 'queue-load-pressure', source: 'loading-or-unscriptable-tab', tabId, targetUrl: metadata?.profileHref || '', tabStatus: liveTab?.status || ''})
             rememberQueueLoadPressure('loading-or-unscriptable-tab', {
                 tabId,
                 profileHref: metadata?.profileHref || '',
@@ -35632,6 +35694,7 @@ registerServiceWorkerListeners({
         clearPersistentFailedRetry,
         clearSchedulerAlarms,
         closeIdleQueuedWorkerActionSurfaceWindows,
+        closeQueuedTabAfterTerminal,
         closeQueuedWorkerActionSurfaceIfIdle,
         consumeCanceledOwnerUrls,
         createOwnedTab,
@@ -35735,6 +35798,7 @@ registerServiceWorkerListeners({
         scheduleQueuedWorkContinuation,
         scheduleQueuedWorkerActionSurfaceCleanup,
         scheduleStoredWorkRearmAfterExtensionReload,
+        noteTabRemoved,
         sendTabMessage,
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,

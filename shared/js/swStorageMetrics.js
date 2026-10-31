@@ -269,7 +269,23 @@ function createStorageMetrics(deps = {}) {
         [4194304, '1m_4m'],
         [Infinity, 'ge4m']
     ]
-    function recordPhysicalWriteMetrics(bytes = 0) {
+    // The time each physical write took, in the same size bucket. Per size bucket: one counter per latency bucket, plus calls,
+    // the summed time and the longest time, so the histogram and the mean and worst case all read from the queue-wakeup metrics.
+    const PHYSICAL_WRITE_LATENCY_BUCKETS = [
+        [10, 'lt10ms'],
+        [50, '10_50ms'],
+        [100, '50_100ms'],
+        [300, '100_300ms'],
+        [1000, '300_1000ms'],
+        [Infinity, 'ge1000ms']
+    ]
+    // A write this slow is counted as slow. Slow writes whose starts fall within the cluster gap of the previous slow write form
+    // one cluster, so a run shows whether slow writes come in bursts or one at a time.
+    const SLOW_PHYSICAL_WRITE_MS = 300
+    const SLOW_WRITE_CLUSTER_GAP_MS = 2000
+    let lastSlowWriteStartedAt = null
+    let slowWriteClusterSize = 0
+    function recordPhysicalWriteMetrics(bytes = 0, elapsedMs = null) {
         const size = Math.max(0, Number(bytes) || 0)
         if(!size) return
         incrementQueueWakeupMetric('storagePhysical.write.total.bytes', size)
@@ -277,6 +293,25 @@ function createStorageMetrics(deps = {}) {
         recordQueueWakeupMetricMax('storagePhysical.write.total.maxBytes', size)
         const [, bucketName] = PHYSICAL_WRITE_SIZE_BUCKETS.find(([limit]) => size < limit)
         incrementQueueWakeupMetric(`storagePhysical.write.size.${bucketName}`)
+        if(elapsedMs !== null) recordPhysicalWriteLatency(bucketName, Math.max(0, Number(elapsedMs) || 0))
+    }
+    function recordPhysicalWriteLatency(sizeBucketName, elapsedMs) {
+        const [, latencyBucketName] = PHYSICAL_WRITE_LATENCY_BUCKETS.find(([limit]) => elapsedMs < limit)
+        const prefix = `storagePhysical.writeMs.${sizeBucketName}`
+        incrementQueueWakeupMetric(`${prefix}.${latencyBucketName}`)
+        incrementQueueWakeupMetric(`${prefix}.calls`)
+        incrementQueueWakeupMetric(`${prefix}.sumMs`, elapsedMs)
+        recordQueueWakeupMetricMax(`${prefix}.maxMs`, elapsedMs)
+    }
+    // Notes one storage write's start and time, and returns where a slow write falls: how long since the previous slow write
+    // started, and how many slow writes the current cluster holds so far. A fast write returns nulls and changes nothing.
+    function noteStorageWriteTiming(startedAt, elapsedMs) {
+        if(elapsedMs < SLOW_PHYSICAL_WRITE_MS) return {sinceLastSlowWriteMs: null, slowWriteClusterSize: 0}
+        const sinceLastSlowWriteMs = lastSlowWriteStartedAt === null ? null : startedAt - lastSlowWriteStartedAt
+        if(sinceLastSlowWriteMs === null || sinceLastSlowWriteMs > SLOW_WRITE_CLUSTER_GAP_MS) slowWriteClusterSize = 0
+        slowWriteClusterSize += 1
+        lastSlowWriteStartedAt = startedAt
+        return {sinceLastSlowWriteMs, slowWriteClusterSize}
     }
 
     // Returns the bytes, rows and key names it counted, so the write path can log the same numbers per write (owner 18 Oct).
@@ -364,10 +399,36 @@ function createStorageMetrics(deps = {}) {
         recordQueueWriteOperationMetrics,
         recordStoragePayloadMetrics,
         recordStorageReadPayloadMetrics,
-        recordPhysicalWriteMetrics
+        recordPhysicalWriteMetrics,
+        noteStorageWriteTiming
     }
 }
 
+// Browser-only event-loop lag sampler. Its timer is due every intervalMs; a tick that arrives stallMs or more late means something
+// else held the event loop, so the stall is recorded with its length. Under Node and in the test harness's realm there is no worker
+// event loop to watch, so it does nothing and returns a no-op stop. inWorker can be passed to force the sampler on for a test.
+function startEventLoopLagSampler(deps = {}) {
+    const {
+        inWorker = typeof process === 'undefined' && typeof setInterval === 'function',
+        recordFlightRecorderEvent = () => {},
+        setIntervalFn = (...args) => setInterval(...args),
+        clearIntervalFn = (...args) => clearInterval(...args),
+        now = () => Date.now(),
+        intervalMs = 50,
+        stallMs = 100
+    } = deps
+    if(!inWorker) return () => {}
+    let lastTickAt = now()
+    const timer = setIntervalFn(() => {
+        const tickAt = now()
+        const lagMs = tickAt - lastTickAt - intervalMs
+        lastTickAt = tickAt
+        if(lagMs >= stallMs) recordFlightRecorderEvent({kind: 'event-loop-stall', lagMs, at: tickAt})
+    }, intervalMs)
+    return () => clearIntervalFn(timer)
+}
+
 module.exports = {
-    createStorageMetrics
+    createStorageMetrics,
+    startEventLoopLagSampler
 }

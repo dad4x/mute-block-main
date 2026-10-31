@@ -54,7 +54,8 @@ function createOwnedTabLifecycle(deps = {}) {
         normalizeOwnedParentId,
         persistOwnedTabIdsByParent,
         setTimeoutFn,
-        clearTimeoutFn
+        clearTimeoutFn,
+        recordFlightRecorderEvent = () => {}
     } = deps.handlers || {}
     const {
         getPersistOwnedTabIdsTimeout,
@@ -105,18 +106,97 @@ function createOwnedTabLifecycle(deps = {}) {
         }, delayMs))
     }
 
+    // Tabs this worker has seen removed, and the probes still waiting on each tab. A tab we close on completion can no longer
+    // answer, so its waiting probes settle at once instead of sitting out the full timeout.
+    const removedTabIds = new Set()
+    const pendingTabMessages = new Map()
+
+    function noteTabRemoved(tabId) {
+        const key = `${tabId}`
+        removedTabIds.add(key)
+        if(removedTabIds.size > 500) removedTabIds.delete(removedTabIds.values().next().value)
+        const waiters = pendingTabMessages.get(key)
+        if(!waiters) return
+        pendingTabMessages.delete(key)
+        for(const settleWaiter of waiters) settleWaiter('removed')
+    }
+
     function sendTabMessage(tabId, message, timeoutMs = 3000) {
-        const delivery = browser.tabs.sendMessage(tabId, message).catch(error => {
-            if(/Receiving end does not exist|no tab|invalid tab|cannot find tab|not found/i.test(error?.message || '')) return
+        // Undelivered and timed-out messages both come back as no response, so the reason is recorded here.
+        // Close checks also record how long the tab took to answer, or that it answered after the timeout, with the calling site.
+        const startedAt = Date.now()
+        const action = message?.action || ''
+        const probeSource = message?.probeSource || ''
+        const isCloseCheck = action === 'close-if-blocked'
+        const key = `${tabId}`
+        if(isCloseCheck && removedTabIds.has(key)) {
+            recordFlightRecorderEvent({kind: 'close-check-skipped-removed', tabId, probeSource})
+            return Promise.resolve(null)
+        }
+
+        let timedOut = false
+        const delivery = browser.tabs.sendMessage(tabId, message).then(response => {
+            if(isCloseCheck) {
+                recordFlightRecorderEvent({
+                    kind: timedOut ? 'close-check-late-reply' : 'close-check-reply',
+                    tabId,
+                    probeSource,
+                    elapsedMs: Date.now() - startedAt,
+                    willClose: response?.willClose === true,
+                    reason: response?.reason || ''
+                })
+            }
+            return response
+        }).catch(error => {
+            if(/Receiving end does not exist|no tab|invalid tab|cannot find tab|not found/i.test(error?.message || '')) {
+                recordFlightRecorderEvent({kind: 'tab-message-undelivered', tabId, action, probeSource, elapsedMs: Date.now() - startedAt, error: error?.message || ''})
+                return
+            }
             throw error
         })
 
         if(!timeoutMs || timeoutMs <= 0) return delivery
 
-        return Promise.race([
-            delivery,
-            new Promise(resolve => setTimeoutFn(() => resolve(null), timeoutMs))
-        ])
+        let finished = false
+        let timer = null
+        let resolveWait = () => {}
+        const wait = new Promise(resolve => { resolveWait = resolve })
+        const settleWaiter = how => {
+            if(finished) return
+            finished = true
+            clearTimeoutFn(timer)
+            const waiters = pendingTabMessages.get(key)
+            waiters?.delete(settleWaiter)
+            if(waiters?.size === 0) pendingTabMessages.delete(key)
+            if(how === 'removed' && isCloseCheck) {
+                recordFlightRecorderEvent({kind: 'close-check-settled-removed', tabId, probeSource, elapsedMs: Date.now() - startedAt})
+            }
+            resolveWait(null)
+        }
+        timer = setTimeoutFn(() => {
+            if(finished) return
+            timedOut = true
+            recordFlightRecorderEvent({kind: 'tab-message-timeout', tabId, action, probeSource, timeoutMs})
+            if(isCloseCheck) {
+                // What the tab looked like when it failed to answer: loading, discarded, audible, and the URL path only.
+                Promise.resolve()
+                    .then(() => browser.tabs.get(tabId))
+                    .then(tab => recordFlightRecorderEvent({
+                        kind: 'close-check-timeout-tab',
+                        tabId,
+                        probeSource,
+                        tabStatus: tab?.status || '',
+                        discarded: tab?.discarded === true,
+                        audible: tab?.audible === true,
+                        urlPath: (() => { try { return new URL(tab?.url || '').pathname } catch { return '' } })()
+                    }), () => recordFlightRecorderEvent({kind: 'close-check-timeout-tab', tabId, probeSource, tabStatus: 'missing'}))
+            }
+            settleWaiter('timeout')
+        }, timeoutMs)
+        if(!pendingTabMessages.has(key)) pendingTabMessages.set(key, new Set())
+        pendingTabMessages.get(key).add(settleWaiter)
+
+        return Promise.race([delivery, wait])
     }
 
     function registerOwnedTab(parentTabId, childTabId) {
@@ -138,6 +218,7 @@ function createOwnedTabLifecycle(deps = {}) {
         rebuildOwningParentByChild,
         schedulePersistOwnedTabIdsByParent,
         sendTabMessage,
+        noteTabRemoved,
         registerOwnedTab,
         unregisterOwnedTab
     }

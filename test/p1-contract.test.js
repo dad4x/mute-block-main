@@ -882,8 +882,7 @@ test('metadata-only progress does not drive Current Work status transitions', ()
     )
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     // D4: the tabs.onUpdated handler body is now a named function (the listener only gates and dispatches to it).
-    const tabUpdatedIndex = bootstrap.indexOf('function handleTabUpdated(')
-    const tabUpdatedBody = bootstrap.slice(tabUpdatedIndex, tabUpdatedIndex + 2600)
+    const tabUpdatedBody = extractFunction(bootstrap, 'function handleTabUpdated(')
 
     // progressPatchHasExplicitStatus/shouldApplyExplicitProgressStatusToCoordinatorItem
     // moved to swCoordinatorProgressRules.js in decomposition Slice 12.
@@ -2959,7 +2958,8 @@ test('queued tab release kicks durable stored work even after service worker sle
     assert.match(authorityReleaseBody, /scheduleQueuedWorkContinuation\('runtime-authority-missing-active-row'\)/)
     assert.match(staleSweepBody, /await releaseQueuedTabAndCleanup\(tabId, \{awaitFill: true\}\)/)
     assert.match(staleSweepBody, /await releaseQueuedTabAndCleanup\(tabId, \{awaitFill: false\}\)/)
-    assert.match(blockedSweepBody, /await releaseQueuedTabAndCleanup\(tabId, \{awaitFill: true\}\)/)
+    assert.match(blockedSweepBody, /await closeQueuedTabAfterTerminal\(tabId, 'background-blocked-sweep', \{awaitFill: true\}\)/)
+    assert.match(extractFunction(source, 'async function closeQueuedTabAfterTerminal(tabId, reason, options = {})'), /await browser\.tabs\.remove\(normalizedTabId\)[\s\S]*releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: options\.awaitFill === true\}\)/)
     assert.match(terminalCloseBody, /getHydratedCoordinatorAuthorityState\('terminalOwnedTabs\.usedResidentAuthority'\)/)
     assert.match(terminalCloseBody, /coordinatorQueueReader\.full\(\{[\s\S]*metricPath: 'terminalOwnedTabs\.load'/)
     assert.doesNotMatch(terminalCloseBody, /ensureProfileNukeProgressReady\(\)/)
@@ -3050,12 +3050,10 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.doesNotMatch(sweepBody, /recordCoordinatorJobProgress\(normalizedProfileHref/)
     assert.ok(
         sweepBody.indexOf("type: 'BLOCKED_SWEEP_TERMINAL_RECORD'") <
-        sweepBody.indexOf('markQueuedTabClosing(tabId')
+        sweepBody.indexOf("closeQueuedTabAfterTerminal(tabId, 'background-blocked-sweep'")
     )
-    assert.ok(
-        sweepBody.indexOf('recordOwnedBlockedSweepTerminal(tabId, metadata, response)') <
-        sweepBody.indexOf('releaseQueuedTabAndCleanup(tabId')
-    )
+    assert.match(sweepBody, /const recorded = await applyCoordinatorQueueMachineEvent\(/)
+    assert.match(readRepoFile('shared/js/swQueueMachineHandlers.js'), /BLOCKED_SWEEP_TERMINAL_RECORD\]: async \(event = \{\}\) => \{[\s\S]{0,200}recordOwnedBlockedSweepTerminal\(/)
 
     assert.match(recordSweepBody, /queueRuntime\.hasActiveQueuedTab\(normalizedTabId\)/)
     assert.match(recordSweepBody, /!attemptId/)
@@ -3156,8 +3154,8 @@ test('close-if-blocked is a service-worker-owned cleanup probe', () => {
     assert.doesNotMatch(activeBlockedLiveBody, /recordCoordinatorJobProgressViaQueueMachine/)
     assert.doesNotMatch(activeBlockedLiveBody, /allowBlockedLiveTabSender/)
     assert.match(activeBlockedLiveBody, /for\(const closeCandidate of matches\.length > 1 \? matches : \[\{tab: match\.tab, response: match\.response\}\]\)/)
-    assert.match(activeBlockedLiveBody, /await releaseQueuedTabAndCleanup\(closeTabId, \{awaitFill: closeTabId === tabId\}\)/)
-    assert.match(activeBlockedLiveBody, /browser\.tabs\.remove\(closeTabId\)/)
+    assert.match(activeBlockedLiveBody, /await closeQueuedTabAfterTerminal\(closeTabId, reason, \{[\s\S]{0,80}awaitFill: closeTabId === tabId/)
+    assert.match(extractFunction(swSource, 'async function closeQueuedTabAfterTerminal(tabId, reason, options = {})'), /await browser\.tabs\.remove\(normalizedTabId\)[\s\S]*releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: options\.awaitFill === true\}\)/)
     assert.match(serviceWorkerSweepBody, /sweepOwnedBlockedProfileTabs\(SERVICE_WORKER_QUEUE_OWNER_ID\)/)
     assert.match(bootstrap, /request\.action === 'sweep-service-worker-blocked-profile-tabs'/)
     assert.match(queuedActionBody, /sweepServiceWorkerBlockedProfileTabs\(\)/)
@@ -5569,7 +5567,8 @@ test('service worker records a cloudflareChallenge.detected stat and throttles f
     const source = readRepoFile('shared/js/swBootstrap.js')
     const handlerIndex = source.indexOf("request.action === 'cloudflare-challenge-detected'")
     assert.notEqual(handlerIndex, -1)
-    const handlerBody = source.slice(handlerIndex, handlerIndex + 1100)
+    const nextBranchIndex = source.indexOf('else if(request.action', handlerIndex + 1)
+    const handlerBody = source.slice(handlerIndex, nextBranchIndex === -1 ? handlerIndex + 2400 : nextBranchIndex)
     assert.match(handlerBody, /incrementQueueWakeupMetric\('cloudflareChallenge\.detected'\)/)
     assert.match(handlerBody, /rememberQueueLoadPressure\('cloudflare-challenge'/)
 })
@@ -5611,7 +5610,7 @@ test('queued tab release and close messages are bounded', () => {
     assert.doesNotMatch(closeBody, /await safeSendRuntimeMessage\(/)
     assert.notEqual(releaseBranchStart, -1)
     assert.notEqual(closeBranchStart, -1)
-    assert.match(releaseAndCloseBranches, /releaseQueuedTab\(tabId, \{awaitFill: true\}\)/)
+    assert.match(releaseAndCloseBranches, /closeQueuedTabAfterTerminal\(tabId, 'content-close-request', \{awaitFill: true\}\)/)
 })
 
 test('active queued already-blocked reconcile releases and closes the tab', () => {
@@ -5674,8 +5673,8 @@ test('live queued tab adoption requires durable active transition before cleanup
     assert.match(terminalizeBody, /action: 'close-if-blocked'/)
     assert.match(terminalizeBody, /applyCoordinatorQueueMachineEvent\(\{[\s\S]*type: 'BLOCKED_SWEEP_TERMINAL_RECORD'/)
     assert.match(terminalizeBody, /if\(!recorded\?\.terminal\) return false/)
-    assert.match(terminalizeBody, /releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: true\}\)/)
-    assert.match(terminalizeBody, /browser\.tabs\.remove\(normalizedTabId\)/)
+    assert.match(terminalizeBody, /await closeQueuedTabAfterTerminal\(normalizedTabId, reason, \{awaitFill: true\}\)/)
+    assert.match(extractFunction(source, 'async function closeQueuedTabAfterTerminal(tabId, reason, options = {})'), /await browser\.tabs\.remove\(normalizedTabId\)[\s\S]*releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: options\.awaitFill === true\}\)/)
 })
 
 test('profile blocked detection accepts body-level blocked confirmation', () => {
@@ -6823,10 +6822,10 @@ test('a run\'s source page comes from the run record only; the event log is not 
 test('a blocked worker tab is removed before its release waits for the next fill (20 Oct stall)', () => {
     const source = readRepoFile('shared/js/sw.js')
     const sweepBody = extractFunction(source, 'async function sweepOwnedBlockedProfileTabs(parentTabId)')
-    assert.ok(sweepBody.indexOf('await browser.tabs.remove(tabId)') !== -1)
-    assert.ok(sweepBody.indexOf('await browser.tabs.remove(tabId)') < sweepBody.indexOf('await releaseQueuedTabAndCleanup(tabId, {awaitFill: true})'))
-    assert.match(source, /await browser\.tabs\.remove\(normalizedTabId\)\.catch\(\(\) => \{\}\)\n    await releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: true\}\)/)
-    assert.match(source, /await browser\.tabs\.remove\(normalizedTabId\)\n                \}\n                catch \{\}\n                await releaseQueuedTabAndCleanup\(normalizedTabId, \{awaitFill: true\}\)/)
+    const closeBody = extractFunction(source, 'async function closeQueuedTabAfterTerminal(tabId, reason, options = {})')
+    assert.match(sweepBody, /await closeQueuedTabAfterTerminal\(tabId, 'background-blocked-sweep', \{awaitFill: true\}\)/)
+    assert.ok(closeBody.indexOf('await browser.tabs.remove(normalizedTabId)') !== -1)
+    assert.ok(closeBody.indexOf('await browser.tabs.remove(normalizedTabId)') < closeBody.indexOf('releaseQueuedTabAndCleanup(normalizedTabId'))
 })
 
 test('history filter matches every typed word in any visible field, case-insensitively, in any order', () => {

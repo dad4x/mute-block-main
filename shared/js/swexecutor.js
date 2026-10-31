@@ -17,6 +17,7 @@ async function createQueuedExecutorBrowserTabEffect(deps = {}, options = {}, lab
         reason: label
     })
 
+    const createStartedAt = Date.now()
     let timedOut = false
     let settled = false
     let timeoutId = null
@@ -55,7 +56,9 @@ async function createQueuedExecutorBrowserTabEffect(deps = {}, options = {}, lab
             timeoutPromise
         ])
         if(!tab?.id) throw new Error(`${label} did not create a tab`)
+        const createdAt = Date.now()
         await browser.tabs.get(tab.id)
+        recordFlightRecorderEvent({kind: 'tab-create-timing', tabId: tab.id, targetUrl: options.url || '', createMs: createdAt - createStartedAt, getMs: Date.now() - createdAt})
         return tab
     }
     finally {
@@ -69,6 +72,7 @@ function makeQueuedTabOpenUrlCommitHelpers(deps = {}) {
         getQueuedExecutorTabStatusWithTimeout,
         getTabObservedUrls,
         incrementQueueWakeupMetric = () => {},
+        recordFlightRecorderEvent = () => {},
         normalizeCoordinatorRequestedUrl,
         normalizeQuoraProfileUrl,
         normalizeTabId,
@@ -91,15 +95,23 @@ function makeQueuedTabOpenUrlCommitHelpers(deps = {}) {
 
     async function waitForQueuedTabExpectedOpenUrl(tabId = null, expectedUrl = '', timeoutMs = openUrlCommitTimeoutMs) {
         const startedAt = now()
+        let polls = 0
+        const finish = (tab, reason) => {
+            recordFlightRecorderEvent({kind: 'tab-url-commit-timing', tabId, expectedUrl, committed: !!tab, reason, polls, waitMs: now() - startedAt})
+            return tab
+        }
         while(now() - startedAt < timeoutMs) {
+            polls += 1
             const status = await getQueuedExecutorTabStatusWithTimeout(tabId, 'queued-tab-open-url-commit')
-            if(status.tab && queuedTabMatchesExpectedOpenUrl(status.tab, expectedUrl)) return status.tab
-            if(status.missing) return null
+            if(status.tab && queuedTabMatchesExpectedOpenUrl(status.tab, expectedUrl)) return finish(status.tab, 'matched')
+            if(status.missing) return finish(null, 'missing')
             await new Promise(resolve => setTimeoutFn(resolve, pollMs))
         }
 
+        polls += 1
         const status = await getQueuedExecutorTabStatusWithTimeout(tabId, 'queued-tab-open-url-commit-final')
-        return status.tab && queuedTabMatchesExpectedOpenUrl(status.tab, expectedUrl) ? status.tab : null
+        const matched = !!(status.tab && queuedTabMatchesExpectedOpenUrl(status.tab, expectedUrl))
+        return finish(matched ? status.tab : null, matched ? 'matched-final' : 'timeout')
     }
 
     async function ensureCreatedQueuedTabCommittedToExpectedUrl(tab = null, action = {}, options = {}) {
