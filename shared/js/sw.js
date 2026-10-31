@@ -27922,7 +27922,9 @@ async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
         if(!tabId || tabId === anchorTabId) continue
         const href = normalizeQuoraProfileUrl(tab?.url || '')
         const entry = href ? (findCoordinatorQueueEntryForHref(queue, href) || (queue[href] ? {item: queue[href]} : null)) : null
-        const orphaned = !!href && !queueRuntime.hasActiveQueuedTab(tabId) && !(entry?.item && isActiveCoordinatorStatus(entry.item.status))
+        // A tab that is not a queue profile page (a question, or a link the profile page opened) is orphaned too: the queue never
+        // claimed it, so it must not hold the worker window's surface.
+        const orphaned = !queueRuntime.hasActiveQueuedTab(tabId) && (!href || !(entry?.item && isActiveCoordinatorStatus(entry.item.status)))
         if(!orphaned) {
             orphanSurfaceTabFirstSeenAt.delete(tabId)
             continue
