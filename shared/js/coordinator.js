@@ -14,7 +14,7 @@ const {
     COORDINATOR_MESSAGE_MUTATION_TIMEOUT_MS
 } = require('./timeouts')
 const defaults = require('./defaults')
-const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS, HISTOGRAM_DURATION_EDGES_SEC} = require('./tunables')
+const {SOFT_FAIL_RETRY_LIMIT, DASHBOARD_THROTTLE_NOTE_REFRESH_MS, DASHBOARD_WORK_SESSION_REDRAW_MS, DASHBOARD_WORK_SESSION_REFRESH_MS, FLIGHT_RECORDER_CARD_POLL_MS, FLIGHT_RECORDER_CARD_ROW_LIMIT, OUTLIER_EVENT_GAP_ABNORMAL_MS, HISTOGRAM_DURATION_EDGES_SEC} = require('./tunables')
 const {createQueueProgressBar} = require('./queueProgressBar')
 const {
     COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY,
@@ -28,7 +28,7 @@ const {
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
     SPACE_REGISTRY_KEY
 } = require('./storageKeys')
-const {namespaceArea, namespaceChanges} = require('./storageNamespace')
+const {namespaceArea} = require('./storageNamespace')
 
 // coordinatorStatusRules is the same factory sw.js uses, so
 // isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
@@ -2418,15 +2418,17 @@ function renderWorkSessionLine() {
 setInterval(refreshThrottleNote, DASHBOARD_THROTTLE_NOTE_REFRESH_MS)
 setInterval(renderWorkSessionLine, DASHBOARD_WORK_SESSION_REDRAW_MS)
 
-// loadState reads the work session once. A session that starts or ends while this page is open changes the stored value,
-// so the header follows those changes here instead of showing the copy from when the page loaded.
-browser.storage.onChanged.addListener((changes, area) => {
-    if(area !== 'local') return
-    const own = namespaceChanges(changes)
-    if(!own || !Object.prototype.hasOwnProperty.call(own, COORDINATOR_WORK_SESSION_KEY)) return
-    state.workSession = own[COORDINATOR_WORK_SESSION_KEY].newValue || null
-    renderWorkSessionLine()
-})
+// loadState reads the work session once, so a run that ends while this page is open would keep showing "End running".
+// Re-read only this one key on a slow timer. Not a change listener: the dashboard avoids broad change delivery.
+async function refreshWorkSessionFromStorage() {
+    try {
+        const stored = await namespaceArea(browser.storage.local).get({[COORDINATOR_WORK_SESSION_KEY]: null})
+        state.workSession = stored[COORDINATOR_WORK_SESSION_KEY] || null
+        renderWorkSessionLine()
+    }
+    catch {}
+}
+setInterval(refreshWorkSessionFromStorage, DASHBOARD_WORK_SESSION_REFRESH_MS)
 
 function getCurrentQueueLoadThrottle() {
     const metrics = state.metrics || {}

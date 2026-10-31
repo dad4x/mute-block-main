@@ -28034,10 +28034,15 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         const anchorTabId = normalizeTabId(surface.anchorTabId)
         // Only tabs this queue owns count. A tab the user opened in this window, or a tab the profile page opened, is not ours,
         // so it is never looked at here.
-        const isOwnedSurfaceTab = tabId => !!tabId && (queueRuntime.hasQueuedTabMetadata(tabId) || queueRuntime.hasActiveQueuedTab(tabId) || queueRuntime.hasOwnedTabState(tabId))
+        const isOwnedSurfaceTab = tab => {
+            const tabId = normalizeTabId(tab?.id)
+            if(!tabId) return false
+            if(queueRuntime.hasQueuedTabMetadata(tabId) || queueRuntime.hasActiveQueuedTab(tabId) || queueRuntime.hasOwnedTabState(tabId)) return true
+            return !!normalizeQuoraProfileUrl(tab?.url || '')
+        }
         const isSurfaceBusy = tabs => tabs.some(tab => {
             const tabId = normalizeTabId(tab?.id)
-            return !!tabId && tabId !== anchorTabId && isOwnedSurfaceTab(tabId)
+            return !!tabId && tabId !== anchorTabId && isOwnedSurfaceTab(tab)
         })
 
         let surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])

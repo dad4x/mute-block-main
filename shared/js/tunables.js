@@ -87,6 +87,7 @@ module.exports = {
     DASHBOARD_THROTTLE_NOTE_REFRESH_MS: 1000,
     // Dashboard: how often the Current Work line's session duration is redrawn while a work session runs. The line reads no storage between redraws.
     DASHBOARD_WORK_SESSION_REDRAW_MS: 1000,
+    DASHBOARD_WORK_SESSION_REFRESH_MS: 5000,
     // Dashboard flight recorder card (dev mode only): how often it asks the worker for new events while it is expanded, and how many rows it keeps.
     FLIGHT_RECORDER_CARD_POLL_MS: 1000,
     FLIGHT_RECORDER_CARD_ROW_LIMIT: 200,
