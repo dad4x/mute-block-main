@@ -28,7 +28,7 @@ const {
     QUEUE_WAKEUP_METRICS_VIEW_KEY,
     SPACE_REGISTRY_KEY
 } = require('./storageKeys')
-const {namespaceArea} = require('./storageNamespace')
+const {namespaceArea, namespaceChanges} = require('./storageNamespace')
 
 // coordinatorStatusRules is the same factory sw.js uses, so
 // isTerminalQueueStatus/isActiveQueueItem/isPendingQueueStatus/
@@ -2417,6 +2417,16 @@ function renderWorkSessionLine() {
 
 setInterval(refreshThrottleNote, DASHBOARD_THROTTLE_NOTE_REFRESH_MS)
 setInterval(renderWorkSessionLine, DASHBOARD_WORK_SESSION_REDRAW_MS)
+
+// loadState reads the work session once. A session that starts or ends while this page is open changes the stored value,
+// so the header follows those changes here instead of showing the copy from when the page loaded.
+browser.storage.onChanged.addListener((changes, area) => {
+    if(area !== 'local') return
+    const own = namespaceChanges(changes)
+    if(!own || !Object.prototype.hasOwnProperty.call(own, COORDINATOR_WORK_SESSION_KEY)) return
+    state.workSession = own[COORDINATOR_WORK_SESSION_KEY].newValue || null
+    renderWorkSessionLine()
+})
 
 function getCurrentQueueLoadThrottle() {
     const metrics = state.metrics || {}
