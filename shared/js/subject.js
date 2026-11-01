@@ -334,8 +334,19 @@ function shadowSuffixTokens(removed = '') {
     return known.length ? known : ['other']
 }
 
+// A profile href that is already canonical, as a queue item stores it or a context sends it (1 Nov). It is read as it is, so a canonical href is
+// not cut a second time (a stored Name-1-2 would otherwise become Name-1). Anything else is normalized once. Live inputs (tab URLs and page
+// links) still go through normalizeQuoraProfileHref, once.
+const CANONICAL_PROFILE_HREF_PATTERN = /^https:\/\/www\.quora\.com\/profile\/[^/?#]+$/
+function storedProfileHref(value = '') {
+    const text = `${value || ''}`.trim()
+    if (CANONICAL_PROFILE_HREF_PATTERN.test(text)) return text
+    return normalizeQuoraProfileHref(text)
+}
+
 module.exports = {
     QUORA_NON_PROFILE_ROOT_PATHS,
+    storedProfileHref,
     getLikelyQuoraProfileSlug,
     isLikelyExplicitProfileTargetHref,
     isLikelyExplicitProfileTargetSlug,

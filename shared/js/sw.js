@@ -62,6 +62,7 @@ const {namespaceArea, prefixedName, readPlainLocalNames} = require('./storageNam
 const {
     QUORA_NON_PROFILE_ROOT_PATHS,
     normalizeQuoraProfileHref: normalizeQuoraProfileUrl,
+    storedProfileHref,
     normalizeTabTargetUrl,
     legacyStrippedSuffix,
     shadowSuffixTokens
@@ -4012,8 +4013,8 @@ async function terminalizeActiveCoordinatorNonProfileLanding(itemKey = '', landi
 
 async function terminalizeActiveCoordinatorProfileRedirectMismatch(itemKey = '', requestedHref = '', resolvedHref = '', options = {}) {
     const key = `${itemKey || ''}`.trim()
-    const requestedProfileHref = normalizeQuoraProfileUrl(requestedHref || '')
-    const resolvedProfileHref = normalizeQuoraProfileUrl(resolvedHref || '')
+    const requestedProfileHref = storedProfileHref(requestedHref || '')
+    const resolvedProfileHref = storedProfileHref(resolvedHref || '')
     if(!key || !requestedProfileHref || !resolvedProfileHref || requestedProfileHref === resolvedProfileHref) {
         return {changed: false, reason: 'invalid-profile-redirect-mismatch'}
     }
@@ -4215,8 +4216,8 @@ async function mutateCoordinatorActiveProfileRedirectMismatchTerminalize(operati
     const itemKey = `${operation.itemKey || ''}`.trim()
     if(!itemKey) return {changed: false, reason: 'missing-item-key'}
 
-    const requestedProfileHref = normalizeQuoraProfileUrl(operation.requestedProfileHref || '')
-    const resolvedProfileHref = normalizeQuoraProfileUrl(operation.resolvedProfileHref || '')
+    const requestedProfileHref = storedProfileHref(operation.requestedProfileHref || '')
+    const resolvedProfileHref = storedProfileHref(operation.resolvedProfileHref || '')
     if(!requestedProfileHref || !resolvedProfileHref || requestedProfileHref === resolvedProfileHref) {
         return {changed: false, reason: 'not-profile-redirect-mismatch'}
     }
@@ -16134,7 +16135,7 @@ const {
 
 async function getQueuedProfileActionSurfaceState(tab = null, href = '') {
     const tabId = normalizeTabId(tab?.id)
-    const requestedProfileHref = normalizeQuoraProfileUrl(href || '')
+    const requestedProfileHref = storedProfileHref(href || '')
     if(!tabId || !requestedProfileHref) return null
 
     const response = await promiseWithTimeout(
@@ -16157,7 +16158,7 @@ async function getQueuedProfileActionSurfaceState(tab = null, href = '') {
 async function isLikelyQueuedWorkerActionSurfaceWindowForTab(tab = null, href = '') {
     const tabId = normalizeTabId(tab?.id)
     const windowId = Number.parseInt(tab?.windowId, 10) || 0
-    const normalizedHref = normalizeQuoraProfileUrl(href || '')
+    const normalizedHref = storedProfileHref(href || '')
     if(!tabId || !windowId || !normalizedHref || !browser.windows?.get) return false
 
     const win = await browser.windows.get(windowId, {populate: true}).catch(() => null)
@@ -29504,7 +29505,10 @@ async function sweepOwnedBlockedProfileTabs(parentTabId) {
 
 async function probeOwnedBlockedProfileTab(tabId, metadata = null) {
     const normalizedTabId = normalizeTabId(tabId)
-    const requestedProfileHref = normalizeQuoraProfileUrl(metadata?.profileHref || metadata?.requestedUrl || '')
+    // A stored target is canonical, so it is read as it is. A raw request URL is normalized once (1 Nov).
+    const requestedProfileHref = metadata?.profileHref
+        ? storedProfileHref(metadata.profileHref)
+        : normalizeQuoraProfileUrl(metadata?.requestedUrl || '')
     if(!normalizedTabId || !requestedProfileHref) return {willClose: false, reason: 'missing-profile-href'}
     if(`${metadata?.actionKind || metadata?.tabAction || ''}` === UNBLOCK_UNMUTE_ACTION_KIND) {
         return {willClose: false, reason: 'reverse-action'}
@@ -29617,8 +29621,8 @@ function scheduleOwnedBlockedProfileSweep(parentTabId, delayMs = 3000) {
 
 async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response = {}) {
     const normalizedTabId = normalizeTabId(tabId)
-    const normalizedProfileHref = normalizeQuoraProfileUrl(metadata?.profileHref || '')
-    const resolvedProfileHref = normalizeQuoraProfileUrl(response?.resolvedProfileHref || '')
+    const normalizedProfileHref = storedProfileHref(metadata?.profileHref || '')
+    const resolvedProfileHref = storedProfileHref(response?.resolvedProfileHref || '')
     const actionKind = getCoordinatorActionKindForRequestedAction(metadata?.actionKind || metadata?.tabAction || 'mute-block')
     const attemptId = getAttemptIdFromValue(metadata)
     const attemptNumber = getAttemptNumberFromValue(metadata)
@@ -29823,8 +29827,8 @@ async function recordOwnedBlockedSweepTerminal(tabId, metadata = null, response 
 // for the sweep flow too was rejected as changing a different guarantee.
 async function recordActiveBlockedLiveTabTerminal(tabId, metadata = null, response = {}) {
     const normalizedTabId = normalizeTabId(tabId)
-    const normalizedProfileHref = normalizeQuoraProfileUrl(metadata?.profileHref || '')
-    const resolvedProfileHref = normalizeQuoraProfileUrl(response?.resolvedProfileHref || '')
+    const normalizedProfileHref = storedProfileHref(metadata?.profileHref || '')
+    const resolvedProfileHref = storedProfileHref(response?.resolvedProfileHref || '')
     const actionKind = getCoordinatorActionKindForRequestedAction(metadata?.actionKind || metadata?.tabAction || 'mute-block')
     const attemptId = getAttemptIdFromValue(metadata)
     const attemptNumber = getAttemptNumberFromValue(metadata)

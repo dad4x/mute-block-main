@@ -40,7 +40,8 @@ const {
     isLikelyExplicitProfileTargetHref,
     isLikelyExplicitProfileTargetSlug,
     normalizeQuoraProfileHref,
-    sanitizeProfileHrefSlug
+    sanitizeProfileHrefSlug,
+    storedProfileHref
 } = require('./subject')
 const {
     mapProgressToCoordinatorState,
@@ -2442,7 +2443,7 @@ function onMessage(request, sender, sendResponse) {
             reportInitialBlockedStateUnconditionally(blocked)
 
             if(blocked) {
-                const requestedProfileHref = normalizeQuoraProfileHref(request?.requestedProfileHref || '') || ''
+                const requestedProfileHref = storedProfileHref(request?.requestedProfileHref || '') || ''
                 const resolvedProfileHref = getProfileKey(location.href) || ''
                 if(!requestedProfileHref || !resolvedProfileHref || requestedProfileHref !== resolvedProfileHref) {
                     return Promise.resolve({
@@ -5903,7 +5904,11 @@ function logProfileActionDebug(reason) {
 }
 
 function getQuoraProfileSlugData(href) {
-    const normalizedHref = normalizeQuoraProfileHref(href)
+    return getQuoraProfileSlugDataFromCanonical(normalizeQuoraProfileHref(href))
+}
+
+// The identity of a profile href that is already canonical (1 Nov). It is read as it is, so a canonical href is not cut a second time.
+function getQuoraProfileSlugDataFromCanonical(normalizedHref) {
     if(!normalizedHref) return null
 
     try {
@@ -5939,7 +5944,7 @@ function getNormalizedProfileHrefList(urls) {
 
     for(const url of urls || []) {
         const normalized = normalizeQuoraProfileHref(url)
-        const identityKey = getNormalizedProfileIdentityKey(normalized)
+        const identityKey = getQuoraProfileSlugDataFromCanonical(normalized)?.normalizedSlug || ''
         if(!normalized || !identityKey || seen.has(identityKey)) continue
 
         seen.add(identityKey)

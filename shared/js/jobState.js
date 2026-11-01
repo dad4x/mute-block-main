@@ -1,5 +1,6 @@
 const {
-    normalizeQuoraProfileHref
+    normalizeQuoraProfileHref,
+    storedProfileHref
 } = require('./subject')
 const {
     EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
@@ -747,7 +748,10 @@ function normalizeAttempt(item = {}) {
 
 function upgradeCoordinatorQueueItem(key = '', item = {}, options = {}) {
     const source = item && typeof item === 'object' ? item : {}
-    const targetProfileHref = normalizeQuoraProfileHref(source.targetProfileHref || source.requestedUrl || source.dedupeKey || key || '')
+    // A stored target is canonical already, so it is read as it is (1 Nov). Only a raw request is normalized.
+    const targetProfileHref = source.targetProfileHref
+        ? storedProfileHref(source.targetProfileHref)
+        : normalizeQuoraProfileHref(source.requestedUrl || source.dedupeKey || key || '')
     const canonicalSubject = makeCanonicalSubject(targetProfileHref)
     const actionKind = normalizeString(source.actionKind || options.actionKind) || DEFAULT_ACTION_KIND
     const scope = source.scope && typeof source.scope === 'object'

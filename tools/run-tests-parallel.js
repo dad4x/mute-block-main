@@ -22,6 +22,7 @@ const lanes = [
       ['node', 'test/collectHiddenTabWait.test.js'],
       ['node', 'test/spaceFeedAnswerCardQuestion.test.js'],
       ['node', 'test/flightRecorderProfileMismatch.test.js'],
+      ['node', 'test/storedProfileHref.test.js'],
       ['node', 'test/jobState.test.js'],
       ['node', 'test/swQueueRuntime.test.js'],
       ['node', 'test/storageInvariants.test.js'],

@@ -1287,7 +1287,8 @@ function _iterableToArray(iter) { if (typeof Symbol !== "undefined" && iter[Symb
 function _arrayWithoutHoles(arr) { if (Array.isArray(arr)) return _arrayLikeToArray(arr); }
 function _arrayLikeToArray(arr, len) { if (len == null || len > arr.length) len = arr.length; for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i]; return arr2; }
 var _require = __webpack_require__(/*! ./subject */ "./shared/js/subject.js"),
-  normalizeQuoraProfileHref = _require.normalizeQuoraProfileHref;
+  normalizeQuoraProfileHref = _require.normalizeQuoraProfileHref,
+  storedProfileHref = _require.storedProfileHref;
 var _require2 = __webpack_require__(/*! ./tunables */ "./shared/js/tunables.js"),
   EXHAUSTED_ROLLBACK_RECOVERY_LIMIT = _require2.EXHAUSTED_ROLLBACK_RECOVERY_LIMIT,
   QUEUE_LOAD_THROTTLE_MAX_MS = _require2.QUEUE_LOAD_THROTTLE_MAX_MS,
@@ -1966,7 +1967,8 @@ function upgradeCoordinatorQueueItem() {
   var item = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
   var options = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
   var source = item && _typeof(item) === 'object' ? item : {};
-  var targetProfileHref = normalizeQuoraProfileHref(source.targetProfileHref || source.requestedUrl || source.dedupeKey || key || '');
+  // A stored target is canonical already, so it is read as it is (1 Nov). Only a raw request is normalized.
+  var targetProfileHref = source.targetProfileHref ? storedProfileHref(source.targetProfileHref) : normalizeQuoraProfileHref(source.requestedUrl || source.dedupeKey || key || '');
   var canonicalSubject = makeCanonicalSubject(targetProfileHref);
   var actionKind = normalizeString(source.actionKind || options.actionKind) || DEFAULT_ACTION_KIND;
   var scope = source.scope && _typeof(source.scope) === 'object' ? source.scope : {
@@ -2845,8 +2847,20 @@ function shadowSuffixTokens() {
   })));
   return known.length ? known : ['other'];
 }
+
+// A profile href that is already canonical, as a queue item stores it or a context sends it (1 Nov). It is read as it is, so a canonical href is
+// not cut a second time (a stored Name-1-2 would otherwise become Name-1). Anything else is normalized once. Live inputs (tab URLs and page
+// links) still go through normalizeQuoraProfileHref, once.
+var CANONICAL_PROFILE_HREF_PATTERN = /^https:\/\/www\.quora\.com\/profile\/[^/?#]+$/;
+function storedProfileHref() {
+  var value = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : '';
+  var text = "".concat(value || '').trim();
+  if (CANONICAL_PROFILE_HREF_PATTERN.test(text)) return text;
+  return normalizeQuoraProfileHref(text);
+}
 module.exports = {
   QUORA_NON_PROFILE_ROOT_PATHS: QUORA_NON_PROFILE_ROOT_PATHS,
+  storedProfileHref: storedProfileHref,
   getLikelyQuoraProfileSlug: getLikelyQuoraProfileSlug,
   isLikelyExplicitProfileTargetHref: isLikelyExplicitProfileTargetHref,
   isLikelyExplicitProfileTargetSlug: isLikelyExplicitProfileTargetSlug,

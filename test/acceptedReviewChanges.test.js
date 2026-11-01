@@ -583,6 +583,7 @@ register('the identity key and the queue dedupe are exact: a lookalike or a case
     const {normalizeQuoraProfileHref} = require('../shared/js/subject.js')
     const source = [
         extractFunction(contentSource, 'function getQuoraProfileSlugData(href)'),
+        extractFunction(contentSource, 'function getQuoraProfileSlugDataFromCanonical(normalizedHref)'),
         extractFunction(contentSource, 'function getNormalizedProfileIdentityKey(href)'),
         extractFunction(contentSource, 'function getNormalizedProfileHrefList(urls)')
     ].join('\n')
@@ -613,6 +614,7 @@ register('a shorter identity stays beside a longer one that starts with it, and 
     const {normalizeQuoraProfileHref} = require('../shared/js/subject.js')
     const source = [
         extractFunction(contentSource, 'function getQuoraProfileSlugData(href)'),
+        extractFunction(contentSource, 'function getQuoraProfileSlugDataFromCanonical(normalizedHref)'),
         extractFunction(contentSource, 'function getNormalizedProfileIdentityKey(href)'),
         extractFunction(contentSource, 'function getNormalizedProfileHrefList(urls)')
     ].join('\n')
