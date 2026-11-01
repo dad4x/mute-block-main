@@ -12453,10 +12453,10 @@ function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0) {
     if(!toolbar) return
     const remaining = Number.parseInt(count, 10) || 0
     const queueing = Number.parseInt(queueingCount, 10) || 0
-    // The search's remaining count already holds every pending row (in-progress rows included), so workActive is false here. The same
-    // presence rule as the space page then gives the same result: the status shows while anything is left or paused, and hides otherwise.
-    const text = formatToolbarNukingStatus({queueing, left: remaining, workActive: false, paused: nukingQueuePaused})
-    syncNukingToolbarStatus(toolbar, toolbar.querySelector('.mb-ext_profile-search-batch-btn'), text, remaining)
+    // 1 Nov (owner): the drop-down carries the Nuking words and count, so the status text keeps only the queueing count. The drop-down stays
+    // beside it while nuking work is left or the queue is paused. The same helper as the space page (spaceFeedNukingToolbar).
+    const toolbarState = spaceFeedNukingToolbar({queueing, left: remaining, paused: nukingQueuePaused})
+    syncNukingToolbarStatus(toolbar, toolbar.querySelector('.mb-ext_profile-search-batch-btn'), toolbarState.statusText, remaining, toolbarState.showsControl)
 }
 
 // Owner, 27 Oct: "Considered X displayed matches", X = the distinct result rows the last collect read. Commas only from 1000 up.

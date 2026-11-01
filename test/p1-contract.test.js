@@ -5208,7 +5208,7 @@ test('the status and batch text on the space page and the search page come from 
     // Each page builds its toolbar status with the one presence rule (formatToolbarNukingStatus), from its own facts (28 Oct).
     // Both pages read the paused flag from the stored pause (nukingQueuePaused), not from the space model's ownerPaused.
     assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /spaceFeedNukingToolbar\(\{\s*queueing: model\?\.queueingProfileCount \|\| 0,\s*left,\s*paused: nukingQueuePaused\s*\}\)/)
-    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /formatToolbarNukingStatus\(\{queueing, left: remaining, workActive: false, paused: nukingQueuePaused\}\)/)
+    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /spaceFeedNukingToolbar\(\{queueing, left: remaining, paused: nukingQueuePaused\}\)/)
     // The search rows take their words from the shared row-state builder, and the batch driver takes its Queueing words from the shared builder.
     assert.match(content, /setNukeButtonWorking\(button, formatProfileRowState\('queueing'\)\)/)
     assert.match(content, /setNukeButtonWorking\(button, formatProfileRowState\('nuking'\)\)/)
@@ -5272,7 +5272,7 @@ test('both batch toolbars call one builder and use one class set and one style r
     // The one builder. Both toolbars call it, and it is the only place the status element is built.
     assert.match(extractFunction(content, 'function syncNukingToolbarStatus(host, anchor, text, left = 0, showsControl = nukingStatusShowsControl(text))'), /status\.className = NUKING_TOOLBAR_STATUS_CLASS/)
     assert.match(extractFunction(content, 'function syncSpaceFeedNukingStatus(host, model = {}, activeWork = false)'), /syncNukingToolbarStatus\(host, host\.querySelector\('\.mb-ext_space-feed-nuke-btn'\), toolbar\.statusText, left, toolbar\.showsControl\)/)
-    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /syncNukingToolbarStatus\(toolbar, toolbar\.querySelector\('\.mb-ext_profile-search-batch-btn'\), text, remaining\)/)
+    assert.match(extractFunction(content, 'function setProfileSearchNukingStatus(toolbar, count = 0, queueingCount = 0)'), /syncNukingToolbarStatus\(toolbar, toolbar\.querySelector\('\.mb-ext_profile-search-batch-btn'\), toolbarState\.statusText, remaining, toolbarState\.showsControl\)/)
     assert.equal(content.split("className = 'mb-ext_nuking-status'").length - 1, 0, 'no page sets its own class on the status')
     assert.equal(content.includes('mb-ext_space-feed-nuking-status'), false)
     assert.equal(content.includes('mb-ext_profile-search-nuking-status'), false)

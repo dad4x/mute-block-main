@@ -53,3 +53,11 @@ When the profile menu opens but `waitForMenuStateWithForegroundFallback()` canno
 
 A harness using the real helper and outer Pardon function reproduced `ok: true` after a successful unblock with an unknown menu state and no recognized action. Return an unverified failure for this null/unknown state; reserve success for a positively observed inverse Mute action (or another explicit verified state).
 
+
+
+## Fix verification: d0b5137
+
+- **Target checked:** `rc/1.6` at `d0b5137199c4991af8d1bbc44525b413afdfdfb8`.
+- **Unreadable unmute menu finding:** fixed. When neither Unmute nor its inverse Mute action is recognized, `unmuteProfileBestEffort()` now returns `ok: false` with `unmute-menu-unreadable`. The Pardon caller propagates the failure before clearing stored state.
+- **Validation:** `npm test`, `npm run lint:correctness`, `npm run lint:queue-boundary`, `npm run lint:block-classification`, and `npm run lint:queue-storage-layering` all passed. Focused identity, selector, and Pardon tests passed. A runtime harness of the real unmute helper and outer Pardon flow confirmed the unknown-menu case returns failure and does not clear stored state.
+
