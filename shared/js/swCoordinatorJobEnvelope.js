@@ -47,6 +47,7 @@
 // through as get/set state accessors here, matching the
 // swQueueWakeupMetricsShape.js convention, rather than moved.
 
+const {storedProfileHref} = require('./subject')
 const {coordinatorEventToFlightRecorderEntry} = require('./coordinatorEventRecord')
 
 function createCoordinatorJobEnvelope(deps = {}) {
@@ -59,6 +60,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
     const {
         normalizeQuoraProfileUrl,
         makeCanonicalSubject,
+        makeCanonicalSubjectFromStored,
         getCoordinatorActionKindForRequestedAction,
         getCoordinatorItemHref,
         isTerminalCoordinatorStatus,
@@ -112,7 +114,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
     }
 
     function makeCoordinatorJobEnvelope(details = {}) {
-        const targetProfileHref = normalizeQuoraProfileUrl(details.targetProfileHref || '')
+        const targetProfileHref = storedProfileHref(details.targetProfileHref || '')
         const coordinatorKey = `${details.coordinatorKey || targetProfileHref || ''}`.trim()
         const requestedUrl = isProfileResolutionItem({
                 requestedUrl: details.requestedUrl || '',
@@ -126,7 +128,7 @@ function createCoordinatorJobEnvelope(deps = {}) {
         const actionKind = getCoordinatorActionKindForRequestedAction(details.actionKind || '')
         const scope = makeCoordinatorScope(details.runInput || {}, details.source || {}, details.runId || '')
         const canonicalSubject = targetProfileHref
-            ? makeCanonicalSubject(targetProfileHref)
+            ? makeCanonicalSubjectFromStored(targetProfileHref)
             : makeCoordinatorResolutionSubject(requestedUrl, coordinatorKey)
         const jobKey = makeCoordinatorJobKey(scope, actionKind, canonicalSubject)
 

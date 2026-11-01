@@ -100,6 +100,7 @@ const {
     JOB_EVENT_TAB_REMOVED,
     JOB_EVENT_TERMINAL,
     makeCanonicalSubject,
+    makeCanonicalSubjectFromStored,
     makeEmptyJobMilestones,
     mapProgressToCoordinatorState,
     reduceJobEvent,
@@ -2813,6 +2814,7 @@ const coordinatorJobEnvelope = createCoordinatorJobEnvelope({
     handlers: {
         normalizeQuoraProfileUrl,
         makeCanonicalSubject,
+        makeCanonicalSubjectFromStored,
         getCoordinatorActionKindForRequestedAction,
         getCoordinatorItemHref,
         isTerminalCoordinatorStatus,

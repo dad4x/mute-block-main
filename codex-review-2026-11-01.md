@@ -1,21 +1,38 @@
 # De-novo Code Review
 
-- **Target:** `rc/1.6` at `330adcdd66d39fc2e3f3c666be0ac45de0d76f3c` (`330adcd`)
+- **Target:** rc/1.6 at 19a4f435f4f7bd5576ebf0d8935f7bc77ef4796f (19a4f43)
 - **Review date:** 2026-11-01
-- **Method:** Static review of the checked-out source and relevant queue/profile call paths. No tests were run.
+- **Scope:** Full repository snapshot, including content-script actions, coordinator queue identity/dispatch, persistence, manifests, and the test suite. This review starts from the complete snapshot rather than limiting itself to the commit diff.
+- **Validation:** npm test; npm run lint:correctness; npm run lint:queue-boundary; npm run lint:block-classification; npm run lint:queue-storage-layering. All passed. Focused runtime reproductions also confirmed the queue identity, reverse-action, and selector issues below.
 
 ## Findings
 
-### [P1] Make profile slug normalization idempotent
+### [P1] Preserve stored profile identity through queue dispatch
 
-**Location:** `shared/js/subject.js:28` (`sanitizeProfileHrefSlug`)
+**Location:** shared/js/swCoordinatorExecutorClassification.js:98-115; dispatch URL selection at shared/js/swProfileResolution.js:262-267; canonical subject creation at shared/js/jobState.js:710-755; content claim handling at shared/js/content.js:13391.
 
-The new rule removes one trailing alphanumeric token when it follows a numeric token, but applying it again can remove another token. For example, `Name-1-2-3` normalizes to `Name-1-2` on the first pass and `Name-1` on a second pass.
+The 19a4f43 change preserves targetProfileHref with storedProfileHref, but queue identity helpers still pass that already-canonical value through normalizeQuoraProfileHref. For a target first normalized from https://www.quora.com/Name-1-2-3, the stored target is https://www.quora.com/profile/Name-1-2; getCoordinatorItemHref changes it again to .../Name-1. getCoordinatorItemOpenUrl uses that result as the executor tab URL, and upgradeCoordinatorQueueItem also builds canonicalSubject by normalizing the stored target again. Content claim handling normalizes claimedAction.targetUrl again when setting queuedProfileHref.
 
-The code normalizes already-normalized profile URLs in multiple paths. `getNormalizedProfileHrefList()` normalizes each input, then derives its identity key by normalizing that output again (`shared/js/content.js:5941-5942` via `getQuoraProfileSlugData()` at `5906`). Coordinator job construction also normalizes `targetProfileHref` (`shared/js/jobState.js:750`). As a result, duplicate detection and the durable queued target can disagree about which profile a repeated-numeric slug identifies. A queued mute/block action can therefore land on a different profile than the link selected. The new test for `Name-1-2-3` asserts only the first pass and misses this repeated-normalization case (`test/subject.test.js:158-161`).
+This can open the wrong profile for a queued mute/block action. It also aliases queue lookup: when both .../profile/Name-1-2 and .../profile/Name-1 rows exist, findCoordinatorQueueEntryForHref normalizes the first target to the second key and returns the Name-1 row. The focused reproduction produced targetProfileHref = .../Name-1-2, canonicalSubject.href = .../Name-1, and a lookup for the first row returning the second row.
 
-Make the canonicalization idempotent, or keep the cleanup confined to raw input before a canonical profile URL is produced.
+Use the canonical-only reader for persisted queue targets and canonical subjects; normalize only raw URLs at their input boundary.
+
+### [P2] Do not report Pardon success when unmute could not be checked
+
+**Location:** shared/js/content.js:15027-15038, shared/js/content.js:15170-15182; queued completion at shared/js/content.js:13986-14008.
+
+When the profile starts blocked, unblockUnmuteProfile only treats the exact reason unmute-clicked-unverified as a fatal unmute result. But unmuteProfileBestEffort also returns failures such as {ok:false, reason:'profile-menu-not-open'}. After a successful unblock, that failure falls through and the outer function returns ok:true. The queued Pardon path then verifies only that the profile is unblocked, records terminal unblocked success, and closes the tab; the profile may remain muted. The manual Pardon path can also clear the stored state and show “Unblocked”.
+
+A focused harness running the real functions returned ok:true with unmute.ok:false and unmute.reason='profile-menu-not-open'. Treat every unverified unmute failure as incomplete, while retaining explicit “already unmuted”/“option not offered” outcomes if those are intended successes.
+
+### [P2] Keep the unmute confirmation fallback inside a confirmation surface
+
+**Location:** shared/js/content.js:14291-14302, shared/js/content.js:14412-14448, shared/js/content.js:14505-14528.
+
+If dialog-scoped lookup finds no Unmute confirmation, getUnmuteConfirmAction falls back to getInPageConfirmPairAction, which scans every visible button, role button, and link in the page. That fallback accepts a bare “Unmute” label and matching context as confirmation evidence; the confirmation-kind check accepts the same text without requiring a dialog, cancel peer, or confirmation wording. If the real dialog is not recognized while an unrelated in-page Unmute control is visible, the action can click that control and unmute another profile, while the intended profile remains unchanged.
+
+A focused selector harness with no dialog and an unrelated “Unmute Another User” button selected that button, and the confirmation-kind check returned no mismatch. Restrict this fallback to a positively identified confirmation surface and require confirmation context.
 
 ## Review notes
 
-No other confirmed actionable findings were identified in this review. `git diff --check` reported only trailing whitespace in generated webpack wrapper comments in the Chrome and Firefox bundles.
+The first finding is a remaining queue-execution path beyond the canonical-reader call sites covered by storedProfileHref.test.js. The existing contentUnmuteVerification.test.js covers the clicked-but-unverified result but not the menu-open failure above. No other confirmed actionable findings were identified in this pass.

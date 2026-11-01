@@ -107,7 +107,7 @@ register('unverified unmute click does not report ok', async () => {
 register('blocked unblock path refuses success when the unmute is unverified', async () => {
     const source = readRepoFile('shared/js/content.js')
     const body = extractFunction(source, 'async function unblockUnmuteProfile(options = {})')
-    const guard = body.indexOf("unmute?.reason === 'unmute-clicked-unverified'")
+    const guard = body.indexOf('unmute && unmute.ok !== true')
     const clear = body.indexOf('await clearProfileNukeState(profileHref, ')
     assert.notEqual(guard, -1, 'unverified-unmute guard missing')
     assert.ok(guard < clear, 'guard must run before nuke state is cleared')

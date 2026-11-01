@@ -1926,7 +1926,15 @@ function isRetryableJobFailureFromProgress() {
 }
 function makeCanonicalSubject() {
   var profileHref = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : '';
-  var href = normalizeQuoraProfileHref(profileHref);
+  return makeCanonicalSubjectFromHref(normalizeQuoraProfileHref(profileHref));
+}
+
+// A stored target is canonical already, so it is read as it is (1 Nov).
+function makeCanonicalSubjectFromStored() {
+  var profileHref = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : '';
+  return makeCanonicalSubjectFromHref(storedProfileHref(profileHref));
+}
+function makeCanonicalSubjectFromHref(href) {
   if (!href) return null;
   var slug = decodeURIComponent(href.split('/').filter(Boolean).pop() || '');
   return {
@@ -1939,7 +1947,7 @@ function makeCanonicalSubject() {
 function makeJobDedupeKey() {
   var _options$scope, _options$scope2;
   var options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
-  var subject = options.canonicalSubject || makeCanonicalSubject(options.profileHref || options.targetProfileHref || options.requestedUrl || '');
+  var subject = options.canonicalSubject || makeCanonicalSubjectFromStored(options.profileHref || options.targetProfileHref || '') || makeCanonicalSubject(options.requestedUrl || '');
   if (!(subject !== null && subject !== void 0 && subject.href)) return '';
   var scope = normalizeString(options.scopeKey || options.runId || ((_options$scope = options.scope) === null || _options$scope === void 0 ? void 0 : _options$scope.runId) || ((_options$scope2 = options.scope) === null || _options$scope2 === void 0 ? void 0 : _options$scope2.type) || 'global');
   var actionKind = normalizeString(options.actionKind) || DEFAULT_ACTION_KIND;
@@ -1969,7 +1977,7 @@ function upgradeCoordinatorQueueItem() {
   var source = item && _typeof(item) === 'object' ? item : {};
   // A stored target is canonical already, so it is read as it is (1 Nov). Only a raw request is normalized.
   var targetProfileHref = source.targetProfileHref ? storedProfileHref(source.targetProfileHref) : normalizeQuoraProfileHref(source.requestedUrl || source.dedupeKey || key || '');
-  var canonicalSubject = makeCanonicalSubject(targetProfileHref);
+  var canonicalSubject = makeCanonicalSubjectFromStored(targetProfileHref);
   var actionKind = normalizeString(source.actionKind || options.actionKind) || DEFAULT_ACTION_KIND;
   var scope = source.scope && _typeof(source.scope) === 'object' ? source.scope : {
     type: ((_source$source = source.source) === null || _source$source === void 0 ? void 0 : _source$source.type) || options.sourceType || 'unknown',
@@ -2029,6 +2037,7 @@ module.exports = {
   isTransientOpenRolledBackQueuedTabRetry: isTransientOpenRolledBackQueuedTabRetry,
   isTransientProgressStatus: isTransientProgressStatus,
   makeCanonicalSubject: makeCanonicalSubject,
+  makeCanonicalSubjectFromStored: makeCanonicalSubjectFromStored,
   makeEmptyJobMilestones: makeEmptyJobMilestones,
   makeJobDedupeKey: makeJobDedupeKey,
   mapProgressToCoordinatorState: mapProgressToCoordinatorState,

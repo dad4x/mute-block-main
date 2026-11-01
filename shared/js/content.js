@@ -13388,7 +13388,8 @@ async function maybeRunAutoProfileAction() {
     autoProfileAction = null
     autoProfileActionAttempts = 0
 
-    let queuedProfileHref = normalizeQuoraProfileHref(claimedAction?.targetUrl || '') || normalizeQuoraProfileHref(location.href) || ''
+    // The claimed target is canonical, so it is read as stored (1 Nov). The page URL is a live input and is normalized once.
+    let queuedProfileHref = storedProfileHref(claimedAction?.targetUrl || '') || normalizeQuoraProfileHref(location.href) || ''
     activeQueuedAttemptId = `${claimedAction?.attemptId || ''}`.trim()
     activeQueuedAttemptNumber = Number.parseInt(claimedAction?.attemptNumber, 10) || 0
     activeQueuedAttemptProfileHref = queuedProfileHref
@@ -14292,7 +14293,8 @@ function getUnmuteConfirmAction() {
     const candidates = getUnmuteConfirmCandidates()
     if(candidates.length) return candidates[0].button
 
-    const inPageConfirm = getInPageConfirmPairAction(/\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i)
+    // 1 Nov: the whole-page fallback needs a confirmation surface, not any visible Unmute control.
+    const inPageConfirm = getInPageConfirmPairAction(/\bun[\s-]*mute\b|\bconfirm\b|\bcontinue\b/i, {requireConfirmation: true})
     if(inPageConfirm) return inPageConfirm
 
     const container = getUnmuteConfirmContainer()
@@ -14409,7 +14411,7 @@ function isUnmuteConfirmPending() {
     return !!getUnmuteConfirmAction()
 }
 
-function getInPageConfirmPairAction(preferredRegex) {
+function getInPageConfirmPairAction(preferredRegex, options = {}) {
     const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'))
         .filter(button => !shouldIgnoreActionCandidate(button) && isVisible(button))
         .filter(button => preferredRegex.test(getActionCandidateLabel(button)))
@@ -14430,10 +14432,12 @@ function getInPageConfirmPairAction(preferredRegex) {
                 /\bblock\b|\bblocked\b|\bask question\b|\badd question\b|\bcreate post\b/i.test(contextText)) score -= 900
             if(!hasCancelPeer && !isUnmuteConfirmContextText(contextText)) score -= 1200
 
-            return {button, score, label, contextText}
+            return {button, score, label, contextText, hasCancelPeer}
         })
         .filter(candidate => candidate.score > 0 &&
             (hasUnmuteActionText(candidate.label) || isUnmuteConfirmContextText(candidate.contextText)))
+        .filter(candidate => !options.requireConfirmation ||
+            (candidate.hasCancelPeer && /\bsure\b|\bconfirm\b|\bare you\b|\?/i.test(candidate.contextText)))
 
     candidates.sort((left, right) => right.score - left.score)
     return candidates[0]?.button || null
@@ -15174,8 +15178,9 @@ async function unblockUnmuteProfile(options = {}) {
         rememberProfileUnblocked(profileHref)
         // The unblock verified, but a profile that is still muted is not a
         // completed reverse action. Keep the nuke state so the retry runs again.
-        if(unmute?.reason === 'unmute-clicked-unverified') {
-            return {ok: false, reason: unmute.reason, unblock, unmute}
+        // 1 Nov: an unmute that is not ok is not a completed reverse action, whatever the reason (menu not open, option not found, unverified).
+        if(unmute && unmute.ok !== true) {
+            return {ok: false, reason: unmute.reason || 'unmute-failed', unblock, unmute}
         }
         if(clearNukeState) {
             await clearProfileNukeState(profileHref, 'Pardon action unblocked the profile')
@@ -15192,7 +15197,8 @@ async function unblockUnmuteProfile(options = {}) {
             ...getReverseActionDebugSnapshot()
         })
         unmute = await unmuteProfileBestEffort({silent, allowForegroundFallback})
-        if(!unmute.ok && unmute.reason !== 'unmute-option-not-found' && unmute.reason !== 'unmute-option-not-offered') {
+        // 1 Nov: the same rule as the queued path. An unmute that is not ok fails the Pardon.
+        if(!unmute.ok) {
             return {ok: false, reason: unmute.reason || 'unmute-failed', unmute}
         }
     }

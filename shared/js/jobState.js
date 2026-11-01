@@ -708,7 +708,15 @@ function isRetryableJobFailureFromProgress(item = null, record = null) {
 }
 
 function makeCanonicalSubject(profileHref = '') {
-    const href = normalizeQuoraProfileHref(profileHref)
+    return makeCanonicalSubjectFromHref(normalizeQuoraProfileHref(profileHref))
+}
+
+// A stored target is canonical already, so it is read as it is (1 Nov).
+function makeCanonicalSubjectFromStored(profileHref = '') {
+    return makeCanonicalSubjectFromHref(storedProfileHref(profileHref))
+}
+
+function makeCanonicalSubjectFromHref(href) {
     if(!href) return null
 
     const slug = decodeURIComponent(href.split('/').filter(Boolean).pop() || '')
@@ -721,7 +729,9 @@ function makeCanonicalSubject(profileHref = '') {
 }
 
 function makeJobDedupeKey(options = {}) {
-    const subject = options.canonicalSubject || makeCanonicalSubject(options.profileHref || options.targetProfileHref || options.requestedUrl || '')
+    const subject = options.canonicalSubject ||
+        makeCanonicalSubjectFromStored(options.profileHref || options.targetProfileHref || '') ||
+        makeCanonicalSubject(options.requestedUrl || '')
     if(!subject?.href) return ''
 
     const scope = normalizeString(options.scopeKey || options.runId || options.scope?.runId || options.scope?.type || 'global')
@@ -752,7 +762,7 @@ function upgradeCoordinatorQueueItem(key = '', item = {}, options = {}) {
     const targetProfileHref = source.targetProfileHref
         ? storedProfileHref(source.targetProfileHref)
         : normalizeQuoraProfileHref(source.requestedUrl || source.dedupeKey || key || '')
-    const canonicalSubject = makeCanonicalSubject(targetProfileHref)
+    const canonicalSubject = makeCanonicalSubjectFromStored(targetProfileHref)
     const actionKind = normalizeString(source.actionKind || options.actionKind) || DEFAULT_ACTION_KIND
     const scope = source.scope && typeof source.scope === 'object'
         ? source.scope
@@ -818,6 +828,7 @@ module.exports = {
     isTransientOpenRolledBackQueuedTabRetry,
     isTransientProgressStatus,
     makeCanonicalSubject,
+    makeCanonicalSubjectFromStored,
     makeEmptyJobMilestones,
     makeJobDedupeKey,
     mapProgressToCoordinatorState,
