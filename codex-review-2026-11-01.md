@@ -36,3 +36,20 @@ A focused selector harness with no dialog and an unrelated “Unmute Another Use
 ## Review notes
 
 The first finding is a remaining queue-execution path beyond the canonical-reader call sites covered by storedProfileHref.test.js. The existing contentUnmuteVerification.test.js covers the clicked-but-unverified result but not the menu-open failure above. No other confirmed actionable findings were identified in this pass.
+
+## Fix verification: 4db5c8f
+
+- **Target checked:** `rc/1.6` at `4db5c8fc2ceef6e1f565ac3f12d8093bad87bebc`.
+- **Validation:** `npm test`, `npm run lint:correctness`, `npm run lint:queue-boundary`, `npm run lint:block-classification`, and `npm run lint:queue-storage-layering` all passed. The focused queue identity, review, selector, and unmute verification tests also passed.
+- **Stored profile identity finding:** fixed for queue rows with a stored `targetProfileHref`. The new runtime tests confirm the stored Name-1-2 identity is preserved through lookup, canonical subject creation, envelope construction, executor dispatch, and raw live-tab matching.
+- **Unmute confirmation selector finding:** fixed. The selector tests pass for real confirmation dialogs; an additional runtime harness confirmed that a page with no dialog and an unrelated “Unmute Another User” button yields no confirmation action.
+- **Pardon completion finding:** the previously reported cases where `unmuteProfileBestEffort()` returned `ok: false` are now rejected by both blocked and already-unblocked flows. A narrower false-success remains:
+
+### [P2] Treat an unreadable unmute menu as unverified
+
+**Location:** `shared/js/content.js:15044-15060`; result handling at `shared/js/content.js:15182-15185` and `15199-15202`.
+
+When the profile menu opens but `waitForMenuStateWithForegroundFallback()` cannot identify either the Unmute action or its inverse Mute action, `unmuteProfileBestEffort()` falls through to `unmute-option-not-offered` with `ok: true`. The helper only establishes “already unmuted” when it positively sees the inverse state; a null menu state means the mute status is unknown. Both Pardon branches accept this result as success, and the blocked branch can clear the stored nuke state.
+
+A harness using the real helper and outer Pardon function reproduced `ok: true` after a successful unblock with an unknown menu state and no recognized action. Return an unverified failure for this null/unknown state; reserve success for a positively observed inverse Mute action (or another explicit verified state).
+

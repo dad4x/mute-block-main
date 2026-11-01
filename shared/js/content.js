@@ -15056,8 +15056,10 @@ async function unmuteProfileBestEffort(options = {}) {
 
     const unmuteButton = unmuteState?.button || getMenuAction(isUnmuteActionLabel)
     if(!unmuteButton) {
+        // 1 Nov: success needs a positively seen Mute action (the inverse state above). With neither action readable, the mute status is
+        // unknown, so the unmute is unverified, not done.
         await closeProfileMenu()
-        return {ok: true, changed: false, reason: 'unmute-option-not-offered'}
+        return {ok: false, changed: false, reason: 'unmute-menu-unreadable'}
     }
 
     activateActionElement(unmuteButton)

@@ -38,4 +38,13 @@ test('the whole-page unmute confirmation fallback requires a confirmation surfac
     assert.match(source, /\(candidate\.hasCancelPeer && \/\\bsure\\b\|\\bconfirm\\b\|\\bare you\\b\|\\\?\/i\.test\(candidate\.contextText\)\)/)
 })
 
+// 1 Nov (review nit): with neither the Unmute nor the Mute action readable, the unmute is unverified, not a success.
+test('an unreadable unmute menu is an unverified failure, not unmute-option-not-offered success', () => {
+    const body = source.slice(source.indexOf('async function unmuteProfileBestEffort('))
+    const end = body.indexOf('\n}\n')
+    const fn = body.slice(0, end)
+    assert.doesNotMatch(fn, /reason: 'unmute-option-not-offered'/)
+    assert.match(fn, /return \{ok: false, changed: false, reason: 'unmute-menu-unreadable'\}/)
+})
+
 console.log('reviewUnmuteAndClaim: all tests passed')
