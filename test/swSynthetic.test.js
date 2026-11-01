@@ -19517,6 +19517,8 @@ test('coordinator reconcile accepts Chrome-delayed scheduled alarm delivery', as
         url: 'https://www.quora.com/profile/Synthetic-Activation',
         status: 'complete'
     })
+    // The queue's live activation tab (the queue made it), so the alarm sees its own tab.
+    sw.__testRecordQueueCreatedWorkerTab(101)
     assert.equal(sw.scheduleCoordinatorReconcile(1000, {
         allowBeforeQuora: true,
         reason: 'synthetic-delayed-live-reconcile-alarm'
@@ -19617,6 +19619,8 @@ test('coordinator resume accepts Chrome-delayed scheduled alarm delivery', async
         url: 'https://www.quora.com/profile/Synthetic-Activation',
         status: 'complete'
     })
+    // The queue's live activation tab (the queue made it), so the alarm sees its own tab.
+    sw.__testRecordQueueCreatedWorkerTab(101)
     const result = await sw.kickCoordinatorQueueResume('synthetic-delayed-live-resume-alarm')
     assert.equal(result.scheduledOnly, true)
 
@@ -21713,6 +21717,7 @@ test('begin-profile-action promotes from sender tab when tab lookup is transient
     })
     browser.__setNextTabId(tabId)
     const tab = await browser.tabs.create({url: href, active: false})
+    sw.__testRecordQueueCreatedWorkerTab(tab.id)
     sw.__testAddProvisionalQueuedTab(tab.id, {
         profileHref: href,
         coordinatorKey: href,
@@ -23903,6 +23908,7 @@ test('fast executor reclaims queued retry row after active missing-tab rollback 
         }
     })
     const liveTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(liveTab.id)
     await sw.coordinatorAuthority.hydrate()
 
     const result = await settleWithFakeTimers(
@@ -24994,11 +25000,13 @@ test('executor apply adopts service-worker-owned queued row from duplicate worke
         windowId: surface.id,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(selectedTab.id)
     const duplicateTab = await browser.tabs.create({
         url: href,
         windowId: surface.id,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTab.id)
 
     const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-duplicate-worker-surface-adoption', {
             ownerTabId: 'service-worker-queue-owner',
@@ -25062,6 +25070,7 @@ test('executor apply adopts live worker-surface tab after fill timeout before op
         windowId: surface.id,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(materializedTab.id)
     sw.__testClearQueuedActions()
     sw.__testSetQueuedTabFillPromise(Promise.resolve({
         openedTabs: 0,
@@ -25219,11 +25228,13 @@ test('queued live-tab recovery adopts likely worker-surface tabs without no-fore
         windowId: surface.id,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(selectedTab.id)
     const duplicateTab = await browser.tabs.create({
         url: href,
         windowId: surface.id,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTab.id)
 
     const result = await sw.recoverQueuedAuthorityLiveTabAfterMaterializationFailure(
         storage.mbCoordinatorQueue[href],
@@ -25283,11 +25294,13 @@ test('executor apply reclaims same-href duplicates in likely worker window', asy
         windowId: surface.id,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(selectedTab.id)
     const duplicateTab = await browser.tabs.create({
         url: href,
         windowId: surface.id,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTab.id)
 
     const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-likely-worker-duplicate-reclaim', {
             ownerTabId: 'service-worker-queue-owner',
@@ -25676,12 +25689,14 @@ test('executor apply queue critical storage avoids soft-fails in compound active
         url: activePendingHref,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(activePendingTabId)
     browser.__tabs.set(queuedLiveTabId, {
         id: queuedLiveTabId,
         windowId: 1,
         url: queuedLiveHref,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(queuedLiveTabId)
     sw.__testAddProvisionalQueuedTab(activePendingTabId, {
         profileHref: activePendingHref,
         coordinatorKey: activePendingHref,
@@ -26199,6 +26214,7 @@ test('executor apply adopts worker-surface live tab on final open decision timeo
         active: true
     }
     browser.__tabs.set(materializedTab.id, materializedTab)
+    sw.__testRecordQueueCreatedWorkerTab(materializedTab.id)
     sw.__testClearQueuedActions()
     sw.__testSetQueuedTabFillPromise(Promise.resolve({
         openedTabs: 1,
@@ -26387,7 +26403,9 @@ test('executor apply repairs final-open timeout live batch shape with duplicate 
         active: true
     }
     browser.__tabs.set(selectedTab.id, selectedTab)
+    sw.__testRecordQueueCreatedWorkerTab(selectedTab.id)
     browser.__tabs.set(duplicateTab.id, duplicateTab)
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTab.id)
     sw.__testClearQueuedActions()
     sw.__testSetQueuedTabFillPromise(Promise.resolve({
         openedTabs: 0,
@@ -27072,7 +27090,9 @@ test('executor apply adopts one duplicate live tab when runtime materialization 
         }
     })
     const activeTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(activeTab.id)
     const duplicateTab = await browser.tabs.create({url: href, active: false})
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTab.id)
 
     const item = storage.mbCoordinatorQueue[href]
     const result = await settleWithFakeTimers(sw.recoverQueuedAuthorityLiveTabAfterMaterializationFailure(
@@ -28737,6 +28757,7 @@ test('executor apply adopts live worker tab before opening duplicate queued runt
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(existingTab.id)
 
     const result = await settleWithFakeTimers(sw.runCoordinatorExecutorApplyPhase('synthetic-pre-open-live-worker-adopt', {
             ownerTabId: 'service-worker-queue-owner',
@@ -29067,12 +29088,14 @@ test('executor apply consumes active-with-tab-missing-pending-action classifier 
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(tabId)
     browser.__tabs.set(duplicateTabId, {
         id: duplicateTabId,
         windowId: 55,
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTabId)
 
     assert.equal(sw.state().activeQueuedTabs.length, 0)
     assert.equal(sw.state().queuedTabActions.length, 0)
@@ -29412,6 +29435,7 @@ test('executor apply prunes failed queued live-tab adoption and refills runtime 
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(tabId)
     const originalGet = browser.tabs.get.bind(browser.tabs)
     browser.tabs.get = async id => {
         if(Number.parseInt(id, 10) === tabId) throw new Error('synthetic adoption tab lookup failure')
@@ -29489,12 +29513,14 @@ test('executor apply closes duplicate same-profile worker tabs after live-tab ad
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(adoptedTabId)
     browser.__tabs.set(duplicateTabId, {
         id: duplicateTabId,
         windowId: 44,
         url: href,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(duplicateTabId)
 
     const before = await sw.getCoordinatorWhyNotRunning({reason: 'synthetic-queued-adoption-duplicate-before'})
     assert.equal(before.executor.primaryCase, 'queued-with-live-profile-tab-needs-adoption')
@@ -30695,6 +30721,7 @@ test('queued fill does not open second worker profile tab while surface profile 
         windowId: surface.id,
         active: false
     })
+    sw.__testRecordQueueCreatedWorkerTab(busyTab.id)
     storage.mbCoordinatorQueue[busyHref].actionSurfaceWindowId = surface.id
     storage.mbCoordinatorQueue[busyHref].actionSurfaceAnchorTabId = surface.tabs[0].id
     storage.mbCoordinatorQueue[busyHref].tabId = busyTab.id
@@ -31785,6 +31812,7 @@ test('service-worker executor apply adopts expected live queued profile tab befo
         attemptNumber: 1
     }))
     const {sw, storage, timers} = loadServiceWorkerHarness({now: 3800, browser})
+    sw.__testRecordQueueCreatedWorkerTab(existingTab.id)
     const originalGet = browser.storage.local.get.bind(browser.storage.local)
     let queueRunsOnlyReads = 0
 
@@ -31914,6 +31942,7 @@ test('service-worker executor adopts orphaned worker-window queued profile tab',
         windowId: surface.id,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(surfaceProfileTab.id)
 
     const result = await sw.resumeCoordinatorQueueExecutionOnce({
         tabId: 'service-worker-queue-owner',
@@ -32035,6 +32064,7 @@ test('service-worker executor adopts orphaned pending-confirmation worker-window
         url: href,
         active: true
     })
+    sw.__testRecordQueueCreatedWorkerTab(confirmationTab.id)
     browser.tabs.sendMessage = async (tabId, message) => {
         if(Number.parseInt(tabId, 10) === confirmationTab.id &&
             message?.action === 'get-profile-action-surface-state') {
@@ -32114,7 +32144,9 @@ test('service-worker executor reclaims rolled-back queued profile tab before ope
         }
     })
     const firstTab = await browser.tabs.create({url: href, active: false})
+    sw.__testRecordQueueCreatedWorkerTab(firstTab.id)
     const activeTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(activeTab.id)
 
     const result = await sw.resumeCoordinatorQueueExecutionOnce({
         tabId: 'service-worker-queue-owner',
@@ -32180,6 +32212,7 @@ test('service-worker executor reclaims rolled-back queued profile tab when retry
         }
     })
     const liveTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(liveTab.id)
     const originalGet = browser.tabs.get.bind(browser.tabs)
     let hungGetCalls = 0
     browser.tabs.get = async candidateTabId => {
@@ -37293,6 +37326,7 @@ test('authority reconcile adopts same-profile live tab before no-actor terminal 
         }
     })
     const liveTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(liveTab.id)
 
     const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-no-actor-live-drift')
 
@@ -37356,6 +37390,7 @@ test('authority reconcile adopts blocked live profile tab before no-actor termin
         }
     })
     const liveTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(liveTab.id)
     const originalSendMessage = browser.tabs.sendMessage.bind(browser.tabs)
     const closeIfBlockedMessages = []
     browser.tabs.sendMessage = async (tabId, message) => {
@@ -37894,6 +37929,7 @@ test('authority reconcile adopts same-profile live tab after releasing stale act
         }
     })
     const liveTab = await browser.tabs.create({url: href, active: true})
+    sw.__testRecordQueueCreatedWorkerTab(liveTab.id)
 
     const result = await sw.runCoordinatorAuthorityReconcileActions('test-active-lease-live-drift')
 
@@ -44334,7 +44370,7 @@ test('source: row events prefer the authenticated sender over a tab id in the ev
 
 test('source: a remapped queued page returns before any block, mute, unblock or already-blocked decision (review-2 C-1)', () => {
     const source = fs.readFileSync(path.join(LIST_REPO_ROOT, 'shared/js/content.js'), 'utf8')
-    assert.match(source, /const remappedProfileHref = getQueuedProfileRemapTarget\(queuedProfileHref\)\n\s+if\(remappedProfileHref\) \{\n[\s\S]*?\n\s+return\n\s+\}\n\n\s+if\(isProfileBlocked\(\)\) \{/)
+    assert.match(source, /const remappedProfileHref = getQueuedProfileRemapTarget\(queuedProfileHref\)\n\s+if\(remappedProfileHref\) \{\n[\s\S]*?\n\s+return\n\s+\}\n\n\s+if\(isProfileBlockedConfirmed\(\)\) \{/)
     assert.match(source, /const remappedUnblockProfileHref = getQueuedProfileRemapTarget\(queuedProfileHref\)\n\s+if\(remappedUnblockProfileHref\) \{\n[\s\S]*?\n\s+return\n\s+\}\n/)
 })
 
@@ -46029,6 +46065,10 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         'let spaceFeedCollectLimit = 10',
         'let spaceFeedCollectProgress = {startedAt: 0, passes: 0, collected: 0, target: 0}',
         'let spaceFeedStopLabelTimer = 0',
+        'const spaceFeedPosterProfileHrefs = new Set()',
+        'const spaceFeedQueuedProfileHrefs = new Set()',
+        'async function safeSendRuntimeMessage(message, fallback = null) { return fallback }',
+        contentFunctionSource(contentSource, 'async function weedSpaceFeedPosterRows()'),
         contentFunctionSource(contentSource, 'function getSpaceFeedCollectedSince(startCount, peakCount)'),
         contentFunctionSource(contentSource, 'function isSpaceFeedCollectDone(startCount, peakCount, limit)'),
         contentFunctionSource(contentSource, 'function setSpaceFeedCollectButtons(setLabel)'),

@@ -46,6 +46,8 @@ module.exports = {
     QUORA_RUNTIME_ACTIVATED_SESSION_KEY: 'mbQuoraRuntimeActivated',
     FLIGHT_RECORDER_SESSION_KEY: 'mbFlightRecorderSnapshot',
     QUEUED_ACTION_SURFACE_STATE_KEY: 'mbQueuedActionSurfaceState',
+    // The worker-window tabs this queue created (session only). Kept so a service-worker restart still knows which tabs are the queue's.
+    QUEUE_CREATED_WORKER_TABS_KEY: 'mbQueueCreatedWorkerTabs',
     COORDINATOR_STATS_CLEARED_AT_KEY: 'mbCoordinatorStatsClearedAt',
     // The outlier index (the list, the baseline and the dismissals). Its entry bodies are under COORDINATOR_OUTLIER_ENTRY_KEY_PREFIX plus a
     // two-digit slot number (27 Oct; swCoordinatorOutliers.js). The index keeps this name, so the 1.6 single-record layout is read from it.

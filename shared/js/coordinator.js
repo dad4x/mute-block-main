@@ -162,8 +162,11 @@ function historyStatusLabel(row = {}) {
 }
 
 // A row with an error reads in red: a failed row, or any row that carries an error text.
+// A block attempt that stopped because the profile is already followed is an error to look at, not a success (Oct 31).
 function historyRowHasError(row = {}) {
-    return `${row.status || ''}` === 'failed' || `${row.error || row.finalError || ''}`.trim() !== ''
+    return `${row.status || ''}` === 'failed' ||
+        `${row.outcome || ''}` === 'block-attempt-on-following' ||
+        `${row.error || row.finalError || ''}`.trim() !== ''
 }
 
 function historyRowAt(row = {}) {
@@ -192,10 +195,20 @@ function historyRowSpaceLabel(row = {}) {
     }
 }
 
-// The post a completed row came from: the first evidence entry that names one, else the row's own post address.
+// A profile link on a space feed names the profile, not the post it sits in. The row then has no post address of its own (Oct 31).
+function historyRowFromProfileLink(row = {}) {
+    const evidence = Array.isArray(row.evidence) ? row.evidence : []
+    return evidence.some(entry => `${entry?.postKey || ''}`.startsWith('space-profile-link:'))
+}
+
+// The posting a completed row came from: the post the profile link sat in (sourcePostUrl), else the first evidence entry that names
+// a post, else the row's own post address. A profile-link entry's own address is the profile, so it is never taken as the post.
 function historyRowPostUrl(row = {}) {
-    const evidence = (Array.isArray(row.evidence) ? row.evidence : []).find(entry => entry?.postUrl)
-    return `${evidence?.postUrl || row.postUrl || ''}`
+    const evidence = Array.isArray(row.evidence) ? row.evidence : []
+    const sourced = evidence.find(entry => entry?.sourcePostUrl)
+    if(sourced) return `${sourced.sourcePostUrl}`
+    const post = evidence.find(entry => entry?.postUrl && !`${entry?.postKey || ''}`.startsWith('space-profile-link:'))
+    return `${post?.postUrl || row.postUrl || ''}`
 }
 
 // Asks the worker for the rows. A full query replaces the rows the page has; an incremental one adds the rows it does not have yet.
@@ -238,13 +251,20 @@ function historyFilterWords(text = '') {
 }
 
 // The visible text a row's filter words are matched against: the profile, status, outcome, source and error. Lowercased.
+// The outcome as the history page words it. "blocked" is a block this run made, shown as "new block" so a search for "blocked" no longer
+// finds "already blocked" rows too (Oct 31). "already-blocked" keeps its own words.
+function historyOutcomeText(row = {}) {
+    const outcome = `${row.outcome || ''}`
+    return outcome === 'blocked' ? 'new block' : outcome.replace(/-/g, ' ')
+}
+
 function historyRowFilterFields(row = {}) {
     const outcome = `${row.outcome || ''}`
     const fields = [
         `${row.targetProfileHref || row.coordinatorKey || ''}`,
         historyStatusLabel(row),
         outcome,
-        outcome.replace(/-/g, ' '),
+        historyOutcomeText(row),
         row.origin === 'manual' ? 'Manual' : 'Space',
         historyRowSpaceLabel(row),
         `${row.origin || ''}`,
@@ -311,10 +331,11 @@ function renderHistoryRows() {
         const profileLabel = profileHref ? getProfileLabelFromHref(profileHref) : ''
         const titleLabel = profileLabel || `${row.coordinatorKey || 'Unknown profile'}`
         const status = historyStatusLabel(row)
-        const outcome = `${row.outcome || ''}`.replace(/-/g, ' ')
+        const outcome = historyOutcomeText(row)
         const attempt = Number.parseInt(row.attemptNumber, 10) > 1 ? `attempt ${row.attemptNumber}` : ''
         const spaceLabel = historyRowSpaceLabel(row)
-        const source = row.origin === 'manual' ? 'Manual' : spaceLabel ? `Space ${spaceLabel}` : 'Space'
+        const feedNote = !historyRowFromProfileLink(row) ? '' : historyRowPostUrl(row) ? ' (profile link in post)' : ' (profile link, post not recorded)'
+        const source = row.origin === 'manual' ? 'Manual' : spaceLabel ? `Space ${spaceLabel}${feedNote}` : `Space${feedNote}`
         const at = historyRowAt(row)
         const when = at ? formatDateTime(at) : ''
         const error = `${row.error || row.finalError || ''}`.trim().slice(0, 160)
@@ -512,6 +533,7 @@ async function init() {
     document.getElementById('saveFlightRecorderButton')?.addEventListener('click', () => {
         void saveFlightRecorder()
     })
+    initFlightRecorderAutosave()
     document.getElementById('clearCurrentWorkButton')?.addEventListener('click', () => {
         void clearCurrentWork()
     })
@@ -1624,9 +1646,7 @@ function render() {
     const skippedByOutcome = finishedOutcomes?.skipped || {}
     const skippedTotal = Object.values(skippedByOutcome).reduce((sum, n) => sum + (Number.parseInt(n, 10) || 0), 0)
     setText('skippedCount', finishedOutcomes ? skippedTotal : '--')
-    setText('skippedDetail', finishedOutcomes
-        ? Object.entries(skippedByOutcome).map(([outcome, n]) => outcome + ' ' + n).join(', ') || 'none'
-        : 'no completed rows yet')
+    renderSkippedDetail(finishedOutcomes ? skippedByOutcome : null)
     setText('failedCount', finishedOutcomes ? (Number.parseInt(finishedOutcomes.failed, 10) || 0) : '--')
     const finishedDurations = state.queueView?.finishedWork?.durations || null
     const averageSeconds = bucket => {
@@ -1997,6 +2017,63 @@ async function saveFlightRecorder() {
     link.click()
     link.remove()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// Autosave (dev mode): the Autosave drop-down is 0 (save only when pressed) or 50 (also save after every 50 completed items). The
+// button's label names the setting. Completions are counted from the worker's completed log as they arrive, so a count starts when
+// the dashboard is open and the setting is 50.
+const FLIGHT_RECORDER_AUTOSAVE_STEP = 50
+const FLIGHT_RECORDER_AUTOSAVE_POLL_MS = 5000
+// The setting lives in this page only, so it resets when the dashboard is reloaded. The worker owns stored settings; a stored
+// copy is a follow-up.
+let flightAutosaveEvery = 0
+let flightAutosaveSeenAt = 0
+let flightAutosavePending = 0
+
+function readFlightRecorderAutosaveEvery() {
+    return flightAutosaveEvery === FLIGHT_RECORDER_AUTOSAVE_STEP ? FLIGHT_RECORDER_AUTOSAVE_STEP : 0
+}
+
+function renderFlightRecorderSaveButton(every) {
+    const button = document.getElementById('saveFlightRecorderButton')
+    if(button) button.textContent = every === FLIGHT_RECORDER_AUTOSAVE_STEP ? `Save flight recorder every ${FLIGHT_RECORDER_AUTOSAVE_STEP} completed` : 'Save flight recorder'
+}
+
+function initFlightRecorderAutosave() {
+    const select = document.getElementById('flightRecorderAutosaveSelect')
+    const every = readFlightRecorderAutosaveEvery()
+    if(select) select.value = String(every)
+    renderFlightRecorderSaveButton(every)
+    select?.addEventListener('change', () => {
+        const next = Number.parseInt(select.value, 10) === FLIGHT_RECORDER_AUTOSAVE_STEP ? FLIGHT_RECORDER_AUTOSAVE_STEP : 0
+        flightAutosaveEvery = next
+        renderFlightRecorderSaveButton(next)
+        flightAutosaveSeenAt = 0
+        flightAutosavePending = 0
+    })
+    setInterval(() => { void pollFlightRecorderAutosave() }, FLIGHT_RECORDER_AUTOSAVE_POLL_MS)
+}
+
+async function pollFlightRecorderAutosave() {
+    if(!isDevModeStoredEnabled() || readFlightRecorderAutosaveEvery() !== FLIGHT_RECORDER_AUTOSAVE_STEP) return
+    if(document.hidden) return
+    // The first poll sets the starting point, so rows completed before the setting was chosen are not counted.
+    if(!flightAutosaveSeenAt) {
+        flightAutosaveSeenAt = Date.now()
+        return
+    }
+    const result = await sendRuntimeMessageWithTimeout({
+        action: 'get-recent-history',
+        since: flightAutosaveSeenAt
+    }, null, COORDINATOR_MESSAGE_DEFAULT_TIMEOUT_MS).catch(() => null)
+    if(!result || !Array.isArray(result.rows) || !result.rows.length) return
+    const fresh = result.rows.filter(row => historyRowAt(row) > flightAutosaveSeenAt)
+    flightAutosaveSeenAt = Math.max(flightAutosaveSeenAt, ...result.rows.map(row => historyRowAt(row)))
+    flightAutosavePending += fresh.length
+    while(flightAutosavePending >= FLIGHT_RECORDER_AUTOSAVE_STEP) {
+        flightAutosavePending -= FLIGHT_RECORDER_AUTOSAVE_STEP
+        void saveFlightRecorder()
+    }
 }
 
 async function cancelCurrentWork() {
@@ -3735,12 +3812,43 @@ function getOutcomeHelp(outcome = '') {
         timeout: 'Timeout: retryable failure from a missing, stale, or over-deadline background tab.',
         'action-error': 'Nuke error: the profile action failed while finding or applying it.',
         'security-verification': 'Security verification: non-retryable Quora challenge or verification state.',
-        'profile-unavailable': 'Profile unavailable: the target could not be acted on.',
+        'profile-unavailable': 'Profile unavailable: the profile was not found. Nothing was blocked.',
+        banned: 'Banned: Quora banned this account. Nothing was blocked by this run.',
+        deactivated: 'Deactivated: Quora deactivated this account. Nothing was blocked by this run.',
+        'profile-redirect-mismatch': 'Redirect mismatch: Quora opened a different profile than the one queued, so nothing was acted on.',
         'unresolved-target': 'Unresolved target: source evidence did not identify one profile target.',
         paused: 'Paused: canceled by operator pause.'
     }
 
     return descriptions[normalized] || ''
+}
+
+// The skipped breakdown under the Skipped count: one line per outcome, so none is cut off, and the meaning of each on hover (Oct 31).
+function renderSkippedDetail(skippedByOutcome = null) {
+    const element = document.getElementById('skippedDetail')
+    if(!element) return
+    element.textContent = ''
+    if(skippedByOutcome === null) {
+        element.textContent = 'no completed rows yet'
+        element.removeAttribute('title')
+        return
+    }
+    const entries = Object.entries(skippedByOutcome).filter(([, n]) => (Number.parseInt(n, 10) || 0) > 0)
+    if(!entries.length) {
+        element.textContent = 'none'
+        element.removeAttribute('title')
+        return
+    }
+    const help = []
+    for(const [outcome, n] of entries) {
+        const label = outcome.replace(/-/g, ' ') + ' ' + n
+        const line = document.createElement('div')
+        line.textContent = label
+        element.append(line)
+        const meaning = getOutcomeHelp(outcome)
+        help.push(meaning ? label + ': ' + meaning : label)
+    }
+    element.title = muteBlockHelpText('Skipped rows by outcome. ' + help.join('\n'))
 }
 
 function getTime(record) {

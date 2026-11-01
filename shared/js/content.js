@@ -73,6 +73,8 @@ const {
     WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS,
     WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS,
+    WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_TIMEOUT_MS,
+    WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_INTERVAL_MS,
     WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS,
     WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS,
@@ -1545,7 +1547,7 @@ function installProfilePageEventListeners() {
             const target = event.target?.closest?.('button, a, [role="menuitem"], [role="menu"] *') || event.target
             const label = `${target?.textContent || target?.getAttribute?.('aria-label') || ''}`.replace(/\s+/g, ' ').trim()
             if(!/mute|block|unmute|unblock|confirm|yes/i.test(label)) return
-            reportPageEvent(`user-${type}`, label)
+            reportPageEvent(`${extensionActivationState.depth > 0 ? 'ext' : 'user'}-${type}`, label)
         }, true)
     }
 }
@@ -1648,7 +1650,7 @@ async function maybeClearCurrentProfileNukeStateFromLiveUnblocked() {
 }
 
 async function maybeRecordAlreadyBlockedCoordinatorProfile() {
-    if(getPageType() !== 'profile' || !isProfileBlocked()) return
+    if(getPageType() !== 'profile' || !isProfileBlockedConfirmed()) return
 
     const href = normalizeQuoraProfileHref(location.href)
     if(!href) return
@@ -3539,7 +3541,8 @@ function getProfileUnavailableReason() {
     ]
     const matches = pattern => pattern.test(title) || pattern.test(bodyText)
 
-    if(enforcedPatterns.some(matches)) return 'Profile banned'
+    // Deactivated accounts are reported apart from banned ones (31 Oct): the page wording is the only signal.
+    if(enforcedPatterns.some(matches)) return matches(/\bdeactivated\b/) ? 'Profile deactivated' : 'Profile banned'
     if(notFoundPatterns.some(matches)) return 'Profile unavailable'
 
     return ''
@@ -3547,7 +3550,7 @@ function getProfileUnavailableReason() {
 
 function isQuoraNotFoundPage() {
     const bodyText = (document.body?.innerText || '').replace(/s+/g, ' ').trim().toLowerCase()
-    return /page not found/.test(bodyText) && /couldn'?t find the page you were looking for/.test(bodyText)
+    return /\bpage not found\b/.test(bodyText) && /couldn'?t find the page you were looking for/.test(bodyText)
 }
 
 function getQuestionLogHref() {
@@ -5203,6 +5206,25 @@ function hasInlineBlockedStateMarker(text = '') {
         text.includes('\\"isBlockedByViewer?\\":true') ||
         text.includes('"isBlocking?":true') ||
         text.includes('\\"isBlocking?\\":true')
+}
+
+// The viewer's block state from the profile's own record in the page data (isBlockedByViewer, next to /profile/<slug>/edit).
+// True or false when the record is there; null when it is not. The record is read from the page, so it does not depend on a
+// label that can flicker or be remembered (Oct 31: a row finished as blocked on a page whose record said not blocked).
+function readOwnProfileBlockedField() {
+    const slug = (location.pathname || '').split('/').filter(Boolean).pop() || ''
+    if(!slug) return null
+    const html = document.documentElement?.innerHTML || ''
+    const at = html.indexOf(`/profile/${slug}/edit`)
+    if(at < 0) return null
+    const match = html.slice(at, at + 1500).match(/isBlockedByViewer\\?":\s*(true|false)/)
+    return match ? match[1] === 'true' : null
+}
+
+// Blocked when the page's own record says so; the label check is used only when there is no record.
+function isProfileBlockedConfirmed() {
+    const own = readOwnProfileBlockedField()
+    return own === null ? !!isProfileBlocked() : own
 }
 
 function isProfileBlockedFromInlineState() {
@@ -7091,6 +7113,7 @@ async function collectMoreSpaceFeedPosts(button) {
         endReached = outcome === 'end'
 
         const collected = getSpaceFeedCollectedSince(startCount, peakCount)
+        void weedSpaceFeedPosterRows().catch(() => null)
         reportCollectEnd('space', {
             reason: spaceFeedCollectStopRequested ? 'stopped' : collected >= limit ? 'captured' : endReached ? 'end-of-feed' : 'stalled',
             collected,
@@ -8108,6 +8131,68 @@ function getSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
     return entries
 }
 
+// A name followed by "upvoted this" is an upvoter in a post's action bar. The check reads the nearest container whose text
+// says "upvoted this", and asks whether this name is the one before it. Upvoters are never targets (Oct 31).
+function isSpaceFeedUpvoterLink(link) {
+    const name = `${link?.textContent || ''}`.replace(/\s+/g, ' ').trim()
+    if(!name) return false
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const upvoted = new RegExp(`${escaped}\\s*upvoted this`, 'i')
+    let node = link.parentElement || null
+    for(let depth = 0; node && node !== document.body && depth < 12; depth += 1) {
+        const text = `${node.innerText || node.textContent || ''}`.replace(/\s+/g, ' ')
+        if(/upvoted this/i.test(text)) return upvoted.test(text)
+        node = node.parentElement
+    }
+    return false
+}
+
+// Why a profile-link card is a candidate, for the MB Info trace (Oct 31). It reports only; it does not decide whether the card is kept.
+// "Following" is read from the byline here for diagnosis only, not used to exclude.
+function describeSpaceFeedProfileLinkCard(link, href) {
+    const linkText = `${link?.textContent || ''}`.replace(/\s+/g, ' ').trim()
+    const handle = `${href || ''}`.split('/').pop() || ''
+    const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const followingPattern = new RegExp(`${escaped}\\s*\\u00b7?\\s*Following\\b`, 'i')
+    let byline = 'no byline with the name'
+    let node = link?.parentElement || null
+    // Keeps climbing after a container with the name but no "Following": a name link's own parent often holds only the name.
+    for(let depth = 0; node && node !== document.body && depth < 10; depth += 1) {
+        const text = `${node.textContent || ''}`.replace(/\s+/g, ' ').slice(0, 400)
+        if(handle && followingPattern.test(text)) {
+            byline = 'byline shows Following'
+            break
+        }
+        if(handle && text.includes(handle)) byline = 'byline shows no Following'
+        node = node.parentElement
+    }
+    const upvoterRule = linkText ? 'no "upvoted this" match' : 'cannot match, link has no name'
+    return `${linkText ? 'name link' : 'avatar link (no text)'}; upvoter rule: ${upvoterRule}; ${byline}`
+}
+
+// The post a profile link sits in as the post scanner sees it: the nearest ancestor holding a post timestamp, and that timestamp. Null when none encloses the link.
+function getSpaceFeedProfileLinkSourcePost(link) {
+    let node = link instanceof Element ? link.parentElement : null
+    while(node && node !== document.body) {
+        const timestamp = node.querySelector?.('a.post_timestamp, a.answer_timestamp')
+        if(timestamp) return {postRoot: node, timestamp}
+        node = node.parentElement
+    }
+    return null
+}
+
+// The post a profile link sits in: the nearest ancestor that holds a post's own timestamp link. Empty when none encloses the link.
+// A profile link names the profile, so this is the only record of which posting identified it (Oct 31).
+function getSpaceFeedProfileLinkSourcePostUrl(link) {
+    let node = link instanceof Element ? link.parentElement : null
+    while(node && node !== document.body) {
+        const timestamp = node.querySelector?.('a.post_timestamp, a.answer_timestamp')
+        if(timestamp) return normalizeQuoraPostHref(timestamp.href || '') || ''
+        node = node.parentElement
+    }
+    return ''
+}
+
 function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
     if(!isAssetSpacePage()) return []
 
@@ -8121,19 +8206,30 @@ function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set()) {
     for(const link of getSpaceFeedProfileLinksInDomOrder(contentRoot)) {
         const root = getSpaceFeedProfileLinkCardRoot(link)
         if(!root || seenRoots.has(root)) continue
+        // An upvoter's name in a post's action bar is not a target (Oct 31: a name followed by "upvoted this" was taken as one).
+        if(isSpaceFeedUpvoterLink(root)) continue
 
         const href = normalizeQuoraProfileHref(root.href)
         if(!href || seenHrefs.has(href)) continue
+        // 31 Oct: on an asset space the author of a post is never a candidate. The post scanner (getSpaceFeedPostCandidateProfileUrls) already
+        // drops the header author; this scanner must drop the same profile when it is the byline of the post the link sits in.
+        const sourcePost = getSpaceFeedProfileLinkSourcePost(root)
+        const authorHref = sourcePost ? normalizeQuoraProfileHref(getSpaceFeedPostHeaderProfileHref(sourcePost.postRoot, sourcePost.timestamp)) : null
+        noteSpaceFeedPosterProfile(authorHref)
+        if(authorHref && authorHref === href) continue
 
         const postKey = `space-profile-link:${href}`
         seenRoots.add(root)
         seenHrefs.add(href)
         activeKeys.add(postKey)
+        const cardReason = describeSpaceFeedProfileLinkCard(root, href)
         entries.push({
             postKey,
             postRoot: root,
             postUrl: href,
-            candidateUrls: [href]
+            candidateUrls: [href],
+            sourcePostUrl: getSpaceFeedProfileLinkSourcePostUrl(root),
+            cardReason
         })
     }
 
@@ -8304,6 +8400,7 @@ function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp) {
 
     const headerProfileHref = getSpaceFeedPostHeaderProfileHref(postRoot, timestamp)
     const posterProfileUrls = getSpaceFeedPosterProfileUrls(postRoot, timestamp)
+    noteSpaceFeedPosterProfile(headerProfileHref)
     if(isTargetSpacePage()) {
         return posterProfileUrls.length
             ? posterProfileUrls
@@ -10228,9 +10325,11 @@ function syncSpaceFeedStatusButton(entries = null) {
     const host = getSpaceFeedStatusHost()
     if(!host) return false
 
-    // 30 Oct: no MB Info on a neutral space. Any copy left from before the category was known is removed.
+    // MB Info is for asset and target spaces only. A space with no stored category is neutral, so most spaces (which have none)
+    // get no MB Info and need no classification. Any copy left from before is removed (30 Oct; no-category rule, 31 Oct).
     const space = resolveCurrentSpaceDescriptor()
-    if(space && getStoredSpaceCategory(space) === 'neutral') {
+    const category = space ? getStoredSpaceCategory(space) : ''
+    if(category !== 'asset' && category !== 'target') {
         host.querySelector('.mb-ext_space-feed-status-btn')?.remove()
         return false
     }
@@ -10664,6 +10763,7 @@ function getSpaceFeedProfilePostAssociations(entries) {
                     source: candidateEvidence.source || '',
                     rawSlug: candidateEvidence.rawSlug || '',
                     sourcePageUrl: location.href,
+                    ...(entry?.sourcePostUrl ? {sourcePostUrl: entry.sourcePostUrl} : {}),
                     ...(postCandidateUrls.length ? {candidateUrls: postCandidateUrls} : {})
                 })
             }
@@ -10840,10 +10940,24 @@ async function sendCoordinatorEnqueueChunked(payload = {}, onProgress = null) {
     }
 }
 
+// Header authors of this page's asset-space posts (31 Oct). On an asset space a poster is never a candidate, so these profiles are left out
+// of every enqueue. Page memory only: cleared on reload, never stored.
+const spaceFeedPosterProfileHrefs = new Set()
+// Profiles this page has queued from the space feed, so the weeding at the end of a collect only asks about rows that could be there.
+const spaceFeedQueuedProfileHrefs = new Set()
+
+function noteSpaceFeedPosterProfile(href) {
+    const normalized = normalizeQuoraProfileHref(href || '') || ''
+    if(normalized && isAssetSpacePage()) spaceFeedPosterProfileHrefs.add(normalized)
+}
+
 async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations, preFilter = null, onProgress = null) {
     if(!space || !runId || !Array.isArray(profileAssociations) || !profileAssociations.length) {
         return null
     }
+    profileAssociations = profileAssociations.filter(association => association.resolveProfileFromPage ||
+        !spaceFeedPosterProfileHrefs.has(normalizeQuoraProfileHref(association.profileHref || '') || ''))
+    if(!profileAssociations.length) return null
 
     const source = {
         type: 'space-feed',
@@ -10853,7 +10967,7 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
         ...(preFilter ? {preFilter} : {})
     }
 
-    return sendCoordinatorEnqueueChunked({
+    const enqueueResult = await sendCoordinatorEnqueueChunked({
         run: {
             id: runId,
             sourceType: 'space-feed',
@@ -10894,6 +11008,22 @@ async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociation
             }
         })
     }, onProgress)
+    for(const association of profileAssociations) {
+        const queuedHref = normalizeQuoraProfileHref(association.profileHref || '') || ''
+        if(queuedHref) spaceFeedQueuedProfileHrefs.add(queuedHref)
+    }
+    return enqueueResult
+}
+
+// Removes the rows this page queued for profiles that have since been seen as a post's header author (31 Oct). The worker only cancels
+// pending rows, so a row that has finished keeps its outcome.
+async function weedSpaceFeedPosterRows() {
+    const posters = [...spaceFeedQueuedProfileHrefs].filter(href => spaceFeedPosterProfileHrefs.has(href))
+    for(const profileHref of posters) {
+        spaceFeedQueuedProfileHrefs.delete(profileHref)
+        await safeSendRuntimeMessage({action: 'cancel-coordinator-current-work-item', storageKey: '', coordinatorKey: profileHref, profileHref}, null)
+    }
+    return posters.length
 }
 
 async function enqueueCoordinatorProfileUrls(options = {}) {
@@ -11428,7 +11558,7 @@ function syncSpaceFeedPostButtons(renderModel) {
         // Owner, 24 Oct: buttons are for the main post card only. A profile link in a post's text is still counted in the queue, but gets no button,
         // and it is not kept active here, so an old button on it is removed by the cleanup at the end of this sync.
         if(`${entry.postKey || ''}`.startsWith('space-profile-link:')) {
-            recordSpaceFeedButtonTrace(entry, 'link-in-body')
+            recordSpaceFeedButtonTrace(entry, entry.cardReason ? `link-in-body: ${entry.cardReason}` : 'link-in-body')
             continue
         }
         if(!isSpaceFeedPostRootNear(entry.postRoot)) {
@@ -13239,35 +13369,17 @@ async function maybeRunAutoProfileAction() {
         const skipQueuedUnavailableTab = async message => {
             console.info(message)
             const unavailableReason = getProfileUnavailableReason() || message
-            if(unavailableReason === 'Profile banned') {
-                // Quora banned/deactivated the account itself -- there is no
-                // block control to interact with and never will be, so this
-                // is functionally identical to an already-blocked profile.
-                // Record it the same way a real block success is recorded
-                // (status/blockSucceeded/blockedAt) so every downstream
-                // dedup/skip check -- the space-feed "Nuked" badge, future
-                // queue-building -- treats it as done without needing to
-                // reopen a tab for it again.
-                await recordQueuedProfileProgress({
-                    status: 'blocked',
-                    openedViablePage: false,
-                    blockSucceeded: true,
-                    blockedAt: Date.now(),
-                    finalError: '',
-                    blockReason: 'quora-banned',
-                    unavailableReason,
-                    event: 'Profile is banned/deactivated by Quora; treated as already blocked'
-                })
-            }
-            else {
-                await recordQueuedProfileProgress({
-                    status: 'profile-unavailable',
-                    openedViablePage: false,
-                    finalError: message,
-                    unavailableReason,
-                    event: message
-                })
-            }
+            // Quora banned or deactivated the account itself (Oct 31). The profile is not blocked by this run, so it is recorded as a skip
+            // with the reason, not as a new block. profile-unavailable is terminal, so the profile is not queued again.
+            const enforced = unavailableReason === 'Profile banned' || unavailableReason === 'Profile deactivated'
+            await recordQueuedProfileProgress({
+                status: 'profile-unavailable',
+                openedViablePage: false,
+                finalError: enforced ? unavailableReason : message,
+                unavailableReason,
+                blockReason: unavailableReason === 'Profile banned' ? 'quora-banned' : unavailableReason === 'Profile deactivated' ? 'quora-deactivated' : '',
+                event: enforced ? `Quora has ${unavailableReason === 'Profile banned' ? 'banned' : 'deactivated'} this profile; skipped, not blocked` : message
+            })
             await releaseQueuedTabSlot()
             await requestCloseTab(2, 100, true)
         }
@@ -13833,7 +13945,7 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
-        if(isProfileBlocked()) {
+        if(isProfileBlockedConfirmed()) {
             await closeQueuedBlockedTab({
                 status: 'already-blocked',
                 openedViablePage: true,
@@ -13873,7 +13985,7 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
-        if(isProfileBlocked()) {
+        if(isProfileBlockedConfirmed()) {
             await closeQueuedBlockedTab({
                 status: 'already-blocked',
                 openedViablePage: true,
@@ -13890,7 +14002,7 @@ async function maybeRunAutoProfileAction() {
             return
         }
 
-        if(isProfileBlocked()) {
+        if(isProfileBlockedConfirmed()) {
             await closeQueuedBlockedTab({
                 status: 'already-blocked',
                 openedViablePage: true,
@@ -13962,13 +14074,13 @@ async function maybeRunAutoProfileAction() {
                 return
             }
 
-            if(isProfileBlocked()) {
+            if(isProfileBlockedConfirmed()) {
                 await closeQueuedBlockedTab()
                 return
             }
 
-            const blocked = await waitForCondition(() => isProfileBlocked(), 2500, 250)
-            if(blocked || isProfileBlocked()) {
+            const blocked = await waitForCondition(() => isProfileBlockedConfirmed(), 2500, 250)
+            if(blocked || isProfileBlockedConfirmed()) {
                 await closeQueuedBlockedTab()
             }
             else {
@@ -14225,6 +14337,10 @@ function isProfileLoadedAndUnblocked() {
         !!getProfileMenuButton()
 }
 
+// Counts the clicks this script makes itself, so the page-event log can tell them from the user's (Oct 31: a click the log
+// labelled "user" was the extension's own, and the log could not say which).
+const extensionActivationState = {depth: 0}
+
 function activateActionElement(element) {
     if(!element) return false
 
@@ -14233,6 +14349,7 @@ function activateActionElement(element) {
     const clientY = rect.top + Math.max(1, Math.min(rect.height / 2, rect.height - 1))
     const base = {bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, button: 0}
 
+    extensionActivationState.depth += 1
     try {
         element.dispatchEvent(new PointerEvent('pointerdown', {...base, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 1}))
         element.dispatchEvent(new MouseEvent('mousedown', {...base, buttons: 1}))
@@ -14244,6 +14361,9 @@ function activateActionElement(element) {
     catch {
         element.click()
         return true
+    }
+    finally {
+        extensionActivationState.depth -= 1
     }
 }
 
@@ -14332,19 +14452,27 @@ async function activateConfirmationElement(element, isStillPending, confirmation
 
     let activated = activateActionElement(element)
     await sleep(100)
-    if(typeof isStillPending === 'function' && isStillPending()) {
+    // A block that has already applied (the profile reads blocked) gets no more retries. The button can relabel to Unblock, and a
+    // retry on it would undo the block (Oct 31, William Birge).
+    const stillPendingForRetry = () => typeof isStillPending === 'function' && isStillPending() &&
+        !(confirmationKind === 'block' && isProfileBlocked())
+    if(stillPendingForRetry()) {
         dispatchActivationKey(element, 'Enter')
         await sleep(100)
-        if(isStillPending()) {
+        if(stillPendingForRetry()) {
             dispatchActivationKey(element, ' ')
             await sleep(100)
-            if(isStillPending()) {
+            if(stillPendingForRetry()) {
+                extensionActivationState.depth += 1
                 try {
                     element.click()
                 }
                 catch {}
+                finally {
+                    extensionActivationState.depth -= 1
+                }
                 await sleep(100)
-                if(isStillPending()) {
+                if(stillPendingForRetry()) {
                     const pageWorldResult = await activateConfirmationElementInPageWorld(element, confirmationKind)
                     activated = activated || !!pageWorldResult?.clicked
                     noteCurrentProfileNukeProgress({
@@ -15108,7 +15236,55 @@ async function muteProfile(options = {}) {
     return blockProfile({silent, allowForegroundFallback})
 }
 
+// The page's own record decides a block (31 Oct). A label can read blocked while the record says not blocked (a stale "Unblock" in the menu,
+// or a label that flips before the record does), so a label alone no longer counts as a block. null means this page has no record, and
+// the label decides as before.
+async function waitForProfileRecordBlocked(timeoutMs = WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_INTERVAL_MS) {
+    const deadline = Date.now() + timeoutMs
+    let verdict = readOwnProfileBlockedField()
+    while(verdict === false && Date.now() < deadline) {
+        await sleep(intervalMs)
+        verdict = readOwnProfileBlockedField()
+    }
+    return verdict
+}
+
+// After a block click, a blocked label is counted only when the record does not say not blocked, once it has had its wait.
+async function confirmBlockedAfterClick(silent, event) {
+    if(await waitForProfileRecordBlocked() === false) {
+        await recordCurrentProfileNukeProgress({
+            blockSucceeded: false,
+            blockError: 'Page record does not confirm the block',
+            event: 'Labels read blocked after the click, but the profile record says not blocked'
+        })
+        reportActionIssue('Page record does not confirm the block', silent)
+        return false
+    }
+    rememberProfileBlocked()
+    await recordCurrentProfileNukeProgress({
+        status: 'blocked',
+        blockSucceeded: true,
+        blockedAt: Date.now(),
+        event
+    })
+    return true
+}
+
+// The block, verified against the page's own record. When a block reports success but the record still reads not blocked, the block
+// flow runs once more. It never runs again once the record reads blocked, and the flow itself sees an Unblock menu as already
+// done, so a second pass cannot undo a block (Oct 31).
 async function blockProfile(options = {}) {
+    const first = await blockProfileOnce(options)
+    if(!first) return first
+    // Nothing was blocked here when the page already reads blocked, or the profile is followed (the block flow skips both). Waiting
+    // for a record to settle would only slow those profiles down (Oct 31: the already-blocked path had gone up by the 1.5 s wait).
+    if(readOwnProfileBlockedField() === true || isProfileFollowedByCurrentUser()) return first
+    await sleep(1500)
+    if(readOwnProfileBlockedField() !== false) return first
+    return blockProfileOnce(options)
+}
+
+async function blockProfileOnce(options = {}) {
     const {silent = false, allowForegroundFallback = false} = options
 
     // Checked before anything else: a candidate the current user already
@@ -15128,7 +15304,7 @@ async function blockProfile(options = {}) {
         return true
     }
 
-    const alreadyBlockedOnEntry = isProfileBlocked()
+    const alreadyBlockedOnEntry = isProfileBlockedConfirmed()
     reportInitialBlockedStateIfQueued(alreadyBlockedOnEntry)
 
     if(alreadyBlockedOnEntry) {
@@ -15212,6 +15388,16 @@ async function blockProfile(options = {}) {
     }
     if(blockState?.state === 'inverse') {
         await closeProfileMenu()
+        // Nothing has been clicked yet. A menu that reads Unblock against a record that says not blocked is not counted as blocked (31 Oct).
+        if(readOwnProfileBlockedField() === false) {
+            await recordCurrentProfileNukeProgress({
+                blockSucceeded: false,
+                blockError: 'Menu reads Unblock but the profile record says not blocked',
+                event: 'Menu label and profile record disagree before any block action'
+            })
+            reportActionIssue('Menu reads Unblock but the profile record says not blocked', silent)
+            return false
+        }
         rememberProfileBlocked()
         await recordCurrentProfileNukeProgress({
             status: 'blocked',
@@ -15225,7 +15411,7 @@ async function blockProfile(options = {}) {
 
     let blockOpt = blockState?.button || getMenuAction(isBlockActionLabel)
     if(!blockOpt) {
-        if(isProfileBlocked()) {
+        if(isProfileBlocked() && readOwnProfileBlockedField() !== false) {
             await recordCurrentProfileNukeProgress({
                 status: 'blocked',
                 blockSucceeded: true,
@@ -15271,14 +15457,7 @@ async function blockProfile(options = {}) {
     if(!confirmState) {
         const blockedAppliedEarly = await waitForProfileMenuState('inverse', isBlockActionLabel, isUnblockActionLabel, 1500, 200)
         if(blockedAppliedEarly || isProfileBlocked()) {
-            rememberProfileBlocked()
-            await recordCurrentProfileNukeProgress({
-                status: 'blocked',
-                blockSucceeded: true,
-                blockedAt: Date.now(),
-                event: 'Block applied before confirm state resolved'
-            })
-            return true
+            return confirmBlockedAfterClick(silent, 'Block applied before confirm state resolved')
         }
 
         await recordCurrentProfileNukeProgress({
@@ -15296,14 +15475,13 @@ async function blockProfile(options = {}) {
     }
 
     if(confirmState.type === 'blocked') {
-        rememberProfileBlocked()
-        await recordCurrentProfileNukeProgress({
-            status: 'blocked',
-            blockSucceeded: true,
-            blockedAt: Date.now(),
-            event: 'Profile reached blocked state without an explicit confirm click'
-        })
-        return true
+        return confirmBlockedAfterClick(silent, 'Profile reached blocked state without an explicit confirm click')
+    }
+
+    // The block can apply while the confirm is being found. Clicking the confirm then would be a second click on a button that may
+    // now read Unblock, so the flow stops here (Oct 31, William Birge).
+    if(isProfileBlocked()) {
+        return confirmBlockedAfterClick(silent, 'Profile reached blocked state before the confirm click')
     }
 
     let blockBtn = confirmState.button

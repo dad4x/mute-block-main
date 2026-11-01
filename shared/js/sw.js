@@ -40,6 +40,7 @@ const {
     QUORA_RUNTIME_ACTIVATED_SESSION_KEY,
     FLIGHT_RECORDER_SESSION_KEY,
     QUEUED_ACTION_SURFACE_STATE_KEY,
+    QUEUE_CREATED_WORKER_TABS_KEY,
     COORDINATOR_STATS_CLEARED_AT_KEY,
     COORDINATOR_OUTLIERS_KEY,
     COORDINATOR_TAB_KEY,
@@ -15743,6 +15744,8 @@ async function getLiveProfileTabHrefs() {
     return new Set(tabsByHref.keys())
 }
 
+// Only tabs this queue created count as its profile tabs. A tab the user opens on a queued profile's address is not claimed,
+// acted on or closed by the queue (Oct 31: a test tab on a queued profile was claimed and then closed when the row finished).
 async function getLiveProfileTabsByHref() {
     let tabs = []
 
@@ -15753,7 +15756,7 @@ async function getLiveProfileTabsByHref() {
         return new Map()
     }
 
-    return buildLiveProfileTabsByHref(tabs)
+    return buildLiveProfileTabsByHref(tabs.filter(tab => isOwnedWorkerSurfaceTab(tab)))
 }
 
 // The continuous work session (24 Oct). It starts when the queue has work and is not paused, and it ends when the queue is paused or
@@ -18192,6 +18195,20 @@ async function runCoordinatorExecutorApplyPhase(reason = 'coordinator-executor-a
     }
     if(options.queueOnlyAuthority === true && options.forceDurableQueueReload === true) {
     }
+    // Records which queue copy this pass classifies from and when it was taken, so a flight entry that finds a row
+    // still active after its terminal save can be matched to a copy taken before that save (Oct 31 stale-copy check).
+    const applyPassQueue = currentAuthorityState?.queue || {}
+    recordFlightRecorderEvent({
+        kind: 'apply-pass-snapshot',
+        source: 'runCoordinatorExecutorApplyPhase',
+        reason,
+        snapshotAt: Date.now(),
+        queueRows: Object.keys(applyPassQueue).length,
+        activeAttemptIds: Object.values(applyPassQueue)
+            .filter(row => row?.status === 'active' && row.attemptId)
+            .map(row => row.attemptId)
+            .slice(0, 8)
+    })
     let liveProfileTabsByHref = await getLiveProfileTabsByHref()
     const orphanProfileTabs = await sweepProfileTabsWithoutActiveQueueAuthority({
         currentAuthorityState,
@@ -27926,7 +27943,7 @@ async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
         if(!tabId || tabId === anchorTabId) continue
         const href = normalizeQuoraProfileUrl(tab?.url || '')
         const entry = href ? (findCoordinatorQueueEntryForHref(queue, href) || (queue[href] ? {item: queue[href]} : null)) : null
-        const orphaned = !!href && !queueRuntime.hasActiveQueuedTab(tabId) && !(entry?.item && isActiveCoordinatorStatus(entry.item.status))
+        const orphaned = isOwnedWorkerSurfaceTab(tab) && !!href && !queueRuntime.hasActiveQueuedTab(tabId) && !(entry?.item && isActiveCoordinatorStatus(entry.item.status))
         if(!orphaned) {
             orphanSurfaceTabFirstSeenAt.delete(tabId)
             continue
@@ -27957,6 +27974,62 @@ async function reapOrphanedWorkerSurfaceTabs(surface = {}, tabs = []) {
     return browser.tabs.query({windowId: surface.windowId}).catch(() => [])
 }
 
+// Ids of the worker-window tabs this queue created. Recorded at creation, before the open lock is released, so an overlapping
+// open sees the tab at once. A closed tab drops out of the window's tab list, so its id needs no removal here.
+const queueCreatedWorkerTabIds = new Set()
+let queueCreatedWorkerTabsRestore = null
+
+// Records a tab the queue created and keeps the record in session storage, so a service-worker restart still knows it (Oct 31).
+function registerQueueCreatedWorkerTab(tabId) {
+    const id = normalizeTabId(tabId)
+    if(!id) return
+    queueCreatedWorkerTabIds.add(id)
+    void persistQueueCreatedWorkerTabs()
+}
+
+// Writes the record, dropping ids of tabs that have closed first.
+async function persistQueueCreatedWorkerTabs() {
+    const area = getBrowserSessionStorageArea()
+    if(!area?.set) return
+    // Only ids recorded before the tab list was read can be dropped: a tab registered during the read is not in that list yet.
+    const checked = [...queueCreatedWorkerTabIds]
+    const open = await browser.tabs.query({}).catch(() => null)
+    if(Array.isArray(open)) {
+        const live = new Set(open.map(tab => normalizeTabId(tab?.id)))
+        for(const id of checked) {
+            if(!live.has(id)) queueCreatedWorkerTabIds.delete(id)
+        }
+    }
+    await area.set({[QUEUE_CREATED_WORKER_TABS_KEY]: [...queueCreatedWorkerTabIds]}).catch(() => null)
+}
+
+// Loads the record once per service-worker run. Callers that look at the queue's tabs await it first.
+function restoreQueueCreatedWorkerTabs() {
+    if(!queueCreatedWorkerTabsRestore) {
+        queueCreatedWorkerTabsRestore = (async () => {
+            const area = getBrowserSessionStorageArea()
+            if(!area?.get) return
+            const stored = await area.get({[QUEUE_CREATED_WORKER_TABS_KEY]: []}).catch(() => null)
+            const ids = stored?.[QUEUE_CREATED_WORKER_TABS_KEY]
+            for(const id of Array.isArray(ids) ? ids : []) {
+                const normalized = normalizeTabId(id)
+                if(normalized) queueCreatedWorkerTabIds.add(normalized)
+            }
+        })().catch(() => null)
+    }
+    return queueCreatedWorkerTabsRestore
+}
+// Starts the load when the worker starts. Nothing waits on it: the owned-tab lookup that needs it is not switched on yet.
+void restoreQueueCreatedWorkerTabs()
+
+// The worker window only counts tabs this queue created. Every other tab in it is the user's and is ignored, whatever its
+// address (Oct 31: a user's new tab that ended on Google held the window busy and stopped every fill).
+function isOwnedWorkerSurfaceTab(tab = null) {
+    const tabId = normalizeTabId(tab?.id)
+    if(!tabId) return false
+    return queueCreatedWorkerTabIds.has(tabId) || queueRuntime.hasQueuedTabMetadata(tabId) || queueRuntime.hasActiveQueuedTab(tabId) || queueRuntime.hasOwnedTabState(tabId)
+}
+
 async function isQueuedWorkerActionSurfaceOccupiedForOpen(action = {}) {
     if(!shouldUseQueuedWorkerActionSurface(action)) return false
     if(queuedWorkerActionSurfaceOpensInFlight > 0) return true
@@ -27964,10 +28037,10 @@ async function isQueuedWorkerActionSurfaceOccupiedForOpen(action = {}) {
     if(!surface?.windowId) return false
     let surfaceTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
     const anchorTabId = normalizeTabId(surface.anchorTabId)
-    if(surfaceTabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)) {
+    if(surfaceTabs.some(tab => isOwnedWorkerSurfaceTab(tab) && normalizeTabId(tab.id) !== anchorTabId)) {
         surfaceTabs = await reapOrphanedWorkerSurfaceTabs(surface, surfaceTabs)
     }
-    return surfaceTabs.some(tab => normalizeTabId(tab?.id) && normalizeTabId(tab.id) !== anchorTabId)
+    return surfaceTabs.some(tab => isOwnedWorkerSurfaceTab(tab) && normalizeTabId(tab.id) !== anchorTabId)
 }
 
 // Per-stage timing of one worker-window open, recorded so a live window can show where a create's
@@ -28038,15 +28111,9 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
         const anchorTabId = normalizeTabId(surface.anchorTabId)
         // Only tabs this queue owns count. A tab the user opened in this window, or a tab the profile page opened, is not ours,
         // so it is never looked at here.
-        const isOwnedSurfaceTab = tab => {
-            const tabId = normalizeTabId(tab?.id)
-            if(!tabId) return false
-            if(queueRuntime.hasQueuedTabMetadata(tabId) || queueRuntime.hasActiveQueuedTab(tabId) || queueRuntime.hasOwnedTabState(tabId)) return true
-            return !!normalizeQuoraProfileUrl(tab?.url || '')
-        }
         const isSurfaceBusy = tabs => tabs.some(tab => {
             const tabId = normalizeTabId(tab?.id)
-            return !!tabId && tabId !== anchorTabId && isOwnedSurfaceTab(tab)
+            return !!tabId && tabId !== anchorTabId && isOwnedWorkerSurfaceTab(tab)
         })
 
         let surfaceWindowTabs = await browser.tabs.query({windowId: surface.windowId}).catch(() => [])
@@ -28119,6 +28186,7 @@ async function createOwnedTabInQueuedWorkerActionSurface(action = {}, options = 
             surfaceCreateOptions,
             'queued worker action surface tab create'
         )
+        registerQueueCreatedWorkerTab(tab?.id)
         recordQueuedTabOpenStage('create', createStartedAt, action)
         const activatedAt = Date.now()
         const activateStartedAt = activatedAt
@@ -28222,15 +28290,28 @@ async function createOwnedTab(action = {}, attempt = {}) {
     }
 }
 
+// The one place the queue creates tabs. Every queue tab opens in the background of the worker window: a tab created with no window
+// landed in whichever window was last active (Oct 31). With no live worker window the create is refused, and the fill retries.
+// The tab is recorded here, before the caller gets it back, so the queue owns exactly the tabs it made.
 async function createQueuedExecutorBrowserTab(options = {}, label = 'queued executor tab create') {
-    return createQueuedExecutorBrowserTabEffect({
+    let createOptions = options
+    if(!(Number.parseInt(options.windowId, 10) || 0)) {
+        const surface = await getLiveQueuedWorkerActionSurface().catch(() => null)
+        const surfaceWindowId = Number.parseInt(surface?.windowId, 10) || 0
+        if(!surfaceWindowId) throw new Error('queued-tab-no-worker-window')
+        createOptions = {...options, windowId: surfaceWindowId, active: false}
+        delete createOptions.openerTabId
+    }
+    const tab = await createQueuedExecutorBrowserTabEffect({
         browser,
         createTimeoutMs: QUEUED_TAB_CREATE_TIMEOUT_MS,
         recordFlightRecorderEvent,
         incrementQueueWakeupMetric,
         setTimeoutFn: setTimeout,
         clearTimeoutFn: clearTimeout
-    }, options, label)
+    }, createOptions, label)
+    registerQueueCreatedWorkerTab(tab?.id)
+    return tab
 }
 
 // queuedTabContentScriptEnsureScheduling is constructed here, in place,

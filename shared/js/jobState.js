@@ -174,9 +174,11 @@ function mapProgressToJobState(record = null) {
         }
     }
     if(status === 'profile-unavailable') {
+        // Banned and deactivated accounts are counted apart from other unavailable profiles (31 Oct).
+        const reason = `${record.unavailableReason || ''}`
         return {
             status: 'skipped',
-            outcome: 'profile-unavailable',
+            outcome: reason === 'Profile banned' ? 'banned' : reason === 'Profile deactivated' ? 'deactivated' : 'profile-unavailable',
             error: record.finalError || record.unavailableReason || '',
             terminal: true
         }

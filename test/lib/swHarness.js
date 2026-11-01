@@ -765,6 +765,10 @@ module.exports.__test = {
         coordinatorReconcileScheduler.clearSchedule()
         coordinatorReconcileScheduler.resetBackoff()
     },
+    // A tab the queue made (what the queue does when it opens a worker-window tab). Tabs a test creates without this are the user's.
+    __testRecordQueueCreatedWorkerTab(tabId) {
+        registerQueueCreatedWorkerTab(tabId)
+    },
     __testAddProvisionalQueuedTab(tabId, metadata = {}, action = null) {
         queueRuntime.addActiveQueuedTab(tabId)
         setQueuedTabMetadata(tabId, metadata)
@@ -965,11 +969,23 @@ module.exports.__test = {
         module.exports.__test.setWorkerWindowForegroundMode(pinnedWorkerWindowForegroundMode)
     }
 
+    registerSeededQueueTabs(browser, module.exports.__test)
+
     return {
         browser,
         timers,
         sw: module.exports.__test,
         storage: makeWorkerStorageView(browser.__storage, browser.__sessionStorage, layoutPrefix)
+    }
+}
+
+// Profile tabs a test has already put in the browser when the worker loads are the queue's tabs, as the tests have always
+// assumed. A tab marked userTab: true is the user's and is left alone. Tabs a test opens after the load are registered by
+// the test itself (sw.__testRecordQueueCreatedWorkerTab).
+function registerSeededQueueTabs(browser, sw) {
+    for(const tab of browser.__tabs.values()) {
+        if(tab.userTab === true) continue
+        if(/^https:\/\/[^/]*quora\.com\/profile\//.test(tab.url || '')) sw.__testRecordQueueCreatedWorkerTab(tab.id)
     }
 }
 

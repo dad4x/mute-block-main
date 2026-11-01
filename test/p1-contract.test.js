@@ -5582,7 +5582,7 @@ test('service worker records a cloudflareChallenge.detected stat and throttles f
 test('profile block click path does not await nonterminal progress breadcrumbs', () => {
     const body = extractFunction(
         readRepoFile('shared/js/content.js'),
-        'async function blockProfile(options = {})'
+        'async function blockProfileOnce(options = {})'
     )
     const foundIndex = body.indexOf("event: 'Block confirm found'")
     const clickedIndex = body.indexOf("event: 'Block confirm activation attempted'")
@@ -5874,7 +5874,8 @@ test('queued mute-block success uses direct block and releases without a second 
     const directBlockIndex = body.indexOf('Queued Mute Block skipped mute and started block directly')
     const blockCallIndex = body.indexOf('blockedDirectly = await blockProfile({silent: true, allowForegroundFallback})', directBlockIndex)
     const closeIndex = body.indexOf('await closeQueuedBlockedTab()', blockCallIndex)
-    const secondProbeIndex = body.indexOf('if(isProfileBlocked())', closeIndex)
+    // The probe after the direct block reads the record first (Oct 31); a label alone no longer decides a block.
+    const secondProbeIndex = body.indexOf('if(isProfileBlockedConfirmed())', closeIndex)
 
     assert.notEqual(helperIndex, -1)
     assert.notEqual(sweepIndex, -1)
@@ -5919,11 +5920,11 @@ test('block flow skips already-followed profiles before attempting anything else
     // anything else -- a candidate the user already follows is almost
     // certainly a miscategorization, regardless of how it got queued.
     const source = readRepoFile('shared/js/content.js')
-    const blockBody = extractFunction(source, 'async function blockProfile(options = {})')
+    const blockBody = extractFunction(source, 'async function blockProfileOnce(options = {})')
     const detectBody = extractFunction(source, 'function isProfileFollowedByCurrentUser()')
 
     const followedCheckIndex = blockBody.indexOf('isProfileFollowedByCurrentUser()')
-    const alreadyBlockedCheckIndex = blockBody.indexOf('const alreadyBlockedOnEntry = isProfileBlocked()')
+    const alreadyBlockedCheckIndex = blockBody.indexOf('const alreadyBlockedOnEntry = isProfileBlockedConfirmed()')
     assert.notEqual(followedCheckIndex, -1)
     assert.notEqual(alreadyBlockedCheckIndex, -1)
     assert.ok(followedCheckIndex < alreadyBlockedCheckIndex, 'following check runs before anything else in the block flow')
@@ -5954,7 +5955,7 @@ test('block flow skips already-followed profiles before attempting anything else
 
 test('profile block flow can resume from an open confirmation dialog', () => {
     const source = readRepoFile('shared/js/content.js')
-    const blockBody = extractFunction(source, 'async function blockProfile(options = {})')
+    const blockBody = extractFunction(source, 'async function blockProfileOnce(options = {})')
     const confirmBody = extractFunction(source, 'async function completePendingBlockConfirmation(initialButton = null, silent = false)')
     const blockConfirmBody = extractFunction(source, 'function getBlockConfirmAction()')
     const blockContextBody = extractFunction(source, 'function isBlockConfirmContextText(text)')
@@ -6019,7 +6020,7 @@ test('profile menu action lookup does not foreground when action is found in bac
 test('mute and unmute confirmations use robust confirmation activation', () => {
     const source = readRepoFile('shared/js/content.js')
     const muteBody = extractFunction(source, 'async function muteProfile(options = {})')
-    const blockBody = extractFunction(source, 'async function blockProfile(options = {})')
+    const blockBody = extractFunction(source, 'async function blockProfileOnce(options = {})')
     const unmuteBody = extractFunction(source, 'async function unmuteProfile(options = {})')
     const unmuteBestEffortBody = extractFunction(source, 'async function unmuteProfileBestEffort(options = {})')
     const activateBody = extractFunction(source, "async function activateConfirmationElement(element, isStillPending, confirmationKind = '')")
@@ -6884,6 +6885,26 @@ test('history row shows the space and post a completed row was collected from', 
     assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(searchRow)})`), '', 'a row with no post shows no post')
 })
 
+test('history row from a profile link links to the posting it sat in, and names no post when none was recorded', () => {
+    const evaluate = loadDashboardHarness()
+    // A profile link on a space feed: the evidence address is the profile itself, not the post it sits in (ShineOnUCrazyDiamond, Oct 31).
+    const linkRow = {
+        source: {spaceKey: 'quora-space:https://theobvioustrollshootinggallery.quora.com', pageUrl: 'https://theobvioustrollshootinggallery.quora.com/'},
+        provenance: null,
+        evidence: [{postKey: 'space-profile-link:https://www.quora.com/profile/ShineOnUCrazyDiamond', postUrl: 'https://www.quora.com/profile/ShineOnUCrazyDiamond'}],
+        targetProfileHref: 'https://www.quora.com/profile/ShineOnUCrazyDiamond'
+    }
+    assert.equal(evaluate(`historyRowFromProfileLink(${JSON.stringify(linkRow)})`), true, 'the row is marked as a profile-link row')
+    assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(linkRow)})`), '', 'with no recorded post, the profile address is not taken for the post')
+    assert.equal(evaluate(`historyRowSpaceUrl(${JSON.stringify(linkRow)})`), 'https://theobvioustrollshootinggallery.quora.com', 'the space is still known')
+    // The post the profile link sat in is recorded on the evidence as sourcePostUrl, and that posting is what the row links to.
+    const sourcedRow = {...linkRow, evidence: [{...linkRow.evidence[0], sourcePostUrl: 'https://theobvioustrollshootinggallery.quora.com/Shine-Post-Slug'}]}
+    assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(sourcedRow)})`), 'https://theobvioustrollshootinggallery.quora.com/Shine-Post-Slug', 'the row links to the posting that named the profile')
+    const postRow = {...linkRow, evidence: [{postKey: 'space-post:https://theobvioustrollshootinggallery.quora.com/Some-post', postUrl: 'https://theobvioustrollshootinggallery.quora.com/Some-post'}]}
+    assert.equal(evaluate(`historyRowFromProfileLink(${JSON.stringify(postRow)})`), false, 'a row with a post address is not a profile-link row')
+    assert.equal(evaluate(`historyRowPostUrl(${JSON.stringify(postRow)})`), 'https://theobvioustrollshootinggallery.quora.com/Some-post')
+})
+
 test('history remove duplicates keeps only the newest row per profile when on, and every row when off', () => {
     const evaluate = loadDashboardHarness()
     const rows = [
@@ -7306,4 +7327,33 @@ test('space feed reads answer timestamps as posts too, and single-post page dete
     assert.match(extractFunction(content, 'function getSpaceFeedPostRootFromMutationNode(node)'), /a\.answer_timestamp/)
     // Page-type detection is shared with question and single-post pages, so it keeps the post-only selector.
     assert.doesNotMatch(extractFunction(content, 'function isSpacePostPage()'), /answer_timestamp/)
+})
+
+test('the Autosave drop-down offers 0 and 50, the save button names the every-50 setting, and the poll counts completions and saves at each 50', () => {
+    const html = readRepoFile('shared/coordinator.html')
+    const js = readRepoFile('shared/js/coordinator.js')
+    assert.match(html, /<select id="flightRecorderAutosaveSelect"[\s\S]*?<option value="0">0<\/option>[\s\S]*?<option value="50">50<\/option>/)
+    assert.match(js, /Save flight recorder every \$\{FLIGHT_RECORDER_AUTOSAVE_STEP\} completed/)
+    assert.match(js, /initFlightRecorderAutosave\(\)/)
+    const poll = extractFunction(js, 'async function pollFlightRecorderAutosave()')
+    assert.match(poll, /action: 'get-recent-history'/)
+    assert.match(poll, /since: flightAutosaveSeenAt/)
+    assert.match(poll, /while\(flightAutosavePending >= FLIGHT_RECORDER_AUTOSAVE_STEP\)/)
+    assert.match(poll, /void saveFlightRecorder\(\)/)
+    // The autosave only runs in dev mode, where the save button is shown.
+    assert.match(poll, /isDevModeStoredEnabled\(\)/)
+})
+
+test('a block attempt that stopped on a followed profile is highlighted as an error in history', () => {
+    const evaluate = loadDashboardHarness()
+    const followed = {status: 'skipped', outcome: 'block-attempt-on-following', error: '', targetProfileHref: 'https://www.quora.com/profile/Someone'}
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify(followed)})`), true, 'a following skip is highlighted')
+    const done = {status: 'succeeded', outcome: 'blocked', error: '', targetProfileHref: 'https://www.quora.com/profile/Someone'}
+    assert.equal(evaluate(`historyRowHasError(${JSON.stringify(done)})`), false, 'a finished block is not highlighted')
+})
+
+test('MB Info shows only on asset and target spaces; a space with no stored category is neutral and gets none', () => {
+    const body = extractFunction(readRepoFile('shared/js/content.js'), 'function syncSpaceFeedStatusButton(entries = null)')
+    assert.match(body, /if\(category !== 'asset' && category !== 'target'\) \{/)
+    assert.match(body, /host\.querySelector\('\.mb-ext_space-feed-status-btn'\)\?\.remove\(\)/)
 })

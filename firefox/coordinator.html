@@ -112,6 +112,12 @@
                         <div class="panel-action-state dev-mode-controls" id="debugResumeControls" data-dev-mode-panel hidden>
                             <div class="panel-action-buttons">
                                 <button class="clear-button" id="saveFlightRecorderButton" type="button" title="Mute Block extension: Saves the flight recorder as JSON to the browser's download folder (usually Downloads), as mute-block-flight-recorder-YYYY-MM-DDTHH-MM-SS.json in local time. If the browser is set to ask where to save, it asks first. A later save does not replace an earlier file.">Save flight recorder</button>
+                                <label class="dev-mode-select">Autosave
+                                    <select id="flightRecorderAutosaveSelect" title="Mute Block extension: 0 saves only when you press Save. 50 also saves the flight recorder after every 50 completed items, counted while this dashboard is open.">
+                                        <option value="0">0</option>
+                                        <option value="50">50</option>
+                                    </select>
+                                </label>
                                 <label class="dev-mode-select">Run for
                                     <select id="debugResumeMinutesSelect">
                                         <option value="0">No time limit</option>

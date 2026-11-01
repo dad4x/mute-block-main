@@ -273,7 +273,7 @@ test('the button decision for each post with candidates is traced for the Info r
     // A nuked post's button is shown again even if it was hidden while the post had nothing to show.
     assert.match(sync, /doneButton\.style\.display = ''/)
     // Buttons are for the main post card only: a profile link in a post's text gets none, and is not kept active.
-    assert.match(sync, /startsWith\('space-profile-link:'\)[\s\S]*?recordSpaceFeedButtonTrace\(entry, 'link-in-body'\)[\s\S]*?continue/)
+    assert.match(sync, /startsWith\('space-profile-link:'\)[\s\S]*?recordSpaceFeedButtonTrace\(entry, entry\.cardReason \? `link-in-body: \$\{entry\.cardReason\}` : 'link-in-body'\)[\s\S]*?continue/)
     assert.match(sync, /recordSpaceFeedButtonTrace\(entry, 'no-controls'\)/)
     assert.match(sync, /recordSpaceFeedButtonTrace\(entry, 'no-host'\)/)
     assert.match(content, /const SPACE_FEED_BUTTON_TRACE_LIMIT = 40/)
@@ -543,4 +543,189 @@ test('the nuke run counts already-nuked profiles, not posts, and a profile linke
     assert.match(body, /for\(const url of nukedProfiles\) alreadyNukedProfiles\.add\(url\)/)
     assert.match(body, /alreadyNuked: alreadyNukedProfiles\.size/)
     assert.doesNotMatch(body, /alreadyNukedCount/)
+})
+
+test('a name followed by "upvoted this" is an upvoter, not a target, and a poster name in the same post is still a target', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const isUpvoter = extractFunction(content, 'function isSpaceFeedUpvoterLink(link)')
+    const check = vm.runInNewContext(`(${isUpvoter})`, {document: {body: {}}})
+
+    // The action bar: the upvoter's name, then "upvoted this", inside the nearest container that says so.
+    const upvoter = {textContent: 'ShineOnUCrazyDiamond', parentElement: {innerText: 'ShineOnUCrazyDiamond upvoted this\nUpvote', parentElement: null}}
+    assert.equal(check(upvoter), true)
+
+    // The poster's header: the name is not followed by "upvoted this".
+    const poster = {textContent: 'Handsome Dan', parentElement: {innerText: 'Handsome Dan\n· Follow\nThat is a load of manure\nShineOnUCrazyDiamond upvoted this', parentElement: null}}
+    assert.equal(check(poster), false)
+
+    // Another name's upvote in the same container does not make this name an upvoter.
+    const other = {textContent: 'Someone Else', parentElement: {innerText: 'ShineOnUCrazyDiamond upvoted this', parentElement: null}}
+    assert.equal(check(other), false)
+
+    // A link with no name text is never treated as an upvoter.
+    assert.equal(check({textContent: '  ', parentElement: null}), false)
+
+    // The scanner skips upvoter roots before it reads their address.
+    const compute = extractFunction(content, 'function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set())')
+    assert.match(compute, /if\(isSpaceFeedUpvoterLink\(root\)\) continue/)
+})
+
+test('a profile-link card records why it is a candidate: avatar or name link, the upvoter rule result, and whether its byline shows Following', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const describe = extractFunction(content, 'function describeSpaceFeedProfileLinkCard(link, href)')
+    const run = (link, href) => vm.runInNewContext(`(${describe})`, {document: {body: {}}})(link, href)
+    const href = 'https://www.quora.com/profile/ShineOnUCrazyDiamond'
+
+    // A poster's byline: the avatar link has no text, and the name beside it is followed by "Following".
+    const byline = {textContent: 'ShineOnUCrazyDiamond · Following Former Manager (1983–2017)', parentElement: null}
+    const avatar = {textContent: '', parentElement: {textContent: '', parentElement: byline}}
+    assert.equal(run(avatar, href), 'avatar link (no text); upvoter rule: cannot match, link has no name; byline shows Following')
+
+    // A name link in the same byline gets the same byline answer, and the upvoter rule ran and did not match.
+    const name = {textContent: 'ShineOnUCrazyDiamond', parentElement: byline}
+    assert.equal(run(name, href), 'name link; upvoter rule: no "upvoted this" match; byline shows Following')
+
+    // A name with no Following beside it reads as no Following.
+    const plain = {textContent: '', parentElement: {textContent: 'ShineOnUCrazyDiamond · Former Manager', parentElement: null}}
+    assert.equal(run(plain, href), 'avatar link (no text); upvoter rule: cannot match, link has no name; byline shows no Following')
+
+    // A name link whose own parent holds only the name still finds "Following" in the byline above it.
+    const nameParent = {textContent: 'ShineOnUCrazyDiamond', parentElement: byline}
+    const nameLink = {textContent: 'ShineOnUCrazyDiamond', parentElement: nameParent}
+    assert.equal(run(nameLink, href), 'name link; upvoter rule: no "upvoted this" match; byline shows Following')
+
+    // The scanner stores the reason on the card entry and the trace line shows it.
+    const entries = extractFunction(content, 'function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set())')
+    assert.match(entries, /const cardReason = describeSpaceFeedProfileLinkCard\(root, href\)/)
+
+    // 31 Oct: on an asset space the author of a post is never a candidate, so a profile link that is the post's header author is skipped,
+    // the same rule the post scanner applies (getSpaceFeedPostCandidateProfileUrls drops the header author on asset pages).
+    assert.match(entries, /const sourcePost = getSpaceFeedProfileLinkSourcePost\(root\)/)
+    assert.match(entries, /getSpaceFeedPostHeaderProfileHref\(sourcePost\.postRoot, sourcePost\.timestamp\)/)
+    assert.match(entries, /if\(authorHref && authorHref === href\) continue/)
+})
+
+test('the block state comes from the profile record when it is there, and the label check is the fallback; a block is verified once and never undone', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const reader = extractFunction(content, 'function readOwnProfileBlockedField()')
+    const readOwn = (html, pathname) => vm.runInNewContext(`(${reader})()`, {
+        location: {pathname},
+        document: {documentElement: {innerHTML: html}}
+    })
+    const profileHtml = (value) => `<div>{"profileEditUrl":"/profile/Some-Person/edit","viewerIsFollowedBy":false,"isBlockedByViewer":${value}}</div>`
+    assert.equal(readOwn(profileHtml('true'), '/profile/Some-Person'), true)
+    assert.equal(readOwn(profileHtml('false'), '/profile/Some-Person'), false)
+    assert.equal(readOwn('<div>no record here</div>', '/profile/Some-Person'), null, 'no record gives null, so the label check is used')
+    // The escaped form the page uses inside its script data.
+    assert.equal(readOwn('<script>{\\"profileEditUrl\\":\\"/profile/Some-Person/edit\\",\\"isBlockedByViewer\\":true}</script>', '/profile/Some-Person'), true)
+
+    // The fallback: with no record, the label check decides.
+    const confirmed = extractFunction(content, 'function isProfileBlockedConfirmed()')
+    const ctx = {
+        location: {pathname: '/profile/Some-Person'},
+        document: {documentElement: {innerHTML: '<div>no record</div>'}},
+        isProfileBlocked: () => true,
+        readOwnProfileBlockedField: () => null
+    }
+    assert.equal(vm.runInNewContext(`(${confirmed})()`, ctx), true, 'no record: the label check is used')
+    ctx.readOwnProfileBlockedField = () => false
+    assert.equal(vm.runInNewContext(`(${confirmed})()`, ctx), false, 'a record that says not blocked wins over a label that says blocked')
+
+    // Blocking: the wrapper verifies once, runs the flow again only when the record still reads not blocked.
+    const block = extractFunction(content, 'async function blockProfile(options = {})')
+    assert.match(block, /const first = await blockProfileOnce\(options\)/)
+    assert.match(block, /if\(readOwnProfileBlockedField\(\) !== false\) return first/)
+    // An already-blocked or followed profile is not waited on: the check comes before the 1.5 s wait.
+    assert.match(block, /if\(readOwnProfileBlockedField\(\) === true \|\| isProfileFollowedByCurrentUser\(\)\) return first[\s\S]*?await sleep\(1500\)/)
+    assert.match(block, /return blockProfileOnce\(options\)/)
+    assert.equal((block.match(/blockProfileOnce\(options\)/g) || []).length, 2, 'the flow runs at most twice')
+
+    // The decisions that record a profile as already blocked read the record first.
+    const already = extractFunction(content, 'async function maybeRecordAlreadyBlockedCoordinatorProfile()')
+    assert.match(already, /!isProfileBlockedConfirmed\(\)/)
+    const entry = extractFunction(content, 'async function blockProfileOnce(options = {})')
+    assert.match(entry, /const alreadyBlockedOnEntry = isProfileBlockedConfirmed\(\)/)
+})
+
+test('history words a block this run made as "new block", so a search for "blocked" does not also find "already blocked" rows (Oct 31)', () => {
+    const coordinator = readRepoFile('shared/js/coordinator.js')
+    const outcomeText = vm.runInNewContext(`(${extractFunction(coordinator, 'function historyOutcomeText(row = {})')})`, {})
+    assert.equal(outcomeText({outcome: 'blocked'}), 'new block')
+    assert.equal(outcomeText({outcome: 'already-blocked'}), 'already blocked')
+    assert.equal(outcomeText({outcome: 'block-attempt-on-following'}), 'block attempt on following')
+    assert.equal(outcomeText({}), '')
+
+    // The row subtitle and the search fields both use the same words.
+    const render = extractFunction(coordinator, 'function renderHistoryRows()')
+    assert.match(render, /const outcome = historyOutcomeText\(row\)/)
+    const fields = extractFunction(coordinator, 'function historyRowFilterFields(row = {})')
+    assert.match(fields, /historyOutcomeText\(row\)/)
+})
+
+test('a block label is counted only when the profile record does not say not blocked, before and after a click (Oct 31)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const flow = extractFunction(content, 'async function blockProfileOnce(options = {})')
+    // Before any click: a menu that reads Unblock, or a label with no block option, is not a block when the record says not blocked.
+    assert.match(flow, /if\(blockState\?\.state === 'inverse'\) \{[\s\S]*?readOwnProfileBlockedField\(\) === false[\s\S]*?return false/)
+    assert.match(flow, /if\(isProfileBlocked\(\) && readOwnProfileBlockedField\(\) !== false\)/)
+    // After a click: each blocked label goes through the record check before it is counted.
+    assert.equal((flow.match(/return confirmBlockedAfterClick\(silent, /g) || []).length, 3, 'the three post-click paths confirm through the record')
+    assert.doesNotMatch(flow, /if\(isProfileBlocked\(\)\) \{\s*rememberProfileBlocked\(\)/)
+    const confirm = extractFunction(content, 'async function confirmBlockedAfterClick(silent, event)')
+    assert.match(confirm, /await waitForProfileRecordBlocked\(\) === false/)
+    const wait = extractFunction(content, 'async function waitForProfileRecordBlocked(timeoutMs = WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_TIMEOUT_MS, intervalMs = WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_INTERVAL_MS)')
+    assert.match(wait, /verdict === false && Date\.now\(\) < deadline/)
+})
+
+test('the queued-tab flow closes a tab as blocked only when the profile record agrees, not on a label alone (Oct 31)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const body = extractFunction(content, 'async function maybeRunAutoProfileAction()')
+    assert.doesNotMatch(body, /if\(isProfileBlocked\(\)\) \{\s*await closeQueuedBlockedTab/)
+    assert.doesNotMatch(body, /if\(blocked \|\| isProfileBlocked\(\)\)/)
+    assert.equal((body.match(/isProfileBlockedConfirmed\(\)\) \{\s*await closeQueuedBlockedTab/g) || []).length, 5, "four entry checks and the blocked check before the confirm, all record-first; the check after the direct block stays a label-plus-result check")
+})
+
+test('the skipped breakdown lists each outcome on its own line, wraps instead of truncating, and puts the meaning of each in its hover text (Oct 31)', () => {
+    const coordinator = readRepoFile('shared/js/coordinator.js')
+    const css = readRepoFile('shared/css/coordinator.css')
+    const render = extractFunction(coordinator, 'function renderSkippedDetail(skippedByOutcome = null)')
+    assert.match(render, /element\.append\(line\)/)
+    assert.match(render, /element\.title = muteBlockHelpText\('Skipped rows by outcome\. ' \+ help\.join/)
+    assert.match(render, /getOutcomeHelp\(outcome\)/)
+    assert.doesNotMatch(render, /join\(', '\)/)
+    assert.match(coordinator, /renderSkippedDetail\(finishedOutcomes \? skippedByOutcome : null\)/)
+    const detail = css.match(/\.summary-detail \{[\s\S]*?\}/)[0]
+    assert.match(detail, /white-space: normal/)
+    assert.doesNotMatch(detail, /text-overflow: ellipsis/)
+    assert.match(coordinator, /'profile-redirect-mismatch': 'Redirect mismatch/)
+})
+
+test('banned and deactivated profiles are counted apart from other unavailable profiles, as their own skip outcomes (Oct 31)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    const jobState = readRepoFile('shared/js/jobState.js')
+    const reason = extractFunction(content, 'function getProfileUnavailableReason()')
+    assert.match(reason, /return matches\(\/\\bdeactivated\\b\/\) \? 'Profile deactivated' : 'Profile banned'/)
+    assert.match(jobState, /outcome: reason === 'Profile banned' \? 'banned' : reason === 'Profile deactivated' \? 'deactivated' : 'profile-unavailable'/)
+    const coordinator = readRepoFile('shared/js/coordinator.js')
+    assert.match(coordinator, /\n\s+banned: 'Banned: /)
+    assert.match(coordinator, /\n\s+deactivated: 'Deactivated: /)
+})
+
+test('asset-space posters: the header author of each post is captured in page memory, left out of every enqueue, and weeded from queued rows at the end of a collect (Oct 31)', () => {
+    const content = readRepoFile('shared/js/content.js')
+    assert.match(content, /const spaceFeedPosterProfileHrefs = new Set\(\)/)
+    assert.match(content, /function noteSpaceFeedPosterProfile\(href\) \{[\s\S]*?if\(normalized && isAssetSpacePage\(\)\) spaceFeedPosterProfileHrefs\.add\(normalized\)/)
+    const candidates = extractFunction(content, 'function getSpaceFeedPostCandidateProfileUrls(postRoot, timestamp)')
+    assert.match(candidates, /noteSpaceFeedPosterProfile\(headerProfileHref\)/)
+    const cards = extractFunction(content, 'function computeSpaceFeedProfileLinkCardEntries(activeKeys = new Set())')
+    assert.match(cards, /noteSpaceFeedPosterProfile\(authorHref\)/)
+    const enqueue = extractFunction(content, 'async function enqueueCoordinatorSpaceFeedItems(space, runId, profileAssociations, preFilter = null, onProgress = null)')
+    assert.match(enqueue, /profileAssociations = profileAssociations\.filter\(association => association\.resolveProfileFromPage \|\|/)
+    assert.match(enqueue, /!spaceFeedPosterProfileHrefs\.has/)
+    assert.match(enqueue, /spaceFeedQueuedProfileHrefs\.add\(queuedHref\)/)
+    const weed = extractFunction(content, 'async function weedSpaceFeedPosterRows()')
+    assert.match(weed, /spaceFeedQueuedProfileHrefs\]\.filter\(href => spaceFeedPosterProfileHrefs\.has\(href\)\)/)
+    assert.match(weed, /action: 'cancel-coordinator-current-work-item'/)
+    const collect = extractFunction(content, 'async function collectMoreSpaceFeedPosts(button)')
+    assert.match(collect, /void weedSpaceFeedPosterRows\(\)\.catch\(\(\) => null\)/)
 })
