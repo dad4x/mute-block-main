@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Design probes (Firefox)",
+  "version": "0.0.1",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "design-probes@mute-block.local"
+    }
+  },
+  "background": {
+    "scripts": [
+      "sw.js"
+    ]
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

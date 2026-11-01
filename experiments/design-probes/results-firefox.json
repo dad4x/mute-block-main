@@ -1,0 +1,91 @@
+{
+  "addonId": "design-probes@mute-block.local",
+  "extensionUuid": "1e2ef66c-8ee2-4d7c-9f0f-4a9c13b3364e",
+  "capabilities": {
+    "contentCapabilities": {
+      "ranContentScript": true,
+      "hasSessionArea": "undefined",
+      "hasSetAccessLevel": "undefined",
+      "sessionGetError": "can't access property \"get\", chrome.storage.session is undefined"
+    },
+    "contentSessionChangeEvents": 0,
+    "contentListenError": null
+  },
+  "routing": {
+    "ownerPresent": {
+      "ok": true,
+      "attempts": 1,
+      "totalMs": 4,
+      "errors": []
+    },
+    "ownerAbsentThenStart": {
+      "ok": true,
+      "attempts": 3,
+      "totalMs": 2909,
+      "errors": [
+        "sw",
+        "sw"
+      ]
+    },
+    "ownerRestartInFlight": {
+      "ok": true,
+      "attempts": 2,
+      "totalMs": 3379,
+      "errors": [
+        "timeout"
+      ]
+    }
+  },
+  "handoff": {
+    "keys": 141,
+    "bytes": 629903,
+    "records": 2820,
+    "repetitions": 10,
+    "readMsMedian": 14,
+    "copyAndReplayMsMedian": 3,
+    "workerReplayMsMedian": 2
+  },
+  "atomic": {
+    "iterations": 200,
+    "reads": 200,
+    "mixedReads": 0
+  },
+  "tabs": {
+    "focused": {
+      "visibility": "visible",
+      "query": {
+        "medianMs": 2,
+        "p95Ms": 6,
+        "maxMs": 6
+      },
+      "create": {
+        "medianMs": 17,
+        "p95Ms": 22,
+        "maxMs": 22
+      },
+      "remove": {
+        "medianMs": 6,
+        "p95Ms": 8,
+        "maxMs": 8
+      }
+    },
+    "hidden": {
+      "visibility": "hidden",
+      "query": {
+        "medianMs": 2,
+        "p95Ms": 6,
+        "maxMs": 6
+      },
+      "create": {
+        "medianMs": 18,
+        "p95Ms": 20,
+        "maxMs": 20
+      },
+      "remove": {
+        "medianMs": 6,
+        "p95Ms": 20,
+        "maxMs": 20
+      }
+    }
+  }
+}

@@ -1,5 +1,7 @@
 # Quora Labeler Bridge Design
 
+> **Status: ROADMAP** (24 Oct 2026). Design for a future labeler bridge. No decision. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: future architecture context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

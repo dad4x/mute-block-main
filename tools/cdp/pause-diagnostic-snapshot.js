@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {PAUSE_DIAGNOSTIC_SNAPSHOT_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the snapshot: the layout prefix plus the plain key name (storageNamespace.js).
+const SNAPSHOT_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${PAUSE_DIAGNOSTIC_SNAPSHOT_KEY}`
+
 const {
     evaluate,
     getCdpConfig,
@@ -27,7 +32,7 @@ runMain(async () => {
                 })
             })
         })
-    }})(${JSON.stringify('mbPauseDiagnosticSnapshot')})`, 10000)
+    }})(${JSON.stringify(SNAPSHOT_STORED_KEY)})`, 10000)
 
     console.log(JSON.stringify(result, null, 2))
 })

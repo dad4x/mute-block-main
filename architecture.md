@@ -1,607 +1,903 @@
 # Mute Block Architecture
 
-Date: 2026-05-20
-
-This is the canonical architecture front door for the active `1.6`/`2.0`
-stabilization line. Use [planning.md](planning.md) for priority and sequencing;
-use this note for the durable model and design constraints.
-
-## Core Authority Model
-
-The service worker is the mutation authority for queued work.
-
-Durable queue state is the desired state. Browser tabs, content-script state,
-progress mirrors, dashboard state, and runtime maps are observations or caches
-unless they have been converted into reducer-approved durable events.
-
-The central rule:
-
-```text
-durable queue state + live browser observations
-  -> bounded reconcile tick
-  -> durable state changes + minimal side effects
-```
-
-Direct actions are allowed to reduce latency. They are not allowed to become a
-second authority path.
-
-## Single Decision Core (State Machine)
-
-The two-phase tick below ("Observe" then "Decide and apply") is a state
-machine by design: durable state plus observations produce one decision step,
-which produces durable transitions plus effects. That decision step must have
-exactly one implementation, not one per call site or per orchestrator.
-
-Canonical decision core: [jobState.js](shared/js/jobState.js)'s
-`reduceJobEvent`, plus the `swQueueMachine*` dispatcher
-(`swQueueMachineDispatcher.js`, `swQueueMachineEvents.js`,
-`swQueueMachineHandlers.js`) that applies its output. This is what
-[top-level-rethink-1.5.md](top-level-rethink-1.5.md)'s "First Implementation
-Candidate" called for, and it exists and is tested (`test/jobState.test.js`).
-Converged means: every place that decides a row's status, retry eligibility,
-or terminal classification does so by constructing a `JOB_EVENT_*` and calling
-`reduceJobEvent`/the queue-machine dispatcher, not by independently branching
-on `item.milestones`/`item.status`/attempt counters inline.
-
-This is a stricter bar than the `sw.js` decomposition effort in
-[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md).
-That plan extracts each large orchestrator's inline decision spans into named
-`decide*` sync functions and moves them into their own modules -- valuable for
-readability and unit-testing, but by itself it produces one local decider per
-orchestrator, not one shared decider. A `decide*` extraction only counts as
-converged for this purpose when its output is a call into (or a value
-consumed by) the shared reducer, not a same-shaped-but-separately-implemented
-decision living in its own module.
-
-Known fragmentation points that violate this today (tracked here until each
-is converged into the shared reducer; do not add a new one without recording
-it here):
-
-1. **Block-confirmation classification, two entry points.**
-   `recordOwnedBlockedSweepTerminal` and
-   `terminalizeActiveCoordinatorItemFromBlockedLiveTab`'s fallback (both
-   `shared/js/sw.js`) each independently decide "already-blocked vs.
-   we-blocked-it." As of 2026-09-17 both call the shared
-   `classifyBlockConfirmationFromItem(item)` helper, which stopped the two
-   call sites from diverging from each other, but the decision still lives
-   outside `reduceJobEvent` and is reached from two call sites instead of one
-   terminal-classification event. `terminalizeActiveCoordinatorItemFromBlockedLiveTab`
-   is Part 2 target #8 in the decomposition plan; its extraction should route
-   through the reducer, not just relocate the helper call.
-2. **`mbProfileNukeProgress` as a second terminal-state writer.**
-   Content-script `noteCurrentProfileNukeProgress` (fire-and-forget) writes
-   block-attempt/terminal-adjacent milestones from `shared/js/content.js`,
-   racing the service worker's own sweep-based confirmation of the same fact.
-   This is the case Migration Slice 10 below calls out: `mbProfileNukeProgress`
-   must become a compatibility mirror only, not a competing source of truth.
-   Not yet done.
-3. **Retry/recovery budget approval, three branches.**
-   `shouldRecoverExhaustedRolledBackQueuedTabRetry`
-   (`shared/js/swRolledBackQueuedTabRetryClassification.js`) has three
-   independent conditions that can approve recovering an exhausted row. As of
-   2026-09-17 all three are gated by one shared
-   `COORDINATOR_EXHAUSTED_ROLLBACK_RECOVERY_LIMIT` counter, closing the
-   infinite-recovery-loop bug, but there are still three separate approval
-   branches rather than one recovery-policy decision reachable from a single
-   job event.
-4. **Storage-layer triplication.** WAL (`mbCoordinatorQueueWal*`, true
-   authority) vs. `mbCoordinatorQueue` (legacy mirror, silently drops terminal
-   rows) vs. `mbCoordinatorQueueView` (denormalized snapshot, written by a
-   separate non-atomic `storage.local.set`). Three representations of the same
-   row that can diverge under load; see "Storage Authority" cleanup end-state
-   below. `mbCoordinatorQueue` and `mbCoordinatorQueueView` should become pure
-   derived materializations of WAL-replayed reducer state, never independently
-   decided.
-
-New code must not add a fifth. A change that needs to decide a row's status,
-retry eligibility, or terminal outcome should go through `reduceJobEvent`/the
-queue-machine dispatcher, or be added to this list as a new tracked violation
-with the reason it couldn't yet.
-
-## Scheduler / Reconciler
-
-The live-debug work has shown that "repair" is increasingly the normal
-processing mechanism. Treat that deliberately: the normal queue processor should
-be a reconciler/scheduler tick, not several separate direct paths plus a broad
-exception handler.
-
-Terminology target: when the queue WAL is the authority, stale or missing
-derived state is not normally "repair". It is reconciliation or materialization
-from authority. Use:
-
-- `apply` for reducer/authority operations and WAL record application;
-- `resolve` for ambiguity decisions such as profile target resolution;
-- `reconcile` for comparing authority, runtime actors, and derived state;
-- `materialize` for writing derived runs/events/progress/views from authority;
-- `recover` for startup/crash rebuild from checkpoint plus WAL tail;
-- `audit` or `validate` for mismatch detection without mutation;
-- `legacy cleanup` for one-time snapshot-era or invariant cleanup.
-
-Long term, ordinary scheduler and derived-state paths should not use `repair`
-names. Reserve `repair` only for true authority corruption or unavoidable legacy
-compatibility cleanup while the transition is in progress.
-
-Each tick should be two-phase:
-
-1. Observe: load the bounded durable state needed for the tick, inspect owned
-   tabs and candidate tabs, collect content-script claims, challenge state, and
-   recent progress.
-2. Decide and apply: produce durable transitions and side effects, then perform
-   them under token checks and budget limits.
-
-Important fixed-point cases:
-
-- `queued + no runtime`: durably claim, then open/nudge as provisional side
-  effect.
-- `active + matching confirmed runtime`: continue, observe, or nudge.
-- `active + no matching runtime`: adopt by token or release/requeue/fail.
-- `runtime + no matching durable active row`: detach/close as orphan or stale
-  provisional fallout.
-- `terminal + runtime`: close/detach.
-- `challenge/no progress timeout`: retry or fail according to policy.
-
-Confirmation requires row id plus attempt/claim token, and tab id where
-applicable. Row id alone is not enough under delayed storage writes.
-
-## Runtime Queue Boundary
-
-Runtime structures such as `queuedTabActions`, `queuedTabMetadata`, and
-`activeQueuedTabs` are caches derived from durable rows and live observations.
-They must not block scheduling unless they match durable active authority.
-
-The volatile queue runtime should be split from the service-worker monolith the
-same way durable storage, machine reducers, dashboard projections, preferences,
-and the flight recorder have been split. The split exists to hide capability:
-ordinary code should not mutate raw runtime arrays/maps directly.
-
-`swqueueRuntime` owns volatile executor state:
-
-- queued activation intents;
-- active and pending tab attachments;
-- queued-tab metadata;
-- owned-tab parent/child maps;
-- profile-open reservations;
-- canceled or paused runtime owner state;
-- removed/stale runtime tab markers.
-
-The module does not own durable queue state. It exposes operations such as
-`enqueueActivationIntent`, `consumeActivationIntent`,
-`requeueActivationIntent`, `dropRuntimeActionAt`,
-`patchQueuedTabMetadata`, `setPendingTabAction`, `deleteActiveQueuedTab`,
-owned-tab helpers, and profile-open reservation helpers. Those operations may
-attach browser effects to a machine attempt, but they must not decide queue
-status or reconstruct durable work from storage.
-
-The current split hides its volatile collections behind named methods; `sw.js`
-does not destructure raw runtime maps/arrays. New code should use the named
-runtime methods, and follow-up slices should keep moving queue policy out of
-the service-worker monolith without re-exposing those collections.
-
-Runtime-surface matching now goes through `swqueueRuntime.getRuntimeSurface`.
-`sw.js` still supplies durable row matching policy, but the runtime module owns
-enumeration of active tab handles, pending actions, and activation intents for
-that query.
-
-`swquoraTabs` owns Quora tab/window URL classification and live profile-tab
-indexing. `sw.js` still decides what a candidate tab means for durable queue
-authority, but raw Quora URL, challenge, non-profile landing, and profile-tab
-map logic is no longer embedded in the machine file.
-
-`swprojections` owns rebuildable shard-key mechanics for compact read models.
-Authority writes still flow through the storage/machine path; projection helpers
-only name deterministic shard keys and default payload shapes.
-
-`swmessages` owns runtime-message action normalization and labeling. Message
-handlers still live in `sw.js` while they touch queue authority, but the message
-boundary now normalizes inputs before dispatch.
-
-`swexecutor` owns browser-tab executor effects that do not decide queue
-authority: timed tab creation and target-URL commit verification/retry. The
-service worker passes browser, timing, metric, recorder, and normalization
-capabilities into that module; durable activation, rollback, retry, and
-terminal decisions remain in the machine/service-worker layer.
-
-## Queued Worker Action Surface
-
-Some queued mute/block actions require a genuinely foreground/active tab to
-work at all (`isForegroundQueuedTabWork`) but are owned by the service worker
-rather than by any tab the user is actually looking at
-(`shouldUseQueuedWorkerActionSurface`,
-[swQueuedWorkerActionSurfaceState.js](shared/js/swQueuedWorkerActionSurfaceState.js)).
-For those, the service worker self-provisions a dedicated, separate browser
-window rather than borrowing the user's current window: `getOrCreateQueuedWorkerActionSurface`
-(`sw.js`) opens `coordinator.html#worker-window` via `browser.windows.create`
-with `focused: false`, reuses that window across subsequent queued actions
-while it stays live, and tears it down when idle
-(`scheduleQueuedWorkerActionSurfaceCleanup` /
-`closeQueuedWorkerActionSurfaceIfIdle`). The queued action's own tab is
-created and activated inside that window; `restoreQueuedActionSurfaceCallerFocus`
-restores the user's actual previous tab/window focus afterward so the surface
-window never visibly steals attention. This window is coordinator.html loaded
-in a special mode (it retitles itself "Mute Block Worker") -- it is not the
-human-facing dashboard, even though it is the same HTML file, and a user
-seeing a "Mute Block Worker" window appear on its own is this mechanism, not a
-bug or something they opened.
-
-Known unresolved concern (2026-09-25, not yet root-caused in code):
-recollection from earlier work is that leaving this surface window completely
-unfocused for the whole action sometimes produced a silent no-op -- briefly
-bringing it to the foreground was what made the action actually happen. If
-true, the suspected explanation is that `focused: false` may satisfy
-`document.visibilityState === 'visible'` without the window ever gaining
-real OS-level focus, and whatever gate the queued action's foreground
-requirement actually checks may need true focus, not just visibility. This
-was accepted as a known imperfection rather than fixed at the time, and is
-worth deliberately revisiting (confirm the real gate condition, and whether a
-brief programmatic focus/blur around the action is an acceptable tradeoff
-against the "don't steal user attention" goal this surface exists for) once
-the rest of the coordinator/queue work now in progress lands.
-
-## Scheduler Boundary
-
-Scheduler timers and browser alarms are non-persistent runtime effects. They
-are not durable queue authority, but their state must still be hidden behind a
-single capability boundary so callers cannot independently mutate timeout
-handles, due times, alarm bookkeeping, or reconcile backoff counters.
-
-`swscheduler` owns volatile scheduler slot bookkeeping. `sw.js` still owns the
-current scheduling policy and browser alarm names, but resume/reconcile due
-times, timeout handles, alarm persistence state, stale alarm suppression, and
-reconcile backoff now move through scheduler-slot operations. In tests, the
-slot receives the service-worker clock/timer functions so fake timer behavior
-matches production scheduling semantics.
-
-Every activation intent should carry machine identity: `attemptId`,
-`attemptNumber`, `coordinatorKey`, `profileHref`, `ownerTabId`, and an intent
-source category. Repair/reconcile code may delete stale runtime state; if it
-needs new work, it submits a machine event or requests a fresh activation
-intent from current authority instead of rebuilding `queuedTabActions`
-privately.
-
-Use separate concepts for:
-
-- candidate tab: visible/live tab that might match a row;
-- provisional actor: side effect that has been issued but not durably
-  confirmed;
-- confirmed actor: durable active row and runtime tab/action match by token;
-- orphan actor: runtime work with no durable authority;
-- stranded active row: durable active row with no confirmed runtime actor.
-
-Both orphan actors and stranded active rows are ordinary reconcile cases.
-
-## Storage Authority
-
-Ordinary queue/progress/runs changes should not be scattered full-map
-load/edit/save operations. The storage authority layer should make mutation
-reasons explicit and keep compatibility paths from creating truth.
-
-### Deleted Legacy Surfaces
-
-Legacy full progress storage and repair-style compatibility are deleted
-architecture, not deprecated architecture. The full profile progress blob key,
-legacy progress runtime actions, dashboard repair request aliases, legacy repair
-alarms, progress-to-queue legacy import switches, repair operation kinds, and
-repair metric namespaces must not be reintroduced as live product surfaces.
-
-Current progress storage is compact projection state only. Queue authority is
-the queue WAL and its checkpoints; reconciliation may materialize projections
-from authority, but compatibility progress state must not write, retry,
-schedule, throttle, import queued work, or influence queue drain.
-
-The browser-local storage adapter factory lives in `swstorage`, alongside the
-WAL/checkpoint helpers. `swstorage` also owns the serialized storage update
-queue and its non-persistent state: active storage context, tail promise, depth,
-abandoned update tokens, timeout bookkeeping, and storage-update serialization.
-`sw.js` injects browser timers plus queue-specific hooks for metrics,
-diagnostics, timeout recovery, and post-storage continuations, but it no longer
-mutates those queue internals directly.
-
-`swCoordinatorQueueWal` owns the coordinator queue WAL's synchronous
-storage-shape helpers: physical-key classification, WAL store defaults and
-normalization, and WAL remove-record construction. It exists to keep those
-details out of reach of ordinary reconcile code. The queue WAL's `async`
-load/persist/checkpoint-switch operations stay in `sw.js` rather than moving
-into that module -- see "Module Extraction And The Test Harness Realm
-Boundary" below for why that split is not just a style choice.
-
-Current cleanup requirements:
-
-- reason-tag all snapshot writes;
-- inventory full-state load/save call sites;
-- quarantine or remove compatibility writers;
-- prevent content scripts from writing coordinator authority maps directly;
-- keep executor startup behind durable authority;
-- add tests that make new direct authority writes visible.
-
-Cleanup end state:
-
-- queue WAL records are the durable row authority;
-- raw `mbCoordinatorQueue` is a checkpoint/compatibility mirror, not the
-  per-row authority path;
-- `mbProfileNukeProgress` is not a queue-authority input and does not receive
-  ordinary milestone or terminal mirror writes;
-- progress views, progress shards, queue views, runs, events, source-post
-  pending records, and remembered post state are derived materializations;
-- derived materialization failure never poisons an already-durable queue WAL
-  acknowledgement;
-- startup, dashboard, content, executor, and reconcile reads use projected
-  current authority instead of raw queue/progress snapshots;
-- legacy progress request handlers either reroute valid current-attempt rows to
-  job progress/WAL authority or reject; they do not fall back to full progress
-  snapshot writes;
-- broad progress-derived queue mutation is split into explicit, tested
-  materializers or deleted;
-- ordinary code uses `reconcile`, `materialize`, `recover`, `resolve`, and
-  `apply` names; `repair` remains only for true authority corruption or
-  explicitly bounded legacy cleanup.
-
-The target storage design is WAL plus A/B checkpoints:
-
-- ordinary mutations append compact reducer-shaped records;
-- projection is `last checkpoint + ordered WAL records`;
-- checkpoint generation switches write full checkpoints only when useful;
-- A/B checkpoints provide a recoverable alternate snapshot;
-- gzip is the first production compression target for checkpoint snapshots, with
-  raw JSON fallback;
-- WAL is durability/replay format, not an alternate state machine.
-
-The logical WAL and checkpoint model is separate from the physical storage
-adapter. Correctness and authority isolation came first; segmented physical
-queue WAL storage has landed for `mbCoordinatorQueueWal`, using generation-local
-record segments plus a small manifest cursor. Segment numbers reset on each
-checkpoint generation, while WAL record sequence numbers remain monotonic within
-the active logical WAL generation. The active generation has a soft threshold
-that schedules a checkpoint generation switch, and a hard segment limit that
-blocks new durable queue WAL appends until the switch can make room. Hydration
-fails closed when the manifest references a missing or identity-mismatched
-committed segment. Extra orphan segment keys that are not committed by the
-manifest are ignored. Covered old-generation segment keys are retired only
-after the new checkpoint generation switch is durable. Remaining work is
-reducing compatibility mirrors and shrinking old progress/runs materialization.
-See
-[queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md).
-
-Terminology: older code, metrics, and notes may still say `compaction`. In the
-architecture, read that as checkpoint generation switching plus later
-old-generation cleanup, not as a garbage-collection model.
-
-### Derived Stats Must Not Be A Mutated Running Total
-
-A derived materialization (see "runs... are derived materializations" above)
-is only actually derived if computing it means *reading authority and
-recomputing from scratch*. If instead some field is read from its own prior
-persisted value, adjusted by a local delta, and written back -- `next = prior +
-delta`, or `next = recompute(existing-as-seed, currently-visible-authority)`
--- then it is a mutated running total wearing a derived-materialization
-costume, and it inherits every problem a running total has: it is only
-correct if every writer that ever touches it is serialized against every
-other writer, forever, everywhere it's touched.
-
-Confirmed real instance (2026-09-25): `mbCoordinatorRuns[runId]`'s
-`itemCount`/`activeCount`/`terminalCount`/`targetProfileHrefs`/`targetWorkKeys`
-are recomputed via `recomputeCoordinatorRuns`, called from roughly two dozen
-independent call sites across enqueue, requeue, and reconcile-driven
-terminalization (redirect-mismatch, non-profile-landing, exhausted-rollback,
-and others). Each call site does its own unserialized
-read-runs-from-storage -> recompute -> write-runs-to-storage cycle -- the
-per-row queue mutation each of these sits inside of *is* properly serialized
-through `coordinatorAuthority`'s lock, but the follow-up runs-bookkeeping
-write happens after that lock releases, as a separate, un-serialized
-`saveCoordinatorState` call. When several items belonging to the same run
-terminalize in quick succession (routine for e.g. a batch of candidates where
-most fail validation almost immediately), their concurrent runs-updates
-race and lose each other's contributions -- a classic lost update. Live
-evidence: a 13-item run's tracked `itemCount` settled at 4. The same file has
-a second, smaller instance of the identical pattern: `enqueueRequested`/
-`enqueueQueued`/`enqueueMerged` on that same run record are accumulated as
-`priorX + delta` read from `runs[runId]` at the top of the enqueue path,
-subject to the same race.
-
-The fix direction: stop persisting these fields as mutated state at all.
-Compute run-level stats on demand, by scanning current queue authority plus
-the completed-work log for rows matching the run, at the moment something
-needs to display or decide on them -- the same direction the compact queue
-view (`mbCoordinatorQueueView`) is also moving in (see "Dashboard And UI
-Surfaces"): nothing incrementally mutated means nothing to race. A field that
-must persist across restarts and isn't reconstructible from authority (e.g.
-`paused`, `createdAt`, `sourcePages`) is not this pattern and is fine as
-ordinary state.
-
-This was found while chasing one specific dashboard inconsistency; it has not
-been exhaustively audited across the whole file. Any future "N accumulated so
-far" or "recompute onto a seed read moments ago" pattern touching a durable
-key deserves the same scrutiny, especially wherever the read and the eventual
-write are separated by an `await`.
-
-## Module Extraction And The Test Harness Realm Boundary
-
-**Resolved 2026-09** (`test/lib/swHarness.js`, commits `db12da9`,
-`372f5c9`, `f845a99`): the harness now compiles `sw.js` and every module
-it (transitively) requires into the *same* contextified `vm` sandbox via
-a hand-rolled in-realm CommonJS loader (`createSharedRealmRequire`),
-instead of sandboxing `sw.js` alone while its ~69 required sibling
-modules ran via a plain `require()` into the outer Node process. This
-matches production, where webpack bundles everything into one realm.
-Landing it collapsed 69+ real realm crossings to zero across the whole
-require graph and, doing so, exposed (not caused) a genuine pre-existing
-concurrency bug in `restoreActiveLiveCoordinatorQueuedTabAction` that the
-old harness's extra microtask ticks had been masking -- confirmed via A/B
-(the bug reproduced with the realm fix in place and did not reproduce
-without it, against identical `sw.js` logic) before being fixed
-separately. See
-[sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md)'s
-"Phase 0" section for the full design and rollout history. The
-constraint described below no longer applies to new extractions -- an
-`async` function, or one that builds/chains a Promise into another
-module, can now move into its own module without a realm penalty either
-way. The history is kept below because the underlying mechanism (and the
-two confirmed regressions that motivated fixing it) are still useful
-context for anyone extending the harness further.
-
-`sw.js` used to run inside a `vm.createContext` sandbox in tests, with
-`Date` and timers injected so fake-timer control works, while a module
-loaded into the surrounding test process via a plain `require()` lived in
-a different V8 realm from that sandboxed `sw.js` source.
-
-A same-realm `await` chain costs one microtask tick. The identical chain
-crossing a vm/real-Node realm boundary costs two, in either direction. This
-is not a fake-timer bug and injecting the clock correctly into an extracted
-module is necessary but not sufficient to avoid it: the extra tick changes
-when a promise settles relative to other concurrent promises, which can
-silently reorder operations that a reconcile tick is racing, with no
-difference in the moved code's logic.
-
-Confirmed while attempting to extract the coordinator queue WAL's async
-persist/load/checkpoint-switch path into its own module (2026-09): the moved
-code was byte-identical to what it replaced and the fake clock was correctly
-injected, but two test ranges failed reliably with the extraction in place
-and passed reliably without it. The cause was repeated, bidirectional realm
-crossings in that path -- vm-sandboxed code awaiting the extracted module's
-async functions, and the module awaiting vm-injected async capabilities --
-each crossing doubling its tick cost and compounding across the reconcile
-tick's concurrent work.
-
-**(Historical -- resolved, see above.)** Constraint that used to apply to
-future extraction: a function with no `async` keyword and no Promise
-chain in its body could be pulled into its own module freely; it carried
-no realm penalty either way. An `async` function that participated in
-ordering within a reconcile tick (queue WAL persist, checkpoint
-switching, and similar) had to stay in `sw.js` unless the test harness's
-module-loading strategy changed to put an extracted module in the same
-realm as the vm-sandboxed source. That strategy change is what "Resolved
-2026-09" above describes; this constraint no longer restricts new
-extractions.
-
-Refinement found during the sw.js decomposition plan's Slice 7 (2026-09):
-"no `async` keyword" is not the same test as "no realm penalty." A
-non-`async` function that *builds or returns a Promise chain reaching into
-another already-extracted module* is still exposed to this, and the effect
-can run in either direction, not just add cost. All `require()`'d modules
-share one common realm with each other, separate from `sw.js`'s vm-sandboxed
-realm. A chain that starts in `sw.js` and calls into one extracted module
-crosses the boundary once. Moving the *starting* function into a second
-extracted module changes nothing about where the call lands (still the same
-target module, still one shared non-`sw.js` realm) but removes the crossing
-that used to happen leaving `sw.js` -- collapsing a chain that used to cost
-one crossing down to zero. That changed which of two same-named metric
-increments landed in which epoch, deterministically breaking a test, with
-no logic difference in the moved code. Confirmed by instrumenting and
-comparing tick counts before and after the move.
-
-Practical effect: before extracting a function -- sync-declared or not --
-check whether it constructs, chains, or returns a `Promise`/`.then()` that
-reaches into any other `require()`'d module (including one being extracted
-in the same slice). If it does, treat it with the same caution as an
-`async` function: moving it can shift realm-crossing parity in the
-extracted direction, the removed direction, or both at once if the slice
-also touches the target module, and any of those can silently reorder
-concurrent reconcile-tick work. Grep for `.then(`, `Promise.`, and calls
-into already-extracted modules, not just the `async` keyword.
-
-## Dashboard And UI Surfaces
-
-The dashboard and preferences are reporting/control surfaces. They may request
-service-worker mutations or scheduler ticks, but they do not own queue truth.
-
-Dashboard reads should move toward service-worker projected state. Snapshot
-fallbacks may exist during migration, but they should be labeled stale-capable
-and should not mutate authority.
-
-## Content Scripts
-
-Content scripts observe pages and perform foreground page actions after the
-service worker grants authority for a specific attempt. They report claims,
-milestones, terminal results, and page observations back to the service worker.
-
-Content-side timeout or message failure must not trigger a direct durable write
-to coordinator authority maps. It may record local observation only where that
-cannot move queue truth.
-
-After cleanup, content scripts should not send legacy `record-nuke-progress`
-fallback messages. Active queued work reports through job milestone/terminal
-messages that carry attempt identity and are accepted or rejected by the service
-worker authority boundary. Non-queued local observations may update content-local
-UI state, but they do not persist service-worker queue/progress authority.
-
-## Shared Moderation Boundary
-
-Imported moderation data is review and policy input, not a remote command
-channel.
-
-Shared moderation can provide:
-
-- source documents;
-- profile or Space recommendations;
-- provenance;
-- labels or intents;
-- local-policy inputs.
-
-Only local policy and local user action may turn that input into queued work.
-Publication formats should preserve provenance and local decision history, but
-publisher intent stays advisory.
-
-## Metrics And Tests
-
-Architecture health should be measurable:
-
-- reconcile ticks requested, changed, no-op, rescheduled;
-- durable active rows without confirmed actors;
-- provisional/runtime actors without durable active rows;
-- rows reclaimed, requeued, failed, or adopted by reconcile;
-- pump/nudge/repair yield;
-- storage timeout, deadline miss, fallback, abandoned, late-write suppression;
-- snapshot write reason, bytes, rows, and call path;
-- queued/active/terminal movement per tick window;
-- legacy progress fallback rejection count;
-- derived materialization failure and recovery count by materializer;
-- WAL append bytes, record bytes, checkpoint generation switch count, active
-  tail length, and physical segment count for segmented queue WAL storage.
-
-The service worker should also keep a bounded in-memory diagnostic journal,
-called the flight recorder. It records compact summaries of authority
-mutations, WAL/storage outcomes, scheduler decisions, page observations, and
-UI controls activated. The flight recorder is remotely probeable for failure
-analysis, but it is not persisted, not replay input, not authority, and not a
-trace file. See
-[flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md).
-
-Tests should exercise state snapshots directly:
-
-- delayed storage confirmation;
-- stale late writes;
-- service-worker restart between claim/open/confirm;
-- disappeared tabs;
-- challenge tabs;
-- durable active rows without actors;
-- runtime actors without durable rows;
-- compatibility progress trying to move terminal truth backward;
-- repeated ticks reaching a fixed point or bounded progress;
-- legacy progress requests with and without current authority;
-- derived materialization failure after durable WAL acknowledgement;
-- restart recovery from checkpoint plus WAL tail;
-- segmented WAL orphan, missing-segment, and manifest edge cases.
-
-## Supporting Architecture Notes
-
-- [normal-reconcile.txt](normal-reconcile.txt): latest reconcile-first
-  implementation framing.
-- [reconciler-first-fallback-architecture-2026-05-20.md](reconciler-first-fallback-architecture-2026-05-20.md):
-  detailed rationale and pivot criteria.
-- [storage-authority-refactor-plan-for-review-2026-05-20.md](storage-authority-refactor-plan-for-review-2026-05-20.md):
-  storage authority cleanup plan.
-- [storage-wal-overlay-design-2026-05-20.md](storage-wal-overlay-design-2026-05-20.md):
-  WAL/checkpoint design.
-- [queue-wal-segmented-record-followup-2026-05-27.md](queue-wal-segmented-record-followup-2026-05-27.md):
-  physical WAL segmentation follow-up.
-- [flight-recorder-plan-2026-06-04.md](flight-recorder-plan-2026-06-04.md):
-  bounded in-memory diagnostic journal for authority, scheduler, page
-  observation, and UI action evidence.
-- [shared-moderation-publication-design-2026-05-18.md](shared-moderation-publication-design-2026-05-18.md):
-  shared moderation design.
-- [top-level-rethink-1.5.md](top-level-rethink-1.5.md): historical durable
-  job model that informed the current line.
-- [sw-state-machine-decomposition-plan-2026-09-01.md](sw-state-machine-decomposition-plan-2026-09-01.md):
-  plan for splitting `sw.js`'s remaining decide/act spans into modules. As of
-  2026-09-17, redirected by that plan's "Part 3" section to converge into the
-  single decision core above rather than stop at one `decide*` module per
-  orchestrator.
+Date: 2026-10-25, revised 2026-10-26, 2026-10-27, 2026-10-28 and 2026-10-29. Verified against package version 1.6.1665 in the working tree (29 Oct), which is ahead of the tagged build `v1.6.1636` (`8e146cc`). HEAD is `d9a35c2`; commits after `8e146cc` are not all listed here. The 27 Oct pass was checked by reading code and by grep, not by running the extension. `shared/js` has working-tree changes, so line numbers may have moved. This note replaces the 24 Oct state map. The previous text is in git history (`git show HEAD:architecture.md`).
+
+29 Oct pass: verified against package version 1.6.1665 in the working tree (`package.json` and both manifests). On 29 Oct only the header (version, date, HEAD) and section 12.2 item 1 (version) changed. The rest is as the 28 Oct pass left it.
+
+28 Oct pass: verified against package version 1.6.1664 in the working tree (`package.json` and both manifests). The sections changed on 28 Oct are Terms (four entries added at the end), 1.4, 1.5, 2 (one note), 3.1, 3.5, 3.6, 6.1b, 6.2 (items 17 to 20), 7, 8 and 12.2; the rest is as before. Checked by reading code and by grep only: no tests, build or live browser run. Git: the last commit before the WIP snapshot is `3ab637d`; the snapshot is `7abdfea` (working tree at 1.6.1662); HEAD is `d9a35c2`, a join commit with no content change. Nothing from 28 Oct is committed.
+
+Review of current gaps: [codex-mb-review-1.md](codex-mb-review-1.md). Its items 1-5 are tracked there. Its headings repeat number 4, so the file holds six findings. Items marked "(review N)" below point to it. Planning and status: [planning.md](planning.md) and [docs/notes-register.md](docs/notes-register.md). The iPhone plan is separate: [mute-block-ios-safari-plan.md](mute-block-ios-safari-plan.md).
+
+How to read the references: function names are the anchors. Line numbers are given where they are stable enough to help, and they are as of HEAD `0209f52`. They drift with edits, so search by name if a line is off.
+
+Terminology: "checkpoint" and "snapshot" are used interchangeably in this document, in the code and in the dashboard for the same thing: the durable state folded from the WAL into one of the two checkpoint slots (A and B), written as per-area shards. A few point-in-time reads (for example the dashboard's own snapshot of the queue) are also called snapshots. We use the two words interchangeably, and we mildly regret it; the choice to settle on one is open (see section 8). Where a name matters, the code identifier is the authority.
+
+Terms (27 Oct; one line each, as the code and the planning note use them):
+- **Coordinator:** the role that decides queue state. Minimal form: it runs the scheduling state machine. Current thinking (owner, 27 Oct): it also holds the authoritative in-memory copies it needs, and it calls out for browser interaction (the background window and tabs) and for persistent storage. Those three are co-located today, in the service worker. The historic name for the queue Worker (planning.md, Terms).
+- **Service worker:** Chrome's background script, `shared/js/sw.js`, where the Coordinator runs today. The browser can stop it at any time. "Service worker" names only that script; do not write "the service worker owns the queue".
+- **Queue Worker:** the planned host for the Coordinator, outside the service worker. Not built and not decided. Nothing may move queue work out of the service worker until worker-host failover is designed (section 6.2, item 16).
+- **Dashboard:** the extension page `coordinator.html` (with `coordinator.js`). It is a page, not the Coordinator. Also the names of the pages the user sees: Dashboard and Preferences.
+- **Browser side / storage side:** the two parts the Coordinator calls out to: the browser (open, focus and close the window and tabs, and run actions in them) and storage (queue log, checkpoints, stored settings). Both run in the service worker today.
+- **Authoritative state:** state the Coordinator decides from (queue rows, completed rows, runs; section 2.1). **Other state:** settings, the space list, the outlier list, and session copies or caches (sections 2.2 and 2.3); owned by the module that writes them, not the Coordinator.
+- **Content script:** runs on each Quora page, holds page-local state, and reports to the Coordinator. It holds no authoritative queue state.
+- **Background window, background tab, background work:** the browser window and tabs the extension uses to run queued actions, and the work done in them. This is the user-facing name, chosen by the owner (27 Oct): plain words for a user. "Work" alone is overloaded and is not used for these; "hidden" is not used either, because it means something else to the browser. The code name is still "worker window" (`worker` in the code and settings); the docs use "background window". Not the Queue Worker.
+- **Naming rule (owner, 27 Oct):** user-facing names describe what the user sees, not which part of the code or which browser context does it. Tooltips and labels do not say "service worker", "Coordinator", "queue Worker", "storage" or "host", so that the Coordinator, the browser side and the storage side can later run in different places without changing the words the user reads. The reason for the vocabulary work is that decomposition.
+- **Profile:** a Quora profile, identified by its URL.
+- **Target:** the thing being acted against: a space, a profile found in a post, or something identified by something in a post (for example Instant Block, where a post's poster is the target profile).
+- **Candidate:** a profile that might be queued for later action.
+- **Post:** a post in a space that may identify several targets; or the queueing of a profile for action.
+- **Row:** an item in the queue, the history, or a run listing.
+- **Result:** the completion status of a profile the extension has acted upon.
+- **Item:** usually what is in a row, whatever it may be.
+- **Skipped:** an error result: the desired action could not be taken, for one reason or another.
+- **Unblock:** unblock and unmute together. Also called a **pardon**.
+- **Working tab:** a background tab in the background window that is running a block or unblock action for a row. The number that can run at once is the user setting `targetQueuedTabConcurrency` (default 4, minimum 1; no Preferences control found). Replaces "worker slot" in user-facing text (27 Oct).
+- **Host:** a machine, VM or address. The owner does not use "host" for the Queue Worker; do not write "queue host" in docs. The worker-host experiments (`experiments/worker-host/`) keep their folder name only.
+- **Queue:** the durable set of queued and active rows, stored in the WAL (section 4). **Row:** one queued profile action in the queue, with its status and attempt.
+- **Attempt:** one try at a row, identified by `attemptId`. A retried row has a new attempt.
+- **Run:** one batch the user started from a page, identified by `runId` (a Nuke 'Em batch, a Collect run, or a space feed run). **Runs** (the runs area): the record of those batches, capped at 700 (section 4.6).
+- **Enqueue:** sending rows to the queue. **Enqueue mark:** the in-memory note on the page that a profile has just been sent (queueing) or is being nuked (nuking). Marks are not stored.
+- **Pending:** a profile that the queue or a settled batch still holds. Derived from the queue, not stored.
+- **Completed (row, area, count):** a finished row, kept in the completed area of the WAL. "Completed" replaces "terminal" in user-visible text (27 Oct).
+- **Space feed / space page:** a Quora space's posts, and the page that lists them. **Search page:** a Quora people search (`type=profile`), and the page that lists its profile rows.
+- **Profile:** a Quora profile page, identified by its normalised URL (the href).
+- **Collect:** the page action that scrolls and stages more candidates; **Nuke 'Em:** the action that sends the staged candidates to the queue.
+- **Block:** the action of blocking (muting) a profile on Quora; a **manual block** is one the user makes on a profile page.
+- **Outlier:** a finished row whose time is far above the running average; kept with its recorder events (section 10.7).
+- **WAL:** the write-ahead log of queue changes (section 4.1). **Shard:** one stored piece of a checkpoint. **Segment:** one WAL append. **Manifest:** the record of which shards and segments a checkpoint holds.
+- **Session storage:** browser memory for the extension, cleared when the browser restarts (section 2.3). **Local storage:** the disk copy. Erase clears it; Clear changes it only for outlier entries (section 5.4).
+- **Flight recorder:** the in-memory diagnostic log of recent events, with a session copy (section 2.3).
+- **Erase:** the destructive reset of all stored history (section 5.3). **Clear:** resets what the dashboard shows (the cutoff for history, completed rows and runs; section 5.4), and it also deletes the stored outlier entries, on disk and in the session copy. It does not delete completed rows or runs from storage; space management and Erase do that.
+- **Namespace prefix:** the `v1.6.` prefix on stored keys (section 5.1). **Unprefixed key:** a key written by an older version, which 1.6 does not read.
+- **Nuke error (28 Oct):** the Dashboard's label for the stored outcome `action-error`, a row whose activation failed. The stored value does not change; `timeout` keeps its own label and is used only when the release reason names a timeout (section 6.1b).
+- **Nuking drop-down (28 Oct):** the small Pause and Resume menu beside a "Nuking" status on the space page and the search page. It sends the Dashboard's pause or resume message, so it pauses the whole queue (section 1.5).
+- **Considered line and cause line (28 Oct):** the two lines under Collect N More on the search page: "Considered X displayed matches", and the reason the last run ended.
+- **Stop collecting label (28 Oct):** the button text during a collect run on the space and search pages: "N / M Stop collecting · S · m:ss".
+- **Remove (failed row) (28 Oct):** the Dashboard control on a row whose status is `failed`. It removes that one row from Current Work; nothing is sent to Quora (section 3.5).
+
+Contents: Overview; 1 Layers and rules; 2 State map; 3 Write paths; 4 Checkpoint and shard layout; 5 Storage namespace and erase rules; 6 Known exceptions and planned work; 7 Metrics and tests; 8 Not verified in this pass; 9 Every stored key; 10 Data structures; 11 Session storage against its quota; 12 Corrections found in the 26 Oct enumeration. Sections 9 to 12 were added on 2026-10-26 against the working tree at package version 1.6.1650 (working tree ahead of HEAD `8e146cc`). Sections 9 to 12 were checked by reading code, not by running the extension.
+
+## Overview
+
+**What it is.** Mute Block is a WebExtension for Quora (Chrome Manifest V3 and Firefox). It simplifies muting and blocking unwanted profiles for the human user.    It adds buttons to the Quora pages for user to interact with that Quora doesn't provide.   It supports manual muting and blocking of individual profiles, and easier exploration of followers, following and contributor lists to spaces.    Recently it adds buttons for bulk operations on collected lists of profiles that can be blocked by automation.    It provides a dashboard, history, and tuning preferences.
+
+This note covers the desktop Chrome and Firefox lane only.
+
+**State**
+
+State takes the following forms.
+
+1. Quora state reflects what Quora is keeping on behalf of the logged in user.   That includes users and spaces being followed and profiles that have been muted and blocked.    This is the ultimate authority for the user, and can be manipulated by the user and the extension running in multiple browsers on different devices.
+
+2. Persistent browser state lives on disk in the browser profile's storage for the extension.    It is the ultimate authority for that browser on that machine.    The extension state kept in the browser consists of:  (a) a significant amount of stored data about queued work, completed work, and "runs" of work; (c) moderate amounts of memory for diagnostic purposes, mostly errors and things that took too long (outliers).     Preferences (b) and simple memory (c) are held in keyed storage.   Critical work state (a) is kept in ways not visible outside the worker.   It keeps a Write-ahead-log (WAL) of change records that can be written quickly.   Every so often, the worker writes one of two alternating snapshots of the current memory state, then clears the WAL entries.   There is one WAL; one checkpoint manifest; separate shard sets per area.   Each snapshot is divided into time ordered shards, which are each  compressed with gzip.  When a snapshot is written only writes the last modified shards, not all the data.   Thus, even snapshot writes are usually not very large, even for large data sets.
+
+3. Worker state, an in-memory live copy of the persistent state, directly visible only to that single worker.   When this state is updated, is is done as a write-through to the persistent state with the in-memory copy updated to match.    On startup, the worker reads the persistent state to populate its in-memory caches.   This is called "hydrating"  The in-memory caches are organized for fast keyed access, unlike the time ordered snapshot shards and the WAL records.   
+
+4. Session state, memory state owned by the extension that can be read and written by the worker and other tabs.  There is a limited amount of session state determined by the browser.  It is typically 10M, so it must be used  judiciously.   We keep a copy of the work queue there, and some metrics used by the dashboard, information for progress bar,  and diagnostic data in a "flight recorder".   The queue is kept by replicating the raw shards and the WAL records.  A tab wanting a copy of the queue does it's own hydration of the queue shards and applies the WAL records from the session memory as they are changed, not from storage. (Built only for the worker's own restart, section 4.7; a page-level copy is not built.)     The worker updates the WAL records and shards in the session memory as they change, and broadcasts to interested parties.
+
+5. Tab state, javascript values that are held in a particular page only.    Tabs can read session state via browser APIs, and get notification of changes to the session state.  Tabs get and set worker state by sending messages to the worker,   
+
+**Layers.**
+
+- Content script on a  Quora page (`shared/js/content.js`, on quora.com): reads pages, presents buttons, performs Quora actions, and reports claims and results.  It interacts with Quora and the other layers of the extension.   It queues work to the background, and can execute queued work when directed.
+
+- Coordinator, the thing orchestrating background work.    On Chrome, it runs in a Service worker (`shared/js/sw.js`):  It contains the worker state, and a state-machine that turns various input events into orchestrated action.   It owns scheduling the dispatch of work, storage writes and browser effects and maintaining the shared session state.    
+
+- Extension page, which is owned by the extention and presents as a Dashboard, history, and preference page (`coordinator.js`, `preferences.js`): display and control. This communicates with the worker by messages and shared session state.  It owns only its own tab state.
+
+- Worker-action window: a separate window opened by the worker to execute background actions that need foreground visibility.   It comes and goes during operation, and is usually behind the user window.   
+
+**What is authoritative.**
+
+- Queue rows,  run definitions and completed records are authoritative on disk, by use of a write-ahead log (WAL) and checkpoints.  These are durable, surviving browser restart, machine crash, etc.   The worker is the only writer.
+- Tabs, page claims, runtime maps and dashboard data are observations or caches of the authoriative state accessed through the worker.
+- Progress, the content queue index and the flight recorder are derived or session-only. The space post maps were removed on 25 Oct. Remembered profiles are the completed profile history, which is not queue authority; pending space state is derived from queue rows, and the search and space pages keep enqueue marks in memory only.
+
+**Main flows.**
+
+A user works on a profile page, and presses a button.   The button may cause interaction with quora, read session state,  and exchange messages with the worker.   A direct muteblock button on a profile page does the operation with quora, and records results with messaging to the worker.     On a space of search page, the extension collect a list of profile candidates that might be actionable, and checks them against the current queue and completed list to find out if they are already handled.   If not, the profile is added to a local list.   When the user hits the the "Nuke 'Em" button, the page sends messages to the worker to queue the work and create a "run".   The page updates its display to indicate things are now being nuked and that it is available to do something else.
+
+The worker receives a queue work message and writes its contents into WAL and the in-memory copies of the queue, and runs, and returns success to the user page.   When possible, the worker makes an attempt to process the head of the queue, opening a worker action window if needed, and a tab.  The content script acts in the tab and reports milestones and a terminal result, tagged with the attempt id and number. The worker accepts or rejects each report through the job reducer reduceJobEvent`), and finished are moved from the queue to the completed area via a WAL record.
+
+Progress: queued attempts report through the jsession state, updated as the worked dispatches and collects worker action window tabs.  Other visible pages listen for broadcast of progress events and display the progress bar when there is something to see.
+
+A space is persitently categorized (as a preference) as Asset, Neutral or Target.   Neutral spaces are ignored.   Asset spaces contain poosts identifying potential target profiles.  In target spaces, the posters are themselves target profiles.   The extension scans posts as they scroll and become visible, and collects candidates, checking with the worker whether is is already queued or already known to be nuked.   If a candidate is not already handled, it is added to a local list for later nuking.    r profile. Pending space state comes from queue rows; the search and space pages keep enqueue marks in memory only. Remembered profiles are the completed history, limited to 90 days and 10,000 rows (section 3.4).
+
+Persistence: the WAL is checkpointed into two slots (A and B), with rows partitioned by arrival-order shards. Completed rows are pruned by whole shard at checkpoint. Runs are capped at 700 by whole shard.
+
+Clear: Clear Current Work removes queue and completed rows through the WAL. No pending space-feed records are stored, so there is none to remove.
+
+**Space Management.**
+
+The main disk space consumers are the queue, the runs list, and the completed work list.    
+
+The queue is more or less self-limiting.   It grows as much as the user puts into it, and gets drained.   Space expands in the snapshot on growth as more shards, and shrinks when the number of rows goes to zero.
+
+The completed queue is very interesting, as it contains history that is useful for avoiding work, and for future sharing of user activity.  We want to keep a lot of it, but not too much.    There are preference settings for maximum age (default 90 days) and number of records (default 10,000).  When the history exceeds either of those values, we delete some number of them to get under it.   We don't say how much, and it is unlikely to be exact.
+
+The runs history is arbitrarily limites to 700, being 100 rows a day for a week.   When it goes over, it too get reduced by some amount.
+
+The amount of history deleted is variable because of the way we do it.   We delete the oldest shards of the checkpoint until we're under the limit.  Exactly how much is in the shard varies, but it's cheap and keeps us from having to delete one row at a time at great expense.
+
+**Current directions.**
+
+- Built on the WAL and checkpoint model, arrival-order checkpoint shards, the `v1.6.` storage namespace is built.
+- Removed: the old runs bucket layout, which the WAL has replaced (commit `8d08054`).
+- Built: time-sharded runs (day shards by run shard; retention by the 700-run cap only, with no age rule). A single observation contract for manual progress is not scheduled.
+- Open risks: the landing check reads the URL only; progress has many in-memory writers, not checked in this pass (review 2, item 10); session storage is not measured live; the worker-window focus behaviour is unresolved.
+- The raw queue key (`mbCoordinatorQueue`) is refused on write and removed at startup; its dead write path was removed (section 2.4).
+- We are working to exploiting the history for shared moderation.   Capturing user mute-block operations is key to this.   With that, we can publish Space posts that contain things this user have newly blocked, and other users can follow those spaces, and get simple buttons to nuke those.   The networks of followers will create a web of trust.
+
+DAVE PASS STOPS HERE
+
+## 1. Layers and rules
+
+### 1.1 Layer map
+
+| Layer                           | Where                                                                             | Role                                                                                                                             |
+| ------------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Content script                  | `shared/js/content.js` on `*.quora.com`                                           | Reads the page, renders controls, performs Quora actions. Reports claims, milestones and terminal results with attempt identity. |
+| Service worker                  | `shared/js/sw.js`, bootstrapped by `shared/js/swBootstrap.js`                     | Authority for queued work. Owns scheduling, storage writes and browser effects.                                                  |
+| Message normalization           | `shared/js/swmessages.js`                                                         | Normalizes runtime action names before dispatch.                                                                                 |
+| Dashboard, history, preferences | `shared/js/coordinator.js`, `shared/coordinator.html`, `shared/js/preferences.js` | Display and control. Changes are sent to the worker by message.                                                                  |
+| Worker-action window            | `coordinator.html` in worker mode (title "Mute Block Worker")                     | Created by `getOrCreateQueuedWorkerActionSurface` (`sw.js`).                                                                     |
+
+### 1.2 Module map for the queue
+
+| Concern                                  | Modules                                                                                                                                                                           |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Job status, retry and terminal decision  | `shared/js/jobState.js` (`reduceJobEvent`); `shared/js/swQueueMachineEvents.js` (event type names), `swQueueMachineDispatcher.js`, `swQueueMachineHandlers.js`                    |
+| Progress reduction                       | `shared/js/swCoordinatorProgressReducer.js`                                                                                                                                       |
+| WAL records and shapes                   | `shared/js/swCoordinatorQueueWal.js`, `shared/js/swQueueWalStore.js`, `shared/js/swQueueWalRecovery.js`, `shared/js/swQueueWalDurableReads.js`, `shared/js/swQueueWalRowShard.js` |
+| Generic WAL and checkpoint engine        | `shared/js/walSnapshotStore.js`, `shared/js/swstorage.js`                                                                                                                         |
+| Runs                                     | `shared/js/swRunsWal.js`, `shared/js/swRunShards.js`                                                                                                                              |
+| Completed rows                           | `shared/js/swCompletedShards.js`, `shared/js/swCoordinatorTerminalSettlement.js`                                                                                                  |
+| Scheduler, executor, runtime, Quora tabs | `shared/js/swscheduler.js`, `shared/js/swexecutor.js`, `shared/js/swqueueRuntime.js`, `shared/js/swquoraTabs.js`                                                                  |
+| Storage names and namespace              | `shared/js/storageKeys.js`, `shared/js/storageNamespace.js`                                                                                                                       |
+
+### 1.3 Rules
+
+- Claims and milestones carry attempt identity (attempt id and number). Row id alone is not enough for delayed reports. The worker checks this in `validateProgressAttempt` (`sw.js`, about line 33345) and `validateQueuedTabAttempt` (`sw.js`, about line 33362).
+- Row status, retry and terminal outcome go through `reduceJobEvent` (`jobState.js`) and the `swQueueMachine*` modules. Known places outside it are listed in section 6.
+- Profile identity is exact: the slug as written, NFC, case-sensitive, with no suffix cut and no trimming. See `sanitizeProfileHrefSlug` and `normalizeQuoraProfileHref` in `shared/js/subject.js`, and `getNormalizedProfileIdentityKey` in `content.js`. The old suffix rule is computed only for a shadow counter.
+- Hydrate, recovery and startup prove state is current. They do not trust a cached copy (`hydrate` and `loadResidentState` in `createCoordinatorAuthority`, `sw.js`).
+- Runtime maps (queued actions, metadata, active tabs) are caches. They do not decide queue status.
+- Build and process rules (version bump before any build, no Puppeteer, command shapes) are in `AGENTS.md`.
+
+### 1.4 Runtime message groups
+
+The worker's runtime message dispatch is in `shared/js/swBootstrap.js`. The actions named below are the ones this note refers to.
+
+- Queue intake: `enqueue-coordinator-items`, `open-coordinator`, `pause-coordinator-nukes`, `resume-coordinator-queue`, `resume-paused-coordinator-nukes`, `retry-coordinator-failed`, `remove-coordinator-failed-work-item` (one failed row, 28 Oct; section 3.5).
+- Tab and attempt: `claim-tab-action`, `promote-queued-tab`, `begin-profile-action`, `record-job-milestone`, `record-job-terminal`, `release-job-tab`, `close-tab`.
+- Manual and profile state: `record-direct-profile-progress`, `record-manual-profile-action`, `clear-profile-nuke-state`, `get-recent-history`.
+- Space feed: no space-feed routes remain (section 3.4; checked 27 Oct). `settle-terminal-coordinator-items` is still routed for queue rows.
+- Clear and erase: `clear-coordinator-current-work`, `cancel-coordinator-current-work`, `clear-coordinator-events`, `clear-coordinator-terminal-stats`, `erase-block-history`.
+
+Actions in the authority set wait for the queue authority to load before they run (`RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY`, `swBootstrap.js`). An action missing from that set runs ungated.
+
+### 1.5 Page-side shared modules (28 Oct)
+
+The space page and the profile search page in `content.js` share the batch, collect, status and drop-down code below (refactor steps 1 to 6). Each module is a pure helper or a driver with its DOM work passed in as hooks; the DOM work itself stays in `content.js`. None of them stores anything or calls the browser, so they add no state (section 2).
+
+| Module                           | Role                                                                                                                                                                                                  |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `shared/js/candidateMarks.js`    | `createEnqueueMarkStore`: the in-memory enqueue marks (queueing and nuking) that a page keeps for its own rows. One store per page; no state is shared between the two pages.                          |
+| `shared/js/candidateCollect.js`  | Collect controls and labels: `formatCollectStopLabel` and `STOP_COLLECT_LABEL_TEXT` (the Stop collecting label), `formatElapsed`, `collectPassMadeProgress`, and `runCollectLoop` (the shared skeleton: a pass, a wait, a read and a stall clock). |
+| `shared/js/candidateNuke.js`     | `runBatchNuke`: the batch driver for Nuke 'Em. Marks the batch, presses, sends it, settles the marks from the reply, refreshes the page, and finishes the marks on every path.                       |
+| `shared/js/candidateStatus.js`   | Status and label text: `formatQueueingLabel`, `formatNukingLabel`, `formatNukingStatus`, `formatProfileRowState`, `NOTHING_QUEUED_LABEL`, `NUKED_LABEL`. Both pages build their words here; the presence rules stay on each page. |
+| `shared/js/nukingControl.js`     | The Nuking drop-down: its items, help text and label (`nukingControlView`, `nukingControlMessage`). Pause sends `pause-coordinator-nukes`; Resume sends `resume-paused-coordinator-nukes`. Both are the Dashboard's Pause Current Work messages, so the pause is queue-wide. |
+
+Constants that moved to `shared/js/tunables.js`: `CANDIDATE_BATCH_PROFILES_PER_BATCH` (the batch size cap) and `COLLECT_STALLED_TIMEOUT_MS` (the collect stall timeout). The search page's enqueue reports progress per chunk ("Queueing... R of T"), as the space page does. The paused label is "Nuking Paused" on both pages and in the drop-down. The space page's toolbar status passes no queueing count, so it has no queueing part. Both pages pass the stored pause flag to the status; the code does not match the note that the search page does not show Paused (planning.md, open item (f)).
+
+Build and process rules are in `AGENTS.md`.
+
+## 2. State map
+
+28 Oct: the changes add no stored key and no session key. The enqueue marks and the drop-down are in memory only. The failed-row remove writes through the existing queue WAL (section 3.5).
+
+### 2.1 Authoritative (durable)
+
+| Store                         | Where                                                                                                 | Owner                                                                                                    | Notes                                                                                                                                          |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Queue rows, active and queued | Queue WAL, key `mbCoordinatorQueueWal` (`storageKeys.js`). Segment records plus two checkpoint slots. | `sw.js` (write door and hydrate); `swCoordinatorQueueWal.js` and `swQueueWalStore.js` (shapes and store) | Worker is the only writer. Hydrated into worker memory by `loadResidentState` (checkpoint plus WAL tail). Reads come from that resident state. |
+| Terminal (completed) rows     | The `completed` area of the same WAL                                                                  | `sw.js` `archiveTerminalCoordinatorRow`; `swCompletedShards.js` (shards)                                 | Durable record of finished work. Used for display and profile-level dedupe. It does not drive scheduling.                                      |
+| Runs                          | WAL records in area `runs`                                                                            | `swRunsWal.js` (records); `swRunShards.js` (run shards); `sw.js` `takeRunsPartFromChange`                | Run status and counts are recomputed from queue rows. Not in the session mirror: runs are read from disk at restart (sections 4.6 and 4.7).                                             |
+
+### 2.2 Derived or non-authoritative (durable on disk)
+
+| Store                                    | Stored name                                                                              | Owner                                                                                         | Notes                                                                                                                                                                                                                   |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Space post maps (remembered and pending) | None. Removed 25 Oct.                                                                    | None                                                                                          | Decisions are per profile. Remembered history is the completed profile history (section 2.1). Pending space state comes from queue rows; the search and space pages keep enqueue marks in memory only. See section 3.4. |
+| Space registry and sort                  | `mbSpaceRegistry`, `mbSpaceSortBy`                                                       | `spaceRegistry.js`; `sw.js`                                                                   | Space list and sort preference. The 1.5 registry (plain `mbSpaceRegistry`) is imported once at startup into this key, with the marker `mbSpaceRegistryImportedFromV15` (built 27 Oct; section 5.2).                                                                                                                                                                                         |
+| Outlier list                             | `mbCoordinatorOutliers` (`COORDINATOR_OUTLIERS_KEY`)                                     | `sw.js`, written through `persistCoordinator`; session mirror (`QUEUE_NAMESPACE_MIRROR_KEYS`) | Setting-like state.                                                                                                                                                                                                     |
+| Preferences                              | Defined in `defaults.js`                                                                 | `preferences.js`; `sw.js` loads the values                                                    | Includes recent-history retention (`nukedPostRetentionDays`, 90) and row cap (`maxRememberedNukedPosts`, 10,000).                                                                                                       |
+| Pause and retry settings                 | `mbCoordinatorPaused`, `mbCoordinatorRetryFailedEnabled`, `mbCoordinatorPauseGeneration` | `swprefs.js`; `sw.js`                                                                         | Read by the queue (not traced in this pass).                                                                                                                                                                            |
+| Storage build marker                     | `mbStorageBuild` (`STORAGE_BUILD_KEY`)                                                   | `sw.js` `checkStorageBuild`                                                                   | Records the installed build.                                                                                                                                                                                            |
+
+Queue wakeup metrics (`mbQueueWakeupMetrics`, `mbQueueWakeupMetricsView`) are session-only by owner decision (26 Oct); see sections 2.3 and 9.3. The disk copies are left in place until the owner decides cleanup.
+
+### 2.3 Session-only (lost on browser restart)
+
+| Store                            | Stored name or place                                                                                               | Owner                                                                      | Notes                                                                                                                 |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Profile progress                 | `mbProfileNukeProgressShard.<n>` (`PROFILE_NUKE_PROGRESS_SHARD_PREFIX`), 256 shards                                | `swProfileNukeProgress.js`; `sw.js` `saveProfileNukeProgressRowProjection` | Derived view, not authority. Written through `persistCoordinator` progress deltas.                                    |
+| Live-tab set for progress pushes | Worker memory                                                                                                      | `sw.js` (structure not checked)                                            | Lost on worker restart.                                                                                               |
+| Content queue index              | `mbCoordinatorContentQueueIndex` and shard prefixes, in memory                                                     | `swCoordinatorContentQueueIndex.js`                                        | Built from the live queue on the first lookup after a change. Legacy disk copies are removed at startup.              |
+| Flight recorder                  | Memory ring of 20,000 entries (`FLIGHT_RECORDER_CAPACITY`, `tunables.js`); session copy `mbFlightRecorderSnapshot` | `swflightRecorder.js`                                                      | Diagnostic only. The newest 2,000 entries go to session storage, at most every 10 s. Not replay input, not authority. |
+| Erase generation                 | Session storage key `mbEraseBlockHistoryGeneration`                                                                | `sw.js`                                                                    | Lets an open content script say which erase it has finished.                                                          |
+| Queue wakeup metrics             | `mbQueueWakeupMetrics`, `mbQueueWakeupMetricsView`                                                                 | `sw.js` `flushQueueWakeupMetrics`, `refreshQueueWakeupMetricsViewForDashboard`                | Session-only (owner decision 26 Oct; built, checked 27 Oct: the flush and the dashboard view write the session area). Disk copies from before stay until the owner decides cleanup (section 9.2). |
+
+### 2.4 Retired
+
+- Raw `mbCoordinatorQueue`: writes are blocked after a queue mutation (`metricStorageSet` guard, `sw.js`, about line 2808). Retirement also removes it at install and startup (`retireUnusedVersion15StorageKeys`, `sw.js`, about line 37001; called from `swBootstrap.js`). The owner's note said "guarded, not removed"; the code does both. Owner to confirm.
+- `mbCoordinatorQueueView`: not written to disk since 2026-10-01. The file comment at `retireLegacyQueueViewStorageKey` (`sw.js`, about line 37029) says a pre-WAL copy can resurrect rows, so the key is removed once at startup.
+- `mbProfileNukeProgress`: in the startup removal list with `mbCoordinatorQueue` (`VERSION_15_RETIRED_STORAGE_KEYS`).
+
+### 2.5 Key declarations
+
+`shared/js/storageKeys.js` declares every stored key name once. `test/p1-contract.test.js` (per the header comment in `storageKeys.js`) fails if another module assigns one. Changing a key name orphans its data, so a change needs a migration. The table lists each key constant, its stored name, and the modules that reference it (found by searching `shared/js`; "sw.js only" means no other module names the constant).
+
+| Constant                                                 | Stored name                                                              | Modules that reference it                                                                                                            |
+| -------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `COORDINATOR_QUEUE_WAL_KEY`                              | `mbCoordinatorQueueWal`                                                  | sw.js, swCoordinatorQueueWal.js, swQueueWalStore.js, swProfileNukeProgress.js, swCoordinatorSourceProvenance.js, swStorageMetrics.js |
+| `COORDINATOR_QUEUE_KEY` (retired)                        | `mbCoordinatorQueue`                                                     | sw.js, swProfileNukeProgress.js, swStorageMetrics.js                                                                                 |
+| `COORDINATOR_QUEUE_VIEW_KEY` (retired)                   | `mbCoordinatorQueueView`                                                 | many; removed at startup                                                                                                             |
+| `COORDINATOR_RUNS_KEY`                                   | `mbCoordinatorRuns`                                                      | coordinator.js, sw.js, swdashboard.js, swStorageMetrics.js                                                                           |
+| `COORDINATOR_RUNS_LAYOUT_KEY` (removed)                  | `mbCoordinatorRunsLayoutVersion`                                         | None. The runs bucket layout was excised (commit `8d08054`); the constant is not in `storageKeys.js`.                                |
+| `COORDINATOR_EVENTS_KEY`                                 | `mbCoordinatorEvents`                                                    | sw.js, swdashboard.js, swStorageMetrics.js                                                                                           |
+| `COORDINATOR_OUTLIERS_KEY`                               | `mbCoordinatorOutliers`                                                  | sw.js only                                                                                                                           |
+| `COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY`                   | `mbCoordinatorLastEnqueueSummary`                                        | content.js, coordinator.js, sw.js, swdashboard.js                                                                                    |
+| `COORDINATOR_WORK_SESSION_KEY`                           | `mbCoordinatorWorkSession`                                               | coordinator.js, sw.js                                                                                                                |
+| `COORDINATOR_PAUSED_KEY`                                 | `mbCoordinatorPaused`                                                    | many (queue gate and readers)                                                                                                        |
+| `COORDINATOR_PAUSE_GENERATION_KEY`                       | `mbCoordinatorPauseGeneration`                                           | sw.js, swprefs.js, swStorageMetrics.js                                                                                               |
+| `COORDINATOR_RETRY_FAILED_ENABLED_KEY`                   | `mbCoordinatorRetryFailedEnabled`                                        | coordinator.js, sw.js, swBootstrap.js, swprefs.js                                                                                    |
+| `HIDDEN_RUNS_KEY`                                        | `mbCoordinatorHiddenRunIds`                                              | coordinator.js, sw.js                                                                                                                |
+| `COORDINATOR_STATS_CLEARED_AT_KEY`                       | `mbCoordinatorStatsClearedAt`                                            | coordinator.js, sw.js, swCoordinatorQueueView.js                                                                                     |
+| `COORDINATOR_TAB_KEY`                                    | `mbCoordinatorTabId`                                                     | sw.js, swStorageMetrics.js                                                                                                           |
+| `OWNED_TAB_STATE_KEY`                                    | `mbOwnedTabIdsByParent`                                                  | sw.js, swStorageMetrics.js                                                                                                           |
+| `COORDINATOR_CONTENT_QUEUE_INDEX_KEY` (and shard prefix) | `mbCoordinatorContentQueueIndex`, `mbCoordinatorContentQueueIndexShard.` | sw.js, swCoordinatorContentQueueIndex.js, swContentPageStateProjection.js                                                            |
+| `COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX`                | `mbCoordinatorContentSourceIndex.`                                       | sw.js, swCoordinatorContentQueueIndex.js                                                                                             |
+| `COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX`                   | `mbCoordinatorNamespaceSeq.`                                             | sw.js, swStorageMetrics.js                                                                                                           |
+| `PROFILE_NUKE_PROGRESS_VIEW_KEY`                         | `mbProfileNukeProgressView`                                              | Declared in storageKeys.js; referencing modules not searched (section 8)                                                             |
+| `PROFILE_NUKE_PROGRESS_SHARD_PREFIX`                     | `mbProfileNukeProgressShard.`                                            | sw.js, swProfileNukeProgress.js, swStorageMetrics.js                                                                                 |
+| `SPACE_REGISTRY_KEY`                                     | `mbSpaceRegistry`                                                        | content.js, coordinator.js, preferences.js, spaceRegistry.js, sw.js                                                                  |
+| `SPACE_SORT_KEY`                                         | `mbSpaceSortBy`                                                          | preferences.js, spaceRegistry.js, sw.js                                                                                              |
+| `SPACE_REGISTRY_IMPORT_MARKER_KEY` | `mbSpaceRegistryImportedFromV15` | `storageKeys.js`; `sw.js` (startup import, Erase keep set) |
+| `STORAGE_BUILD_KEY`                                      | `mbStorageBuild`                                                         | sw.js only                                                                                                                           |
+| `FLIGHT_RECORDER_SESSION_KEY`                            | `mbFlightRecorderSnapshot`                                               | sw.js only                                                                                                                           |
+| `QUEUE_WAKEUP_METRICS_KEY`                               | `mbQueueWakeupMetrics`                                                   | sw.js, swStorageMetrics.js                                                                                                           |
+| `QUEUED_ACTION_SURFACE_STATE_KEY`                        | `mbQueuedActionSurfaceState`                                             | sw.js only                                                                                                                           |
+| `ERASE_BLOCK_HISTORY_PENDING_KEY`                        | `mbEraseBlockHistoryPending`                                             | sw.js only                                                                                                                           |
+| `COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY`                  | `mbCoordinatorQueueWalSeq`                                               | sw.js only                                                                                                                           |
+| `LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY`                | `mbLegacyContentIndexCleanupV1`                                          | sw.js only                                                                                                                           |
+| `PAUSE_DIAGNOSTIC_SNAPSHOT_KEY`                          | `mbPauseDiagnosticSnapshot`                                              | sw.js only                                                                                                                           |
+| `STORAGE_LAYOUT_PREFIX`                                  | `v1.6.` (prefix of every stored name)                                    | storageKeys.js, storageNamespace.js                                                                                                  |
+
+## 3. Write paths
+
+### 3.1 Queue (WAL)
+
+**Door.** Every ordinary queue or stored change goes through `coordinatorAuthority.persistCoordinator`, defined in `createCoordinatorAuthority` (`sw.js`, from about line 9846). Its steps:
+
+1. `persistCoordinator` runs on the serialized apply tail (`runExclusiveOnApplyTail`, `sw.js`, about line 10970). No two commits interleave.
+2. If the change carries the runs key, `takeRunsPartFromChange` (about line 10227) turns the runs value into run records and removes it from the stored payload. The run cap is applied in the same write.
+3. The queue part goes to `persistCoordinatorQueueChange` (about line 10263), which calls `persistCoordinatorAuthorityQueueWalMutation` (about line 8288) for one change or `persistCoordinatorAuthorityQueueWalBatchMutation` (about line 8502) for a batch.
+4. The WAL append is `appendWalRecordsToGeneration` in `walSnapshotStore.js` (about line 1292). Each record is a `map.set`, `map.patch`, `map.remove` or similar, with an area (`queue`, `completed`, `runs`).
+5. The resident projection is updated after the write, inside the same apply step. A failed WAL write leaves the stored part unwritten (`persistCoordinator` comment, about line 10160).
+6. A checkpoint switch is scheduled when the segment count crosses a threshold (section 4.1).
+
+**Enqueue.** The `enqueue-coordinator-items` message goes to `enqueueCoordinatorItems` (`sw.js`, about line 24903). Large batches are split into chunks (`COORDINATOR_ENQUEUE_CHUNK_THRESHOLD` 100, `COORDINATOR_ENQUEUE_CHUNK_SIZE`, `sw.js`, about lines 610-633). Rows are added through the `COORDINATOR_ITEMS_ENQUEUE` queue-machine event (`swQueueMachineEvents.js`). Enqueue moves the row to the tail of the row-shard order (section 4.4).
+
+**Claim and open.** A content script asks for its action through `claim-tab-action` (`claimPendingTabAction`, `sw.js`, about line 33204). A profile action that the user starts is recorded with `begin-profile-action` (`beginCoordinatorProfileAction`, about line 28210). The worker validates the attempt (`validateQueuedTabAttempt`, about line 33362) before the foreground promotion (`promote-queued-tab`) is honoured.
+
+**Milestone (non-terminal).** The content script sends `record-job-milestone`. `swBootstrap.js` routes it to `recordJobProgressFromRequest` (`sw.js`, about line 35189). That function:
+
+1. Looks up the tab's queued metadata and fills attempt identity from it.
+2. Refuses a patch for a tab that is closing or retrying (`queued-tab-closing`).
+3. Checks the attempt with `validateProgressAttempt` (about line 33345).
+4. Calls `recordDeferredCoordinatorJobMilestone` (about line 35109). The record is kept in memory as a pending milestone. It is written to disk only when the patch carries an explicit status and `shouldPersistExplicitCoordinatorMilestoneNow` agrees.
+
+**Terminal.** The content script sends `record-job-terminal`. It goes to `recordJobProgressFromRequest` with `expectTerminal`, which:
+
+1. Takes the pending milestone, if any, and merges it into the terminal patch.
+2. Calls `recordCoordinatorJobProgressViaQueueMachine` (`sw.js`, about line 16191). Identical in-flight calls are coalesced.
+3. That calls `applyCoordinatorQueueMachineEvent` with `PROGRESS_PATCH_RECORD` (about line 16187). The handler in `swQueueMachineHandlers.js` (about line 295) calls `recordCoordinatorJobProgress` (about line 35020).
+4. `recordCoordinatorJobProgress` decides the outcome with `reduceJobEvent`.
+5. After a terminal result, the worker schedules queued work (`scheduleQueuedWorkContinuation`) and cleans up the owned tab (`scheduleCompletedJobOwnedTabCleanup`, about line 31372).
+
+**Blocked-live-tab probe and rollback (27 Oct fix).** `terminalizeActiveCoordinatorItemFromBlockedLiveTab` (`sw.js`) does not decide anything about a row whose active transition is still in flight. It waits for that row's pending transitions (`getPendingActiveTransitionsForRow`), re-reads the row, and returns `active-transition-settled-row-changed` if the row is no longer the same attempt or is neither active nor terminal. A not-blocked answer writes nothing and leaves the row for its action. The rollback of a failed active transition (`mutateCoordinatorQueuedTabOpenRollback`, `sw.js`) returns without writing when the row is missing or already terminal, so it cannot write a failure over a row another path has settled. The tests for this are in `test/swSynthetic.test.js` (the "failed active transition, then a not-blocked probe" test and the "rollback ... is a no-op" test); they were not run in the 28 Oct pass (section 8).
+
+**Archive.** A finished row is archived by `archiveTerminalCoordinatorRow` (`sw.js`, about line 9719). It writes a `completed`-area record (`makeCoordinatorCompletedWorkWalRecord`, about line 7326). How the active row's removal is recorded alongside it was not traced in this pass (section 8).
+
+**Stored-work clear.** See section 3.5.
+
+**Erase.** See section 5.3.
+
+### 3.2 Progress for queued work (job protocol)
+
+- Content side: `recordProfileNukeProgress` (`content.js`, about line 1311) checks `isActiveQueuedProgressRecord`. When an active queued attempt exists, it sends `record-job-milestone` or `record-job-terminal` through `sendRecordedRuntimeMessageWithRetry` (`content.js`, about line 860) with the attempt id and number. The content script keeps the record the worker accepted.
+- Worker side: steps 1-5 of section 3.1 (milestone and terminal). The worker accepts or rejects each message at the authority boundary.
+- Storage: accepted progress goes to the session shards through `saveProfileNukeProgressRowProjection` (`sw.js`, about line 6286), which calls `persistCoordinator` with `progressDeltas`.
+- Progress is a derived view. Queue authority stays in the WAL.
+
+### 3.3 Manual direct actions (accepted exception)
+
+Manual actions on a profile page that are not part of a queued attempt use a separate path. This is an accepted exception, not a second queue writer.
+
+1. Content side: `recordProfileNukeProgress` (`content.js`, about line 1357 onward) sends `record-direct-profile-progress`. It is fire-and-forget, with a 4 s timeout (`safeSendRuntimeMessageWithTimeout`, `content.js`, about line 849). The content script does not wait for the reply, so the user-facing action does not stall.
+2. Worker side: `recordDirectProfileProgressFromRequest` (`sw.js`, about line 35281) is routed from `swBootstrap.js`. It reads the stored record with `getStoredProfileNukeProgressRecord`, drops a patch older than the last direct write (`directProgressClientUpdatedAt`), and writes through `saveProfileNukeProgressRowProjection`.
+3. The manual action itself is recorded by `record-manual-profile-action` (`recordManualProfileActionRequested`, `sw.js`, about line 22773). It writes one completed-area history row (`completedRows` through `persistCoordinatorWithFinishedOutliers`). Its `results` and `removedRows` are empty, so it writes no queue row.
+4. Clearing: `clear-profile-nuke-state` goes through the queue-machine event `PROFILE_STATE_CLEAR`. `clearProfileNukeState` in `sw.js` (about line 25762) is the worker side. The comment at `recordDirectProfileProgressFromRequest` (about line 35306) says it leaves a tombstone, not a deletion, with a fresh client timestamp, so a late patch cannot recreate the record. The tombstone write was not traced line by line.
+
+Lifecycle: session-only progress. It is lost on browser restart. No queue row or attempt is touched. It is not queue authority. A later migration could move it onto one explicit observation contract (review 2). Not scheduled.
+
+### 3.4 Space feed
+
+The space post maps were removed on 25 Oct (`nukedPosts.js` header; commits `62a67ea` and `8e146cc`). There are no stored space-feed records and no space-map storage keys. Decisions are per profile.
+
+- **Remembered profiles.** Remembered means the completed profile history (section 2.1, `completed` area). It keeps `nukedPostRetentionDays` (90 days) and `maxRememberedNukedPosts` (10,000 rows), applied at checkpoint by whole-shard prune (section 4.5).
+- **Pending space state.** Derived from queue rows. The search page and the space page keep enqueue marks in memory only; they are lost on reload and are not written to storage.
+- **Worker routes.** The space-feed message routes and handlers are gone from `shared/js`: `set-space-nuked-posts`, `merge-space-pending-nuked-posts`, `remove-pending-space-feed-urls`, `remove-pending-space-feed-entries`, `confirm-space-feed-profiles-blocked`, and the functions `settleConfirmedSpaceFeedProfiles`, `reconcilePendingSpaceFeedWithArchive` and `confirmSpaceFeedProfilesBlocked` (checked by search, not by running). `settle-terminal-coordinator-items` is still routed (`swBootstrap.js` ~1126) for queue rows. Its space-feed part is gone, but the comment at `swCoordinatorTerminalSettlement.js` line 7 still describes it.
+- **Clear.** There are no pending space-feed records to remove, so Clear Current Work has nothing to add for them (see section 6.1, item 2).
+
+### 3.5 Clear Current Work and stored-work clear
+
+- Message: `clear-coordinator-current-work` runs `clearCoordinatorCurrentWork` (`sw.js`, about line 23119). A successful clear writes an explicit zero summary; a failed one returns a reason.
+- Core: `clearStoredCoordinatorWork` (`sw.js`, about line 23309) dispatches the stored-work clear.
+- Plan: `buildStoredWorkClearPlan` (`sw.js`, about line 26852) lists the queue rows and owned tabs to remove, from a read.
+- Write: `mutateCoordinatorStoredWorkClear` (`sw.js`, about line 26886) re-reads the planned rows before saving. If a row's attempt moved, the plan is rebuilt. The loop runs at most `STORED_WORK_CLEAR_REREAD_ATTEMPTS` times (`tunables.js`, value 2).
+- Removes: active queue rows and archived completed rows, through the WAL. Owned tabs are listed in the plan for closing (the closing step was not traced).
+- Space feed: no pending space-feed records exist to keep or remove (section 3.4).
+- **Remove one failed row (28 Oct).** The Dashboard's Remove control is shown only on a row whose status is `failed`; queued and active rows keep Cancel. It calls `removeFailedCurrentWorkItem` (`coordinator.js`), which sends `remove-coordinator-failed-work-item` with the row's key. `removeCoordinatorFailedWorkItem` (`sw.js`) runs the queue-machine event `REMOVE_FAILED_STORED_WORK_ITEM` through the same storage update slot as the other Current Work mutations. `mutateCoordinatorStoredWorkFailedItemRemove` (`sw.js`) reads the row, refuses it unless it is still `failed`, and saves the removal through `persistCoordinator` with `guardRemovedRows: true` (operation `current-work-failed-item-remove`). Nothing is sent to Quora, and the row is not requeued. Metric paths for the load and the two saves: `currentWork.failedRemove.load`, `currentWork.failedRemove.save.queueWal`, `currentWork.failedRemove.save.projection`.
+
+Open: a late write from an attempt that moved after the last read. A write to a row that no longer exists is rejected on the milestone path (`missing-coordinator-item`). The other writers have not been checked (carried from the 14 Oct note; unverified now).
+
+### 3.6 Queue-machine events
+
+Every queued-work change is an event type named in `shared/js/swQueueMachineEvents.js` (63 lines, `QUEUE_MACHINE_EVENT_TYPES`). The worker applies them with `applyCoordinatorQueueMachineEvent` (`sw.js`, about line 16187). Handlers are in `swQueueMachineHandlers.js`; the one traced in this pass is `PROGRESS_PATCH_RECORD` (about line 295, section 3.1). The list below is grouped by name, not by a traced handler, except where a section above names the handler.
+
+| Group                 | Events                                                                                                                                                                                                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Enqueue and open      | `COORDINATOR_ITEMS_ENQUEUE`, `TAB_OPENED`, `TAB_OPEN_TIMEOUT`, `TAB_OPEN_ROLLBACK_UNACKED`, `SLOT_AVAILABLE`, `QUEUED_NO_OPEN_REPRIME`, `EXECUTOR_ENQUEUE_TIMEOUT`, `QUEUED_AUTHORITY_ENQUEUE_FAILURE`                                                                                     |
+| Attempt and claim     | `RECOVER_PENDING_TAB_ACTION`, `RESTORE_ACTIVE_RUNTIME_FOR_SENDER`, `RELEASE_RUNTIME_IF_AUTHORITY_NOT_ACTIVE`, `ACTION_LEASE_REQUEST`, `ACTION_LEASE_HEARTBEAT`, `ACTION_LEASE_RELEASE`, `ACTION_LEASE_TAB_RELEASE`, `PROFILE_TARGET_RESOLVE`, `PROFILE_RESOLUTION_UNRESOLVED`              |
+| Progress and terminal | `PROGRESS_PATCH_RECORD`, `ROW_EVENTS_APPLY`, `ACTIVE_TERMINAL_PROGRESS`, `ACTIVE_MISSING_TAB`, `ACTIVE_NON_PROFILE_LANDING`, `ACTIVE_PROFILE_REDIRECT_MISMATCH`, `BLOCKED_LIVE_TAB_TERMINAL_RECORD`, `BLOCKED_SWEEP_TERMINAL_RECORD`, `INITIAL_BLOCKED_STATE_RECORD`, `KEY_ONLY_TERMINATE` |
+| Retry and rollback    | `STALE_RETRY_ADVANCE`, `RETRY_FAILED_ITEMS`, `EXHAUSTED_ROLLBACK_RECOVER`, `EXHAUSTED_ROLLBACK_SETTLE`, `EXHAUSTED_ROLLBACK_TERMINATE`, `QUEUED_MATERIALIZATION_FAILURE`                                                                                                                   |
+| Stored work           | `CLEAR_STORED_WORK`, `CANCEL_STORED_WORK`, `CANCEL_STORED_WORK_ITEM`, `REMOVE_FAILED_STORED_WORK_ITEM` (28 Oct), `PAUSE_STORED_WORK`, `TERMINAL_COORDINATOR_ITEMS_SETTLE`                                                                                                                                                             |
+| Pause                 | `PAUSE_STATE_SET`, `RUNS_PAUSED_SET`                                                                                                                                                                                                                                                       |
+| Profile state         | `PROFILE_STATE_CLEAR` (the clear-profile-nuke-state message, section 3.3)                                                                                                                                                                                                                  |
+| Space feed            | None. The space-feed events were removed with the space post maps (section 3.4).                                                                                                                                                                                                           |
+
+Terminal writes go to the completed area through `archiveTerminalCoordinatorRow` (section 3.1). The progress path decides its outcome with `reduceJobEvent` (section 3.1). The other terminal paths were not all traced to the reducer (section 8).
+
+### 3.7 Restart behaviour
+
+What survives a worker restart (reload or service-worker wake) and a browser restart. "Rebuilt" means the worker recomputes it from durable state.
+
+| Item                             | Worker restart                                                              | Browser restart                                | Source                                                |
+| -------------------------------- | --------------------------------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------- |
+| Queue rows (active and queued)   | Recovered from checkpoint and WAL tail (`hydrate`, `loadResidentState`); on a worker restart the session copy of the queue can be used (section 4.8)     | Same                                           | section 4.8                                           |
+| Completed rows                   | Recovered from the `completed` area                                         | Same                                           | section 4.5                                           |
+| Runs                             | Replayed from the `runs` records on disk. Runs are not in the session mirror (section 4.6) | Same                                           | section 4.6                                           |
+| Pending milestones (in memory)   | Lost                                                                        | Lost                                           | `recordDeferredCoordinatorJobMilestone` (section 3.1) |
+| Progress (session shards)        | Kept in session storage                                                     | Lost                                           | section 2.3                                           |
+| Live-tab set for progress pushes | Lost                                                                        | Lost                                           | section 2.3                                           |
+| Content queue index              | Rebuilt on the first lookup                                                 | Rebuilt                                        | section 2.3                                           |
+| Pending erase marker             | Read at load; the erase finishes if it is set                               | Same                                           | section 5.3                                           |
+| Erase generation                 | Session storage                                                             | Lost                                           | section 2.3                                           |
+| Flight recorder                  | Session snapshot kept                                                       | Snapshot kept only while session storage lasts | section 2.3                                           |
+
+The session-storage behaviour on browser restart is taken from the 24 Oct note and the section 2.3 table; it was not tested in this pass (section 8).
+
+## 4. Checkpoint and shard layout
+
+Built 27 Oct (decided 26 Oct): one WAL, one checkpoint manifest, and one shard set per area (queue, completed, runs). Each area partitions its rows by arrival order within its own shard set, so dropping the oldest completed or runs shards is a single delete with no shared shard ids. The manifest indexes the three sets. Old shared-layout manifests are still read; the first checkpoint write after the change uses area-v1 (sections 4.3 and 6.2, item 8).
+
+### 4.1 When a switch happens
+
+- The log is segmented and in arrival order (`walSnapshotStore.js`, `appendWalRecordsToGeneration`).
+- Thresholds (`sw.js`, about lines 546-564): soft switch at 128 committed segments (`COORDINATOR_QUEUE_WAL_SEGMENT_SOFT_SWITCH_AT`); force switch at 256 (`COORDINATOR_QUEUE_WAL_SEGMENT_FORCE_SWITCH_AT`); hard limit at 1024 (`COORDINATOR_QUEUE_WAL_SEGMENT_HARD_LIMIT`). Above the hard limit, appends wait for the switch (carried from the 24 Oct note; the append path was not re-read).
+- `scheduleCoordinatorQueueWalCheckpointSwitch` (`sw.js`, about line 8045) sets a due reason. A second request while one is due or running is coalesced (metric `segmentCheckpointSwitchCoalesced`).
+- `maybeRunDueCoordinatorQueueWalCheckpointSwitchInline` (`sw.js`, about line 8116) runs the switch on the apply tail.
+- `performCoordinatorQueueWalCheckpointSwitch` (`sw.js`, about line 8779) does the work. `switchCoordinatorAuthorityQueueWalCheckpoint` (about line 8990) is the wrapper used by callers.
+- `cleanupRetiredCoordinatorQueueWalPhysicalKeys` (`sw.js`, about line 8130) is the cleanup of covered old-generation keys. Its behaviour is inferred from the name and the 24 Oct note; the body was not read in this pass.
+
+### 4.2 What a switch writes
+
+Inside `performCoordinatorQueueWalCheckpointSwitch`:
+
+1. Reads the resident queue and completed maps.
+2. Prunes completed shards (about lines 8809-8816): `selectCompletedShardsToPrune` (`swCompletedShards.js`) returns the whole expired shards and the oldest shards over the row cap. The checkpoint is written without them.
+3. Calls `queueWalStore.prepareCheckpointWrite` (about lines 8817-8825) with `shardOf: queueWalCheckpointShardOf` (section 4.3).
+4. Calls `activateCheckpoint` (`walSnapshotStore.js`, about line 1398). Its failure is recorded as `checkpointFailed` and a diagnostic event.
+5. Only after a successful save does the resident map drop the pruned completed shards (`dropResidentCompletedShards`, `sw.js`, about line 9957; metric `completedShardsPruned`). The pruned shards also go into the slot write as `dropShardIds` (`completedDropShardIds`, `swCompletedShards.js`): one null key per dropped shard, in the same write (built 27 Oct).
+
+Two checkpoint slots, A and B (`CHECKPOINT_A`, `CHECKPOINT_B`, `walSnapshotStore.js` lines 2-3). `getInactiveCheckpointId` gives the slot the next write goes to. `writeInactiveCheckpoint` (about line 1341) writes it. `recoverActiveCheckpoint` (about line 1421) reads the active one. The active slot is always complete.
+
+### 4.3 How rows are partitioned
+
+- Arrival order is on. `walSnapshotStore.js` `makeCheckpoint` (about line 138) and `prepareCheckpointWrite` take the sharded path when a `shardOf` function is passed or a shard count is set (about line 139).
+- The arrival partition is `partitionCheckpointStateByShard` (`walSnapshotStore.js`, about line 227). The shard of each entry is the one `shardOf` names. `makeShardedCheckpoint` (about line 278) builds the pieces. A checkpoint records `partition: 'arrival'` (`CHECKPOINT_PARTITION_ARRIVAL`, about line 472).
+- The worker's `shardOf` is `queueWalCheckpointShardOf` (`sw.js`, about line 9842). It sends the `completed` area to `completedAreaShardOf` (`swCompletedShards.js`, about line 65) the runs area to `runAreaShardOf` (`swRunShards.js`), and the queue area to `queueWalRowShards.shardOf`, each wrapped by `checkpointAreaShardId`.
+- `queueWalRowShards`, `completedWalShards` and `runShardTail` are created at about lines 9836-9841. The first two are built with `enabled: true`.
+- Hash partitioning still exists in the generic engine (`partitionCheckpointState`, `walSnapshotStore.js`, about line 204; default count `CHECKPOINT_SHARD_DEFAULT_COUNT` = 10). It is used only when no `shardOf` is passed. The worker passes `shardOf` for every area, so the hash path is not used by the queue store.
+- Built 27 Oct (decided 26 Oct; section 6.2, item 8): each area has its own shard set, partitioned by arrival order within the area, and one manifest indexes the sets. `queueWalCheckpointShardOf` gives each area its own namespace (`checkpointAreaShardId`; queue 0, completed 1, runs 2; `CHECKPOINT_AREA_NAMESPACES` in `walSnapshotStore.js`). The manifest records `shardLayout` (`area-v1`) and `areaShards`, with a shard list and a hash per area (`buildCheckpointAreaShards`). A manifest without `shardLayout` is the shared layout and is still read.
+- An earlier draft said the arrival option was off. The code has it on. The completed-log plan's status line is stale (section 6, item 6).
+
+### 4.4 Queue rows
+
+- Each row has a `shard` field. `makeQueueWalRowShardTail` (`swQueueWalRowShard.js`, about line 39) builds the tail. Its `shardOf` (about line 87) reads that field.
+- The worker stamps rows with `queueWalRowShards.stamp` at the write path (`sw.js`, about lines 10269 and 10808). Enqueue, retry and requeue move the row to the tail. Other updates keep the row's shard.
+- The budget is 16,384 bytes of uncompressed JSON (`QUEUE_WAL_SHARD_BYTES`, `tunables.js` line 11). It is a proxy for the compressed target.
+- On hydrate and on a rebuild, the tail is rebuilt from the loaded queue (`queueWalRowShards.rebuild`, `sw.js`, about lines 9898 and 10092).
+- Shard order is storage order. It does not define execution order. Retry-candidate policy is separate.
+
+### 4.5 Completed rows
+
+- Each archived row gets a completion-order shard: `completedWalShards.stamp` (`sw.js`, about line 7355), with `makeCompletedShardTail` (`swCompletedShards.js`, about line 32) and `completedShardIdOf`.
+- Prune at checkpoint (section 4.2): `selectCompletedShardsToPrune` (`swCompletedShards.js`, about line 71). A shard is dropped when its newest completion is older than retention, then the oldest shards go until the row count is at or under the cap. A retention or cap of 0 turns that limit off.
+- Retention comes from `nukedPostRetentionDays` (default 90, `defaults.js` line 8). The cap comes from `maxRememberedNukedPosts` (default 10,000, `defaults.js` line 9). Both are read in `sw.js` (`recentHistoryRetentionDays`, `recentHistoryMaxEntries`, about lines 993-994 and 2304-2315).
+- Pruning is whole-shard, so the cap can be exceeded by part of a shard.
+- Clear and history operations go through worker messages and WAL mutations, not direct map writes.
+
+### 4.6 Runs
+
+- Each run gets a `runShard` from `runShardTail.stamp` (`swRunShards.js`, `makeRunShardTail` about line 23). A new run takes the tail shard. Runs already in the log keep theirs.
+- The run cap is `RUN_RETENTION_MAX_COUNT` = 700 (`swRunsWal.js`, line 82). `takeRunsPartFromChange` (`sw.js`, about line 10227) applies it in the same write. `selectRunShardsToDrop` (`swRunShards.js`, about line 54) returns the oldest whole shards, keeping the newest shard and any shard a live queue row still refers to. `withoutRunShards` removes them.
+- The 700 cap can be exceeded while references pin shards.
+- Drop: each dropped run shard is one `map.dropShard` record (`runShardDropRecords`, `swRunShards.js`). The storage delete happens at the next checkpoint (owner accepted 27 Oct).
+- Physical partition for runs is applied (built 27 Oct): `queueWalCheckpointShardOf` sends the runs area to `runAreaShardOf` by run shard, in namespace 2. Review 4 is closed for runs.
+- Built: runs are time-sharded (one shard per day of creation, `RUN_SHARD_SPAN_MS`). Owner decision (26 Oct): retention is by the 700-run cap only, with no age rule. The comment at `takeRunsPartFromChange` no longer describes an age rule (checked 27 Oct). Physical partition by run shard is built (27 Oct; section 4.3).
+
+### 4.7 Session mirror of the queue namespace
+
+Built 27 Oct (agreed 26 Oct): the session copy holds the queue's shards and WAL records only. Completed shards and run shards are not copied. Completed is too large for session storage, and runs are read from disk. The page-level copy (a page hydrating its own queue from the session shards and applying WAL records as they arrive) is not built. Shards are re-read only on first hydration or after a failure. Recovery checks the session copy against the disk manifest, which carries a hash per area, so the queue area can be verified alone.
+
+Built: the session WAL mirror holds the meta, the active manifest, the queue's shards (for an area-v1 manifest; a shared-layout manifest keeps every shard, as before) and every committed segment of the active slot (section 11.3). `queueNamespaceMirrorKeys` (`walSnapshotStore.js`) names the one namespace key kept in session beside it: the outlier list (`sw.js`, `QUEUE_NAMESPACE_MIRROR_KEYS`). The run list is not mirrored (runs are log records; owner, 26 Oct). It has a stamp key (`queueNamespaceStampKey`). The comment at `QUEUE_NAMESPACE_MIRROR_KEYS` says the dashboard path reads the outlier list from the mirror, and hydrate does not.
+
+Built for the worker restart (slice 5, 27 Oct): a restart uses the copy's queue shards and segments when the queue-area manifests agree, and reads the disk WAL tail (section 4.8). The page-level copy (each page hydrating its own queue) is not built.
+
+Gate: the target is not built until worker-host failover is designed (section 6.2, item 16). The queue must not move off the service worker before then.
+
+### 4.8 Load and recovery
+
+- `hydrate` (`sw.js`, about line 9070) and `loadResidentState` (about line 9081) call `loadCoordinatorCurrentAuthorityState` (about line 10356) and build the resident state from the checkpoint plus the WAL tail. The resident fast path (same process, resident store present) reads no disk, as before.
+- Session restart (slice 5, owner rule of 27 Oct). Only a hydrate that read a session copy (`readCoordinatorSessionForHydrate`, `sw.js`) can take it. `loadStoreFromStorage` (`swQueueWalStore.js`, about line 370) then decides in this order:
+  1. Candidate, before any disk read (`getSessionRestartCandidate`): the copy's active manifest is area-v1 and matches the copy's own meta, and the copy holds every queue shard that manifest names and every committed segment of the active slot. Otherwise no candidate: the whole WAL is read from disk.
+  2. One disk read, the same snapshot for everything it compares: the disk meta, both manifests, the completed and runs shard supersets of both slots, and the active slot's segments from the copy's committed count on. No queue shard key is in it.
+  3. Decision (`decideSessionRestart`): the disk meta names the same active slot; the disk manifest matches the disk meta; the queue areas agree (`getQueueAreaDisagreement`: the queue area hash, the queue shard ids, and each queue shard hash); the disk has at least as many committed segments as the copy. The copy's commit marker is checked earlier, in `readValidCoordinatorQueueMirrorFromSession`, and it needs `pending === committed` and a meta that matches it.
+  4. Used: the copy's queue shards and segments are the queue state, and the disk segments `[copy committed, disk committed)` are the tail, read from disk and applied in order. Completed and runs come from disk as before.
+  5. Refused (any check fails): the copy is not used, the whole WAL is read from disk in one more read, and the attempt goes on as the disk path (slice 4 rules). Disk wins when the two disagree.
+  6. Counters, written in `recordRestartSourceMetrics` (`sw.js`) after recovery: `coordinatorAuthority.queueWal.restartUsedSessionQueue`; `restartTailRecordsRead` and `restartTailRecordsApplied` (a tail record counts as applied only when recovery applied it); `restartQueueShardsReadFromDisk` (every accepted load that took its queue from disk, which includes a browser start with an empty session); `restartSessionRefused` (each refusal in the loader).
+  - Double apply: the tail is read by segment number, so a segment the copy holds is never read again. A tail record whose id the copy already holds is not counted as tail, and recovery applies the first record of an id only (`duplicate-id`). A record the checkpoint covers (sequence at or below the snapshot sequence) is read but ignored by recovery (`already-in-snapshot`). The other slot's segments are never read, so a leftover segment there is not applied.
+  - Known effect: the copy holds the active slot's queue shards only, so the inactive slot's checkpoint is not loaded on a session restart. The first checkpoint switch after such a restart writes that slot in full, because nothing is remembered about it (`rememberedSlots`).
+  - Hydrate awaits: the session restart makes the same storage reads as before this slice. The copy read and one disk read are unchanged; the queue keys are left out of the disk read, not read in a second one. A refusal adds one disk read. Measured after the change on the synthetic harness, per restart including the harness start: session restart 8 local and 4 session storage calls; disk path 8 and 3; refusal 9 and 4. The counts before the change were not measured.
+- `loadStoreFromStorage` (`swQueueWalStore.js`, about line 286) reads the segmented store. If the manifest and the segments disagree, it retries the read once with the exact segment count (`tornWriteRetry`, about line 386). A committed segment that is missing or does not match fails the load closed (carried from the 24 Oct note; the failure branch was not re-read).
+- Recovery A: `recoverCheckpointFromMirror` (`swQueueWalStore.js`, about line 254), called from `loadStoreFromStorage` only when the disk manifest disagrees with the disk meta. Disk first: an intact disk checkpoint is never replaced, and the session copy is not read. A torn one takes the session copy only if it agrees with the disk meta and verifies (each shard hash and every area hash, the queue area included; the state hash for a shared layout). A copy that fails is refused, and the load fails closed. The load does not write the torn slot back; the disk stays torn until a later checkpoint write rewrites it.
+- Torn queue shard (owner, 27 Oct): when the disk read names a missing queue shard of the active slot, or one whose identity does not match, `recoverQueueShardFromSession` (`swQueueWalStore.js`) takes the session copy's record for that key if it verifies against the disk manifest. The copy is used in memory only; nothing is written back. Completed and runs shards fail closed as before. Owner decision: other torn-shard handling is ignored, because storage.local is SQLite and treated as reliable. No new hash or decode check is added on load; the checks hydrate already runs stay.
+- In this note, restart means a service worker restart (reload or wake). The session restart rule above is the only place a session queue copy is used at restart.
+
+### 4.9 Other layouts
+
+- Profile progress: 256 session shards, hashed per profile href (`PROFILE_NUKE_PROGRESS_SHARD_COUNT`, `storageKeys.js` line 18). The legacy cleanup names 32 old shards (`LEGACY_PROFILE_NUKE_PROGRESS_SHARD_COUNT`, line 19).
+- Content queue index: 32 shards for the queue index and 32 for the source index (`COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_COUNT`, `COORDINATOR_CONTENT_SOURCE_INDEX_SHARD_COUNT`). Derived in memory.
+- Checkpoint piece count: `CHECKPOINT_SHARD_DEFAULT_COUNT` = 10. Used by the hash path only (section 4.3). The on-disk piece count under the arrival partition is not verified here (section 8).
+
+## 5. Storage namespace and erase rules
+
+### 5.1 The prefix and the wrapper
+
+- Every stored key is `STORAGE_LAYOUT_PREFIX` plus its name: `v1.6.` (`storageKeys.js`, line 64). So `mbCoordinatorRuns` is stored as `v1.6.mbCoordinatorRuns`.
+- `namespaceArea` (`storageNamespace.js`, about line 48) wraps a `chrome.storage` area. Its `get`, `set` and `remove` add or strip the prefix. Its `get(null)` returns only this layout's keys, with plain names. Its `clear` removes only this layout's keys. Its `getBytesInUse` counts only them.
+- `namespaceChanges` gives the change events for this layout's keys, with plain names.
+- The worker reads and writes through `namespaceArea` (for example `rawCoordinatorStorageAdapter`, `sw.js`, about line 2479), so code outside the wrapper never sees the raw names.
+
+### 5.2 Unprefixed data
+
+- Unprefixed data from earlier builds is not migrated. The two layouts ignore each other's keys (`storageNamespace.js` header; the `storageKeys.js` comment says a build before 1.6.1628 never reads or writes the prefixed names, and the reverse).
+- Nothing in this layout deletes the unprefixed copies. A fresh start under this layout begins with an empty store.
+- One exception: the 1.5 space classification registry (plain key `mbSpaceRegistry`) is imported once (built 27 Oct). `importSpaceRegistryFromVersion15` (`sw.js`) runs in the background at startup while the marker `mbSpaceRegistryImportedFromV15` is absent; it is not awaited. Its one write carries the imported records and the marker. 1.6 entries win on a conflict. The plain key stays until Erase removes it. A failed read or write writes no marker, so the next start retries. The race with a concurrent registry write is accepted (27 Oct).
+- `checkStorageBuild` (`sw.js`, about line 37011) writes `mbStorageBuild` when the build changes. It performs no schema migration.
+
+### 5.3 Erase (Erase Block History)
+
+`erase-block-history` runs `eraseBlockHistoryRequested` (`sw.js`, about line 22711). This is the clean-slate erase. Its rules, in order:
+
+1. The request must carry the confirmation string `ERASE` (`ERASE_BLOCK_HISTORY_CONFIRMATION`). Anything else is refused (`confirmation-mismatch`).
+2. A second erase while one is scheduled is refused (`erase-already-scheduled`, `storageWritesClosedByErase`).
+3. The authority must be loaded (`authority-not-loaded`).
+4. The erase forces the queue pause (`pauseCoordinatorNukes`, `sw.js`, about line 22941). It stops new opens and requeues any active row.
+5. After the pause, the erase is refused if any row is still active (`queue-row-active`). No tab is mid-action when it runs.
+6. Inside `enqueueSpaceFeedStorageUpdate` (`sw.js`, about line 25650), the marker `ERASE_BLOCK_HISTORY_PENDING_KEY` is written first. The checkpoint-switch due flag and the remembered checkpoint slots are dropped.
+7. All stored keys in this layout are removed except the pending marker and the keep set (`get(null)` then `remove`). The keep set holds one key since 27 Oct: `SPACE_REGISTRY_IMPORT_MARKER_KEY`, so a restart after Erase does not import the 1.5 spaces again (the set was emptied on 22 Oct; the owner added this key on 27 Oct). The plain 1.5 key `mbSpaceRegistry` is removed too (`removePlainLocalNames`). The session namespace is cleared.
+8. The worker closes its writes (`storageWritesClosedByErase`) and reloads the extension after `ERASE_RELOAD_DELAY_MS`, so no in-memory state writes back over the erase.
+
+At the next start, `runPendingBlockHistoryErase` (`sw.js`, about line 22749) runs before anything is loaded. If the marker is set, it removes every stored key outside `ERASE_BLOCK_HISTORY_KEEP_KEYS` (currently only the one-time space import marker, `SPACE_REGISTRY_IMPORT_MARKER_KEY`, so the 1.5 spaces do not come back), removes the old unprefixed `mbSpaceRegistry` key (the 1.5 copy, through `removePlainLocalNames` in `storageNamespace.js`), clears the session namespace, writes a new erase generation to session storage, and reloads the open Quora tabs so their content scripts read the cleared store. The marker is removed last, so an interrupted erase runs again.
+
+The erase is not for routine use. After it the queue has no record of any profile blocked, and will act on them again.
+
+### 5.4 Other clears
+
+- Clear Current Work: section 3.5. No pending space-feed records are stored, so none are kept or removed.
+- Clear All Stats (owner rule, 27 Oct; built): completed rows and runs stay in storage. The cutoff (`mbCoordinatorStatsClearedAt`) hides finished rows from the display and from the Terminal and Avg item time cards. The runs display was not checked in full; no runs cutoff was found (section 8).
+- Clear Outliers (dashboard, built): the listed attempts are dismissed, and the stored list and its events are emptied in memory and on disk. The baseline is kept (`applyCoordinatorOutlierClearEntries`). Clear All Stats also resets the outlier baseline to zero and clears its dismissals (`applyCoordinatorOutlierReset`). Decided (owner, 27 Oct): Clear All Stats clears the persistent baseline for now, because outlier detection has problems that are not being solved, and resetting it eases the long-tail effect of big outliers. Clear Outliers keeps the baseline.
+- Clear events: `clear-coordinator-events` is in the authority set of `swBootstrap.js`; `clearCoordinatorEventsRequested` (`sw.js`, about line 22698) is the worker function. The dispatch branch was not traced.
+- Clear terminal stats: `clear-coordinator-terminal-stats` is in the authority set of `swBootstrap.js`. Its handler was not traced.
+- Clear profile state: `clear-profile-nuke-state` (section 3.3).
+
+### 5.5 Startup retirements and one-time cleanup
+
+- `retireUnusedVersion15StorageKeys` (`sw.js`, about line 37001) removes `mbCoordinatorQueue` and `mbProfileNukeProgress`. Runs from `runtime.onInstalled` and `runtime.onStartup` (`swBootstrap.js`).
+- `retireLegacyQueueViewStorageKey` (`sw.js`, about line 37029) removes `mbCoordinatorQueueView` once, at load (`void retireLegacyQueueViewStorageKey()`, about line 37160).
+- The legacy content index and progress cleanup (`sw.js`, from about line 37038) removes the fixed list of old names. It is guarded by `LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY` (`mbLegacyContentIndexCleanupV1`). Its comment says the marker is in session storage, so the cleanup runs once per browser session.
+- Removal goes through `coordinatorStorageAdapter`, the namespaced adapter. It targets the prefixed names. Unprefixed copies from earlier builds are left alone.
+
+## 6. Known exceptions and planned work
+
+### 6.1 Known exceptions
+
+| #   | Item                                                                                 | Status                                                                                                                                                                                                                                                                                      | Where / source                                                                                                                                                            |
+| --- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Manual direct-action progress is a second progress protocol                          | Accepted exception (section 3.3). Migration to one observation contract not scheduled.                                                                                                                                                                                                      | `content.js` `recordProfileNukeProgress`; `sw.js` `recordDirectProfileProgressFromRequest`. Review 2.                                                                     |
+| 2   | Clear Current Work leaves pending space-feed records                                 | Closed. The space post maps were removed on 25 Oct, so no pending space-feed records are stored (section 3.4). The 18 Oct orphaned-record count no longer applies.                                                                                                                          | Review 1.                                                                                                                                                                 |
+| 3   | Runs bucket layout (read, write, migration)                                          | Removed from code at this HEAD (excise, commit `8d08054`). `applyRunsStoredLayout`, `getRunsDiskWrite`, `commitRunsDiskWrite` and `migrateSpaceMapLayout` are not in `shared/js`. Normal writes go through `takeRunsPartFromChange`. Stored legacy copies on existing installs: unverified. | Section 2.5 (`COORDINATOR_RUNS_LAYOUT_KEY`). Review 3.                                                                                                                    |
+| 4   | Runs are not partitioned by `runShard` at checkpoint                                 | Closed 27 Oct. Runs are time-sharded, and partitioned by run shard in their own namespace (sections 4.3 and 4.6).                                                                                                                                                                                                                               | `queueWalCheckpointShardOf`; `swRunsWal.js`. Review 4.                                                                                                                    |
+| 5   | Shadow and gap checks on write and reconcile paths                                   | Removed 27 Oct check: built in commit `8e146cc` (section 6.2, item 2). The suffix shadow counter (owner, 15 Oct) stays in `sw.js` and `subject.js`; it is not a queue input.                                                                                                                                                                                                                                  | `sw.js` shadow-WAL compare (about lines 9019-9259, 9416-9625), `recordRunsResidentDiskGap` (about line 2745), `startRunsGapWatch` (about line 2789). Review (second "4"). |
+| 6   | Completed-log plan status                                                            | The plan file says steps 4 to 7 are not started. The code has the switches on (section 4.3). The plan's status line is stale.                                                                                                                                                               | `completed-log-shards-plan-2026-10-25.md`.                                                                                                                                |
+| 7   | Raw `mbCoordinatorQueue` removal                                                     | Guarded on write and removed at startup. Owner's note said "not removed".                                                                                                                                                                                                                   | `sw.js` `metricStorageSet` guard; `retireUnusedVersion15StorageKeys`.                                                                                                     |
+| 8   | Session storage quota                                                                | Measured once on 26 Oct: 8,880,912 bytes in use of 10,485,760 (about 85%) on the dashboard page (section 11.2), before the mirror was reduced to the queue on 27 Oct. Not measured again. No quota check on session writes exists.                                                                                                                                                                                                         | See section 11.2.                                                                                                                                              |
+| 9   | Landing check reads the URL only; dry-run mode is not built                          | Open (carried from the 15 Oct identity work).                                                                                                                                                                                                                                               | `getQueuedProfileRemapTarget` (`content.js`); `swBootstrap.js` tab-update check.                                                                                          |
+| 10  | Progress has many in-memory writer sites                                             | Open. No change now.                                                                                                                                                                                                                                                                        | Not counted in this pass.                                                                                                                                                 |
+| 11  | Worker-window focus: a surface with `focused: false` may be a no-op for some actions | Open since 25 Sep.                                                                                                                                                                                                                                                                          | `getOrCreateQueuedWorkerActionSurface` (`sw.js`, about line 28835).                                                                                                       |
+| 12  | Torn-checkpoint recovery from the session copy ("Recovery A"; "Recovery B" is the same item, owner 27 Oct)                        | Built (`recoverCheckpointFromMirror`, section 4.8). Disk first: the copy is used only when the disk checkpoint is torn (slice 4).                                                                                  | `swQueueWalStore.js`; test `test/swQueueWalStore.test.js`.                                                                                                                |
+
+Known and accepted: progress is lost on browser restart (session-only, section 2.3). The live-tab set for progress pushes is worker memory, and is lost on worker restart (carried from the 24 Oct note; the exact structure was not checked).
+
+### 6.1a Built 27 Oct (not in the table above)
+
+- Torn queue shard fallback (`recoverQueueShardFromSession`): built and left in place. It runs only when the disk read names a missing or identity-mismatched queue shard of the active slot, and uses the session copy's record if it verifies. Nothing is written back. Other torn-shard handling is ignored (owner decision; section 4.8).
+- Queue-only checkpoint refused (`refuseQueueOnlyCheckpointFallback`, counter `queueOnlyCheckpointRefused`): built. A queue-only checkpoint, the fallback when the store is missing, is refused when the disk holds completed or runs shards, because it would orphan them. This closes audit item 1 (`audit-2026-10-27.md`).
+- Space classification import (section 5.2): built, one time, in the background, guarded by a marker.
+- Clear rule (section 5.4): built for completed rows and the outlier list. The outlier baseline reset under Clear All Stats is decided (section 8).
+- Soft-fail retry: the visible line and the header counts are removed from the Dashboard. Built. The stored flag (`COORDINATOR_RETRY_FAILED_ENABLED_KEY`), the worker side (`summarizeSoftFailRetryCounts`, `SOFT_FAIL_RETRY_LIMIT`) and the toggle plumbing stay.
+- Dashboard first load: a spinner ("Loading…", role status) shows until the first state arrives. A first load that fails or gets no answer shows "History load failed". Built; not checked in a browser.
+- Session mirror reduced to the queue (section 4.7), session restart (section 4.8, slice 5) and Recovery A (section 4.8, slice 4): built.
+
+### 6.1b Built or changed 28 Oct (not in the table above)
+
+- Failed-activation outcome: an exhausted activation that could not proceed is stored as `action-error` and shown as "Nuke error". `timeout` is kept only when the release reason names a timeout (`getExhaustedRolledBackQueuedTabTerminalOutcome`, `sw.js`). The sibling paths follow the same rule: `terminalizeExhaustedRolledBackQueuedCoordinatorItem` and the batch version, `terminalizeExhaustedRolledBackQueuedCoordinatorItems`. The active-transition-failed terminal path in `mutateCoordinatorQueuedTabOpenRollback` writes `action-error` directly. The rule applies to `fast-executor-preflight` and to the exhausted "runtime disappeared" case (its error text, `swRolledBackQueuedTabRetryClassification.js`), which are treated as activation failures. The owner has not confirmed that (planning.md, open item (a)).
+- Failed-row Remove control: built (section 3.5). Live check open.
+- Pause from the Nuking drop-down on the space and search pages: built (section 1.5). Live check open.
+- Blocked-live-tab probe and rollback: fixed on 27 Oct (section 3.1). Not confirmed live.
+- Page-side shared modules: built (section 1.5).
+
+### 6.2 Planned work, with status
+
+Owner decisions of 25 Oct from `dead-ends-review-2026-10-24.md` ("Decided, next"), plus items from `planning.md` and the completed-log plan. Status is as of 27 Oct, checked against the code. Several items are now built; each row says which.
+
+| #   | Work                                                                                                                                                                                                                                                                                                                                                                                                            | Status                                                                                                                                 | Source                                                                                                  |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| 1   | Excise the run-list bucket path, with no import of old data. Remove its readers and writer, the gap watch and its two calls, the runs part of the startup migration, and the dev tools that read run buckets. Stored legacy run copies stay until the owner says otherwise. | Built (commit `8d08054`). Checked 27 Oct: the bucket writer, the gap watch, the runs part of the startup migration and the bucket readers are not in `shared/js`. The dev tools in `tools/cdp` that read run buckets were not re-checked. | `dead-ends-review-2026-10-24.md`, "Runs excise plan" and item 2; `planning.md`, "Decided, next" item 1. |
+| 2   | Remove the shadow checks: the progress shadow log, the coordinator-authority shadow log, and the deep-pending compare. Keep the flight recorder's persisted snapshot. | Built (commit `8e146cc`). Checked 27 Oct: no shadow log or compare functions remain in `shared/js`; the runs gap watch and the store-size sampler are gone too. The flight recorder snapshot stays. | `dead-ends-review-2026-10-24.md`, decision 3; `planning.md`, item 2. |
+| 3   | Cruft and constants: the empty erase keep-list, a write-only variable, a stale comment. Layout constants to the storage key module; timing and cap values to the tunables file. | Partly built. Checked 27 Oct: the erase keep set holds one key (decided 27 Oct); `EXECUTOR_CLASSIFY_BACKSTOP_MS` and `ORPHAN_SURFACE_TAB_GRACE_MS` are in `tunables.js`; `lastSpaceFeedRenderModel` is read in `content.js`, so it is no longer write-only; layout constants are in `storageKeys.js`. The rest was not checked. | `planning.md`, item 3; `dead-ends-review-2026-10-24.md`, Appendix C. |
+| 4   | Fresh-start cleanup, after item 1: remove migrations, repairs and legacy readers a fresh start does not need. | Partly built. Checked 27 Oct: `migrateSpaceMapLayout` is gone. Still in code: `repairProfileProgressProjection`, `cleanupRetiredCoordinatorQueueWalPhysicalKeys`, the legacy queue-view and content-index cleanup, and the legacy slug shadow cut in `subject.js`. Each needs a dependency check. | `planning.md`, item 4; `dead-ends-review-2026-10-24.md`, section 7. |
+| 5   | Runs time-sharded like completions, with physical partition by run shard. | Built: time sharding (section 4.6) and physical partition by run shard in its own namespace (section 4.3, 27 Oct). | Section 4.6; `completed-log-shards-plan-2026-10-25.md`. |
+| 6   | Clear Current Work removes pending space-feed records.                                                                                                                                                                                                                                                                                                                                                          | Withdrawn. The space post maps were removed on 25 Oct and no pending records are stored. The pending state is derived from queue rows. | Section 3.4; `planning.md`, loose end 19 (not updated here).                                            |
+| 7   | Completed-log plan. Step 4 (queue shard id per row, tail move): code has the switch on (`enabled: true`) and the stamping (section 4.4). The tail-move audit (every path that returns a row to queued) is not confirmed. Step 5 (terminal history and runs in arrival shards, in-memory index): partly in code; the index is not confirmed. Steps 6 and 7 (History reads the index; live check): not confirmed. | Mixed. Steps 4 and 5 are built and switched on (27 Oct); steps 6 and 7 are not built. The tail-move audit is open. The plan's status line is stale.                                                                                                      | `completed-log-shards-plan-2026-10-25.md`.                                                              |
+| 8   | Separate WAL and checkpoint sets per area (queue, runs, completed). The shared set came from moving runs into the shared WAL (`b20be9e`). | Built 27 Oct (decided 26 Oct; `area-v1`): one WAL, one checkpoint manifest, separate shard sets per area. Dropping the oldest completed or runs shards is a single delete (section 4.3). | `planning.md`, "Deferred follow-up: WAL-order storage". |
+| 9   | Outlier recording limit at 3.5 s or more: built (`OUTLIER_MIN_RECORD_MS` = 3500, `tunables.js`; commit `5a41c99`). Outlier events persisting with their outlier until Clear, and terminal-only listing: not checked in this pass.                                                                                                                                                                               | `dead-ends-review-2026-10-24.md`, "Decided, next" items 5-7; `docs/outliers-plan-2026-10-24.md`.                                       |                                                                                                         |
+| 10  | Landing dry-run mode for the landing check.                                                                                                                                                                                                                                                                                                                                                                     | Designed, not built.                                                                                                                   | Section 6.1, item 9.                                                                                    |
+| 11  | Manual progress onto one observation contract.                                                                                                                                                                                                                                                                                                                                                                  | Not scheduled.                                                                                                                         | Section 3.3; review 2.                                                                                  |
+| 12  | Session storage quota: measured once on 26 Oct (section 11.2). Quota check on session writes not built. | Mirror reduced to the queue on 27 Oct (section 4.7). Not measured again. Quota check on session writes not built. | Section 6.1, item 8. |
+| 13  | Worker-window focus behaviour for queued actions.                                                                                                                                                                                                                                                                                                                                                               | Open.                                                                                                                                  | Section 6.1, item 11.                                                                                   |
+| 14  | Recovery A (torn-checkpoint recovery from the session copy). Built, disk first.                                                                                                                                                                                                                                                                                                                                | Slice 4 owner rule: the session copy is used only when the disk checkpoint is torn. Built. Recovery B is the same item (owner, 27 Oct).                                                    | Section 4.8.                                                                                            |
+| 15  | Session queue copy: queue shards and WAL records only, verified against the disk manifest's queue-area hash. Completed and runs out of session. Pages hydrate their own copy. | Agreed 26 Oct. Built for the worker restart (slice 5, 27 Oct; section 4.8). The page-level copy is not built and waits on item 16.                                                                                            | Section 4.7; section 11.3.                                                                              |
+| 16  | Worker-host failover: how a queue host that dies (tab discard, freeze, crash) is replaced, with fenced writes and a rehydrate from storage. | Gate, not built. Owner: must be designed before any queue work leaves the service worker. The service worker becomes a shim over browser APIs, not a shipper (27 Oct). Probes done (Chrome P1 to P5, Firefox F1 to F6); no design yet. | `experiments/worker-host/NOTE.md`; `experiments/worker-host/firefox/NOTE.md`.                             |
+| 17  | Page-side refactor of the space and search pages: shared modules for marks, collect, batch nuke, status text and the drop-down (refactor steps 1 to 6). | Done (28 Oct). Modules in section 1.5. Two constants moved to `tunables.js`. Not checked live. | `planning.md`, "Decisions of 28 Oct, with status". |
+| 18  | Retries and requeue for rolled-back rows, as a Dashboard control. | Closed 28 Oct (owner): not added, and not until a case merits it. Internal requeue of stale rows stays. | `docs/dead-ends.md`, Q7. |
+| 19  | Blocked-live-tab probe racing an in-flight activation (27 Oct incident). | Fixed 27 Oct: the probe waits for the pending transition, and the rollback does nothing to a settled row (section 3.1). Tests exist; not run in the 28 Oct pass. Not confirmed live. | `test/swSynthetic.test.js`. |
+| 20  | Remove control on a failed Current Work row. | Built 28 Oct (section 3.5). Live check open. | `planning.md`, "Live checks not yet run". |
+
+## 7. Metrics and tests
+
+Counters are written with `incrementQueueWakeupMetric` (`sw.js`). Names below were found in the code (search by name). The flight recorder (section 2.3) takes the diagnostic events.
+
+- Checkpoint and WAL: `coordinatorAuthority.queueWal.segmentCheckpointSwitchScheduled`, `coordinatorAuthority.queueWal.segmentCheckpointSwitchCoalesced`, `coordinatorAuthority.queueWal.segmentCheckpointSwitchForcedOverQueueWork`, `coordinatorAuthority.queueWal.checkpointFailed`, `coordinatorAuthority.queueWal.completedShardsPruned`, `coordinatorAuthority.queueWal.projectionSaved` (all in `sw.js`).
+- Progress: `progress.coalescedInFlight` (`recordCoordinatorJobProgressViaQueueMachine`), `progress.rowProjectionStorageFailed` (`saveProfileNukeProgressRowProjection`), `terminalProgress.coalescedInFlight`.
+- Runs: `runs.writeUnchanged` (`persistCoordinator`).
+- Storage: `storageRemoveCalls`, `storageUpdate.lateWriteSuppressed`.
+- Reconcile and pump: `reconcile.requested`, `reconcile.deferredBeforeQuora`, `pump.noop.activeRuntimeFillSuppressed`.
+- Checkpoint, restart and mirror (27 Oct): `coordinatorAuthority.queueWal.queueOnlyCheckpointRefused`, `queueShardRecoveredFromSession`, `queueShardFromSessionRefused`, `hydrateFromMirror`, `hydrateMirrorIncomplete`, `hydrateMirrorFailed`, and the restart counters written by `recordRestartSourceMetrics` (`restartUsedSessionQueue`, `restartTailRecordsRead`, `restartTailRecordsApplied`, `restartQueueShardsReadFromDisk`, `restartSessionRefused`). Space import: `spaceRegistryImport.*`. Erase: `eraseBlockHistory.plainRemoveFailed`.
+- Active transition and failed rows (27-28 Oct, names from the code): `blockedLiveTab.waitedForActiveTransition` (the probe waited for a pending transition), `blockedLiveTab.waitedForActiveTransitionAtWrite` (it waited again at the write), and `blockedLiveTab.settledRow` (metric path of the re-read after the wait). The failed-row remove uses the metric paths in section 3.5. The rollback no-op, the outcome change and the drop-down add no counter.
+
+Tests (Node scripts; `npm test` runs an explicit sequence, and `test/` holds the files):
+
+- `test/p1-contract.test.js`: storage key contract (section 2.5).
+- `test/jobState.test.js`: the job reducer.
+- `test/walSnapshotStore.test.js`, `test/walSnapshotStoreFuzz.test.js`, `test/walCheckpointShards.test.js`: the generic WAL and checkpoint engine.
+- `test/swQueueWalStore.test.js`: the queue store, including the mirror recovery (Recovery A, section 4.8).
+- `test/swSynthetic.test.js`: the worker with synthetic browser and storage.
+
+New test files must be listed in `npm test` and in the parallel runner (`tools/run-tests-parallel.js`). This rule is in the owner's coder instructions, not in `AGENTS.md`. This note did not run tests (section 8).
+
+## 8. Not verified in this pass
+
+- The on-disk piece count of the checkpoint under the arrival partition (section 4.9).
+- Whether the arrival partition's replay agrees with the in-memory completed index on every path (section 6.2, item 7).
+- Whether the checkpoint's "unchanged piece" reuse works beyond the first checkpoint after a load. The 24 Oct note says it does only on the first; not re-checked.
+- Whether any path still removes space-feed records. The space post maps were removed on 25 Oct (section 3.4), so this check is closed for the stored records; the in-memory enqueue marks were not traced.
+- The live-tab set structure for progress pushes (section 2.3).
+- The queue-machine event that `remove-pending-space-feed-entries` applies.
+- The queue-bar summary and the outlier write cadence are not described here.
+- Items 8 to 12 of section 6.1 were carried from earlier notes and were not re-read here, except item 12, which was checked in code.
+- The number of run-list and progress writer sites (section 6.1, item 10).
+- Clear All Stats and the outlier baseline: decided (owner, 27 Oct). The persistent baseline is cleared for now (`applyCoordinatorOutlierReset`); outlier detection problems are not being solved now. Section 5.4.
+- The runs display after Clear All Stats: not checked in full; no runs cutoff was found in the code.
+- The dashboard spinner and failed-load text, the removal of the soft-fail display, and the 1.5 space import: checked by reading the code only. Not checked in a browser or on a 1.5 profile (27 Oct).
+- 28 Oct: no tests, build or live browser run. Everything from 28 Oct was checked by reading code and by grep only.
+- 28 Oct: the owner's note names a "Terminal (handled)" tooltip, "Completed (handled)" after the change. No "(handled)" string is in the code. The card reads "Completed" (`terminalCount`), with the tooltip "Jobs that completed as succeeded, failed, skipped, or canceled."
+- 28 Oct: the note that the search page does not show Paused (planning.md, open item (f)) is not borne out by the code, which passes the paused flag to the search status too. Live check needed.
+- 28 Oct: the Preferences label is now "Background Window Policy". Code comments still say "Worker Window Focus" (in `createOwnedTabInQueuedWorkerActionSurface`, `sw.js`, and in `swprefs.js`). Stale comments only; the stored key is unchanged.
+- 28 Oct: `enqueueSpaceFeedStorageUpdate` is the storage update slot the failed-row remove and other Current Work mutations use. The name still says "space feed"; it is not renamed here.
+- 28 Oct owner decisions still open are listed in planning.md, "Owner decisions still open (28 Oct)", items (a) to (o). None is decided here.
+
+## 9. Every stored key
+
+### 9.1 Conventions and counts
+
+- Stored name = `STORAGE_LAYOUT_PREFIX` (`v1.6.`, `storageKeys.js` line 59) plus the plain name. `namespaceArea` (`storageNamespace.js`, line 48) adds and strips the prefix. Code everywhere uses plain names.
+- Area: **L** is `chrome.storage.local` (disk). **S** is `chrome.storage.session` (session memory). Functions are in `sw.js` unless another file is named. Line numbers are approximate, as of working tree 1.6.1655 (27 Oct; not re-checked line by line).
+- "Import-only" means a file imports a constant and never uses it. Import-only files are not counted as readers.
+- Counts. `storageKeys.js` declares 38 names: 34 single key names and 4 family bases (`PROFILE_NUKE_PROGRESS_SHARD_PREFIX`, `COORDINATOR_NAMESPACE_SEQ_KEY_PREFIX`, `COORDINATOR_CONTENT_SOURCE_INDEX_PREFIX`, `COORDINATOR_CONTENT_QUEUE_INDEX_SHARD_PREFIX`). `STORAGE_LAYOUT_PREFIX` is also declared there but is not a key. The counts were not redone on 27 Oct; the import marker `SPACE_REGISTRY_IMPORT_MARKER_KEY` (section 9.2) is not in them.
+- Nine preference keys are stored under the same prefix but are declared in `defaults.js` (9.2 last row), not in `storageKeys.js`.
+- Retired names: `mbCoordinatorQueue` and `mbCoordinatorQueueView` (constants, in the 34) and `mbProfileNukeProgress` (a literal in `sw.js`, no constant).
+- Families are expanded in 9.4. Totals: 34 single names in `storageKeys.js` (two of them retired), 9 preference names, 1 retired literal, and five families (WAL, progress shards, namespace stamps, content queue index shards, content source index shards).
+- Legacy cleanup (`getLegacyContentIndexCleanupNames`, `sw.js` line 35508) names 131 keys: 65 content-index names, 33 progress names and 33 stamp names. Those keys are removed once, not written.
+- Keys with no live writer or no live reader are flagged in 9.5.
+
+### 9.2 Disk keys (L)
+
+| Constant                                                                                                                                                                                                                                     | Stored name                                | Writer (file, function)                                                                                                                                                                                                                                                               | Reader(s)                                                                                                                                                                                                                                                     | Size driver and bound                                                                                                                                                                                                             | Needed                                                                                                  |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `COORDINATOR_QUEUE_WAL_KEY`                                                                                                                                                                                                                  | `v1.6.mbCoordinatorQueueWal` (family, 9.4) | Door `persistCoordinatorAuthorityQueueWalMutation` (sw.js ~8288); checkpoint `performCoordinatorQueueWalCheckpointSwitch` (~8779); both write through `coordinatorStorageAdapter`                                                                                                     | `loadStoreFromStorage` (`swQueueWalStore.js` ~286); `hydrate` and `loadResidentState` (sw.js ~9875, ~9884)                                                                                                                                                    | Queue rows, completed rows and run records, as WAL records. Segments reset at each checkpoint switch (soft 128, force 256, hard 1024). Queue rows have no count cap. Completed rows are capped and expire (10,000 rows, 90 days). | Yes                                                                                                     |
+| `COORDINATOR_RUNS_KEY`                                                                                                                                                                                                                       | `v1.6.mbCoordinatorRuns`                   | Logical key only. `persistCoordinator` passes it to `takeRunsPartFromChange` (sw.js ~9396), which turns it into WAL `runs` records and removes it from the stored payload. Callers reach it through `saveCoordinatorState` (~10573) and `coordinatorRunsUpdateLockedUpdate` (~10644). | `hydrate` from the WAL `runs` area; `loadState` in `coordinator.js` (~1063, ~1104; a local read, whether it is on the live path was not traced); session mirror (S, 9.3)                                                                                      | Runs. Cap `RUN_RETENTION_MAX_COUNT` = 700 (`swRunsWal.js`). Whole time-shard drop. Can exceed the cap while a live row pins a shard.                                                                                              | Yes, as the WAL `runs` area. The normal path writes no disk key of this name. Old installs: unverified. |
+| `COORDINATOR_EVENTS_KEY`                                                                                                                                                                                                                     | `v1.6.mbCoordinatorEvents`                 | None live. `coordinatorRunsUpdateLockedUpdate` sets `const eventsChanged = false` (sw.js 10648), so the write branch (10673-10674) never runs. `clearCoordinatorEventsRequested` (21374) clears the flight recorder only.                                                             | None live. The `swdashboard.js` reference is import-only.                                                                                                                                                                                                     | None. Code does not trim an old stored list (no cap in `normalizeCoordinatorEvents`, `swCoordinatorAttemptIdentity.js` 99).                                                                                                       | NO LIVE WRITER AND NO READER. Candidate for retirement.                                                 |
+| `COORDINATOR_LAST_ENQUEUE_SUMMARY_KEY`                                                                                                                                                                                                       | `v1.6.mbCoordinatorLastEnqueueSummary`     | `persistLastCoordinatorEnqueueSummary` (sw.js ~23655), via `metricStorageSet`                                                                                                                                                                                                         | `waitForCoordinatorEnqueueSummary` (`content.js` ~10188); `loadState` (`coordinator.js` ~1069, ~1117)                                                                                                                                                         | One summary object.                                                                                                                                                                                                               | Yes                                                                                                     |
+| `HIDDEN_RUNS_KEY`                                                                                                                                                                                                                            | `v1.6.mbCoordinatorHiddenRunIds`           | `setHiddenRunIdsRequested` (sw.js ~21563)                                                                                                                                                                                                                                             | `loadState` (`coordinator.js` ~1066, ~1114)                                                                                                                                                                                                                   | List of hidden run ids, deduplicated. Grows with each hide. No pruning seen (unverified).                                                                                                                                         | Yes                                                                                                     |
+| `COORDINATOR_OUTLIERS_KEY`                                                                                                                                                                                                                   | `v1.6.mbCoordinatorOutliers`               | `issueCoordinatorOutliersWrite` (sw.js ~6708), through `persistCoordinator`                                                                                                                                                                                                           | `readCoordinatorOutliersRecordFromStorage` (sw.js ~6630; session copy first, then local); `toCoordinatorOutlierBaseRecord` (`swCoordinatorOutliers.js` ~169)                                                                                                  | Entries capped at 50 (`OUTLIER_MAX_ENTRIES`, `tunables.js` 51). `dismissedKeys` has no cap seen (unverified). Baseline is three numbers.                                                                                          | Yes                                                                                                     |
+| `COORDINATOR_PAUSED_KEY`                                                                                                                                                                                                                     | `v1.6.mbCoordinatorPaused`                 | `mutateCoordinatorPauseStateSet` (sw.js ~21883); `resumeStoredWorkAfterQuoraActivation` (~2097)                                                                                                                                                                                       | Queue gate `decidePausedStateGate` (`swFillQueuedTabsOnceDecisions.js` ~111); `decideResumeCoordinatorStoredPausedOutcome` (`swResumeQueueExecutionDecisions.js` ~39); `refreshContentProgressBar` (`content.js` ~3939); `loadState` (`coordinator.js` ~1077) | Scalar.                                                                                                                                                                                                                           | Yes                                                                                                     |
+| `COORDINATOR_PAUSE_GENERATION_KEY`                                                                                                                                                                                                           | `v1.6.mbCoordinatorPauseGeneration`        | `mutateCoordinatorPauseStateSet` (sw.js ~21892-21920)                                                                                                                                                                                                                                 | `isCoordinatorPauseGenerationCurrent` (~21151); `restoreLatestCoordinatorPauseGenerationIfStale` (~21165)                                                                                                                                                     | Scalar.                                                                                                                                                                                                                           | Yes                                                                                                     |
+| `COORDINATOR_RETRY_FAILED_ENABLED_KEY`                                                                                                                                                                                                       | `v1.6.mbCoordinatorRetryFailedEnabled`     | `setCoordinatorRetryFailedEnabledRequested` (sw.js ~21513)                                                                                                                                                                                                                            | `runPersistentFailedRetryTick` (~11947); `restoreCoordinatorPageForPersistentRetry` (~11839); `handleStorageChanged` (`swBootstrap.js` ~620); `loadState` (`coordinator.js` ~1115)                                                                            | Scalar.                                                                                                                                                                                                                           | Yes                                                                                                     |
+| `COORDINATOR_WORK_SESSION_KEY`                                                                                                                                                                                                               | `v1.6.mbCoordinatorWorkSession`            | `persistCoordinatorWorkSession` (sw.js ~15528)                                                                                                                                                                                                                                        | `loadCoordinatorWorkSessionFromStorage` (~15520); `loadState` (`coordinator.js` ~1070, ~1118)                                                                                                                                                                 | One object: start and end of the current work.                                                                                                                                                                                    | Yes                                                                                                     |
+| `COORDINATOR_STATS_CLEARED_AT_KEY`                                                                                                                                                                                                           | `v1.6.mbCoordinatorStatsClearedAt`         | `clearCoordinatorTerminalStats` (sw.js ~6600)                                                                                                                                                                                                                                         | `loadCoordinatorStatsClearedAtFromStorage` (~6331); `coordinator.js` (use not traced)                                                                                                                                                                         | Scalar timestamp. Sets the cutoff of `completedSummary` (10.10).                                                                                                                                                                  | Yes                                                                                                     |
+| `COORDINATOR_TAB_KEY`                                                                                                                                                                                                                        | `v1.6.mbCoordinatorTabId`                  | `rememberCoordinatorTabId` (sw.js ~11683); removed by `forgetCoordinatorTabId` (~11697)                                                                                                                                                                                               | `getStoredCoordinatorTabId` (~11724)                                                                                                                                                                                                                          | Scalar.                                                                                                                                                                                                                           | Yes (purpose not traced)                                                                                |
+| `OWNED_TAB_STATE_KEY`                                                                                                                                                                                                                        | `v1.6.mbOwnedTabIdsByParent`               | `persistOwnedTabIdsByParent` (sw.js ~28893)                                                                                                                                                                                                                                           | `loadOwnedTabIdsByParent` (~28911)                                                                                                                                                                                                                            | Map from parent tab to owned tab ids. Grows with owned tabs. Pruning not traced (unverified).                                                                                                                                     | Yes                                                                                                     |
+| `SPACE_REGISTRY_KEY`                                                                                                                                                                                                                         | `v1.6.mbSpaceRegistry`                     | `setSpaceRegistryRequested` (sw.js ~21550)                                                                                                                                                                                                                                            | `content.js` (~427, ~728); `preferences.js` `init` (~35, ~69, ~161); `loadState` (`coordinator.js` ~1065, ~1113)                                                                                                                                              | One record per space the user tracks. User-driven; no cap seen.                                                                                                                                                                   | Yes                                                                                                     |
+| `SPACE_REGISTRY_IMPORT_MARKER_KEY` | `v1.6.mbSpaceRegistryImportedFromV15` | `importSpaceRegistryFromVersion15` (sw.js; one write with the imported records) | Startup check in `hydrate` (sw.js); Erase keep set | One marker object | Yes |
+| `SPACE_SORT_KEY`                                                                                                                                                                                                                             | `v1.6.mbSpaceSortBy`                       | `setSpaceSortRequested` (sw.js ~21544)                                                                                                                                                                                                                                                | `preferences.js` `init` (~36, ~70, ~166)                                                                                                                                                                                                                      | Scalar.                                                                                                                                                                                                                           | Yes                                                                                                     |
+| `STORAGE_BUILD_KEY`                                                                                                                                                                                                                          | `v1.6.mbStorageBuild`                      | `checkStorageBuild` (sw.js ~35461)                                                                                                                                                                                                                                                    | `checkStorageBuild` (~35458)                                                                                                                                                                                                                                  | Scalar (build string).                                                                                                                                                                                                            | Yes                                                                                                     |
+| `DEV_MODE_SYNC_STORAGE_KEY`                                                                                                                                                                                                                  | `v1.6.mbDashboardDevModeEnabled`           | `setDevModeEnabledRequested` (sw.js ~21557)                                                                                                                                                                                                                                           | `loadDevModeStoredEnabled` (`coordinator.js` ~697); `snapshotDiagnosticsOnPause` (sw.js ~21257)                                                                                                                                                               | Scalar. The name says "sync"; the code uses local.                                                                                                                                                                                | Yes                                                                                                     |
+| `QUEUE_WAKEUP_METRICS_KEY`                                                                                                                                                                                                                   | `v1.6.mbQueueWakeupMetrics`                | `flushQueueWakeupMetrics` (sw.js ~5677), via `buildPersistedQueueWakeupMetrics`                                                                                                                                                                                                       | `loadQueueWakeupMetrics` (sw.js ~5692)                                                                                                                                                                                                                        | Session-only (26 Oct decision; built, checked 27 Oct: the flush writes the session area; section 9.3). Journal capped at 1,200 (`MAX_QUEUE_WAKEUP_METRIC_JOURNAL`, `tunables.js` 22). The `previousEpochs` cap was not traced (unverified).                                                                                              | Yes                                                                                                     |
+| `QUEUE_WAKEUP_METRICS_VIEW_KEY`                                                                                                                                                                                                              | `v1.6.mbQueueWakeupMetricsView`            | `refreshQueueWakeupMetricsViewForDashboard` (sw.js ~5731); flush (~5678)                                                                                                                                                                                                              | `refreshCompactMetricsView` (`coordinator.js` ~1199); `loadState` (~1064, ~1107)                                                                                                                                                                              | Session-only by owner decision (26 Oct). View journal capped at 30 (`MAX_QUEUE_WAKEUP_METRICS_VIEW_JOURNAL`, `tunables.js` 23).                                                                                                                                            | Yes                                                                                                     |
+| `PAUSE_DIAGNOSTIC_SNAPSHOT_KEY`                                                                                                                                                                                                              | `v1.6.mbPauseDiagnosticSnapshot`           | `snapshotDiagnosticsOnPause` (sw.js ~21263)                                                                                                                                                                                                                                           | None in `shared/js`                                                                                                                                                                                                                                           | Overwritten at each pause. Size not traced.                                                                                                                                                                                       | NO READER in `shared/js` (`tools/` not searched)                                                        |
+| `DEBUG_RUN_AUTOSAVED_ID_KEY`                                                                                                                                                                                                                 | `v1.6.mbDebugRunAutosavedId`               | `claimDebugRunAutosaveRequested` (sw.js ~21576)                                                                                                                                                                                                                                       | `claimDebugRunAutosaveRequested` (~21574)                                                                                                                                                                                                                     | One id.                                                                                                                                                                                                                           | Debug only                                                                                              |
+| `ERASE_BLOCK_HISTORY_PENDING_KEY`                                                                                                                                                                                                            | `v1.6.mbEraseBlockHistoryPending`          | `eraseBlockHistoryRequested` (sw.js ~21403)                                                                                                                                                                                                                                           | `loadCoordinatorCurrentAuthorityState` (~10305); `runPendingBlockHistoryErase` (~21427)                                                                                                                                                                       | Marker. Removed last (~21440).                                                                                                                                                                                                    | Yes, for erase only                                                                                     |
+| Nine preference keys: `fopDelay`, `flipToAnswers`, `fopFlipDelay`, `profilesPerBatch`, `targetQueuedTabConcurrency`, `coordinatorAutoStartOnBrowserStart`, `nukedPostRetentionDays`, `maxRememberedNukedPosts`, `workerWindowForegroundMode` | `v1.6.<name>`                              | `setExtensionSettingsRequested` (sw.js ~21530) via `metricStorageSet`. The page sends `set-extension-settings` (`preferences.js` ~93; `swBootstrap.js` ~725).                                                                                                                         | `preferences.js` `init` (~33); sw.js load and setters (~2228-2264); `content.js` (`fopDelay` ~2557, `flipToAnswers` ~6077, `fopFlipDelay` ~6100, `profilesPerBatch` ~12049)                                                                                   | Scalars. `nukedPostRetentionDays` default 90 and `maxRememberedNukedPosts` default 10,000 (`defaults.js` 8-9) bound the completed history. `nukedPosts.js` uses 30 days only as a fallback for an invalid value.                  | Yes. Declared in `defaults.js` and `swprefs.js` constants, not in `storageKeys.js`.                     |
+
+Retired or legacy disk names (none written today):
+
+| Name                                                                     | Writer                                                                                                                                            | Reader                                                                                                                                                                                      | Status                                                                                                                     |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `mbCoordinatorContentQueueIndex` (`COORDINATOR_CONTENT_QUEUE_INDEX_KEY`) | None on disk. The index is derived in memory (`getResidentDerivedQueueIndexPayload`, sw.js ~8046-8066; `swCoordinatorContentQueueIndex.js` ~273). | None on disk                                                                                                                                                                                | Removed at startup by `retireLegacyContentIndexKeys` (sw.js ~35520-35545). NO WRITER.                                      |
+| `mbCoordinatorQueueView` (`COORDINATOR_QUEUE_VIEW_KEY`)                  | None on disk. The view is sent to pages by message (sw.js ~6429-8655).                                                                            | None on disk. `coordinator.js` (~578-579) reads it from a message; `swCoordinatorReconcileSupportSingles.js` (~169) reads it from state. `content.js` and `swdashboard.js` are import-only. | Removed by `retireLegacyQueueViewStorageKey` (sw.js ~35475). NO WRITER, NO STORAGE READER.                                 |
+| `mbCoordinatorQueue` (`COORDINATOR_QUEUE_KEY`)                           | Write guard in `metricStorageSet` (sw.js ~2572) blocks it                                                                                         | Only as an ignored default in `readCoordinatorCurrentAuthority` (sw.js ~10499)                                                                                                              | Removed at startup by `retireUnusedVersion15StorageKeys` (sw.js ~37001). NO WRITER, NO READER.                             |
+| `mbProfileNukeProgress` (literal in `sw.js`)                             | None                                                                                                                                              | None                                                                                                                                                                                        | In the startup removal list (`VERSION_15_RETIRED_STORAGE_KEYS`; from architecture 2.4, not re-read). NO WRITER, NO READER. |
+
+### 9.3 Session keys (S)
+
+| Constant                                                | Stored name                              | Writer (file, function)                                                                                                                                                                                    | Reader(s)                                                                                                                                                          | Size driver and bound                                                                                                                                                                                                | Needed                              |
+| ------------------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `PROFILE_NUKE_PROGRESS_VIEW_KEY`                        | `v1.6.mbProfileNukeProgressView`         | `applyCoordinatorProgressDeltas` (sw.js ~9503-9589), then `writeProfileNukeProgressSession` (sw.js ~7238)                                                                                                  | `getContentPageCoordinatorState` (~35114); `loadProfileNukeProgress` (~24336); `getProfileNukeProgressRecordsFromProjection` (`swProfileNukeProgress.js` ~420-425) | Records capped at 1,200 (`MAX_PROFILE_NUKE_PROGRESS_VIEW_RECORDS`, sw.js 738).                                                                                                                                       | Yes                                 |
+| `PROFILE_NUKE_PROGRESS_SHARD_PREFIX` (family, 9.4)      | `v1.6.mbProfileNukeProgressShard.<n>`    | `applyCoordinatorProgressDeltas` and `writeProfileNukeProgressSession` (as above); `updateProfileNukeProgressShardRecord` (`swProfileNukeProgress.js` ~353)                                                | `getProfileNukeProgressRecordsFromProjection` (~420); `getAllProfileNukeProgressShardDefaults` (~214)                                                              | Full records, one per profile href. No count cap on records in the shards. The 1,000-entry pruning is in `content.js` (`pruneProfileNukeProgress`, ~991) and `swProfileResolution.js` (~72). Unbounded in principle. | Yes                                 |
+| `COORDINATOR_QUEUE_WAL_KEY` (session mirror, same base) | `v1.6.mbCoordinatorQueueWal.*` | `rebuildCoordinatorQueueMirrorFromDisk` (sw.js); `mirrorCoordinatorQueueWalAfterAck` (sw.js) | `readCoordinatorQueueRowsFromMirror` (sw.js); `getSessionRestartCandidate` and `recoverCheckpointFromMirror` (`swQueueWalStore.js`) | Meta, active manifest, the queue's shards (area-v1; a shared-layout manifest keeps every shard), and every committed segment of the active slot. Completed and runs shards are not mirrored (built 27 Oct). | Yes (recovery and restart copy) |
+| `COORDINATOR_RUNS_KEY` (session copy) | None | None | None | Not mirrored: runs are log records (owner, 26 Oct; checked 27 Oct) | No |
+| `COORDINATOR_OUTLIERS_KEY` (session copy)               | `v1.6.mbCoordinatorOutliers` with stamp  | `mirrorQueueNamespaceKeys` (sw.js ~7386)                                                                                                                                                                   | `readCoordinatorOutliersRecordFromStorage` (~6632). The outlier mirror is excluded from hydrate (~7445).                                                           | Up to 50 entries.                                                                                                                                                                                                    | Yes                                 |
+| `COORDINATOR_QUEUE_WAL_SEQ_SESSION_KEY`                 | `v1.6.mbCoordinatorQueueWalSeq`          | `writeCoordinatorQueueWalPendingMarker` (sw.js ~7295); `writeQueueNamespacePendingMarker` (~7333); `mirrorQueueNamespaceKeys` (~7391); rebuild (~7581, ~7609); `mirrorCoordinatorQueueWalAfterAck` (~7642) | `readCoordinatorSessionForHydrate` (~7411); `readValidCoordinatorQueueMirrorFromSession` (~7438); `readCoordinatorQueueRowsFromMirror` (~7503-7523)                | One marker object (pending and committed fingerprints).                                                                                                                                                              | Yes                                 |
+| `FLIGHT_RECORDER_SESSION_KEY`                           | `v1.6.mbFlightRecorderSnapshot`          | `persistFlightRecorderSnapshotThrottled` (sw.js ~5662); `scheduleStoredWorkRearmAfterStartupHydrate` (~35652); both through `sessionMemory.setSessionValue` (`swSessionMemory.js`)                         | `scheduleStoredWorkRearmAfterStartupHydrate` (~35631, `loadSessionValue`)                                                                                          | Newest 2,000 entries (`FLIGHT_RECORDER_SESSION_SNAPSHOT_LIMIT`, `tunables.js` 16). Written at most every 10 s (`tunables.js` 17).                                                                                    | Yes (diagnostic seed)               |
+| `QUEUED_ACTION_SURFACE_STATE_KEY`                       | `v1.6.mbQueuedActionSurfaceState`        | `persistQueuedWorkerActionSurfaceState` (sw.js ~26990); cleared at ~27015 and ~27018                                                                                                                       | `restorePersistedQueuedWorkerActionSurface` (~27035)                                                                                                               | One state object.                                                                                                                                                                                                    | Yes                                 |
+| `COORDINATOR_QUEUE_VIEW_TIMING_CACHE_SESSION_KEY`       | `v1.6.mbCoordinatorQueueViewTimingCache` | sw.js ~6287; cleared at ~6608                                                                                                                                                                              | `loadCoordinatorQueueViewTimingCacheFromSession` (~6227-6232)                                                                                                      | One cache object. Size not traced.                                                                                                                                                                                   | Yes (cache)                         |
+| `BROWSER_SESSION_MARKER_KEY`                            | `v1.6.mbBrowserSessionMarker`            | `rememberBrowserSessionMarker` (`swBrowserSessionRuntime.js` ~151)                                                                                                                                         | `ensureBrowserSessionStartupMetricsReset` (sw.js ~2021); `rearmStoredWorkAfterServiceWorkerReload` (~2339)                                                         | One marker object.                                                                                                                                                                                                   | Yes                                 |
+| `QUORA_RUNTIME_ACTIVATED_SESSION_KEY`                   | `v1.6.mbQuoraRuntimeActivated`           | `rememberQuoraRuntimeActivation` (`swBrowserSessionRuntime.js` ~171); cleared by `forgetQuoraRuntimeActivation` (~191, writes null)                                                                        | `restoreQuoraRuntimeActivationFromSession` (sw.js ~2182)                                                                                                           | One marker.                                                                                                                                                                                                          | Yes                                 |
+| `ERASE_BLOCK_HISTORY_GENERATION_SESSION_KEY`            | `v1.6.mbEraseBlockHistoryGeneration`     | `runPendingBlockHistoryErase` (sw.js ~21435)                                                                                                                                                               | None in `shared/js`. The code comment at ~21375-21380 describes a content-script reader; none was found under this name.                                           | One number.                                                                                                                                                                                                          | NO READER in `shared/js`            |
+| `LEGACY_CONTENT_INDEX_CLEANUP_MARKER_KEY`               | `v1.6.mbLegacyContentIndexCleanupV1`     | `writeLegacyContentIndexCleanupMarker` (sw.js ~35501)                                                                                                                                                      | `readLegacyContentIndexCleanupMarker` (~35495)                                                                                                                     | One marker.                                                                                                                                                                                                          | Until the legacy cleanup is removed |
+
+Queue wakeup metrics (`mbQueueWakeupMetrics`, `mbQueueWakeupMetricsView`) are session-only by owner decision (26 Oct). Their disk rows in 9.2 are left in place until the owner decides cleanup. Checked 27 Oct: both are written to the session area (`flushQueueWakeupMetrics`; `refreshQueueWakeupMetricsViewForDashboard`), which matches the decision.
+
+### 9.4 Families
+
+| Family                            | Expansion                                                                                                                                                                                                      | Area                 | Count                                                                                                                                                                                        | Notes                                                                                                                                                                                                             |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAL (`COORDINATOR_QUEUE_WAL_KEY`) | `.meta` (`getSegmentedWalMetaKey`, `walSnapshotStore.js` 1055); `.checkpoint.A` and `.checkpoint.B` (manifests, 1059); `.checkpoint.<A or B>.s<nn>` (shards, 416); `.segment.<A or B>.<nnnn>` (segments, 1063) | L (full); S (mirror) | Meta: 1. Manifests: 2. Shards per checkpoint: the arrival shard count (row shards are budgeted at 16,384 bytes, `QUEUE_WAL_SHARD_BYTES`, `tunables.js` 11). Segments: up to 1,024 committed. Built 27 Oct: one shard set per area (`area-v1`, section 4.3). The session mirror holds the queue's shards only. | Shard index is padded to two digits, so indexes 100 and above give three digits. The hash-partition count `CHECKPOINT_SHARD_DEFAULT_COUNT` = 10 (`storageKeys.js` 22; `sw.js` 526) is used only by the hash path. |
+| Profile progress shards           | `mbProfileNukeProgressShard.<n>`, n = 0 to 255 (`PROFILE_NUKE_PROGRESS_SHARD_COUNT` = 256, `storageKeys.js` 18)                                                                                                | S                    | 256                                                                                                                                                                                          | Hash by href (`hashProjectionShardKey`, `swProfileNukeProgress.js` 184-186).                                                                                                                                      |
+| Namespace stamps                  | `mbCoordinatorNamespaceSeq.<key>`                                                                                                                                                                              | S                    | 2 live (`mbCoordinatorRuns`, `mbCoordinatorOutliers`); 33 legacy progress stamps (cleanup only)                                                                                              | Token per namespace write (`makeCoordinatorNamespaceStamps`). Written with the session mirror.                                                                                                                    |
+| Content queue index shards        | `mbCoordinatorContentQueueIndexShard.<n>`, n = 0 to 31                                                                                                                                                         | None                 | 32 legacy                                                                                                                                                                                    | Cleanup only.                                                                                                                                                                                                     |
+| Content source index shards       | `mbCoordinatorContentSourceIndex.<n>`, n = 0 to 31                                                                                                                                                             | None                 | 32 legacy                                                                                                                                                                                    | Cleanup only.                                                                                                                                                                                                     |
+
+Legacy progress names removed at startup use the same prefix as the live progress shards (`mbProfileNukeProgressShard.0` to `.31`). See 12, item 3.
+
+### 9.5 Keys with no live writer or no live reader
+
+- No live writer: `mbCoordinatorEvents` (dead branch, sw.js 10648); `mbCoordinatorContentQueueIndex` and both content index families (memory only); `mbCoordinatorQueueView`; `mbCoordinatorQueue`; `mbProfileNukeProgress`.
+- No reader in `shared/js`: `mbCoordinatorEvents`; `mbPauseDiagnosticSnapshot`; `mbEraseBlockHistoryGeneration`; `mbCoordinatorQueueView` (no storage reader); `mbCoordinatorQueue` (only an ignored default); `mbProfileNukeProgress`; the legacy content index names.
+- Not a key: `mb_op` (`content.js` ~3257, 3262) is a URL query parameter.
+
+## 10. Data structures
+
+### 10.1 Queue row (queue area of the WAL)
+
+- Key: `rowKey`, the profile href or work key (`normalizeCoordinatorAuthorityRowKey`). Stored in the WAL `queue` area as a `map.set` value (10.4).
+- Built: `createCoordinatorJobEnvelope` (`swCoordinatorJobEnvelope.js` 52); the queued reset patch `buildQueuedCoordinatorProgressResetPatch` (same file, ~208); enqueue `enqueueCoordinatorItems` (sw.js ~24903) through `COORDINATOR_ITEMS_ENQUEUE`; terminal rows `buildTerminalCoordinatorQueueItem` (`swCoordinatorProgressReducer.js` 759); requeue on rollback (`swRolledBackQueuedTabRetryClassification.js` ~367, ~398).
+- Fields seen in the reset patch: `runId`, `actionKind`, `attemptId`, `attemptNumber`, `status`, `queuedAt`, `queueIndex`, `retryAttempt`, `maxRetries`, `tabId`, `tabCreatedAt`, `tabOpenedAt`, `contentOpenedAt`, `actionReadyAt`, `openedViablePage`, `terminalAt`, `slotReleasedAt`, `closeRequestedAt`, `tabClosedAt`, `closedByExtension`, `closeReason`, `ownerTabId`, `ownerWindowId`, `waitingForForegroundAt`, `foregroundWaitReason`, `foregroundLeaseAcquiredAt`, `foregroundPromotedAt`, `foregroundPromotionReason`, `muteAttempted`, `muteSucceeded`, `mutedAt`, `muteError`, `blockAttempted`, `blockSucceeded`, `blockedAt`, `blockError`, `directBlockFailureDetail`, `unblockOk`, `unblockSucceeded`, `unmuteOk`, `foundBlockedBeforeQueue`, `profileBlocked`, `selectedActionLabel`, `menuActionLabels`.
+- Other fields the rows carry (seen in `sw.js` rollback code and the view): `outcome`, `error`, `activeAt`, `updatedAt`, `actionLease`, `actionLeaseReleasedAt`, `actionLeaseReleaseReason`, `milestones` (`makeEmptyCoordinatorMilestones`), `preserveLiveTabAfterRelease`, and the row shard stamp (`queueWalRowShards.stamp`, sw.js ~10269, ~10808).
+- States (`jobState.js`): `VALID_JOB_STATUSES` (line 47) = queued, opening, active, acting, settling, succeeded, failed, skipped, canceled. Terminal (line 23) = succeeded, failed, skipped, canceled. Transitions: `VALID_JOB_TRANSITIONS` (line 56). Raw content-page statuses map to these inside `reduceJobEvent` (about lines 150-240): `tab-opening` to opening; `tab-opened`, `awaiting-visibility`, `page-ready` to active; `muting`, `blocking`, `unmuting`, `unblocking`, `retrying` to acting; `blocked` and `already-blocked` to succeeded; `profile-unavailable` to skipped; `error`, `error-page` and `interrupted` to failed.
+- Read: `loadResidentState` and `hydrate` (sw.js ~9884); queue view `buildCoordinatorQueueView` (10.10); the queue machine handlers.
+
+### 10.2 Completed row (completed area)
+
+- Built: `makeCoordinatorCompletedWorkWalRecord` (sw.js 7113) from a terminal row (`entry.previousRow` or `entry.row`). The record is `kind` `map.set`, `area` `completed`, `key` = `rowKey`, `dedupeKey` = `completed:<operationKind>:<rowKey>:<attemptId>:<attemptNumber>:<status>`, `operationKind`, `reason`, `value` (the full terminal row), `runId`, `attemptId`, `attemptNumber`, `status`, `terminal`, `at`, `seq`.
+- Completion-order shards: `completedWalShards` (sw.js 8989, `makeCompletedShardTail`, `swCompletedShards.js`), budgeted at 16,384 bytes, with `completedShardIdOf`.
+- Prune at checkpoint: `selectCompletedShardsToPrune` (`swCompletedShards.js`). A whole shard goes when its newest completion is older than the retention (90 days, `nukedPostRetentionDays`), then the oldest shards go while the count is over 10,000 (`maxRememberedNukedPosts`).
+- Read: resident completed map (`residentCompletedRowsFor`, sw.js ~9194 area); `sortCompletedWorkRowsNewestFirst` (sw.js ~6360); `summarizeCompletedWorkDurationsSince` (sw.js 6373); dashboard snapshot `completedRows` (sw.js ~6405-6411).
+
+### 10.3 Run record (runs area) and run shards
+
+- Persisted fields (`persistedRunFields`, `swRunsWal.js` ~30-38): `id`; scalar fields `sourceType`, `createdAt`, `paused`, `runShard` (`RUN_SCALAR_FIELDS`); list fields `sourcePages`, `targetProfileHrefs`, `targetWorkKeys` (`RUN_LIST_FIELDS`). Counts and status are not stored; they are recomputed from queue rows at start.
+- Records (`runsChangeRecords`, `swRunsWal.js` ~40-80): `map.set` for a new run (full value); `map.patch` for changed scalars; `map.appendUnique` for new list values; `map.remove` for a removed run. Area `runs`.
+- Shards: `runShard` is the day of creation (`RUN_SHARD_SPAN_MS` = 24 h, `swRunsWal.js`). `makeRunShardTail` and `selectRunShardsToDrop` are in `swRunShards.js`. Whole-shard drop, oldest first, keeping the newest shard and any shard a live row refers to (`withoutRunShards`). A dropped shard is one `map.dropShard` record (`runShardDropRecords`).
+- Cap: `RUN_RETENTION_MAX_COUNT` = 700 (`swRunsWal.js`). No age rule (26 Oct).
+- Read: `hydrate` from the WAL `runs` area on disk (not the session copy; section 9.3); the run list for the dashboard.
+- Partitioned at checkpoint by run shard, in its own namespace (built 27 Oct; sections 4.3 and 4.6).
+
+### 10.4 WAL record kinds
+
+| Kind                                                     | Area        | Fields                                                                                                                                                                                                      | Written by                                                                      |
+| -------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `map.set`                                                | `queue`     | `key`, `value` (full row), `dedupeKey`, `operationKind`, `reason`, `runId`, `attemptId`, `attemptNumber`, `status`, `terminal`, `allowTerminalOverwrite`, `allowActiveTransitionAfterRollback`, `at`, `seq` | `makeCoordinatorAuthorityQueueWalSetRecord` (sw.js 7076)                        |
+| `map.remove`                                             | `queue`     | `key`, `dedupeKey`, `operationKind`, attempt fields of the removed row, `at`                                                                                                                                | `makeCoordinatorAuthorityQueueWalRemoveRecord` (`swCoordinatorQueueWal.js` 281) |
+| `map.set`                                                | `completed` | as 10.2                                                                                                                                                                                                     | `makeCoordinatorCompletedWorkWalRecord` (sw.js 7113)                            |
+| `map.set`, `map.patch`, `map.appendUnique`, `map.remove` | `runs`      | as 10.3                                                                                                                                                                                                     | `runsChangeRecords` (`swRunsWal.js`)                                            |
+| `map.dropShard` | `runs` | `area`, `shardField`, `shard` | `runShardDropRecords` (`swRunShards.js`), one per dropped run shard. A dropped completed shard is not a record: it is a null key in the slot write (section 4.2). |
+
+- `makeWalRecord` (`walSnapshotStore.js` 1447) normalizes raw records; `area: 'queue'` appears at line 1746 (not inspected further).
+- `makeCoordinatorProgressOperationRecord` (sw.js 7047) builds a record with `area: 'progress'` for row-event metrics. Whether it is persisted: unverified.
+
+### 10.5 Checkpoint manifest, shard and segment layout
+
+Built 27 Oct (decided 26 Oct): one manifest indexes the shard sets, one per area. A shard id is the area's namespace times the stride, plus the area's local id (`checkpointAreaShardId`; queue 0, completed 1, runs 2). The layout below is the one in code.
+
+- Meta, `mbCoordinatorQueueWal.meta` (`getSegmentedWalMetaKey`, `walSnapshotStore.js` 1055): `version` (`SEGMENTED_WAL_STORAGE_VERSION` = 1), `activeCheckpoint` (`A` or `B`), `snapshotSeq`, `nextSeq`, `checkpoints` (per slot, including `shardCount`; read in sw.js ~7336), `generations`, `checkpointSwitch`.
+- Manifest, `mbCoordinatorQueueWal.checkpoint.<A or B>`: built by `makeCheckpoint` (`walSnapshotStore.js`, about 290-330) through `writeInactiveCheckpoint` (~1341). Fields: `version`, `id`, `snapshotSeq`, `snapshotEpoch`, `createdAt`, `stateHash`, `format` = `sharded-v1` (`CHECKPOINT_SHARD_FORMAT`, line 23), `shardCount`, `partition` = `arrival` when a `shardOf` is given (`CHECKPOINT_PARTITION_ARRIVAL`, line 472), `shardIds` (written only when the ids are not 0 to n-1), `shardLayout` and `areaShards` (area-v1: each area's `shardIds` and a `hash`), `areas`, `shards` (descriptors with `index` and `shardStateHash`, plus encoding fields, not all traced). Read by `readStoredCheckpoint` (~387).
+- Shard, `mbCoordinatorQueueWal.checkpoint.<A or B>.s<nn>` (`getSegmentedWalCheckpointShardKey`, `walSnapshotStore.js` 416): content for one shard. Each shard is checked against its manifest entry (`checkpoint-shard-hash-mismatch`, `checkpoint-shard-missing`).
+- Segment, `mbCoordinatorQueueWal.segment.<A or B>.<nnnn>` (`getSegmentedWalSegmentKey`, 1063): one committed write, holding `segment.records`, each with `seq`. Read at ~585.
+- Thresholds: soft switch 128 segments, force switch 256, hard limit 1,024 (`sw.js` 527, 545, 528). Carried from section 4.1.
+
+### 10.6 Profile progress record, view and shards
+
+- Record (in a shard, keyed by profile href): `summarizeProfileNukeProgressRecord` (`swProfileNukeProgress.js` 90) shows `profileHref`, `status`, `actionKind`, `attemptId`, `attemptNumber`, `generation`, plus fields not read in this pass. Full records are built by `makeTerminalProgressRecordFromCoordinatorItem` (`swCoordinatorProgressReducer.js` 588) and merged in `swProfileProgressMerge.js`. A clear leaves a tombstone from `makeTombstonedProfileProgressRecord` (sw.js 24422).
+- Shard: `getProfileNukeProgressShardIndex` (`swProfileNukeProgress.js` 184) hashes the href into 256 shards. `buildProfileNukeProgressShardPayload` (232) builds every shard name.
+- View: `buildProfileNukeProgressView` (`swProfileNukeProgress.js` 160) returns `version` 2, `updatedAt`, `total`, `recordLimit` (1,200), `truncated`, and `records` (href to summary). Read by `getContentPageCoordinatorState` (sw.js ~35114).
+- Session only: `writeProfileNukeProgressSession` (sw.js 7238). Nothing goes to disk for progress (decision 31, sw.js ~9636).
+
+### 10.7 Outlier record, entry and recorder events
+
+- Index, `mbCoordinatorOutliers` (`layout: 2`, 27 Oct): `entries` (summaries only, at most 50, newest last, each with its `slot`; no events), `dismissedKeys`, `baseline` (`n`, mean, `M2`, from `IncrementalStats`). The index is the only outlier key in the session mirror. `normalizeCoordinatorOutliersRecord` (`swCoordinatorOutliers.js`).
+- Entry bodies, one key per outlier (27 Oct): `mbCoordinatorOutlierEntry.00` to `.49`, named by slot, not by a hash. Each body holds `rowKey`, `attemptId`, `slot`, `events` (newest 100) and `eventsDropped`. A new outlier takes the slot of the one it displaces in the same write, so no key is removed and at most 50 body keys exist. Bodies are not in the session mirror.
+- Archive write (27 Oct): `issueCoordinatorOutliersWrite` (`sw.js`) sends the index and only the bodies whose slot content changed, with `null` for each slot no longer listed, in one `persistCoordinator` stored part. `diffCoordinatorOutlierBodies` computes the changed bodies. Settled through `settleCoordinatorOutliersWrite`. This replaces the whole-record rewrite that made each archive write up to about 15 MB (live, 649 writes, 9.9 GB, queue waits up to 9.8 s).
+- Event cap (27 Oct): at most 100 events per outlier (`OUTLIER_MAX_EVENTS_PER_ENTRY`, `tunables.js`). When an outlier would exceed 100, the newest 100 are kept and `eventsDropped` counts the rest (`capCoordinatorOutlierEvents`, `swCoordinatorOutliers.js`).
+- Migration (27 Oct): an index without `layout: 2` is the old single-record layout. Load sets an owed full write, which writes every body once; the first saved full write clears the flag and counts `outlier.migrated`. A failed migration leaves the old record on disk and retries on the next write or start (`outlier.migrationFailed`). The migration runs once; a second start migrates nothing.
+- Load and serve (27 Oct): the worker reads the bodies from disk in one read per worker start and keeps them in memory. Refresh reads no disk. The dashboard's expand is served from memory. A body whose slot, `rowKey` or `attemptId` does not match the index is served with no events and counted as `outlier.bodyMissing`.
+- Known edge (27 Oct): a failed write followed by a saved one can list an attempt whose body is not yet on disk until the correcting write. The read marks it missing and serves no events. Not verified in a browser.
+- Entry (the body and the index summary), `normalizeOutlierEntry`: `rowKey`, `targetUrl`, `runId`, `attemptId`, `attemptNumber`, `actionKind`, `status`, `outcome`, `activeAt`, `terminalAt`, `final` (true for listed entries), `thresholdReason`, `meanDurationMsAtCapture`, `stdDevMsAtCapture`, `capturedAt`, `events` (array).
+- Built: `makeCoordinatorOutlierEntry` (175) from a finished row. `applyCoordinatorOutlierFinishedRows` (238) judges each finished row. Thresholds in `tunables.js`: `OUTLIER_FLOOR_MS` 45,000 (line 47); `OUTLIER_STDDEV_MULTIPLIER` 2.5; `OUTLIER_MIN_SAMPLES_FOR_STDDEV` 5; `OUTLIER_MIN_RECORD_MS` 3,500 (line 50).
+- Recorder events: `collectCoordinatorOutlierRecorderEvents` takes flight recorder events that fall in the row's scope (`makeCoordinatorOutlierScope`; `isCoordinatorOutlierRecorderEventInScope`) and stores them in `entry.events`, newest 100 (27 Oct). Span event kinds: `OUTLIER_SPAN_EVENT_KINDS`.
+- Read: `readCoordinatorOutliersRecordFromStorage` (`sw.js`, index then bodies once per start) and the dashboard.
+
+### 10.8 Flight recorder entry
+
+- Built: `recordFlightRecorderEvent` (`swflightRecorder.js` 112). The caller's fields are sanitized, and `seq` is assigned. Callers pass fields such as `kind`, `source`, `checkpointId`, `metaFingerprint`, `manifestFingerprint` and `mirror` (for example sw.js ~7580-7650). Strings are capped at 240 characters (`FLIGHT_RECORDER_STRING_MAX`), URLs at 500 (`FLIGHT_RECORDER_URL_MAX`), and other values are JSON-stringified and capped (`swflightRecorder.js` 60-70).
+- Ring: 20,000 entries (`FLIGHT_RECORDER_CAPACITY`, `tunables.js` 15). Oldest entries are overwritten.
+- Session snapshot: the newest 2,000 entries (`FLIGHT_RECORDER_SESSION_SNAPSHOT_LIMIT`, `tunables.js` 16) through `persistFlightRecorderSnapshotThrottled` (sw.js 5662), at most every 10 s (`FLIGHT_RECORDER_SESSION_PERSIST_MIN_MS`, `tunables.js` 17).
+- Read: `getFlightRecorderSnapshot` (`swflightRecorder.js`), used by the dashboard and the outlier scan.
+- Full field list per event kind: not traced (unverified).
+
+### 10.9 Metrics: persisted record and view
+
+Session-only by owner decision (26 Oct); see section 9.3. The code writes these records to session storage (checked 27 Oct).
+
+- Persisted, `mbQueueWakeupMetrics` (`buildPersistedQueueWakeupMetrics`, `swQueueWakeupMetricsShape.js` 297): `version`, `currentEpoch` (counters, phases, journal up to 1,200), `previousEpochs` (cap not traced), `lifetime` (`startedAt`, `updatedAt`, `resetCount`). Written by `flushQueueWakeupMetrics` (sw.js 5677), read by `loadQueueWakeupMetrics` (5692).
+- View, `mbQueueWakeupMetricsView` (`buildQueueWakeupMetricsView`, `swQueueWakeupMetricsShape.js` 249): `version`, `viewVersion` (1), `updatedAt`, `currentEpoch` (journal up to 30), `lifetime`. Built at sw.js 5678 and 5731 and read by `refreshCompactMetricsView` (`coordinator.js` 1199-1201).
+
+### 10.10 Queue view and completedSummary
+
+- Queue view, `buildCoordinatorQueueView` (`swCoordinatorQueueView.js` 437): `version` (1), `updatedAt`, `total`, `counts` (rows by status), `authoritativeCounts` (rows by status that are authoritative), `hasAuthoritativeStoredWork`, `actualBlockTiming`, `alreadyBlockedTiming`, `activationHandoffTiming`, and per-row summaries from `summarizeCoordinatorQueueViewItem` (359). The view is not stored on disk; it is sent to pages by message (retired key `mbCoordinatorQueueView`, 9.2).
+- completedSummary: an object with three numbers, `count`, `durationCount` and `durationTotalMs`. `summarizeCompletedWorkDurationsSince` (sw.js 6373) counts completed rows whose `terminalAt` is later than the stats-cleared cutoff. `residentCompletedSummaryFor` (sw.js 9194) builds it, and `withCoordinatorCompletedSummary` (sw.js ~6416) attaches it to the view. The page reads it with `readCompletedSummary` (`coordinator.js` 1241-1249). Note: the brief calls this a "pair"; the code carries three numbers.
+
+## 11. Session storage against its quota
+
+### 11.1 Quotas
+
+| Area                     | Limit                                                                                                                                   | Source                                                                                                      | Notes                                                                                                                                                        |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `chrome.storage.local`   | `QUOTA_BYTES` = 10,485,760 bytes (10 MB; 5 MB in Chrome 113 and earlier)                                                                | Chrome storage reference, `developer.chrome.com/docs/extensions/reference/api/storage` (fetched 2026-10-26) | Ignored when the extension has `unlimitedStorage`.                                                                                                           |
+| `chrome.storage.session` | `QUOTA_BYTES` = 10,485,760 bytes (10 MB; 1 MB in Chrome 111 and earlier)                                                                | Same page                                                                                                   | Usage is measured as estimated dynamically allocated memory of values and keys, not JSON size. No per-item limit is listed. Available from Chrome 102 (MV3). |
+| `unlimitedStorage`       | Declared in both manifests: `manifests/chrome.json` line 40; `manifests/firefox.json` line 41. `storage` is declared at line 39 and 40. | Manifests                                                                                                   | The local quota no longer applies; the disk limit is the browser's.                                                                                          |
+
+- Firefox session quota: an MDN `storage.session` `QUOTA_BYTES` page appeared in search results. It was not fetched. Firefox figures are unverified here.
+- Two search summaries gave older local numbers that conflict with the Chrome page. The Chrome page is used here.
+
+### 11.2 What the code measures
+
+- Measured 26 Oct 2026 with `chrome.storage.session.getBytesInUse` on the dashboard page: 8,880,912 bytes in use of 10,485,760 (about 85%). The per-key breakdown was not supplied to this note, so the largest keys are not listed here.
+- The session mirror was reduced to the queue's shards and WAL on 27 Oct (section 4.7). The 26 Oct figure predates that change and has not been measured again.
+
+- No session size check exists in the code. No `getBytesInUse` call reads the session area; the 26 Oct measurement above was taken by hand. The only `getBytesInUse` call on the storage path is `coordinatorStorageAdapter.getBytesInUse(null)` in `maybeCheckCoordinatorStorageQuotaHealth` (sw.js ~7752-7759), which reads local.
+- That check compares local usage with a self-set soft limit, `COORDINATOR_STORAGE_SOFT_QUOTA_BYTES` = 100 MiB (sw.js 690), and warns at 80% (`COORDINATOR_STORAGE_QUOTA_WARN_RATIO`, sw.js 691). It is not the browser quota.
+- Session writes: a refused write returns false and is counted (`progress.sessionWriteRefused`, sw.js ~7246-7248). A thrown write is counted and rethrown (`progress.sessionWriteFailed`). Session writes are not checked against any quota before they are made (confirms section 6.1, item 8).
+
+### 11.3 Session growth paths
+
+| Path                                                                                          | Bound                                                                                                            | Source                                        |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| Profile progress view                                                                         | At most 1,200 records                                                                                            | sw.js 738                                     |
+| Profile progress shards (256 names)                                                           | Full records, one per profile href. No count cap in code. Grows with the profiles processed.                     | `swProfileNukeProgress.js`                    |
+| WAL session mirror (meta, active manifest, the queue's shards, committed segments of the active slot) | Built 27 Oct: queue shards and WAL only, for area-v1 manifests (a shared-layout manifest keeps every shard). Completed and runs shards are not mirrored. Queue rows have no count cap, so the mirror follows the queue. | `sw.js` ~7550-7642; `walSnapshotStore.js` (`getQueueMirrorKeys`) |
+| Outlier session copy | Index only: at most 50 outlier summaries. Bodies stay on disk (27 Oct); events capped at 100 per outlier. Runs are not in session (27 Oct). | `sw.js` ~7386 |
+| Flight recorder snapshot                                                                      | At most 2,000 entries; strings at most 240 characters, URLs at most 500                                          | `tunables.js` 16; `swflightRecorder.js` 30-31 |
+| Markers, stamps, pending marker, surface state, timing cache, erase generation, legacy marker | One object each (timing cache size not traced)                                                                   | Section 9.3                                   |
+
+**Sum.** The session-stored total is bounded only in part. The progress shards and the WAL mirror have no count cap in code: their size follows the number of queue rows and progress records. Those two are unbounded in principle and bounded in practice by how much the user has queued. The fixed bounds apply to the progress view (1,200 records), the flight snapshot (2,000 entries) and outliers (50). The WAL mirror holds the queue's shards and WAL only (built 27 Oct), so the session footprint is roughly the queue, the progress shards, the outlier list and the flight snapshot. The queue is self-limiting (section 1). The 26 Oct measurement predates this change. No number has been measured against the 10 MB session quota. Session writes have no quota pre-check, so a refused write surfaces only as a write that returns false.
+
+### 11.4 Unverified without a live measurement
+
+- `getBytesInUse` on the session area and on the local area in a live browser. The code never measures the session area; the 26 Oct measurement (section 11.2) was taken by hand.
+- Sizes of one queue row, one completed row, one progress record and one flight entry, in JSON bytes. The ratio of session mirror size to disk WAL size.
+- Whether session quota is counted at JSON size or at the "estimated memory" measure the Chrome page describes.
+- Firefox `storage.session` quota and behaviour.
+- Whether `previousEpochs` (metrics), `dismissedKeys` (outliers), and the timing cache have caps.
+- Whether the 100 MiB local soft limit has ever been reached on any profile.
+
+## 12. Corrections found in the 26 Oct enumeration
+
+These are new findings. Earlier text is not rewritten here; each item names the place it conflicts with.
+
+1. The space post map is not in the code. `storageKeys.js` has no `SPACE_NUKED_POSTS_KEY`, `SPACE_PENDING_NUKED_POSTS_KEY` or `SPACE_MAP_LAYOUT_KEY`, and `shared/js/spaceMapStorage.js` does not exist. The `nukedPosts.js` header says the space post map was removed on 25 Oct (commits `62a67ea` and `8e146cc`). Sections 2.2, 2.5 (the rows for these three names), 3.4 (the "Nuked map" and "Register candidates" paragraphs), 4.9 (space post maps) and 6.1 item 3 describe it as present. The pending records are described in `8e146cc` as held in memory; not traced.
+2. Section 2.5 lists `COORDINATOR_RUNS_LAYOUT_KEY` (`mbCoordinatorRunsLayoutVersion`). It is not in the code (the runs bucket layout was excised in `8d08054`).
+3. The legacy progress cleanup may overlap the live progress shards. `getLegacyContentIndexCleanupNames` (sw.js ~35512-35515) builds 32 legacy shard names with `PROFILE_NUKE_PROGRESS_SHARD_PREFIX`. The live shards use the same prefix with count 256 (`storageKeys.js` 18), so names `mbProfileNukeProgressShard.0` to `.31` are the same strings. The comment at sw.js ~35512 says live shards are never on this list. Not confirmed at runtime; check when the cleanup runs relative to progress writes.
+4. `mbCoordinatorEvents` has no live writer (`eventsChanged = false`, sw.js 10648). Sections 2 and 5 do not mention it.
+5. Nine preference keys and three `swprefs.js` constants are declared outside `storageKeys.js`. The header of `storageKeys.js` says every storage key name is declared there. Whether `test/p1-contract.test.js` checks these names was not read.
+6. `DEV_MODE_SYNC_STORAGE_KEY` is named "sync" but the code uses `browser.storage.local` (`coordinator.js` 697).
+7. `mbEraseBlockHistoryGeneration` has no reader in `shared/js`. Section 5.3 implies that an open content script reads it; no such reader was found.
+8. `mbPauseDiagnosticSnapshot` has no reader in `shared/js`.
+9. Superseded by the 26 Oct header update (lines 3 and 9): version 1.6.1650, working tree ahead of HEAD `8e146cc`.
+10. `nukedPosts.js` uses 30 days only as an invalid-value fallback. The stored default is 90 (`defaults.js` 8).
+11. The local soft quota (100 MiB, warn at 80%, sw.js 690-691) is not described anywhere in sections 1 to 8.
+12. Section 6.1 item 8 (no quota check on session writes) is confirmed for session. The session area is never measured by code.
+
+### 12.1 Corrections found on 27 Oct
+
+1. Session mirror: sections 2.1, 4.7, 9.3, 10.3 and 11.3 said the run list was mirrored and that the mirror followed all areas. The mirror holds the queue's shards and WAL only, and `QUEUE_NAMESPACE_MIRROR_KEYS` holds the outlier list alone (`sw.js`). Corrected in those sections.
+2. Runs partition: sections 4.3, 4.6 and 10.3 said runs were not partitioned by run shard. They are, in namespace 2. Corrected.
+3. Queue wakeup metrics: sections 2.3, 9.2, 9.3 and 10.9 said the code wrote them to local storage. It writes the session area. Corrected.
+4. Section 1.4 listed space-feed routes that `swBootstrap.js` no longer routes. Corrected.
+5. Section 5.3 step 7 said only the marker is kept. The keep set now holds one more key (section 5.3).
+6. Section 2.5 had no row for the 1.5 import marker. Added.
+7. Decided: Clear All Stats resets the outlier baseline to zero (`applyCoordinatorOutlierReset`), for now (owner, 27 Oct). See section 5.4.
+
+### 12.2 Corrections and changes on 28 Oct
+
+1. Version: the working tree is at 1.6.1665 (`package.json` and both manifests, checked 29 Oct). The header of this file says so.
+2. HEAD: the owner's note gives `3ab637d` as the last commit. The log shows `3ab637d`, then the WIP snapshot `7abdfea` (working tree at 1.6.1662), then `d9a35c2` (a join commit with no content change). HEAD is `d9a35c2`. Nothing from 28 Oct is committed.
+3. Section 1.4 now lists `resume-paused-coordinator-nukes` and `remove-coordinator-failed-work-item`, which the route table lacked.
+4. Section 3.6 lists `REMOVE_FAILED_STORED_WORK_ITEM` under stored work.
+5. The failed-activation outcome is `action-error` where a timeout-named release reason is absent. Section 6.1b says which paths; the 27 Oct text in section 6.1a is unchanged.
+6. The blocked-live-tab probe's wait and the rollback no-op are in section 3.1. The 27 Oct text did not describe them.

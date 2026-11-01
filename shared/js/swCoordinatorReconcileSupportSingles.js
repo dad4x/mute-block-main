@@ -84,6 +84,9 @@
 // from modules constructed even earlier) -- no thunk is needed for any
 // dependency.
 
+const {COORDINATOR_QUEUE_VIEW_KEY} = require('./storageKeys')
+const {recordQueueBarSummary, summarizeQueueBarView, pushQueueBarSummary} = require('./swQueueBarSummary')
+
 function createCoordinatorReconcileSupportSingles(deps = {}) {
     const now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     const {
@@ -159,6 +162,13 @@ function createCoordinatorReconcileSupportSingles(deps = {}) {
         const state = {}
         for(const key of changedKeys) {
             if(Object.prototype.hasOwnProperty.call(payload || {}, key)) state[key] = payload[key]
+        }
+
+        // Owner decision 11 (18 Oct): this is the one hook for queue-view changes. The queue bar's summary is recorded from the view
+        // the broadcast carries, and a change of total or pending is pushed to the open Quora tabs. No storage is read or written.
+        if(changedKeys.includes(COORDINATOR_QUEUE_VIEW_KEY) && state[COORDINATOR_QUEUE_VIEW_KEY]) {
+            const {summary, changed} = recordQueueBarSummary(summarizeQueueBarView(state[COORDINATOR_QUEUE_VIEW_KEY], now()))
+            if(changed) void pushQueueBarSummary(browser, summary)
         }
 
         void browser.runtime.sendMessage({

@@ -51,6 +51,23 @@
 // surface that something was dropped, rather than silently.
 const COORDINATOR_TIMING_SAMPLE_MAX_PLAUSIBLE_MS = 1800000
 
+// Counts durations (ms) into the buckets that the edges define (owner, 26 Oct; the edges are HISTOGRAM_DURATION_EDGES_SEC in tunables.js).
+// Each edge is a lower bound in seconds: a bucket includes its lower bound and excludes the next edge, and the last bucket has no upper
+// bound. A duration below the first edge, or one that is not a number, is not counted. Returns one count per edge.
+function countDurationHistogramBuckets(durationsMs = [], edgesSec = []) {
+    const edgesMs = (Array.isArray(edgesSec) ? edgesSec : []).map(edge => Number(edge) * 1000)
+    const counts = edgesMs.map(() => 0)
+    if(!edgesMs.length) return counts
+    for(const duration of Array.isArray(durationsMs) ? durationsMs : []) {
+        const ms = Number(duration)
+        if(!Number.isFinite(ms) || ms < edgesMs[0]) continue
+        let index = 0
+        while(index + 1 < edgesMs.length && ms >= edgesMs[index + 1]) index += 1
+        counts[index] += 1
+    }
+    return counts
+}
+
 function createCoordinatorQueueView(deps = {}) {
     const {now} = deps
     const {
@@ -616,9 +633,12 @@ function createCoordinatorQueueView(deps = {}) {
 
     function makeCoordinatorCurrentWorkAccounting(queue = {}) {
         const counts = makeCoordinatorQueueAccountingCounts(queue).counts
-        const ready = Number(counts.queued) || 0
+        // An active row with no tab yet is waiting for the worker surface, so it counts as ready (31 Oct, display only; the same rule as
+        // the dashboard row in coordinator.js).
+        const waitingForTab = Object.values(queue || {}).filter(item => item?.status === 'active' && !item?.tabId).length
+        const ready = (Number(counts.queued) || 0) + waitingForTab
         const active = ['opening', 'active', 'acting', 'settling']
-            .reduce((total, status) => total + (Number(counts[status]) || 0), 0)
+            .reduce((total, status) => total + (Number(counts[status]) || 0), 0) - waitingForTab
         const succeeded = Number(counts.succeeded) || 0
         const failed = Number(counts.failed) || 0
 
@@ -659,5 +679,6 @@ function createCoordinatorQueueView(deps = {}) {
 }
 
 module.exports = {
-    createCoordinatorQueueView
+    createCoordinatorQueueView,
+    countDurationHistogramBuckets
 }

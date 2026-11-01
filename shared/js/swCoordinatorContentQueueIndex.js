@@ -269,8 +269,8 @@ function createCoordinatorContentQueueIndex(deps = {}) {
     // mbCoordinatorQueueView is never persisted. Every call site that used to
     // get the queue view "for free" as part of this bundle now broadcasts it
     // separately via notifyCoordinatorDashboardStateChanged instead.
-    // content-queue-index/source-index are untouched -- content.js's own UI
-    // reads those back from storage, so they still need to land on disk.
+    // content-queue-index/source-index are not stored: they are derived in memory
+    // from the resident queue (readResidentDerivedQueueIndex in sw.js), so nothing writes them to disk.
     function buildCoordinatorQueueDerivedProjectionPayload(queue = {}, nowMs = now()) {
         return {
             [COORDINATOR_CONTENT_QUEUE_INDEX_KEY]: buildCoordinatorContentQueueIndex(queue, nowMs),
@@ -279,8 +279,11 @@ function createCoordinatorContentQueueIndex(deps = {}) {
         }
     }
 
+    // Builds a queue-only WAL checkpoint. Callers: the empty-fallback in swCoordinatorQueueWal.js and the WAL store's makeCheckpoint
+    // (sw.js). None of them passes runs, so the checkpoint holds the queue alone.
     function makeCoordinatorQueueWalCheckpoint(queue = {}, options = {}) {
-        return makePairedCheckpointStore({queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(queue || {}))}, {
+        const state = {queue: normalizeCoordinatorMap(cloneCoordinatorAuthorityValue(queue || {}))}
+        return makePairedCheckpointStore(state, {
             snapshotSeq: Number.parseInt(options.snapshotSeq, 10) || 0,
             nextSeq: Number.parseInt(options.nextSeq, 10) || 1,
             createdAt: Number.parseInt(options.createdAt, 10) || now()

@@ -1,3 +1,5 @@
+const {namespaceChanges} = require('./storageNamespace')
+
 // Bootstrap/wiring tail extracted from sw.js (decomposition Slice 1).
 //
 // This module is pure composition-root code: a single function that
@@ -16,17 +18,126 @@
 // accessors rather than snapshotted values, so a listener registered once
 // at startup still observes current state whenever it fires later.
 
+const {QUEUE_BAR_GET_ACTION, getQueueBarSummary, summarizeQueueBarView, recordQueueBarSummary, subscribeQueueBarTab, pushQueueBarSummary} = require('./swQueueBarSummary')
+const {PROFILE_NUKE_PROGRESS_CLEAR_ACTION, PROFILE_NUKE_PROGRESS_GET_ACTION} = require('./swProfileNukeProgressPush')
+
 function registerServiceWorkerListeners(deps = {}) {
     const {
         browser
     } = deps
+    // A tab event can change how queued rows classify (a tab opened, closed or updated), so it bumps the executor input generation.
+    const bumpExecutorInput = typeof deps.bumpExecutorInputGeneration === 'function' ? deps.bumpExecutorInputGeneration : () => {}
+
+    // Times a request a content script awaits before it acts (profile pages wait on these), so a slow
+    // worker shows up in the flight recorder as a content-request event. Diagnostic only.
+    function timeContentRequest(action, run) {
+        const startedAt = Date.now()
+        const record = accepted => recordFlightRecorderEvent({
+            kind: 'content-request',
+            source: 'swBootstrap',
+            reason: action,
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+            accepted,
+            changed: false
+        })
+        return Promise.resolve().then(run).then(
+            result => {
+                record(true)
+                return result
+            },
+            error => {
+                record(false)
+                throw error
+            }
+        )
+    }
+    // D4: the message actions that read coordinator state. Each waits for the resident authority before its handler runs.
+    // Every other action dispatches at once: the five that read only settings, metrics, the flight recorder, or in-memory debug
+    // status (get-debug-resume-limit-status, refresh-queue-wakeup-metrics-view, reset-queue-wakeup-metrics, get-flight-recorder,
+    // record-page-event) and any action no handler matches, which gets no response as before. An
+    // action added to the dispatch chain without an entry here runs ungated, so a read of an unloaded authority fails loudly.
+    const RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY = new Set([
+        // The queue bar's summary is answered after startup, so a request made on a cold worker waits for the authority (18 Oct).
+        QUEUE_BAR_GET_ACTION,
+        // A tool's read of the progress waits for the authority too, so it never reads an unloaded copy (decision 32).
+        PROFILE_NUKE_PROGRESS_GET_ACTION,
+        PROFILE_NUKE_PROGRESS_CLEAR_ACTION,
+        'cloudflare-challenge-detected',
+        'create-tab',
+        'enqueue-coordinator-items',
+        'open-coordinator',
+        'open-coordinator-history',
+        'coordinator-page-ready',
+        'pause-coordinator-nukes',
+        'clear-coordinator-events',
+        'clear-coordinator-outliers',
+        'get-coordinator-outlier-events',
+        'set-coordinator-retry-failed-enabled',
+        'resume-paused-coordinator-nukes',
+        'cancel-coordinator-current-work',
+        'cancel-coordinator-current-work-item',
+        'remove-coordinator-failed-work-item',
+        'clear-coordinator-current-work',
+        'clear-completed-history',
+        'reconcile-coordinator-storage',
+        'refresh-coordinator-queue-view',
+        'refresh-coordinator-runs-view',
+        'refresh-coordinator-dashboard-views',
+        'get-coordinator-queue-accounting',
+        'get-coordinator-why-not-running',
+        'clear-coordinator-terminal-stats',
+        'get-content-page-coordinator-state',
+        'resume-coordinator-queue',
+        'retry-coordinator-failed',
+        'claim-tab-action',
+        'resolve-queued-profile-target',
+        'resolve-queued-profile-target-failed',
+        'promote-queued-tab',
+        'activate-confirmation-in-page-world',
+        'begin-profile-action',
+        'request-action-lease',
+        'record-initial-blocked-state',
+        'heartbeat-action-lease',
+        'release-action-lease',
+        'release-job-tab',
+        'cancel-queued-owner-nukes',
+        'pause-owner-nukes',
+        'close-tab',
+        'record-job-milestone',
+        'record-job-terminal',
+        'record-direct-profile-progress',
+        'record-manual-profile-action',
+        'get-recent-history',
+        'clear-profile-nuke-state',
+        'settle-terminal-coordinator-items',
+        'get-owned-nuke-status',
+        'get-coordinator-queue-runtime-state',
+        'cleanup-owned-nuke-status',
+        'sweep-owned-blocked-profile-tabs',
+        'sweep-service-worker-blocked-profile-tabs'
+    ])
+
+    // The choke point (D4). A listener that can touch coordinator state runs only once the resident authority is loaded. A
+    // hydrated authority makes ensureCoordinatorAuthorityHydrated return null, so the run starts at once with no added await.
+    // A load that fails never reaches the handler: a listener that responds rejects, so the sender gets an error rather than a
+    // hang; a fire-and-forget listener drops it (the failed load is already recorded as a coordinator-authority-unavailable
+    // diagnostic).
+    function runAfterCoordinatorAuthorityReady(run, {respond = false} = {}) {
+        const pending = ensureCoordinatorAuthorityHydrated()
+        if(!pending) return run()
+        const ready = pending.then(() => run())
+        return respond ? ready : ready.catch(() => null)
+    }
+
     const {
         defaults,
         COORDINATOR_RESUME_ALARM_NAME,
         COORDINATOR_RETRY_FAILED_ENABLED_KEY,
         PERSISTENT_FAILED_RETRY_ALARM_NAME,
-        PROFILE_NUKE_PROGRESS_VIEW_KEY,
-        TARGET_QUEUED_TAB_CONCURRENCY_KEY
+        TARGET_QUEUED_TAB_CONCURRENCY_KEY,
+        WORKER_WINDOW_FOREGROUND_MODE_KEY,
+        NUKED_POST_RETENTION_DAYS_KEY,
+        MAX_REMEMBERED_NUKED_POSTS_KEY
     } = deps.constants || {}
     const {
         coordinatorReconcileScheduler,
@@ -36,9 +147,7 @@ function registerServiceWorkerListeners(deps = {}) {
         getCoordinatorTabId,
         getQueuedActionSurfaceAnchorTabId,
         getQueuedActionSurfaceWindowId,
-        getProfileNukeProgressProjectionWriteDepth,
-        getProfileNukeProgress,
-        setProfileNukeProgress
+        getProfileNukeProgress
     } = deps.state || {}
     const {
         activateConfirmationElementInPageWorld,
@@ -46,14 +155,17 @@ function registerServiceWorkerListeners(deps = {}) {
         beginCoordinatorProfileAction,
         cancelCoordinatorCurrentWork,
         cancelCoordinatorCurrentWorkItem,
+        removeCoordinatorFailedWorkItem,
         cancelQueuedOwnerActions,
         claimPendingTabAction,
+        clearCoordinatorCompletedHistory,
         clearCoordinatorCurrentWork,
         clearCoordinatorReconcileAlarms,
         clearCoordinatorTerminalStats,
         clearPersistentFailedRetry,
         clearSchedulerAlarms,
         closeIdleQueuedWorkerActionSurfaceWindows,
+        closeQueuedTabAfterTerminal,
         closeQueuedWorkerActionSurfaceIfIdle,
         consumeCanceledOwnerUrls,
         createOwnedTab,
@@ -67,18 +179,20 @@ function registerServiceWorkerListeners(deps = {}) {
         forgetRemovedCoordinatorTabId,
         getAttemptIdFromValue,
         getAttemptNumberFromValue,
-        getChangedProfileProgressRecords,
         getContentPageCoordinatorState,
         getCoordinatorQueueAccounting,
         getCoordinatorQueueRuntimeState,
         getCoordinatorWhyNotRunning,
         getErrorPageUrl,
         getFlightRecorder,
+        getDebugResumeLimitStatus,
         getLiveOwnedTabIds,
         getOwnedNukeStatus,
         getQueuedTabMetadata,
         handleCoordinatorBrowserStartup,
         recordInitialBlockedStateFromRequest,
+        requestProfileBlockedPageEventCheck,
+        requestQueuedTabRemovalRefill,
         heartbeatCoordinatorActionLease,
         incrementQueueWakeupMetric,
         isBrowserTabId,
@@ -96,9 +210,7 @@ function registerServiceWorkerListeners(deps = {}) {
         markQueuedTabClosing,
         markQuoraRuntimeActivated,
         markQuoraRuntimeActivatedFromRequest,
-        mergeStoredProfileProgressRecord,
         metricStorageSet,
-        normalizeProfileNukeProgressView,
         normalizeQuoraProfileUrl,
         normalizeRuntimeMessageAction,
         normalizeTabId,
@@ -106,11 +218,25 @@ function registerServiceWorkerListeners(deps = {}) {
         openCoordinatorPage,
         openCoordinatorHistoryPage,
         pauseCoordinatorNukes,
+        clearCoordinatorEventsRequested,
+        eraseBlockHistoryRequested,
+        clearCoordinatorOutliersRequested,
+        getCoordinatorOutlierEventsRequested,
+        setCoordinatorRetryFailedEnabledRequested,
+        setExtensionSettingsRequested,
+        setSpaceSortRequested,
+        setSpaceRecordRequested,
+        setDevModeEnabledRequested,
+        setHiddenRunIdsRequested,
+        claimDebugRunAutosaveRequested,
+        registerQueuedWorkerActionSurfaceRequested,
         promoteQueuedTab,
         reconcileCoordinatorStorageBestEffort,
         reconcileReleasedActiveCoordinatorTab,
         recordCoordinatorJobProgressViaQueueMachine,
         recordDirectProfileProgressFromRequest,
+        recordManualProfileActionRequested,
+        getRecentHistoryRequested,
         recordFlightRecorderEvent,
         recordJobProgressFromRequest,
         refreshCoordinatorQueueViewForDashboard,
@@ -123,7 +249,6 @@ function registerServiceWorkerListeners(deps = {}) {
         rememberCanceledOwnerUrls,
         rememberQueueLoadPressure,
         requestCoordinatorActionLease,
-        requeueCoordinatorFailedItems,
         resetQueueWakeupMetricsEpochAfterLoad,
         resetQueuedWorkerActionSurface,
         resolveQueuedProfileTarget,
@@ -133,6 +258,7 @@ function registerServiceWorkerListeners(deps = {}) {
         retryCoordinatorFailedItems,
         runPersistentFailedRetryTick,
         runScheduledCoordinatorQueueResume,
+        handleDebugResumeLimitAlarm,
         runScheduledCoordinatorReconcileTick,
         scheduleCoordinatorQueueResume,
         scheduleCoordinatorReconcile,
@@ -140,9 +266,13 @@ function registerServiceWorkerListeners(deps = {}) {
         scheduleQueuedWorkContinuation,
         scheduleQueuedWorkerActionSurfaceCleanup,
         scheduleStoredWorkRearmAfterExtensionReload,
+        noteTabRemoved,
         sendTabMessage,
         setQueuedTabMetadata,
         setTargetQueuedTabConcurrency,
+        setWorkerWindowForegroundMode,
+        setRecentHistoryRetentionDays,
+        setRecentHistoryMaxEntries,
         shouldAllowStoredWorkBeforeQuora,
         startUserInitiatedCoordinatorQueueResume,
         stopOwnerNukes,
@@ -151,9 +281,17 @@ function registerServiceWorkerListeners(deps = {}) {
         terminalizeQueuedTabNonProfileLandingFromMetadata,
         terminalizeQueuedTabProfileRedirectMismatchFromMetadata,
         validateQueuedTabAttempt,
+        ensureCoordinatorAuthorityHydrated,
+        readProfileNukeProgressForTools,
+        clearProfileNukeProgressForTools,
+        retireUnusedVersion15StorageKeys,
+        checkStorageBuild,
+        noteStorageRemovals
     } = deps.handlers || {}
 
-    browser.runtime.onInstalled.addListener(details => {
+    function handleRuntimeInstalled(details) {
+        void retireUnusedVersion15StorageKeys().catch(() => null)
+        void checkStorageBuild({reason: details.reason, previousVersion: details.previousVersion}).catch(() => null)
         const resetReason = details.reason === 'install'
             ? 'extension-installed'
             : 'extension-updated'
@@ -170,12 +308,19 @@ function registerServiceWorkerListeners(deps = {}) {
             scheduleStoredWorkRearmAfterExtensionReload(resetReason)
             return null
         })
-    })
-    browser.runtime.onStartup.addListener(() => {
+    }
+    function handleRuntimeStartup() {
+        void retireUnusedVersion15StorageKeys().catch(() => null)
+        void checkStorageBuild({reason: 'startup'}).catch(() => null)
         return handleCoordinatorBrowserStartup()
-    })
+    }
+    browser.runtime.onInstalled.addListener(details => runAfterCoordinatorAuthorityReady(() => handleRuntimeInstalled(details)))
+    browser.runtime.onStartup.addListener(() => runAfterCoordinatorAuthorityReady(() => handleRuntimeStartup()))
     if(browser.alarms?.onAlarm) {
-        browser.alarms.onAlarm.addListener(async alarm => {
+        const handleAlarm = async alarm => {
+            if(handleDebugResumeLimitAlarm(alarm?.name)) {
+                return null
+            }
             if(alarm?.name === COORDINATOR_RESUME_ALARM_NAME) {
                 if(isSuppressedStaleCoordinatorResumeAlarm(alarm)) {
                     incrementQueueWakeupMetric('pump.alarmStale')
@@ -214,9 +359,18 @@ function registerServiceWorkerListeners(deps = {}) {
                 }
                 void runPersistentFailedRetryTick()
             }
-        })
+        }
+        browser.alarms.onAlarm.addListener(alarm => runAfterCoordinatorAuthorityReady(() => handleAlarm(alarm)))
     }
-    browser.tabs.onRemoved.addListener(tabId => {
+    function handleTabRemoved(tabId) {
+        noteTabRemoved(tabId)
+        recordFlightRecorderEvent({
+            kind: 'tab-removed',
+            source: 'tabs.onRemoved',
+            tabId,
+            accepted: true,
+            changed: false
+        })
         notifyQueuedWorkerActionSurfaceSlotMaybeFreed()
 
         if(normalizeTabId(tabId) === normalizeTabId(getQueuedActionSurfaceAnchorTabId())) {
@@ -231,7 +385,11 @@ function registerServiceWorkerListeners(deps = {}) {
         }
     
         const detached = detachQueuedTabRuntimeState(tabId, 'tab-removed')
-    
+        // Any tab removal may free the worker-window slot, so the fill runs again now (owner 18 Oct). Most removals are tabs the
+        // worker closed itself, and their queued-tab metadata is already gone, so the refill is not gated on it. Coalesced, and
+        // a no-op while paused.
+        requestQueuedTabRemovalRefill()
+
         void ownedTabIdsReady.then(async () => {
             const metadata = detached.metadata
             const isOwnerTab = detached.wasOwnerTab
@@ -354,21 +512,39 @@ function registerServiceWorkerListeners(deps = {}) {
                 metadata,
                 wasActive: detached.wasActive,
                 foregroundLeaseReleased: detached.foregroundLeaseReleased
-            }).catch(() => null)
+            }).catch(() => incrementQueueWakeupMetric('queuedTab.releaseFailed'))
             if(metadata?.profileHref || metadata?.coordinatorKey || isOwnerTab || wasOwnedChild) {
                 scheduleCoordinatorQueueResume(1000, 'tab-removed', {
                     allowBeforeQuora: true
                 })
             }
         })
+    }
+    browser.tabs.onRemoved.addListener(tabId => {
+        bumpExecutorInput()
+        return runAfterCoordinatorAuthorityReady(() => handleTabRemoved(tabId))
     })
-    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    function handleTabUpdated(tabId, changeInfo, tab) {
         const observedUrl = `${changeInfo.url || tab?.url || ''}`.trim()
         if(isQuoraRuntimeUrl(observedUrl)) {
             markQuoraRuntimeActivated('quora-tab-updated')
         }
     
         const metadata = getQueuedTabMetadata(tabId)
+        if(metadata && (changeInfo.url || changeInfo.status)) {
+            // Each URL or load-status change on a queued tab, with the path only, so the navigation just before a frame goes away is visible.
+            let changedPath = ''
+            if(changeInfo.url) {
+                try { changedPath = new URL(changeInfo.url).pathname } catch {}
+            }
+            recordFlightRecorderEvent({
+                kind: 'tab-navigation',
+                tabId,
+                status: changeInfo.status || '',
+                path: changedPath,
+                targetUrl: metadata.profileHref || ''
+            })
+        }
         if(metadata && changeInfo.status === 'complete') {
             // Marks the browser-level page-load boundary of a handoff, split
             // from 'tab-open-request' (swexecutor.js, fired when the tab is
@@ -412,7 +588,7 @@ function registerServiceWorkerListeners(deps = {}) {
     
                 if(errorPageUrl && /^(?:chrome|edge|about|moz-extension|chrome-error):/i.test(errorPageUrl)) {
                     const closeRequestedAt = markQueuedTabClosing(tabId, 'browser-error-page')
-                    void releaseQueuedTab(tabId)
+                    void releaseQueuedTab(tabId).catch(() => incrementQueueWakeupMetric('queuedTab.releaseFailed'))
                     void recordCoordinatorJobProgressViaQueueMachine(metadata.profileHref, {
                         status: 'error-page',
                         finalError: 'Queued tab navigated to a browser error page',
@@ -454,8 +630,12 @@ function registerServiceWorkerListeners(deps = {}) {
         queueRuntime.pauseQueuedOwner(tabId)
         const canceledUrls = cancelQueuedOwnerActions(tabId, 'nuke')
         rememberCanceledOwnerUrls(tabId, canceledUrls)
+    }
+    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+        bumpExecutorInput()
+        return runAfterCoordinatorAuthorityReady(() => handleTabUpdated(tabId, changeInfo, tab))
     })
-    browser.storage.onChanged.addListener((changes, areaName) => {
+    function handleStorageChanged(changes, areaName) {
         if(areaName !== 'local') return
     
         if(getQuoraRuntimeActivated() && changes?.[COORDINATOR_RETRY_FAILED_ENABLED_KEY]?.newValue) {
@@ -467,39 +647,33 @@ function registerServiceWorkerListeners(deps = {}) {
         if(changes?.[TARGET_QUEUED_TAB_CONCURRENCY_KEY]) {
             setTargetQueuedTabConcurrency(changes[TARGET_QUEUED_TAB_CONCURRENCY_KEY].newValue)
         }
-        if(!changes?.[PROFILE_NUKE_PROGRESS_VIEW_KEY]) return
-        if(getProfileNukeProgressProjectionWriteDepth() > 0) return
-    
-        const oldProgress = normalizeProfileNukeProgressView(changes[PROFILE_NUKE_PROGRESS_VIEW_KEY].oldValue || null).records
-        const nextProgress = normalizeProfileNukeProgressView(changes[PROFILE_NUKE_PROGRESS_VIEW_KEY].newValue || null).records
-        const changedProgress = getChangedProfileProgressRecords(oldProgress, nextProgress)
-        if(Object.keys(nextProgress).length) {
-            const mergedProgress = {
-                ...getProfileNukeProgress()
-            }
-            for(const [profileHref, record] of Object.entries(nextProgress)) {
-                mergedProgress[profileHref] = mergeStoredProfileProgressRecord(
-                    mergedProgress[profileHref] || null,
-                    record,
-                    profileHref
-                )
-            }
-            setProfileNukeProgress(mergedProgress)
+        if(changes?.[WORKER_WINDOW_FOREGROUND_MODE_KEY]) {
+            setWorkerWindowForegroundMode(changes[WORKER_WINDOW_FOREGROUND_MODE_KEY].newValue)
         }
-        const terminalChangedProgress = Object.fromEntries(
-            Object.entries(changedProgress)
-                .filter(([, record]) => isTerminalProfileNukeRecord(record))
-        )
-        if(Object.keys(terminalChangedProgress).length) {
-            scheduleCoordinatorQueueResume(1000, 'terminal-progress', {
-                allowBeforeQuora: true
-            })
-        }
+        // The completed-work log uses the recent-history preferences: applied to the next checkpoint.
+        if(changes?.[NUKED_POST_RETENTION_DAYS_KEY]) setRecentHistoryRetentionDays(changes[NUKED_POST_RETENTION_DAYS_KEY].newValue)
+        if(changes?.[MAX_REMEMBERED_NUKED_POSTS_KEY]) setRecentHistoryMaxEntries(changes[MAX_REMEMBERED_NUKED_POSTS_KEY].newValue)
+        // Progress lives in session storage (decision 31), and nothing writes its view to disk now, so no progress key is read here.
+        // A change to the old disk key is not handled (20 Oct review, decision 2).
+    }
+    browser.storage.onChanged.addListener((changes, areaName) => {
+        if(areaName !== 'local') return undefined
+        // This layout's keys only, with their plain names (storageNamespace.js).
+        const ownChanges = namespaceChanges(changes)
+        if(!ownChanges) return undefined
+        // Synchronous, before the readiness gate: a clear is seen at once, so a switch that starts after it cannot reuse a slot that is gone.
+        noteStorageRemovals(ownChanges)
+        return runAfterCoordinatorAuthorityReady(() => handleStorageChanged(ownChanges, areaName))
     })
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const action = normalizeRuntimeMessageAction(request)
         request = {...(request || {}), action}
         markQuoraRuntimeActivatedFromRequest(request, sender, `message:${describeRuntimeMessage(request)}`)
+        if(!RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.has(request.action)) return dispatchRuntimeMessage(request, sender)
+        return runAfterCoordinatorAuthorityReady(() => dispatchRuntimeMessage(request, sender), {respond: true})
+    })
+
+    function dispatchRuntimeMessage(request, sender) {
     
         if(request.action === 'create-tab') {
             return createOwnedTab({
@@ -522,11 +696,10 @@ function registerServiceWorkerListeners(deps = {}) {
             return enqueueCoordinatorItems(request, sender)
         }
         else if(request.action === 'open-coordinator') {
-            // sender.tab is only populated for messages from a content
-            // script in a tab -- the popup has no tab of its own, so it
-            // sends its own window id explicitly (see popup.js). Prefer
-            // that when present; sender.tab?.windowId covers any other
-            // caller that IS a content script.
+            // sender.tab is only populated for messages from a tab. The
+            // preferences page sends its own window id as well (see
+            // preferences.js). Prefer that when present; sender.tab?.windowId
+            // covers any other caller that is a tab.
             return openCoordinatorPage({
                 windowId: Number.parseInt(request.windowId, 10) || sender.tab?.windowId || null,
                 active: request.active === true
@@ -555,8 +728,44 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'pause-coordinator-nukes') {
             return pauseCoordinatorNukes()
         }
+        else if(request.action === 'clear-coordinator-events') {
+            return clearCoordinatorEventsRequested()
+        }
+        else if(request.action === 'clear-coordinator-outliers') {
+            return clearCoordinatorOutliersRequested()
+        }
+        else if(request.action === 'get-coordinator-outlier-events') {
+            return getCoordinatorOutlierEventsRequested(request)
+        }
+        else if(request.action === 'erase-block-history') {
+            return eraseBlockHistoryRequested(request)
+        }
+        else if(request.action === 'set-coordinator-retry-failed-enabled') {
+            return setCoordinatorRetryFailedEnabledRequested(request.enabled === true)
+        }
+        else if(request.action === 'set-extension-settings') {
+            return setExtensionSettingsRequested(request.settings)
+        }
+        else if(request.action === 'set-space-sort') {
+            return setSpaceSortRequested(request.sortBy)
+        }
+        else if(request.action === 'set-space-record') {
+            return setSpaceRecordRequested(request)
+        }
+        else if(request.action === 'set-dev-mode-enabled') {
+            return setDevModeEnabledRequested(request.enabled === true)
+        }
+        else if(request.action === 'set-hidden-run-ids') {
+            return setHiddenRunIdsRequested(request.runIds)
+        }
+        else if(request.action === 'claim-debug-run-autosave') {
+            return claimDebugRunAutosaveRequested(request.limitId)
+        }
+        else if(request.action === 'register-queued-worker-action-surface') {
+            return registerQueuedWorkerActionSurfaceRequested(sender)
+        }
         else if(request.action === 'resume-paused-coordinator-nukes') {
-            return resumePausedCoordinatorNukes()
+            return resumePausedCoordinatorNukes({debugLimit: request.debugLimit || null})
         }
         else if(request.action === 'cancel-coordinator-current-work') {
             return cancelCoordinatorCurrentWork()
@@ -564,8 +773,43 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'cancel-coordinator-current-work-item') {
             return cancelCoordinatorCurrentWorkItem(request)
         }
+        else if(request.action === 'remove-coordinator-failed-work-item') {
+            return removeCoordinatorFailedWorkItem(request)
+        }
+        else if(request.action === QUEUE_BAR_GET_ACTION) {
+            // The queue bar's summary, as the worker holds it (decisions 9 and 11). Null until a queue view has been recorded. The asking
+            // tab is subscribed, so it receives later pushes (decision 15).
+            subscribeQueueBarTab(sender?.tab?.id)
+            if(getQueueBarSummary()) return Promise.resolve({summary: getQueueBarSummary()})
+            // A cold worker has recorded no summary yet. The first view after startup is built here, its summary recorded and pushed
+            // (decision 2, 18 Oct). A failed build answers null, which hides the bar.
+            return refreshCoordinatorQueueViewForDashboard('queue-bar-first-build').then(result => {
+                if(result?.view) {
+                    const {summary, changed} = recordQueueBarSummary(summarizeQueueBarView(result.view, Date.now()))
+                    if(changed) void pushQueueBarSummary(browser, summary)
+                }
+                return {summary: getQueueBarSummary()}
+            }).catch(() => ({summary: null}))
+        }
+        else if(request.action === PROFILE_NUKE_PROGRESS_GET_ACTION) {
+            // Tools read the whole progress through the worker (decision 32): the stored copy, as the content page reads it (20 Oct review).
+            return Promise.resolve(readProfileNukeProgressForTools()).then(profileNukeProgress => ({profileNukeProgress}))
+        }
+        else if(request.action === PROFILE_NUKE_PROGRESS_CLEAR_ACTION) {
+            // The dev tools' clear (20 Oct review). Only an extension page may clear progress: a message from a tab is refused.
+            if(sender?.tab) return Promise.resolve({cleared: 0, saved: false, reason: 'extension-pages-only'})
+            return clearProfileNukeProgressForTools()
+        }
         else if(request.action === 'clear-coordinator-current-work') {
-            return clearCoordinatorCurrentWork()
+            return clearCoordinatorCurrentWork().then(result => {
+                // Owner decision 11 (18 Oct): a successful clear writes an explicit zero summary. A failed clear returns a reason and
+                // leaves the summary as it was.
+                if(!result?.reason) {
+                    const {summary} = recordQueueBarSummary({total: 0, pending: 0, updatedAt: Date.now()})
+                    void pushQueueBarSummary(browser, summary)
+                }
+                return result
+            })
         }
         else if(request.action === 'reconcile-coordinator-storage') {
             if(request.userInitiated !== true) {
@@ -656,6 +900,11 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'get-flight-recorder') {
             return getFlightRecorder(request)
         }
+        else if(request.action === 'get-debug-resume-limit-status') {
+            // Must be a promise: a plain return value gets no response from the listener, so the
+            // dashboard countdown never received an answer.
+            return Promise.resolve(getDebugResumeLimitStatus())
+        }
         else if(request.action === 'refresh-queue-wakeup-metrics-view') {
             return refreshQueueWakeupMetricsViewForDashboard(request.reason || 'dashboard-refresh')
         }
@@ -665,8 +914,12 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'clear-coordinator-terminal-stats') {
             return clearCoordinatorTerminalStats()
         }
+        else if(request.action === 'clear-completed-history') {
+            // The History page's Clear (28 Oct). The page is an extension page opened in a tab, so the sender's tab is not a test here.
+            return clearCoordinatorCompletedHistory()
+        }
         else if(request.action === 'get-content-page-coordinator-state') {
-            return getContentPageCoordinatorState(request, sender)
+            return timeContentRequest('get-content-page-coordinator-state', () => getContentPageCoordinatorState(request, sender))
         }
         else if(request.action === 'resume-coordinator-queue') {
             const userInitiated = request.userInitiated === true
@@ -687,11 +940,28 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'retry-coordinator-failed') {
             return retryCoordinatorFailedItems(request, sender)
         }
-        else if(request.action === 'requeue-coordinator-failed') {
-            return requeueCoordinatorFailedItems(request, sender)
-        }
         else if(request.action === 'claim-tab-action') {
             return claimPendingTabAction(sender)
+        }
+        else if(request.action === 'content-claim-retry-hit') {
+            // Measurement only (review-2 C-3): a claim retry loop in content.js reports once, when it reaches its pass threshold.
+            // Nothing here reads coordinator state, so the action is not in RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.
+            const loop = /^[a-z-]{1,40}$/.test(`${request.loop || ''}`) ? request.loop : 'unknown'
+            incrementQueueWakeupMetric(`contentClaimRetry.${loop}`)
+            recordFlightRecorderEvent({
+                kind: 'content-claim-retry-hit',
+                source: 'content-script',
+                targetUrl: `${request.href || ''}`,
+                tabId: sender.tab?.id || null,
+                accepted: true,
+                reason: loop,
+                passes: Number.isFinite(request.passes) ? request.passes : 0
+            })
+        }
+        else if(request.action === 'content-live-check') {
+            // Measurement only (owner, 15 Oct): the live-check card counts these. Nothing here reads coordinator state, so the
+            // action is not in RUNTIME_MESSAGE_ACTIONS_WITH_AUTHORITY.
+            if(request.check === 'did-not-land') incrementQueueWakeupMetric('liveCheck.didNotLand')
         }
         else if(request.action === 'cloudflare-challenge-detected') {
             incrementQueueWakeupMetric('cloudflareChallenge.detected')
@@ -709,6 +979,7 @@ function registerServiceWorkerListeners(deps = {}) {
             // tab, exponential backoff) is the right response here too, so a
             // run that starts tripping challenges backs off instead of
             // hammering straight into more of them.
+            recordFlightRecorderEvent({kind: 'queue-load-pressure', source: 'cloudflare-challenge', tabId: sender.tab?.id || null, targetUrl: `${request.href || ''}`})
             rememberQueueLoadPressure('cloudflare-challenge', {
                 href: `${request.href || ''}`,
                 tabId: sender.tab?.id || null
@@ -754,6 +1025,27 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'request-action-lease') {
             return requestCoordinatorActionLease(request, sender)
         }
+        else if(request.action === 'record-page-event') {
+            // Events the profile page reports about itself (a click on a block control, or the page's blocked
+            // state changing). clientAt is the page's own clock, so it is not the moment the message arrived.
+            recordFlightRecorderEvent({
+                kind: 'page-event',
+                source: 'content',
+                reason: `${request.event || ''}`.slice(0, 40),
+                statusAfter: `${request.detail || ''}`.slice(0, 80),
+                targetUrl: `${sender.tab?.url || ''}`.slice(0, 200),
+                tabId: sender.tab?.id || null,
+                at: Number.parseInt(request.clientAt, 10) || undefined,
+                accepted: true,
+                changed: false
+            })
+            // A profile page that turned blocked is checked now, not at the next reconcile tick (owner 17 Oct). Not awaited: the
+            // page gets its answer at once, and the check reports through the flight recorder and the row's own terminal write.
+            if(request.event === 'profile-blocked-state' && request.detail === 'blocked' && sender.tab?.id) {
+                void requestProfileBlockedPageEventCheck(sender.tab.id, 'profile-blocked-page-event').catch(() => null)
+            }
+            return Promise.resolve({recorded: true})
+        }
         else if(request.action === 'record-initial-blocked-state') {
             return recordInitialBlockedStateFromRequest(request, sender)
         }
@@ -781,11 +1073,13 @@ function registerServiceWorkerListeners(deps = {}) {
                 })
         }
         else if(request.action === 'cancel-queued-owner-nukes') {
-            const ownerTabId = sender.tab?.id || null
-            const canceledUrls = consumeCanceledOwnerUrls(ownerTabId)
-                .concat(cancelQueuedOwnerActions(ownerTabId, 'nuke'))
-            return Promise.resolve({
-                canceledUrls
+            return timeContentRequest('cancel-queued-owner-nukes', () => {
+                const ownerTabId = sender.tab?.id || null
+                const canceledUrls = consumeCanceledOwnerUrls(ownerTabId)
+                    .concat(cancelQueuedOwnerActions(ownerTabId, 'nuke'))
+                return {
+                    canceledUrls
+                }
             })
         }
         else if(request.action === 'pause-owner-nukes') {
@@ -809,33 +1103,27 @@ function registerServiceWorkerListeners(deps = {}) {
                             (getQueuedActionSurfaceWindowId() &&
                                 Number.parseInt(sender.tab?.windowId, 10) === Number.parseInt(getQueuedActionSurfaceWindowId(), 10))
                         if(!valid && !shouldCleanupWorkerSurface) return {closed: false, staleAttempt: true}
-                        markQueuedTabClosing(tabId, 'content-close-request')
-                        await releaseQueuedTab(tabId, {awaitFill: true})
+                        const closeResult = await closeQueuedTabAfterTerminal(tabId, 'content-close-request', {awaitFill: true})
+                        if(!closeResult.closed) return {closed: false}
                         if(shouldCleanupWorkerSurface) {
                             scheduleQueuedWorkerActionSurfaceCleanup('idle-after-release')
+                            await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
+                                windowId: sender.tab?.windowId || null
+                            }).catch(() => false)
                         }
-                        return browser.tabs.remove(tabId)
-                            .then(async () => {
-                                if(shouldCleanupWorkerSurface) {
-                                    await closeQueuedWorkerActionSurfaceIfIdle('idle-after-release', {
-                                        windowId: sender.tab?.windowId || null
-                                    }).catch(() => false)
-                                }
-                                else {
-                                    await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
-                                }
-                                return {closed: true}
-                            })
-                            .catch(() => ({closed: false}))
+                        else {
+                            await closeIdleQueuedWorkerActionSurfaceWindows('idle-after-release').catch(() => false)
+                        }
+                        return {closed: true}
                     })
             }
     
             return Promise.resolve({closed: false})
         }
         else if(request.action === 'record-job-milestone') {
-            return recordJobProgressFromRequest(request, sender, {
+            return timeContentRequest('record-job-milestone', () => recordJobProgressFromRequest(request, sender, {
                 expectTerminal: false
-            })
+            }))
         }
         else if(request.action === 'record-job-terminal') {
             return recordJobProgressFromRequest(request, sender, {
@@ -843,7 +1131,13 @@ function registerServiceWorkerListeners(deps = {}) {
             })
         }
         else if(request.action === 'record-direct-profile-progress') {
-            return recordDirectProfileProgressFromRequest(request)
+            return recordDirectProfileProgressFromRequest(request, sender)
+        }
+        else if(request.action === 'record-manual-profile-action') {
+            return recordManualProfileActionRequested(request)
+        }
+        else if(request.action === 'get-recent-history') {
+            return getRecentHistoryRequested(request)
         }
         else if(request.action === 'clear-profile-nuke-state') {
             return applyCoordinatorQueueMachineEvent({
@@ -859,34 +1153,6 @@ function registerServiceWorkerListeners(deps = {}) {
                     profileHrefs: request.profileHrefs || request.urls || []
                 }
             })
-        }
-        else if(request.action === 'remove-pending-space-feed-urls') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'PENDING_SPACE_FEED_URLS_REMOVE',
-                urls: request.urls || []
-            }).then(result => ({
-                changed: !!result?.changed,
-                pendingPosts: result?.pendingPosts || null
-            }))
-        }
-        else if(request.action === 'remove-pending-space-feed-entries') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'PENDING_SPACE_FEED_ENTRIES_REMOVE',
-                postKeys: request.postKeys || []
-            }).then(result => ({
-                changed: !!result?.changed,
-                pendingPosts: result?.pendingPosts || null
-            }))
-        }
-        else if(request.action === 'confirm-space-feed-profiles-blocked') {
-            return applyCoordinatorQueueMachineEvent({
-                type: 'SPACE_FEED_PROFILES_CONFIRM',
-                profileHrefs: request.profileHrefs || request.urls || []
-            }).then(result => ({
-                confirmed: !!result?.confirmed,
-                pendingPosts: result?.pendingPosts || null,
-                nukedPosts: result?.nukedPosts || null
-            }))
         }
         else if(request.action === 'get-owned-nuke-status') {
             return ownedTabIdsReady.then(async () => {
@@ -914,7 +1180,60 @@ function registerServiceWorkerListeners(deps = {}) {
         else if(request.action === 'sweep-service-worker-blocked-profile-tabs') {
             return sweepServiceWorkerBlockedProfileTabs()
         }
-    })
+    }
+    // Every Quora main-frame and XHR response, with its HTTP status, so throttled or challenged requests show in the flight
+    // recorder. The listener below only watches a few GraphQL mutations. Only the URL path is kept, never the query string.
+    const quoraRequestStartedAt = new Map()
+    const quoraRequestFilter = {urls: ['https://*.quora.com/*'], types: ['main_frame', 'xmlhttprequest']}
+    browser.webRequest.onBeforeRequest.addListener(details => {
+        if(quoraRequestStartedAt.size > 500) quoraRequestStartedAt.clear()
+        quoraRequestStartedAt.set(details.requestId, details.timeStamp)
+    }, quoraRequestFilter)
+    browser.webRequest.onCompleted.addListener(details => {
+        const startedAt = quoraRequestStartedAt.get(details.requestId)
+        quoraRequestStartedAt.delete(details.requestId)
+        let path = ''
+        try { path = new URL(details.url).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-response',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            statusCode: details.statusCode,
+            fromCache: details.fromCache === true,
+            path,
+            durationMs: startedAt ? Math.round(details.timeStamp - startedAt) : -1
+        })
+    }, quoraRequestFilter)
+    // Redirects and failed requests on Quora's main and sub frames, so a navigation that removes a queued tab's frame shows in the recorder. Paths only.
+    const quoraNavigationFilter = {urls: ['https://*.quora.com/*'], types: ['main_frame', 'sub_frame']}
+    browser.webRequest.onBeforeRedirect.addListener(details => {
+        let path = ''
+        let redirectPath = ''
+        try { path = new URL(details.url).pathname } catch {}
+        try { redirectPath = new URL(details.redirectUrl).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-redirect',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            statusCode: details.statusCode,
+            path,
+            redirectPath
+        })
+    }, quoraNavigationFilter)
+    browser.webRequest.onErrorOccurred.addListener(details => {
+        let path = ''
+        try { path = new URL(details.url).pathname } catch {}
+        recordFlightRecorderEvent({
+            kind: 'quora-request-error',
+            source: 'webRequest',
+            tabId: details.tabId,
+            requestType: details.type,
+            error: details.error || '',
+            path
+        })
+    }, quoraNavigationFilter)
     browser.webRequest.onCompleted.addListener(details => {
         if(details.url.match(/TribePeopleModalQuery/i)) {
             sendTabMessage(details.tabId, {status: 'space-people-modal-loaded'})

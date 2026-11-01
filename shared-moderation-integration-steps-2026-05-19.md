@@ -1,5 +1,7 @@
 # Shared Moderation Integration Steps, 2026-05-19
 
+> **Status: ROADMAP** (24 Oct 2026). Staged integration steps (19 May). Runtime integration deferred. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: supporting staged plan, runtime integration deferred.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

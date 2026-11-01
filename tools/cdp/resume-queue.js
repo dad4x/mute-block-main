@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_PAUSED_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the paused flag: the layout prefix plus the plain key name (storageNamespace.js). Used inside the page code below.
+const PAUSED_KEY_JSON = JSON.stringify(`${STORAGE_LAYOUT_PREFIX}${COORDINATOR_PAUSED_KEY}`)
+
 const {
     evaluate,
     getCdpConfig,
@@ -19,7 +24,7 @@ async function readPausedFlag(config) {
     if(!target) return null
 
     return evaluate(target.webSocketDebuggerUrl, `new Promise(resolve => {
-        chrome.storage.local.get({mbCoordinatorPaused: false}, stored => resolve(!!stored?.mbCoordinatorPaused))
+        chrome.storage.local.get({[${PAUSED_KEY_JSON}]: false}, stored => resolve(!!stored?.[${PAUSED_KEY_JSON}]))
     })`, 15000).catch(() => null)
 }
 
@@ -124,11 +129,11 @@ async function attemptResume(config) {
                 return
             }
             try {
-                const result = chrome.storage.local.get({mbCoordinatorPaused: false}, stored => {
-                    start(!!stored?.mbCoordinatorPaused)
+                const result = chrome.storage.local.get({[${PAUSED_KEY_JSON}]: false}, stored => {
+                    start(!!stored?.[${PAUSED_KEY_JSON}])
                 })
                 if(result && typeof result.then === 'function') {
-                    result.then(stored => start(!!stored?.mbCoordinatorPaused)).catch(() => start(false))
+                    result.then(stored => start(!!stored?.[${PAUSED_KEY_JSON}])).catch(() => start(false))
                 }
             }
             catch {

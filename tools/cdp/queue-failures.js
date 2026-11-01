@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_VIEW_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
+// The stored name of the queue view: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_VIEW_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_VIEW_KEY}`
+
 const {
     evaluate,
     getCdpConfig,
@@ -23,10 +28,10 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function getQueueFailures(needle) {
-        const storage = await chrome.storage.local.get({mbCoordinatorQueueView: {}})
-        const view = storage.mbCoordinatorQueueView && typeof storage.mbCoordinatorQueueView === 'object'
-            ? storage.mbCoordinatorQueueView
+    const result = await evaluate(extensionPage.webSocketDebuggerUrl, `(${async function getQueueFailures(needle, viewKey) {
+        const storage = await chrome.storage.local.get({[viewKey]: {}})
+        const view = storage[viewKey] && typeof storage[viewKey] === 'object'
+            ? storage[viewKey]
             : {}
         const items = Array.isArray(view.items) ? view.items : []
         const rows = items.map((item, index) => [
@@ -62,7 +67,7 @@ runMain(async () => {
             usedCompactView: true,
             truncated: view.truncated === true
         }
-    }})( ${JSON.stringify(needle)} )`, 10000)
+    }})( ${JSON.stringify(needle)}, ${JSON.stringify(QUEUE_VIEW_STORED_KEY)} )`, 10000)
 
     console.log(JSON.stringify(result, null, 2))
 })

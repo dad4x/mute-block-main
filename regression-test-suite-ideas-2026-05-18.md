@@ -1,5 +1,7 @@
 # Regression Test Suite Ideas
 
+> **Status: ROADMAP** (24 Oct 2026). Layered test strategy and ideas (18 May). Partly in use; not scheduled. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: active supporting test strategy.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical

@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, STORAGE_LAYOUT_PREFIX} = require('../../shared/js/storageKeys')
+
 const {
     evaluate,
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 
-const QUEUE_KEY = 'mbCoordinatorQueue'
-const PROGRESS_VIEW_KEY = 'mbProfileNukeProgressView'
+// The stored name of the queue: the layout prefix plus the plain key name (storageNamespace.js).
+const QUEUE_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${COORDINATOR_QUEUE_KEY}`
 
 function normalizeHref(value = '') {
     try {
@@ -45,7 +48,8 @@ runMain(async () => {
         return
     }
 
-    const result = await evaluate(target.webSocketDebuggerUrl, `(${function inspectBrief(queueKey, progressKey, key, needle) {
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const result = await evaluate(target.webSocketDebuggerUrl, `(${function inspectBrief(queueKey, progress, key, needle) {
         const normalize = value => {
             try {
                 const url = new URL(`${value || ''}`)
@@ -70,12 +74,11 @@ runMain(async () => {
                 })
         })
         const readStorage = () => new Promise(resolve => {
-            chrome.storage.local.get({[queueKey]: {}, [progressKey]: {}}, value => resolve(value || {}))
+            chrome.storage.local.get({[queueKey]: {}}, value => resolve(value || {}))
         })
         return withTimeout(readStorage()).then(result => {
             if(result.timedOut || result.error) return result
             const queue = result.value?.[queueKey] || {}
-            const progress = result.value?.[progressKey]?.records || {}
             const entries = Object.entries(queue)
             const match = key
                 ? entries.find(([itemKey]) => itemKey === key)
@@ -111,7 +114,7 @@ runMain(async () => {
                 progress: progressEntries
             }
         })
-    }})( ${JSON.stringify(QUEUE_KEY)}, ${JSON.stringify(PROGRESS_VIEW_KEY)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
+    }})( ${JSON.stringify(QUEUE_STORED_KEY)}, ${JSON.stringify(progressRecords)}, ${JSON.stringify(key)}, ${JSON.stringify(needle)} )`, 45000)
 
     const output = {
         target: {

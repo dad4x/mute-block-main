@@ -1,0 +1,31 @@
+> **Status: HISTORICAL** (24 Oct 2026). Dashboard observations (28 May). Kept as a record. Do not implement from it. planning.md is the front door. Register: [notes register](../docs/notes-register.md).
+
+## Dashboard:
+	- move Running status to the left, grouping all action buttons.
+	- action buttons:  pause, cancel queue, queue-all-fails, en/disable retry soft-fails;
+	- move trailing numbers to the front:
+           Showing 80 of 741, 270 queued, 436 suceeded 0 soft fail, 0 hard fail
+	- if we're not started (no quora load yet) have a start button.
+
+Ready-to-run -> Queued
+
+## bugs?
+
+# Potential anomaly / overnight watch:
+	- Large profile-search enqueue request: page showed Nuke 'Em 303, but durable enqueue event recorded only 97 new + 1 merged.
+	- Recovered queue/dashboard accounting remained consistent afterward, so this looked like partial admission or page-local candidate accounting, not queue-view corruption.
+	- Storage was stressed during the attempt: storage timeouts/fallbacks and late-write suppression increased.
+	- Treat any overnight result after the 300+ Elon request as potentially affected by large enqueue pressure until enqueue admission/accounting is inspected.
+	- Current suspicion: profile-search page candidate count can exceed what the service worker durably accepts, especially with very large collected pages and scoped content-page state.
+
+# still seeing odd displays in spaces
+	- Nuking... instead of Nuking... N from here left
+	- card displays don't match
+
+# when scrolling through spaces, card Nuke 'Em N numbers don't make sense.   It you see 10 go buy, you should see 'nuke em 5'
+
+----
+WAL should have bulk pause/cancel/resume operations to cut down write traffic.
+
+
+

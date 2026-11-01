@@ -7,7 +7,7 @@ Silence unwanted noise on Quora profiles instantly with this browser extension.
 - Source is now on the `1.6` main development line.
 - The `release/1.4` branch remains the maintenance lane for the `1.4.247` baseline.
 - The `refactor/1.5` branch is closed for new feature work and preserved only as the last `1.5.x` coordinator/debugging lane.
-- The `1.6` series is the active durable job/state-machine reset of the accreted nuke, queue, and recovery code; start with [planning.md](planning.md) and [architecture.md](architecture.md), with [refactor-1.6-plan.md](refactor-1.6-plan.md) as supporting series detail.
+- The `1.6` series is the active durable job/state-machine reset of the accreted nuke, queue, and recovery code; start with [planning.md](planning.md) and [architecture.md](architecture.md), with [refactor-1.6-plan.md](historical/refactor-1.6-plan.md) as supporting series detail.
 - The public release target for the completed reset is `2.0`.
 - Chrome is the current release track.
 - Firefox store updates are currently blocked, so the published Firefox add-on is still on `1.2` until that pipeline is sorted out.

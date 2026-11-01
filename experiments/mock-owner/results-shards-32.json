@@ -1,0 +1,71 @@
+{
+  "mock": true,
+  "rows": 1000,
+  "shards": 32,
+  "publication": {
+    "totalMirrorBytes": 997666,
+    "totalMirrorKiB": 974.3,
+    "sessionQuotaFraction": 0.0951,
+    "fullRewritePerCommitBytes": 997666,
+    "changedShardPerCommit": {
+      "medianBytes": 34607,
+      "p95Bytes": 41225,
+      "maxBytes": 44091,
+      "medianShards": 5,
+      "maxShards": 6
+    },
+    "reductionAtMedian": 28.8
+  },
+  "fanOut": {
+    "1SourcesPerRow": {
+      "medianBytes": 33316,
+      "p95Bytes": 37294
+    },
+    "2SourcesPerRow": {
+      "medianBytes": 35946,
+      "p95Bytes": 40007
+    },
+    "3SourcesPerRow": {
+      "medianBytes": 38510,
+      "p95Bytes": 42549
+    },
+    "4SourcesPerRow": {
+      "medianBytes": 40971,
+      "p95Bytes": 45432
+    }
+  },
+  "startupHandoff": {
+    "keys": 141,
+    "payloadKiB": 1065.2,
+    "structuredCloneMs": 1.01,
+    "arrayBufferCopyMs": 0.283,
+    "arrayBufferBytes": 1096166
+  },
+  "protocol": [
+    {
+      "name": "normal write is applied once",
+      "pass": true,
+      "detail": "applied in 1 attempt, count 1"
+    },
+    {
+      "name": "owner crash after physical write, before ack: retry applies once",
+      "pass": true,
+      "detail": "retry on epoch 2 returned duplicate-ignored, count 1"
+    },
+    {
+      "name": "owner crash before physical write: retry applies once",
+      "pass": true,
+      "detail": "applied once on epoch 2"
+    },
+    {
+      "name": "stale owner is fenced after handover",
+      "pass": true,
+      "detail": "stale write rejected, not in log"
+    },
+    {
+      "name": "viewer ignores a broadcast from an earlier epoch",
+      "pass": true,
+      "detail": "accepted 2 of 3, none from epoch 1"
+    }
+  ]
+}

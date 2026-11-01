@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_QUEUE_WAL_KEY, SPACE_REGISTRY_KEY, STORAGE_LAYOUT_PREFIX} = require('../../../shared/js/storageKeys')
+const {plainName} = require('../../../shared/js/storageNamespace')
+
+// The stored name of the space registry: the layout prefix plus the plain key name (storageNamespace.js).
+const SPACE_REGISTRY_STORED_KEY = `${STORAGE_LAYOUT_PREFIX}${SPACE_REGISTRY_KEY}`
+
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
@@ -8,8 +14,10 @@ const {
     cdpCommand,
     DEFAULT_CHROME_DEV_PATH,
     evaluate,
+    getCdpConfig,
     getJson,
     getTargets,
+    readProfileNukeProgressFromWorker,
     resolveCdpConfig,
     runMain,
     sleep
@@ -86,8 +94,6 @@ const PHASE10_HARNESS_WATCHDOG_MS = 180000
 const PHASE10_TARGET_SELECTION_TIMEOUT_MS = 180000
 const PHASE10_FLIGHT_RECORDER_LIMIT = 2000
 const EXPECTED_EXTENSION_NAMES = new Set(['Mute Block', 'Mute Block Dev'])
-const COORDINATOR_QUEUE_KEY = 'mbCoordinatorQueue'
-const COORDINATOR_QUEUE_WAL_KEY = 'mbCoordinatorQueueWal'
 const COORDINATOR_QUEUE_WAL_META_KEY = `${COORDINATOR_QUEUE_WAL_KEY}.meta`
 const SUPPORTED_PHASES = [
     PHASE1,
@@ -152,7 +158,7 @@ const ALLOWED_STORAGE_KEY_PATTERNS = [
     /^mbProfileNukeProgressShard\./,
     /^mbCoordinator/,
     /^mbQueueWakeupMetrics(?:View)?$/,
-    /^mbSpace(?:Registry|PendingNukedPosts|NukedPosts)$/,
+    /^mbSpaceRegistry$/,
     /^mbOwnedTabIdsByParent$/,
     /^mbBrowserSessionMarker$/,
     /^mbQuoraRuntimeActivated$/,
@@ -923,8 +929,32 @@ async function readIdleFlightRecorderDelta(target, idleMs = 20000) {
     }
 }
 
+// The storage snapshot of a target, with the progress the worker holds. Disk holds no progress now (20 Oct review), so the progress
+// comes from the worker's message, sent from an extension page (decision 32). A target outside the extension gets no worker progress.
 async function readStorage(target) {
-    return evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
+    const snapshot = await readDiskStorage(target)
+    const extensionId = (target?.url || '').match(/^chrome-extension:\/\/([^/]+)\//)?.[1] || ''
+    const workerProgress = extensionId ? await readProfileNukeProgressFromWorker({...getCdpConfig(), extensionId}) : null
+    return {...snapshot, workerProgress}
+}
+
+// The stored names of this layout are the layout prefix plus the plain name (storageNamespace.js). The checks in this file read plain
+// names, so a snapshot maps this layout's stored keys to their plain names. An unprefixed key (an older layout's) keeps its own name.
+function plainStorageSnapshot(snapshot = {}) {
+    const stored = snapshot?.data && typeof snapshot.data === 'object' ? snapshot.data : {}
+    const data = {}
+    for(const [storedName, value] of Object.entries(stored)) {
+        if(plainName(storedName) === null) data[storedName] = value
+    }
+    for(const [storedName, value] of Object.entries(stored)) {
+        const key = plainName(storedName)
+        if(key !== null) data[key] = value
+    }
+    return {...snapshot, data, keys: Object.keys(data).sort()}
+}
+
+async function readDiskStorage(target) {
+    const snapshot = await evaluate(target.webSocketDebuggerUrl, `(${function readLocalStorage() {
         return new Promise(resolve => {
             let settled = false
             const finish = value => {
@@ -1001,6 +1031,7 @@ async function readStorage(target) {
             tryRead()
         })
     }})()`, 60000)
+    return plainStorageSnapshot(snapshot)
 }
 
 async function readAlarms(target) {
@@ -1022,6 +1053,11 @@ async function readAlarms(target) {
     }})()`, 10000)
 }
 
+// The values as the stored names they are written under: the layout prefix plus each plain key name (storageNamespace.js).
+function prefixedValues(values = {}) {
+    return Object.fromEntries(Object.entries(values || {}).map(([key, value]) => [`${STORAGE_LAYOUT_PREFIX}${key}`, value]))
+}
+
 async function setStorageValues(target, values = {}) {
     return evaluate(target.webSocketDebuggerUrl, `(${function writeLocalStorage(nextValues) {
         return new Promise(resolve => {
@@ -1035,7 +1071,7 @@ async function setStorageValues(target, values = {}) {
                 lastError: chrome.runtime.lastError ? chrome.runtime.lastError.message : ''
             }))
         })
-    }})(${JSON.stringify(values || {})})`, 10000)
+    }})(${JSON.stringify(prefixedValues(values))})`, 10000)
 }
 
 function isAllowedStorageKey(key) {
@@ -1219,10 +1255,10 @@ function summarizeAuthorityState(storage) {
         walKeyDigest: stableDigest(walKeys),
         walSignature: stableDigest(Object.fromEntries(walKeys.map(key => [key, data[key]]))),
         walKeys: walKeys.slice(-8),
-        progressViewRecords: countRecordMap(data.mbProfileNukeProgressView),
+        progressViewRecords: storage?.workerProgress
+            ? Object.keys(storage.workerProgress).length
+            : countRecordMap(data.mbProfileNukeProgressView),
         progressShardRecords,
-        pendingSpacePostRecords: countRecordMap(data.mbSpacePendingNukedPosts),
-        nukedSpacePostRecords: countRecordMap(data.mbSpaceNukedPosts),
         queuedActionSurfaceRecords: countRecordMap(queuedActionSurfaceState)
     }
 }
@@ -1232,15 +1268,21 @@ function getSelectedProgressRecords(storage, targetProfileHrefs = [], selectedSu
     const targets = Array.from(new Set((targetProfileHrefs || [])
         .map(target => normalizeComparableUrl(target || ''))
         .filter(Boolean)))
-    const viewRecords = data.mbProfileNukeProgressView?.records &&
-        typeof data.mbProfileNukeProgressView.records === 'object'
-        ? data.mbProfileNukeProgressView.records
-        : {}
-    const shardRecords = Object.entries(data)
-        .filter(([key, value]) => key.startsWith('mbProfileNukeProgressShard.') &&
-            value?.records && typeof value.records === 'object')
-        .flatMap(([key, value]) => Object.entries(value.records)
-            .map(([profileHref, record]) => ({key, profileHref, record})))
+    // The worker's progress (every record, from the stored copy) when the snapshot carries it. Disk holds no progress now (20 Oct
+    // review), so the disk view and shards are read only for a snapshot without the worker's copy.
+    const viewRecords = storage?.workerProgress
+        ? storage.workerProgress
+        : data.mbProfileNukeProgressView?.records &&
+            typeof data.mbProfileNukeProgressView.records === 'object'
+            ? data.mbProfileNukeProgressView.records
+            : {}
+    const shardRecords = storage?.workerProgress
+        ? []
+        : Object.entries(data)
+            .filter(([key, value]) => key.startsWith('mbProfileNukeProgressShard.') &&
+                value?.records && typeof value.records === 'object')
+            .flatMap(([key, value]) => Object.entries(value.records)
+                .map(([profileHref, record]) => ({key, profileHref, record})))
     const authorityByTarget = new Map((selectedSummary?.selected || [])
         .map(item => [
             normalizeComparableUrl(item?.targetProfileHref || ''),
@@ -2268,18 +2310,6 @@ function assertDiscoveryDidNotCreateAuthority(before = {}, after = {}, fail) {
             after: after.progressShardRecords
         })
     }
-    if(after.pendingSpacePostRecords !== before.pendingSpacePostRecords) {
-        changed('pending space post records', {
-            before: before.pendingSpacePostRecords,
-            after: after.pendingSpacePostRecords
-        })
-    }
-    if(after.nukedSpacePostRecords !== before.nukedSpacePostRecords) {
-        changed('nuked space post records', {
-            before: before.nukedSpacePostRecords,
-            after: after.nukedSpacePostRecords
-        })
-    }
     if(after.queuedActionSurfaceRecords !== before.queuedActionSurfaceRecords) {
         changed('queued action surface records', {
             before: before.queuedActionSurfaceRecords,
@@ -2440,7 +2470,7 @@ function comparableDashboardAuthoritySmoke(dashboardAuthoritySmoke = null) {
         queuedCount: Number(dashboard.queuedCount || 0) || 0,
         activeCount: Number(dashboard.activeCount || 0) || 0,
         terminalCount: Number(dashboard.terminalCount || 0) || 0,
-        eventCount: Number(dashboard.eventCount || 0) || 0,
+        avgPageLoad: dashboard.avgPageLoad || '',
         queueListRows: Number(dashboard.queueListRows || 0) || 0,
         metricsGridItems: Number(dashboard.metricsGridItems || 0) || 0,
         compactQueueViewPresent: authoritySources.compactQueueViewPresent === true,
@@ -2815,11 +2845,11 @@ async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = 
     ].filter(Boolean)
     if(!records.length) return {updated: 0, records: []}
 
-    return evaluate(context.webSocketDebuggerUrl, `(${function setSpaceRegistry(nextRecords) {
+    return evaluate(context.webSocketDebuggerUrl, `(${function setSpaceRegistry(nextRecords, registryKey) {
         return new Promise(resolve => {
-            chrome.storage.local.get({mbSpaceRegistry: {}}, stored => {
-                const registry = stored.mbSpaceRegistry && typeof stored.mbSpaceRegistry === 'object'
-                    ? stored.mbSpaceRegistry
+            chrome.storage.local.get({[registryKey]: {}}, stored => {
+                const registry = stored[registryKey] && typeof stored[registryKey] === 'object'
+                    ? stored[registryKey]
                     : {}
                 let updated = 0
                 for(const record of nextRecords || []) {
@@ -2831,13 +2861,13 @@ async function classifySpacesForDiscovery(context, assetUrls = [], targetUrls = 
                     }
                     updated += 1
                 }
-                chrome.storage.local.set({mbSpaceRegistry: registry}, () => resolve({
+                chrome.storage.local.set({[registryKey]: registry}, () => resolve({
                     updated,
                     keys: nextRecords.map(record => record.key).filter(Boolean)
                 }))
             })
         })
-    }})(${JSON.stringify(records)})`, 10000)
+    }})(${JSON.stringify(records)}, ${JSON.stringify(SPACE_REGISTRY_STORED_KEY)})`, 10000)
 }
 
 
@@ -3306,7 +3336,7 @@ async function injectContentScriptForPage(context, pageUrl) {
             try {
                 await chrome.scripting.insertCSS({
                     target: {tabId: tab.id},
-                    files: ['css/content.css']
+                    files: ['css/tokens.css', 'css/content.css']
                 }).catch(error => ({
                     ignored: true,
                     error: error?.message || `${error || ''}`
@@ -5875,7 +5905,7 @@ async function inspectDashboardPage(target) {
             queuedCount: numericText('queuedCount'),
             activeCount: numericText('activeCount'),
             terminalCount: numericText('terminalCount'),
-            eventCount: numericText('eventCount'),
+            avgPageLoad: text('avgPageLoadValue'),
             runCount: text('runCount'),
             metricsUpdated: text('metricsUpdated'),
             queueListRows: document.querySelectorAll('#queueList > *').length,

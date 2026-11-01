@@ -1,0 +1,23 @@
+{
+  "queueRows": 1000,
+  "tailSegments": 128,
+  "buildStoreMs": 58.6,
+  "checkpoint": {
+    "keys": 13,
+    "totalBytes": 56179,
+    "kiB": 54.9
+  },
+  "perMutation": {
+    "averageBytes": 1277,
+    "keysWritten": 2,
+    "samples": 20
+  },
+  "startup": {
+    "keys": 141,
+    "totalBytes": 153543,
+    "kiB": 149.9,
+    "hydrateMs": 1.8,
+    "recoverAndReplayMs": 33.22,
+    "tailRecords": 128
+  }
+}

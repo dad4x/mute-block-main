@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
+const {COORDINATOR_QUEUE_KEY, COORDINATOR_RUNS_KEY, STORAGE_LAYOUT_PREFIX} = require("../../shared/js/storageKeys")
 const zlib = require('node:zlib')
 const {
     evaluate,
     getCdpConfig,
     getOption,
     getTargets,
+    readProfileNukeProgressFromWorker,
     runMain
 } = require('./lib/cdp')
 const {
@@ -137,21 +139,23 @@ async function readLiveStorage(config) {
     }
 }
 
-function buildDatasets(storage = {}) {
+// A stored map by its plain key name: the layout prefix plus the plain name (storageNamespace.js). The run list is one key.
+function storedMap(storage = {}, key = '') {
+    return storage[`${STORAGE_LAYOUT_PREFIX}${key}`] || {}
+}
+
+function buildDatasets(storage = {}, progressRecords = {}) {
     const recoveryCritical = {
-        queue: storage.mbCoordinatorQueue || {},
-        runs: storage.mbCoordinatorRuns || {},
-        progressView: storage.mbProfileNukeProgressView || {},
-        events: storage.mbCoordinatorEvents || []
-    }
-    const userMemory = {
-        mbSpaceNukedPosts: storage.mbSpaceNukedPosts || {}
+        queue: storedMap(storage, COORDINATOR_QUEUE_KEY),
+        runs: storedMap(storage, COORDINATOR_RUNS_KEY),
+        progressView: {records: progressRecords, total: Object.keys(progressRecords).length},
+        // Coordinator events are no longer stored (1442); they live in the flight recorder, so this set is empty.
+        events: []
     }
     const full = storage
 
     return [
         {name: 'recoveryCritical', state: recoveryCritical},
-        {name: 'userMemory', state: userMemory},
         {name: 'fullStorage', state: full}
     ]
 }
@@ -165,7 +169,8 @@ runMain(async () => {
         .filter(Number.isFinite)
     const codecs = codecNames.flatMap(codecName => levels.map(level => makeCodec(codecName, level)))
     const live = await readLiveStorage(config)
-    const datasets = buildDatasets(live.storage)
+    const progressRecords = await readProfileNukeProgressFromWorker(config)
+    const datasets = buildDatasets(live.storage, progressRecords)
 
     const results = datasets.map(dataset => ({
         name: dataset.name,

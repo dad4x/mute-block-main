@@ -39,9 +39,9 @@ function getClickExtensionActionPageFunction() {
             }))
         const button = buttons.find(item => {
             const label = `${item.text}\n${item.aria}\n${item.title}`
-            if(closeAfter) return /Mute-Block Extension: Mute and block this profile, then close the tab/i.test(label) ||
-                /Mute-Block Extension: Close this tab/i.test(label)
-            return /Mute-Block Extension: Mute and block this profile$/i.test(label) ||
+            if(closeAfter) return /Mute Block extension: Mute and block this profile, then close the tab/i.test(label) ||
+                /Mute Block extension: Close this tab/i.test(label)
+            return /Mute Block extension: Mute and block this profile$/i.test(label) ||
                 /^Mute Block$/i.test(item.text)
         })
         if(!button) {

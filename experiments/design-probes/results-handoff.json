@@ -1,0 +1,41 @@
+{
+  "command": "handoff",
+  "result": {
+    "keys": 141,
+    "bytes": 629903,
+    "records": 2820,
+    "repetitions": 10,
+    "copy": {
+      "read": {
+        "medianMs": 4.4,
+        "maxMs": 5.6
+      },
+      "copyAndReplay": {
+        "medianMs": 1.6,
+        "maxMs": 3.6
+      },
+      "workerReplay": {
+        "medianMs": 1.2,
+        "maxMs": 2.7
+      }
+    },
+    "buffer": {
+      "read": {
+        "medianMs": 4.8,
+        "maxMs": 5.3
+      },
+      "encode": {
+        "medianMs": 3.1,
+        "maxMs": 3.6
+      },
+      "transferAndReplay": {
+        "medianMs": 2.2,
+        "maxMs": 3.3
+      },
+      "workerReplay": {
+        "medianMs": 1.9,
+        "maxMs": 2.9
+      }
+    }
+  }
+}

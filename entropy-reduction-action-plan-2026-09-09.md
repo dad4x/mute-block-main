@@ -1,5 +1,7 @@
 # Entropy Reduction Action Plan — 2026-09-09
 
+> **Status: CURRENT** (24 Oct 2026). Reference list of recurring problems. AGENTS.md requires reading it before non-trivial sw.js changes. A checklist to apply, not a plan to execute. Current reference. Read it before non-trivial sw.js changes (AGENTS.md). A checklist, not a plan to execute. Register: [notes register](docs/notes-register.md).
+
 ## Motivating problem
 
 This codebase has been extensively edited across many sessions by different
@@ -14,13 +16,13 @@ rather than rediscovering it from scratch. That's itself part of the fix
 (see Phase 5).
 
 Concrete origin: a single live-testing session (2026-09-09, documented in
-`live-testing-todo-2026-09-08.md`) chasing one reported bug (an
+`historical/live-testing-todo-2026-09-08.md`) chasing one reported bug (an
 internally-inconsistent persisted profile-progress record) surfaced four
 independent, unrelated bugs stacked on top of each other, each a different
 instance of the same underlying gap: no schema/typed-union discipline for
 state that different code paths mutate independently over time.
 
-## Named patterns (see live-testing-todo-2026-09-08.md for the concrete bugs each was drawn from)
+## Named patterns (see historical/live-testing-todo-2026-09-08.md for the concrete bugs each was drawn from)
 
 0. **Untyped, unioned progress record (the root pattern).** `profileNukeProgress[href]`
    is one flat object accumulating fields from conceptually distinct action
@@ -166,7 +168,7 @@ requested.
   outer `(5000, 500)` — risk: medium — only 1-2 real iterations possible.
   **This is very likely the mechanism behind the live-testing session's
   unexplained "unblock verification keeps failing under repeated cycling"
-  finding** (see live-testing-todo-2026-09-08.md) — the budget is tight
+  finding** (see historical/live-testing-todo-2026-09-08.md) — the budget is tight
   enough that any real added latency (Quora-side lag, extra CPU load) can
   exhaust it before a second attempt lands.
 - `content.js:4313` (`waitForVerifiedProfileBlocked`) outer `(6000, 500)` —
@@ -267,7 +269,7 @@ key prefix even though their names suggest they're testing projection
 ## Status log
 
 - 2026-09-09: Plan created. Phase 1 sub-plan drafted (see
-  `entropy-audit-phase1-subplan-2026-09-09.md`), farmed out to 3 scoped
+  `historical/entropy-audit-phase1-subplan-2026-09-09.md`), farmed out to 3 scoped
   research agents. All three completed same day; findings folded in above.
   Phase 1 complete. Re-evaluating with user before starting Phase 2.
 - 2026-09-09 (same day): User approved fixing the "obvious" confirmed bugs

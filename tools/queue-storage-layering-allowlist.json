@@ -1,0 +1,16 @@
+{
+  "allowed": [
+    "sw.js::loadCoordinatorCurrentAuthorityState",
+    "sw.js::loadCoordinatorDashboardAuthoritySnapshot",
+    "sw.js::loadCoordinatorQueueProjection",
+    "sw.js::loadCoordinatorQueueRunsEventsProgressProjection",
+    "sw.js::loadCoordinatorQueueRunsEventsProjection",
+    "sw.js::loadCoordinatorQueueRunsProgressProjection",
+    "sw.js::loadCoordinatorQueueRunsProjection",
+    "sw.js::loadCoordinatorQueueRunsScopedProgressProjection",
+    "sw.js::loadCoordinatorQueueWalProjection",
+    "sw.js::mirrorCoordinatorQueueWalAfterAck",
+    "sw.js::readCoordinatorQueueRowsFromMirror",
+    "sw.js::rebuildCoordinatorQueueMirrorFromDisk"
+  ]
+}

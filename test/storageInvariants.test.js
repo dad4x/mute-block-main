@@ -2,7 +2,6 @@ const assert = require('node:assert/strict')
 const {
     COORDINATOR_QUEUE_KEY,
     COORDINATOR_RUNS_KEY,
-    SPACE_PENDING_POSTS_KEY,
     checkStorageInvariants
 } = require('./lib/storageInvariants')
 
@@ -62,17 +61,6 @@ function cleanSnapshot() {
                 targetProfileHrefs: [first, second, third]
             }
         },
-        [SPACE_PENDING_POSTS_KEY]: {
-            'post-clean': {
-                postKey: 'post-clean',
-                remainingUrls: [first, second],
-                jobKeysByProfileHref: {
-                    [first]: first,
-                    [second]: second
-                },
-                resolverPending: false
-            }
-        }
     }
 }
 
@@ -80,7 +68,7 @@ function issueCodes(issues) {
     return issues.map(issue => issue.code)
 }
 
-test('passes clean queued active terminal and pending-post snapshot', () => {
+test('passes clean queued active and terminal snapshot', () => {
     assert.deepEqual(checkStorageInvariants(cleanSnapshot()), [])
 })
 
@@ -127,106 +115,9 @@ test('flags active queue rows without attempt identity', () => {
     assert.equal(issues[0].status, 'acting')
 })
 
-test('flags pending post URL whose queue row is terminal', () => {
-    const href = profile('Already-Settled')
-    const issues = checkStorageInvariants({
-        [COORDINATOR_QUEUE_KEY]: {
-            [href]: {
-                status: 'skipped',
-                targetProfileHref: href,
-                attemptId: 'attempt-skipped'
-            }
-        },
-        [SPACE_PENDING_POSTS_KEY]: {
-            'post-terminal': {
-                remainingUrls: [href],
-                jobKeysByProfileHref: {
-                    [href]: href
-                }
-            }
-        }
-    })
 
-    assert.deepEqual(issueCodes(issues), ['terminal-url-still-pending'])
-    assert.equal(issues[0].postKey, 'post-terminal')
-    assert.equal(issues[0].href, href)
-    assert.equal(issues[0].key, href)
-    assert.equal(issues[0].status, 'skipped')
-})
 
-test('flags missing and stale pending post job-key mappings', () => {
-    const remaining = profile('Still-Queued')
-    const stale = profile('No-Longer-Remaining')
-    const issues = checkStorageInvariants({
-        [COORDINATOR_QUEUE_KEY]: {
-            [remaining]: {
-                status: 'queued',
-                targetProfileHref: remaining
-            }
-        },
-        [SPACE_PENDING_POSTS_KEY]: {
-            'post-mapping': {
-                remainingUrls: [remaining],
-                jobKeysByProfileHref: {
-                    [stale]: stale
-                }
-            }
-        }
-    })
 
-    assert.deepEqual(issueCodes(issues), [
-        'pending-job-key-missing',
-        'pending-job-key-stale'
-    ])
-    assert.equal(issues[0].postKey, 'post-mapping')
-    assert.equal(issues[0].href, remaining)
-    assert.equal(issues[1].href, stale)
-})
-
-test('flags resolver-pending records without resolver URL evidence', () => {
-    const issues = checkStorageInvariants({
-        [SPACE_PENDING_POSTS_KEY]: {
-            'post-unresolved': {
-                resolverPending: true,
-                remainingUrls: [],
-                jobKeysByProfileHref: {}
-            }
-        }
-    })
-
-    assert.deepEqual(issueCodes(issues), ['resolver-pending-missing-url'])
-    assert.equal(issues[0].postKey, 'post-unresolved')
-})
-
-test('flags resolver-pending records after terminal resolver queue row', () => {
-    const resolverUrl = 'https://www.quora.com/q/example/post/abc'
-    const resolverKey = `resolve-profile:${resolverUrl}`
-    const issues = checkStorageInvariants({
-        [COORDINATOR_QUEUE_KEY]: {
-            [resolverKey]: {
-                status: 'failed',
-                requestedUrl: resolverUrl,
-                resolutionMode: 'author-profile',
-                resolveProfileFromPage: true,
-                attemptId: 'attempt-resolver'
-            }
-        },
-        [SPACE_PENDING_POSTS_KEY]: {
-            'post-resolver': {
-                resolverPending: true,
-                resolverUrl,
-                remainingUrls: [],
-                jobKeysByProfileHref: {}
-            }
-        }
-    })
-
-    assert.deepEqual(issueCodes(issues), ['terminal-resolver-still-pending'])
-    assert.equal(issues[0].postKey, 'post-resolver')
-    assert.equal(issues[0].key, resolverKey)
-    assert.equal(issues[0].resolverUrl, resolverUrl)
-    assert.equal(issues[0].status, 'failed')
-})
 
 test('warns when an active run target has no queue row', () => {
     const href = profile('Missing-From-Queue')

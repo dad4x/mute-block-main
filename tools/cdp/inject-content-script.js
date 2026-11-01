@@ -35,7 +35,7 @@ runMain(async () => {
             try {
                 await chrome.scripting.insertCSS({
                     target: {tabId: tab.id},
-                    files: ['css/content.css']
+                    files: ['css/tokens.css', 'css/content.css']
                 }).catch(() => null)
                 await chrome.scripting.executeScript({
                     target: {tabId: tab.id},

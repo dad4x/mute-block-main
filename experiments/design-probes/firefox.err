@@ -1,0 +1,5 @@
+site: http://127.0.0.1:8770/ attrs=data-mb-result,data-mb-caps
+phase: capabilities
+phase: routing
+phase: handoff
+phase: tabs

@@ -1,0 +1,14 @@
+{
+  "command": "lifetime",
+  "result": {
+    "waiterAcquiredBeforeFreeze": false,
+    "frozenOwnerLockHeld": true,
+    "waiterAcquiredWhileFrozen": false,
+    "discardOk": true,
+    "discardToWaiterAcquireMs": 5,
+    "ownerTargetStillListedAfterDiscard": false,
+    "replacementReadinessMs": 10,
+    "replacementHandoffWorkerReplayMs": 2.4,
+    "replacementRecords": 2820
+  }
+}

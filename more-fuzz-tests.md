@@ -1,5 +1,7 @@
 # More Fuzz Test Plans
 
+> **Status: ROADMAP** (24 Oct 2026). Test plans for more fuzzers (24 May). Not scheduled. Not scheduled. Check planning.md before acting on it. Register: [notes register](docs/notes-register.md).
+
 Status: planning and safe-slice execution note.
 
 Purpose: expand the synthetic harness beyond more seeds of the same current fuzzers. The useful next step is to add different adversaries that exercise the WAL-prep boundary, storage fault behavior, row-event batching, and scheduler/reconciler ordering.

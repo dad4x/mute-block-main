@@ -40,6 +40,9 @@ module.exports = {
     WAIT_FOR_VERIFIED_PROFILE_UNBLOCKED_DEFAULT_INTERVAL_MS: 250,
     WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_TIMEOUT_MS: 8000,
     WAIT_FOR_VERIFIED_PROFILE_BLOCKED_DEFAULT_INTERVAL_MS: 250,
+    // The page record check after a block click (31 Oct): a label that reads blocked is counted only when the record does not say not blocked.
+    WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_TIMEOUT_MS: 3000,
+    WAIT_FOR_PROFILE_RECORD_BLOCKED_DEFAULT_INTERVAL_MS: 250,
     WAIT_FOR_PROFILE_ACTION_READY_DEFAULT_TIMEOUT_MS: 5000,
     WAIT_FOR_CANONICAL_PROFILE_ACTION_ROUTE_DEFAULT_TIMEOUT_MS: 5000,
     WAIT_FOR_OWNED_NUKE_TABS_TO_DRAIN_DEFAULT_TIMEOUT_MS: 180000,
@@ -158,5 +161,22 @@ module.exports = {
     // fillQueuedTabsOnce) so a genuinely stuck occupant still fails here,
     // with the accurate "worker-action-surface-busy" reason, rather than
     // in the outer wrapper with a less specific "tab create timed out".
-    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS: 8000
+    WORKER_ACTION_SURFACE_SLOT_WAIT_TIMEOUT_MS: 8000,
+    // Gap between blocked-tab re-checks after a profile-blocked-state page event (sw.js, owner 17 Oct). A fixed schedule, not a
+    // back-off: a re-check that finds the tab not yet blocked waits this long, and the schedule ends when the tab is blocked or the
+    // attempt ends. The reconcile interval is deliberately not used, so a stalled reconcile cannot delay the check.
+    PROFILE_BLOCKED_PAGE_EVENT_RECHECK_INTERVAL_MS: 1000,
+    // Delay before the fill runs again after a queued tab is removed (sw.js, owner 18 Oct). Set at the scheduler's minimum, so a
+    // freed slot is filled at once, instead of waiting for the one-second resume timers the fill otherwise uses.
+    QUEUED_TAB_REMOVAL_REFILL_DELAY_MS: 100,
+    // Shortest gap between two diagnostic-event flushes that write to storage (sw.js, owner 18 Oct). A flush inside the gap waits
+    // for the next idle moment, unless the pending list is more than half full. Coalesces the flushes; the events are kept.
+    DIAGNOSTIC_EVENT_FLUSH_MIN_INTERVAL_MS: 5000,
+    // The one read of the legacy-cleanup names, once per browser session (sw.js, owner 20 Oct; the cleanup has no budget of its own,
+    // so it used the space-feed storage budget). Same value as that budget: 15 seconds.
+    LEGACY_CONTENT_INDEX_CLEANUP_READ_TIMEOUT_MS: 15000,
+    // A batch enqueue from the search page whose save timed out is checked against the queue for this long, polling at the interval.
+    // The worker can still queue a large batch after the page has stopped waiting (24 Oct: 1100 profiles).
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_TIMEOUT_MS: 60000,
+    PROFILE_SEARCH_ENQUEUE_CONFIRM_INTERVAL_MS: 2000
 }

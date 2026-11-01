@@ -1,5 +1,7 @@
 # Blockzooka Write-Up
 
+> **Status: REFERENCE** (24 Oct 2026). External write-up on Blockzooka (20 May). Reference only. Reference or dated data. Check before relying on its numbers. Register: [notes register](docs/notes-register.md).
+
 Status: external reference context.
 
 Canonical planning now starts at [planning.md](planning.md). Canonical
