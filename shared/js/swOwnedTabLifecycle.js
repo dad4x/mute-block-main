@@ -143,7 +143,13 @@ function createOwnedTabLifecycle(deps = {}) {
                     probeSource,
                     elapsedMs: Date.now() - startedAt,
                     willClose: response?.willClose === true,
-                    reason: response?.reason || ''
+                    reason: response?.reason || '',
+                    // 31 Oct: on a profile mismatch, the profile the probe expected and the one the tab showed, so the rejection can be checked
+                    // against the real page.
+                    ...(response?.reason === 'profile-mismatch' ? {
+                        expectedProfileHref: `${message?.requestedProfileHref || ''}`,
+                        landedProfileHref: `${response?.resolvedProfileHref || ''}`
+                    } : {})
                 })
             }
             return response

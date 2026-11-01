@@ -46022,6 +46022,10 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         document: {
             documentElement: {scrollHeight: 5000},
             body: {appendChild: () => {}},
+            // A visible tab, so a collect does not wait for it (31 Oct).
+            visibilityState: 'visible',
+            addEventListener: () => {},
+            removeEventListener: () => {},
             createElement: () => ({setAttribute: () => {}}),
             // The Stop button is one element on the body, so the lookup is by its class, not a list in the right column.
             querySelector: selector => (selector === '.mb-ext_space-collect-stop-btn' ? stopButton : null),
@@ -46077,6 +46081,7 @@ function makeSpaceCollectHarness(stopOnPass = 0) {
         contentFunctionSource(contentSource, 'function refreshSpaceFeedStopLabel()'),
         contentFunctionSource(contentSource, 'function syncSpaceFeedStopButtons()'),
         contentFunctionSource(contentSource, 'function removeSpaceCollectButtons()'),
+        contentFunctionSource(contentSource, 'function waitForSpaceFeedTabVisible()'),
         contentFunctionSource(contentSource, 'async function collectMoreSpaceFeedPosts(button)')
     ].join('\n'), context)
     const run = code => vm.runInContext(code, context)

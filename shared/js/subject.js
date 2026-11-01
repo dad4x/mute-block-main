@@ -23,7 +23,9 @@ function sanitizeProfileHrefSlug(slug) {
     // owner 15 Oct): NFC, not NFKC, so fullwidth lookalikes stay apart, and no trailing separator or whitespace trim, so the
     // slug is kept as written. The helpers below (stripDescriptiveProfileSuffix, stripTrailingProfileArtifactToken) are no
     // longer called; they stay for that day.
-    return `${slug || ''}`.normalize('NFC').replace(/[?#].*$/g, '')
+    // Owner, 31 Oct: a single trailing letter or digit after a number is a stray suffix, so "Nick-Davis-1145-M" is "Nick-Davis-1145" and
+    // "Will-Fridolf-5-1" is "Will-Fridolf-5". Only the "-N-M" shape is cut; a bare trailing "-N" is kept, since a number can be part of a name.
+    return `${slug || ''}`.normalize('NFC').replace(/[?#].*$/g, '').replace(/^(.*-\d+)-[A-Za-z0-9]$/, '$1')
 }
 
 const DESCRIPTIVE_PROFILE_WORDS = new Set([

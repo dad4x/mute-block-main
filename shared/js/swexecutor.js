@@ -83,11 +83,25 @@ function makeQueuedTabOpenUrlCommitHelpers(deps = {}) {
         now = () => Date.now()
     } = deps
 
+    // A short link (qr.ae) is a redirect: the tab commits to the Quora page it names, never to the short link itself (31 Oct). A tab that
+    // has landed on a Quora page therefore matches the link it was opened from. The resolver then chases that page (content.js).
+    function isShortLinkRedirectLanding(expectedUrl = '', observedUrl = '') {
+        try {
+            const expected = new URL(expectedUrl)
+            const observed = new URL(observedUrl)
+            return expected.hostname === 'qr.ae' && /(^|\.)quora\.com$/.test(observed.hostname)
+        }
+        catch {
+            return false
+        }
+    }
+
     function queuedTabMatchesExpectedOpenUrl(tab = null, expectedUrl = '') {
         const expectedHref = normalizeQuoraProfileUrl(expectedUrl || '')
         const normalizedExpectedUrl = normalizeCoordinatorRequestedUrl(expectedUrl || '')
         return getTabObservedUrls(tab).some(observedUrl => {
             if(expectedHref && normalizeQuoraProfileUrl(observedUrl) === expectedHref) return true
+            if(isShortLinkRedirectLanding(expectedUrl || '', observedUrl)) return true
             return normalizedExpectedUrl &&
                 normalizeCoordinatorRequestedUrl(observedUrl) === normalizedExpectedUrl
         })

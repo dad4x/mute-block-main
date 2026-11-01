@@ -2263,6 +2263,16 @@ function isActiveQueueItem(item = {}) {
     return isActiveCoordinatorStatus(item?.status)
 }
 
+// An active row with no tab yet is waiting for the worker surface (31 Oct). The dashboard shows it as queued, so two rows never read as
+// running when only one has a tab. Display only: the stored status is unchanged.
+function isWaitingForTabQueueItem(item = {}) {
+    return isActiveQueueItem(item) && !item?.tabId
+}
+
+function getDisplayedQueueStatus(item = {}) {
+    return isWaitingForTabQueueItem(item) ? 'queued' : `${item?.status || 'unknown'}`
+}
+
 function getCurrentMetricsEpochStartedAt() {
     const metrics = state.metrics || {}
     const currentEpoch = metrics.currentEpoch || metrics
@@ -3160,7 +3170,7 @@ function renderQueue(items) {
                 subtitleHref: sourcePageUrl
             }),
             buildQueueCancelCell(item),
-            buildBadge(item.status || 'unknown', `${item.status || ''}`.trim() === 'failed' ? (item.error || item.outcome || '') : ''),
+            buildBadge(getDisplayedQueueStatus(item), `${item.status || ''}`.trim() === 'failed' ? (item.error || item.outcome || '') : ''),
             buildTextCell(item.outcome || item.error || '', getOutcomeHelp(item.outcome || item.error || '')),
             buildQueueTimingCell(item)
         )
@@ -3371,7 +3381,8 @@ function buildQueueTimingCell(item = {}) {
     cell.className = 'row-subtitle row-time-cell'
 
     const queuedAt = Number.parseInt(item.queuedAt || item.createdAt, 10) || 0
-    const activeAt = Number.parseInt(item.activeAt, 10) || 0
+    // A row marked active with no tab yet is waiting for the worker surface, so its time shows as queued (31 Oct, display only).
+    const activeAt = isWaitingForTabQueueItem(item) ? 0 : (Number.parseInt(item.activeAt, 10) || 0)
     const terminalAt = Number.parseInt(item.terminalAt, 10) || 0
     const updatedAt = Number.parseInt(item.updatedAt || item.createdAt, 10) || 0
     const primaryAt = activeAt || queuedAt || updatedAt

@@ -2103,7 +2103,7 @@ test('dashboard queued rows expose per-item cancel before status', () => {
     const bootstrap = readRepoFile('shared/js/swBootstrap.js')
     const messageStart = bootstrap.indexOf("request.action === 'cancel-coordinator-current-work-item'")
 
-    assert.match(renderBody, /buildQueueCancelCell\(item\),\s*buildBadge\(item\.status \|\| 'unknown'/)
+    assert.match(renderBody, /buildQueueCancelCell\(item\),\s*buildBadge\(getDisplayedQueueStatus\(item\)/)
     assert.match(cancelCellBody, /isPendingQueueStatus/)
     assert.match(cancelCellBody, /button\.textContent = 'Cancel'/)
     assert.match(cancelCellBody, /cancelCurrentWorkItem\(item\)/)

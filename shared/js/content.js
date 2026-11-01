@@ -7062,6 +7062,21 @@ function syncSpaceFeedStopButtons() {
     refreshSpaceFeedStopLabel()
 }
 
+// A hidden tab does not load the next batch of posts, so a collect waits for its tab to be visible rather than reading the stall as the end
+// of the feed (31 Oct). Resolves when the tab is visible again, or when a stop is requested.
+function waitForSpaceFeedTabVisible() {
+    return new Promise(resolve => {
+        const check = () => {
+            if(document.visibilityState !== 'visible' && !spaceFeedCollectStopRequested) return
+            document.removeEventListener('visibilitychange', check)
+            clearInterval(timer)
+            resolve()
+        }
+        const timer = setInterval(check, 1000)
+        document.addEventListener('visibilitychange', check)
+    })
+}
+
 async function collectMoreSpaceFeedPosts(button) {
     const limit = spaceFeedCollectLimit
     if(spaceFeedCollecting) {
@@ -7089,11 +7104,19 @@ async function collectMoreSpaceFeedPosts(button) {
         // COLLECT_SCROLL_PASS_WAIT_MS. At the bottom, Quora may still be loading, so the feed ends only after COLLECT_END_CONFIRM_MS without
         // growth. Away from the bottom, a stall of COLLECT_STALLED_TIMEOUT_MS is stuck, not finished.
         const atFeedBottom = () => window.innerHeight + (window.scrollY || 0) >= document.documentElement.scrollHeight - 4
+        // Set when a pass waited for a hidden tab. The pass after that counts as progress, so the wait is not read as a stall.
+        let resumedFromHiddenTab = false
         const outcome = await runCollectLoop({
             isStopRequested: () => spaceFeedCollectStopRequested,
             isDone: () => isSpaceFeedCollectDone(startCount, peakCount, limit),
             snapshot: () => ({count: peakCount, scrollY: window.scrollY || 0, scrollHeight: document.documentElement.scrollHeight}),
-            pass: () => {
+            pass: async () => {
+                if(document.visibilityState !== 'visible' && !spaceFeedCollectStopRequested) {
+                    resumedFromHiddenTab = true
+                    setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, 'Paused: tab hidden'))
+                    await waitForSpaceFeedTabVisible()
+                    if(spaceFeedCollectStopRequested) return
+                }
                 window.scrollBy({top: Math.round(window.innerHeight * 0.8), behavior: 'auto'})
             },
             sleep,
@@ -7105,7 +7128,11 @@ async function collectMoreSpaceFeedPosts(button) {
                 spaceFeedCollectProgress.passes += 1
                 setSpaceFeedCollectButtons(collectButton => setNukeButtonWorking(collectButton, `Collecting ${getSpaceFeedCollectedSince(startCount, peakCount)} / ${limit}`))
             },
-            madeProgress: collectPassMadeProgress,
+            madeProgress: (before, after) => {
+                const resumed = resumedFromHiddenTab
+                resumedFromHiddenTab = false
+                return resumed || collectPassMadeProgress(before, after)
+            },
             endCheck: stalledMs => atFeedBottom() && stalledMs >= COLLECT_END_CONFIRM_MS,
             stallTimeoutApplies: () => !atFeedBottom(),
             stallTimeoutMs: COLLECT_STALLED_TIMEOUT_MS
@@ -8803,9 +8830,16 @@ function getPendingSpaceFeedIndex() {
 
     const hrefsByPostKey = new Map()
     const resolverPostKeys = new Set()
+    // 31 Oct: the chase URLs of the pending resolver rows. A resolver post is pending when its chase URL is already queued, whether or not
+    // the row's evidence names the post (the Nuke 'Em count read 59 for 53 posts already queued).
+    const resolverChaseUrls = new Set()
     for(const [itemKey, item] of Object.entries(queue)) {
         if(!isPendingCoordinatorStatus(item?.status)) continue
         const href = getCoordinatorItemProfileHref(itemKey, item)
+        if(!href) {
+            const chaseUrl = `${item?.requestedUrl || itemKey || ''}`.trim().replace(/^resolve-profile:/, '')
+            if(chaseUrl) resolverChaseUrls.add(chaseUrl)
+        }
         for(const evidence of Array.isArray(item?.evidence) ? item.evidence : []) {
             const postKey = `${evidence?.postKey || ''}`.trim()
             if(!postKey) continue
@@ -8829,9 +8863,15 @@ function getPendingSpaceFeedIndex() {
         }
     }
 
-    const index = {hrefsByPostKey, resolverPostKeys}
+    const index = {hrefsByPostKey, resolverPostKeys, resolverChaseUrls}
     pendingSpaceFeedIndexCache = {queue, index}
     return index
+}
+
+// True when a resolver post's chase URL (its cited link, or its question's log) is already a queued row (31 Oct).
+function isSpaceFeedResolverChaseQueued(entry = null) {
+    const chaseUrl = `${entry?.resolutionUrl || ''}`.trim()
+    return !!chaseUrl && getPendingSpaceFeedIndex().resolverChaseUrls.has(chaseUrl)
 }
 
 function hasPendingCoordinatorSpaceFeedPost(postKey = '') {
@@ -9105,6 +9145,7 @@ function isQueueableSpaceFeedResolverEntryForRender(entry = null, context = null
     if(getNormalizedProfileHrefList(entry?.candidateUrls || []).length) return false
     if(isSpaceFeedEntryNukedForRender(entry, context)) return false
     if(isSpaceFeedPostPendingForRender(entry.postKey, context)) return false
+    if(isSpaceFeedResolverChaseQueued(entry)) return false
 
     return true
 }
@@ -9116,7 +9157,8 @@ function buildSpaceFeedRenderEntry(entry = null, context = null) {
     const queueableUrls = postNuked ? [] : getQueueableSpaceFeedEntryUrlsForRender(entry, context)
     const hasResolver = !postNuked && isQueueableSpaceFeedResolverEntryForRender(entry, context)
     const liveUrls = postNuked ? [] : getNormalizedProfileHrefList([...activePendingUrls, ...queueableUrls])
-    const resolverPending = isResolvableSpaceFeedEntry(entry) && getPendingSpaceFeedIndex().resolverPostKeys.has(entry?.postKey)
+    const resolverPending = isResolvableSpaceFeedEntry(entry) &&
+        (getPendingSpaceFeedIndex().resolverPostKeys.has(entry?.postKey) || isSpaceFeedResolverChaseQueued(entry))
     const postBusy = !postNuked && (isSpaceFeedPostNuking(entry?.postKey) || isSpaceFeedPostPendingForRender(entry?.postKey || '', context))
     const queueableWorkCount = queueableUrls.length + (hasResolver ? 1 : 0)
     const liveWorkCount = liveUrls.length + (resolverPending ? 1 : 0)
@@ -9427,7 +9469,11 @@ function normalizeSpaceFeedButtonEntries(entries = []) {
             postUrl: entry?.postUrl || '',
             candidateUrls,
             resolveProfileFromPage,
-            resolutionReason: `${entry?.resolutionReason || ''}`.trim()
+            resolutionReason: `${entry?.resolutionReason || ''}`.trim(),
+            // The chase fields must survive the button round trip. Without them a cited post (Instant Block, qr.ae or a question's /log) falls
+            // back to the post's own address and the queued tab never lands on a profile (history, 31 Oct).
+            resolutionUrl: `${entry?.resolutionUrl || ''}`.trim(),
+            resolutionSubject: `${entry?.resolutionSubject || ''}`.trim()
         }]
     })
 }
@@ -9532,6 +9578,47 @@ function getSpaceFeedCitedUrl(timestamp) {
     return question ? `https://www.quora.com/${question[1]}/log` : ''
 }
 
+// The question a post shares, read from its question card (31 Oct). The card's link is the full question address, while the post's
+// own address can be cut short ("...-nationals-t"), so a chase built from the address reaches the wrong slug. The card sits above the
+// post's timestamp, so the climb goes up from the timestamp and stops at the first ancestor that holds another post.
+const SPACE_FEED_QUESTION_CARD_MAX_LEVELS = 20
+// Root paths on www.quora.com that are not a question, so a root-level card link to one of them is not chased (31 Oct).
+const SPACE_FEED_QUESTION_CARD_NON_QUESTION_ROOTS = new Set([
+    'answer', 'bookmarks', 'business', 'careers', 'contact', 'following', 'messages', 'notifications',
+    'profile', 'question', 'search', 'settings', 'space', 'spaces', 'topic', 'unanswered'
+])
+function getSpaceFeedQuestionCardCitedUrl(timestamp) {
+    let node = timestamp?.parentElement || null
+    for(let level = 0; level < SPACE_FEED_QUESTION_CARD_MAX_LEVELS && node && node !== document.body; level += 1) {
+        // The timestamp itself is one post timestamp, so a second one means this ancestor holds another post.
+        if(node.querySelectorAll('a.post_timestamp, a.answer_timestamp').length > 1) break
+
+        for(const link of Array.from(node.querySelectorAll('a[href]'))) {
+            if(link === timestamp) continue
+            let url = null
+            try {
+                url = new URL(link.getAttribute('href') || '', location.origin)
+            }
+            catch {
+                continue
+            }
+            const questionPath = url.pathname.replace(/\/+$/, '')
+            // Two forms: "/unanswered/<question>", and a root-level answered question "/<question>" on www.quora.com. The root form is
+            // told from a profile alias by its title: a question card's link text is the question itself, which ends in "?".
+            const unansweredCard = /(^|\.)quora\.com$/.test(url.hostname) && questionPath.startsWith('/unanswered/') && questionPath !== '/unanswered'
+            const rootQuestionCard = url.hostname === 'www.quora.com' &&
+                questionPath.split('/').length === 2 &&
+                questionPath.indexOf('-') > 0 &&
+                !SPACE_FEED_QUESTION_CARD_NON_QUESTION_ROOTS.has(questionPath.slice(1)) &&
+                `${link.textContent || ''}`.indexOf('?') >= 0
+            if(!unansweredCard && !rootQuestionCard) continue
+            return `https://www.quora.com${questionPath}/log`
+        }
+        node = node.parentElement
+    }
+    return ''
+}
+
 // A question title in a question card: a link into this space that is not a post's timestamp (30 Oct).
 function isSpaceFeedQuestionTitleLink(link) {
     if (!link || link.matches?.('a.post_timestamp, a.answer_timestamp')) return false
@@ -9565,12 +9652,25 @@ function getSpaceFeedQuestionRow(link) {
 
 // Questions asked in this space (30 Oct). They have no timestamp, so they are not in the post scan. Each question's querent is read from the
 // question's own log page, in a worker-window resolution. The subject is the poster.
+// A question link inside an answer card (31 Oct): the card's own "1 of 3 answers" and question title point at the question, but the card is
+// a post and already has its controls. The nearest ancestor with a post timestamp is the card when it holds exactly one timestamp; a feed
+// holds many, so the climb stops there without a card.
+function isInsideSpaceFeedPostCard(link) {
+    for (let node = link.parentElement; node && node !== document.body; node = node.parentElement) {
+        const count = node.querySelectorAll('a.post_timestamp, a.answer_timestamp').length
+        if (count === 1) return true
+        if (count > 1) return false
+    }
+    return false
+}
+
 function getSpaceFeedQuestionRowEntries() {
     if (!isTargetSpacePage()) return []
     const entries = []
     const seen = new Set()
     for (const link of Array.from(document.querySelectorAll('a[href]'))) {
         if (!isSpaceFeedQuestionTitleLink(link)) continue
+        if (isInsideSpaceFeedPostCard(link)) continue
         const submissionUrl = normalizeQuoraPostHref(link.getAttribute('href'))
         if (!submissionUrl || seen.has(submissionUrl)) continue
         const row = getSpaceFeedQuestionRow(link)
@@ -9662,7 +9762,12 @@ function getSpaceFeedPostEntries() {
         // header is not the target, so the cited post replaces it. On an asset space the cited post is chased only when the post names no
         // profile of its own (Instant Block: "more often an example post that has to be chased").
         const citedFromAddress = isNukableSpacePage() ? getSpaceFeedCitedUrl(timestamp) : ''
-        const citedUrl = citedFromAddress && (isTargetSpacePage() || !candidateUrls.length) ? citedFromAddress : ''
+        // 31 Oct: an asset post whose address names no cited link is chased to its question card instead (Instant Block).
+        const citedFromCard = isNukableSpacePage() && isAssetSpacePage() && !citedFromAddress
+            ? getSpaceFeedQuestionCardCitedUrl(timestamp)
+            : ''
+        const citedCandidate = citedFromAddress || citedFromCard
+        const citedUrl = citedCandidate && (isTargetSpacePage() || !candidateUrls.length) ? citedCandidate : ''
         entries.push({
             postKey,
             postRoot,
@@ -13463,6 +13568,17 @@ async function maybeRunAutoProfileAction() {
             return claimedAction?.resolveProfileFromPage === true ||
                 `${claimedAction?.resolutionMode || ''}`.trim() === QUEUED_PROFILE_RESOLUTION_MODE
         }
+        // 31 Oct: a queued resolution that lands on a question page (a short link redirects there, or a cited question) names no profile on
+        // that page. The question's log names the asker, so the same tab goes to the log and the log page reads the poster. The claim is kept
+        // per tab, so the action carries over the navigation, as the resolved-profile hand-off below does.
+        const continueQueuedResolutionToQuestionLog = async () => {
+            if(getPageType() !== 'question' || !isQueuedResolutionAction()) return false
+
+            const logHref = getQuestionLogHref()
+            await recordQueuedProfileProgress({event: `Question page reached, chasing to its log: ${logHref}`})
+            location.replace(logHref)
+            return true
+        }
         let queuedActionLeaseHeld = false
         let queuedActionLeaseDeniedReason = ''
         const beginQueuedProfileAction = async (reason, readyPredicate = null) => {
@@ -13783,6 +13899,7 @@ async function maybeRunAutoProfileAction() {
 
             if(getPageType() !== 'profile') {
                 if(await resolveQueuedProfileFromCurrentPage()) return
+                if(await continueQueuedResolutionToQuestionLog()) return
 
                 const pageType = getPageType() || 'unknown'
                 const message = isSecurityVerificationPage()
@@ -13922,6 +14039,7 @@ async function maybeRunAutoProfileAction() {
 
         if(getPageType() !== 'profile') {
             if(await resolveQueuedProfileFromCurrentPage()) return
+            if(await continueQueuedResolutionToQuestionLog()) return
 
             const pageType = getPageType() || 'unknown'
             const message = isSecurityVerificationPage()

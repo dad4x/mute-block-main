@@ -145,3 +145,19 @@ test('rejects prose-contaminated explicit profile target slugs', () => {
         false
     )
 })
+
+test('a trailing -N-M drops the -M, and a bare trailing -N is kept (owner, 31 Oct)', () => {
+    assert.equal(sanitizeProfileHrefSlug('Nick-Davis-1145-M'), 'Nick-Davis-1145')
+    assert.equal(sanitizeProfileHrefSlug('Fridoff-2-M'), 'Fridoff-2')
+    assert.equal(normalizeQuoraProfileHref('https://www.quora.com/profile/Nick-Davis-1145-M'), 'https://www.quora.com/profile/Nick-Davis-1145')
+    assert.equal(sanitizeProfileHrefSlug('Fridoff-1'), 'Fridoff-1')
+    assert.equal(sanitizeProfileHrefSlug('Name-12-ab'), 'Name-12-ab')
+    assert.equal(sanitizeProfileHrefSlug('Cesc-Fabregas-56-SHARE-x'), 'Cesc-Fabregas-56-SHARE-x')
+})
+
+test('a trailing -N-digit drops the digit too (owner, 31 Oct: Will-Fridolf-5-1 is Will-Fridolf-5)', () => {
+    assert.equal(sanitizeProfileHrefSlug('Will-Fridolf-5-1'), 'Will-Fridolf-5')
+    assert.equal(normalizeQuoraProfileHref('https://www.quora.com/Will-Fridolf-5-1'), 'https://www.quora.com/profile/Will-Fridolf-5')
+    assert.equal(sanitizeProfileHrefSlug('Name-1-2-3'), 'Name-1-2')
+    assert.equal(sanitizeProfileHrefSlug('Will-Fridolf-5'), 'Will-Fridolf-5')
+})

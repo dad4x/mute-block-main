@@ -633,9 +633,12 @@ function createCoordinatorQueueView(deps = {}) {
 
     function makeCoordinatorCurrentWorkAccounting(queue = {}) {
         const counts = makeCoordinatorQueueAccountingCounts(queue).counts
-        const ready = Number(counts.queued) || 0
+        // An active row with no tab yet is waiting for the worker surface, so it counts as ready (31 Oct, display only; the same rule as
+        // the dashboard row in coordinator.js).
+        const waitingForTab = Object.values(queue || {}).filter(item => item?.status === 'active' && !item?.tabId).length
+        const ready = (Number(counts.queued) || 0) + waitingForTab
         const active = ['opening', 'active', 'acting', 'settling']
-            .reduce((total, status) => total + (Number(counts[status]) || 0), 0)
+            .reduce((total, status) => total + (Number(counts[status]) || 0), 0) - waitingForTab
         const succeeded = Number(counts.succeeded) || 0
         const failed = Number(counts.failed) || 0
 
